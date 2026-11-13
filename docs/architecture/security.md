@@ -158,11 +158,127 @@ Copied session files are recorded in `harness_session_handoffs` — only files
 the copy created (a destination that already existed is never recorded), and
 session/thread ids must be plain file names. The database is agent-writable,
 so cleanup trusts a recorded path only when it lies below the destination
-account's config root, matches a handoff shape (Claude
-`projects/<enc>/<sid>.jsonl` or `…/<sid>/{subagents,tool-results,mcp-tasks}/…`;
-Codex `sessions/YYYY/MM/DD/rollout-*.jsonl`), has no symlinked component and is
-a regular file; it unlinks files only (never a recursive delete) and then
-prunes only empty plain directories inside those shapes. Full behaviour: [harness-stacks.md](harness-stacks.md).
+account's config root, matches a handoff shape **for the row's recorded session
+id** (Claude `projects/<enc>/<sid>.jsonl`, `…/<sid>/{subagents,tool-results,
+mcp-tasks}/…` or `file-history/<sid>/…`; Codex
+`sessions/YYYY/MM/DD/rollout-*-<sid>.jsonl`), so a row can only reach files of
+the session it names (the session id is a claim too), has no symlinked
+component and is a regular file (a row whose column is not the session column
+of its account's kind is dropped, its paths never acted on, by task cleanup
+and account delete alike);
+it unlinks files only (never a recursive delete) and then prunes only empty plain
+directories inside those shapes. A path outside the account's current root is
+*retained* (the row is kept), never followed. Session transcripts are copied
+with no size cap, in asynchronous 1 MiB chunks; the destination is checked one
+path component at a time (`destinationState`) and the source's directory chain
+is `lstat`-checked before any leaf is stat'ed. Full behaviour: [harness-stacks.md](harness-stacks.md).
+
+`harness_orphaned_copies` rows (copies no handoff row can clean up any more)
+and `harness_mirror_sources` rows (the folders each backup's last mirror read
+and wrote) are **untrusted** the same way: the SQLite file is agent-writable.
+
+- An **orphan row** is trusted for at most this: deleting one regular file of
+  a handoff shape of the account's own kind for the row's session (a
+  `claude_session_id` row only on a Claude account, a `codex_session_id` row
+  only on a Codex account; any other column is forgotten unread,
+  `columnMatchesHarness`), below the account's **current** root, with no
+  symlinked component (the handoff cleanup rules,
+  `removeCopiedPathsDetailed`), and only for a session no live handoff row of
+  that account holds, no transfer onto it has in flight, and no task still
+  resumes on that account (a task whose runs recorded the session and for which
+  `findSessionIdForHarness` still returns it, `liveOnRunsOfHarness`). So a
+  planted row deletes nothing an Agetor task still resumes on that account. It
+  can still name a session file of that shape under the account's own root
+  that the user ran in the CLI outside Agetor (no Agetor run knows it, so it
+  is not live to Agetor), or a dead session's copy, and remove that file. Its
+  `created_at` never stalls the monotonic stamp: the seed reads integer stamps
+  only, clamped to a day ahead of the clock.
+- A **mirror-sources row** is only compared and checked for existence, never
+  read from or written into: its folders are resolved lexically and never
+  stat'ed inside a macOS-protected folder (such a folder counts as existing).
+  A planted row can at most make that backup's mirror skip, make its Restore
+  refuse, make an edit of the account ask for confirmation (409
+  `mirror-records`), or make a mirror or a Restore drop that same account's own mirror
+  records and saved originals under `<dataDir>/mirror-backups/<id>/` (removed
+  by `removeMirrorBackups` or `removeFolderBackups`, which never follow a
+  link), after which the mirror treats that account as new in its own current
+  folder, where every file it already has counts as preexisted and is backed
+  up before an overwrite. A recorded folder that is gone (even one that only
+  vanished, such as an unmounted volume) counts as moved for good, so its
+  records and saved originals are dropped, not kept for a folder nothing can
+  restore into. The row's folders are never a write or delete target.
+
+### Mirror provenance, the backup store and the widened stripper
+
+`harness_mirror_provenance` rows (what a mirror wrote into a backup account) are
+**untrusted data**, like the handoff rows, because the database is
+agent-writable. A row's `path`, `key`, `value_hash` and `backup_ref` are claims, and so is a
+created-file marker: Restore removes a merged file only for a merge-spec path,
+only while the file's text hashes to the marker's, and only when removing the
+rows' unedited keys leaves it empty.
+Every removal and every Restore re-checks the path before touching the disk: it
+must have a mirror-allowlist shape (`isMirrorCopyShape`: below a `copy` entry,
+not a never-copy path, no `..`/absolute/backslash/NUL), lie below the account's
+config root with no symlinked component (`isPlainPathUnder`), be a regular file
+(a link row: a symlink), and its *current* hash must still equal the recorded
+one; the account root itself must not have been redirected into a protected
+folder (`rootsRedirectRefusal`). A row that fails is dropped, not obeyed. A
+backup ref is never read from a row: it is recomputed from the account id and the
+relative path, and must stay inside the backup store.
+
+The **backup store** (`<dataDir>/mirror-backups/<harnessId>/{files,modes,links,
+keys}`) holds originals the mirror replaced, which can include secrets (an `env`
+value it overwrote). It lives under the data directory and never inside an
+account root, which an agent writes; directories are 0700, files 0600, writes
+are atomic, a symlinked or non-directory component is refused, an original is
+saved before the overwrite (a failed backup aborts the write), and the whole
+directory is removed with the account or once a Restore leaves no rows. Agetor's
+own data directory is also a **forbidden symlink target**: a dotfile link
+resolving at, inside or above it is refused, because it holds the core token file
+and these originals.
+
+The **credential stripper** is wider than the original shape rule, and
+case-insensitive: whole-segment `APIKEY`, `PASS`, `PASSWD`, `PAT`, `AUTH`,
+`HEADERS`, `COOKIE(S)`, `SESSION`, `DSN`, `WEBHOOK`, `CONNECTION` and
+`PASSPHRASE` join the original credential segments; any `settings.json` `env`
+value that is a URL with userinfo (`scheme://user:pw@host`) is dropped whatever
+its name; an `extraKnownMarketplaces` or plugin-registry entry whose URL carries
+userinfo is dropped; Codex `shell_environment_policy.set.<credential-shaped
+name>` and every `otel…headers` are dropped. The backup's own values survive.
+Safe mode additionally refuses every `env` variable that runs a command when
+set (`NODE_OPTIONS`, `BASH_ENV`, `LD_PRELOAD`, `DYLD_*`, `GIT_ASKPASS`,
+`EDITOR`, anything ending `_HELPER` or `_COMMAND`, …).
+
+**Dotfile-symlinked configs.** The primary's top-level `CLAUDE.md`,
+`AGENTS.md`, `settings.json`, `config.toml` and `.claude.json` may be symlinks
+into a dotfiles repo. They are resolved lexically (never `realpath`, nothing
+stat'ed below a protected folder), must end in the entry's own extension, must
+be a regular file, and are refused when they point at an account root or its
+ancestors, a never-copy or credential path, a `.git` path, a secret-bearing home
+folder (`.ssh`, `.aws`, `.gnupg`, `.config/gh`, `.netrc`, `.docker`,
+`.git-credentials`, `.npmrc`, `.kube`, `.config/gcloud`, `.pypirc`), a protected
+folder, or the data directory. A symlinked file on the **backup** side is
+skipped, never replaced by a regular file.
+
+**Routes.** `GET /harness-stacks/:id/history`, `DELETE
+/harnesses/:id/limit-state`, `POST /harness-stacks/mirror-preview`, `POST
+/harnesses/:id/mirror-restore` and `POST`/`DELETE /tasks/:id/switch-account` are
+`app+cli` and take ids, never paths, so none declares `pathParams`. The three
+that reach an account's config root for a CLI-token caller — preview (every
+member), restore (the account) and switch POST (the task's account and every
+member) — probe those roots through the CLI path gate first
+(`gateStackMemberRoots`, 403 `path-not-accessible`), like stack create/edit and
+a same-stack account PATCH. History and cooldown clear touch no files. The
+preview returns key and file names only, never values, and its path gate runs
+before the draft is validated (validation resolves the account roots and reads
+login evidence inside them in the core's process). The backup store never
+follows a symlink: each ref is resolved by `lstat`-ing every component from
+`mirror-backups/` down, a symlinked or non-directory parent reads as missing
+(writes refuse it), and removal uses Bun's recursive `fs.rm`, which walks by
+file descriptor with `O_NOFOLLOW` (Zig `deleteTree`), so a folder swapped for a
+link mid-delete is refused, not followed. Never use `/bin/rm -rf` or a
+path-based walk for an agent-writable tree: on macOS both can be redirected out
+of it ([harness-stacks.md](harness-stacks.md#mirror-provenance-backups-preview-and-restore)).
 
 ## Multiple repositories in one task
 

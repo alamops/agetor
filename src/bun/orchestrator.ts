@@ -85,7 +85,7 @@ import {
   parseFxRecoveryPayload,
 } from "../shared/fx-recovery.ts";
 import { resolveStartStep, validatePipelineGraph } from "../shared/pipeline.ts";
-import { HARNESS_LIMIT_STATUS_PREFIX, HARNESS_SWAP_STATUS_PREFIX, type HarnessLimitSignal, type HarnessStack, type HarnessStackMember, type HarnessSwapNotice, type TaskHarnessState } from "../shared/types.ts";
+import { HARNESS_LIMIT_STATUS_PREFIX, HARNESS_SWAP_STATUS_PREFIX, type HarnessLimitSignal, type HarnessMemberReason, type HarnessStack, type HarnessStackMember, type HarnessSwapEvent, type HarnessSwapNotice, type SwitchAccountRefusal, type SwitchAccountResult, type TaskHarnessState } from "../shared/types.ts";
 import { classifyHarnessLimitSignal, parseHarnessLimitSignal } from "../shared/harness-limits.ts";
 import {
   composeHarnessStackContinuationPrompt,
@@ -97,26 +97,36 @@ import {
   wrapHarnessStackContinuation,
 } from "../shared/harness-stack.ts";
 import { harnessStacks } from "./harness-stacks.ts";
-import { composeCleanRetryText, normalizeDeliveredUserText } from "../shared/user-message.ts";
-import { cleanupHarnessSessionCopies, findSessionIdForHarness, hasPriorSessionForHarness } from "./harness-session-transfer.ts";
+import { canonicalizeUserText, cleanRetryParts as cleanRetryPartsFromRows, composeCleanRetryText, normalizeDeliveredUserText } from "../shared/user-message.ts";
+import {
+  cleanupHarnessSessionCopies,
+  findSessionIdForHarness,
+  hasPriorSessionForHarness,
+  sweepOrphanedHandoffCopiesAtBoot,
+} from "./harness-session-transfer.ts";
 import {
   HARNESS_STACK_RETRY_MAX,
   armAutoRetry,
   cancelAutoRetry,
   clearFailoverState,
+  cooldownModelFor,
   deferAutoRetryNow,
+  memberReasonsFor,
   memberUnusableReason,
   moveTaskToMember,
   patchTaskState,
   planExhausted,
+  planManualSwitchTarget,
   planNextMember,
   planRetryMember,
   prepareTaskHarness,
   reconcilePendingSwaps,
+  recordHarnessSwapEvent,
   recordLimitSignal,
   recordTried,
   rearmAutoRetries,
   resetLap,
+  retryMinMs,
   setHarnessFailoverHooks,
   stopAllAutoRetryTimers,
   updateTaskState,
@@ -383,6 +393,10 @@ interface ActiveRun {
    *  `handleHarnessLimitSettlement` when the task is on a stack; otherwise the
    *  run settles normally and only the account cooldown was recorded. */
   limitHit: HarnessLimitSignal | null;
+  /** The exact cooldown row the chunk handler stored for `limitHit`. A Codex
+   *  turn that still completed (exit 0) dismisses its own signal; the settle
+   *  then clears exactly that row, and nothing another task wrote since. */
+  limitRecorded: { harnessId: string; model: string | null; updatedAt: number } | null;
   /** Set when the run's tmux session died unexpectedly mid-turn (the driver
    *  emitted the `SESSION_DIED_STATUS_PREFIX` sentinel). Like `apiError`, the
    *  chunk handler flips the column to `blocked` immediately and the done
@@ -717,8 +731,11 @@ setLagStallSink((stall) => {
 // Death-watch during a #92 hold: keep polling `tmux has-session` even though
 // no turn is in flight, so a session dying mid-hold is caught instead of
 // silently stranding the card in `running` until the next boot. Reuses the
-// existing DB-derived hold predicate — no new state to track.
-setHeldSessionProbe(isHeldByBackgroundAgents);
+// existing DB-derived hold predicate — no new state to track. A turn that
+// failed while its background agents kept running is watched too: if that
+// REPL dies, nothing else would ever settle their rows, and they would block
+// every account switch on the task (`backgroundAgentsHoldTask`) for good.
+setHeldSessionProbe(backgroundAgentsHoldTask);
 
 // Run association for `signalSubagentApiError` (#93): answers "what run id
 // is currently in flight for this task, per the orchestrator's OWN `active`
@@ -1010,6 +1027,37 @@ export function isHeldByBackgroundAgents(taskId: string): boolean {
 }
 
 /**
+ * Whether running background agents hold the task against an account move:
+ * a turn that succeeded and is held in `running` ({@link
+ * isHeldByBackgroundAgents}), or a turn that FAILED (an API error) while its
+ * background agents kept running, which is never held in `running` but whose
+ * REPL hosts those agents all the same. Moving accounts drops that REPL, so
+ * every account-switch path (the turn end, the release edge, a claim release,
+ * boot, "Switch to next account", a same-stack PATCH) asks this one question
+ * and treats both cases alike. A live turn is not "held": it owns the task,
+ * and its own end decides.
+ *
+ * The failed case is exactly a `blocked` card whose current run `failed`: the
+ * two states that still show a Stop for the agents (the card's and the run
+ * panel's controls are offered on `running` and `blocked` cards only). A
+ * running agent row on any other card (a turn the user stopped, which leaves
+ * a background shell or a persistent monitor running, or a card the user moved
+ * on) holds nothing: such rows may never finish, and with no Stop on the card
+ * the switch would wait for them forever.
+ */
+export function backgroundAgentsHoldTask(taskId: string): boolean {
+  // Polled by the claude death watch on every tick of an idle session, so the
+  // common "no background agent" answer costs one indexed lookup.
+  const task = tasks.get(taskId);
+  if (!task) return false;
+  if (isTaskHeldByBackgroundAgents(task)) return true;
+  if (task.column !== "blocked" || task.runId == null) return false;
+  if (!subagents.hasRunning(taskId)) return false;
+  if (runs.get(task.runId)?.status !== "failed") return false;
+  return !(active.has(task.runId) || runs.hasRunning(taskId));
+}
+
+/**
  * Flip a held task to `review` once its last subagent finishes. Called on
  * every subagent completion (via the settle hook), so it must be cheap and
  * safe to call repeatedly — it no-ops unless the task is still held-and-clear:
@@ -1041,10 +1089,20 @@ function maybeReleaseHeldTask(taskId: string): void {
   if (deletingTaskIds.has(taskId)) return;
   drainSessionJsonl(taskId);
   const task = tasks.get(taskId);
-  if (!task || task.archivedAt != null || task.column !== "running" || task.runId == null) return;
-  if (runs.get(task.runId)?.status !== "succeeded") return;
-  if (subagents.hasRunning(taskId)) return;
-  updateColumn(taskId, task.runId, "review");
+  if (!task || task.archivedAt != null) return;
+  if (
+    task.column === "running"
+    && task.runId != null
+    && runs.get(task.runId)?.status === "succeeded"
+    && !subagents.hasRunning(taskId)
+  ) {
+    updateColumn(taskId, task.runId, "review");
+  }
+  // A "switch to next account" deferred behind the background agents runs now.
+  // Not only on the release above: a turn that FAILED with background agents
+  // still running (an API error) is never held in `running`, yet its switch
+  // waited for the same agents, and this edge is the only one left to apply it.
+  settleWaitingScheduledSwitch(taskId);
 }
 
 /**
@@ -1227,6 +1285,13 @@ export async function reconcileOrphans(): Promise<number> {
 
   const reattachedTaskIds = new Set<string>();
   const orphaned: { id: string; task_id: string; prevColumn: ColumnId | null; kind: AgentKind | null }[] = [];
+  // Runs whose limit settlement had already persisted an automatic
+  // `pendingSwap` before the crash: the swap is resumed by the boot swap
+  // reconcile, so these are recorded `failed` (reason `harness-swap`) and the
+  // task keeps its column and `run_id`. Orphaning them would emit `orphaned`
+  // (settling a pipeline step), flip the card to `ready` and null `run_id`,
+  // and the reconcile would block instead of resuming.
+  const swapInterrupted: { id: string; task_id: string }[] = [];
 
   // OpenCode 2.x server runs (orchestrator-opencode-server.ts): the adopted
   // servers are asked, all at once under one budget, which sessions they still
@@ -1237,6 +1302,11 @@ export async function reconcileOrphans(): Promise<number> {
     const task = tasks.get(row.task_id);
     const prevColumn: ColumnId | null = task?.column ?? null;
     const kind = resolveHarness(row.agent)?.kind ?? null;
+    const interruptedSwap = task?.harnessState?.pendingSwap;
+    if (task && interruptedSwap && !interruptedSwap.manual && interruptedSwap.runId === row.id) {
+      swapInterrupted.push({ id: row.id, task_id: row.task_id });
+      continue;
+    }
     // claude-code, codex, gemini, antigravity, opencode and copilot runs can
     // be reattached when their detached tmux session is still alive. Cursor
     // and fx are ACP over stdio: a `running` row is orphaned (cursor also
@@ -1412,6 +1482,11 @@ export async function reconcileOrphans(): Promise<number> {
   }
 
   const now = Date.now();
+  for (const row of swapInterrupted) {
+    runs.update(row.id, { status: "failed", endedAt: now, exitCode: -1 });
+    saveStatusLineQuietly(row.id, row.task_id, "the core restarted during the account switch — finishing it");
+    emitGlobal({ kind: "run-status", taskId: row.task_id, runId: row.id, status: "failed", ts: now, reason: "harness-swap" });
+  }
   if (orphaned.length > 0) {
     const reconcile = db.transaction(() => {
       for (const row of orphaned) {
@@ -1615,6 +1690,11 @@ export async function reconcileOrphans(): Promise<number> {
   if (reArmed > 0 || released > 0) {
     console.log(`[agetor] held tasks: re-armed ${reArmed} watcher(s), released ${released} background-agent row(s)`);
   }
+
+  // Harness-stack handoff copies no row can clean up any more (re-keyed
+  // sessions, deleted tasks; migration 088). Cooperative, never rejects, and
+  // not awaited: boot must not wait on file removal.
+  void sweepOrphanedHandoffCopiesAtBoot();
 
   return orphaned.length;
 }
@@ -2008,9 +2088,25 @@ function adoptPendingTaskCancel(taskId: string, runId: string): boolean {
  *  against the claim that no minted run adopted. */
 function releaseStartingClaim(taskId: string): void {
   startingTaskIds.delete(taskId);
-  pendingCancelTaskIds.delete(taskId);
+  const stopped = pendingCancelTaskIds.delete(taskId);
   // An OpenCode wake that arrived while the claim was held waits for this edge.
   if (hasDeferredOpencodeWake(taskId)) queueMicrotask(() => retryDeferredOpencodeWake(taskId));
+  // A turn that ended while this claim was held left its scheduled switch to
+  // the claim holder (`settleScheduledSwitchAtTurnEnd`). A holder that minted a
+  // run hands it to that run's turn end; one that ended without a live run (a
+  // failed pre-flight, a failed spawn) must settle it here, or it would fire at
+  // some unrelated later turn end.
+  if (tasks.get(taskId)?.harnessState?.scheduledSwitch) {
+    // A throw here would surface as an uncaught microtask error, not reach the
+    // claim holder; log it like `endTurnSettle` does.
+    queueMicrotask(() => {
+      try {
+        settleWaitingScheduledSwitch(taskId, { stopped });
+      } catch (err) {
+        console.warn(`[agetor] settling a waiting account switch for ${taskId} failed:`, err);
+      }
+    });
+  }
 }
 
 /**
@@ -2391,7 +2487,7 @@ async function startTaskInner(
   // Mirror/transfer warnings of a move land on the new run (review S11).
   const accountMoveNotes: string[] = [];
   {
-    const prepared = await prepareTaskHarness(taskId, { manual: true });
+    const prepared = await prepareTaskHarnessForUser(taskId, { manual: true });
     if (!prepared.ok) {
       return { error: prepared.error ?? "no usable account in this stack" };
     }
@@ -2465,7 +2561,7 @@ async function startTaskInner(
     // re-probed by the next loop iteration; if it also fails, refuse.
     if (preflightMoved || !harnessFailoverEnabledFor(task)) return { error: failure };
     preflightMoved = true;
-    const moved = await prepareTaskHarness(taskId, {
+    const moved = await prepareTaskHarnessForUser(taskId, {
       manual: true,
       forceOffCurrent: true,
       forceReason: "pre-flight failed",
@@ -3376,7 +3472,10 @@ function makeChunkHandlerInner(
           // Account identity comes from the run, never `task.agent`: a swap
           // or manual move may already point the task at the next account.
           const harnessId = runs.get(runId)?.agent ?? (task ? taskHarnessId(task) : null);
-          if (harnessId) recordLimitSignal(harnessId, signal);
+          if (harnessId) {
+            const stored = recordLimitSignal(harnessId, signal);
+            handle.limitRecorded = { harnessId, model: stored.model ?? null, updatedAt: stored.updatedAt };
+          }
         }
       }
     }
@@ -3534,6 +3633,7 @@ function registerActiveRun(
     cancelled: false,
     apiError: false,
     limitHit: null,
+    limitRecorded: null,
     sessionDied: false,
     unknownCommand: false,
     writeInput: (line) => agent.writeInput(line),
@@ -3854,6 +3954,14 @@ const swapWindowTaskIds = new Set<string>();
  *  `sendInput` declines with a clear reason; a follow-up sent after the swap
  *  settles is accepted normally. */
 const accountSwitchTaskIds = new Set<string>();
+/** Tasks whose account-switch claim is a "Switch to next account" move (idle,
+ *  or applied at turn end): a message arriving meanwhile is held and delivered
+ *  after the move, not refused. */
+const switchNowTaskIds = new Set<string>();
+/** A Stop pressed while an account switch was copying the conversation. The
+ *  copy finishes; queued and held follow-ups go to the tray. Cleared with the
+ *  switch's claim. */
+const switchStopRequested = new Set<string>();
 
 /**
  * Claim a task for an explicit same-stack account switch. Returns false when
@@ -3864,19 +3972,47 @@ const accountSwitchTaskIds = new Set<string>();
  */
 export function claimTaskForAccountSwitch(taskId: string): boolean {
   if (startingTaskIds.has(taskId)) return false;
-  // A held task's REPL is still hosting background agents: the switch would
-  // drop it and abandon them (review N3). The PATCH route refuses with its
-  // own 409 first; this keeps every other caller out too.
-  if (isHeldByBackgroundAgents(taskId)) return false;
+  // A freeze admits no new account move (the next owner's boot decides).
+  if (launchesFrozenFlag) return false;
+  // A held task's REPL (or a failed turn's) is still hosting background
+  // agents: the switch would drop it and abandon them (review N3). The PATCH
+  // route refuses with its own 409 first; this keeps every other caller out too.
+  if (backgroundAgentsHoldTask(taskId)) return false;
   startingTaskIds.add(taskId);
   accountSwitchTaskIds.add(taskId);
   return true;
+}
+
+/** Whether an account switch (a PATCH, a "Switch to next account" move, a
+ *  scheduled one being applied, or a boot completion) is copying the task's
+ *  conversation right now. */
+export function isAccountSwitchUnderway(taskId: string): boolean {
+  return accountSwitchTaskIds.has(taskId);
+}
+
+/**
+ * Whether the account move holding the task's claim is one that settles a
+ * scheduled "switch to next account" itself: a "Switch to next account" move
+ * (the scheduled one being applied, or one the user started on an idle task),
+ * whose end always consumes the request (`moveTaskForSwitchNow`), or the boot
+ * completion of such a move. A Cancel then has nothing left to cancel, and the
+ * route answers 409 `busy`. Any other claim (a same-stack PATCH, the boot
+ * completion of one) may still be refused or fail and leave the request
+ * behind, so a Cancel then drops the request as usual.
+ */
+export function isScheduledSwitchUnderway(taskId: string): boolean {
+  if (!accountSwitchTaskIds.has(taskId)) return false;
+  if (switchNowTaskIds.has(taskId)) return true;
+  const pending = tasks.get(taskId)?.harnessState?.pendingSwap;
+  return bootSwapClaims.has(taskId) && pending?.manual === true && pending.switchNow != null;
 }
 
 /** Release a claim taken by {@link claimTaskForAccountSwitch}. Safe to call
  *  when the switch threw: the claim must never outlive the copy. */
 export function releaseTaskAccountSwitch(taskId: string): void {
   accountSwitchTaskIds.delete(taskId);
+  switchNowTaskIds.delete(taskId);
+  switchStopRequested.delete(taskId);
   releaseStartingClaim(taskId);
 }
 
@@ -3887,7 +4023,12 @@ export function releaseTaskAccountSwitch(taskId: string): void {
  * automatic swap is protected by its own `pendingSwap`; the manual path had
  * none. Returns false when the task or its stack no longer resolves.
  */
-export function beginManualAccountSwitch(taskId: string, from: string, to: string): boolean {
+export function beginManualAccountSwitch(
+  taskId: string,
+  from: string,
+  to: string,
+  opts: { switchNow?: "manual" | "scheduled" } = {},
+): boolean {
   const task = tasks.get(taskId);
   if (!task) return false;
   const stack = harnessStacks.getByMember(from);
@@ -3907,9 +4048,15 @@ export function beginManualAccountSwitch(taskId: string, from: string, to: strin
       runId: task.runId ?? "",
       startedAt: Date.now(),
       manual: true,
+      ...(opts.switchNow ? { switchNow: opts.switchNow } : {}),
     },
     allExhausted: state?.allExhausted ?? null,
     lastMove: state?.lastMove ?? null,
+    // A scheduled "switch to next account" stays recorded until the move's
+    // final state write consumes it: a move that throws drops it with the
+    // error, and one a crash interrupts before the row changed accounts is
+    // retried by the boot reconcile instead of being lost.
+    ...(state?.scheduledSwitch ? { scheduledSwitch: state.scheduledSwitch } : {}),
   }));
   return true;
 }
@@ -3920,6 +4067,416 @@ export function clearManualAccountSwitch(taskId: string): void {
   if (!tasks.get(taskId)?.harnessState?.pendingSwap?.manual) return;
   patchTaskState(taskId, { pendingSwap: null });
 }
+
+// ---------------------------------------------------------------------------
+// Switch to the next account (docs/plans/harness-stacks-fix-round.md D12)
+// ---------------------------------------------------------------------------
+
+/** A "Switch to next account" the task cannot take. Maps to HTTP 409; the
+ *  message is `body.error`. */
+export class SwitchAccountRefusedError extends Error {
+  constructor(readonly body: SwitchAccountRefusal) {
+    super(body.error);
+    this.name = "SwitchAccountRefusedError";
+  }
+}
+
+/** "Label: reason; Label: reason" for a status line or a refusal message. */
+function memberReasonsText(reasons: readonly HarnessMemberReason[]): string {
+  return reasons.map((r) => `${r.label}: ${r.reason}`).join("; ");
+}
+
+/** The run a task-level status line should land on. */
+function noteRunIdOf(taskId: string): string | null {
+  return tasks.get(taskId)?.runId ?? runs.latestForTask(taskId)?.id ?? null;
+}
+
+/** True while a turn, a start/swap claim or a persisted swap owns the task, so
+ *  an account move now would race it. */
+function accountSwitchMustWait(task: Task): boolean {
+  return (
+    (task.runId != null && active.has(task.runId))
+    || isTurnSettling(task.id)
+    || runs.hasRunning(task.id)
+    || startingTaskIds.has(task.id)
+    || swapWindowTaskIds.has(task.id)
+    || Boolean(task.harnessState?.pendingSwap)
+  );
+}
+
+/** Drop a scheduled switch and say why on the task's latest run. */
+function dropScheduledSwitch(taskId: string, line: string): void {
+  if (!tasks.get(taskId)?.harnessState?.scheduledSwitch) return;
+  patchTaskState(taskId, { scheduledSwitch: null });
+  const runId = noteRunIdOf(taskId);
+  if (runId) saveStatusLineQuietly(runId, taskId, line);
+}
+
+/**
+ * Move an idle task to `toId` through the same path a same-stack PATCH takes
+ * (`reconcileTaskSession` -> `moveTaskToMember`). The caller holds the account
+ * switch claim. Never cools the old account and never adds it to `tried`.
+ */
+async function moveTaskForSwitchNow(taskId: string, toId: string, trigger: "manual" | "scheduled"): Promise<void> {
+  const before = tasks.get(taskId);
+  if (!before) return;
+  switchNowTaskIds.add(taskId);
+  beginManualAccountSwitch(taskId, before.agent, toId, { switchNow: trigger });
+  let threw = false;
+  try {
+    // Awaited only when a test hook returns a promise: no yield in production.
+    const heldByTest = scheduledSwitchTestHooks.afterIntent?.(taskId);
+    if (heldByTest) await heldByTest;
+    const updated = tasks.update(taskId, { agent: toId });
+    if (!updated) {
+      clearManualAccountSwitch(taskId);
+      return;
+    }
+    await reconcileTaskSession(taskId, before, updated, { switchNow: trigger });
+  } catch (err) {
+    threw = true;
+    clearManualAccountSwitch(taskId);
+    throw err;
+  } finally {
+    // The final state write clears it; a path that bailed early must not
+    // leave a request nobody will honour. A scheduled move that threw keeps
+    // it for its caller, which drops it with the error
+    // (`applyScheduledSwitch`).
+    if (!(threw && trigger === "scheduled") && tasks.get(taskId)?.harnessState?.scheduledSwitch) {
+      patchTaskState(taskId, { scheduledSwitch: null });
+    }
+  }
+}
+
+/** Release a switch-now claim, then deliver the messages held during the move
+ *  through the ordinary path (or re-stash them when the user pressed Stop). */
+/** Tasks whose held messages wait for the turn-end follow-up queues to drain
+ *  first (see {@link finishSwitchNow}); {@link drainFollowUpQueues} delivers
+ *  them right behind the queue. */
+const heldAfterQueueTaskIds = new Set<string>();
+
+/** Deliver (or, when the drain cannot run, stash) the messages
+ *  {@link finishSwitchNow} left behind the turn's queued follow-ups. */
+async function drainHeldBehindQueue(taskId: string, stash: boolean): Promise<void> {
+  if (!heldAfterQueueTaskIds.delete(taskId)) return;
+  try {
+    if (stash) stashSwapFollowUps(taskId);
+    else await drainSwapFollowUps(taskId);
+  } catch (err) {
+    console.warn(`[agetor] delivering messages held during the account switch for ${taskId} failed:`, err);
+    stashSwapFollowUps(taskId);
+  }
+}
+
+/** `behindQueue`: the move ran at a turn end, whose queued follow-ups are
+ *  older than the held messages and drain next. The held messages then go out
+ *  after them (through the ordinary send, which queues behind a live turn), so
+ *  the order stays oldest first. */
+async function finishSwitchNow(taskId: string, behindQueue = false): Promise<void> {
+  const stopped = switchStopRequested.has(taskId);
+  releaseTaskAccountSwitch(taskId);
+  if (behindQueue && !stopped) {
+    heldAfterQueueTaskIds.add(taskId);
+    return;
+  }
+  try {
+    if (stopped) stashSwapFollowUps(taskId);
+    else await drainSwapFollowUps(taskId);
+  } catch (err) {
+    console.warn(`[agetor] delivering messages held during the account switch for ${taskId} failed:`, err);
+    stashSwapFollowUps(taskId);
+  }
+}
+
+/**
+ * "Switch to next account" for one task. An idle task moves now to the next
+ * usable member; a task with a live turn persists
+ * `harnessState.scheduledSwitch` and moves when the turn ends (unless the user
+ * pressed Stop). The target is planned up front so a hopeless request is
+ * refused immediately, with the per-member reasons.
+ *
+ * Throws {@link SwitchAccountRefusedError}. The caller checks the task exists.
+ */
+export async function switchTaskAccountNow(taskId: string): Promise<SwitchAccountResult> {
+  const task = tasks.get(taskId);
+  if (!task) throw new Error(`task not found: ${taskId}`);
+  const plan = planManualSwitchTarget(task);
+  if (plan.kind === "refused") {
+    throw new SwitchAccountRefusedError({
+      error: plan.code === "not-in-stack"
+        ? "this task's account is not in a stack with a backup account"
+        : `no other account in the stack can take this task right now (${memberReasonsText(plan.reasons)})`,
+      code: plan.code,
+      reasons: plan.reasons,
+    });
+  }
+  if (task.archivedAt != null) {
+    throw new SwitchAccountRefusedError({
+      error: "this task is archived",
+      code: "archived",
+    });
+  }
+  // The same check the PATCH route makes: the switch drops the REPL that hosts
+  // the background agents, whether the turn that left them running succeeded
+  // or failed.
+  if (backgroundAgentsHoldTask(taskId)) {
+    throw new SwitchAccountRefusedError({
+      error: "stop the background agents before switching accounts",
+      code: "background-agents",
+    });
+  }
+  if (accountSwitchTaskIds.has(taskId)) {
+    throw new SwitchAccountRefusedError({ error: "switching accounts — try again in a moment", code: "busy" });
+  }
+  // A claim alone (a start that has not minted its run yet) is not a turn the
+  // request can wait for: if that start fails the request would be stranded.
+  // A swap, a retry or the boot swap rewrites the task's state wholesale, so a
+  // request scheduled inside that window would vanish: refuse it instead.
+  const pending = task.harnessState?.pendingSwap;
+  if (
+    swapWindowTaskIds.has(taskId)
+    || bootSwapClaims.has(taskId)
+    || (pending != null && !pending.manual)
+    || Boolean(task.harnessState?.allExhausted?.inFlight)
+  ) {
+    throw new SwitchAccountRefusedError({
+      error: "an account switch is already in progress — try again when it finishes",
+      code: "busy",
+    });
+  }
+  // Only a genuinely live run can be waited for.
+  const liveTurn = (task.runId != null && active.has(task.runId)) || runs.hasRunning(taskId);
+  if (launchesFrozenFlag && !liveTurn) {
+    throw new SwitchAccountRefusedError({ error: LAUNCHES_FROZEN_REASON, code: "launches-frozen" });
+  }
+  if (!liveTurn && startingTaskIds.has(taskId)) {
+    throw new SwitchAccountRefusedError({ error: "task is busy starting a turn — try again in a moment", code: "busy" });
+  }
+  if (liveTurn) {
+    if (!task.harnessState?.scheduledSwitch) {
+      const requestedAt = Date.now();
+      updateTaskState(taskId, (state, current) => {
+        const resolved = harnessStacks.resolveForTask(current);
+        const base: TaskHarnessState = state ?? {
+          stackId: plan.stack.id,
+          position: resolved?.position ?? 0,
+          count: plan.stack.members.length,
+          tried: [],
+          pendingSwap: null,
+          allExhausted: null,
+          lastMove: null,
+        };
+        return { ...base, scheduledSwitch: { requestedAt } };
+      });
+      const runId = noteRunIdOf(taskId);
+      if (runId) saveStatusLineQuietly(runId, taskId, "switch to the next account scheduled for the end of this turn");
+    }
+    return { status: "scheduled", task: tasks.get(taskId) ?? task };
+  }
+  if (!claimTaskForAccountSwitch(taskId)) {
+    throw new SwitchAccountRefusedError({ error: "task is busy starting a turn — try again in a moment", code: "busy" });
+  }
+  try {
+    await moveTaskForSwitchNow(taskId, plan.member.harnessId, "manual");
+  } finally {
+    await finishSwitchNow(taskId);
+  }
+  const after = tasks.get(taskId);
+  if (!after || after.agent !== plan.member.harnessId) {
+    // `reconcileTaskSession` put the row back: background agents appeared
+    // between the check and the claim.
+    throw new SwitchAccountRefusedError({ error: "the account switch did not go through — try again", code: "busy" });
+  }
+  return { status: "switched", task: after };
+}
+
+/** Clear a scheduled switch (the user cancelled it). A no-op returning the task
+ *  when nothing is scheduled. The caller checks the task exists. */
+export function cancelScheduledAccountSwitch(taskId: string, line = "scheduled account switch cancelled"): Task {
+  const task = tasks.get(taskId);
+  if (!task) throw new Error(`task not found: ${taskId}`);
+  if (!task.harnessState?.scheduledSwitch) return task;
+  dropScheduledSwitch(taskId, line);
+  return tasks.get(taskId) ?? task;
+}
+
+/**
+ * Perform a scheduled switch now that the task is idle: re-plan the target,
+ * drop the request with the member reasons when none is usable, otherwise hold
+ * the account-switch claim for the move. Leaves the request persisted when
+ * another start already owns the task (its own turn end decides) or launches
+ * are frozen (the next owner's boot performs it).
+ */
+async function applyScheduledSwitch(taskId: string, behindQueue = false): Promise<void> {
+  const task = tasks.get(taskId);
+  if (!task?.harnessState?.scheduledSwitch) return;
+  if (launchesFrozenFlag) return;
+  // Background agents hold the task, or a turn is live: the request stays
+  // persisted and is applied when they finish (`maybeReleaseHeldTask`) or the
+  // turn ends. `reconcileTaskSession` must never see a live run, or it would
+  // take its "start fresh" branch.
+  if (backgroundAgentsHoldTask(taskId) || runs.hasRunning(taskId)) return;
+  const plan = planManualSwitchTarget(task);
+  if (plan.kind === "refused") {
+    dropScheduledSwitch(
+      taskId,
+      plan.code === "not-in-stack"
+        ? "scheduled account switch dropped: the task is no longer in a stack with a backup account"
+        : `scheduled account switch dropped: no other account can take the task (${memberReasonsText(plan.reasons)})`,
+    );
+    return;
+  }
+  if (!claimTaskForAccountSwitch(taskId)) return;
+  try {
+    await moveTaskForSwitchNow(taskId, plan.member.harnessId, "scheduled");
+  } catch (err) {
+    console.warn(`[agetor] scheduled account switch for ${taskId} failed:`, err);
+    dropScheduledSwitch(taskId, `scheduled account switch failed: ${err instanceof Error ? err.message : String(err)}`);
+  } finally {
+    await finishSwitchNow(taskId, behindQueue);
+  }
+}
+
+/**
+ * Turn-end hook of the settle paths, called BEFORE the queued follow-ups
+ * drain so they run on the new account. A provider limit never reaches here
+ * (the swap path moves the task and clears the request itself).
+ */
+async function settleScheduledSwitchAtTurnEnd(
+  taskId: string,
+  runId: string,
+  status: RunStatus,
+  wasCancelled: boolean,
+): Promise<void> {
+  const task = tasks.get(taskId);
+  if (!task?.harnessState?.scheduledSwitch) return;
+  // A newer turn already owns the task: its end decides.
+  if (task.runId !== runId) return;
+  if (wasCancelled || status === "cancelled") {
+    dropScheduledSwitch(taskId, "scheduled account switch cancelled (stopped)");
+    return;
+  }
+  // Another start holds the task: its run's turn end decides, or, when it ends
+  // without a live run, the claim release does (`releaseStartingClaim`).
+  if (startingTaskIds.has(taskId)) return;
+  if (backgroundAgentsHoldTask(taskId)) {
+    // Dropping the REPL would abandon the background agents: wait for them
+    // (`maybeReleaseHeldTask` applies it; a Stop drops it).
+    const noteRunId = noteRunIdOf(taskId);
+    if (noteRunId) saveStatusLineQuietly(noteRunId, taskId, "will switch to the next account once the background agents finish");
+    return;
+  }
+  await applyScheduledSwitch(taskId, true);
+}
+
+/**
+ * A scheduled switch whose turn already ended but had to wait (for background
+ * agents, or for another start's claim): apply it now that the task is idle,
+ * the same as at a turn end. `stopped`: the user pressed Stop on the claim
+ * that held the task, which drops the request like a Stop on the turn. A
+ * request on an archived task is dropped, as at boot. Anything still owning
+ * the task (a live turn, a claim, a swap, background agents) keeps it for its
+ * own end. Fire-and-forget.
+ */
+function settleWaitingScheduledSwitch(taskId: string, opts: { stopped?: boolean } = {}): void {
+  scheduledSwitchTestHooks.waitingSettle?.(taskId);
+  const task = tasks.get(taskId);
+  const scheduled = task?.harnessState?.scheduledSwitch;
+  if (!task || !scheduled) return;
+  if (task.archivedAt != null) {
+    patchTaskState(taskId, { scheduledSwitch: null });
+    return;
+  }
+  // A Stop that landed on the start holding the task: either recorded on the
+  // claim with no run to adopt it, or adopted by a run that was cancelled
+  // before it registered (no done handler ever settles that run).
+  const latest = task.runId ? runs.get(task.runId) : null;
+  if (opts.stopped || (latest?.status === "cancelled" && (latest.endedAt ?? 0) >= scheduled.requestedAt)) {
+    dropScheduledSwitch(taskId, "scheduled account switch cancelled (stopped)");
+    return;
+  }
+  if (launchesFrozenFlag) return;
+  if (accountSwitchMustWait(task) || backgroundAgentsHoldTask(taskId)) return;
+  void applyScheduledSwitch(taskId).catch((err) => {
+    console.warn(`[agetor] deferred account switch for ${taskId} failed:`, err);
+  });
+}
+
+/** A limit settlement that threw supersedes a scheduled switch exactly as one
+ *  that moved or blocked the task does (it is consumed there); the throw can
+ *  land before that point, and the task is blocked either way. */
+function dropScheduledSwitchAfterFailedLimitMove(taskId: string): void {
+  dropScheduledSwitch(taskId, "scheduled account switch dropped: the account switch after the limit failed");
+}
+
+/**
+ * Boot: a scheduled switch whose turn ended during downtime (the run was
+ * orphaned) is performed now. A task with a live run keeps it for its own turn
+ * end; a pending swap's reconcile owns its state.
+ */
+async function reconcileScheduledSwitchesAtBoot(): Promise<void> {
+  for (const task of tasks.list()) {
+    if (!task.harnessState?.scheduledSwitch) continue;
+    if (launchesFrozenFlag) return;
+    if (task.archivedAt != null) {
+      patchTaskState(task.id, { scheduledSwitch: null });
+      continue;
+    }
+    // Background agents still running after the restart (the subagent
+    // watcher is re-armed at boot) hold the request whether the turn that
+    // left them succeeded or failed; their release edge applies it.
+    if (accountSwitchMustWait(task) || backgroundAgentsHoldTask(task.id)) continue;
+    try {
+      await applyScheduledSwitch(task.id);
+    } catch (err) {
+      console.warn(`[agetor] boot scheduled account switch for ${task.id} failed:`, err);
+    }
+  }
+}
+/**
+ * Test seam: runs synchronously in a done handler right where it pumps the
+ * subagent watcher (`pumpWatcherForHoldCheck`), after the run left `active`
+ * and its status was written, before the turn-end account switch. A test can
+ * settle the last background agent here, exactly as a pump that reads its
+ * completion line would.
+ */
+type TurnSettlePumpHook = (taskId: string, runId: string) => void;
+let turnSettlePumpHook: TurnSettlePumpHook | null = null;
+
+/** Test-only: install/clear {@link turnSettlePumpHook}. Returns the previous
+ *  hook so a test can restore it. */
+export function __setTurnSettlePumpHookForTest(hook: TurnSettlePumpHook | null): TurnSettlePumpHook | null {
+  const prev = turnSettlePumpHook;
+  turnSettlePumpHook = hook;
+  return prev;
+}
+
+/**
+ * Test seams for the scheduled-switch edges, all no-ops in production:
+ * - `afterIntent`: inside a switch-now move, right after the intent
+ *   (`pendingSwap`) is persisted and before the row changes accounts. A throw
+ *   there is a move that failed after its first write; the state read there is
+ *   what a crash would leave. A returned promise holds the move there (with
+ *   its claim) until it settles.
+ * - `waitingSettle`: at the top of `settleWaitingScheduledSwitch`.
+ * - `turnDrain`: in a done handler right after the turn-end switch decision,
+ *   before the follow-up drain (inside the settling window).
+ */
+interface ScheduledSwitchTestHooks {
+  afterIntent?: (taskId: string) => void | Promise<void>;
+  waitingSettle?: (taskId: string) => void;
+  turnDrain?: (taskId: string, runId: string) => void;
+}
+let scheduledSwitchTestHooks: ScheduledSwitchTestHooks = {};
+
+/** Test-only: install/clear {@link scheduledSwitchTestHooks}. Returns the
+ *  previous hooks so a test can restore them. */
+export function __setScheduledSwitchHooksForTest(hooks: ScheduledSwitchTestHooks): ScheduledSwitchTestHooks {
+  const prev = scheduledSwitchTestHooks;
+  scheduledSwitchTestHooks = hooks;
+  return prev;
+}
+
 /** Tasks whose all-exhausted retry is currently starting a successor. A
  *  duplicate timer callback must not mint a second run. */
 const harnessRetriesInFlight = new Set<string>();
@@ -4041,12 +4598,12 @@ async function drainSwapFollowUps(taskId: string): Promise<void> {
     const item = q[i]!;
     const task = tasks.get(taskId);
     if (!task?.runId) {
-      for (const rest of q.slice(i)) restashPasteWithheldText(taskId, rest.text);
+      stashFollowUpBatch(taskId, q.slice(i).map((rest) => rest.text));
       return;
     }
     const result = await sendHeldFollowUp(task.runId, item, false);
     if (!result.delivered) {
-      for (const rest of q.slice(i)) restashPasteWithheldText(taskId, rest.text);
+      stashFollowUpBatch(taskId, q.slice(i).map((rest) => rest.text));
       return;
     }
   }
@@ -4098,7 +4655,7 @@ function stashSwapFollowUps(taskId: string): void {
   const q = swapFollowUps.get(taskId);
   if (!q || q.length === 0) return;
   swapFollowUps.delete(taskId);
-  for (const item of [...q].reverse()) restashPasteWithheldText(taskId, item.text);
+  stashFollowUpBatch(taskId, [...q].reverse().map((item) => item.text));
 }
 
 /**
@@ -4113,6 +4670,226 @@ function stashHeldFollowUpsUnlessLive(taskId: string): void {
   const runId = tasks.get(taskId)?.runId;
   if (runId && active.has(runId)) return;
   stashSwapFollowUps(taskId);
+}
+
+/** Delete the cooldown row a run stored itself, only while it is still the
+ *  row it stored (same key and `updatedAt`): a newer overwrite survives. */
+function clearOwnLimitState(own: { harnessId: string; model: string | null; updatedAt: number }): void {
+  const still = harnessStacks.listLimitStates().some(
+    (row) => row.harnessId === own.harnessId && (row.model ?? null) === own.model && row.updatedAt === own.updatedAt,
+  );
+  if (!still) return;
+  if (own.model) harnessStacks.clearLimitState(own.harnessId, { model: own.model });
+  else harnessStacks.clearLimitState(own.harnessId, { startedAtMs: own.updatedAt });
+}
+
+/**
+ * A settlement ended WITHOUT a started successor (blocked, aborted, stopped, a
+ * failed or cancelled spawn): nothing will drain what the account switch left
+ * behind, so all of it goes to the task's backlog tray in typed order — the
+ * mid-turn follow-ups Claude never read (when `midTurnRunId` names the limited
+ * run), whatever sits in the per-kind turn queues (Codex queues a live-turn
+ * follow-up as its own later turn) and the messages held during the swap
+ * window. A started successor drains these itself, so it never calls this.
+ */
+function stashFollowUpsWithoutSuccessor(taskId: string, statusRunId: string | null, midTurnRunId?: string | null): void {
+  // `backlog.add` prepends, so the newest group goes in first and the tray
+  // reads oldest to newest from the top: held (newest), queued, mid-turn.
+  stashSwapFollowUps(taskId);
+  stashQueuedFollowUps(taskId, statusRunId || null, "no new turn started after the account switch");
+  if (midTurnRunId) stashUndeliveredMidTurnFollowUps(taskId, midTurnRunId);
+}
+
+/**
+ * The limited run an armed (not yet running) CLEAN retry would replay, or
+ * undefined. An `inFlight` retry already started its successor, which carries
+ * the follow-ups itself.
+ */
+function unrunCleanRetryOf(taskId: string): string | undefined {
+  const ex = tasks.get(taskId)?.harnessState?.allExhausted;
+  return ex && !ex.inFlight ? ex.cleanRetryOf : undefined;
+}
+
+/**
+ * Every user message a clean retry of `retryOfRunId` re-sends, in send order
+ * (the first one included): the ORIGINAL run's tagged rows, then whatever the
+ * swap-origin runs started after it received after their first row. A second
+ * consecutive clean retry replays the first one as ONE hidden wrapper row
+ * (original prompt plus follow-ups), so those later runs' first rows are not
+ * new messages; the rest is newer and is kept in order without repeating a
+ * message. A sequential-turn harness (Codex) replays only the first row.
+ */
+function cleanRetryChainParts(taskId: string, retryOfRunId: string): string[] {
+  const firstOnly = runHarnessKind(retryOfRunId) !== "claude-code";
+  const parts = cleanRetryPartsFromRows(runs.mainUserRows(retryOfRunId), { firstOnly });
+  const original = runs.get(retryOfRunId);
+  if (original && !firstOnly) {
+    const later = runs
+      .listForTask(taskId)
+      .filter((r) => r.origin === "harness-swap" && r.startedAt > original.startedAt)
+      .sort((a, b) => a.startedAt - b.startedAt);
+    for (const run of later) {
+      for (const part of cleanRetryPartsFromRows(runs.mainUserRows(run.id), {}).slice(1)) {
+        if (!parts.includes(part)) parts.push(part);
+      }
+    }
+  }
+  return parts;
+}
+
+/**
+ * A clean retry ended without running: put the follow-ups after the original
+ * prompt (what its replay would have re-sent) into the backlog tray. Rebuilt
+ * from the persisted rows of `retryOfRunId`, so it survives a restart. A
+ * sequential-turn harness (Codex) replays only the first row: its follow-ups
+ * were queued turns, already stashed when the retry blocked.
+ */
+function stashCleanRetryFollowUps(taskId: string, retryOfRunId: string): void {
+  const chain = cleanRetryChainParts(taskId, retryOfRunId);
+  // Drop the first part only when it is the task prompt (what the replay would
+  // have re-sent anyway). A fresh start on another account whose first message
+  // was something else keeps every part: none of them is the prompt.
+  const prompt = canonicalizeUserText((tasks.get(taskId)?.prompt ?? "").replace(/\r\n?/g, "\n")).trim();
+  const parts = chain.length > 0 && chain[0] === prompt ? chain.slice(1) : chain;
+  if (parts.length === 0) return;
+  // `backlog.add` PREPENDS: restash newest first so the tray reads in send order.
+  const saved = stashFollowUpBatch(taskId, [...parts].reverse());
+  if (saved === 0) return;
+  saveStatusLineQuietly(
+    retryOfRunId,
+    taskId,
+    `${saved === 1 ? "a message" : `${saved} messages`} sent before the account retry — saved to your backlog, resend from the tray`,
+  );
+}
+
+/** End an armed clean retry's claim on its follow-ups: clear the marker first
+ *  (a stash happens at most once) and stash them. */
+function endCleanRetry(taskId: string, alsoStash?: () => void): void {
+  const retryOf = unrunCleanRetryOf(taskId);
+  if (retryOf) {
+    patchTaskState(taskId, (state) => (
+      state.allExhausted ? { allExhausted: { ...state.allExhausted, cleanRetryOf: undefined } } : {}
+    ));
+  }
+  // The retry's follow-ups precede everything queued or held after them, so
+  // they are stashed last (the tray prepends).
+  alsoStash?.();
+  if (retryOf) stashCleanRetryFollowUps(taskId, retryOf);
+}
+
+/** `planExhausted` for the re-arm paths (a retry that found nothing usable, a
+ *  failed retry spawn): when the new state no longer holds an armed clean retry
+ *  (the cap was reached, or nothing can reset by itself), the retry ended
+ *  without running and its follow-ups go back to the tray. */
+function planExhaustedTracked(
+  taskId: string,
+  plan: Parameters<typeof planExhausted>[1],
+  now = Date.now(),
+  opts: Parameters<typeof planExhausted>[3] = {},
+): ReturnType<typeof planExhausted> {
+  const priorOf = unrunCleanRetryOf(taskId);
+  const persisted = planExhausted(taskId, plan, now, opts);
+  if (priorOf && persisted?.allExhausted?.cleanRetryOf !== priorOf) stashCleanRetryFollowUps(taskId, priorOf);
+  return persisted;
+}
+
+/** `prepareTaskHarness` for a user-driven Run/message: a manual prepare resets
+ *  `allExhausted`, ending an armed clean retry without running it. */
+async function prepareTaskHarnessForUser(
+  taskId: string,
+  opts: Parameters<typeof prepareTaskHarness>[1],
+): ReturnType<typeof prepareTaskHarness> {
+  const retryOf = unrunCleanRetryOf(taskId);
+  const result = await prepareTaskHarness(taskId, opts);
+  if (retryOf && tasks.get(taskId)?.harnessState?.allExhausted?.cleanRetryOf !== retryOf) {
+    stashCleanRetryFollowUps(taskId, retryOf);
+  }
+  return result;
+}
+
+/** The stack a task's history row belongs to, or null (no row is written). */
+function historyStackIdOf(task: Task, accountId: string): string | null {
+  return harnessStacks.getByMember(accountId)?.id ?? harnessStacks.resolveForTask(task)?.stack.id ?? task.harnessState?.stackId ?? null;
+}
+
+/** One history row for a blocked outcome (no move). Never throws. */
+function recordBlockedHistory(
+  taskId: string,
+  runId: string | null,
+  reason: NonNullable<HarnessSwapEvent["reason"]>,
+  signal: HarnessLimitSignal | null,
+): void {
+  const task = tasks.get(taskId);
+  if (!task) return;
+  const from = (runId ? runs.get(runId)?.agent : null) ?? task.agent;
+  const stackId = historyStackIdOf(task, from);
+  if (!stackId) return;
+  recordHarnessSwapEvent({
+    task,
+    stackId,
+    trigger: "blocked",
+    fromHarnessId: from,
+    toHarnessId: null,
+    reason,
+    signal,
+    fromRunId: runId || null,
+  });
+}
+
+/**
+ * Limit signals of successors that hit a provider limit while the task's own
+ * swap window / boot swap claim was still held (a held follow-up was being
+ * delivered, or the boot reconcile owned the task). The run is left `running`
+ * until the claim is released and the settlement re-runs, so its column is
+ * decided exactly once and no second successor is minted.
+ */
+const deferredLimitSettlements = new Map<string, { runId: string; signal: HarnessLimitSignal }>();
+
+/** Re-run a deferred limit settlement. Call right after the claim that
+ *  deferred it is released. Fire-and-forget; failures are logged. */
+function runDeferredLimitSettlement(taskId: string): void {
+  const deferred = deferredLimitSettlements.get(taskId);
+  if (!deferred) return;
+  deferredLimitSettlements.delete(taskId);
+  void settleDeferredLimit(taskId, deferred.runId, deferred.signal).catch((err) => {
+    console.warn(`[agetor] deferred limit settlement failed for task ${taskId}:`, err);
+  });
+}
+
+async function settleDeferredLimit(taskId: string, runId: string, signal: HarnessLimitSignal): Promise<void> {
+  // Something else (boot orphaning, a delete) already ended the run.
+  if (runs.get(runId)?.status !== "running") return;
+  const task = tasks.get(taskId);
+  if (task && task.runId === runId) {
+    try {
+      if (await handleHarnessLimitSettlement({ task, runId, signal }) === "handled") return;
+    } catch (err) {
+      console.warn(`[agetor] harness swap settlement failed for task ${taskId}:`, err);
+      if (tasks.get(taskId)?.harnessState?.pendingSwap?.runId === runId) patchTaskState(taskId, { pendingSwap: null });
+      swapCancelRequested.delete(taskId);
+      runs.update(runId, { status: "failed", endedAt: Date.now(), exitCode: -1 });
+      saveStatusLineQuietly(runId, taskId, `switching accounts failed: ${err instanceof Error ? err.message : String(err)}`);
+      dropScheduledSwitchAfterFailedLimitMove(taskId);
+      updateColumn(taskId, runId, "blocked", "harness-swap-failed");
+      recordBlockedHistory(taskId, runId, signal.reason, { ...signal, message: `the account switch failed: ${err instanceof Error ? err.message : String(err)}` });
+      emitGlobal({ kind: "run-status", taskId, runId, status: "failed", ts: Date.now(), reason: "harness-swap" });
+      return;
+    }
+  }
+  // No swap target (or the task moved on): the normal failed settle.
+  runs.update(runId, { status: "failed", endedAt: Date.now(), exitCode: -1 });
+  const current = tasks.get(taskId);
+  const isTerminalRun = !!current && current.runId === runId;
+  if (isTerminalRun) updateColumn(taskId, runId, "ready");
+  saveStatusLineQuietly(runId, taskId, "exit:-1");
+  if (isTerminalRun) {
+    emitGlobal({ kind: "run-status", taskId, runId, status: "failed", ts: Date.now() });
+  } else {
+    reportDisplacedStepRunSettled(current, taskId, runId, "failed");
+  }
+  await settleScheduledSwitchAtTurnEnd(taskId, runId, "failed", false);
+  await drainFollowUpQueues(taskId, runId, false);
+  await settleHarnessStateAndFollowUps(taskId, runId, "failed", false);
 }
 
 /**
@@ -4134,27 +4911,42 @@ function noteMidTurnFollowUp(runId: string, text: string): void {
 
 /**
  * The mid-turn follow-ups of `runId` that never reached the transcript: a
- * delivered one has two main-stream user rows (the optimistic live echo and
- * claude's JSONL twin, which `composeCleanRetryText` canonicalizes to the
- * same text), an undelivered one only the echo.
+ * delivered one is paired by claude's JSONL twin row (`twin: true`) with its
+ * live echo, an undelivered one has only the echo. Pairing is by multiset per
+ * canonical text, as `cleanRetryParts` does: the echoes that are not
+ * follow-ups (the run's own prompt) take their twins first, and the twins left
+ * over mark the oldest noted follow-ups of that text as delivered, so two
+ * identical unread sends are never counted as one delivered pair.
  */
 function undeliveredMidTurnFollowUps(runId: string): string[] {
   const noted = midTurnFollowUps.get(runId);
   if (!noted || noted.length === 0) return [];
-  const counts = new Map<string, number>();
-  for (const raw of runs.mainUserTexts(runId)) {
-    const key = composeCleanRetryText([raw]);
-    if (key !== null) counts.set(key, (counts.get(key) ?? 0) + 1);
+  const echoes = new Map<string, number>();
+  const twins = new Map<string, number>();
+  for (const row of runs.mainUserRows(runId)) {
+    const key = composeCleanRetryText([row.data]);
+    if (key === null) continue;
+    const m = row.twin ? twins : echoes;
+    m.set(key, (m.get(key) ?? 0) + 1);
+  }
+  const notedCounts = new Map<string, number>();
+  for (const text of noted) {
+    const key = composeCleanRetryText([text]);
+    if (key !== null) notedCounts.set(key, (notedCounts.get(key) ?? 0) + 1);
+  }
+  // Delivered follow-ups per text still to be consumed, oldest first.
+  const delivered = new Map<string, number>();
+  for (const [key, n] of notedCounts) {
+    const otherEchoes = Math.max(0, (echoes.get(key) ?? 0) - n);
+    delivered.set(key, Math.min(n, Math.max(0, (twins.get(key) ?? 0) - otherEchoes)));
   }
   const out: string[] = [];
   for (const text of noted) {
     const key = composeCleanRetryText([text]);
     if (key === null) continue;
-    const seen = counts.get(key) ?? 0;
-    if (seen >= 2) {
-      // Delivered: consume one echo/twin pair so a second identical follow-up
-      // is judged on its own rows.
-      counts.set(key, seen - 2);
+    const left = delivered.get(key) ?? 0;
+    if (left > 0) {
+      delivered.set(key, left - 1);
       continue;
     }
     // A hidden clean-retry remainder (N2) carries the user's own words inside
@@ -4178,8 +4970,7 @@ function stashUndeliveredMidTurnFollowUps(taskId: string, runId: string): void {
   midTurnFollowUps.delete(runId);
   if (texts.length === 0) return;
   // `backlog.add` PREPENDS: restash newest first so the tray reads in send order.
-  let saved = 0;
-  for (const text of [...texts].reverse()) if (restashPasteWithheldText(taskId, text)) saved++;
+  const saved = stashFollowUpBatch(taskId, [...texts].reverse());
   if (saved === 0) return;
   saveStatusLineQuietly(
     runId,
@@ -4337,13 +5128,21 @@ async function handleHarnessLimitSettlement(args: {
   const { task, runId, signal } = args;
   const taskId = task.id;
   if (startingTaskIds.has(taskId)) {
-    // Another start already owns the next turn. Never leave this run row
-    // `running` forever: record the limit failure and let the claim holder
-    // own the task's continuation.
-    runs.update(runId, { status: "failed", endedAt: Date.now(), exitCode: -1 });
-    saveStatusLineQuietly(runId, taskId, `account limit reached while another turn was starting (${signal.reason})`);
-    emitGlobal({ kind: "run-status", taskId, runId, status: "failed", ts: Date.now(), reason: "harness-swap" });
-    return "handled";
+    if (swapWindowTaskIds.has(taskId) || bootSwapClaims.has(taskId)) {
+      // The claim is this task's own swap window or boot swap claim: a
+      // successor limited while its held follow-ups were still being
+      // delivered (or the boot reconcile owns the task). The limit is settled
+      // as soon as the claim is released (`runDeferredLimitSettlement`), so
+      // the run is never failed with its column undecided and no second
+      // successor is minted next to the one this window is finishing.
+      deferredLimitSettlements.set(taskId, { runId, signal });
+      saveStatusLineQuietly(runId, taskId, `account limit reached (${limitReasonText(signal.reason)}) — switching once the current switch settles`);
+      return "handled";
+    }
+    // A manual start or an account switch holds the claim: it owns the next
+    // turn, so this run takes the normal failed settle (status, column,
+    // follow-up drain) like a lone account's limit.
+    return "passthrough";
   }
   startingTaskIds.add(taskId);
   swapWindowTaskIds.add(taskId);
@@ -4352,20 +5151,24 @@ async function handleHarnessLimitSettlement(args: {
     outcome = await settleHarnessLimitInClaim(task, runId, signal);
     return outcome;
   } finally {
-    swapWindowTaskIds.delete(taskId);
-    // A Stop recorded in this window but never consumed (the settlement ended
-    // on a path that does not spawn, e.g. an archived deletion) must not leak
-    // into a later, unrelated swap.
-    swapCancelRequested.delete(taskId);
-    releaseStartingClaim(taskId);
-    // A passthrough hands the held messages to the normal settle's drain;
-    // every handled ending without a live successor stashes them now (M6).
-    // Mid-turn follow-ups Claude never read go to the tray too unless the
-    // successor carried them (it then already forgot them) — R-S12. They
-    // were typed before the held ones, so they are stashed first.
-    if (outcome === "handled") {
-      stashUndeliveredMidTurnFollowUps(taskId, runId);
-      stashHeldFollowUpsUnlessLive(taskId);
+    try {
+      swapWindowTaskIds.delete(taskId);
+      // A Stop recorded in this window but never consumed (the settlement ended
+      // on a path that does not spawn, e.g. an archived deletion) must not leak
+      // into a later, unrelated swap. A successor's limit deferred behind this
+      // window consumes the Stop itself.
+      if (!deferredLimitSettlements.has(taskId)) swapCancelRequested.delete(taskId);
+      releaseStartingClaim(taskId);
+      // A passthrough hands the held messages to the normal settle's drain;
+      // every handled ending without a live successor stashes them now (M6).
+      // Mid-turn follow-ups Claude never read go to the tray too unless the
+      // successor carried them (it then already forgot them) — R-S12.
+      if (outcome === "handled") {
+        stashHeldFollowUpsUnlessLive(taskId);
+        stashUndeliveredMidTurnFollowUps(taskId, runId);
+      }
+    } finally {
+      runDeferredLimitSettlement(taskId);
     }
   }
 }
@@ -4445,6 +5248,10 @@ async function settleHarnessLimitInClaim(
   recordTried(taskId, current);
   harnessStacks.setLimitState(current, signal);
   saveStatusLineQuietly(runId, taskId, `account limit reached: ${signal.reason} — switching`);
+  // The turn ended in a provider limit: failover moves (or blocks) the task
+  // anyway, so a requested "switch to next account" is consumed here, without
+  // a second move.
+  if (fetched.harnessState?.scheduledSwitch) patchTaskState(taskId, { scheduledSwitch: null });
 
   // The limit notice leaves Claude's REPL paused and the codex turn is over;
   // drop the session either way. Cards for this run can never be answered.
@@ -4481,7 +5288,7 @@ async function settleHarnessLimitInClaim(
   if (plan.kind === "next") {
     const toHarness = resolveHarness(plan.member.harnessId);
     if (!toHarness) {
-      await blockStackTask(taskId, runId, "harness-swap-failed", "the backup account no longer exists");
+      await blockStackTask(taskId, runId, "harness-swap-failed", "the backup account no longer exists", signal);
       return "handled";
     }
     await executeStackSwap({
@@ -4525,9 +5332,23 @@ async function settleHarnessLimitInClaim(
   // cap is three retry runs, not two. A settlement of a run that was
   // itself a retry (or a swap successor inside one — the marker is carried
   // through the next-member branch) does increment.
+  // A first turn on this account with no tool call is replayed by the retry as
+  // a clean restart: the run it replays is persisted so a retry that ends
+  // without running can still hand the follow-ups after the original prompt
+  // back (`allExhausted.cleanRetryOf`).
+  const cleanRetry = !conversationToPreserve(taskId, runId, current, harnessSessionColumnFor(fromKind ?? "claude-code") ?? "claude_session_id");
   const persisted = planExhausted(taskId, plan, Date.now(), {
     startedThisAttempt: priorExhausted != null,
+    // Chain to the ORIGINAL run (a retry that limited again): its rows are
+    // tagged, while a successor holds the whole request as one wrapper row.
+    cleanRetryOf: cleanRetry ? (priorExhausted?.cleanRetryOf ?? runId) : null,
   });
+  recordBlockedHistory(
+    taskId,
+    runId,
+    persisted?.allExhausted?.reason ?? (plan.kind === "all-exhausted" ? signal.reason : "no-usable-member"),
+    signal,
+  );
   if (persisted?.allExhausted) {
     const ex = persisted.allExhausted;
     // Only claim a scheduled retry when a timer was actually armed. A
@@ -4548,16 +5369,14 @@ async function settleHarnessLimitInClaim(
   // hold them, and no retry at all leaves them nowhere. Only the first case
   // may skip the tray (the settlement's `finally` stashes the rest, R-S12).
   const retryArmed = (persisted?.allExhausted?.nextAttemptAt ?? 0) > 0;
-  const retryCarriesThem = retryArmed
-    && fromKind === "claude-code"
-    && !conversationToPreserve(taskId, runId, current, harnessSessionColumnFor(fromKind) ?? "claude_session_id");
+  const retryCarriesThem = retryArmed && fromKind === "claude-code" && cleanRetry;
   if (retryCarriesThem) midTurnFollowUps.delete(runId);
   // Messages typed during the swap are put back in the tray now, timer or
   // not: a retry can be hours away and the in-memory hold would die with the
   // process while the sender was told `delivered` (review M6). They then run
-  // as normal messages once the user acts.
-  stashUndeliveredMidTurnFollowUps(taskId, runId);
-  stashSwapFollowUps(taskId);
+  // as normal messages once the user acts. Follow-ups a clean retry replays
+  // are covered by `cleanRetryOf` if it never runs.
+  stashFollowUpsWithoutSuccessor(taskId, runId, runId);
   return "handled";
 }
 
@@ -4580,9 +5399,10 @@ function abortSwapForUserStop(taskId: string, runId: string): void {
   swapCancelRequested.delete(taskId);
   runs.update(runId, { status: "cancelled", endedAt: Date.now(), exitCode: -1 });
   saveStatusLineQuietly(runId, taskId, "cancelled by user during the account switch");
+  endCleanRetry(taskId, () => stashFollowUpsWithoutSuccessor(taskId, runId));
   patchTaskState(taskId, { pendingSwap: null, allExhausted: null });
+  dropScheduledSwitch(taskId, "scheduled account switch cancelled (stopped)");
   cancelAutoRetry(taskId);
-  stashSwapFollowUps(taskId);
   if (tasks.get(taskId)?.runId === runId) updateColumn(taskId, runId, "ready");
   emitGlobal({ kind: "run-status", taskId, runId, status: "cancelled", ts: Date.now() });
 }
@@ -4598,7 +5418,7 @@ function leaveSwapForNextOwner(taskId: string, runId: string): void {
   runs.update(runId, { status: "failed", endedAt: Date.now(), exitCode: -1 });
   saveStatusLineQuietly(runId, taskId, "the account switch will finish after the restart");
   emitGlobal({ kind: "run-status", taskId, runId, status: "failed", ts: Date.now(), reason: "harness-swap" });
-  stashSwapFollowUps(taskId);
+  stashFollowUpsWithoutSuccessor(taskId, runId);
 }
 
 type AllExhaustedState = NonNullable<TaskHarnessState["allExhausted"]>;
@@ -4623,6 +5443,8 @@ async function executeStackSwap(args: {
   signal: HarnessLimitSignal;
   /** The retry marker the limited run carried, if it was a retry attempt. */
   priorExhausted: AllExhaustedState | null;
+  /** Why the swap runs: a live limit, or the boot completion of one. */
+  trigger?: "limit" | "boot-resume";
 }): Promise<void> {
   const { taskId, runId, task: fetched, stack, current, fromHarness, toHarness, member, signal } = args;
   const fromLabel = fromHarness?.label ?? current;
@@ -4645,6 +5467,9 @@ async function executeStackSwap(args: {
     pendingSwap,
     allExhausted: carried,
     lastMove: null,
+    // A request scheduled before this state write must survive it; it is
+    // consumed by the limit settle (or the successor's turn end), never lost.
+    ...(state?.scheduledSwitch ? { scheduledSwitch: state.scheduledSwitch } : {}),
   });
 
   // Persist the intent before the mirror/transfer awaits (the first
@@ -4701,7 +5526,7 @@ async function executeStackSwap(args: {
   if (moved.kind === "transfer-failed") {
     // The account has a recorded conversation, so "no-session" (the file is
     // gone) is not nothing-to-lose: never silently start fresh on the backup.
-    await blockStackTask(taskId, runId, "harness-swap-failed", `could not move the conversation to ${toLabel}: ${moved.message}`);
+    await blockStackTask(taskId, runId, "harness-swap-failed", `could not move the conversation to ${toLabel}: ${moved.message}`, signal);
     return;
   }
   if (moved.kind === "aborted") {
@@ -4715,7 +5540,7 @@ async function executeStackSwap(args: {
     }
     runs.update(runId, { status: "failed", endedAt: Date.now(), exitCode: -1 });
     saveStatusLineQuietly(runId, taskId, "the account switch was cancelled before it started");
-    stashSwapFollowUps(taskId);
+    stashFollowUpsWithoutSuccessor(taskId, runId);
     // The archive/delete may have landed before our own `pendingSwap` write,
     // so this settlement owns clearing it or boot reconcile would later
     // resurrect the swap.
@@ -4732,7 +5557,7 @@ async function executeStackSwap(args: {
   saveStatusLineQuietly(runId, taskId, `switched from ${fromLabel} to ${toLabel}`);
   emitGlobal({ kind: "run-status", taskId, runId, status: "failed", ts: Date.now(), reason: "harness-swap" });
 
-  const cleanRetryParts = cleanRetryPartsOf(runs.mainUserTexts(runId), {
+  const cleanRetryParts = cleanRetryPartsFromRows(runs.mainUserRows(runId), {
     // Codex queues a follow-up typed during a live turn as its own later
     // run; only Claude folds it into this one. Replaying a queued Codex
     // row here would duplicate it.
@@ -4754,6 +5579,7 @@ async function executeStackSwap(args: {
     hasToolUse,
     cleanRetryText,
     cleanRetryParts,
+    historyTrigger: args.trigger ?? "limit",
     // Follow-ups Claude never wrote to the copied transcript (review S16).
     undelivered: hasToolUse && fromKind === "claude-code" ? undeliveredMidTurnFollowUps(runId) : [],
     position: member.position + 1,
@@ -4768,6 +5594,7 @@ async function executeStackSwap(args: {
     // The carried retry marker has no retry behind it here (only the
     // all-exhausted handler re-arms after a failed spawn): the blocked card
     // is a manual fix, not "Retrying…" with no timer.
+    endCleanRetry(taskId);
     patchTaskState(taskId, { allExhausted: null });
     cancelAutoRetry(taskId);
   }
@@ -4805,9 +5632,16 @@ async function blockStackTask(
   runId: string,
   reason: "harness-swap-failed" | "harness-exhausted",
   message: string,
+  /** The limit that triggered the move, when one did. A failed move after a
+   *  limit is recorded with that limit's reason and source; only a block with
+   *  no limit behind it reads `no-usable-member`. */
+  limit: HarnessLimitSignal | null = null,
 ): Promise<void> {
   runs.update(runId, { status: "failed", endedAt: Date.now(), exitCode: -1 });
   saveStatusLineQuietly(runId, taskId, message);
+  // The retry this block ends will never run: its follow-ups go back to the
+  // tray together with everything queued or held.
+  endCleanRetry(taskId, () => stashFollowUpsWithoutSuccessor(taskId, runId || null));
   // A hard block is a manual intervention: clear the retry marker entirely.
   // Keeping `allExhausted` with `nextAttemptAt: 0` made RunPanel, StackBadge
   // and `agetor show` claim "Retrying…" with no timer armed — the blocked
@@ -4818,7 +5652,11 @@ async function blockStackTask(
   // window must not leak into a later, unrelated swap (the retry path has no
   // `handleHarnessLimitSettlement` finally to clear it).
   swapCancelRequested.delete(taskId);
-  stashSwapFollowUps(taskId);
+  if (limit) {
+    recordBlockedHistory(taskId, runId || null, limit.reason, { ...limit, message: `the account switch failed: ${message}` });
+  } else {
+    recordBlockedHistory(taskId, runId || null, "no-usable-member", null);
+  }
   emitGlobal({ kind: "run-status", taskId, runId, status: "failed", ts: Date.now(), reason: "harness-swap" });
   updateColumn(taskId, runId, "blocked", reason);
 }
@@ -4851,7 +5689,7 @@ async function spawnSwapContinuation(args: {
   hasToolUse: boolean;
   cleanRetryText: string;
   /** The clean-retry text's separate user messages, in send order
-   *  ({@link cleanRetryPartsOf}); `cleanRetryText` is their join (or the task
+   *  (`cleanRetryParts` over the run's `mainUserRows`); `cleanRetryText` is their join (or the task
    *  prompt when there are none). Lets a leading slash command go out alone
    *  (review N2). */
   cleanRetryParts?: readonly string[];
@@ -4862,6 +5700,9 @@ async function spawnSwapContinuation(args: {
   notes?: readonly string[];
   /** A retry on the SAME account after its reset: no "Switched to" notice. */
   sameAccount?: boolean;
+  /** What caused this move, for the stack's swap history (one row, written
+   *  here where both run ids are known). */
+  historyTrigger: "limit" | "retry" | "boot-resume";
   /** Transfer branch only: follow-ups typed into the limited turn that never
    *  reached the copied transcript, appended to the hidden prompt. */
   undelivered?: readonly string[];
@@ -4869,7 +5710,7 @@ async function spawnSwapContinuation(args: {
   const { taskId, from, fromLabel, to, toLabel, signal } = args;
   const harness = resolveHarness(to);
   if (!harness) {
-    await blockStackTask(taskId, args.oldRunId, "harness-swap-failed", `${toLabel} no longer exists`);
+    await blockStackTask(taskId, args.oldRunId, "harness-swap-failed", `${toLabel} no longer exists`, signal);
     return "failed";
   }
   // See `harnessSwapSpawnHook`: before the run row exists, so a throw here is
@@ -4936,6 +5777,25 @@ async function spawnSwapContinuation(args: {
   if (retryMarker) {
     patchTaskState(taskId, { allExhausted: { ...retryMarker, inFlight: true, attemptRunId: newRunId } });
   }
+  // The move committed and its successor run exists: one history row, with both
+  // run ids. (`moveTaskToMember` was called without `history` for these moves.)
+  {
+    const moved = tasks.get(taskId);
+    const stackId = moved ? historyStackIdOf(moved, to) : null;
+    if (moved && stackId) {
+      recordHarnessSwapEvent({
+        task: moved,
+        stackId,
+        trigger: args.historyTrigger,
+        fromHarnessId: from,
+        toHarnessId: to,
+        signal,
+        fromRunId: args.oldRunId || null,
+        toRunId: newRunId,
+        continuation: args.hasToolUse ? "transferred" : "restarted",
+      });
+    }
+  }
   // A Stop recorded against the swap claim before this run existed becomes a
   // run-level pending cancel (`pendingCancelRunIds`), consumed below.
   const stoppedDuringClaim = adoptPendingTaskCancel(taskId, newRunId);
@@ -4953,6 +5813,9 @@ async function spawnSwapContinuation(args: {
     else if (kind === "codex") await dropCodexSession(taskId);
     runs.update(newRunId, { status: "cancelled", endedAt: Date.now(), exitCode: -1 });
     saveStatusLineQuietly(newRunId, taskId, statusLine);
+    // The successor never ran: the retry's follow-ups and everything queued or
+    // held for it go back to the tray.
+    endCleanRetry(taskId, () => stashFollowUpsWithoutSuccessor(taskId, newRunId));
     patchTaskState(taskId, { pendingSwap: null, allExhausted: null });
     cancelAutoRetry(taskId);
     if (tasks.get(taskId)?.runId === newRunId) updateColumn(taskId, newRunId, "ready");
@@ -5066,7 +5929,7 @@ async function spawnSwapContinuation(args: {
     emitGlobal({ kind: "run-status", taskId, runId: newRunId, status: "failed", ts: Date.now(), reason: "harness-swap" });
     // Nothing will run these now, and the successor never registered; put
     // them back in the tray instead of leaving them in memory.
-    stashSwapFollowUps(taskId);
+    stashFollowUpsWithoutSuccessor(taskId, newRunId);
     return "failed";
   }
   // Stop landed while the spawn was in flight: `cancelRun` records it either
@@ -5087,6 +5950,11 @@ async function spawnSwapContinuation(args: {
     if (kind === "claude-code") await dropSession(taskId);
     else if (kind === "codex") await dropCodexSession(taskId);
     runs.update(newRunId, { status: "cancelled", endedAt: Date.now(), exitCode: -1 });
+    // A replacement run that is live owns the queues; otherwise nothing will
+    // drain what was queued or held for this successor.
+    if (!fresh || fresh.archivedAt != null || !fresh.runId || !active.has(fresh.runId)) {
+      stashFollowUpsWithoutSuccessor(taskId, newRunId);
+    }
     if (fresh && fresh.runId === newRunId) {
       saveStatusLineQuietly(
         newRunId,
@@ -5109,25 +5977,6 @@ async function spawnSwapContinuation(args: {
   // the ordinary mid-turn path, not when its whole turn settles (R-S13).
   await deliverHeldFollowUpsToSuccessor(taskId, newRunId);
   return "started";
-}
-
-/**
- * The separate user messages a clean retry re-sends, in send order: each
- * persisted main-stream user text canonicalized exactly as
- * {@link composeCleanRetryText} does (wrapper stripped, deduped, blanks
- * dropped), so `parts.join("\n\n")` equals `composeCleanRetryText(raws, opts)`.
- */
-function cleanRetryPartsOf(raws: readonly string[], opts: { firstOnly?: boolean } = {}): string[] {
-  const parts: string[] = [];
-  const seen = new Set<string>();
-  for (const raw of raws) {
-    const part = composeCleanRetryText([raw]);
-    if (part === null || seen.has(part)) continue;
-    seen.add(part);
-    parts.push(part);
-    if (opts.firstOnly) break;
-  }
-  return parts;
 }
 
 function attachDoneHandler(
@@ -5155,6 +6004,7 @@ function attachDoneHandler(
       const wasSessionDied = handle?.sessionDied ?? false;
       const wasUnknownCommand = handle?.unknownCommand ?? false;
       active.delete(runId);
+      settlingTurnRuns.set(runId, taskId);
       // First thing, so nothing below can leave a settled server turn counted as busy.
       const wasOpencodeServerRun = forgetOpencodeServerTurn(runId);
       // Nothing can arrive for a run that's no longer running — drop its
@@ -5173,6 +6023,12 @@ function attachDoneHandler(
       // fail the run or swap the task (review M1). The cooldown the chunk
       // handler may have recorded is cleared by the successful settle below.
       const limitSignal = limitSignalForSettle(runHarnessKind(runId), code, handle?.limitHit ?? null);
+      if (handle?.limitHit && !limitSignal && handle.limitRecorded) {
+        // The turn completed, so the signal its own chunk handler recorded was
+        // not a limit (a retried 429 inside a successful turn): take back that
+        // exact row, never one another task wrote or overwrote meanwhile.
+        clearOwnLimitState(handle.limitRecorded);
+      }
       let limitFailed = false;
       if (limitSignal && !wasCancelled) {
         // Test seam: a limit observed on the current run, before any swap
@@ -5203,7 +6059,9 @@ function attachDoneHandler(
             swapCancelRequested.delete(taskId);
             runs.update(runId, { status: "failed", endedAt: Date.now(), exitCode: -1 });
             saveStatusLineQuietly(runId, taskId, `switching accounts failed: ${message}`);
+            dropScheduledSwitchAfterFailedLimitMove(taskId);
             updateColumn(taskId, runId, "blocked", "harness-swap-failed");
+            recordBlockedHistory(taskId, runId, limitSignal.reason, { ...limitSignal, message: `the account switch failed: ${message}` });
             emitGlobal({ kind: "run-status", taskId, runId, status: "failed", ts: Date.now(), reason: "harness-swap" });
             return;
           }
@@ -5274,6 +6132,7 @@ function attachDoneHandler(
         // misleading breadcrumb. Pumping here reads the launch line that is
         // already on disk and makes the hold decision deterministic.
         try {
+          turnSettlePumpHook?.(taskId, runId);
           pumpWatcherForHoldCheck(taskId);
         } catch {
           // Belt-and-braces: the callee already swallows its own errors, but a
@@ -5316,6 +6175,10 @@ function attachDoneHandler(
       // row once it drains, and `recordFxPause` needs to see the queue as it
       // stands right now to decide whether to skip scheduling.
       noteFxRunSettled(task, runId, newStatus);
+      // A requested "switch to next account" runs BEFORE the queued follow-ups
+      // drain, so they start on the new account.
+      await settleScheduledSwitchAtTurnEnd(taskId, runId, newStatus, wasCancelled);
+      scheduledSwitchTestHooks.turnDrain?.(taskId, runId);
       await drainFollowUpQueues(taskId, runId, wasCancelled);
       await settleHarnessStateAndFollowUps(taskId, runId, newStatus, wasCancelled);
       if (wasOpencodeServerRun) retryDeferredOpencodeWake(taskId);
@@ -5326,6 +6189,7 @@ function attachDoneHandler(
       const wasSessionDied = handle?.sessionDied ?? false;
       const wasUnknownCommand = handle?.unknownCommand ?? false;
       active.delete(runId);
+      settlingTurnRuns.set(runId, taskId);
       const wasOpencodeServerRun = forgetOpencodeServerTurn(runId);
       pendingSentFilesByRun.delete(runId);
       // A driver that rejects after emitting a limit signal still has a stack
@@ -5353,7 +6217,9 @@ function attachDoneHandler(
             swapCancelRequested.delete(taskId);
             runs.update(runId, { status: "failed", endedAt: Date.now(), exitCode: -1 });
             saveStatusLineQuietly(runId, taskId, `switching accounts failed: ${message}`);
+            dropScheduledSwitchAfterFailedLimitMove(taskId);
             updateColumn(taskId, runId, "blocked", "harness-swap-failed");
+            recordBlockedHistory(taskId, runId, limitSignal.reason, { ...limitSignal, message: `the account switch failed: ${message}` });
             emitGlobal({ kind: "run-status", taskId, runId, status: "failed", ts: Date.now(), reason: "harness-swap" });
             return;
           }
@@ -5385,10 +6251,49 @@ function attachDoneHandler(
       // fx-only settlement hook — see the matching call/comment in the
       // `.then` branch above.
       noteFxRunSettled(task, runId, newStatus);
+      // A requested "switch to next account" runs BEFORE the queued follow-ups
+      // drain, so they start on the new account.
+      await settleScheduledSwitchAtTurnEnd(taskId, runId, newStatus, wasCancelled);
+      scheduledSwitchTestHooks.turnDrain?.(taskId, runId);
       await drainFollowUpQueues(taskId, runId, wasCancelled);
       await settleHarnessStateAndFollowUps(taskId, runId, newStatus, wasCancelled);
       if (wasOpencodeServerRun) retryDeferredOpencodeWake(taskId);
-    });
+    })
+    .finally(() => endTurnSettle(runId, taskId));
+}
+
+/**
+ * Runs whose done handler is settling (`runId` -> `taskId`): from the moment
+ * the run leaves `active` until its whole settle chain (turn-end switch,
+ * follow-up drain, harness-state settle) is over. Between those points the
+ * task has no live run and no claim, yet the settle path still owns it: a
+ * scheduled switch applied from another edge then (the last background agent
+ * settling inside `pumpWatcherForHoldCheck`, or during any await of the
+ * chain) would take the account-switch claim without `behindQueue`, the
+ * turn-end call would fail to claim, and the queue would drain under the held
+ * claim with the held messages ahead of the turn's own follow-ups. So
+ * {@link accountSwitchMustWait} counts a settling turn, and the turn-end path
+ * is the one that applies it.
+ */
+const settlingTurnRuns = new Map<string, string>();
+
+function isTurnSettling(taskId: string): boolean {
+  for (const settling of settlingTurnRuns.values()) if (settling === taskId) return true;
+  return false;
+}
+
+/** End of a done handler's settle chain: a scheduled switch that became
+ *  applicable meanwhile (its background agents finished after the turn end
+ *  deferred it) and that every edge skipped while the turn was settling is
+ *  applied now. */
+function endTurnSettle(runId: string, taskId: string): void {
+  settlingTurnRuns.delete(runId);
+  if (isTurnSettling(taskId)) return;
+  try {
+    if (tasks.get(taskId)?.harnessState?.scheduledSwitch) settleWaitingScheduledSwitch(taskId);
+  } catch (err) {
+    console.warn(`[agetor] settling a waiting account switch for ${taskId} failed:`, err);
+  }
 }
 
 /**
@@ -5404,15 +6309,26 @@ async function settleHarnessStateAndFollowUps(
 ): Promise<void> {
   const task = tasks.get(taskId);
   // A successful turn is proof the account is serving again, even when the
-  // task is not (or no longer) in a stack.
+  // task is not (or no longer) in a stack. It clears only what was recorded
+  // before the turn started (a limit another task recorded while this turn ran
+  // is newer evidence), for the account-wide row and the model the turn ran.
   if (status === "succeeded") {
-    harnessStacks.clearLimitState(harnessLineFor(taskId, runId));
+    const run = runs.get(runId);
+    if (run) {
+      harnessStacks.clearLimitState(harnessLineFor(taskId, runId), {
+        startedAtMs: run.startedAt,
+        model: cooldownModelFor({ model: task?.model ?? null }, run.agent),
+      });
+    }
   }
   // The run is over: its mid-turn follow-up bookkeeping (S16) has no reader.
   midTurnFollowUps.delete(runId);
   if (task?.harnessState) {
     const exhausted = task.harnessState.allExhausted;
     if (status === "succeeded" || wasCancelled) {
+      // A clean retry still armed (not running) ends here: hand its
+      // follow-ups back before `resetLap` drops the marker.
+      endCleanRetry(taskId);
       // `resetLap` also ends the all-exhausted loop (attempts included).
       resetLap(taskId);
       cancelAutoRetry(taskId);
@@ -5450,12 +6366,15 @@ async function drainFollowUpQueues(
     // This process is exiting (`freezeLaunches`): a drained turn would be cut
     // off, and an undrained queue dies with the process — keep the text.
     fxPendingSteers.delete(runId);
+    // The tray prepends: the newer held messages go in first.
+    await drainHeldBehindQueue(taskId, true);
     stashQueuedFollowUps(taskId, runId, "Agetor stopped before it could run");
     return;
   }
   if (wasCancelled && isPipelineStepTaskId(taskId)) {
     // Dropped steers were re-queued in send order before `done` resolved.
     fxPendingSteers.delete(runId);
+    await drainHeldBehindQueue(taskId, true);
     stashQueuedFollowUpsOfStoppedStep(taskId, runId);
     return;
   }
@@ -5469,6 +6388,9 @@ async function drainFollowUpQueues(
   // `done` resolved) or absorbed — forget the bookkeeping.
   fxPendingSteers.delete(runId);
   await drainFxQueue(taskId);
+  // The messages held during a turn-end account move come last: they are newer
+  // than everything the turn had queued.
+  await drainHeldBehindQueue(taskId, false);
 }
 
 function isPipelineStepTaskId(taskId: string): boolean {
@@ -5525,9 +6447,8 @@ function stashQueuedFollowUpsOfStoppedStep(taskId: string, runId: string): void 
 function stashQueuedFollowUps(taskId: string, runId: string | null, why: string, tail = ""): void {
   const lines = takeQueuedFollowUps(taskId);
   if (lines.length === 0) return;
-  let saved = false;
   // `backlog.add` PREPENDS, so restash newest first (see `drainCodexQueue`).
-  for (const text of [...lines].reverse()) saved = restashPasteWithheldText(taskId, text) || saved;
+  const saved = stashFollowUpBatch(taskId, [...lines].reverse()) > 0;
   if (!saved || runId === null) return;
   const what = lines.length === 1 ? "queued message not sent" : `${lines.length} queued messages not sent`;
   const data = `${what} — ${why}; saved to your backlog, resend from the tray${tail ? ` ${tail}` : ""}`;
@@ -5594,7 +6515,16 @@ function dropQueuedFollowUpsAfterPendingCancel(taskId: string, runId: string): v
  *   • Anything else (codex, cursor, gemini; no live session): no-op — the
  *     change just persists for the next spawn.
  */
-export async function reconcileTaskSession(taskId: string, before: Task, after: Task): Promise<void> {
+export async function reconcileTaskSession(
+  taskId: string,
+  before: Task,
+  after: Task,
+  /** `switchNow`: this same-stack switch is the "Switch to next account"
+   *  action (`manual` = idle request, `scheduled` = applied at turn end), not a
+   *  picker/CLI edit: it records `lastMove.reason = "switch-now"` and the
+   *  matching history trigger. */
+  opts: { switchNow?: "manual" | "scheduled" } = {},
+): Promise<void> {
   const beforeKind = resolveHarness(before.agent)?.kind ?? null;
   const afterKind = resolveHarness(after.agent)?.kind ?? null;
   // Treat any harness id change as a session-killing event for claude — the
@@ -5608,7 +6538,7 @@ export async function reconcileTaskSession(taskId: string, before: Task, after: 
     const beforeStack = harnessStacks.getByMember(before.agent);
     const afterStack = harnessStacks.getByMember(after.agent);
     const sameStack = Boolean(beforeStack && afterStack && beforeStack.id === afterStack.id);
-    if (sameStack && isHeldByBackgroundAgents(taskId)) {
+    if (sameStack && backgroundAgentsHoldTask(taskId)) {
       // The REPL still hosts background agents: the switch would drop it and
       // abandon them mid-work (review N3). The PATCH route refuses this with a
       // 409 before writing; a direct caller that got here anyway is refused
@@ -5655,6 +6585,9 @@ export async function reconcileTaskSession(taskId: string, before: Task, after: 
         // already wrote `agent`; the move mirrors the destination's config
         // (contract C4) and copies the conversation.
         const position = sameStack.members.findIndex((m) => m.harnessId === after.agent);
+        // The move clears `allExhausted`: a clean retry that was still armed
+        // ends here without running, so its unread follow-ups go to the tray.
+        const armedCleanRetry = unrunCleanRetryOf(taskId);
         const moved = await moveTaskToMember({
           taskId,
           stack: sameStack,
@@ -5663,6 +6596,8 @@ export async function reconcileTaskSession(taskId: string, before: Task, after: 
           sessionId,
           cwd: after.worktreePath ?? after.workdir,
           writeAgent: false,
+          // One history row per move, recorded by the shared move itself.
+          history: { trigger: opts.switchNow ?? "manual", reason: "user" },
           state: () => ({
             stackId: sameStack.id,
             position: position < 0 ? 0 : position,
@@ -5670,11 +6605,18 @@ export async function reconcileTaskSession(taskId: string, before: Task, after: 
             tried: [],
             pendingSwap: null,
             allExhausted: null,
-            lastMove: { from: before.agent, to: after.agent, at: Date.now(), reason: "manual-switch" },
+            lastMove: { from: before.agent, to: after.agent, at: Date.now(), reason: opts.switchNow ? "switch-now" : "manual-switch" },
           }),
         });
         for (const warning of moved.warnings) saveStatusLineQuietly(statusRunId, taskId, warning);
         if (moved.kind === "moved") {
+          if (armedCleanRetry) stashCleanRetryFollowUps(taskId, armedCleanRetry);
+          // A Stop pressed while the conversation was copying: the move
+          // finished, but nothing queued for the task drains onto the new
+          // account (held messages are re-stashed when the claim is released).
+          if (switchStopRequested.has(taskId)) {
+            stashQueuedFollowUps(taskId, statusRunId, "stopped during the account switch");
+          }
           await dropSessionAfterAccountMove(taskId, before.agent);
           cancelAutoRetry(taskId);
           const toLabel = resolveHarness(after.agent)?.label ?? after.agent;
@@ -5690,6 +6632,25 @@ export async function reconcileTaskSession(taskId: string, before: Task, after: 
           taskId,
           `could not move the conversation to ${toLabel} (${moved.kind === "transfer-failed" ? moved.message : "cancelled"}) — starting fresh there`,
         );
+        // The account did change (the row was written first), so the move gets
+        // its history row; nothing was transferred.
+        const rowNow = tasks.get(taskId);
+        if (rowNow && rowNow.agent === after.agent) {
+          recordHarnessSwapEvent({
+            task: rowNow,
+            stackId: sameStack.id,
+            trigger: opts.switchNow ?? "manual",
+            fromHarnessId: before.agent,
+            toHarnessId: after.agent,
+            reason: "user",
+            continuation: "restarted",
+          });
+        }
+        // The reset below would delete the queued follow-ups of a
+        // switch-now (or stopped) move; they go to the tray instead.
+        if (opts.switchNow || switchStopRequested.has(taskId)) {
+          stashQueuedFollowUps(taskId, statusRunId, "the conversation could not be moved to the new account");
+        }
       }
       // Any queued codex/cursor/gemini/antigravity/opencode/copilot/fx follow-ups
       // belong to the old agent — drop them so a later drain doesn't spawn
@@ -5706,7 +6667,9 @@ export async function reconcileTaskSession(taskId: string, before: Task, after: 
       // account it was copied onto, so it never steers another account's
       // resume; the files go with task delete, archived-history retention
       // and harness delete.
+      const endedCleanRetry = unrunCleanRetryOf(taskId);
       clearFailoverState(taskId);
+      if (endedCleanRetry) stashCleanRetryFollowUps(taskId, endedCleanRetry);
       codexTurnQueue.delete(taskId);
       cursorTurnQueue.delete(taskId);
       geminiTurnQueue.delete(taskId);
@@ -6322,25 +7285,39 @@ export async function reconcilePendingHarnessSwaps(): Promise<number> {
     else swapWindowTaskIds.add(task.id);
     bootSwapClaims.add(task.id);
   }
+  let reconciled = 0;
   try {
-    return await reconcilePendingSwaps();
+    reconciled = await reconcilePendingSwaps();
   } catch (err) {
     console.warn("[agetor] reconciling pending harness swaps failed:", err);
-    return 0;
   } finally {
     // A task whose reconcile never ran (it was cleared meanwhile) keeps no
     // claim.
     for (const taskId of [...bootSwapClaims]) releaseBootSwapClaim(taskId);
   }
+  // A "switch to next account" requested during a turn that ended while the
+  // core was down is performed now, after the swaps (they own those tasks).
+  try {
+    await reconcileScheduledSwitchesAtBoot();
+  } catch (err) {
+    console.warn("[agetor] reconciling scheduled account switches failed:", err);
+  }
+  return reconciled;
 }
 
 function releaseBootSwapClaim(taskId: string): void {
   if (!bootSwapClaims.delete(taskId)) return;
-  accountSwitchTaskIds.delete(taskId);
-  swapWindowTaskIds.delete(taskId);
-  swapCancelRequested.delete(taskId);
-  releaseStartingClaim(taskId);
-  stashHeldFollowUpsUnlessLive(taskId);
+  try {
+    accountSwitchTaskIds.delete(taskId);
+    switchStopRequested.delete(taskId);
+    swapWindowTaskIds.delete(taskId);
+    if (!deferredLimitSettlements.has(taskId)) swapCancelRequested.delete(taskId);
+    releaseStartingClaim(taskId);
+    stashHeldFollowUpsUnlessLive(taskId);
+  } finally {
+    // A successor that limited while this claim was held settles now.
+    runDeferredLimitSettlement(taskId);
+  }
 }
 
 /**
@@ -6403,12 +7380,22 @@ async function reconcileHarnessSwapInClaim(task: Task, pending: PendingSwapState
     runs.update(pending.runId, { status: "failed", endedAt: Date.now(), exitCode: -1 });
   }
   const liveRunId = task.runId;
-  if (liveRunId && liveRunId === pending.runId) {
+  // No successor was minted when the task still points at the limited run, or
+  // (defensively, e.g. a run whose pointer an older orphan pass cleared) points
+  // at nothing and the limited run is the task's latest.
+  if (
+    (liveRunId && liveRunId === pending.runId)
+    || (!liveRunId && runs.latestForTask(taskId)?.id === pending.runId)
+  ) {
     await resumeInterruptedSwap(task, pending);
     return;
   }
-  if (liveRunId && active.has(liveRunId)) {
+  if (liveRunId && (active.has(liveRunId) || deferredLimitSettlements.get(taskId)?.runId === liveRunId)) {
     // The successor registered before the restart: let its done handler settle.
+    // One that already hit a limit while this claim was held has left `active`
+    // but is still owned: its deferred settlement swaps (or blocks) it as soon
+    // as the claim is released, so blocking it here first would write a
+    // blocked row and a "run the task" line the swap then contradicts.
     patchTaskState(taskId, { pendingSwap: null });
     return;
   }
@@ -6425,7 +7412,9 @@ async function reconcileHarnessSwapInClaim(task: Task, pending: PendingSwapState
 
 function blockInterruptedSwap(task: Task, pending: PendingSwapState, line: string): void {
   const taskId = task.id;
+  endCleanRetry(taskId);
   patchTaskState(taskId, { pendingSwap: null, allExhausted: null });
+  recordBlockedHistory(taskId, pending.runId, "no-usable-member", null);
   cancelAutoRetry(taskId);
   saveStatusLineQuietly(pending.runId, taskId, line);
   const column = tasks.get(taskId)?.column ?? task.column;
@@ -6461,23 +7450,39 @@ async function resumeInterruptedSwap(task: Task, pending: PendingSwapState): Pro
     return;
   }
   const fromHarness = resolveHarness(pending.from);
-  await executeStackSwap({
-    taskId,
-    runId: pending.runId,
-    task,
-    stack,
-    current: pending.from,
-    fromHarness,
-    toHarness,
-    member,
-    signal: {
-      reason: pending.reason,
-      resetAtMs: null,
-      message: "resuming the account switch after a restart",
-      source: (fromHarness ?? toHarness).kind === "codex" ? "codex-error" : "claude-api-error",
-    },
-    priorExhausted: task.harnessState?.allExhausted ?? null,
-  });
+  try {
+    await executeStackSwap({
+      taskId,
+      runId: pending.runId,
+      task,
+      stack,
+      current: pending.from,
+      fromHarness,
+      toHarness,
+      member,
+      signal: {
+        reason: pending.reason,
+        resetAtMs: null,
+        message: "resuming the account switch after a restart",
+        source: (fromHarness ?? toHarness).kind === "codex" ? "codex-error" : "claude-api-error",
+      },
+      priorExhausted: task.harnessState?.allExhausted ?? null,
+      trigger: "boot-resume",
+    });
+  } catch (err) {
+    // The mirror or transfer threw (EACCES, ENOSPC, …). The limited run is
+    // already failed and the column is still `running`: decide it now, or the
+    // card stays stuck and the persisted swap rethrows on every boot.
+    console.warn(`[agetor] resuming the account switch for ${taskId} failed:`, err);
+    if (tasks.get(taskId)?.runId === pending.runId) {
+      blockInterruptedSwap(
+        task,
+        pending,
+        `the account switch could not be finished after the restart (${err instanceof Error ? err.message : String(err)}) — run the task to continue`,
+      );
+      stashFollowUpsWithoutSuccessor(taskId, pending.runId, pending.runId);
+    }
+  }
 }
 
 /**
@@ -6492,26 +7497,45 @@ async function reconcileManualAccountSwitch(task: Task, pending: PendingSwapStat
   const clear = () => {
     if (tasks.get(taskId)?.harnessState?.pendingSwap?.manual) patchTaskState(taskId, { pendingSwap: null });
   };
+  // Once the row has left the source account (every branch after the first),
+  // a scheduled "switch to next account" the intent carried is consumed by
+  // this move (the final state write below omits it) or by its failure, and
+  // never re-applied by the scheduled-switch reconcile that runs next.
+  const clearWithScheduled = () => {
+    clear();
+    if (tasks.get(taskId)?.harnessState?.scheduledSwitch) patchTaskState(taskId, { scheduledSwitch: null });
+  };
   if (task.agent === pending.from) {
     // The row update never landed; the task is still on the source account.
+    // A scheduled switch is still recorded (`beginManualAccountSwitch` carries
+    // it, whichever move wrote the intent), and
+    // `reconcileScheduledSwitchesAtBoot` retries it right after, so the line
+    // says so whenever one is recorded.
     clear();
+    const stillScheduled = tasks.get(taskId)?.harnessState?.scheduledSwitch != null;
     saveStatusLineQuietly(
       pending.runId,
       taskId,
-      "the core restarted before the account switch started — run the task to switch",
+      pending.switchNow === "scheduled"
+        ? stillScheduled
+          ? "the core restarted before the scheduled account switch started — it stays scheduled"
+          : "the core restarted before the scheduled account switch started — switch again to move the task"
+        : stillScheduled
+          ? "the core restarted before the account switch started — the switch to the next account scheduled for this task stays scheduled"
+          : "the core restarted before the account switch started — run the task to switch",
     );
     return;
   }
   if (task.agent !== pending.to) {
     // Edited to a third account before the restart; this intent is stale.
-    clear();
+    clearWithScheduled();
     return;
   }
   const fromHarness = resolveHarness(pending.from);
   const toHarness = resolveHarness(pending.to);
   const stack = harnessStacks.getByMember(pending.to);
   if (!fromHarness || !toHarness || !stack) {
-    clear();
+    clearWithScheduled();
     return;
   }
   const column = harnessSessionColumnFor(fromHarness.kind);
@@ -6525,6 +7549,7 @@ async function reconcileManualAccountSwitch(task: Task, pending: PendingSwapStat
     sessionId,
     cwd: task.worktreePath ?? task.workdir,
     writeAgent: false,
+    history: { trigger: "boot-resume", reason: "user" },
     state: () => ({
       stackId: stack.id,
       position: position < 0 ? 0 : position,
@@ -6532,14 +7557,27 @@ async function reconcileManualAccountSwitch(task: Task, pending: PendingSwapStat
       tried: [],
       pendingSwap: null,
       allExhausted: null,
-      lastMove: { from: pending.from, to: pending.to, at: Date.now(), reason: "manual-switch" },
+      // A "Switch to next account" the restart interrupted keeps its label.
+      lastMove: { from: pending.from, to: pending.to, at: Date.now(), reason: pending.switchNow ? "switch-now" : "manual-switch" },
     }),
   });
   for (const warning of moved.warnings) saveStatusLineQuietly(pending.runId, taskId, warning);
   if (moved.kind !== "moved") {
     // The account changed but its conversation could not be copied. Surface
     // it exactly like the live fallback path does; never pretend continuity.
-    clear();
+    clearWithScheduled();
+    const rowNow = tasks.get(taskId);
+    if (rowNow) {
+      recordHarnessSwapEvent({
+        task: rowNow,
+        stackId: stack.id,
+        trigger: "boot-resume",
+        fromHarnessId: pending.from,
+        toHarnessId: pending.to,
+        reason: "user",
+        continuation: "restarted",
+      });
+    }
     saveStatusLineQuietly(
       pending.runId,
       taskId,
@@ -6595,10 +7633,11 @@ function recoverFailedHarnessAutoRetry(taskId: string): void {
   const attempts = Math.min(exhausted.attempts + 1, HARNESS_STACK_RETRY_MAX);
   patchTaskState(taskId, { allExhausted: { ...exhausted, attempts, inFlight: false, nextAttemptAt: 0 } });
   if (attempts >= HARNESS_STACK_RETRY_MAX) {
+    endCleanRetry(taskId);
     cancelAutoRetry(taskId);
     return;
   }
-  planExhausted(
+  planExhaustedTracked(
     taskId,
     {
       kind: "all-exhausted",
@@ -6637,14 +7676,19 @@ async function fireHarnessAutoRetry(taskId: string): Promise<void> {
     // A Stop recorded against this retry's window (`cancelRun` saw the swap
     // window) that nothing consumed must not outlive it: a later, unrelated
     // limit would read it as "cancelled by user" and skip its failover
-    // (review R-S14).
-    swapCancelRequested.delete(taskId);
+    // (review R-S14). A deferred limit settlement consumes its own.
+    if (!deferredLimitSettlements.has(taskId)) swapCancelRequested.delete(taskId);
     harnessRetriesInFlight.delete(taskId);
-    releaseStartingClaim(taskId);
-    // Messages typed during the retry window drain on a live successor;
-    // otherwise (re-armed, blocked, capped, stopped) they go to the tray now
-    // (review M6).
-    stashHeldFollowUpsUnlessLive(taskId);
+    try {
+      releaseStartingClaim(taskId);
+      // Messages typed during the retry window drain on a live successor;
+      // otherwise (re-armed, blocked, capped, stopped) they go to the tray now
+      // (review M6).
+      stashHeldFollowUpsUnlessLive(taskId);
+    } finally {
+      // A retry successor that limited while this window was open settles now.
+      runDeferredLimitSettlement(taskId);
+    }
   }
 }
 
@@ -6657,8 +7701,10 @@ async function fireHarnessAutoRetryInner(taskId: string): Promise<void> {
   const exhausted = task.harnessState?.allExhausted;
   if (!exhausted) return;
   if (exhausted.attempts >= HARNESS_STACK_RETRY_MAX) return;
-  if (runs.hasRunning(taskId) || isHeldByBackgroundAgents(taskId)) {
-    // A turn is live (an adopted continuation, a reattached run): never mint
+  if (runs.hasRunning(taskId) || backgroundAgentsHoldTask(taskId)) {
+    // A turn is live (an adopted continuation, a reattached run), or background
+    // agents (after a succeeded or a failed turn) still run in the REPL a
+    // retry on another account would drop: never mint
     // a second one, but do not consume the timer either — push it a short
     // backoff out so the countdown is still owned by a timer (review Q7). The
     // live run's own settle clears or re-plans the state.
@@ -6673,6 +7719,8 @@ async function fireHarnessAutoRetryInner(taskId: string): Promise<void> {
   }
   const resolved = harnessStacks.resolveForTask(task);
   if (!resolved) {
+    // The stack is gone: this retry will never run.
+    endCleanRetry(taskId);
     patchTaskState(taskId, { allExhausted: null });
     return;
   }
@@ -6680,12 +7728,12 @@ async function fireHarnessAutoRetryInner(taskId: string): Promise<void> {
   const now = Date.now();
   const plan = planRetryMember(task, { now });
   if (plan.kind !== "next") {
-    planExhausted(taskId, plan, now, { startedThisAttempt: false });
+    planExhaustedTracked(taskId, plan, now, { startedThisAttempt: false });
     return;
   }
   const toHarness = resolveHarness(plan.member.harnessId);
   if (!toHarness) {
-    planExhausted(taskId, { kind: "none-usable", reasons: [{ harnessId: plan.member.harnessId, reason: "account no longer exists" }], earliestResetAtMs: null, skipped: [] }, Date.now(), { startedThisAttempt: false });
+    planExhaustedTracked(taskId, { kind: "none-usable", reasons: [{ harnessId: plan.member.harnessId, reason: "account no longer exists" }], earliestResetAtMs: null, skipped: [] }, Date.now(), { startedThisAttempt: false });
     return;
   }
   const fromHarness = resolveHarness(current);
@@ -6754,6 +7802,7 @@ async function fireHarnessAutoRetryInner(taskId: string): Promise<void> {
       // interruption to re-arm, not a settle.
       allExhausted: { ...(state?.allExhausted ?? exhausted), inFlight: true, attemptRunId: undefined, nextAttemptAt: 0 },
       lastMove: null,
+      ...(state?.scheduledSwitch ? { scheduledSwitch: state.scheduledSwitch } : {}),
     }),
   });
   if (moved.kind === "transfer-failed") {
@@ -6765,6 +7814,14 @@ async function fireHarnessAutoRetryInner(taskId: string): Promise<void> {
       lastRun?.id ?? "",
       "harness-swap-failed",
       `could not move the conversation to ${toHarness.label}: ${moved.message}`,
+      exhausted.reason === "no-usable-member"
+        ? null
+        : {
+          reason: exhausted.reason,
+          resetAtMs: null,
+          message: "retrying after the quota reset",
+          source: toHarness.kind === "codex" ? "codex-error" : "claude-api-error",
+        },
     );
     return;
   }
@@ -6787,9 +7844,14 @@ async function fireHarnessAutoRetryInner(taskId: string): Promise<void> {
   const transferredSessionId = moved.transferredSessionId;
   // See the limit settlement: Codex's live-turn follow-ups are queued as
   // their own turns, so only the first user text belongs to this retry.
-  const retryParts = cleanRetryPartsOf(lastRun ? runs.mainUserTexts(lastRun.id) : [], {
-    firstOnly: fromKind !== "claude-code",
-  });
+  // After a failed retry spawn the latest run is the empty failed successor,
+  // so a marked clean retry rebuilds its parts from the chain of the ORIGINAL
+  // run instead (the follow-ups would be lost otherwise).
+  const retryParts = exhausted.cleanRetryOf
+    ? cleanRetryChainParts(taskId, exhausted.cleanRetryOf)
+    : cleanRetryPartsFromRows(lastRun ? runs.mainUserRows(lastRun.id) : [], {
+      firstOnly: fromKind !== "claude-code",
+    });
   const outcome = await spawnSwapContinuation({
     taskId,
     task: tasks.get(taskId) ?? task,
@@ -6812,6 +7874,7 @@ async function fireHarnessAutoRetryInner(taskId: string): Promise<void> {
     position: position + 1,
     count: stack.members.length,
     sameAccount,
+    historyTrigger: "retry",
   });
   const after = tasks.get(taskId)?.harnessState;
   if (!after) return;
@@ -6843,13 +7906,15 @@ async function fireHarnessAutoRetryInner(taskId: string): Promise<void> {
   // reaches the visible cap instead of retrying forever, then re-arm.
   const retryAttempts = after.allExhausted.attempts + 1;
   if (retryAttempts >= HARNESS_STACK_RETRY_MAX) {
+    // The cap ends the retry without running it: its follow-ups go to the tray.
+    endCleanRetry(taskId);
     patchTaskState(taskId, {
-      allExhausted: { ...after.allExhausted, attempts: HARNESS_STACK_RETRY_MAX, inFlight: false, nextAttemptAt: 0 },
+      allExhausted: { ...after.allExhausted, attempts: HARNESS_STACK_RETRY_MAX, inFlight: false, nextAttemptAt: 0, cleanRetryOf: undefined },
     });
     if (lastRun) saveStatusLineQuietly(lastRun.id, taskId, formatStackExhausted({ nextAttemptAt: 0, attempts: HARNESS_STACK_RETRY_MAX, max: HARNESS_STACK_RETRY_MAX }));
     return;
   }
-  planExhausted(
+  planExhaustedTracked(
     taskId,
     { kind: "all-exhausted", earliestResetAtMs: after.allExhausted.earliestResetAtMs ?? null, skipped: [] },
     Date.now(),
@@ -6865,18 +7930,68 @@ setHarnessFailoverHooks({
   // short backoff instead, so a prepare that then fails cannot strand the
   // persisted countdown with no timer.
   canAutoRetry: (taskId) => !startingTaskIds.has(taskId) && !harnessRetriesInFlight.has(taskId),
-  // A held task's REPL is live; a manual prepare must not move it (Q6).
-  isTaskHeld: (taskId) => isHeldByBackgroundAgents(taskId),
+  // A REPL hosting background agents is live, whether the turn that left
+  // them succeeded or failed; a manual prepare must not move it (Q6).
+  isTaskHeld: (taskId) => backgroundAgentsHoldTask(taskId),
+  onScheduledSwitchDropped: (taskId, line) => {
+    const runId = noteRunIdOf(taskId);
+    if (runId) saveStatusLineQuietly(runId, taskId, line);
+  },
 });
 
 /**
- * Stop a task that's "held" (see `isHeldByBackgroundAgents`) — its terminal
- * run already succeeded but background agents are still running, so there's
- * no `active` handle to kill. Interrupt the live session and release the
- * hold. Shared by `cancelRun` (Stop button) and `archiveTask` (`stopRun`).
+ * A cooldown row of `harnessId` was cleared by the user: every blocked stack
+ * task waiting on a limit gets its member reasons refreshed and its retry
+ * countdown re-armed a short backoff out, so the cleared account is tried
+ * soon instead of at the old reset time. An attempt is not spent. A task that
+ * is mid-retry, blocked for lack of any usable member (nothing a cooldown
+ * clear fixes), past the attempt cap, or archived is left alone. Returns how
+ * many tasks were re-armed.
+ */
+export function rearmRetriesAfterCooldownClear(harnessId: string): number {
+  let count = 0;
+  for (const task of tasks.list()) {
+    const ex = task.harnessState?.allExhausted;
+    if (!ex || ex.inFlight || ex.reason === "no-usable-member") continue;
+    if (task.archivedAt != null || ex.attempts >= HARNESS_STACK_RETRY_MAX) continue;
+    const resolved = harnessStacks.resolveForTask(task);
+    if (!resolved || !resolved.stack.members.some((m) => m.harnessId === harnessId)) continue;
+    const now = Date.now();
+    const at = now + retryMinMs();
+    const memberReasons = memberReasonsFor(resolved.stack, task, now, { includeCurrent: true });
+    patchTaskState(task.id, (state) => (
+      state.allExhausted
+        ? {
+          allExhausted: {
+            ...state.allExhausted,
+            nextAttemptAt: at,
+            ...(memberReasons.length > 0 ? { memberReasons } : {}),
+          },
+        }
+        : {}
+    ));
+    armAutoRetry(task.id, at);
+    const label = harnesses.getByIdOrKind(harnessId)?.label ?? harnessId;
+    const runId = noteRunIdOf(task.id);
+    if (runId) saveStatusLineQuietly(runId, task.id, `cooldown cleared on ${label} — retrying soon`);
+    count++;
+  }
+  return count;
+}
+
+/**
+ * Stop a task whose background agents still run with no turn in flight (see
+ * `backgroundAgentsHoldTask`): its terminal run succeeded (held in `running`)
+ * or failed (an API error left the card `blocked`), so there's no
+ * `active` handle to kill. Interrupt the live session and orphan the agents'
+ * rows. Nothing here moves the card or touches the run: the settle hook's
+ * `maybeReleaseHeldTask` advances only a held `running` card to `review`, and
+ * a failed card stays where its turn end put it. Shared by `cancelRun` (Stop
+ * button) and `archiveTask` (`stopRun`).
  */
 async function stopHeldTask(taskId: string, reason: string): Promise<void> {
   stashSwapFollowUps(taskId);
+  dropScheduledSwitch(taskId, "scheduled account switch cancelled (stopped)");
   cancelPendingForTask(taskId, reason);
   // An OpenCode task on the agetor-owned server has no claude session to
   // interrupt: Stop ends the handle still listening for its background
@@ -6906,7 +8021,9 @@ export async function cancelRun(runId: string): Promise<boolean> {
     // in `running`. Its Stop button must still do something, or a background
     // agent that wedges without dying leaves the user no way out short of a
     // restart. Interrupt the live session and release the hold; the run itself
-    // already succeeded, so the card advances to `review`.
+    // already succeeded, so the card advances to `review`. A turn that FAILED
+    // with its background agents still running is stopped the same way (the
+    // card stays where its failure put it).
     const taskId = runs.get(runId)?.taskId;
     if (!taskId) return false;
     // This process is handing off (`freezeLaunches`) and the settlement
@@ -6928,17 +8045,45 @@ export async function cancelRun(runId: string): Promise<boolean> {
     // after `active.delete`, before `pendingSwap` is persisted — where
     // `pendingCancelRunIds.add(oldRunId)` below would target a run nothing
     // ever spawns again and silently lose the Stop.
-    if (tasks.get(taskId)?.harnessState?.pendingSwap || swapWindowTaskIds.has(taskId)) {
+    const pendingSwapOfTask = tasks.get(taskId)?.harnessState?.pendingSwap;
+    if ((pendingSwapOfTask && !pendingSwapOfTask.manual) || swapWindowTaskIds.has(taskId)) {
       swapCancelRequested.add(taskId);
       stashSwapFollowUps(taskId);
       cancelPendingForTask(taskId, "cancelled by user");
       return true;
     }
-    if (isHeldByBackgroundAgents(taskId)) {
+    // A manual / scheduled / switch-now account switch is copying the
+    // conversation. It is not aborted mid-copy (the move finishes), but what
+    // was queued or held for the task goes to the tray instead of draining
+    // onto the new account; the flag dies with the switch's claim.
+    if (accountSwitchTaskIds.has(taskId)) {
+      switchStopRequested.add(taskId);
+      stashSwapFollowUps(taskId);
+      cancelPendingForTask(taskId, "cancelled by user");
+      return true;
+    }
+    if (backgroundAgentsHoldTask(taskId)) {
+      // A start holds the task's claim and has not minted its run yet (a
+      // Run's pre-flight, a follow-up's spawn): the Stop is meant for the turn
+      // it is about to start. Record it against the claim, as
+      // `cancelLiveRunOfTask` does, so that turn is killed instead of
+      // registering. Interrupting the REPL here would land a Ctrl+C just
+      // before the new turn's paste and let the turn go ahead.
+      if (startingTaskIds.has(taskId)) {
+        pendingCancelTaskIds.add(taskId);
+        cancelPendingForTask(taskId, "cancelled by user");
+        return true;
+      }
       // Before the interrupt: the runner queues its record of the stop
-      // ahead of the settle the hold's release triggers.
-      reportHeldStepStopped(taskId);
+      // ahead of the settle the hold's release triggers. Only a held
+      // SUCCEEDED step is still unsettled for the runner; a failed turn
+      // already settled its step.
+      if (isHeldByBackgroundAgents(taskId)) reportHeldStepStopped(taskId);
       await stopHeldTask(taskId, "cancelled by user");
+      // A failed turn can also have left an armed all-exhausted retry or an
+      // fx auto-resume: the Stop ends those too, as it would without agents.
+      if (hasPendingHarnessRetry(taskId) && !runs.hasRunning(taskId)) cancelHarnessRetryForTask(taskId);
+      if (fxAutoResumeTimers.has(taskId)) cancelFxAutoResume(taskId, "stopped");
       return true;
     }
     // A settled OpenCode turn may still be listening for its background
@@ -7372,6 +8517,16 @@ async function sendInputInner(
   // nor a fresh session (the handoff would displace it) may receive this
   // message. Declining is honest: nothing was delivered and the send can be
   // retried once the switch settles (review S3).
+  if (switchNowTaskIds.has(row.task_id) && !bypassSwapHold) {
+    // The claim belongs to "Switch to next account" (idle or at turn end):
+    // hold the message like a swap window does and deliver it after the move
+    // (a pipeline handoff reminder must not be refused and block its step).
+    const heldRunId = tasks.get(row.task_id)?.runId ?? task.runId;
+    if (!heldRunId) return { delivered: false, reason: "the task is starting" };
+    const hidden = isHiddenContinuationUserText(line);
+    pushSwapFollowUp(row.task_id, hidden ? stripHarnessStackContinuation(line) : line, hidden);
+    return { delivered: true, runId: heldRunId };
+  }
   if (accountSwitchTaskIds.has(row.task_id)) {
     return { delivered: false, reason: "switching accounts — try again in a moment" };
   }
@@ -7413,7 +8568,7 @@ async function sendInputInner(
     startingTaskIds.add(row.task_id);
     let prepared: Awaited<ReturnType<typeof prepareTaskHarness>>;
     try {
-      prepared = await prepareTaskHarness(row.task_id, { manual: true });
+      prepared = await prepareTaskHarnessForUser(row.task_id, { manual: true });
       if (prepared.ok && prepared.moved) await dropSessionAfterAccountMove(row.task_id, prepared.moved.from);
     } finally {
       releaseStartingClaim(row.task_id);
@@ -10034,16 +11189,25 @@ export function hasPendingHarnessRetry(taskId: string): boolean {
  * limit starts a fresh cap); the retry spawn's own outcome handling sees the
  * run cancelled and clears anything left. Returns whether there was one.
  */
-export function cancelHarnessRetryForTask(taskId: string): boolean {
+export function cancelHarnessRetryForTask(taskId: string, line = "automatic account retry cancelled"): boolean {
   const task = tasks.get(taskId);
   cancelAutoRetry(taskId);
-  if (!task?.harnessState?.allExhausted) return false;
-  patchTaskState(taskId, { allExhausted: null });
-  if (task.runId) saveStatusLineQuietly(task.runId, taskId, "automatic account retry cancelled");
-  // Nothing will run on the stopped step's behalf, so messages typed while
-  // the retry was armed go back to the task's backlog instead of being
+  const exhausted = task?.harnessState?.allExhausted;
+  if (!task || !exhausted) return false;
+  // A retry whose successor run is still live is not cancelled by this: only
+  // the loop marker goes, with no "retry cancelled" claim and no stash (the
+  // live successor carries the follow-ups).
+  if (exhausted.inFlight && exhausted.attemptRunId && active.has(exhausted.attemptRunId)) {
+    patchTaskState(taskId, { allExhausted: null });
+    return true;
+  }
+  // The retry will never run: the follow-ups it would have replayed after the
+  // original prompt go back to the tray (once — the marker is cleared first),
+  // together with messages typed while it was armed, which would otherwise be
   // stranded in memory until a later, unrelated turn.
-  stashSwapFollowUps(taskId);
+  endCleanRetry(taskId, () => stashSwapFollowUps(taskId));
+  patchTaskState(taskId, { allExhausted: null });
+  if (task.runId) saveStatusLineQuietly(task.runId, taskId, line);
   return true;
 }
 
@@ -10827,6 +11991,27 @@ function restashPasteWithheldText(taskId: string, text: string): boolean {
   const alreadyStashed = task.backlog.some((item) => item.text === text);
   if (!alreadyStashed) backlog.add(taskId, { text });
   return true;
+}
+
+/**
+ * Stash a batch of follow-ups to the backlog tray, in the given ADD order
+ * (`backlog.add` prepends, so callers pass newest first). Unlike
+ * {@link restashPasteWithheldText}, two identical texts inside one batch are
+ * two separate sends and are both kept; only a text already in the tray
+ * before this batch is skipped (an overlapping stash path re-stashing the
+ * same message). Returns how many were added.
+ */
+function stashFollowUpBatch(taskId: string, textsInAddOrder: readonly string[]): number {
+  const task = tasks.get(taskId);
+  if (!task || task.archivedAt != null || textsInAddOrder.length === 0) return 0;
+  const before = new Set(task.backlog.map((item) => item.text));
+  let added = 0;
+  for (const text of textsInAddOrder) {
+    if (before.has(text)) continue;
+    backlog.add(taskId, { text });
+    added++;
+  }
+  return added;
 }
 
 /** Test hook: exercise `handlePasteWithheld` directly against a real task
@@ -12044,7 +13229,7 @@ export async function archiveTask(
   clearFailoverState(taskId);
   if (task.runId && active.has(task.runId)) {
     stopActiveHandle(active.get(task.runId)!, "task archived");
-  } else if (opts?.stopRun && isHeldByBackgroundAgents(taskId)) {
+  } else if (opts?.stopRun && backgroundAgentsHoldTask(taskId)) {
     await stopHeldTask(taskId, "task archived");
   }
   // Idle archive (a restarted Cursor question, a done-column archive, a

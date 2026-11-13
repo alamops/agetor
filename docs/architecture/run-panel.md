@@ -30,8 +30,41 @@ not open a section. A `status`
 event with the `harness-swap:` prefix renders as a divider carrying the exact
 notice plus `(2/3)`; a `user` event that is exactly the hidden
 `<harness-stack-continuation>` wrapper renders nothing. The panel takes an
-optional `stacks` prop; no extra fetch is made. See
+optional `stacks` prop and, new in the fix round, `limitStates` (cooldown rows,
+one per account and model) and `onOpenSettingsHarnesses`; no extra fetch is made
+(App's `reconcileById` keys cooldown rows by account **and** model). See
 [harness-stacks.md](harness-stacks.md).
+
+The fix round added three pieces of per-task state in the harness-stack
+children. None is cleared by the `[task.id]` reset effect: each is **tagged with
+the task id it belongs to** and only counts while `task.id` still matches, so
+switching tasks mid-request neither shows the previous task's disabled button
+nor loses the request:
+
+- `HarnessStackBanner`'s `runningNowFor` (the Run now in-flight guard: the
+  button is disabled and reads "Starting…" until `onRunTask`'s promise settles);
+- `SwitchAccountControl`'s `busy` (`{ taskId, op: "switch" | "cancel" }`, the
+  Switch to next account / Cancel guard; the scheduled state itself is not local,
+  it reads `task.harnessState.scheduledSwitch`, so a reload or a CLI request
+  shows the same thing; an archived task is offered no switch, but a switch
+  still scheduled on one keeps its Cancel; a Cancel that lands while the scheduled switch (or a "Switch to next
+  account" move) is being applied gets the core's 409 `busy` and toasts "Couldn't switch
+  account: the switch is already under way", through
+  `switchAccountFailureToast`; a Cancel while another switch, such as a
+  same-stack PATCH, holds the claim drops the request as usual);
+- `TaskDetails`'s `switchingAgentFor` (the account picker is disabled with a
+  "Switching…" note while the awaited same-stack PATCH copies the transcript;
+  `TaskDetails` is rendered by `RunPanelBody`).
+
+New per-task state in these children should follow the same tagging, or get a
+reset line. For a task in a stack of two or more accounts the account picker
+lists only the stack's members (`stackPickerOptions`); its cooling marks are
+recomputed on a 30 s `pickerNow` tick (`TaskDetails` state) (only while `limitStates` is non-empty,
+cleared on unmount), so an expired cooldown stops reading "cooling" without a
+new payload. The non-editable Harness row shows the account's label. A completed account PATCH or switch calls
+`onTaskFieldsChanged` with only the fields it owns (`agent`, `harnessState` and,
+for a PATCH, mode/model/effort/speed/Max mode), so the panel shows the new
+account before the next 2 s poll.
 
 ## Multiple repositories in one task
 
@@ -48,4 +81,3 @@ Per-task state the multi surfaces add, and how each survives a task switch:
 - **Open folder.** A never-started multi task has no workspace on disk (`worktreePath` is null), so the working-folder button explains that instead of opening (`openFolderUnavailableReason`).
 - **Connection budget.** The multi-repository `@` listing and capability discovery are one request per repository, at most two in flight, and both wait for this task's event stream (`awaitStreamReady(task.id)`, bound to the task id like `TerminalsSection`'s gate) so a switch never queues the stream behind them. The git-status poll stays one batched request for every repository.
 - **Terminals.** With no repository tab chosen (`repoTab` is null after a switch) a new terminal opens at the workspace root (owner decision, grill #19); choosing a tab, or the terminal section's own selector, points the next shell at that repository's checkout. `TerminalView` gets the repository names only for a multi task (their presence, not a count, shows the selector) and ignores a selected name that is no longer on the task, so a removal falls back to the workspace root.
-

@@ -14,7 +14,12 @@ import type {
   HarnessLimitState,
   HarnessStack,
   HarnessStackInput,
+  HarnessStackChanged,
   HarnessStackWarning,
+  HarnessSwapHistoryPage,
+  MirrorPreview,
+  MirrorRestoreResult,
+  SwitchAccountResult,
   RetentionPassResult,
   GitHubIssueThreadResult,
   GitHubItemKind,
@@ -418,6 +423,25 @@ export class ApiError extends Error {
   }
 }
 
+/** A stack edit lost the optimistic-concurrency race: the core answered 409
+ *  `stack-changed` and `current` is the stack as stored now. Callers reload the
+ *  editor from it instead of showing a generic failure. */
+export class StackChangedApiError extends ApiError {
+  readonly current: HarnessStack;
+  constructor(message: string, body: HarnessStackChanged) {
+    super(message, 409, body);
+    this.name = "StackChangedApiError";
+    this.current = body.stack;
+  }
+}
+
+function isStackChangedBody(body: unknown): body is HarnessStackChanged {
+  return Boolean(body) && typeof body === "object"
+    && (body as { code?: unknown }).code === "stack-changed"
+    && typeof (body as { stack?: unknown }).stack === "object"
+    && (body as { stack?: unknown }).stack !== null;
+}
+
 function j<T>(
   path: string,
   init?: RequestInit,
@@ -530,6 +554,8 @@ export interface HarnessesPayload {
   stacks?: HarnessStack[];
   /** Account-global limit cooldowns currently in force. */
   limitStates?: HarnessLimitState[];
+  /** Account ids that have mirror records (a restore is possible). */
+  mirrorRestorable?: string[];
 }
 export interface HarnessStacksPayload { stacks: HarnessStack[]; limitStates: HarnessLimitState[] }
 export interface HarnessStackResult {
@@ -651,12 +677,61 @@ export const api = {
     j<HarnessStackResult>(`/harness-stacks/${encodeURIComponent(id)}`, {
       method: "PATCH",
       body: JSON.stringify(patch),
-    }, { retry: false }),
+    }, { retry: false }).catch((err: unknown) => {
+      // `patch.expectedUpdatedAt` set and stale: surface the typed conflict.
+      if (err instanceof ApiError && err.status === 409 && isStackChangedBody(err.body)) {
+        throw new StackChangedApiError(err.message, err.body);
+      }
+      throw err;
+    }),
+  /** Swap history of one stack, newest first. `before` is the previous page's
+   *  `nextCursor`. */
+  getHarnessStackHistory: (id: string, opts: { limit?: number; before?: string | null } = {}) => {
+    const qs = new URLSearchParams();
+    if (opts.limit !== undefined) qs.set("limit", String(opts.limit));
+    if (opts.before) qs.set("before", opts.before);
+    const q = qs.toString();
+    return j<HarnessSwapHistoryPage>(`/harness-stacks/${encodeURIComponent(id)}/history${q ? `?${q}` : ""}`);
+  },
+  /** Dry run of a stack save: what the mirror would add/update/remove. */
+  previewHarnessMirror: (draft: {
+    kind: HarnessStackInput["kind"];
+    members: string[];
+    mirrorMode?: HarnessStackInput["mirrorMode"];
+    stackId?: string;
+  }) =>
+    j<MirrorPreview>("/harness-stacks/mirror-preview", { method: "POST", body: JSON.stringify(draft) }),
+  /** Put an account's mirror backups back. `retry: false` — a replay after a
+   *  lost response would run the restore twice. */
+  restoreHarnessMirror: (id: string) =>
+    j<MirrorRestoreResult>(`/harnesses/${encodeURIComponent(id)}/mirror-restore`, { method: "POST" }, { retry: false }),
+  /** Clear an account's cooldown (all rows, or only `model`'s). */
+  clearHarnessCooldown: (id: string, opts?: { model?: string | null; accountWideOnly?: boolean } | string) => {
+    const o = typeof opts === "string" ? { model: opts } : opts ?? {};
+    const qs = o.model ? `?model=${encodeURIComponent(o.model)}` : o.accountWideOnly ? "?scope=account" : "";
+    return j<{ cleared: true; rearmed?: number; limitStates: HarnessLimitState[] }>(
+      `/harnesses/${encodeURIComponent(id)}/limit-state${qs}`,
+      { method: "DELETE" },
+    );
+  },
+  /** Move a stacked task to its next account now (idle) or after the turn
+   *  (live run). 409 refusals carry a `SwitchAccountRefusal` body on the
+   *  thrown `ApiError`. `retry: false` — a replay could switch twice. */
+  switchTaskAccount: (taskId: string) =>
+    j<SwitchAccountResult>(`/tasks/${encodeURIComponent(taskId)}/switch-account`, { method: "POST" }, { retry: false }),
+  cancelScheduledAccountSwitch: (taskId: string) =>
+    j<{ task: Task; cancelled?: boolean }>(`/tasks/${encodeURIComponent(taskId)}/switch-account`, { method: "DELETE" }),
   deleteHarnessStack: (id: string) =>
     j<{ removed: true }>(`/harness-stacks/${encodeURIComponent(id)}`, { method: "DELETE" }),
   createHarness: (input: HarnessInput) =>
     j<Harness>("/harnesses", { method: "POST", body: JSON.stringify(input) }),
-  updateHarness: (id: string, patch: Partial<Omit<HarnessInput, "id" | "kind">>) =>
+  /** A `home`/`env` edit that would drop the account's config-mirror records
+   *  is refused with 409 `mirror-records` unless `confirmMirrorDrop` is set
+   *  (`saveConfirmingMirrorDrop` in harness-edit-confirm.ts). */
+  updateHarness: (
+    id: string,
+    patch: Partial<Omit<HarnessInput, "id" | "kind">> & { confirmMirrorDrop?: boolean },
+  ) =>
     j<Harness>(`/harnesses/${encodeURIComponent(id)}`, {
       method: "PATCH",
       body: JSON.stringify(patch),
@@ -1725,8 +1800,11 @@ export const api = {
   }) =>
     // retry: false — a replay would create a duplicate task + branch.
     j<Task>("/tasks", { method: "POST", body: JSON.stringify(input) }, { retry: false }),
-  updateTask: (id: string, patch: Partial<Task>) =>
-    j<Task>(`/tasks/${id}`, { method: "PATCH", body: JSON.stringify(patch) }),
+  /** `opts.retry: false` for an account-switch PATCH: the core copies the
+   *  transcript before answering, and a replay after a lost response would
+   *  copy it twice (same reason as `switchTaskAccount`). */
+  updateTask: (id: string, patch: Partial<Task>, opts?: { retry?: boolean }) =>
+    j<Task>(`/tasks/${id}`, { method: "PATCH", body: JSON.stringify(patch) }, opts),
   moveTask: (id: string, column: ColumnId) =>
     j<Task>(`/tasks/${id}`, { method: "PATCH", body: JSON.stringify({ column }) }),
   deleteTask: (id: string) => j<void>(`/tasks/${id}`, { method: "DELETE" }),

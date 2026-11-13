@@ -64,19 +64,39 @@ const repo = (name: string, over: Partial<TaskRepository> = {}): TaskRepository 
   ...over,
 });
 
-test("087 applies to an 086 DB and lands last", async () => {
+test("091 applies to an 086 DB and lands last", async () => {
   const { migrations } = await import("./migrations/index.ts");
   const { migrate } = await import("./migrate.ts");
   const { Database } = await import("bun:sqlite");
   const mem = new Database(":memory:");
   migrate(mem, migrations.slice(0, migrations.findIndex((m) => m.id === "086_normalize_cursor_fable_5_2") + 1));
   expect(mem.query(`SELECT 1 FROM pragma_table_info('tasks') WHERE name = 'repositories'`).get()).toBeNull();
-  expect(migrate(mem, migrations)).toEqual(["087_task_repositories"]);
+  expect(migrate(mem, migrations)).toEqual(["087_harness_stacks_fix_round", "088_harness_orphaned_copies", "089_harness_mirror_sources", "090_harness_mirror_backup_folder", "091_task_repositories"]);
   const cols = mem
     .query<{ name: string; dflt_value: string | null }, []>(`SELECT name, dflt_value FROM pragma_table_info('tasks')`)
     .all();
   expect(cols.find((c) => c.name === "repositories")?.dflt_value).toBe("'[]'");
   expect(cols.find((c) => c.name === "issue_repo_path")).toBeTruthy();
+  mem.close();
+});
+
+test("a dev DB that applied the migration as 087_task_repositories does not re-run it after the renumber", async () => {
+  const { migrations } = await import("./migrations/index.ts");
+  const { migrate, splitSqlStatements } = await import("./migrate.ts");
+  const { Database } = await import("bun:sqlite");
+  const mem = new Database(":memory:");
+  // A pre-merge dev DB: the multi-repo branch's own 087 had already run, while
+  // main's 087-090 had not.
+  migrate(mem, migrations.slice(0, migrations.findIndex((m) => m.id === "086_normalize_cursor_fable_5_2") + 1));
+  const renamed = migrations.find((m) => m.id === "091_task_repositories")!;
+  for (const statement of splitSqlStatements(renamed.sql)) mem.run(statement);
+  mem.run(`INSERT INTO _migrations (id, applied_at) VALUES ('087_task_repositories', 1)`);
+  // The alias marks 091 applied (its SQL is not re-run, which would throw on the
+  // duplicate ADD COLUMN) and main's four migrations still apply.
+  expect(migrate(mem, migrations)).toEqual(["087_harness_stacks_fix_round", "088_harness_orphaned_copies", "089_harness_mirror_sources", "090_harness_mirror_backup_folder"]);
+  const applied = mem.query<{ id: string }, []>(`SELECT id FROM _migrations ORDER BY id`).all().map((r) => r.id);
+  expect(applied).toContain("087_task_repositories");
+  expect(applied).toContain("091_task_repositories");
   mem.close();
 });
 

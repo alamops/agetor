@@ -7,7 +7,7 @@
  * `scrapeOnce` tick against a synthetic pane so the gate is exercised end to
  * end, not just as a predicate.
  */
-import { afterAll, afterEach, beforeAll, describe, expect, test } from "bun:test";
+import { afterAll, afterEach, beforeAll, describe, expect, setSystemTime, test } from "bun:test";
 import { mkdtempSync } from "node:fs";
 import { tmpdir } from "node:os";
 import path from "node:path";
@@ -472,6 +472,12 @@ describe("claude pane usage-limit notice", () => {
   test("the standalone 'Continuing automatically' row settles a stacked turn with a reset (S12)", async () => {
     installPane(livePane([HINT("Continuing automatically at 8am · Esc to cancel")]));
     const { state, chunks, isResolved } = paneState("t-limit-waiting", true);
+    // Pin the clock well before 8am: a time-only reset that passed under an
+    // hour ago reads as no reset (finding 7), so the real clock would make
+    // this fail every day between 08:00 and 09:00.
+    const at = new Date();
+    at.setHours(3, 0, 0, 0);
+    setSystemTime(at);
     try {
       await __forTest.scrapeOnce(state);
       const signal = chunks.find((c) => c.stream === "status" && c.data.startsWith(HARNESS_LIMIT_STATUS_PREFIX));
@@ -482,6 +488,7 @@ describe("claude pane usage-limit notice", () => {
       expect(new Date(payload.resetAtMs).getHours()).toBe(8);
       expect(isResolved()).toBe(true);
     } finally {
+      setSystemTime();
       __forTest.uninstallSession("t-limit-waiting");
     }
   });

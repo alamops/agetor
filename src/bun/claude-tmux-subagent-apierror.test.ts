@@ -219,6 +219,14 @@ test(
       // the orchestrator to flip to `blocked`; a sentinel here would lie.
       expect(rec.out[0]!.data.startsWith(CLAUDE_API_ERROR_STATUS_PREFIX)).toBe(false);
       expect(rec.out[0]!.data).toContain("background agent hit an API error");
+      // The probe is also true for a FAILED turn whose agents still run (its
+      // card is `blocked` and never releases to `review`), so the line must
+      // not promise a release for every held card.
+      expect(rec.out[0]!.data).toBe(
+        "background agent hit an API error (HTTP 529 — turn aborted; blocked for manual retry) — it stopped; "
+          + "the other background agents keep running (a card held open for them is released when they finish)",
+      );
+      expect(rec.out[0]!.data).not.toContain("task releases when");
 
       // Nothing to resolve — no slot existed and onEndOfTurn was never set.
       expect(state.turnQueue.length).toBe(0);

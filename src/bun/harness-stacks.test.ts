@@ -196,6 +196,17 @@ describe("harnessStacks", () => {
     expect(safe.warnings.map((w) => w.code)).not.toContain("full-mirror-hooks");
   });
 
+  test("clearLimitState accountWideOnly leaves per-model rows", () => {
+    stacks.harnessStacks.clearLimitState("stack-a");
+    const base = { reason: "quota" as const, resetAtMs: Date.now() + 60_000, message: "m", source: "claude-api-error" as const };
+    stacks.harnessStacks.setLimitState("stack-a", base);
+    stacks.harnessStacks.setLimitState("stack-a", { ...base, model: "m1" });
+    stacks.harnessStacks.clearLimitState("stack-a", { accountWideOnly: true });
+    const left = stacks.harnessStacks.listLimitStates().filter((l) => l.harnessId === "stack-a");
+    expect(left.map((l) => l.model)).toEqual(["m1"]);
+    stacks.harnessStacks.clearLimitState("stack-a");
+  });
+
   test("cooldown upsert, isCooling, prune and clear", () => {
     stacks.harnessStacks.clearLimitState("stack-a");
     const now = 1_000_000;
@@ -211,7 +222,7 @@ describe("harnessStacks", () => {
     // stays until the boot sweep or the next write prunes it.
     expect(stacks.harnessStacks.listLimitStates(now + 1000).map((s) => s.harnessId)).toContain("stack-a");
     expect(stacks.harnessStacks.listLimitStates(now + 60_001)).toEqual([]);
-    expect(stacks.harnessStacks.getLimitState("stack-a")).not.toBeNull();
+    expect(stacks.harnessStacks.getLimitState("stack-a", { now: now + 1000 })).not.toBeNull();
     stacks.harnessStacks.setLimitState("stack-b", {
       reason: "quota",
       resetAtMs: now + 120_000,
@@ -229,7 +240,7 @@ describe("harnessStacks", () => {
       message: "429",
       source: "claude-api-error",
     }, now);
-    const state = stacks.harnessStacks.getLimitState("stack-a")!;
+    const state = stacks.harnessStacks.getLimitState("stack-a", { now })!;
     expect(state.exhaustedUntilMs).toBe(now + stacks.HARNESS_RATE_LIMIT_COOLDOWN_MS);
     stacks.harnessStacks.clearLimitState("stack-a");
     expect(stacks.harnessStacks.getLimitState("stack-a")).toBeNull();
@@ -252,7 +263,7 @@ describe("harnessStacks", () => {
       message: "429",
       source: "claude-api-error",
     }, now + 1000);
-    expect(stacks.harnessStacks.getLimitState("stack-a")!.exhaustedUntilMs)
+    expect(stacks.harnessStacks.getLimitState("stack-a", { now: now + 1000 })!.exhaustedUntilMs)
       .toBe(now + 3 * 60 * 60_000);
     // A provider reset is authoritative even when it is earlier than the
     // stored fallback.
@@ -269,7 +280,7 @@ describe("harnessStacks", () => {
       message: "usage limit",
       source: "claude-pane",
     }, now);
-    expect(stacks.harnessStacks.getLimitState("stack-a")!.exhaustedUntilMs).toBe(now + 30_000);
+    expect(stacks.harnessStacks.getLimitState("stack-a", { now: now + 1000 })!.exhaustedUntilMs).toBe(now + 30_000);
     stacks.harnessStacks.clearLimitState("stack-a");
   });
 
@@ -612,9 +623,13 @@ describe("loginEvidence", () => {
     const awsProfile = claudeHome({
       "settings.json": JSON.stringify({ env: { AWS_PROFILE: "bedrock" } }),
     });
-    // A login-selecting cloud setting is evidence of *some* login (the
-    // profile may hold it); it must never read as logged out.
-    expect(stacks.loginEvidence({ kind: "claude-code", home: awsProfile, env: {} } as never)).toBe(true);
+    // A cloud key with no provider selector says nothing about Claude (finding
+    // 10); with a selector in the same scope it is unknown, never logged in.
+    expect(stacks.loginEvidence({ kind: "claude-code", home: awsProfile, env: {} } as never)).toBe(false);
+    const awsSelected = claudeHome({
+      "settings.json": JSON.stringify({ env: { AWS_PROFILE: "bedrock", CLAUDE_CODE_USE_BEDROCK: "1" } }),
+    });
+    expect(stacks.loginEvidence({ kind: "claude-code", home: awsSelected, env: {} } as never)).toBeNull();
 
     const bare = claudeHome();
     expect(stacks.loginEvidence({ kind: "claude-code", home: bare, env: {} } as never)).toBe(false);
@@ -923,14 +938,20 @@ describe("loginEvidence", () => {
 
   test("a process-level cloud credential warns on stack creation (R15-S2)", () => {
     const previous = process.env.AWS_SECRET_ACCESS_KEY;
+    const selector = process.env.CLAUDE_CODE_USE_BEDROCK;
     process.env.AWS_SECRET_ACCESS_KEY = "aws-secret";
     try {
+      // No selector: the AWS key is not Claude's, so no warning.
+      expect(stacks.validateInput(input(["stack-a", "stack-b"])).warnings.some((w) => w.code === "process-provider-key")).toBe(false);
+      process.env.CLAUDE_CODE_USE_BEDROCK = "1";
       const warnings = stacks.validateInput(input(["stack-a", "stack-b"])).warnings;
       const warning = warnings.find((w) => w.code === "process-provider-key");
       expect(warning?.message).toContain("AWS_SECRET_ACCESS_KEY");
     } finally {
       if (previous === undefined) delete process.env.AWS_SECRET_ACCESS_KEY;
       else process.env.AWS_SECRET_ACCESS_KEY = previous;
+      if (selector === undefined) delete process.env.CLAUDE_CODE_USE_BEDROCK;
+      else process.env.CLAUDE_CODE_USE_BEDROCK = selector;
     }
     // A credential for a provider this kind never reads must not warn.
     const github = process.env.GITHUB_TOKEN;
@@ -942,5 +963,226 @@ describe("loginEvidence", () => {
       if (github === undefined) delete process.env.GITHUB_TOKEN;
       else process.env.GITHUB_TOKEN = github;
     }
+  });
+});
+
+describe("per-model cooldowns, conditional clear and optimistic edits (087)", () => {
+  const sig = (model: string | null, resetAtMs: number) => ({
+    reason: "quota" as const,
+    resetAtMs,
+    message: "usage limit",
+    source: "codex-error" as const,
+    model,
+  });
+
+  test("a model row only cools tasks on that model; the later-expiring of account and model wins", () => {
+    const hs = stacks.harnessStacks;
+    hs.clearLimitState("stack-a");
+    const now = 5_000_000;
+    hs.setLimitState("stack-a", sig("m1", now + 10_000), now);
+    expect(hs.isCooling("stack-a", now + 1, "m1")?.model).toBe("m1");
+    expect(hs.isCooling("stack-a", now + 1, "m2")).toBeNull();
+    expect(hs.isCooling("stack-a", now + 1)).toBeNull();
+    hs.setLimitState("stack-a", sig(null, now + 50_000), now);
+    expect(hs.getLimitState("stack-a", { model: "m1", now: now + 1 })?.exhaustedUntilMs).toBe(now + 50_000);
+    expect(hs.getLimitState("stack-a", { model: "m1", now: now + 1 })?.model).toBeNull();
+    expect(hs.listLimitStates(now + 1).map((s) => s.model).sort()).toEqual([null, "m1"].sort());
+    // The model row's own fallback applies; the account row (50s) stays a separate row.
+    hs.setLimitState("stack-a", { ...sig("m1", 0), resetAtMs: null, reason: "rate_limit" }, now + 1);
+    expect(hs.getLimitState("stack-a", { model: "m1", now: now + 2 })?.exhaustedUntilMs)
+      .toBe(now + 1 + stacks.HARNESS_RATE_LIMIT_COOLDOWN_MS);
+    expect(hs.getLimitState("stack-a", { model: "m1", now: now + 2 })?.model).toBe("m1");
+    hs.clearLimitState("stack-a");
+    expect(hs.listLimitStates(now + 1).filter((s) => s.harnessId === "stack-a")).toEqual([]);
+  });
+
+  test("clearLimitState with startedAtMs spares a limit recorded after the turn started and other models", () => {
+    const hs = stacks.harnessStacks;
+    hs.clearLimitState("stack-a");
+    const now = 6_000_000;
+    hs.setLimitState("stack-a", sig(null, now + 9000), now + 100);
+    hs.setLimitState("stack-a", sig("m1", now + 9000), now - 100);
+    hs.setLimitState("stack-a", sig("m2", now + 9000), now - 100);
+    hs.clearLimitState("stack-a", { startedAtMs: now, model: "m1" });
+    const left = hs.listLimitStates(now).filter((s) => s.harnessId === "stack-a").map((s) => s.model);
+    expect(left.sort()).toEqual([null, "m2"].sort());
+    hs.clearLimitState("stack-a", { startedAtMs: now + 100 });
+    expect(hs.listLimitStates(now).filter((s) => s.harnessId === "stack-a").map((s) => s.model)).toEqual(["m2"]);
+    hs.clearLimitState("stack-a", { model: "m2" });
+    expect(hs.listLimitStates(now).filter((s) => s.harnessId === "stack-a")).toEqual([]);
+  });
+
+  test("update with a stale expectedUpdatedAt throws StackChangedError carrying the stored stack", () => {
+    const stack = stacks.harnessStacks.create(input(["stack-a", "stack-b"]));
+    const edited = stacks.harnessStacks.update(stack.id, { label: "one", expectedUpdatedAt: stack.updatedAt });
+    expect(edited.updatedAt).toBeGreaterThan(stack.updatedAt);
+    let caught: unknown;
+    try {
+      stacks.harnessStacks.update(stack.id, { label: "two", expectedUpdatedAt: stack.updatedAt });
+    } catch (err) {
+      caught = err;
+    }
+    expect(caught).toBeInstanceOf(stacks.StackChangedError);
+    expect((caught as InstanceType<typeof stacks.StackChangedError>).current.label).toBe("one");
+    expect(stacks.harnessStacks.get(stack.id)?.label).toBe("one");
+    // Omitted = last write wins.
+    expect(stacks.harnessStacks.update(stack.id, { label: "three" }).label).toBe("three");
+    stacks.harnessStacks.delete(stack.id);
+  });
+
+  test("cloud credential keys are login evidence only under a provider selector, and then unknown", () => {
+    const home = mkdtempSync(path.join(tmpdir(), "agetor-cloud-"));
+    homes.push(home);
+    const ev = (env: Record<string, string>) =>
+      stacks.loginEvidence({ kind: "claude-code", home, env } as never);
+    expect(ev({ AWS_SECRET_ACCESS_KEY: "x" })).toBe(false);
+    expect(ev({ AWS_SECRET_ACCESS_KEY: "x", CLAUDE_CODE_USE_BEDROCK: "1" })).toBeNull();
+    expect(ev({ ANTHROPIC_API_KEY: "x" })).toBe(true);
+  });
+});
+
+describe("TT-B: cooldown reads never write, same-millisecond edits conflict, cloud keys are not login evidence", () => {
+  const sigFor = (model: string | null, resetAtMs: number) => ({
+    reason: "quota" as const,
+    resetAtMs,
+    message: "usage limit",
+    source: "codex-error" as const,
+    model,
+  });
+  const rowCount = () =>
+    dbm.db.query<{ n: number }, [string]>(`SELECT COUNT(*) AS n FROM harness_limit_state WHERE harness_id = ?`).get("stack-c")!.n;
+
+  test("getLimitState, isCooling and listLimitStates never DELETE an expired row (a GET must not write)", () => {
+    const hs = stacks.harnessStacks;
+    hs.clearLimitState("stack-c");
+    const now = 9_000_000;
+    hs.setLimitState("stack-c", sigFor(null, now + 1000), now);
+    hs.setLimitState("stack-c", sigFor("m1", now + 1000), now);
+    expect(rowCount()).toBe(2);
+    const later = now + 5000;
+    expect(hs.getLimitState("stack-c", { now: later, model: "m1" })).toBeNull();
+    expect(hs.isCooling("stack-c", later, "m1")).toBeNull();
+    expect(hs.listLimitStates(later).filter((s) => s.harnessId === "stack-c")).toEqual([]);
+    // Observed through the changes counter as well as the row count.
+    const before = dbm.db.query<{ n: number }, []>(`SELECT total_changes() AS n`).get()!.n;
+    hs.getLimitState("stack-c", { now: later });
+    hs.listLimitStates(later);
+    expect(dbm.db.query<{ n: number }, []>(`SELECT total_changes() AS n`).get()!.n).toBe(before);
+    expect(rowCount()).toBe(2);
+    hs.clearLimitState("stack-c");
+  });
+
+  test("a provider reset replaces the stored row for the same (account, model) and a fallback keeps the later one per model", () => {
+    const hs = stacks.harnessStacks;
+    hs.clearLimitState("stack-c");
+    const now = 9_500_000;
+    hs.setLimitState("stack-c", sigFor("m1", now + 50_000), now);
+    hs.setLimitState("stack-c", sigFor("m1", now + 20_000), now + 1);
+    expect(hs.getLimitState("stack-c", { model: "m1", now: now + 2 })?.exhaustedUntilMs).toBe(now + 20_000);
+    // A fallback for a DIFFERENT model must not touch the m1 row.
+    hs.setLimitState("stack-c", { ...sigFor("m2", 0), resetAtMs: null, reason: "rate_limit" }, now + 3);
+    expect(hs.getLimitState("stack-c", { model: "m1", now: now + 4 })?.exhaustedUntilMs).toBe(now + 20_000);
+    hs.clearLimitState("stack-c");
+  });
+
+  test("two edits inside one millisecond still conflict, and the refused write does not happen", () => {
+    const stack = stacks.harnessStacks.create(input(["stack-a", "stack-b"], { label: "same-ms" }));
+    const realNow = Date.now;
+    try {
+      // The clock reads at or before the stored stamp, as two edits in one
+      // millisecond would: a stamp of `now` alone would repeat.
+      Date.now = () => stack.updatedAt;
+      const first = stacks.harnessStacks.update(stack.id, { label: "editor-a", expectedUpdatedAt: stack.updatedAt });
+      expect(first.updatedAt).toBeGreaterThan(stack.updatedAt);
+      expect(() =>
+        stacks.harnessStacks.update(stack.id, { label: "editor-b", expectedUpdatedAt: stack.updatedAt }),
+      ).toThrow(stacks.StackChangedError);
+      expect(stacks.harnessStacks.get(stack.id)?.label).toBe("editor-a");
+    } finally {
+      Date.now = realNow;
+      stacks.harnessStacks.delete(stack.id);
+    }
+  });
+
+  test("an account delete bumps the stack's updated_at, so a stale editor conflicts (D16)", () => {
+    const ids = ["x", "y", "z"].map((n) => `d16-${n}-${randomUUID().slice(0, 6)}`);
+    for (const id of ids) {
+      const home = mkdtempSync(path.join(tmpdir(), "agetor-d16-"));
+      homes.push(home);
+      dbm.harnesses.insert({ id, kind: "claude-code", label: id, home, env: {} } as never);
+    }
+    const stack = stacks.harnessStacks.create(input(ids, { label: "d16" }));
+    dbm.harnesses.delete(ids[1]!);
+    const after = stacks.harnessStacks.get(stack.id)!;
+    expect(after.updatedAt).toBeGreaterThan(stack.updatedAt);
+    expect(after.members.map((m) => m.harnessId)).toEqual([ids[0]!, ids[2]!]);
+    expect(() => stacks.harnessStacks.update(stack.id, { label: "stale", expectedUpdatedAt: stack.updatedAt })).toThrow(
+      stacks.StackChangedError,
+    );
+    expect(stacks.harnessStacks.get(stack.id)?.label).toBe("d16");
+    stacks.harnessStacks.delete(stack.id);
+    dbm.harnesses.delete(ids[0]!);
+    dbm.harnesses.delete(ids[2]!);
+  });
+
+  describe("finding 10: cloud credential keys without a provider selector", () => {
+    const CLOUD = ["AWS_SECRET_ACCESS_KEY", "AWS_ACCESS_KEY_ID", "AWS_PROFILE", "GOOGLE_APPLICATION_CREDENTIALS"];
+    const SELECTORS = ["CLAUDE_CODE_USE_BEDROCK", "CLAUDE_CODE_USE_VERTEX"];
+    const touched = new Map<string, string | undefined>();
+    const setEnv = (key: string, value: string) => {
+      if (!touched.has(key)) touched.set(key, process.env[key]);
+      process.env[key] = value;
+    };
+    const home = () => {
+      const h = mkdtempSync(path.join(tmpdir(), "agetor-f10-"));
+      homes.push(h);
+      return h;
+    };
+    beforeAll(() => {
+      for (const key of [...CLOUD, ...SELECTORS]) touched.set(key, process.env[key]);
+      for (const key of [...CLOUD, ...SELECTORS]) delete process.env[key];
+      stacks.setLoginEvidenceDepsForTests({ keychainProbe: () => false });
+    });
+    afterAll(() => {
+      stacks.setLoginEvidenceDepsForTests(null);
+      for (const [key, value] of touched) {
+        if (value === undefined) delete process.env[key];
+        else process.env[key] = value;
+      }
+    });
+
+    for (const key of CLOUD) {
+      test(`${key} in the account's env map is not evidence; with CLAUDE_CODE_USE_BEDROCK it is unknown, never true`, () => {
+        const h = home();
+        const ev = (env: Record<string, string>) => stacks.loginEvidence({ kind: "claude-code", home: h, env } as never);
+        expect(ev({ [key]: "v" })).toBe(false);
+        expect(ev({ [key]: "v", CLAUDE_CODE_USE_BEDROCK: "1" })).toBeNull();
+        expect(ev({ [key]: "v", CLAUDE_CODE_USE_VERTEX: "1" })).toBeNull();
+      });
+
+      test(`${key} in Agetor's own process env is not evidence either (and unknown under a selector)`, () => {
+        const h = home();
+        const acct = { kind: "claude-code", home: h, env: {} } as never;
+        try {
+          setEnv(key, "v");
+          expect(stacks.loginEvidence(acct)).toBe(false);
+          setEnv("CLAUDE_CODE_USE_BEDROCK", "1");
+          expect(stacks.loginEvidence(acct)).toBeNull();
+        } finally {
+          for (const k of [key, "CLAUDE_CODE_USE_BEDROCK"]) delete process.env[k];
+        }
+      });
+    }
+
+    test("the same keys in settings.json env follow the same rule", () => {
+      const h = home();
+      writeFileSync(path.join(h, "settings.json"), JSON.stringify({ env: { AWS_SECRET_ACCESS_KEY: "v" } }));
+      expect(stacks.loginEvidence({ kind: "claude-code", home: h, env: {} } as never)).toBe(false);
+      writeFileSync(
+        path.join(h, "settings.json"),
+        JSON.stringify({ env: { AWS_SECRET_ACCESS_KEY: "v", CLAUDE_CODE_USE_BEDROCK: "1" } }),
+      );
+      expect(stacks.loginEvidence({ kind: "claude-code", home: h, env: {} } as never)).toBeNull();
+    });
   });
 });

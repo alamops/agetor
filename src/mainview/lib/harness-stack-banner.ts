@@ -4,8 +4,9 @@
  * The precedence comes from `harnessStackBannerMode` (pending swap →
  * all-exhausted → recent move). Model: docs/architecture/harness-stacks.md.
  */
-import { harnessMoveNote, harnessStackBannerMode } from "../../shared/harness-stack.ts";
+import { harnessMoveNote, harnessStackBannerMode, memberReasonText } from "../../shared/harness-stack.ts";
 import type { Task } from "../../shared/types.ts";
+import { formatResetClock } from "./stack-badge.ts";
 
 export type HarnessStackBannerView =
   | { kind: "pending"; text: string }
@@ -13,7 +14,16 @@ export type HarnessStackBannerView =
   /** The retry run is live (`inFlight`, or the task is running): no Run now —
    *  a manual run would only bounce off "task already running". */
   | { kind: "retry-running"; text: string }
-  | { kind: "exhausted"; text: string; runNow: true };
+  | {
+      kind: "exhausted";
+      text: string;
+      runNow: true;
+      /** One line per member that can't take the task (`memberReasonText`),
+       *  empty for state written before the reasons were recorded. */
+      reasons: string[];
+      /** The banner links to Settings → Harnesses (where a member is fixed). */
+      openHarnesses: true;
+    };
 
 export function formatCountdown(totalSeconds: number): string {
   const s = Math.max(0, totalSeconds);
@@ -37,7 +47,8 @@ export function harnessStackBannerView(
     return { kind: "pending", text: `Switching to ${labelOf(state.pendingSwap.to)}…` };
   }
   if (mode === "moved" && state?.lastMove) {
-    return { kind: "moved", text: harnessMoveNote(state.lastMove, labelOf(state.lastMove.to)) };
+    const to = labelOf(state.lastMove.to);
+    return { kind: "moved", text: harnessMoveNote(state.lastMove, to) };
   }
   const ex = mode === "exhausted" ? state?.allExhausted : null;
   if (!ex) return null;
@@ -61,12 +72,24 @@ export function harnessStackBannerView(
   // next timer (nextAttemptAt 0) until the run row exists. That is "in
   // progress", not "nothing usable".
   const retrying = targetAt <= 0 && ex.reason !== "no-usable-member" && ex.attempts < ex.max;
-  const text = ex.attempts >= ex.max
+  const earliest = ex.earliestResetAtMs;
+  const resetNote = earliest != null && earliest > 0 && ex.reason !== "no-usable-member"
+    ? ` Next reset around ${formatResetClock(earliest, now)}.`
+    : "";
+  const base = ex.attempts >= ex.max
     ? "Every account in this stack is out of quota — run the task manually after a reset."
     : targetAt > 0
-      ? `Every account in this stack is out of quota — retrying in ${formatCountdown(secondsLeft)} (attempt ${ex.attempts + 1}/${ex.max}).`
+      ? ex.reason === "no-usable-member"
+        ? `No account in this stack can run this task — retrying in ${formatCountdown(secondsLeft)} (attempt ${ex.attempts + 1}/${ex.max}).`
+        : `Every account in this stack is out of quota — retrying in ${formatCountdown(secondsLeft)} (attempt ${ex.attempts + 1}/${ex.max}).`
       : retrying
         ? `Retrying on the next available account (attempt ${ex.attempts + 1}/${ex.max})…`
-        : "No account in this stack can run this task — fix one in Settings → Stacks.";
-  return { kind: "exhausted", text, runNow: true };
+        : "No account in this stack can run this task — fix one in Settings → Harnesses.";
+  return {
+    kind: "exhausted",
+    text: `${base}${resetNote}`,
+    runNow: true,
+    reasons: (ex.memberReasons ?? []).map(memberReasonText),
+    openHarnesses: true,
+  };
 }

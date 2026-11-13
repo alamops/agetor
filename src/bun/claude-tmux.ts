@@ -7734,11 +7734,13 @@ function signalSessionDeath(state: SessionState): void {
       ? `${SESSION_DIED_STATUS_PREFIX}tmux session ${state.sessionName} ended unexpectedly — task blocked`
       // Held-probe-driven death, no active turn: the main run already
       // resolved, so there's no handle for the orchestrator to flip to
-      // `blocked` — the task actually releases to `review`. Say so honestly
-      // instead of reusing the sentinel, which the orchestrator would
-      // otherwise pattern-match into a "blocked" breadcrumb that never
+      // `blocked`. A card held in `running` for the agents releases to
+      // `review`; a failed turn's card (already `blocked`) only has its agent
+      // rows ended. The probe can't tell the two apart, so the line covers
+      // both honestly instead of reusing the sentinel, which the orchestrator
+      // would otherwise pattern-match into a "blocked" breadcrumb that never
       // happens for this path.
-      : `tmux session ${state.sessionName} ended while background agents were running — releasing task`,
+      : `tmux session ${state.sessionName} ended while background agents were running — the background agents were ended (a card held open for them is released)`,
   );
   if (slot && slot.resolve) {
     state.turnQueue.shift();
@@ -7824,13 +7826,16 @@ function signalSubagentApiError(
     // `signalSessionDeath`'s held branch ("say so honestly instead of
     // reusing the sentinel": there's no handle for the orchestrator to flip
     // to `blocked`, so a sentinel here would just lie). Neither in flight
-    // nor held: truly nothing to do.
+    // nor held: truly nothing to do. The probe also answers true for a turn
+    // that failed with its agents still running, whose card is already
+    // `blocked` and never releases to `review`; it can't tell the two apart,
+    // so the line holds for both, like the session-death one.
     if (heldProbeSafe(state.taskId)) {
       const onChunk = state.lastChunk ?? (() => {});
       onChunk(
         "status",
-        `background agent hit an API error (${info.detail}) — it stopped; task releases when `
-          + `remaining agents finish`,
+        `background agent hit an API error (${info.detail}) — it stopped; the other background agents `
+          + `keep running (a card held open for them is released when they finish)`,
       );
     }
     return;

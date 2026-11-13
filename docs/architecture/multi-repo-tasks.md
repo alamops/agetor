@@ -12,7 +12,7 @@ repository").
 The subsystem docs hold the parts of this contract that belong to them:
 [security.md](security.md) (path gate, desktop-only route, workspace-root I/O,
 codex writable roots), [persistence.md](persistence.md) (columns, writers,
-migration 087), [task-lifecycle.md](task-lifecycle.md) (create, start, PATCH,
+migration 091), [task-lifecycle.md](task-lifecycle.md) (create, start, PATCH,
 delete, archive, unarchive, boot sweep), [pipelines.md](pipelines.md) (multi
 parents and steps), [harness-codex.md](harness-codex.md) (sandbox escalation),
 [at-file-references.md](at-file-references.md) and
@@ -47,7 +47,7 @@ interface TaskRepository {
   count fallback keeps an older core's JSON, which has no `multiRepo`, working.
   A count is read directly only where a count is meant (the CLI's "2+
   repositories requested" at create time).
-- **Multi rows** store the JSON in `tasks.repositories` (migration 087): two or
+- **Multi rows** store the JSON in `tasks.repositories` (migration 091): two or
   more entries at creation, and at least one after removals. A one-repository
   multi task keeps the whole multi contract: the workspace-root layout, the
   `Repositories:` launch block, the extra roots, the per-repository tabs, diff,

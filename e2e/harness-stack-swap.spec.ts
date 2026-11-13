@@ -2,7 +2,15 @@ import { Database } from "bun:sqlite";
 import { existsSync, mkdirSync, writeFileSync } from "node:fs";
 import path from "node:path";
 import { test, expect, type APIRequestContext, type E2EBackend, type Locator, type Page } from "./fixtures";
-import { gotoApp } from "./helpers";
+import {
+  bearerHeaders,
+  createStackAccount,
+  createStackViaApi,
+  gotoApp,
+  openSettingsGeneral,
+  queryBackendScalar,
+  seedLimitState,
+} from "./helpers";
 
 /**
  * End-to-end harness-stack failover (TT8): two fake Claude accounts, a task
@@ -269,9 +277,258 @@ test.describe("harness-stack swap", () => {
     await page.getByRole("button", { name: "Settings", exact: true }).click();
     const dialog = page.getByRole("dialog");
     await dialog.getByRole("button", { name: "Harnesses", exact: true }).click();
-    const coolingChip = dialog.getByTestId("harness-cooling-chip").first();
+    // Scoped to this test's stack: earlier tests leave their own cooling chips.
+    const coolingChip = dialog
+      .getByTestId("harness-stack-row")
+      .filter({ hasText: "e2e cooling" })
+      .getByTestId("harness-cooling-chip");
     await expect(coolingChip).toBeVisible();
-    await expect(coolingChip).toHaveAttribute("title", /^Cooling until /);
+    // The chip's visible text carries the reset; its `title` is the provider's
+    // own message ("usage limit", as seeded), its aria-label the full sentence.
+    await expect(coolingChip).toContainText(/until /);
+    await expect(coolingChip).toHaveAttribute("aria-label", /^Cooling: .*until /);
+    await expect(coolingChip).toHaveAttribute("title", "usage limit");
+  });
+});
+
+
+/* ───────────────────────── TT11: exhausted / retry / codex ───────────────────────── */
+
+const CODEX_LIMIT_MARKER = "__agetor_fake_codex_limit__";
+const HOUR_MS = 3_600_000;
+
+interface TaskView {
+  id: string;
+  column: string;
+  agent: string;
+  harnessState: {
+    allExhausted?: {
+      attempts: number;
+      nextAttemptAt: number;
+      inFlight?: boolean;
+      memberReasons?: Array<{ harnessId: string; label: string; reason: string }>;
+    } | null;
+    lastMove?: unknown;
+  } | null;
+}
+
+async function getTask(backend: E2EBackend, taskId: string): Promise<TaskView> {
+  const res = await fetch(`${backend.apiBase}/tasks/${taskId}`, { headers: auth(backend) });
+  if (!res.ok) throw new Error(`GET /tasks/${taskId} -> ${res.status}`);
+  return (await res.json()) as TaskView;
+}
+
+/** Poll the API until `pred(task)` holds — a real-state wait, not a sleep. */
+async function waitForTask(
+  backend: E2EBackend,
+  taskId: string,
+  what: string,
+  pred: (t: TaskView) => boolean,
+  timeoutMs = 20_000,
+): Promise<TaskView> {
+  const deadline = Date.now() + timeoutMs;
+  let last: TaskView | null = null;
+  while (Date.now() < deadline) {
+    last = await getTask(backend, taskId);
+    if (pred(last)) return last;
+    await new Promise((r) => setTimeout(r, 200));
+  }
+  throw new Error(`task ${taskId} never reached "${what}" (last column=${last?.column}, state=${JSON.stringify(last?.harnessState)})`);
+}
+
+async function makeTask(
+  backend: E2EBackend,
+  opts: { agent: string; title: string; prompt: string; model?: string },
+): Promise<string> {
+  const res = await fetch(`${backend.apiBase}/tasks`, {
+    method: "POST",
+    headers: bearerHeaders(backend),
+    body: JSON.stringify({
+      title: opts.title,
+      prompt: opts.prompt,
+      agent: opts.agent,
+      workdir: backend.dataDir,
+      isolation: "none",
+      ...(opts.model ? { model: opts.model } : {}),
+    }),
+  });
+  if (!res.ok) throw new Error(`POST /tasks -> ${res.status}: ${await res.text()}`);
+  return ((await res.json()) as { id: string }).id;
+}
+
+async function startTaskApi(backend: E2EBackend, taskId: string): Promise<void> {
+  const res = await fetch(`${backend.apiBase}/tasks/${taskId}/start`, { method: "POST", headers: auth(backend) });
+  if (!res.ok) throw new Error(`POST /tasks/${taskId}/start -> ${res.status}: ${await res.text()}`);
+}
+
+/** Two accounts + a stack, the backup cooling until `backupCoolsForMs` from now. */
+async function exhaustedSetup(
+  backend: E2EBackend,
+  tag: string,
+  backupCoolsForMs: number,
+): Promise<{ a: string; b: string; stackId: string; taskId: string; title: string }> {
+  const a = `e2e-ex-a-${tag}`;
+  const b = `e2e-ex-b-${tag}`;
+  await createStackAccount(backend, a);
+  await createStackAccount(backend, b);
+  const stack = await createStackViaApi(backend, `e2e ex ${tag}`, "claude-code", [a, b]);
+  seedLimitState(backend, { harnessId: b, untilMs: Date.now() + backupCoolsForMs, message: "Weekly limit reached" });
+  const title = `exhausted ${tag}`;
+  const taskId = await makeTask(backend, { agent: a, title, prompt: `go ${LIMIT_MARKER}`, model: "sonnet-4.6" });
+  await startTaskApi(backend, taskId);
+  await waitForTask(backend, taskId, "all-exhausted", (t) => t.harnessState?.allExhausted != null && t.column !== "running");
+  return { a, b, stackId: stack.id, taskId, title };
+}
+
+async function panelFor(page: Page, title: string): Promise<Locator> {
+  return openTask(page, title);
+}
+
+test.describe("harness-stack all-exhausted banner", () => {
+  test("shows the earliest reset, each member's reason and an Open Harnesses link; Run now starts once", async ({ page, backend }) => {
+    const tag = `${Date.now()}`;
+    const { a, b, stackId, taskId, title } = await exhaustedSetup(backend, tag, 2 * HOUR_MS);
+    createdHarnessIds.push(a, b);
+    createdStackIds.push(stackId);
+    createdTaskIds.push(taskId);
+
+    await gotoApp(page, backend.bootBase);
+    const panel = await panelFor(page, title);
+    const banner = panel.getByTestId("harness-stack-exhausted");
+    await expect(banner).toBeVisible();
+    await expect(banner).toContainText("Every account in this stack is out of quota");
+    await expect(banner).toContainText("retrying in");
+    await expect(banner).toContainText("Next reset around");
+    // One line per member that can't take the task, naming the account.
+    const reasons = panel.getByTestId("harness-stack-member-reasons").locator("li");
+    await expect(reasons.filter({ hasText: a })).toHaveCount(1);
+    await expect(reasons.filter({ hasText: b })).toHaveCount(1);
+
+    // Open Harnesses lands on Settings → Harnesses (where a member is fixed).
+    await panel.getByTestId("harness-stack-open-harnesses").click();
+    const dialog = page.getByRole("dialog").filter({ has: page.getByRole("heading", { name: "Settings" }) });
+    await expect(dialog.getByTestId("harness-stacks-section")).toBeVisible();
+    await dialog.getByRole("button", { name: "Close", exact: true }).click();
+    await expect(dialog).toBeHidden();
+
+    // Run now: a double click must start the task exactly once, with no error toast.
+    const before = runsOf(backend, taskId).length;
+    await panel.getByTestId("harness-stack-run-now").dblclick();
+    await expect
+      .poll(async () => (await getTask(backend, taskId)).column, { timeout: 20_000 })
+      .toMatch(/review|done/);
+    expect(runsOf(backend, taskId).length).toBe(before + 1);
+    await expect(panel.getByTestId("harness-stack-exhausted")).toHaveCount(0);
+    await expect(page.locator("[data-sonner-toast]").filter({ hasText: /already running|couldn't|failed/i })).toHaveCount(0);
+  });
+
+  test("deleting the stack during an armed retry clears the banner and leaves a status line", async ({ page, backend }) => {
+    const tag = `del-${Date.now()}`;
+    const { a, b, stackId, taskId, title } = await exhaustedSetup(backend, tag, 2 * HOUR_MS);
+    createdHarnessIds.push(a, b);
+    createdTaskIds.push(taskId);
+
+    await gotoApp(page, backend.bootBase);
+    const panel = await panelFor(page, title);
+    await expect(panel.getByTestId("harness-stack-exhausted")).toBeVisible();
+
+    const del = await fetch(`${backend.apiBase}/harness-stacks/${stackId}`, { method: "DELETE", headers: auth(backend) });
+    expect(del.status).toBe(200);
+
+    await expect(panel.getByTestId("harness-stack-exhausted")).toHaveCount(0);
+    expect((await getTask(backend, taskId)).harnessState?.allExhausted ?? null).toBeNull();
+    const line = "automatic account retry cancelled — the stack was deleted";
+    const lastRun = runsOf(backend, taskId).at(-1)!;
+    expect(statusLines(backend, lastRun.id)).toContain(line);
+    await expect(panel.getByText(line)).toBeVisible();
+  });
+});
+
+test.describe("harness-stack retry run", () => {
+  // Hold every ordinary claude turn open so the retry run is observably live.
+  test.use({ backendEnv: { AGETOR_FAKE_CLAUDE_TURN_MS: "20000" } });
+  test.setTimeout(90_000);
+
+  test("while the retry run is live the banner reads Running on <account> after a quota reset, with no Run now", async ({
+    page,
+    freshBackend: backend,
+  }) => {
+    const tag = `${Date.now()}`;
+    // All-exhausted first (the backup cools for two hours), then the user
+    // clears that cooldown: the waiting task is re-armed a short backoff out
+    // (AGETOR_HARNESS_RETRY_MIN_MS) and its retry runs on the backup.
+    const { b, taskId, title } = await exhaustedSetup(backend, tag, 2 * HOUR_MS);
+    const cleared = await fetch(`${backend.apiBase}/harnesses/${b}/limit-state`, { method: "DELETE", headers: auth(backend) });
+    expect(cleared.status).toBe(200);
+    expect(((await cleared.json()) as { rearmed: number }).rearmed).toBe(1);
+
+    const live = await waitForTask(
+      backend,
+      taskId,
+      "retry run live",
+      (t) => t.column === "running" && t.harnessState?.allExhausted?.inFlight === true,
+      30_000,
+    );
+    expect(live.agent).toBe(b);
+
+    await gotoApp(page, backend.bootBase);
+    const panel = await panelFor(page, title);
+    const banner = panel.getByTestId("harness-stack-retry-running");
+    await expect(banner).toBeVisible();
+    await expect(banner).toContainText("after a quota reset");
+    await expect(banner).toContainText(/attempt \d\/3/);
+    // A manual run would only bounce off "task already running".
+    await expect(panel.getByTestId("harness-stack-run-now")).toHaveCount(0);
+    await expect(panel.getByTestId("harness-stack-exhausted")).toHaveCount(0);
+  });
+});
+
+test.describe("harness-stack codex swap", () => {
+  test.use({ backendEnv: { AGETOR_E2E_CODEX_STUB: "1" } });
+  test.setTimeout(90_000);
+
+  test("a Codex usage limit moves the task to the backup account on the fake Codex driver", async ({
+    page,
+    freshBackend: backend,
+  }) => {
+    const tag = `${Date.now()}`;
+    const a = `e2e-cx-a-${tag}`;
+    const b = `e2e-cx-b-${tag}`;
+    const rootA = await createStackAccount(backend, a, "codex");
+    await createStackAccount(backend, b, "codex");
+    const stack = await createStackViaApi(backend, `e2e codex ${tag}`, "codex", [a, b]);
+    const title = `codex swap ${tag}`;
+    const taskId = await makeTask(backend, { agent: a, title, prompt: `go ${CODEX_LIMIT_MARKER}` });
+    // The fake driver reports the thread id `fake-codex-thread-<task>` at spawn
+    // but, unlike real codex, writes no rollout file. The session transfer
+    // needs one under the account's CODEX_HOME, so plant it where codex would.
+    const thread = `fake-codex-thread-${taskId}`;
+    const rolloutDir = path.join(rootA, "sessions", "2026", "11", "08");
+    mkdirSync(rolloutDir, { recursive: true });
+    writeFileSync(
+      path.join(rolloutDir, `rollout-2026-11-08T00-00-00-${thread}.jsonl`),
+      `${JSON.stringify({ type: "session_meta", payload: { id: thread } })}\n`,
+    );
+    await startTaskApi(backend, taskId);
+
+    const settled = await waitForTask(backend, taskId, "swapped and settled", (t) => t.agent === b && t.column !== "running", 30_000);
+    expect(["review", "done"]).toContain(settled.column);
+    const runs = runsOf(backend, taskId);
+    expect(runs.length).toBe(2);
+    expect(runs[0]!.agent).toBe(a);
+    expect(runs[0]!.status).toBe("failed");
+    expect(runs[1]!.agent).toBe(b);
+    expect(runs[1]!.origin).toBe("harness-swap");
+    expect(
+      queryBackendScalar(backend, "SELECT COUNT(*) AS n FROM harness_swap_events WHERE stack_id = ? AND trigger = 'limit'", [stack.id]),
+    ).toBe(1);
+
+    await gotoApp(page, backend.bootBase);
+    const panel = await panelFor(page, title);
+    const divider = panel.getByTestId("harness-swap-divider");
+    await expect(divider).toBeVisible();
+    await expect(divider).toContainText(`Switched to ${b}`);
+    await expect(divider).toContainText("(2/2)");
   });
 });
 

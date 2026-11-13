@@ -1,6 +1,6 @@
 // Provider-session transfer (T05/T12): Claude transcript + sidecars, Codex
 // rollout, handoff recording, cleanup and unsafe-source refusal.
-import { afterAll, beforeAll, describe, expect, test } from "bun:test";
+import { afterAll, afterEach, beforeAll, describe, expect, spyOn, test } from "bun:test";
 import { randomUUID } from "node:crypto";
 import {
   chmodSync,
@@ -11,6 +11,7 @@ import {
   readdirSync,
   readFileSync,
   realpathSync,
+  rmSync,
   statSync,
   symlinkSync,
   writeFileSync,
@@ -25,6 +26,7 @@ let dbm: Db;
 let transfer: typeof import("./harness-session-transfer.ts");
 let claudeTmux: typeof import("./claude-tmux.ts");
 let fileTransfer: typeof import("./harness-file-transfer.ts");
+let configRoot: typeof import("./harness-config-root.ts");
 let restore: () => void;
 
 beforeAll(async () => {
@@ -32,17 +34,42 @@ beforeAll(async () => {
   transfer = await import("./harness-session-transfer.ts");
   claudeTmux = await import("./claude-tmux.ts");
   fileTransfer = await import("./harness-file-transfer.ts");
+  configRoot = await import("./harness-config-root.ts");
   const { snapshotHarnessState } = await import("./test-harness-state.ts");
   restore = snapshotHarnessState();
 });
 
-afterAll(() => restore());
+// Every folder this file creates (account homes, roots, "outside" targets),
+// removed once the file is done.
+const homes: string[] = [];
+
+function tempDir(prefix: string): string {
+  const dir = mkdtempSync(path.join(tmpdir(), prefix));
+  homes.push(dir);
+  return dir;
+}
+
+afterEach(() => transfer.resetOrphanSweepPauseForTests());
+
+afterAll(async () => {
+  await transfer.orphanSweepsSettled();
+  restore();
+  for (const home of homes) {
+    try {
+      // A test may leave a folder read-only on a failure path.
+      chmodSync(home, 0o700);
+      rmSync(home, { recursive: true, force: true });
+    } catch {
+      // best effort
+    }
+  }
+});
 
 let seq = 0;
 function alias(kind: "claude-code" | "codex"): { id: string; home: string } {
   seq++;
   const id = `${kind === "codex" ? "ctx" : "clt"}-${seq}`;
-  const home = mkdtempSync(path.join(tmpdir(), `agetor-${id}-`));
+  const home = tempDir(`agetor-${id}-`);
   dbm.harnesses.insert({ id, kind, label: id, home, env: {} } as never);
   return { id, home };
 }
@@ -123,8 +150,8 @@ describe("claudeSessionTransfer", () => {
   test("an env CLAUDE_CONFIG_DIR override is the transfer root, not the home field", async () => {
     const from = alias("claude-code");
     const to = alias("claude-code");
-    const fromRoot = mkdtempSync(path.join(tmpdir(), "agetor-xfer-env-from-"));
-    const toRoot = mkdtempSync(path.join(tmpdir(), "agetor-xfer-env-to-"));
+    const fromRoot = tempDir("agetor-xfer-env-from-");
+    const toRoot = tempDir("agetor-xfer-env-to-");
     dbm.harnesses.update(from.id, { env: { CLAUDE_CONFIG_DIR: fromRoot } });
     dbm.harnesses.update(to.id, { env: { CLAUDE_CONFIG_DIR: toRoot } });
     const cwd = "/tmp/agetor-env-cwd";
@@ -152,7 +179,7 @@ describe("claudeSessionTransfer", () => {
     const to = alias("claude-code");
     const cwd = "/tmp/agetor-linked-parent";
     const column = claudeTmux.encodeProjectPath(cwd);
-    const outside = mkdtempSync(path.join(tmpdir(), "agetor-xfer-parent-"));
+    const outside = tempDir("agetor-xfer-parent-");
     const sessionId = "33333333-3333-4333-8333-333333333333";
     write(path.join(outside, "projects", column, `${sessionId}.jsonl`), "outside transcript");
     // The leaf looks like a regular file inside the account when only the
@@ -230,8 +257,8 @@ describe("codexSessionTransfer", () => {
   test("an env CODEX_HOME override is the transfer root, not <home>/.codex", async () => {
     const from = alias("codex");
     const to = alias("codex");
-    const fromRoot = mkdtempSync(path.join(tmpdir(), "agetor-xfer-codex-env-from-"));
-    const toRoot = mkdtempSync(path.join(tmpdir(), "agetor-xfer-codex-env-to-"));
+    const fromRoot = tempDir("agetor-xfer-codex-env-from-");
+    const toRoot = tempDir("agetor-xfer-codex-env-to-");
     dbm.harnesses.update(from.id, { env: { CODEX_HOME: fromRoot } });
     dbm.harnesses.update(to.id, { env: { CODEX_HOME: toRoot } });
     const thread = "55555555-5555-4555-8555-555555555555";
@@ -278,7 +305,7 @@ describe("codex rollout projection migration (T12)", () => {
   }
 
   function fakeCodex(body: string): string {
-    const dir = mkdtempSync(path.join(tmpdir(), "agetor-fake-codex-"));
+    const dir = tempDir("agetor-fake-codex-");
     const bin = path.join(dir, "codex");
     writeFileSync(bin, `#!/bin/sh\n${body}\n`);
     chmodSync(bin, 0o755);
@@ -294,7 +321,7 @@ describe("codex rollout projection migration (T12)", () => {
 
   test("runs codex migrate-rollouts against the destination CODEX_HOME when a stale projection exists (Q2)", async () => {
     const from = alias("codex");
-    const toHome = mkdtempSync(path.join(tmpdir(), "agetor-xfer-migrate-to-"));
+    const toHome = tempDir("agetor-xfer-migrate-to-");
     const marker = path.join(toHome, "migration.log");
     const bin = fakeCodex(`printf '%s\\n%s\\n' "$CODEX_HOME" "$*" > "${marker}"`);
     const toId = codexAccountWithBin(toHome, bin, { CODEX_HOME: toHome });
@@ -326,7 +353,7 @@ describe("codex rollout projection migration (T12)", () => {
 
   test("a failing migration keeps the transfer and surfaces the exit code as a warning", async () => {
     const from = alias("codex");
-    const toHome = mkdtempSync(path.join(tmpdir(), "agetor-xfer-migrate-fail-"));
+    const toHome = tempDir("agetor-xfer-migrate-fail-");
     const bin = fakeCodex("exit 9");
     const toId = codexAccountWithBin(toHome, bin);
     const thread = "77777777-7777-4777-8777-777777777777";
@@ -353,8 +380,8 @@ describe("codex rollout projection migration (T12)", () => {
 
   test("a migration that cannot spawn is a warning, not a lost conversation", async () => {
     const from = alias("codex");
-    const toHome = mkdtempSync(path.join(tmpdir(), "agetor-xfer-migrate-missing-"));
-    const missing = path.join(mkdtempSync(path.join(tmpdir(), "agetor-missing-bin-")), "codex");
+    const toHome = tempDir("agetor-xfer-migrate-missing-");
+    const missing = path.join(tempDir("agetor-missing-bin-"), "codex");
     const toId = codexAccountWithBin(toHome, missing);
     const thread = "88888888-8888-4888-8888-888888888888";
     seedRollout(from.home, thread);
@@ -377,7 +404,7 @@ describe("codex rollout projection migration (T12)", () => {
 
   test("an account with only an env-map HOME migrates <HOME>/.codex, never the real ~/.codex (review R-S11)", async () => {
     const from = alias("codex");
-    const envHome = mkdtempSync(path.join(tmpdir(), "agetor-xfer-migrate-envhome-"));
+    const envHome = tempDir("agetor-xfer-migrate-envhome-");
     const codexHome = path.join(envHome, ".codex");
     const marker = path.join(envHome, "migration.log");
     const bin = fakeCodex(`printf '%s\\n' "$CODEX_HOME" > "${marker}"`);
@@ -415,7 +442,7 @@ describe("codex rollout projection migration (T12)", () => {
 
   test("a destination without a projection database runs no migration process", async () => {
     const from = alias("codex");
-    const toHome = mkdtempSync(path.join(tmpdir(), "agetor-xfer-migrate-absent-"));
+    const toHome = tempDir("agetor-xfer-migrate-absent-");
     const marker = path.join(toHome, "should-not-exist.log");
     const bin = fakeCodex(`printf ran > "${marker}"`);
     const toId = codexAccountWithBin(toHome, bin);
@@ -528,7 +555,7 @@ describe("collectHarnessSessionCopies / removeHarnessSessionCopies (harness dele
     const taskId = seedTask(`task-harness-delete-${seq}`);
     const inside = path.join(to.home, "projects", "p", "s.jsonl");
     write(inside, "{}\n");
-    const outsideDir = mkdtempSync(path.join(tmpdir(), "agetor-outside-"));
+    const outsideDir = tempDir("agetor-outside-");
     const outside = path.join(outsideDir, "keep.jsonl");
     write(outside, "keep\n");
     // A planted row naming the account's own config is not a handoff shape.
@@ -658,7 +685,7 @@ describe("transfer safety (review S5, S27, contract C5)", () => {
     const enc = claudeTmux.encodeProjectPath(cwd);
     const sessionId = "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa";
     write(path.join(from.home, "projects", enc, `${sessionId}.jsonl`), "mine");
-    const linkParent = mkdtempSync(path.join(tmpdir(), "agetor-xfer-alias-"));
+    const linkParent = tempDir("agetor-xfer-alias-");
     symlinkSync(from.home, path.join(linkParent, "home"));
     dbm.harnesses.update(to.id, { home: path.join(linkParent, "home") });
     const claude = await transfer.claudeSessionTransfer.transfer({
@@ -677,7 +704,7 @@ describe("transfer safety (review S5, S27, contract C5)", () => {
     const cto = alias("codex");
     const thread = "bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb";
     write(path.join(cfrom.home, ".codex", "sessions", "2026", "11", "08", `rollout-x-${thread}.jsonl`), "r");
-    const codexLinkParent = mkdtempSync(path.join(tmpdir(), "agetor-xfer-alias-codex-"));
+    const codexLinkParent = tempDir("agetor-xfer-alias-codex-");
     symlinkSync(path.join(cfrom.home, ".codex"), path.join(codexLinkParent, "codex-home"));
     dbm.harnesses.update(cto.id, { env: { CODEX_HOME: path.join(codexLinkParent, "codex-home") } });
     const codex = await transfer.codexSessionTransfer.transfer({
@@ -699,7 +726,7 @@ describe("transfer safety (review S5, S27, contract C5)", () => {
     const enc = claudeTmux.encodeProjectPath(cwd);
     const sessionId = "cccccccc-cccc-4ccc-8ccc-cccccccccccc";
     write(path.join(from.home, "projects", enc, `${sessionId}.jsonl`), "t");
-    const outside = mkdtempSync(path.join(tmpdir(), "agetor-sidecar-outside-"));
+    const outside = tempDir("agetor-sidecar-outside-");
     write(path.join(outside, "secret.txt"), "OUTSIDE-SECRET");
     write(path.join(outside, "dir", "inner.txt"), "OUTSIDE-DIR");
     const sub = path.join(from.home, "projects", enc, sessionId, "subagents");
@@ -743,7 +770,7 @@ describe("transfer safety (review S5, S27, contract C5)", () => {
     const sessionId = "dddddddd-dddd-4ddd-8ddd-dddddddddddd";
     write(path.join(from.home, "projects", enc, `${sessionId}.jsonl`), "t");
     write(path.join(from.home, "projects", enc, sessionId, "subagents", "a.jsonl"), "a");
-    const outside = mkdtempSync(path.join(tmpdir(), "agetor-dest-projects-outside-"));
+    const outside = tempDir("agetor-dest-projects-outside-");
     symlinkSync(outside, path.join(to.home, "projects"));
     const taskId = seedTask(`task-dest-link-${seq}`);
 
@@ -756,7 +783,7 @@ describe("transfer safety (review S5, S27, contract C5)", () => {
     });
     expect(result.ok).toBe(false);
     if (result.ok) return;
-    expect(result.reason).toBe("io");
+    expect(result.reason).toBe("unsafe-source");
     expect(readdirSync(outside)).toEqual([]);
     expect(dbm.harnessSessionHandoffs.get(taskId, to.id, "claude_session_id")).toBeNull();
   });
@@ -798,9 +825,367 @@ describe("transfer safety (review S5, S27, contract C5)", () => {
   });
 });
 
+describe("transfer completeness and cleanup (fix round T4)", () => {
+  const cwd = "/tmp/agetor-t4-cwd";
+  const sid = "55555555-5555-4555-8555-555555555555";
+  const run = (from: { id: string }, to: { id: string }, taskId: string, c = cwd, s = sid) =>
+    transfer.claudeSessionTransfer.transfer({
+      taskId,
+      fromHarness: dbm.harnesses.get(from.id)!,
+      toHarness: dbm.harnesses.get(to.id)!,
+      sessionId: s,
+      cwd: c,
+    });
+
+  test("a transcript over the old 64 MB cap copies, with file-history and sidecar warnings", async () => {
+    const from = alias("claude-code");
+    const to = alias("claude-code");
+    const column = claudeTmux.encodeProjectPath(cwd);
+    const src = path.join(from.home, "projects", column, `${sid}.jsonl`);
+    mkdirSync(path.dirname(src), { recursive: true });
+    writeFileSync(src, Buffer.alloc(65 * 1024 * 1024, 97));
+    write(path.join(from.home, "file-history", sid, "abc@v1"), "checkpoint");
+    write(path.join(from.home, "file-history", "other-sid", "zzz@v1"), "not mine");
+    const taskId = seedTask(`t4-big-${seq}`);
+    const result = await run(from, to, taskId);
+    expect(result.ok).toBe(true);
+    expect(statSync(path.join(to.home, "projects", column, `${sid}.jsonl`)).size).toBe(65 * 1024 * 1024);
+    expect(readFileSync(path.join(to.home, "file-history", sid, "abc@v1"), "utf8")).toBe("checkpoint");
+    expect(existsSync(path.join(to.home, "file-history", "other-sid"))).toBe(false);
+    await transfer.cleanupHarnessSessionCopies(taskId);
+    expect(existsSync(path.join(to.home, "file-history", sid))).toBe(false);
+    expect(existsSync(path.join(to.home, "file-history"))).toBe(true);
+  });
+
+  test("a transcript in a hashed (long-path) project dir is found by session id", async () => {
+    const from = alias("claude-code");
+    const to = alias("claude-code");
+    const hashed = `${"-x".repeat(100)}-epaaob`;
+    write(path.join(from.home, "projects", hashed, `${sid}.jsonl`), "long");
+    const taskId = seedTask(`t4-long-${seq}`);
+    const result = await run(from, to, taskId, `/${"x/".repeat(150)}`);
+    expect(result.ok).toBe(true);
+    expect(readFileSync(path.join(to.home, "projects", hashed, `${sid}.jsonl`), "utf8")).toBe("long");
+  });
+
+  test("a symlinked projects dir is refused before the leaf is stat'ed", async () => {
+    const from = alias("claude-code");
+    const to = alias("claude-code");
+    const outside = tempDir("agetor-t4-out-");
+    symlinkSync(outside, path.join(from.home, "projects"));
+    const taskId = seedTask(`t4-link-${seq}`);
+    const result = await run(from, to, taskId);
+    expect(result.ok).toBe(false);
+    if (!result.ok) expect(result.reason).toBe("unsafe-source");
+  });
+
+  test("the destination paths are recorded before the copy, so a re-run after a crash still cleans up", async () => {
+    const from = alias("claude-code");
+    const to = alias("claude-code");
+    const column = claudeTmux.encodeProjectPath(cwd);
+    write(path.join(from.home, "projects", column, `${sid}.jsonl`), "t");
+    const taskId = seedTask(`t4-crash-${seq}`);
+    // Simulate the crash: the file exists at the destination, but no row.
+    const dest = path.join(to.home, "projects", column, `${sid}.jsonl`);
+    write(dest, "orphan");
+    expect(dbm.harnessSessionHandoffs.get(taskId, to.id, "claude_session_id")).toBeNull();
+    // A pre-recorded row (what the new code writes before copying) is enough.
+    dbm.harnessSessionHandoffs.upsert({
+      taskId, harnessId: to.id, columnName: "claude_session_id", sessionId: sid, copiedPaths: [dest], createdAt: 0,
+    });
+    await transfer.cleanupHarnessSessionCopies(taskId);
+    expect(existsSync(dest)).toBe(false);
+  });
+
+  test("a changed account root keeps the row and warns; restoring the root cleans up", async () => {
+    const from = alias("claude-code");
+    const to = alias("claude-code");
+    const column = claudeTmux.encodeProjectPath(cwd);
+    write(path.join(from.home, "projects", column, `${sid}.jsonl`), "t");
+    const taskId = seedTask(`t4-root-${seq}`);
+    expect((await run(from, to, taskId)).ok).toBe(true);
+    const dest = path.join(to.home, "projects", column, `${sid}.jsonl`);
+    const other = tempDir("agetor-t4-newroot-");
+    dbm.harnesses.update(to.id, { home: other });
+    const warnings = await transfer.cleanupHarnessSessionCopies(taskId);
+    expect(warnings.length).toBe(1);
+    expect(existsSync(dest)).toBe(true);
+    expect(dbm.harnessSessionHandoffs.get(taskId, to.id, "claude_session_id")).not.toBeNull();
+    dbm.harnesses.update(to.id, { home: to.home });
+    expect(await transfer.cleanupHarnessSessionCopies(taskId)).toEqual([]);
+    expect(existsSync(dest)).toBe(false);
+    expect(dbm.harnessSessionHandoffs.get(taskId, to.id, "claude_session_id")).toBeNull();
+  });
+
+  test("a symlinked projects dir on the DESTINATION is refused and nothing lands in its target", async () => {
+    const from = alias("claude-code");
+    const to = alias("claude-code");
+    const column = claudeTmux.encodeProjectPath(cwd);
+    write(path.join(from.home, "projects", column, `${sid}.jsonl`), "t");
+    write(path.join(from.home, "file-history", sid, "abc@v1"), "c");
+    const outside = tempDir("agetor-t4-dest-out-");
+    symlinkSync(outside, path.join(to.home, "projects"));
+    symlinkSync(outside, path.join(to.home, "file-history"));
+    const taskId = seedTask(`t4-destlink-${seq}`);
+    const result = await run(from, to, taskId);
+    expect(result.ok).toBe(false);
+    if (!result.ok) expect(result.reason).toBe("unsafe-source");
+    expect(readdirSync(outside)).toEqual([]);
+    expect(dbm.harnessSessionHandoffs.get(taskId, to.id, "claude_session_id")).toBeNull();
+    expect(fileTransfer.destinationState(to.home, path.join(to.home, "file-history", sid, "abc@v1"))).toBe("unsafe");
+    expect(await fileTransfer.planTreeDestinations(path.join(from.home, "file-history", sid), path.join(to.home, "file-history", sid), { root: to.home })).toEqual([]);
+  });
+
+  test("a pre-recorded (createdAt 0) row is never resumed; a superseded session is cleaned only after the new copy", async () => {
+    const from = alias("claude-code");
+    const to = alias("claude-code");
+    const column = claudeTmux.encodeProjectPath(cwd);
+    const taskId = seedTask(`t4-super-${seq}`);
+    dbm.harnessSessionHandoffs.upsert({
+      taskId, harnessId: to.id, columnName: "claude_session_id", sessionId: sid, copiedPaths: [], createdAt: 0,
+    });
+    expect(transfer.findSessionIdForHarness(taskId, "claude_session_id", to.id)).toBeNull();
+
+    const oldSid = "66666666-6666-4666-8666-666666666666";
+    write(path.join(from.home, "projects", column, `${oldSid}.jsonl`), "old");
+    expect((await run(from, to, taskId, cwd, oldSid)).ok).toBe(true);
+    const oldDest = path.join(to.home, "projects", column, `${oldSid}.jsonl`);
+    // New session whose source is missing: the transfer fails, the old copy stays.
+    expect((await run(from, to, taskId)).ok).toBe(false);
+    expect(existsSync(oldDest)).toBe(true);
+    write(path.join(from.home, "projects", column, `${sid}.jsonl`), "new");
+    expect((await run(from, to, taskId)).ok).toBe(true);
+    // The superseded session's sweep is fired once the transfer let go.
+    await transfer.orphanSweepsSettled();
+    expect(existsSync(oldDest)).toBe(false);
+    expect(readFileSync(path.join(to.home, "projects", column, `${sid}.jsonl`), "utf8")).toBe("new");
+    await transfer.cleanupHarnessSessionCopies(taskId);
+  });
+
+  test("a planted row naming another session's transcript deletes nothing", async () => {
+    const to = alias("claude-code");
+    const column = claudeTmux.encodeProjectPath(cwd);
+    const victim = path.join(to.home, "projects", column, "99999999-9999-4999-8999-999999999999.jsonl");
+    write(victim, "keep me");
+    const taskId = seedTask(`t4-plant-${seq}`);
+    dbm.harnessSessionHandoffs.upsert({
+      taskId, harnessId: to.id, columnName: "claude_session_id", sessionId: sid, copiedPaths: [victim], createdAt: 1,
+    });
+    await transfer.cleanupHarnessSessionCopies(taskId);
+    expect(readFileSync(victim, "utf8")).toBe("keep me");
+  });
+});
+
+describe("TT-B: fix-round transfer regressions", () => {
+  const cwd = "/tmp/agetor-ttb-cwd";
+  const sid = "77777777-7777-4777-8777-777777777777";
+  const run = (from: { id: string }, to: { id: string }, taskId: string, s = sid) =>
+    transfer.claudeSessionTransfer.transfer({
+      taskId,
+      fromHarness: dbm.harnesses.get(from.id)!,
+      toHarness: dbm.harnesses.get(to.id)!,
+      sessionId: s,
+      cwd,
+    });
+
+  test("the destination paths are recorded BEFORE any byte is copied (createdAt 0), then re-stamped after", async () => {
+    const from = alias("claude-code");
+    const to = alias("claude-code");
+    const column = claudeTmux.encodeProjectPath(cwd);
+    write(path.join(from.home, "projects", column, `${sid}.jsonl`), "t");
+    write(path.join(from.home, "projects", column, sid, "subagents", "agent-1.jsonl"), "sub");
+    const taskId = seedTask(`ttb-pre-${seq}`);
+    const dest = path.join(to.home, "projects", column, `${sid}.jsonl`);
+    const store = dbm.harnessSessionHandoffs;
+    const realUpsert = store.upsert.bind(store);
+    const calls: { createdAt: number; paths: string[]; transcriptExisted: boolean; sidecarExisted: boolean }[] = [];
+    store.upsert = ((h: Parameters<typeof realUpsert>[0]) => {
+      calls.push({
+        createdAt: h.createdAt,
+        paths: [...h.copiedPaths],
+        transcriptExisted: existsSync(dest),
+        sidecarExisted: existsSync(path.join(to.home, "projects", column, sid)),
+      });
+      return realUpsert(h);
+    }) as typeof store.upsert;
+    try {
+      expect((await run(from, to, taskId)).ok).toBe(true);
+    } finally {
+      store.upsert = realUpsert;
+    }
+    expect(calls.length).toBeGreaterThanOrEqual(2);
+    const first = calls[0]!;
+    expect(first).toMatchObject({ createdAt: 0, transcriptExisted: false, sidecarExisted: false });
+    expect(first.paths).toContain(dest);
+    expect(first.paths).toContain(path.join(to.home, "projects", column, sid, "subagents", "agent-1.jsonl"));
+    expect(calls[calls.length - 1]!.createdAt).toBeGreaterThan(0);
+    await transfer.cleanupHarnessSessionCopies(taskId);
+  });
+
+  test("a superseded session's copy survives a new transfer that fails at the copy step, and is removed once one succeeds", async () => {
+    const from = alias("claude-code");
+    const to = alias("claude-code");
+    const column = claudeTmux.encodeProjectPath(cwd);
+    const oldSid = "99999999-0000-4000-8000-000000000001";
+    const taskId = seedTask(`ttb-super-${seq}`);
+    write(path.join(from.home, "projects", column, `${oldSid}.jsonl`), "old");
+    expect((await run(from, to, taskId, oldSid)).ok).toBe(true);
+    const oldDest = path.join(to.home, "projects", column, `${oldSid}.jsonl`);
+    // The new session's source exists but its destination path is a directory.
+    write(path.join(from.home, "projects", column, `${sid}.jsonl`), "new");
+    mkdirSync(path.join(to.home, "projects", column, `${sid}.jsonl`), { recursive: true });
+    expect((await run(from, to, taskId)).ok).toBe(false);
+    expect(readFileSync(oldDest, "utf8")).toBe("old");
+    expect(dbm.harnessSessionHandoffs.get(taskId, to.id, "claude_session_id")?.sessionId).toBe(oldSid);
+    expect(dbm.harnessSessionHandoffs.get(taskId, to.id, "claude_session_id")?.copiedPaths).toContain(oldDest);
+    // Clear the blocker: the retry succeeds and only then is the old copy removed.
+    rmSync(path.join(to.home, "projects", column, `${sid}.jsonl`), { recursive: true });
+    expect((await run(from, to, taskId)).ok).toBe(true);
+    await transfer.orphanSweepsSettled();
+    expect(existsSync(oldDest)).toBe(false);
+    await transfer.cleanupHarnessSessionCopies(taskId);
+  });
+
+  test("a failed transcript copy rolls the pre-recorded row back, leaving nothing resumable", async () => {
+    const from = alias("claude-code");
+    const to = alias("claude-code");
+    const column = claudeTmux.encodeProjectPath(cwd);
+    write(path.join(from.home, "projects", column, `${sid}.jsonl`), "t");
+    // The transcript's destination is a directory: the copy cannot land.
+    mkdirSync(path.join(to.home, "projects", column, `${sid}.jsonl`), { recursive: true });
+    const taskId = seedTask(`ttb-fail-${seq}`);
+    const result = await run(from, to, taskId);
+    expect(result.ok).toBe(false);
+    expect(dbm.harnessSessionHandoffs.get(taskId, to.id, "claude_session_id")).toBeNull();
+    expect(transfer.findSessionIdForHarness(taskId, "claude_session_id", to.id)).toBeNull();
+  });
+
+  test("a sidecar entry that cannot be copied becomes a warning; the transfer still succeeds", async () => {
+    const from = alias("claude-code");
+    const to = alias("claude-code");
+    const column = claudeTmux.encodeProjectPath(cwd);
+    write(path.join(from.home, "projects", column, `${sid}.jsonl`), "t");
+    write(path.join(from.home, "projects", column, sid, "subagents", "ok.jsonl"), "fine");
+    const outside = path.join(from.home, "secret.txt");
+    write(outside, "do not copy");
+    symlinkSync(outside, path.join(from.home, "projects", column, sid, "subagents", "link.jsonl"));
+    const taskId = seedTask(`ttb-warn-${seq}`);
+    const result = await run(from, to, taskId);
+    expect(result.ok).toBe(true);
+    if (!result.ok) return;
+    expect(result.warnings?.some((w) => w.includes("subagents") && w.includes("skipped"))).toBe(true);
+    expect(existsSync(path.join(to.home, "projects", column, sid, "subagents", "link.jsonl"))).toBe(false);
+    expect(readFileSync(path.join(to.home, "projects", column, sid, "subagents", "ok.jsonl"), "utf8")).toBe("fine");
+    await transfer.cleanupHarnessSessionCopies(taskId);
+  });
+
+  test("a sidecar tree whose copy throws is a warning, not a lost conversation", async () => {
+    const from = alias("claude-code");
+    const to = alias("claude-code");
+    const column = claudeTmux.encodeProjectPath(cwd);
+    write(path.join(from.home, "projects", column, `${sid}.jsonl`), "t");
+    write(path.join(from.home, "file-history", sid, "abc@v1"), "checkpoint");
+    // The destination file-history/<sid> exists as a FILE: the tree copy cannot create the directory.
+    write(path.join(to.home, "file-history", sid), "in the way");
+    const taskId = seedTask(`ttb-throw-${seq}`);
+    const result = await run(from, to, taskId);
+    expect(result.ok).toBe(true);
+    if (!result.ok) return;
+    expect(readFileSync(path.join(to.home, "projects", column, `${sid}.jsonl`), "utf8")).toBe("t");
+    expect(result.warnings?.some((w) => w.startsWith("file-history:"))).toBe(true);
+    expect(readFileSync(path.join(to.home, "file-history", sid), "utf8")).toBe("in the way");
+    await transfer.cleanupHarnessSessionCopies(taskId);
+  });
+
+  test("a symlinked projects dir on the source is refused even when the transcript is reachable through it", async () => {
+    const from = alias("claude-code");
+    const to = alias("claude-code");
+    const column = claudeTmux.encodeProjectPath(cwd);
+    const outside = tempDir("agetor-ttb-src-out-");
+    write(path.join(outside, column, `${sid}.jsonl`), "reachable through the link");
+    symlinkSync(outside, path.join(from.home, "projects"));
+    const taskId = seedTask(`ttb-srclink-${seq}`);
+    const result = await run(from, to, taskId);
+    expect(result.ok).toBe(false);
+    if (!result.ok) expect(result.reason).toBe("unsafe-source");
+    expect(existsSync(path.join(to.home, "projects"))).toBe(false);
+    expect(dbm.harnessSessionHandoffs.get(taskId, to.id, "claude_session_id")).toBeNull();
+  });
+
+  test("a symlinked project dir (not just projects/) on the source is refused too", async () => {
+    const from = alias("claude-code");
+    const to = alias("claude-code");
+    const column = claudeTmux.encodeProjectPath(cwd);
+    const outside = tempDir("agetor-ttb-proj-out-");
+    write(path.join(outside, `${sid}.jsonl`), "reachable");
+    mkdirSync(path.join(from.home, "projects"), { recursive: true });
+    symlinkSync(outside, path.join(from.home, "projects", column));
+    const taskId = seedTask(`ttb-projlink-${seq}`);
+    const result = await run(from, to, taskId);
+    expect(result.ok).toBe(false);
+    if (!result.ok) expect(["unsafe-source", "no-session"]).toContain(result.reason);
+    expect(existsSync(path.join(to.home, "projects"))).toBe(false);
+  });
+
+  test("destination parents are walked per component: a symlinked <projects>/<project> is refused and nothing lands in its target", async () => {
+    const from = alias("claude-code");
+    const to = alias("claude-code");
+    const column = claudeTmux.encodeProjectPath(cwd);
+    write(path.join(from.home, "projects", column, `${sid}.jsonl`), "t");
+    const outside = tempDir("agetor-ttb-dest-out-");
+    mkdirSync(path.join(to.home, "projects"), { recursive: true });
+    symlinkSync(outside, path.join(to.home, "projects", column));
+    const taskId = seedTask(`ttb-destcomp-${seq}`);
+    const result = await run(from, to, taskId);
+    expect(result.ok).toBe(false);
+    if (!result.ok) expect(result.reason).toBe("unsafe-source");
+    expect(readdirSync(outside)).toEqual([]);
+    expect(dbm.harnessSessionHandoffs.get(taskId, to.id, "claude_session_id")).toBeNull();
+    expect(fileTransfer.destinationState(to.home, path.join(to.home, "projects", column, `${sid}.jsonl`))).toBe("unsafe");
+  });
+
+  test("cleanup removes sidecar files tied to the recorded session and nothing tied to another", async () => {
+    const to = alias("claude-code");
+    const column = claudeTmux.encodeProjectPath(cwd);
+    const mine = path.join(to.home, "projects", column, sid, "subagents", "agent-1.jsonl");
+    const mineHistory = path.join(to.home, "file-history", sid, "abc@v1");
+    const otherSid = "88888888-8888-4888-8888-888888888888";
+    const theirs = path.join(to.home, "projects", column, otherSid, "subagents", "agent-9.jsonl");
+    const theirsHistory = path.join(to.home, "file-history", otherSid, "zzz@v1");
+    for (const p of [mine, mineHistory, theirs, theirsHistory]) write(p, "x");
+    const taskId = seedTask(`ttb-tie-${seq}`);
+    dbm.harnessSessionHandoffs.upsert({
+      taskId, harnessId: to.id, columnName: "claude_session_id", sessionId: sid,
+      copiedPaths: [mine, mineHistory, theirs, theirsHistory], createdAt: 1,
+    });
+    await transfer.cleanupHarnessSessionCopies(taskId);
+    expect(existsSync(mine)).toBe(false);
+    expect(existsSync(mineHistory)).toBe(false);
+    expect(existsSync(theirs)).toBe(true);
+    expect(existsSync(theirsHistory)).toBe(true);
+  });
+
+  test("a planted row naming a non-handoff shape (settings.json, a path outside the root) deletes nothing", async () => {
+    const to = alias("claude-code");
+    const column = claudeTmux.encodeProjectPath(cwd);
+    const settings = path.join(to.home, "settings.json");
+    const outsideDir = tempDir("agetor-ttb-plant-");
+    const outside = path.join(outsideDir, `${sid}.jsonl`);
+    const nested = path.join(to.home, "projects", column, sid, "notes", "x.txt");
+    for (const p of [settings, outside, nested]) write(p, "keep");
+    const taskId = seedTask(`ttb-shape-${seq}`);
+    dbm.harnessSessionHandoffs.upsert({
+      taskId, harnessId: to.id, columnName: "claude_session_id", sessionId: sid,
+      copiedPaths: [settings, outside, nested], createdAt: 1,
+    });
+    await transfer.cleanupHarnessSessionCopies(taskId);
+    for (const p of [settings, outside, nested]) expect(readFileSync(p, "utf8")).toBe("keep");
+  });
+});
+
 describe("roots redirected into a macOS-protected folder (contract CR4, review R-S6)", () => {
   function protectedHome() {
-    const home = realpathSync(mkdtempSync(path.join(tmpdir(), "agetor-xfer-tcc-home-")));
+    const home = realpathSync(tempDir("agetor-xfer-tcc-home-"));
     const documents = path.join(home, "Documents");
     mkdirSync(path.join(documents, "acct2"), { recursive: true });
     fileTransfer.setTccHomeForTests(home);
@@ -815,7 +1200,7 @@ describe("roots redirected into a macOS-protected folder (contract CR4, review R
       const cwd = "/tmp/xfer-tcc";
       const sid = "cdcdcdcd-cdcd-4dcd-8dcd-cdcdcdcdcdcd";
       write(path.join(from.home, "projects", claudeTmux.encodeProjectPath(cwd), `${sid}.jsonl`), "transcript");
-      const linked = path.join(mkdtempSync(path.join(tmpdir(), "agetor-xfer-tcc-link-")), "home");
+      const linked = path.join(tempDir("agetor-xfer-tcc-link-"), "home");
       symlinkSync(path.join(documents, "acct2"), linked);
       dbm.harnesses.update(to.id, { home: linked });
       lock();
@@ -850,7 +1235,7 @@ describe("roots redirected into a macOS-protected folder (contract CR4, review R
         path.join(documents, "acct2", "sessions", "2026", "11", "08", `rollout-2026-11-08T00-00-00-${thread}.jsonl`),
         "rollout",
       );
-      const linked = path.join(mkdtempSync(path.join(tmpdir(), "agetor-xfer-tcc-codex-")), "codex-home");
+      const linked = path.join(tempDir("agetor-xfer-tcc-codex-"), "codex-home");
       symlinkSync(path.join(documents, "acct2"), linked);
       dbm.harnesses.update(from.id, { env: { CODEX_HOME: linked } });
       lock();
@@ -870,5 +1255,551 @@ describe("roots redirected into a macOS-protected folder (contract CR4, review R
       unlock();
       fileTransfer.setTccHomeForTests(null);
     }
+  });
+});
+
+describe("orphaned handoff copies (migration 088)", () => {
+  const cwd = "/tmp/agetor-orphan-cwd";
+  const oldSid = "88888888-0000-4000-8000-000000000001";
+  const newSid = "88888888-0000-4000-8000-000000000002";
+  const run = (from: { id: string }, to: { id: string }, taskId: string, s: string) =>
+    transfer.claudeSessionTransfer.transfer({
+      taskId,
+      fromHarness: dbm.harnesses.get(from.id)!,
+      toHarness: dbm.harnesses.get(to.id)!,
+      sessionId: s,
+      cwd,
+    });
+  const orphansOf = (harnessId: string) =>
+    dbm.harnessOrphanedCopies.list({ harnessId }).map((r) => ({ sessionId: r.sessionId, path: r.path }));
+
+  test("a re-key whose old copy cannot be unlinked keeps it on record under the old session, and a sweep removes it later", async () => {
+    const from = alias("claude-code");
+    const to = alias("claude-code");
+    const column = claudeTmux.encodeProjectPath(cwd);
+    const taskId = seedTask(`orph-rekey-${seq}`);
+    write(path.join(from.home, "projects", column, `${oldSid}.jsonl`), "old");
+    write(path.join(from.home, "projects", column, oldSid, "subagents", "agent-1.jsonl"), "old sub");
+    expect((await run(from, to, taskId, oldSid)).ok).toBe(true);
+    const oldTranscript = path.join(to.home, "projects", column, `${oldSid}.jsonl`);
+    const stuckDir = path.join(to.home, "projects", column, oldSid, "subagents");
+    const stuck = path.join(stuckDir, "agent-1.jsonl");
+    expect(existsSync(stuck)).toBe(true);
+
+    // The old sidecar cannot be unlinked while its folder is read-only.
+    chmodSync(stuckDir, 0o500);
+    const warn = spyOn(console, "warn").mockImplementation(() => {});
+    try {
+      write(path.join(from.home, "projects", column, `${newSid}.jsonl`), "new");
+      const result = await run(from, to, taskId, newSid);
+      expect(result.ok).toBe(true);
+      // The superseded sweep runs after the transfer returned, so what it
+      // keeps is logged rather than returned as a transfer warning.
+      await transfer.orphanSweepsSettled();
+      expect(warn.mock.calls.some((c) => String(c[0]).includes("retried later"))).toBe(true);
+      expect(existsSync(oldTranscript)).toBe(false);
+      expect(existsSync(stuck)).toBe(true);
+      // The live row names only the new session's files; the stuck one is an
+      // orphan under the session it was copied for.
+      const row = dbm.harnessSessionHandoffs.get(taskId, to.id, "claude_session_id")!;
+      expect(row.sessionId).toBe(newSid);
+      expect(row.copiedPaths.some((p) => p.includes(oldSid))).toBe(false);
+      expect(orphansOf(to.id)).toEqual([{ sessionId: oldSid, path: stuck }]);
+    } finally {
+      warn.mockRestore();
+      chmodSync(stuckDir, 0o700);
+    }
+    const swept = await transfer.sweepOrphanedHandoffCopies({ harnessId: to.id });
+    expect(swept.removed).toBe(1);
+    expect(existsSync(stuck)).toBe(false);
+    expect(orphansOf(to.id)).toEqual([]);
+    // The new session is untouched.
+    expect(readFileSync(path.join(to.home, "projects", column, `${newSid}.jsonl`), "utf8")).toBe("new");
+    await transfer.cleanupHarnessSessionCopies(taskId);
+  });
+
+  test("a deleted task's kept copies are orphaned instead of cascading away; restoring the account root sweeps them", async () => {
+    const from = alias("claude-code");
+    const to = alias("claude-code");
+    const column = claudeTmux.encodeProjectPath(cwd);
+    const taskId = seedTask(`orph-delete-${seq}`);
+    write(path.join(from.home, "projects", column, `${oldSid}.jsonl`), "t");
+    expect((await run(from, to, taskId, oldSid)).ok).toBe(true);
+    const dest = path.join(to.home, "projects", column, `${oldSid}.jsonl`);
+    // The account's root changes: cleanup must keep the file and the row.
+    dbm.harnesses.update(to.id, { home: tempDir("agetor-orph-newroot-") });
+    expect((await transfer.cleanupHarnessSessionCopies(taskId)).length).toBe(1);
+    dbm.tasks.delete(taskId);
+    expect(dbm.harnessSessionHandoffs.get(taskId, to.id, "claude_session_id")).toBeNull();
+    expect(orphansOf(to.id)).toEqual([{ sessionId: oldSid, path: dest }]);
+    // Out of reach while the root differs: kept, not forgotten.
+    expect((await transfer.sweepOrphanedHandoffCopies({ harnessId: to.id })).retained).toBe(1);
+    expect(existsSync(dest)).toBe(true);
+    dbm.harnesses.update(to.id, { home: to.home });
+    await transfer.sweepOrphanedHandoffCopies({ harnessId: to.id });
+    expect(existsSync(dest)).toBe(false);
+    expect(orphansOf(to.id)).toEqual([]);
+  });
+
+  test("a crash after the copy but before the final row keeps the old session resumable; the boot sweep removes only the new copy", async () => {
+    const from = alias("claude-code");
+    const to = alias("claude-code");
+    const column = claudeTmux.encodeProjectPath(cwd);
+    const taskId = seedTask(`orph-crash-${seq}`);
+    write(path.join(from.home, "projects", column, `${oldSid}.jsonl`), "old");
+    write(path.join(from.home, "projects", column, oldSid, "subagents", "agent-1.jsonl"), "old sub");
+    expect((await run(from, to, taskId, oldSid)).ok).toBe(true);
+    const oldRow = dbm.harnessSessionHandoffs.get(taskId, to.id, "claude_session_id")!;
+    const oldFiles = [
+      path.join(to.home, "projects", column, `${oldSid}.jsonl`),
+      path.join(to.home, "projects", column, oldSid, "subagents", "agent-1.jsonl"),
+    ];
+
+    write(path.join(from.home, "projects", column, `${newSid}.jsonl`), "new");
+    write(path.join(from.home, "projects", column, newSid, "subagents", "agent-2.jsonl"), "new sub");
+    const newFiles = [
+      path.join(to.home, "projects", column, `${newSid}.jsonl`),
+      path.join(to.home, "projects", column, newSid, "subagents", "agent-2.jsonl"),
+    ];
+    // "Crash": the final upsert for the new session never lands.
+    const store = dbm.harnessSessionHandoffs;
+    const realUpsert = store.upsert.bind(store);
+    store.upsert = ((h: Parameters<typeof realUpsert>[0]) => {
+      if (h.sessionId === newSid && h.createdAt > 0) throw new Error("simulated crash");
+      return realUpsert(h);
+    }) as typeof store.upsert;
+    try {
+      await expect(run(from, to, taskId, newSid)).rejects.toThrow("simulated crash");
+    } finally {
+      store.upsert = realUpsert;
+    }
+    for (const f of newFiles) expect(existsSync(f)).toBe(true);
+    // The old row was never touched: its session is still the resumable one.
+    expect(dbm.harnessSessionHandoffs.get(taskId, to.id, "claude_session_id")).toEqual(oldRow);
+    expect(transfer.findSessionIdForHarness(taskId, "claude_session_id", to.id)).toBe(oldSid);
+
+    await transfer.sweepOrphanedHandoffCopiesAtBoot();
+    for (const f of oldFiles) expect(existsSync(f)).toBe(true);
+    for (const f of newFiles) expect(existsSync(f)).toBe(false);
+    expect(orphansOf(to.id)).toEqual([]);
+    await transfer.cleanupHarnessSessionCopies(taskId);
+  });
+
+  test("a failed copy onto an account holding another session leaves that row and its files alone", async () => {
+    const from = alias("claude-code");
+    const to = alias("claude-code");
+    const column = claudeTmux.encodeProjectPath(cwd);
+    const taskId = seedTask(`orph-fail-${seq}`);
+    write(path.join(from.home, "projects", column, `${oldSid}.jsonl`), "old");
+    expect((await run(from, to, taskId, oldSid)).ok).toBe(true);
+    const oldRow = dbm.harnessSessionHandoffs.get(taskId, to.id, "claude_session_id")!;
+    write(path.join(from.home, "projects", column, `${newSid}.jsonl`), "new");
+    write(path.join(from.home, "projects", column, newSid, "subagents", "agent-2.jsonl"), "sub");
+    // The new transcript's destination is a directory: the copy throws after
+    // the sidecar destination was recorded as a pending orphan.
+    mkdirSync(path.join(to.home, "projects", column, `${newSid}.jsonl`), { recursive: true });
+    expect((await run(from, to, taskId, newSid)).ok).toBe(false);
+    expect(dbm.harnessSessionHandoffs.get(taskId, to.id, "claude_session_id")).toEqual(oldRow);
+    expect(readFileSync(path.join(to.home, "projects", column, `${oldSid}.jsonl`), "utf8")).toBe("old");
+    // The pending record of the never-created sidecar was swept away (the
+    // failure sweep is fired, not awaited, by the transfer).
+    await transfer.orphanSweepsSettled();
+    expect(orphansOf(to.id)).toEqual([]);
+    await transfer.cleanupHarnessSessionCopies(taskId);
+  });
+
+  test("a sweep never touches a session while it is being transferred onto the account", async () => {
+    const to = alias("claude-code");
+    // A pending record of the session being copied, whose file the copy has
+    // already created (no live row names it yet).
+    const copying = path.join(to.home, "projects", "enc", oldSid, "tool-results", "r.txt");
+    write(copying, "being copied");
+    dbm.harnessOrphanedCopies.add(to.id, "claude_session_id", oldSid, [copying]);
+    const release = transfer.holdTransferForTests(to.id, "claude_session_id", oldSid);
+    try {
+      const swept = await transfer.sweepOrphanedHandoffCopies({ harnessId: to.id });
+      expect(swept).toEqual({ removed: 0, forgotten: 0, retained: 1 });
+      expect(existsSync(copying)).toBe(true);
+    } finally {
+      release();
+    }
+    // Once the transfer is over (and failed, so no row names it), it goes.
+    expect((await transfer.sweepOrphanedHandoffCopies({ harnessId: to.id })).removed).toBe(1);
+    expect(existsSync(copying)).toBe(false);
+  });
+
+  test("a sweep never forgets the pending record of a transfer of the same session that started mid-sweep (review S5)", async () => {
+    const to = alias("claude-code");
+    // An old pending record of the session, from a transfer that failed.
+    const file = path.join(to.home, "projects", "enc", oldSid, "tool-results", "r.txt");
+    write(file, "left behind");
+    dbm.harnessOrphanedCopies.add(to.id, "claude_session_id", oldSid, [file]);
+    await transfer.orphanSweepsSettled();
+    const paused = transfer.pauseOrphanSweepForTests({ harnessId: to.id, sessionId: oldSid });
+    const sweeping = transfer.sweepOrphanedHandoffCopies({ harnessId: to.id });
+    await paused.reached;
+    // The sweep has unlinked the file but not yet forgotten its record. A new
+    // transfer of the same session starts now: it records the same path as
+    // pending (in the same millisecond, as fast as it can) and recreates it.
+    expect(existsSync(file)).toBe(false);
+    const release = transfer.holdTransferForTests(to.id, "claude_session_id", oldSid);
+    dbm.harnessOrphanedCopies.add(to.id, "claude_session_id", oldSid, [file]);
+    write(file, "being copied");
+    paused.resume();
+    await sweeping;
+    // The transfer's pending record survives the sweep that was already running.
+    expect(orphansOf(to.id)).toEqual([{ sessionId: oldSid, path: file }]);
+    // The transfer fails: its own sweep still finds and removes the new copy.
+    release();
+    expect((await transfer.sweepOrphanedHandoffCopies({ harnessId: to.id })).removed).toBe(1);
+    expect(existsSync(file)).toBe(false);
+    expect(orphansOf(to.id)).toEqual([]);
+  });
+
+  test("a failed transfer returns without waiting for its cleanup sweep to get a turn (review N4)", async () => {
+    const from = alias("claude-code");
+    const to = alias("claude-code");
+    const blocker = alias("claude-code");
+    const column = claudeTmux.encodeProjectPath(cwd);
+    // Another sweep holds the (serialized) sweep queue.
+    const blocking = path.join(blocker.home, "projects", "enc", oldSid, "tool-results", "b.txt");
+    write(blocking, "x");
+    dbm.harnessOrphanedCopies.add(blocker.id, "claude_session_id", oldSid, [blocking]);
+    await transfer.orphanSweepsSettled();
+    const paused = transfer.pauseOrphanSweepForTests({ harnessId: blocker.id, sessionId: oldSid });
+    const queued = transfer.sweepOrphanedHandoffCopies({ harnessId: blocker.id });
+    await paused.reached;
+    try {
+      const taskId = seedTask(`orph-n4-${seq}`);
+      write(path.join(from.home, "projects", column, `${newSid}.jsonl`), "new");
+      write(path.join(from.home, "projects", column, newSid, "subagents", "agent-2.jsonl"), "sub");
+      // The transcript's destination is a directory: the copy fails after the
+      // sidecar destination was recorded.
+      mkdirSync(path.join(to.home, "projects", column, `${newSid}.jsonl`), { recursive: true });
+      const outcome = await Promise.race([
+        run(from, to, taskId, newSid).then((r) => (r.ok ? "ok" : "failed")),
+        Bun.sleep(3000).then(() => "still waiting"),
+      ]);
+      expect(outcome).toBe("failed");
+      // Its sweep is queued behind the blocked one and has not run yet.
+      expect(orphansOf(to.id).length).toBeGreaterThan(0);
+    } finally {
+      paused.resume();
+    }
+    await queued;
+    await transfer.orphanSweepsSettled();
+    expect(orphansOf(to.id)).toEqual([]);
+    expect(orphansOf(blocker.id)).toEqual([]);
+  });
+
+  test("a planted record naming a session another task still resumes on the account deletes nothing (review S18)", async () => {
+    const to = alias("claude-code");
+    const taskId = seedTask(`orph-runs-${seq}`);
+    // The account's own conversation: a run on it recorded the session, and no
+    // handoff row names it.
+    const runId = randomUUID();
+    dbm.runs.insert({
+      id: runId, taskId, agent: to.id, status: "succeeded", startedAt: Date.now(), endedAt: Date.now(),
+      exitCode: 0, tmuxSession: null, claudeSessionId: oldSid, codexSessionId: null, cursorSessionId: null,
+      geminiSessionId: null, fxSessionId: null,
+    } as never);
+    const transcript = path.join(to.home, "projects", "enc", `${oldSid}.jsonl`);
+    write(transcript, "live conversation");
+    dbm.harnessOrphanedCopies.add(to.id, "claude_session_id", oldSid, [transcript]);
+    const swept = await transfer.sweepOrphanedHandoffCopies({ harnessId: to.id });
+    expect(swept).toEqual({ removed: 0, forgotten: 0, retained: 1 });
+    expect(readFileSync(transcript, "utf8")).toBe("live conversation");
+
+    // Once a handoff of another session supersedes it on this account, the
+    // older session is no longer the one the task resumes there: swept.
+    dbm.harnessSessionHandoffs.upsert({
+      taskId, harnessId: to.id, columnName: "claude_session_id", sessionId: newSid, copiedPaths: [],
+      createdAt: Date.now() + 1,
+    });
+    expect((await transfer.sweepOrphanedHandoffCopies({ harnessId: to.id })).removed).toBe(1);
+    expect(existsSync(transcript)).toBe(false);
+    dbm.db.run("DELETE FROM runs WHERE id = ?", [runId]);
+    dbm.harnessSessionHandoffs.deleteOne(taskId, to.id, "claude_session_id");
+  });
+
+  test("a session live on a handoff row of the same account is never swept", async () => {
+    const to = alias("claude-code");
+    const taskId = seedTask(`orph-live-${seq}`);
+    const file = path.join(to.home, "projects", "enc", oldSid, "subagents", "a.jsonl");
+    write(file, "live");
+    dbm.harnessSessionHandoffs.upsert({
+      taskId, harnessId: to.id, columnName: "claude_session_id", sessionId: oldSid, copiedPaths: [], createdAt: 1,
+    });
+    dbm.harnessOrphanedCopies.add(to.id, "claude_session_id", oldSid, [file]);
+    expect((await transfer.sweepOrphanedHandoffCopies({ harnessId: to.id })).retained).toBe(1);
+    expect(existsSync(file)).toBe(true);
+    // Back on a live row, a path stops being an orphan.
+    dbm.harnessSessionHandoffs.upsert({
+      taskId, harnessId: to.id, columnName: "claude_session_id", sessionId: oldSid, copiedPaths: [file], createdAt: 1,
+    });
+    expect(orphansOf(to.id)).toEqual([]);
+    await transfer.cleanupHarnessSessionCopies(taskId);
+    expect(existsSync(file)).toBe(false);
+  });
+
+  test("an orphan record naming another shape or another session deletes nothing; one outside the root is kept on record", async () => {
+    const to = alias("claude-code");
+    const settings = path.join(to.home, "settings.json");
+    const otherTranscript = path.join(to.home, "projects", "enc", `${newSid}.jsonl`);
+    write(settings, "{}");
+    write(otherTranscript, "someone else's");
+    dbm.harnessOrphanedCopies.add(to.id, "claude_session_id", oldSid, [settings, otherTranscript, "/etc/hosts"]);
+    const swept = await transfer.sweepOrphanedHandoffCopies({ harnessId: to.id });
+    expect(swept.removed).toBe(0);
+    expect(existsSync(settings)).toBe(true);
+    expect(existsSync(otherTranscript)).toBe(true);
+    // Outside the account's current root reads as "the root changed", the
+    // handoff rule: kept for a later sweep, never touched.
+    expect(swept.retained).toBe(1);
+    expect(orphansOf(to.id)).toEqual([{ sessionId: oldSid, path: "/etc/hosts" }]);
+    dbm.harnessOrphanedCopies.deleteForHarness(to.id);
+  });
+
+  test("boot normalization moves a pre-088 re-keyed row's old-session paths to the orphan store and sweeps them", async () => {
+    const to = alias("claude-code");
+    const taskId = seedTask(`orph-boot-${seq}`);
+    const oldFile = path.join(to.home, "projects", "enc", `${oldSid}.jsonl`);
+    const oldSidecar = path.join(to.home, "projects", "enc", oldSid, "tool-results", "r.txt");
+    const newFile = path.join(to.home, "projects", "enc", `${newSid}.jsonl`);
+    for (const f of [oldFile, oldSidecar, newFile]) write(f, "x");
+    // The shape a pre-088 re-key left: new session id, old paths merged in.
+    dbm.harnessSessionHandoffs.upsert({
+      taskId, harnessId: to.id, columnName: "claude_session_id", sessionId: newSid,
+      copiedPaths: [oldFile, oldSidecar, newFile], createdAt: 1,
+    });
+    await transfer.sweepOrphanedHandoffCopiesAtBoot();
+    expect(existsSync(oldFile)).toBe(false);
+    expect(existsSync(oldSidecar)).toBe(false);
+    expect(existsSync(newFile)).toBe(true);
+    expect(dbm.harnessSessionHandoffs.get(taskId, to.id, "claude_session_id")?.copiedPaths).toEqual([newFile]);
+    expect(orphansOf(to.id)).toEqual([]);
+    // Idempotent.
+    expect(await transfer.adoptMismatchedHandoffPaths()).toBe(0);
+    await transfer.cleanupHarnessSessionCopies(taskId);
+  });
+
+  test("Codex: a superseded rollout that cannot be unlinked is orphaned under the codex column and swept later", async () => {
+    const from = alias("codex");
+    const to = alias("codex");
+    const taskId = seedTask(`orph-codex-${seq}`);
+    const day = path.join("sessions", "2026", "11", "10");
+    const nextDay = path.join("sessions", "2026", "11", "11");
+    write(path.join(from.home, ".codex", day, `rollout-2026-11-10T00-00-00-${oldSid}.jsonl`), "old");
+    write(path.join(from.home, ".codex", nextDay, `rollout-2026-11-11T01-00-00-${newSid}.jsonl`), "new");
+    const runCodex = (s: string) =>
+      transfer.codexSessionTransfer.transfer({
+        taskId, fromHarness: dbm.harnesses.get(from.id)!, toHarness: dbm.harnesses.get(to.id)!, sessionId: s, cwd,
+      });
+    expect((await runCodex(oldSid)).ok).toBe(true);
+    const oldDest = path.join(to.home, ".codex", day, `rollout-2026-11-10T00-00-00-${oldSid}.jsonl`);
+    expect(existsSync(oldDest)).toBe(true);
+    // A read-only day folder blocks the unlink; the new rollout lands in
+    // another day's folder.
+    const newDest = path.join(to.home, ".codex", nextDay, `rollout-2026-11-11T01-00-00-${newSid}.jsonl`);
+    chmodSync(path.dirname(oldDest), 0o500);
+    try {
+      expect((await runCodex(newSid)).ok).toBe(true);
+      // Its sweep must run while the folder is still read-only.
+      await transfer.orphanSweepsSettled();
+      expect(existsSync(oldDest)).toBe(true);
+      expect(dbm.harnessOrphanedCopies.list({ harnessId: to.id })).toEqual([
+        expect.objectContaining({ columnName: "codex_session_id", sessionId: oldSid, path: oldDest }),
+      ]);
+    } finally {
+      chmodSync(path.dirname(oldDest), 0o700);
+    }
+    await transfer.sweepOrphanedHandoffCopies();
+    expect(existsSync(oldDest)).toBe(false);
+    expect(readFileSync(newDest, "utf8")).toBe("new");
+    await transfer.cleanupHarnessSessionCopies(taskId);
+    expect(existsSync(newDest)).toBe(false);
+  });
+
+  test("a successful re-key returns without waiting for the superseded session's sweep (review S6)", async () => {
+    const from = alias("claude-code");
+    const to = alias("claude-code");
+    const blocker = alias("claude-code");
+    const column = claudeTmux.encodeProjectPath(cwd);
+    const taskId = seedTask(`orph-s6-${seq}`);
+    write(path.join(from.home, "projects", column, `${oldSid}.jsonl`), "old");
+    expect((await run(from, to, taskId, oldSid)).ok).toBe(true);
+    const oldDest = path.join(to.home, "projects", column, `${oldSid}.jsonl`);
+    const newDest = path.join(to.home, "projects", column, `${newSid}.jsonl`);
+    write(path.join(from.home, "projects", column, `${newSid}.jsonl`), "new");
+    // Another sweep holds the (serialized) sweep queue.
+    const blocking = path.join(blocker.home, "projects", "enc", oldSid, "tool-results", "b.txt");
+    write(blocking, "x");
+    dbm.harnessOrphanedCopies.add(blocker.id, "claude_session_id", oldSid, [blocking]);
+    await transfer.orphanSweepsSettled();
+    const paused = transfer.pauseOrphanSweepForTests({ harnessId: blocker.id, sessionId: oldSid });
+    const queued = transfer.sweepOrphanedHandoffCopies({ harnessId: blocker.id });
+    await paused.reached;
+    try {
+      const outcome = await Promise.race([
+        run(from, to, taskId, newSid).then((r) => (r.ok ? "ok" : "failed")),
+        Bun.sleep(3000).then(() => "still waiting"),
+      ]);
+      expect(outcome).toBe("ok");
+      // The row is re-keyed and the new copy is in place; the superseded copy
+      // waits on record for its sweep, which is queued behind the blocked one.
+      expect(dbm.harnessSessionHandoffs.get(taskId, to.id, "claude_session_id")?.sessionId).toBe(newSid);
+      expect(readFileSync(newDest, "utf8")).toBe("new");
+      expect(readFileSync(oldDest, "utf8")).toBe("old");
+      expect(orphansOf(to.id)).toEqual([{ sessionId: oldSid, path: oldDest }]);
+    } finally {
+      paused.resume();
+    }
+    await queued;
+    await transfer.orphanSweepsSettled();
+    expect(existsSync(oldDest)).toBe(false);
+    expect(readFileSync(newDest, "utf8")).toBe("new");
+    expect(orphansOf(to.id)).toEqual([]);
+    await transfer.cleanupHarnessSessionCopies(taskId);
+  });
+
+  test("a sweep pause is keyed: a sweep of another account queued first never takes it (review N4)", async () => {
+    const a = alias("claude-code");
+    const b = alias("claude-code");
+    const fileA = path.join(a.home, "projects", "enc", oldSid, "tool-results", "a.txt");
+    const fileB = path.join(b.home, "projects", "enc", oldSid, "tool-results", "b.txt");
+    write(fileA, "a");
+    write(fileB, "b");
+    dbm.harnessOrphanedCopies.add(a.id, "claude_session_id", oldSid, [fileA]);
+    dbm.harnessOrphanedCopies.add(b.id, "claude_session_id", oldSid, [fileB]);
+    await transfer.orphanSweepsSettled();
+    const paused = transfer.pauseOrphanSweepForTests({ harnessId: a.id, sessionId: oldSid });
+    try {
+      const other = await Promise.race([
+        transfer.sweepOrphanedHandoffCopies({ harnessId: b.id }).then((r) => r.removed),
+        Bun.sleep(3000).then(() => "paused"),
+      ]);
+      expect(other).toBe(1);
+      const keyed = transfer.sweepOrphanedHandoffCopies({ harnessId: a.id });
+      await paused.reached;
+      expect(existsSync(fileA)).toBe(false);
+      expect(orphansOf(a.id)).toEqual([{ sessionId: oldSid, path: fileA }]);
+      paused.resume();
+      expect((await keyed).removed).toBe(1);
+      expect(orphansOf(a.id)).toEqual([]);
+    } finally {
+      paused.resume();
+    }
+  });
+
+  test("account delete collects its orphaned copies with its handoffs and drops their records", async () => {
+    const to = alias("claude-code");
+    const file = path.join(to.home, "projects", "enc", `${oldSid}.jsonl`);
+    write(file, "x");
+    dbm.harnessOrphanedCopies.add(to.id, "claude_session_id", oldSid, [file]);
+    const copies = transfer.collectHarnessSessionCopies(to.id);
+    expect(copies).toEqual([expect.objectContaining({ sessionId: oldSid, paths: [file] })]);
+    dbm.harnesses.delete(to.id);
+    expect(dbm.harnessOrphanedCopies.list({ harnessId: to.id })).toEqual([]);
+    await transfer.removeHarnessSessionCopies(copies);
+    expect(existsSync(file)).toBe(false);
+  });
+});
+
+describe("orphan and handoff records whose column is not the account's kind (review S4)", () => {
+  const sid = "5a5a5a5a-5a5a-4a5a-8a5a-5a5a5a5a5a5a";
+  const plant = (harnessId: string, column: string, p: string) =>
+    dbm.db.run(
+      `INSERT INTO harness_orphaned_copies (harness_id, column_name, session_id, path, created_at) VALUES (?, ?, ?, ?, ?)`,
+      [harnessId, column, sid, p, 1],
+    );
+  const rawOrphans = (harnessId: string) =>
+    dbm.db
+      .query<{ column_name: string; path: string }, [string]>(
+        `SELECT column_name, path FROM harness_orphaned_copies WHERE harness_id = ?`,
+      )
+      .all(harnessId);
+
+  /** A Codex account whose Claude root (if anything ever asked for one) is a
+   *  temp folder holding a real transcript a `claude_session_id` record names. */
+  function codexAccountWithClaudeFile() {
+    const acct = alias("codex");
+    const claudeRoot = tempDir("agetor-s4-claude-root-");
+    dbm.harnesses.update(acct.id, { env: { CLAUDE_CONFIG_DIR: claudeRoot } });
+    expect(configRoot.claudeConfigDirFor(dbm.harnesses.get(acct.id)!)).toBe(claudeRoot);
+    const file = path.join(claudeRoot, "projects", "enc", `${sid}.jsonl`);
+    write(file, "live claude conversation");
+    return { ...acct, file };
+  }
+
+  /** A Claude account whose Codex home is a temp folder holding a real rollout
+   *  a `codex_session_id` record names. */
+  function claudeAccountWithCodexFile() {
+    const acct = alias("claude-code");
+    const codexRoot = tempDir("agetor-s4-codex-root-");
+    dbm.harnesses.update(acct.id, { env: { CODEX_HOME: codexRoot } });
+    expect(configRoot.codexHomeFor(dbm.harnesses.get(acct.id)!)).toBe(codexRoot);
+    const file = path.join(codexRoot, "sessions", "2026", "11", "10", `rollout-2026-11-10T00-00-00-${sid}.jsonl`);
+    write(file, "live codex rollout");
+    return { ...acct, file };
+  }
+
+  test("a sweep forgets a claude-column record on a Codex account and a codex-column record on a Claude account; the files survive", async () => {
+    const codexAcct = codexAccountWithClaudeFile();
+    const claudeAcct = claudeAccountWithCodexFile();
+    plant(codexAcct.id, "claude_session_id", codexAcct.file);
+    plant(claudeAcct.id, "codex_session_id", claudeAcct.file);
+    const first = await transfer.sweepOrphanedHandoffCopies({ harnessId: codexAcct.id });
+    expect(first).toEqual({ removed: 0, forgotten: 1, retained: 0 });
+    const second = await transfer.sweepOrphanedHandoffCopies({ harnessId: claudeAcct.id });
+    expect(second).toEqual({ removed: 0, forgotten: 1, retained: 0 });
+    expect(readFileSync(codexAcct.file, "utf8")).toBe("live claude conversation");
+    expect(readFileSync(claudeAcct.file, "utf8")).toBe("live codex rollout");
+    expect(rawOrphans(codexAcct.id)).toEqual([]);
+    expect(rawOrphans(claudeAcct.id)).toEqual([]);
+  });
+
+  test("a record under an unknown column is never listed or acted on, and a sweep drops it", async () => {
+    const acct = alias("claude-code");
+    const file = path.join(acct.home, "projects", "enc", `${sid}.jsonl`);
+    write(file, "live claude conversation");
+    plant(acct.id, "cursor_session_id", file);
+    plant(acct.id, "not_a_column", path.join(acct.home, "projects", "enc2", `${sid}.jsonl`));
+    write(path.join(acct.home, "projects", "enc2", `${sid}.jsonl`), "another");
+    expect(dbm.harnessOrphanedCopies.list({ harnessId: acct.id })).toEqual([]);
+    const swept = await transfer.sweepOrphanedHandoffCopies({ harnessId: acct.id });
+    expect(swept).toEqual({ removed: 0, forgotten: 2, retained: 0 });
+    expect(readFileSync(file, "utf8")).toBe("live claude conversation");
+    expect(readFileSync(path.join(acct.home, "projects", "enc2", `${sid}.jsonl`), "utf8")).toBe("another");
+    expect(rawOrphans(acct.id)).toEqual([]);
+  });
+
+  test("account delete never collects a record whose column is not the account's kind", async () => {
+    const codexAcct = codexAccountWithClaudeFile();
+    const taskId = seedTask(`s4-delete-${seq}`);
+    plant(codexAcct.id, "claude_session_id", codexAcct.file);
+    plant(codexAcct.id, "bogus_column", codexAcct.file);
+    dbm.harnessSessionHandoffs.upsert({
+      taskId, harnessId: codexAcct.id, columnName: "claude_session_id", sessionId: sid,
+      copiedPaths: [codexAcct.file], createdAt: 1,
+    });
+    const copies = transfer.collectHarnessSessionCopies(codexAcct.id);
+    expect(copies).toEqual([]);
+    dbm.harnesses.delete(codexAcct.id);
+    await transfer.removeHarnessSessionCopies(copies);
+    expect(readFileSync(codexAcct.file, "utf8")).toBe("live claude conversation");
+    expect(rawOrphans(codexAcct.id)).toEqual([]);
+    expect(dbm.harnessSessionHandoffs.listForHarness(codexAcct.id)).toEqual([]);
+  });
+
+  test("task cleanup drops a handoff row whose column is not the account's kind without touching its paths", async () => {
+    const claudeAcct = claudeAccountWithCodexFile();
+    const taskId = seedTask(`s4-cleanup-${seq}`);
+    dbm.harnessSessionHandoffs.upsert({
+      taskId, harnessId: claudeAcct.id, columnName: "codex_session_id", sessionId: sid,
+      copiedPaths: [claudeAcct.file], createdAt: 1,
+    });
+    expect(await transfer.cleanupHarnessSessionCopies(taskId)).toEqual([]);
+    expect(readFileSync(claudeAcct.file, "utf8")).toBe("live codex rollout");
+    expect(dbm.harnessSessionHandoffs.get(taskId, claudeAcct.id, "codex_session_id")).toBeNull();
   });
 });

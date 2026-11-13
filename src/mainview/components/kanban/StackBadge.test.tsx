@@ -82,7 +82,7 @@ describe("StackBadge", () => {
         allExhausted: { nextAttemptAt: 0, reason: "no-usable-member", attempts: 0, max: 3 },
       },
     });
-    expect(markup).toContain("No account in this stack can run this task — fix one in Settings");
+    expect(markup).toContain("No account in this stack can run this task — fix one in Settings → Harnesses");
     expect(markup).not.toContain("out of quota");
   });
 
@@ -114,6 +114,7 @@ describe("StackBadge", () => {
     // whole-markup substring check can't distinguish the two either.
     expect(markup).toMatch(/⏳\s*cooling<\/span>/);
     expect(markup).not.toMatch(/⏳\s*1\/1/);
+    expect(markup).not.toContain(">1/1<");
     expect(markup).not.toContain("Account 1 of 1");
   });
 

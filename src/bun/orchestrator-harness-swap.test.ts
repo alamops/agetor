@@ -912,7 +912,9 @@ describe("harness-stack swap", () => {
     const prevObserved = orch.__setHarnessLimitObservedHookForTest((hookedTaskId, runId) => {
       if (hookedTaskId !== task.id) return;
       db.runs.appendEvent(runId, "user", folded);
-      db.runs.appendEvent(runId, "user", task.prompt);
+      // The CLI's JSONL twin of the original prompt carries a line uuid; the
+      // clean retry pairs it with the live echo of the same send.
+      db.runs.appendEvent(runId, "user", task.prompt, `twin-${runId}`);
     });
     try {
       const started = await orch.startTask(task.id);
@@ -1163,7 +1165,7 @@ describe("harness-stack swap", () => {
     // and exactly once: the swap window holds the text without writing an
     // optimistic bubble on the displaced run, so the drain's send is the only
     // user event (that duplicate bubble was the review's should-fix).
-    expect(db.runs.mainUserTexts(runs[1]!.id)).toEqual(["follow-up during the limit"]);
+    expect(db.runs.mainUserRows(runs[1]!.id).map((r) => r.data)).toEqual(["follow-up during the limit"]);
     const userBubbles = db.runs
       .listForTask(task.id)
       .flatMap((r) => db.runs.events(r.id))

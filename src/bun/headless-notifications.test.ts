@@ -529,5 +529,15 @@ describe("harness stacks", () => {
     expect(n?.kind).toBe("harness-swap");
     expect(n?.body).toContain("Work → Backup");
     expect(n?.body).not.toContain("@");
+    expect(n?.body).toContain("(2/3)");
+  });
+
+  test("a swap notification omits the position for a stack under two accounts", () => {
+    const n = f({
+      kind: "harness-swap", taskId: "t1", from: "a", to: "b", fromLabel: "Work", toLabel: "Backup",
+      reason: "quota", position: 1, count: 1, ts: 1,
+    });
+    expect(n?.body).toContain("Work → Backup");
+    expect(n?.body).not.toContain("(1/1)");
   });
 });

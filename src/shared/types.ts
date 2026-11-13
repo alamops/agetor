@@ -458,6 +458,17 @@ export interface HarnessStackInput {
   kind: HarnessStackKind;
   members: string[];
   mirrorMode?: HarnessMirrorMode;
+  /** Optimistic concurrency on edit: the `updatedAt` the caller's draft was
+   *  based on. A mismatch answers 409 `HarnessStackChanged`. Omitted = last
+   *  write wins (older clients). Ignored on create. */
+  expectedUpdatedAt?: number;
+}
+
+/** 409 body when an edit's `expectedUpdatedAt` no longer matches. */
+export interface HarnessStackChanged {
+  error: string;
+  code: "stack-changed";
+  stack: HarnessStack;
 }
 
 /** Conservative limit vocabulary: provider quota, HTTP 429, 402/credits. */
@@ -471,9 +482,13 @@ export interface HarnessLimitSignal {
   /** Human-readable notice text. Never contains a token or an email. */
   message: string;
   source: "claude-pane" | "claude-api-error" | "codex-error";
+  /** Set when the provider scoped the limit to one model (Codex "You've hit
+   *  your usage limit for <model>"). Absent/null = the whole account. */
+  model?: string | null;
 }
 
-/** An account-global cooldown row. Written only by the stack store. */
+/** A cooldown row. Written only by the stack store. `model` null = the whole
+ *  account is cooling; a model id = only tasks on that model skip it. */
 export interface HarnessLimitState {
   harnessId: string;
   reason: HarnessLimitReason;
@@ -481,6 +496,110 @@ export interface HarnessLimitState {
   message: string | null;
   exhaustedUntilMs: number;
   updatedAt: number;
+  /** Optional only so pre-087 payloads still type-check; the store always sets it. */
+  model?: string | null;
+}
+
+/** Why a stack member can't take a task right now (banners, refusals). */
+export interface HarnessMemberReason {
+  harnessId: string;
+  label: string;
+  /** Short human text: "cooling until 15:00", "logged out", "disabled", … */
+  reason: string;
+}
+
+/** What caused a row in the per-stack swap history. */
+export type HarnessSwapTrigger =
+  | "limit"        // a provider limit moved a live task
+  | "retry"        // an automatic retry after a reset (may stay on the same account)
+  | "manual"       // a same-stack account change from the picker/CLI, or switch-now on an idle task
+  | "scheduled"    // switch-now requested during a live turn, applied when the turn ended
+  | "unavailable"  // Run/message found the account removed/disabled/logged out and moved on
+  | "boot-resume"  // a swap or manual switch the core completed after a restart
+  | "blocked";     // no move: every account was out of quota or unusable
+
+/** One row of `harness_swap_events`. Labels and the task title are
+ *  denormalized so the row still reads after the task or account is deleted. */
+export interface HarnessSwapEvent {
+  id: string;
+  stackId: string;
+  taskId: string | null;
+  taskTitle: string | null;
+  fromHarnessId: string | null;
+  fromLabel: string | null;
+  /** Null for a `blocked` row. */
+  toHarnessId: string | null;
+  toLabel: string | null;
+  trigger: HarnessSwapTrigger;
+  /** Limit reason, `no-usable-member`, a `lastMove` member reason, or `user`. */
+  reason: HarnessLimitReason | "no-usable-member" | "member-removed" | "member-disabled" | "member-unavailable" | "user" | null;
+  source: HarnessLimitSignal["source"] | null;
+  message: string | null;
+  model: string | null;
+  resetsAtMs: number | null;
+  fromRunId: string | null;
+  toRunId: string | null;
+  continuation: "transferred" | "restarted" | null;
+  at: number;
+}
+
+/** `GET /harness-stacks/:id/history`: newest first, cursor-paged. */
+export interface HarnessSwapHistoryPage {
+  events: HarnessSwapEvent[];
+  /** Opaque; pass back as `?before=` for the next page. Null on the last page. */
+  nextCursor: string | null;
+}
+
+/** One key a mirror run would add/update/remove in a merged file. Names only —
+ *  values never leave the core (they can be secrets). */
+export interface MirrorKeyChange {
+  file: string;
+  key: string;
+  action: "add" | "update" | "remove";
+}
+
+/** The planned (dry-run) or applied mirror changes for one backup account. */
+export interface MirrorPlan {
+  harnessId: string;
+  label: string;
+  files: { add: string[]; update: string[]; remove: string[] };
+  keys: MirrorKeyChange[];
+  /** Files/keys the backup already had that this run overwrites or removes;
+   *  each is saved under the data dir's mirror backups first. */
+  backups: string[];
+  /** Items the mirror wrote earlier that the backup edited since: kept, and
+   *  no longer owned by the mirror. */
+  kept: string[];
+  warnings: string[];
+}
+
+/** `POST /harness-stacks/mirror-preview`. `overwrites` is true when any plan
+ *  has a `backups` entry or a removal — the webview asks before saving then. */
+export interface MirrorPreview {
+  plans: MirrorPlan[];
+  overwrites: boolean;
+}
+
+/** `PATCH /harnesses/:id` refusal body (409 `mirror-records`): the edit moves
+ *  the account away from a config folder the config mirror keeps records and
+ *  saved originals for, which the next mirror into the account would drop.
+ *  Re-sending the same body with `confirmMirrorDrop: true` saves it. */
+export interface HarnessEditMirrorRefusal {
+  error: string;
+  code: "mirror-records";
+  folders: Array<{ what: string; was: string; now: string; records: number; savedOriginals: number }>;
+}
+
+/** `POST /harnesses/:id/mirror-restore`. */
+export interface MirrorRestoreResult {
+  harnessId: string;
+  /** Originals put back from the backup store. */
+  restored: string[];
+  /** Mirror-added items removed (unedited since the mirror wrote them). */
+  removed: string[];
+  /** Mirror-written items the account edited since: left in place. */
+  kept: string[];
+  warnings: string[];
 }
 
 /** The visible divider emitted into the new run's `status` stream when a swap
@@ -525,6 +644,10 @@ export interface TaskHarnessState {
      *  failover). Boot completes or visibly reports it instead of treating it
      *  as a quota swap (review R15-S3). */
     manual?: boolean;
+    /** Set on a manual switch that is the "Switch to next account" action
+     *  (`manual` = an idle request, `scheduled` = applied at turn end), so a
+     *  switch the core finishes after a restart keeps the `switch-now` label. */
+    switchNow?: "manual" | "scheduled";
   } | null;
   /** Set when every usable account is exhausted or unusable. */
   allExhausted: {
@@ -543,16 +666,41 @@ export interface TaskHarnessState {
      *  non-limit reason, stop retrying" from "the core died mid-spawn, retry
      *  again". Optional so older state still parses (legacy = re-arm). */
     attemptRunId?: string;
+    /** Set when the armed retry is a clean retry (first turn, no tool call):
+     *  the limited run whose user rows the retry will replay. Every path that
+     *  ends the retry without running it (cancel, manual message, cap) stashes
+     *  that run's unread follow-ups to the backlog from these persisted rows. */
+    cleanRetryOf?: string;
+    /** Why each member could not take the task when it blocked (banners,
+     *  `agetor show`). Optional so older state still parses. */
+    memberReasons?: HarnessMemberReason[];
   } | null;
   /** The last automatic move, for a visible note in the UI. `manual-switch`
    *  is the user switching accounts inside one stack (which preserves the
-   *  conversation) — not a member leaving or being unavailable. */
+   *  conversation) — not a member leaving or being unavailable. `switch-now`
+   *  is the "Switch to next account" action (idle, or scheduled at turn end). */
   lastMove: {
     from: string;
     to: string;
     at: number;
-    reason: "member-removed" | "member-disabled" | "member-unavailable" | "manual-switch";
+    reason: "member-removed" | "member-disabled" | "member-unavailable" | "manual-switch" | "switch-now";
   } | null;
+  /** "Switch to next account" requested while a run was live: applied when
+   *  the turn ends (unless the user pressed Stop). Survives a restart.
+   *  Optional so older state still parses. */
+  scheduledSwitch?: { requestedAt: number } | null;
+}
+
+/** `POST /tasks/:id/switch-account` success. */
+export type SwitchAccountResult =
+  | { status: "switched"; task: Task }
+  | { status: "scheduled"; task: Task };
+
+/** `POST /tasks/:id/switch-account` refusal body (409). */
+export interface SwitchAccountRefusal {
+  error: string;
+  code: "no-usable-member" | "background-agents" | "not-in-stack" | "busy" | "archived" | "launches-frozen";
+  reasons?: HarnessMemberReason[];
 }
 
 /** Defensive parser for `tasks.harness_state`: malformed or absent → null. */
@@ -587,6 +735,9 @@ export function parseTaskHarnessState(raw: string | null | undefined): TaskHarne
           runId: p.runId,
           startedAt: p.startedAt,
           ...(p.manual === true ? { manual: true } : {}),
+          ...(p.manual === true && (p.switchNow === "manual" || p.switchNow === "scheduled")
+            ? { switchNow: p.switchNow as "manual" | "scheduled" }
+            : {}),
         };
       })()
     : null;
@@ -610,6 +761,12 @@ export function parseTaskHarnessState(raw: string | null | undefined): TaskHarne
           ...(typeof e.attemptRunId === "string" && e.attemptRunId.length > 0
             ? { attemptRunId: e.attemptRunId }
             : {}),
+          ...(typeof e.cleanRetryOf === "string" && e.cleanRetryOf.length > 0
+            ? { cleanRetryOf: e.cleanRetryOf }
+            : {}),
+          ...(Array.isArray(e.memberReasons)
+            ? { memberReasons: parseMemberReasons(e.memberReasons) }
+            : {}),
         };
       })()
     : null;
@@ -618,15 +775,43 @@ export function parseTaskHarnessState(raw: string | null | undefined): TaskHarne
     ? (() => {
         const m = move as Record<string, unknown>;
         if (typeof m.from !== "string" || typeof m.to !== "string" || typeof m.at !== "number") return null;
-        const moveReason: "member-removed" | "member-disabled" | "member-unavailable" | "manual-switch" =
-          m.reason === "member-removed" || m.reason === "member-disabled" || m.reason === "member-unavailable" || m.reason === "manual-switch"
+        const moveReason: NonNullable<TaskHarnessState["lastMove"]>["reason"] =
+          m.reason === "member-removed" || m.reason === "member-disabled" || m.reason === "member-unavailable"
+            || m.reason === "manual-switch" || m.reason === "switch-now"
             ? m.reason
             : "member-unavailable";
         return { from: m.from, to: m.to, at: m.at, reason: moveReason };
       })()
     : null;
   const count = typeof o.count === "number" && Number.isFinite(o.count) ? o.count : undefined;
-  return { stackId: o.stackId, position: o.position, ...(count !== undefined ? { count } : {}), tried, pendingSwap, allExhausted, lastMove };
+  const sched = o.scheduledSwitch;
+  // Omitted when absent so persisted-state equality stays stable for tasks
+  // that never scheduled a switch.
+  const scheduledSwitch = sched && typeof sched === "object"
+    && typeof (sched as Record<string, unknown>).requestedAt === "number"
+    ? { requestedAt: (sched as Record<string, unknown>).requestedAt as number }
+    : null;
+  return {
+    stackId: o.stackId,
+    position: o.position,
+    ...(count !== undefined ? { count } : {}),
+    tried,
+    pendingSwap,
+    allExhausted,
+    lastMove,
+    ...(scheduledSwitch ? { scheduledSwitch } : {}),
+  };
+}
+
+function parseMemberReasons(raw: unknown[]): HarnessMemberReason[] {
+  const out: HarnessMemberReason[] = [];
+  for (const item of raw) {
+    if (!item || typeof item !== "object") continue;
+    const r = item as Record<string, unknown>;
+    if (typeof r.harnessId !== "string" || typeof r.reason !== "string") continue;
+    out.push({ harnessId: r.harnessId, label: typeof r.label === "string" ? r.label : r.harnessId, reason: r.reason });
+  }
+  return out;
 }
 
 function isHarnessLimitReason(v: unknown): v is HarnessLimitReason {
@@ -1877,7 +2062,7 @@ export function branchCommitType(
 
 /**
  * One repository a task was created against (issue #291). A multi-repository
- * task stores two or more of these in `tasks.repositories` (migration 087) —
+ * task stores two or more of these in `tasks.repositories` (migration 091) —
  * one or more once repositories were removed (`Task.multiRepo` stays true);
  * a single-repository task stores `[]` and derives its one entry from the
  * scalar `workdir`/`branch`/`worktreePath`/`baseRef`/`checkoutBranch`/`prUrl`

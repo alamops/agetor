@@ -36,7 +36,7 @@ import {
   codexHomeFor,
   type HarnessRootSource,
 } from "./harness-config-root.ts";
-import { getHarnessDiscoveredModels } from "./agent-discovery.ts";
+import { getDiscoveredModels, getHarnessDiscoveredModels } from "./agent-discovery.ts";
 import { readAccountFileText } from "./no-follow.ts";
 import { db, harnesses, tasks } from "./db.ts";
 
@@ -58,6 +58,7 @@ type StackRow = {
 type MemberRow = { stack_id: string; harness_id: string; position: number };
 type LimitRow = {
   harness_id: string;
+  model: string;
   reason: string;
   source: string;
   message: string | null;
@@ -112,7 +113,7 @@ function isV1Kind(kind: string): kind is HarnessStackKind {
  * account look logged in, and a Bedrock `AWS_*` key must.
  */
 const KIND_AUTH_ENV_PREFIXES: Record<HarnessStackKind, readonly string[]> = {
-  "claude-code": ["ANTHROPIC", "CLAUDE", "AWS", "BEDROCK", "AZURE", "VERTEX_AI", "GOOGLE_APPLICATION"],
+  "claude-code": ["ANTHROPIC", "CLAUDE"],
   codex: ["OPENAI", "CODEX", "AZURE", "AWS", "BEDROCK"],
 };
 
@@ -131,6 +132,18 @@ const UNINSPECTABLE_LOGIN_ENV_KEYS: Record<HarnessStackKind, readonly string[]> 
   ],
   codex: ["OPENAI_BASE_URL", "CODEX_BASE_URL", "OPENAI_API_BASE"],
 };
+
+/** Cloud-provider credential prefixes. They are Claude login evidence only
+ *  when a provider selector (`CLAUDE_CODE_USE_BEDROCK` / `_VERTEX` /
+ *  `_FOUNDRY`) is truthy in the same scope, and then the evidence is
+ *  "unknown", never "logged in": an `AWS_*` key left over from the user's
+ *  other tooling says nothing about Claude (finding 10). */
+const CLAUDE_CLOUD_AUTH_PREFIXES: readonly string[] = ["AWS", "BEDROCK", "AZURE", "VERTEX", "GOOGLE_APPLICATION"];
+const CLAUDE_PROVIDER_SELECTORS: readonly string[] = [
+  "CLAUDE_CODE_USE_BEDROCK",
+  "CLAUDE_CODE_USE_VERTEX",
+  "CLAUDE_CODE_USE_FOUNDRY",
+];
 
 const MAX_LOGIN_EVIDENCE_BYTES = 1024 * 1024;
 
@@ -151,6 +164,22 @@ function hasKindAuthKey(env: Record<string, unknown>, kind: HarnessStackKind): b
       && isHarnessAuthEnvKey(key)
       && prefixes.some((prefix) => key === prefix || key.startsWith(`${prefix}_`)),
   );
+}
+
+/** The first cloud credential key of `env` when a Claude provider selector is
+ *  truthy in the same `env`; null otherwise (selector absent: the key is
+ *  ignored). */
+function claudeCloudKeyUnderSelector(env: Record<string, unknown>): string | null {
+  if (!CLAUDE_PROVIDER_SELECTORS.some((key) => truthyEnvValue(env[key]))) return null;
+  const keys = Object.keys(env)
+    .filter(
+      (key) =>
+        truthyEnvValue(env[key])
+        && isHarnessAuthEnvKey(key)
+        && CLAUDE_CLOUD_AUTH_PREFIXES.some((prefix) => key === prefix || key.startsWith(`${prefix}_`)),
+    )
+    .sort();
+  return keys[0] ?? null;
 }
 
 function hasUninspectableLogin(env: Record<string, unknown>, kind: HarnessStackKind): boolean {
@@ -406,11 +435,15 @@ export function loginEvidence(harness: Harness): boolean | null {
     // out), so either is real login evidence.
     if (hasKindAuthKey(harnessEnv, "claude-code")) return true;
     if (hasKindAuthKey(processEnv, "claude-code")) return true;
+    // A cloud key under a selector in the same scope is a login the file check
+    // cannot verify: unknown. Without a selector it is ignored.
+    if (claudeCloudKeyUnderSelector(harnessEnv) || claudeCloudKeyUnderSelector(processEnv)) return null;
     const settingsPath = path.join(configDir, "settings.json");
     const settings = readJsonObject(settingsPath);
     if (settings) {
       const settingsEnv = isPlainObject(settings.env) ? settings.env : {};
       if (hasKindAuthKey(settingsEnv, "claude-code")) return true;
+      if (claudeCloudKeyUnderSelector(settingsEnv)) return null;
       // `apiKeyHelper` / `forceLoginOrgUUID` / `awsCredentialExport` /
       // `awsAuthRefresh` / `gcpAuthRefresh` produce or select a credential at
       // run time — a login the file check cannot see.
@@ -503,6 +536,15 @@ export function memberInstalled(harness: Harness): boolean {
  *  same kind-scoped prefixes as login evidence, so a stray `GITHUB_TOKEN` does
  *  not warn about a provider the kind never reads. */
 function processProviderKeyFor(kind: HarnessStackKind): string | null {
+  if (kind === "claude-code") {
+    const direct = directProviderKey(kind);
+    if (direct) return direct;
+    return claudeCloudKeyUnderSelector(process.env as Record<string, unknown>);
+  }
+  return directProviderKey(kind);
+}
+
+function directProviderKey(kind: HarnessStackKind): string | null {
   const prefixes = KIND_AUTH_ENV_PREFIXES[kind];
   const keys = Object.keys(process.env)
     .filter(
@@ -515,8 +557,16 @@ function processProviderKeyFor(kind: HarnessStackKind): string | null {
   return keys[0] ?? null;
 }
 
+/** Per-harness catalog kinds (mirrors `modelsForHarness` in
+ *  model-discovery.ts); every other kind, Claude included, has one kind-level
+ *  catalog, so the per-harness list is always empty for it. */
+const PER_HARNESS_CATALOG_KINDS: ReadonlySet<string> = new Set(["fx", "codex", "opencode"]);
+
 function modelCatalogFor(harness: Harness): string[] {
-  return getHarnessDiscoveredModels(harness.id).map((m) => m.id);
+  const models = PER_HARNESS_CATALOG_KINDS.has(harness.kind)
+    ? getHarnessDiscoveredModels(harness.id)
+    : getDiscoveredModels(harness.kind);
+  return models.map((m) => m.id);
 }
 
 function stackRows(): StackRow[] {
@@ -638,6 +688,18 @@ function normalizeLabel(raw: unknown): string {
 }
 
 /** A hard input error carrying user-facing blockers. */
+/** An edit carried an `expectedUpdatedAt` that no longer matches the stored
+ *  stack (another client saved first). `current` is the stored stack; the
+ *  field is not called `stack` because `Error.stack` is a string. */
+export class StackChangedError extends Error {
+  readonly current: HarnessStack;
+  constructor(current: HarnessStack) {
+    super("the stack changed since it was loaded");
+    this.name = "StackChangedError";
+    this.current = current;
+  }
+}
+
 export class StackInputError extends Error {
   readonly blockers: HarnessStackWarning[];
   constructor(message: string, blockers: HarnessStackWarning[] = [{ code: "invalid", message }]) {
@@ -782,6 +844,12 @@ export const harnessStacks = {
   update(id: string, patch: Partial<HarnessStackInput>): HarnessStack {
     const current = this.get(id);
     if (!current) throw new StackInputError(`stack not found: ${id}`);
+    // Fast path so a stale draft reports the conflict, not a validation error
+    // about its own stale content; the authoritative check is in the
+    // transaction below.
+    if (patch.expectedUpdatedAt !== undefined && patch.expectedUpdatedAt !== current.updatedAt) {
+      throw new StackChangedError(current);
+    }
     const label = patch.label === undefined ? current.label : normalizeLabel(patch.label);
     const members = patch.members ?? memberIdsOf(id);
     const kind = patch.kind ?? current.kind;
@@ -790,9 +858,19 @@ export const harnessStacks = {
     if (validation.blockers.length > 0) throw new StackInputError(validation.blockers[0]!.message, validation.blockers);
     const now = Date.now();
     db.transaction(() => {
+      const stored = db
+        .query<{ updated_at: number }, [string]>(`SELECT updated_at FROM harness_stacks WHERE id = ?`)
+        .get(id);
+      if (!stored) throw new StackInputError(`stack not found: ${id}`);
+      if (patch.expectedUpdatedAt !== undefined && stored.updated_at !== patch.expectedUpdatedAt) {
+        throw new StackChangedError(this.get(id) as HarnessStack);
+      }
+      // Strictly increasing, so two edits inside one millisecond still differ
+      // and the second editor's `expectedUpdatedAt` conflicts.
+      const stamp = Math.max(now, stored.updated_at + 1);
       db.run(
         `UPDATE harness_stacks SET label = ?, kind = ?, mirror_mode = ?, updated_at = ? WHERE id = ?`,
-        [label, kind, mirrorMode === "safe" ? "safe" : "full", now, id],
+        [label, kind, mirrorMode === "safe" ? "safe" : "full", stamp, id],
       );
       db.run(`DELETE FROM harness_stack_members WHERE stack_id = ?`, [id]);
       members.forEach((harnessId, position) => {
@@ -876,33 +954,37 @@ export const harnessStacks = {
       orphaned: index < 0,
     };
   },
-  /** Write (or replace) the account cooldown. A provider-reported reset is
+  /** Write (or replace) a cooldown row, keyed by (account, `signal.model ??
+   *  ''`): an empty model is the whole account. A provider-reported reset is
    *  authoritative even when it is earlier than the stored one. A fallback
    *  (no reset time in the signal) must never SHORTEN a later provider reset
-   *  that is still active — an API-error/rate-limit fallback arriving after a
-   *  quota signal would otherwise unblock the account too early (review
-   *  should-fix). Writes are also the safe place to sweep expired rows. */
+   *  that is still active on the same row — an API-error/rate-limit fallback
+   *  arriving after a quota signal would otherwise unblock the account too
+   *  early. Writes are also the safe place to sweep expired rows. */
   setLimitState(harnessId: string, signal: HarnessLimitSignal, now = Date.now()): HarnessLimitState {
     this.pruneExpired(now);
+    const model = signal.model ? signal.model : "";
     const fallback = signal.reason === "rate_limit" ? HARNESS_RATE_LIMIT_COOLDOWN_MS : HARNESS_QUOTA_COOLDOWN_MS;
     const nextUntil = signal.resetAtMs ?? now + fallback;
-    const existing = this.getLimitState(harnessId);
+    const existing = db
+      .query<LimitRow, [string, string]>(`SELECT * FROM harness_limit_state WHERE harness_id = ? AND model = ?`)
+      .get(harnessId, model);
     const exhaustedUntilMs = signal.resetAtMs === null
       && existing !== null
-      && existing.exhaustedUntilMs > nextUntil
-      ? existing.exhaustedUntilMs
+      && existing.exhausted_until_ms > nextUntil
+      ? existing.exhausted_until_ms
       : nextUntil;
     db.run(
       `INSERT INTO harness_limit_state
-         (harness_id, reason, source, message, exhausted_until_ms, updated_at)
-       VALUES (?, ?, ?, ?, ?, ?)
-       ON CONFLICT(harness_id) DO UPDATE SET
+         (harness_id, model, reason, source, message, exhausted_until_ms, updated_at)
+       VALUES (?, ?, ?, ?, ?, ?, ?)
+       ON CONFLICT(harness_id, model) DO UPDATE SET
          reason = excluded.reason,
          source = excluded.source,
          message = excluded.message,
          exhausted_until_ms = excluded.exhausted_until_ms,
          updated_at = excluded.updated_at`,
-      [harnessId, signal.reason, signal.source, signal.message || null, exhaustedUntilMs, now],
+      [harnessId, model, signal.reason, signal.source, signal.message || null, exhaustedUntilMs, now],
     );
     return {
       harnessId,
@@ -911,32 +993,76 @@ export const harnessStacks = {
       message: signal.message || null,
       exhaustedUntilMs,
       updatedAt: now,
+      model: model || null,
     };
   },
-  getLimitState(harnessId: string): HarnessLimitState | null {
-    const row = db
-      .query<LimitRow, [string]>(`SELECT * FROM harness_limit_state WHERE harness_id = ?`)
-      .get(harnessId);
-    return row ? toLimitState(row) : null;
+  /** The effective ACTIVE cooldown for a task on `opts.model`: the
+   *  account-wide row and (when a model is given) that model's row, whichever
+   *  expires later. Without `opts.model` only the account-wide row counts.
+   *  Expired rows are ignored (`opts.now`, default the clock). Read-only. */
+  getLimitState(harnessId: string, opts: { model?: string | null; now?: number } = {}): HarnessLimitState | null {
+    const now = opts.now ?? Date.now();
+    const model = opts.model ? opts.model : "";
+    const rows = model
+      ? db
+          .query<LimitRow, [string, string]>(
+            `SELECT * FROM harness_limit_state WHERE harness_id = ? AND model IN ('', ?)`,
+          )
+          .all(harnessId, model)
+      : db
+          .query<LimitRow, [string]>(`SELECT * FROM harness_limit_state WHERE harness_id = ? AND model = ''`)
+          .all(harnessId);
+    let best: LimitRow | null = null;
+    for (const row of rows) {
+      if (row.exhausted_until_ms <= now) continue;
+      if (best === null || row.exhausted_until_ms > best.exhausted_until_ms) best = row;
+    }
+    return best ? toLimitState(best) : null;
   },
+  /** Every ACTIVE row, account-wide and per-model, soonest reset first.
+   *  `model` is null for an account-wide row. */
   listLimitStates(now = Date.now()): HarnessLimitState[] {
     // Read-only: a GET/poll must not DELETE. Expired rows are filtered out of
-    // the payload; `pruneExpired` runs on boot and on every write below.
+    // the payload; `pruneExpired` runs on boot and on every write.
     return db
-      .query<LimitRow, []>(`SELECT * FROM harness_limit_state ORDER BY exhausted_until_ms ASC`)
+      .query<LimitRow, []>(`SELECT * FROM harness_limit_state ORDER BY exhausted_until_ms ASC, harness_id ASC, model ASC`)
       .all()
       .map(toLimitState)
       .filter((state) => state.exhaustedUntilMs > now);
   },
-  clearLimitState(harnessId: string): void {
+  /** Clear cooldown rows of one account.
+   *  - no opts: every row (the explicit "Clear cooldown" action);
+   *  - `startedAtMs`: only rows written at or before it (a turn that started
+   *    before the limit was recorded must not erase that limit), limited to
+   *    the account-wide row and `opts.model`'s row;
+   *  - `model` alone: that model's row only. */
+  clearLimitState(
+    harnessId: string,
+    opts: { startedAtMs?: number; model?: string | null; accountWideOnly?: boolean } = {},
+  ): void {
+    const model = opts.model ? opts.model : "";
+    if (opts.startedAtMs !== undefined) {
+      db.run(
+        `DELETE FROM harness_limit_state WHERE harness_id = ? AND updated_at <= ? AND model IN ('', ?)`,
+        [harnessId, opts.startedAtMs, model],
+      );
+      return;
+    }
+    if (opts.accountWideOnly) {
+      db.run(`DELETE FROM harness_limit_state WHERE harness_id = ? AND model = ''`, [harnessId]);
+      return;
+    }
+    if (opts.model !== undefined) {
+      db.run(`DELETE FROM harness_limit_state WHERE harness_id = ? AND model = ?`, [harnessId, model]);
+      return;
+    }
     db.run(`DELETE FROM harness_limit_state WHERE harness_id = ?`, [harnessId]);
   },
   pruneExpired(now = Date.now()): void {
     db.run(`DELETE FROM harness_limit_state WHERE exhausted_until_ms <= ?`, [now]);
   },
-  isCooling(harnessId: string, now = Date.now()): HarnessLimitState | null {
-    const state = this.getLimitState(harnessId);
-    return state && state.exhaustedUntilMs > now ? state : null;
+  isCooling(harnessId: string, now = Date.now(), model?: string | null): HarnessLimitState | null {
+    return this.getLimitState(harnessId, { model, now });
   },
 };
 
@@ -951,6 +1077,7 @@ function toLimitState(row: LimitRow): HarnessLimitState {
     message: row.message,
     exhaustedUntilMs: row.exhausted_until_ms,
     updatedAt: row.updated_at,
+    model: row.model ? row.model : null,
   };
 }
 

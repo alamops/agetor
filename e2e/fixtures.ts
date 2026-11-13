@@ -575,6 +575,22 @@ async function provisionBackend(
       // under every spec. Off by default; e2e/harness-auto-enable.spec.ts turns it on
       // through `backendEnv`.
       AGETOR_HARNESS_AUTO_ENABLE: "0",
+      // Harness-stack e2e seams. `AGETOR_E2E_HARNESS_SEAMS=1` is the explicit
+      // opt-in that lets the backend honor `AGETOR_HARNESS_RETRY_MIN_MS`
+      // (src/bun/harness-failover.ts `retryMinMs`), which shortens the
+      // all-exhausted retry floor from 10 s so the countdown, Run now and
+      // retry-running specs finish in about a second. Neither is set in any
+      // production launch.
+      AGETOR_E2E_HARNESS_SEAMS: "1",
+      AGETOR_HARNESS_RETRY_MIN_MS: "500",
+      // Codex turns run through the in-process fake driver. The driver is
+      // inert until a codex harness runs a turn. The BIN is opt-in (a spec
+      // passes `AGETOR_E2E_CODEX_STUB=1` in `backendEnv`) because pointing it
+      // at a real binary makes the seeded Codex row "installed" and would
+      // change what every other spec sees in its pickers.
+      AGETOR_CODEX_DRIVER: "fake",
+      AGETOR_CODEX_ARGS: "",
+      ...(extraEnv.AGETOR_E2E_CODEX_STUB === "1" ? { AGETOR_CODEX_BIN: "/bin/echo" } : {}),
       // GitHub Copilot routes through its in-process fake driver for every
       // worker (`src/bun/copilot-fake.ts`, e2e/copilot-harness.spec.ts). Copilot
       // is seeded enabled, so unlike fx the BIN is opt-in: it points at the

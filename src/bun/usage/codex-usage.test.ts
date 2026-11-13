@@ -144,6 +144,21 @@ describe("parseCodexUsage", () => {
     expect(parseCodexUsage(json, FETCHED_AT_MS)).toEqual([]);
   });
 
+  test("a zero / \"0\" / \"0.00\" credits balance reads 100 on the usage endpoint body too; a positive balance reads 0", () => {
+    for (const balance of [0, "0", "0.00"]) {
+      const meters = parseCodexUsage({ credits: { has_credits: true, unlimited: false, balance } }, FETCHED_AT_MS);
+      expect(meters).toHaveLength(1);
+      expect(meters[0]).toMatchObject({ id: "credits", usedPercent: 100 });
+    }
+    for (const balance of [5, "12.50", "0.01"]) {
+      expect(parseCodexUsage({ credits: { has_credits: true, unlimited: false, balance } }, FETCHED_AT_MS)[0]?.usedPercent).toBe(0);
+    }
+    // A blank or unparsable string is not a zero balance.
+    for (const balance of ["", "n/a"]) {
+      expect(parseCodexUsage({ credits: { has_credits: true, unlimited: false, balance } }, FETCHED_AT_MS)[0]?.usedPercent).toBe(0);
+    }
+  });
+
   test("does not add a credits meter when has_credits is false or unlimited is true", () => {
     const jsonNoCredits = { credits: { has_credits: false, unlimited: false, balance: 10 } };
     const jsonUnlimited = { credits: { has_credits: true, unlimited: true, balance: 10 } };
@@ -255,6 +270,16 @@ describe("parseCodexSessionRateLimits", () => {
 
     expect(meters).toHaveLength(2);
     expect(meters[1]).toEqual({ id: "credits", label: "Credits: 5", usedPercent: 0, resetsAtMs: null });
+  });
+
+  test("a zero credits balance (number or string) reads as used 100", () => {
+    for (const balance of [0, "0", "0.00"]) {
+      const meters = parseCodexSessionRateLimits(
+        { primary: { used_percent: 6, window_minutes: 10080, resets_in_seconds: 100 }, credits: { has_credits: true, unlimited: false, balance } },
+        FETCHED_AT_MS,
+      );
+      expect(meters[1]?.usedPercent).toBe(100);
+    }
   });
 
   test("returns [] when rate_limits is null (exec-mode sessions per openai/codex#14728)", () => {

@@ -21,7 +21,7 @@ import { repositoryCountLabel } from "@/lib/multi-repo-ui";
 import { AgentIcon } from "./AgentIcon";
 import { PipelineBadge } from "@/components/pipelines";
 import { StackBadge } from "./StackBadge";
-import { stackBadgeStateFor } from "@/lib/stack-badge";
+import { activeCooldown, resolvedTaskModel, stackBadgeStateFor } from "@/lib/stack-badge";
 
 interface Props {
   task: Task;
@@ -64,6 +64,9 @@ interface Props {
 
 function TaskCardImpl({ task, homeDir, stacks = [], limitStates = [], onStart, onCancel, onDelete, onOpen, onOpenAttention, onReviewPipeline, onDiff, onMarkDone, onArchive, onUnarchive, isOpen, onContextMenu }: Props) {
   const archived = task.archivedAt != null;
+  // Model-aware (review S2): a per-model row counts only for the model this
+  // task resolves to; an account-wide row always counts.
+  const cardCooldown = activeCooldown(limitStates, task.agent, resolvedTaskModel(task, stacks), Date.now());
   // Last-seen worktree checkout (server-recorded; no git spawn on the 2 s
   // poll) vs the branch agetor created. Drift is tolerated — just shown.
   const branchDrift = driftOf(task.branch ?? null, task.checkoutBranch);
@@ -319,7 +322,8 @@ function TaskCardImpl({ task, homeDir, stacks = [], limitStates = [], onStart, o
           )}
           <StackBadge
             state={stackBadgeStateFor(task, stacks)}
-            coolingUntilMs={limitStates.find((s) => s.harnessId === task.agent)?.exhaustedUntilMs ?? null}
+            coolingUntilMs={cardCooldown?.exhaustedUntilMs ?? null}
+            coolingModel={cardCooldown?.model ?? null}
             running={task.column === "running"}
             className="shrink-0"
           />

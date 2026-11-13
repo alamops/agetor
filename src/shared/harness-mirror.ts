@@ -124,7 +124,70 @@ export function isLoginSelectorEnvKey(key: string): boolean {
  *  and provider/login selectors ({@link isLoginSelectorEnvKey}). A backup's
  *  own value always survives. */
 export function isMirrorNeverImportedEnvKey(key: string): boolean {
-  return isCredentialShapedEnvKey(key) || isLoginSelectorEnvKey(key);
+  return isCredentialShapedEnvKey(key) || isLoginSelectorEnvKey(key) || isLoginSelectorEnvKey(key.toUpperCase());
+}
+
+/** True for a URL-shaped value with userinfo (`scheme://user[:pass]@host`). */
+export function urlHasUserinfo(value: unknown): boolean {
+  return typeof value === "string" && /^[A-Za-z][A-Za-z0-9+.-]*:\/\/[^/?#\s]*@/.test(value.trim());
+}
+
+/**
+ * Entry-level form of {@link isMirrorNeverImportedEnvKey}: also refuses ANY
+ * variable whose value is a URL carrying userinfo (`HTTPS_PROXY`,
+ * `DATABASE_URL=postgres://u:pw@db`, …), which is a credential whatever the
+ * name looks like.
+ */
+export function isMirrorNeverImportedEnvEntry(key: string, value: unknown): boolean {
+  return isMirrorNeverImportedEnvKey(key) || urlHasUserinfo(value);
+}
+
+/** True when any string anywhere inside `value` is a URL with userinfo. */
+export function containsUrlUserinfo(value: unknown): boolean {
+  if (typeof value === "string") return urlHasUserinfo(value);
+  if (Array.isArray(value)) return value.some(containsUrlUserinfo);
+  if (typeof value === "object" && value !== null) return Object.values(value).some(containsUrlUserinfo);
+  return false;
+}
+
+/** Env var names (any case) that make a spawned command run something: a shell
+ *  prefix, a startup script, a loader hook, or a helper/command by suffix. Safe
+ *  mode never imports them from the primary; the backup's own value survives. */
+const COMMAND_RUNNING_ENV_KEYS: readonly string[] = [
+  "CLAUDE_CODE_SHELL_PREFIX",
+  "NODE_OPTIONS",
+  "BASH_ENV",
+  "ENV",
+  "PROMPT_COMMAND",
+  "LD_PRELOAD",
+  "LD_LIBRARY_PATH",
+  "PYTHONSTARTUP",
+  "PYTHONPATH",
+  "NODE_PATH",
+  "GIT_EXTERNAL_DIFF",
+  "GIT_PAGER",
+  "BROWSER",
+  "ZDOTDIR",
+  "PERL5LIB",
+  "RUBYLIB",
+  "PERL5OPT",
+  "RUBYOPT",
+  "GIT_SSH_COMMAND",
+  "GIT_ASKPASS",
+  "SSH_ASKPASS",
+  "EDITOR",
+  "VISUAL",
+  "PAGER",
+];
+
+/** True for an env var that runs a command (see {@link COMMAND_RUNNING_ENV_KEYS}),
+ *  including `DYLD_*` and any name ending `_HELPER` or `_COMMAND`. */
+export function isCommandRunningEnvKey(key: string): boolean {
+  const upper = key.toUpperCase();
+  return COMMAND_RUNNING_ENV_KEYS.includes(upper)
+    || upper.startsWith("DYLD_")
+    || upper.endsWith("_HELPER")
+    || upper.endsWith("_COMMAND");
 }
 
 /** Prefixes owned by a model provider (or the cloud that fronts one). A
@@ -220,6 +283,39 @@ export const CLAUDE_CODE_LOGIN_ENV_KEYS: readonly string[] = [
  * {@link isHarnessAuthEnvKey} to ask "does this log the harness in?".
  */
 export function isCredentialShapedEnvKey(key: string): boolean {
+  // Case-insensitive: `github_token` is as much a secret as `GITHUB_TOKEN`.
+  const upper = key.toUpperCase();
+  if (HARNESS_AUTH_ENV_KEYS.includes(upper)) return true;
+  if (upper.split("_").some((segment) => MIRROR_EXTRA_CREDENTIAL_SEGMENTS.includes(segment))) return true;
+  return isLoginShapedEnvKey(upper);
+}
+
+/** Whole-segment credential names the MIRROR strips on top of
+ *  {@link CREDENTIAL_SEGMENTS}: `SERPAPI_APIKEY`, `DB_PASS`, `GH_PAT`,
+ *  `NPM_AUTH`, `OTEL_EXPORTER_OTLP_HEADERS`, cookies and session blobs. Only a
+ *  whole `_`-separated segment matches, so `PATH` never matches `PAT`. They are
+ *  deliberately NOT part of login evidence ({@link isHarnessAuthEnvKey}):
+ *  `TERM_SESSION_ID` in the process env is not a harness login. */
+const MIRROR_EXTRA_CREDENTIAL_SEGMENTS: readonly string[] = [
+  "APIKEY",
+  "PASS",
+  "PASSWD",
+  "PAT",
+  "AUTH",
+  "HEADERS",
+  "COOKIE",
+  "COOKIES",
+  "SESSION",
+  "DSN",
+  "WEBHOOK",
+  "CONNECTION",
+  "PASSPHRASE",
+];
+
+/** The original (case-sensitive-era) credential shape rule: explicit list,
+ *  credential segment, then vendor prefix + marker. Login evidence keeps using
+ *  exactly this. */
+function isLoginShapedEnvKey(key: string): boolean {
   if (HARNESS_AUTH_ENV_KEYS.includes(key)) return true;
   // Shape first: a credential segment is a credential under any vendor.
   const segments = key.split("_");
@@ -246,7 +342,7 @@ export function isCredentialShapedEnvKey(key: string): boolean {
  *  (`src/bun/harness-stacks.ts`) use this. */
 export function isHarnessAuthEnvKey(key: string): boolean {
   if (key.startsWith("CLAUDE_CODE_")) return CLAUDE_CODE_LOGIN_ENV_KEYS.includes(key);
-  return isCredentialShapedEnvKey(key);
+  return isLoginShapedEnvKey(key);
 }
 
 /**
@@ -344,6 +440,24 @@ export function isCodexLoginBearingKeyPath(segments: readonly string[]): boolean
   return segments[0] === "profiles"
     && segments.length >= 3
     && CODEX_LOGIN_BEARING_CONFIG_KEYS.includes(segments[2]!);
+}
+
+/**
+ * True for a Codex config key path (already split into unquoted segments) that
+ * holds a secret the mirror must not import although it is not a login: a
+ * credential-shaped variable in `shell_environment_policy.set` (`set.GH_TOKEN`)
+ * or anything named `headers` under `otel` (OTLP exporters carry auth headers).
+ * The backup's own value of such a key survives. A path that STOPS at
+ * `shell_environment_policy.set` (an inline `set = {…}`) is not matched here:
+ * the engine filters that table's members one by one.
+ */
+export function isCodexSecretKeyPath(segments: readonly string[]): boolean {
+  if (segments.length === 0) return false;
+  if (segments[0] === "otel") return segments.slice(1).some((s) => s.toLowerCase() === "headers");
+  if (segments[0] === "shell_environment_policy" && segments[1] === "set" && segments.length >= 3) {
+    return isMirrorNeverImportedEnvKey(segments[2]!);
+  }
+  return false;
 }
 
 /**
@@ -596,8 +710,25 @@ export function isNeverCopyPath(kind: HarnessStackKind, rel: string): boolean {
   return false;
 }
 
+/**
+ * True when `rel` (relative to the account's config root, `/`-separated) is a
+ * path the mirror's `copy` allowlist can have written: a listed entry or
+ * something below one, and not a never-copy path. Provenance rows live in
+ * SQLite, which an agent can write, so a removal or restore of a recorded file
+ * must pass this shape check besides the usual path checks.
+ */
+export function isMirrorCopyShape(kind: HarnessStackKind, rel: string): boolean {
+  if (rel.length === 0 || rel.startsWith("/") || rel.includes("\0") || rel.includes("\\")) return false;
+  const parts = rel.split("/");
+  if (parts.some((p) => p === "" || p === "." || p === "..")) return false;
+  if (isNeverCopyPath(kind, rel)) return false;
+  return MIRROR_SPECS[kind].copy.some((entry) => rel === entry || rel.startsWith(`${entry}/`));
+}
+
 /** The per-session sidecar folders Claude Code keeps next to a transcript
- *  (`projects/<encoded cwd>/<session>/<sidecar>/…`). */
+ *  (`projects/<encoded cwd>/<session>/<sidecar>/…`). `file-history/<session>/`
+ *  (the `/rewind` checkpoints) sits beside `projects/`, not under it, and is
+ *  handled separately by the handoff shapes. */
 export const CLAUDE_SESSION_SIDECAR_DIRS: readonly string[] = ["subagents", "tool-results", "mcp-tasks"];
 
 /** A single path segment Agetor may treat as a session or project name: no
@@ -613,41 +744,90 @@ export function isSafePathSegment(segment: string): boolean {
 
 /**
  * True when `rel` (relative to an account's config root, `/`-separated) has
- * the shape a session handoff writes — the only shapes cleanup may unlink:
- * - claude-code: `projects/<enc>/<sid>.jsonl`, or a file below
- *   `projects/<enc>/<sid>/{subagents,tool-results,mcp-tasks}/`;
- * - codex: `sessions/YYYY/MM/DD/rollout-*.jsonl`.
+ * the shape a session handoff writes for the recorded `sessionId` — the only
+ * shapes cleanup may unlink:
+ * - claude-code: `projects/<enc>/<sid>.jsonl`, a file below
+ *   `projects/<enc>/<sid>/{subagents,tool-results,mcp-tasks}/`, or a file
+ *   below `file-history/<sid>/`;
+ * - codex: `sessions/YYYY/MM/DD/rollout-*-<sid>.jsonl` (Codex embeds the
+ *   thread id as the file name's suffix).
  * Handoff rows live in SQLite, which an agent can write; a recorded path of
- * any other shape is never touched, whatever the row says.
+ * any other shape, or one naming a different session, is never touched,
+ * whatever the row says.
  */
-export function isHandoffCopyShape(kind: HarnessStackKind, rel: string): boolean {
+export function isHandoffCopyShape(kind: HarnessStackKind, rel: string, sessionId: string): boolean {
+  if (!isSafePathSegment(sessionId)) return false;
   const parts = rel.split("/");
   if (parts.some((p) => !isSafePathSegment(p))) return false;
   if (kind === "claude-code") {
+    if (parts[0] === "file-history") return parts.length >= 3 && parts[1] === sessionId;
     if (parts[0] !== "projects" || parts.length < 3) return false;
-    if (parts.length === 3) return parts[2]!.endsWith(".jsonl") && parts[2]!.length > ".jsonl".length;
-    return parts.length >= 5 && CLAUDE_SESSION_SIDECAR_DIRS.includes(parts[3]!);
+    if (parts.length === 3) return parts[2] === `${sessionId}.jsonl`;
+    return parts.length >= 5 && parts[2] === sessionId && CLAUDE_SESSION_SIDECAR_DIRS.includes(parts[3]!);
   }
   return parts.length === 5
     && parts[0] === "sessions"
     && /^\d{4}$/.test(parts[1]!)
     && /^\d{2}$/.test(parts[2]!)
     && /^\d{2}$/.test(parts[3]!)
-    && /^rollout-.+\.jsonl$/.test(parts[4]!);
+    && parts[4]!.startsWith("rollout-")
+    && parts[4]!.endsWith(`-${sessionId}.jsonl`);
 }
 
 /**
- * True when `rel` names a DIRECTORY inside a handoff shape that cleanup may
- * prune once it is empty: for claude-code the session folder
- * `projects/<enc>/<sid>` and anything below it; for codex the date folders
- * `sessions/YYYY[/MM[/DD]]`. Never `projects/<enc>`, `projects` or `sessions`
- * themselves — those belong to the account.
+ * The session a recorded handoff path was copied for, read from the path
+ * itself, or null when no handoff shape matches; `prefer` (the row's own
+ * session) wins whenever it matches. Only the boot normalization
+ * of rows written before migration 088 uses it (a re-keyed row could still
+ * list the old session's paths); the session it returns is a proposal that
+ * removal re-checks against the account's current root with
+ * {@link isHandoffCopyShape}.
  */
-export function isHandoffPrunableDir(kind: HarnessStackKind, rel: string): boolean {
+export function handoffCopySessionIdFromPath(kind: HarnessStackKind, absPath: string, prefer?: string): string | null {
+  const parts = absPath.split("/").filter(Boolean);
+  const anchors = kind === "claude-code" ? ["projects", "file-history"] : ["sessions"];
+  // A path that is a handoff shape for the preferred session at ANY anchor is
+  // that session's: a folder inside it that happens to be named like an
+  // anchor must not make it read as another session's.
+  if (prefer !== undefined) {
+    for (let i = 0; i < parts.length; i++) {
+      if (anchors.includes(parts[i]!) && isHandoffCopyShape(kind, parts.slice(i).join("/"), prefer)) return prefer;
+    }
+  }
+  for (let i = parts.length - 1; i >= 0; i--) {
+    if (!anchors.includes(parts[i]!)) continue;
+    const rel = parts.slice(i).join("/");
+    let candidate: string | undefined;
+    if (kind === "codex") {
+      candidate = /-([0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12})\.jsonl$/.exec(parts[parts.length - 1]!)?.[1];
+    } else if (parts[i] === "file-history") {
+      candidate = parts[i + 1];
+    } else if (parts.length - i === 3) {
+      const leaf = parts[i + 2]!;
+      candidate = leaf.endsWith(".jsonl") ? leaf.slice(0, -".jsonl".length) : undefined;
+    } else {
+      candidate = parts[i + 2];
+    }
+    if (candidate && isHandoffCopyShape(kind, rel, candidate)) return candidate;
+  }
+  return null;
+}
+
+/**
+ * True when `rel` names a DIRECTORY inside a handoff shape for `sessionId`
+ * that cleanup may prune once it is empty: for claude-code the session folder
+ * `projects/<enc>/<sid>` and its sidecar folders, and `file-history/<sid>` and
+ * anything below it; for codex the date folders `sessions/YYYY[/MM[/DD]]`.
+ * Never `projects/<enc>`, `projects`, `file-history` or `sessions` themselves —
+ * those belong to the account.
+ */
+export function isHandoffPrunableDir(kind: HarnessStackKind, rel: string, sessionId: string): boolean {
+  if (!isSafePathSegment(sessionId)) return false;
   const parts = rel.split("/");
   if (parts.some((p) => !isSafePathSegment(p))) return false;
   if (kind === "claude-code") {
-    if (parts[0] !== "projects" || parts.length < 3) return false;
+    if (parts[0] === "file-history") return parts.length >= 2 && parts[1] === sessionId;
+    if (parts[0] !== "projects" || parts.length < 3 || parts[2] !== sessionId) return false;
     return parts.length === 3 || CLAUDE_SESSION_SIDECAR_DIRS.includes(parts[3]!);
   }
   if (parts[0] !== "sessions" || parts.length < 2 || parts.length > 4) return false;

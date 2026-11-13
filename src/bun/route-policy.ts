@@ -323,6 +323,15 @@ export const ROUTE_POLICY: Record<string, PolicyEntry> = {
     PATCH: CLI,
     DELETE: CLI,
   },
+  // Fix round: swap history, the save-time mirror dry run, cooldown clear,
+  // mirror restore and switch-to-next-account. All take ids, never paths; the
+  // ones that reach an account's config root (preview, restore, switch) probe
+  // those roots for the CLI token in the handler (`gateStackMemberRoots`).
+  "/harness-stacks/:id/history": { GET: CLI },
+  "/harness-stacks/mirror-preview": { POST: CLI },
+  "/harnesses/:id/limit-state": { DELETE: CLI },
+  "/harnesses/:id/mirror-restore": { POST: CLI },
+  "/tasks/:id/switch-account": { POST: CLI, DELETE: CLI },
   "/harnesses/:id": {
     GET: CLI,
     PATCH: cli({ pathParams: BODY_HOME_BIN }),

@@ -32,7 +32,9 @@ Tests: `os-notification.test.ts`, `notifier.test.ts`, `task-notifier.test.ts`, `
 ## Harness stacks
 
 `harness-swap` is a **quiet** Notification kind: a completed failover posts one
-"Account switched" entry (`from → to, 2/3`) and never needs the user. The old
+"Account switched" entry (`from → to, 2/3`; the position is omitted for a stack
+of fewer than two accounts, the one-account rule of `stackPositionText`) and never
+needs the user. The old
 run's settle carries `run-status.reason: "harness-swap"` and is deliberately
 silent in the webview (`runStatusToastKind`, `src/mainview/lib/run-status-toast.ts`),
 the CLI `--notify` path, the TUI and `headless-notifications.ts`; the

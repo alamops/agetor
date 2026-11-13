@@ -9,6 +9,7 @@
 | Status | implemented; live harness smoke run 2026-11-12 (T17 below): claude-code, codex and fx end to end; OpenCode 2.x end to end on a re-run with an OpenCode Go model (the first attempt's Zen balance was empty); copilot not run against a GitHub account (no login), but its real CLI 1.0.109 passed an opt-in multi-repo case against a fake provider (Auto commits, Read-only denied); cursor and harness failover not run. Repository removal and one-repository multi tasks were added after implementation by owner decision (§3.5). Ledger: `docs/plans/multi-repo-tasks-smoke.md` |
 | Branch | `feature/issue-291-feature-request-support-multip` |
 | Base SHA | `8e308518fd4db2630a1b866522548f786b4d80ec` (`8e308518`, decision record; `c45fd806` is main) |
+| Merge note | Merged `origin/main` (`40d014a4`) into this branch for PR #299. Main's 087–090 harness-stack migrations landed first, so `087_task_repositories` was renumbered to `091_task_repositories`, its original id kept as an alias (the repo's renumber-with-alias pattern); the multi-repo columns and behavior are otherwise unchanged by the merge. |
 
 ## 1. Objective & success criteria
 

@@ -10,7 +10,12 @@ import {
   SAFE_MODE_EXCLUDED_CODEX_KEYS,
   SAFE_MODE_EXCLUDED_SETTINGS_KEYS,
   CLAUDE_CODE_LOGIN_ENV_KEYS,
+  containsUrlUserinfo,
   isCodexLoginBearingKeyPath,
+  isCodexSecretKeyPath,
+  isCommandRunningEnvKey,
+  isMirrorNeverImportedEnvEntry,
+  urlHasUserinfo,
   isCredentialShapedEnvKey,
   isHandoffCopyShape,
   isHandoffPrunableDir,
@@ -20,8 +25,7 @@ import {
   isMirrorNeverImportedEnvKey,
   isMirrorNeverImportedSettingsKey,
   isNeverCopyPath,
-  tccProtectedFolderOf,
-} from "./harness-mirror.ts";
+  tccProtectedFolderOf, handoffCopySessionIdFromPath } from "./harness-mirror.ts";
 
 describe("mirror allowlist", () => {
   test("no credential or session path is ever in a copy/merge list", () => {
@@ -317,33 +321,40 @@ describe("safe mode and login-bearing config keys", () => {
 describe("handoff copy shapes (review S4)", () => {
   test("Claude: a transcript or a file in a session sidecar folder", () => {
     for (const rel of [
-      "projects/-tmp-x/11111111-1111-4111-8111-111111111111.jsonl",
-      "projects/enc/sid/subagents/agent-1.jsonl",
-      "projects/enc/sid/tool-results/a/b.txt",
-      "projects/enc/sid/mcp-tasks/t.json",
+      "projects/-tmp-x/SID.jsonl",
+      "file-history/SID/abcd1234@v2",
+      "projects/enc/SID/subagents/agent-1.jsonl",
+      "projects/enc/SID/tool-results/a/b.txt",
+      "projects/enc/SID/mcp-tasks/t.json",
     ]) {
-      expect(isHandoffCopyShape("claude-code", rel), rel).toBe(true);
+      expect(isHandoffCopyShape("claude-code", rel, "SID"), rel).toBe(true);
     }
     for (const rel of [
       "settings.json",
       ".credentials.json",
       "projects/enc",
       "projects/enc/.jsonl",
-      "projects/enc/sid.json",
-      "projects/enc/sid/notes.txt",
-      "projects/enc/sid/other/x",
-      "projects/enc/sid/subagents",
+      "projects/enc/other-sid.jsonl",
+      "projects/enc/other-sid/subagents/a.jsonl",
+      "file-history/other-sid/abcd@v1",
+      "file-history/SID",
+      "file-history",
+      "projects/enc/SID.json",
+      "projects/enc/SID/notes.txt",
+      "projects/enc/SID/other/x",
+      "projects/enc/SID/subagents",
       "projects/../x/s.jsonl",
       "projects/enc/../s.jsonl",
       "skills/s/SKILL.md",
       "sessions/2026/11/08/rollout-x.jsonl",
     ]) {
-      expect(isHandoffCopyShape("claude-code", rel), rel).toBe(false);
+      expect(isHandoffCopyShape("claude-code", rel, "SID"), rel).toBe(false);
     }
   });
 
   test("Codex: only sessions/YYYY/MM/DD/rollout-*.jsonl", () => {
-    expect(isHandoffCopyShape("codex", "sessions/2026/11/08/rollout-2026-11-08T00-00-00-t.jsonl")).toBe(true);
+    expect(isHandoffCopyShape("codex", "sessions/2026/11/08/rollout-2026-11-08T00-00-00-SID.jsonl", "SID")).toBe(true);
+    expect(isHandoffCopyShape("codex", "sessions/2026/11/08/rollout-2026-11-08T00-00-00-other.jsonl", "SID")).toBe(false);
     for (const rel of [
       "auth.json",
       "config.toml",
@@ -354,20 +365,20 @@ describe("handoff copy shapes (review S4)", () => {
       "sessions/2026/11/08/sub/rollout-x.jsonl",
       "projects/enc/s.jsonl",
     ]) {
-      expect(isHandoffCopyShape("codex", rel), rel).toBe(false);
+      expect(isHandoffCopyShape("codex", rel, "SID"), rel).toBe(false);
     }
   });
 
   test("prunable folders stay inside the shape", () => {
-    expect(isHandoffPrunableDir("claude-code", "projects/enc/sid")).toBe(true);
-    expect(isHandoffPrunableDir("claude-code", "projects/enc/sid/subagents/nested")).toBe(true);
-    expect(isHandoffPrunableDir("claude-code", "projects/enc")).toBe(false);
-    expect(isHandoffPrunableDir("claude-code", "projects")).toBe(false);
-    expect(isHandoffPrunableDir("claude-code", "projects/enc/sid/other")).toBe(false);
-    expect(isHandoffPrunableDir("codex", "sessions/2026/11/08")).toBe(true);
-    expect(isHandoffPrunableDir("codex", "sessions/2026")).toBe(true);
-    expect(isHandoffPrunableDir("codex", "sessions")).toBe(false);
-    expect(isHandoffPrunableDir("codex", "sessions/archive")).toBe(false);
+    expect(isHandoffPrunableDir("claude-code", "projects/enc/SID", "SID")).toBe(true);
+    expect(isHandoffPrunableDir("claude-code", "projects/enc/SID/subagents/nested", "SID")).toBe(true);
+    expect(isHandoffPrunableDir("claude-code", "projects/enc", "SID")).toBe(false);
+    expect(isHandoffPrunableDir("claude-code", "projects", "SID")).toBe(false);
+    expect(isHandoffPrunableDir("claude-code", "projects/enc/SID/other", "SID")).toBe(false);
+    expect(isHandoffPrunableDir("codex", "sessions/2026/11/08", "SID")).toBe(true);
+    expect(isHandoffPrunableDir("codex", "sessions/2026", "SID")).toBe(true);
+    expect(isHandoffPrunableDir("codex", "sessions", "SID")).toBe(false);
+    expect(isHandoffPrunableDir("codex", "sessions/archive", "SID")).toBe(false);
   });
 });
 
@@ -420,5 +431,82 @@ describe("macOS TCC-protected home folders (contract CR4, review R-S5)", () => {
       "Music",
       "Pictures",
     ]);
+  });
+});
+
+describe("TT-C: finding 14 predicates", () => {
+  test("every credential segment is stripped, in any case, as a whole segment only", () => {
+    for (const seg of ["APIKEY", "PASS", "PASSWD", "PAT", "AUTH", "HEADERS", "COOKIE", "COOKIES", "SESSION", "DSN", "WEBHOOK", "CONNECTION", "PASSPHRASE"]) {
+      for (const key of [`SVC_${seg}`, `${seg}_X`, `a_${seg}_b`, `svc_${seg.toLowerCase()}`, `Svc_${seg[0]}${seg.slice(1).toLowerCase()}`]) {
+        expect(isCredentialShapedEnvKey(key), key).toBe(true);
+        expect(isMirrorNeverImportedEnvKey(key), key).toBe(true);
+      }
+    }
+    // Whole-segment: look-alikes keep mirroring.
+    for (const key of ["PATH", "AWS_REGION", "ANTHROPIC_MODEL", "ANTHROPIC_SMALL_FAST_MODEL", "CLAUDE_CODE_MAX_OUTPUT_TOKENS", "MAX_THINKING_TOKENS", "PATHEXT", "AUTHOR", "COMPASS", "PASSENGER", "SESSIONS_DIR_X", "HOME"]) {
+      expect(isMirrorNeverImportedEnvKey(key), key).toBe(false);
+    }
+  });
+
+  test("session-ish credential shapes are mirror-stripped without becoming login evidence", () => {
+    for (const key of ["TERM_SESSION_ID", "SITE_COOKIE", "OTEL_EXPORTER_OTLP_HEADERS", "SENTRY_DSN"]) {
+      expect(isMirrorNeverImportedEnvKey(key), key).toBe(true);
+      expect(isHarnessAuthEnvKey(key), key).toBe(false);
+    }
+  });
+
+  test("a URL with userinfo is a credential whatever the name; a plain URL is not", () => {
+    expect(isMirrorNeverImportedEnvEntry("HTTPS_PROXY", "http://u:p@proxy:8080")).toBe(true);
+    expect(isMirrorNeverImportedEnvEntry("ANY", "  postgres://user@db/x  ")).toBe(true);
+    expect(isMirrorNeverImportedEnvEntry("ANY", "https://host/path?a=b@c")).toBe(false);
+    expect(isMirrorNeverImportedEnvEntry("ANY", "user@example.com")).toBe(false);
+    expect(isMirrorNeverImportedEnvEntry("ANY", 5)).toBe(false);
+    expect(urlHasUserinfo("https://tok@host/x")).toBe(true);
+    expect(urlHasUserinfo("https://host/x")).toBe(false);
+    expect(containsUrlUserinfo({ a: [{ b: "git+https://t:x@h/r.git" }] })).toBe(true);
+    expect(containsUrlUserinfo({ a: [{ b: "https://h/r.git" }], n: 1, z: null })).toBe(false);
+  });
+
+  test("command-running env names, any case, including DYLD_*, *_HELPER and *_COMMAND", () => {
+    for (const key of ["CLAUDE_CODE_SHELL_PREFIX", "NODE_OPTIONS", "node_options", "BASH_ENV", "PROMPT_COMMAND", "LD_PRELOAD", "GIT_PAGER", "GIT_EXTERNAL_DIFF", "GIT_SSH_COMMAND", "EDITOR", "PAGER", "DYLD_INSERT_LIBRARIES", "dyld_library_path", "MY_HELPER", "x_helper", "RUN_COMMAND", "run_command"]) {
+      expect(isCommandRunningEnvKey(key), key).toBe(true);
+    }
+    for (const key of ["PATH", "AWS_REGION", "ANTHROPIC_MODEL", "HELPERS_DIR", "COMMANDS", "LANG"]) {
+      expect(isCommandRunningEnvKey(key), key).toBe(false);
+    }
+  });
+
+  test("Codex secret key paths: shell_environment_policy.set credentials and otel headers", () => {
+    expect(isCodexSecretKeyPath(["shell_environment_policy", "set", "GH_TOKEN"])).toBe(true);
+    expect(isCodexSecretKeyPath(["shell_environment_policy", "set", "db_pass"])).toBe(true);
+    expect(isCodexSecretKeyPath(["shell_environment_policy", "set", "LANG"])).toBe(false);
+    expect(isCodexSecretKeyPath(["otel", "exporter", "otlp-http", "headers"])).toBe(true);
+    expect(isCodexSecretKeyPath(["otel", "exporter", "otlp-http", "headers", "authorization"])).toBe(true);
+    expect(isCodexSecretKeyPath(["otel", "environment"])).toBe(false);
+  });
+});
+
+describe("handoffCopySessionIdFromPath", () => {
+  const a = "11111111-1111-4111-8111-111111111111";
+  const b = "22222222-2222-4222-8222-222222222222";
+  test("reads the session from every handoff shape", () => {
+    expect(handoffCopySessionIdFromPath("claude-code", `/r/projects/enc/${a}.jsonl`)).toBe(a);
+    expect(handoffCopySessionIdFromPath("claude-code", `/r/projects/enc/${a}/subagents/x.jsonl`)).toBe(a);
+    expect(handoffCopySessionIdFromPath("claude-code", `/r/file-history/${a}/abc@v1`)).toBe(a);
+    expect(handoffCopySessionIdFromPath("codex", `/r/.codex/sessions/2026/11/10/rollout-2026-11-10T00-00-00-${a}.jsonl`)).toBe(a);
+  });
+  test("a root folder named like an anchor does not confuse it", () => {
+    expect(handoffCopySessionIdFromPath("claude-code", `/home/projects/acct/projects/enc/${a}.jsonl`)).toBe(a);
+    expect(handoffCopySessionIdFromPath("codex", `/sessions/x/.codex/sessions/2026/11/10/rollout-t-${a}.jsonl`)).toBe(a);
+  });
+  test("the preferred session wins over a nested anchor-named folder", () => {
+    const nested = `/r/projects/enc/${a}/tool-results/projects/x/${b}.jsonl`;
+    expect(handoffCopySessionIdFromPath("claude-code", nested, a)).toBe(a);
+  });
+  test("anything else is null", () => {
+    expect(handoffCopySessionIdFromPath("claude-code", "/r/settings.json")).toBeNull();
+    expect(handoffCopySessionIdFromPath("claude-code", `/r/projects/enc/${a}/other/x.jsonl`)).toBeNull();
+    expect(handoffCopySessionIdFromPath("codex", `/r/.codex/sessions/2026/11/rollout-${a}.jsonl`)).toBeNull();
+    expect(handoffCopySessionIdFromPath("codex", "/r/.codex/sessions/2026/11/10/rollout-not-a-uuid.jsonl")).toBeNull();
   });
 });

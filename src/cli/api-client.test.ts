@@ -442,3 +442,201 @@ test("createHarnessStack / patchHarnessStack use the long mirror budget, and a t
   }
   expect((err as ApiError).message).toContain("may have been saved");
 });
+
+test("ids are URL-encoded; switch/preview/restore/agent-patch use the long budget; a lost switch says it may have gone through", async () => {
+  const seen: { method: string; url: string }[] = [];
+  const server = Bun.serve({
+    port: 0,
+    fetch: async (req) => {
+      const u = new URL(req.url);
+      seen.push({ method: req.method, url: u.pathname + u.search });
+      return new Response(JSON.stringify({}), { headers: { "content-type": "application/json" } });
+    },
+  });
+  const realTimeout = AbortSignal.timeout;
+  const budgets: number[] = [];
+  AbortSignal.timeout = ((ms: number) => {
+    budgets.push(ms);
+    return realTimeout.call(AbortSignal, ms);
+  }) as typeof AbortSignal.timeout;
+  try {
+    const client = new AgetorClient({ port: server.port!, token: "tok" });
+    const odd = "a/b c?#";
+    const enc = encodeURIComponent(odd);
+    await client.getHarnessStack(odd);
+    await client.deleteHarnessStack(odd);
+    await client.patchHarnessStack(odd, { label: "x", expectedUpdatedAt: 5 });
+    await client.getTask(odd);
+    await client.harnessUsage(odd);
+    await client.getHarnessStackHistory(odd, { limit: 10, before: "cur sor" });
+    await client.clearHarnessCooldown(odd, { model: "m/1" });
+    await client.switchTaskAccount(odd);
+    await client.cancelScheduledAccountSwitch(odd);
+    await client.restoreHarnessMirror(odd);
+    await client.previewHarnessMirror({ kind: "claude-code", members: ["a", "b"] });
+    await client.patchTask(odd, { agent: "b" });
+    await client.patchTask(odd, { title: "t" });
+    await client.getUsage();
+    expect(seen.map((s) => `${s.method} ${s.url}`)).toEqual([
+      `GET /harness-stacks/${enc}`,
+      `DELETE /harness-stacks/${enc}`,
+      `PATCH /harness-stacks/${enc}`,
+      `GET /tasks/${enc}`,
+      `GET /harnesses/${enc}/usage`,
+      `GET /harness-stacks/${enc}/history?limit=10&before=cur+sor`,
+      `DELETE /harnesses/${enc}/limit-state?model=${encodeURIComponent("m/1")}`,
+      `POST /tasks/${enc}/switch-account`,
+      `DELETE /tasks/${enc}/switch-account`,
+      `POST /harnesses/${enc}/mirror-restore`,
+      `POST /harness-stacks/mirror-preview`,
+      `PATCH /tasks/${enc}`,
+      `PATCH /tasks/${enc}`,
+      `GET /usage`,
+    ]);
+    const long = 15 * 60_000;
+    expect(budgets[2]).toBe(long); // patchHarnessStack
+    expect(budgets[7]).toBe(long); // switchTaskAccount
+    expect(budgets[9]).toBe(long); // restore
+    expect(budgets[10]).toBe(long); // preview
+    expect(budgets[11]).toBe(long); // agent patch
+    expect(budgets[12]).toBe(15_000); // plain patch keeps the default
+  } finally {
+    AbortSignal.timeout = realTimeout;
+    server.stop(true);
+  }
+
+  const dead = Bun.serve({ port: 0, fetch: () => new Response("") });
+  const deadPort = dead.port!;
+  dead.stop(true);
+  const client = new AgetorClient({ port: deadPort, token: "tok" });
+  for (const call of [() => client.switchTaskAccount("t1"), () => client.patchTask("t1", { agent: "b" })]) {
+    let err: unknown;
+    try {
+      await call();
+    } catch (e) {
+      err = e;
+    }
+    expect((err as ApiError).status).toBe(0);
+    expect((err as ApiError).message).toContain("the switch may have gone through; check 'agetor show t1' before retrying");
+  }
+});
+
+// ── TT-E: finding 20 (encoding) and the stack/switch budgets ─────────────────
+
+/** A stub core that records the raw request line and answers `{}` (or `reply`). */
+function stubCore(reply: () => Response = () => new Response("{}", { headers: { "content-type": "application/json" } })) {
+  const seen: { method: string; pathname: string; search: string }[] = [];
+  const server = Bun.serve({
+    port: 0,
+    fetch: (req) => {
+      const u = new URL(req.url);
+      seen.push({ method: req.method, pathname: u.pathname, search: u.search });
+      return reply();
+    },
+  });
+  return { seen, server, client: new AgetorClient({ port: server.port!, token: "tok" }) };
+}
+
+test("finding 20: every id-taking stack / harness / switch / task method percent-encodes `../x`, `100%`, `a/b` and `%2e%2e` into ONE path segment", async () => {
+  const { seen, server, client } = stubCore();
+  try {
+    const ids = ["../x", "100%", "a/b", "%2e%2e", "a b", "x?y#z"];
+    const calls: [string, (id: string) => Promise<unknown>, (e: string) => string][] = [
+      ["GET", (id) => client.getHarnessStack(id), (e) => `/harness-stacks/${e}`],
+      ["PATCH", (id) => client.patchHarnessStack(id, { label: "x" }), (e) => `/harness-stacks/${e}`],
+      ["DELETE", (id) => client.deleteHarnessStack(id), (e) => `/harness-stacks/${e}`],
+      ["GET", (id) => client.getHarnessStackHistory(id), (e) => `/harness-stacks/${e}/history`],
+      ["DELETE", (id) => client.clearHarnessCooldown(id), (e) => `/harnesses/${e}/limit-state`],
+      ["POST", (id) => client.restoreHarnessMirror(id), (e) => `/harnesses/${e}/mirror-restore`],
+      ["PATCH", (id) => client.patchHarness(id, { label: "x" }), (e) => `/harnesses/${e}`],
+      ["DELETE", (id) => client.deleteHarness(id), (e) => `/harnesses/${e}`],
+      ["GET", (id) => client.harnessUsage(id), (e) => `/harnesses/${e}/usage`],
+      ["POST", (id) => client.switchTaskAccount(id), (e) => `/tasks/${e}/switch-account`],
+      ["DELETE", (id) => client.cancelScheduledAccountSwitch(id), (e) => `/tasks/${e}/switch-account`],
+      ["PATCH", (id) => client.patchTask(id, { agent: "b" }), (e) => `/tasks/${e}`],
+      ["PATCH", (id) => client.patchTask(id, { title: "t" }), (e) => `/tasks/${e}`],
+    ];
+    for (const id of ids) {
+      for (const [method, run, expected] of calls) {
+        seen.length = 0;
+        await run(id);
+        expect(seen, `${method} ${expected(id)}`).toHaveLength(1);
+        expect(seen[0]!.method).toBe(method);
+        expect(seen[0]!.pathname).toBe(expected(encodeURIComponent(id)));
+        // The id never leaks into the query string or splits the path.
+        expect(seen[0]!.search).toBe("");
+        expect(seen[0]!.pathname.split("/").length).toBe(expected("x").split("/").length);
+      }
+    }
+  } finally {
+    server.stop(true);
+  }
+});
+
+test("budgets: create/patch stack, preview, restore, switch and an agent patch get the 15-minute budget; history, cooldown clear, cancel and a plain patch keep the default", async () => {
+  const { server, client } = stubCore();
+  const realTimeout = AbortSignal.timeout;
+  const budgets: Record<string, number> = {};
+  let label = "";
+  AbortSignal.timeout = ((ms: number) => {
+    budgets[label] = ms;
+    return realTimeout.call(AbortSignal, ms);
+  }) as typeof AbortSignal.timeout;
+  try {
+    const run = async (name: string, fn: () => Promise<unknown>) => {
+      label = name;
+      await fn();
+    };
+    await run("create", () => client.createHarnessStack({ label: "T", kind: "claude-code", members: ["a"] }));
+    await run("patchStack", () => client.patchHarnessStack("s", { label: "x" }));
+    await run("preview", () => client.previewHarnessMirror({ kind: "claude-code", members: ["a", "b"] }));
+    await run("restore", () => client.restoreHarnessMirror("a"));
+    await run("switch", () => client.switchTaskAccount("t"));
+    await run("agentPatch", () => client.patchTask("t", { agent: "b" }));
+    await run("history", () => client.getHarnessStackHistory("s"));
+    await run("cooldown", () => client.clearHarnessCooldown("a", { accountWideOnly: true }));
+    await run("cancel", () => client.cancelScheduledAccountSwitch("t"));
+    await run("plainPatch", () => client.patchTask("t", { title: "x" }));
+    const long = 15 * 60_000;
+    for (const k of ["create", "patchStack", "preview", "restore", "switch", "agentPatch"]) expect(budgets[k], k).toBe(long);
+    for (const k of ["history", "cooldown", "cancel", "plainPatch"]) expect(budgets[k], k).toBe(15_000);
+  } finally {
+    AbortSignal.timeout = realTimeout;
+    server.stop(true);
+  }
+});
+
+test("a switch 409 refusal reaches the caller untouched (status, body, message); only a lost answer gets the 'may have gone through' note", async () => {
+  const refusal = { error: "no other account in the stack can take this task right now (B: cooling)", code: "no-usable-member", reasons: [{ harnessId: "b", label: "B", reason: "cooling" }] };
+  const { server, client } = stubCore(() => new Response(JSON.stringify(refusal), { status: 409, headers: { "content-type": "application/json" } }));
+  try {
+    for (const call of [() => client.switchTaskAccount("t1"), () => client.patchTask("t1", { agent: "b" })]) {
+      let err: unknown;
+      try {
+        await call();
+      } catch (e) {
+        err = e;
+      }
+      expect(err).toBeInstanceOf(ApiError);
+      expect((err as ApiError).status).toBe(409);
+      expect((err as ApiError).body).toEqual(refusal);
+      expect((err as ApiError).message).toBe(refusal.error);
+      expect((err as ApiError).message).not.toContain("may have gone through");
+    }
+  } finally {
+    server.stop(true);
+  }
+  // The stack writes keep their own wording and a lost patch of a non-agent field has none.
+  const dead = Bun.serve({ port: 0, fetch: () => new Response("") });
+  const port = dead.port!;
+  dead.stop(true);
+  const lost = new AgetorClient({ port, token: "tok" });
+  let plain: unknown;
+  try {
+    await lost.patchTask("t1", { title: "x" });
+  } catch (e) {
+    plain = e;
+  }
+  expect((plain as ApiError).status).toBe(0);
+  expect((plain as ApiError).message).not.toContain("may have gone through");
+});

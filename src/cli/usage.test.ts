@@ -253,3 +253,17 @@ test("edit documents --remove-repo and what it keeps (round 15)", () => {
   expect(USAGE["edit"]).toContain("--remove-repo <name>");
   expect(USAGE["edit"]).toMatch(/its branch\s+is kept/);
 });
+
+test("fix-round help: switch-account, stack history/preview, cooldown and restore have blocks; harness help lists them", () => {
+  expect(helpFor("switch-account", undefined)!.split("\n", 1)[0]).toStartWith("usage: agetor switch-account <task-id> [--cancel]");
+  expect(helpFor("harness", "stack", "history")!).toContain("--before <cursor>");
+  expect(helpFor("harness", "stack", "preview")!).toContain("<stack>");
+  expect(helpFor("harness", "cooldown")!).toContain("clear <account> [--model <id>]");
+  expect(helpFor("harness", "restore")!).toContain("--yes");
+  const edit = helpFor("harness", "stack", "edit")!;
+  for (const flag of ["--add", "--remove", "--move", "--dry-run", "--yes"]) expect(edit).toContain(flag);
+  expect(helpFor("harness", "stack", "create")!).toContain("--dry-run");
+  const harness = USAGE.harness!;
+  for (const word of ["cooldown clear", "restore", "stack"]) expect(harness).toContain(word);
+  expect(usageError("switch-account").message).toStartWith("usage: agetor switch-account");
+});

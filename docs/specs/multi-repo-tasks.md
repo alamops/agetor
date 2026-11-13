@@ -51,7 +51,7 @@ coordinate changes across every repository in that card.
   10 repositories. Worktree creation, branch minting, base-ref pinning and status polling run in
   bounded batches (at most 4 repositories at a time).
 - The repo set is **chosen at creation**; repositories can't be added later. Amended after implementation (owner decision): one repository can be removed from an existing multi-repo task (see "Amendments after implementation"). Adding one still means creating a new card.
-- Migration 087 adds the repositories JSON column. No backfill: legacy rows derive a one-entry
+- Migration 091 adds the repositories JSON column (authored as 087, renumbered on merge with main's 087-090). No backfill: legacy rows derive a one-entry
   array from the existing columns.
 
 ### Branches

@@ -15,15 +15,19 @@ import {
   utimesSync,
   writeFileSync,
 } from "node:fs";
+import { randomUUID } from "node:crypto";
 import { tmpdir } from "node:os";
 import path from "node:path";
 import {
+  atomicWriteFile,
   copyRegularFileDetailed,
   copyTreeCooperative,
   removeCopiedPaths,
   resolvePathLexically,
   rootRedirectRefusal,
+  setStaleTempAgeForTests,
   setTccHomeForTests,
+  sweepStaleTempFiles,
 } from "./harness-file-transfer.ts";
 
 function fixture(fileCount: number): { src: string; dest: string; names: string[] } {
@@ -258,8 +262,129 @@ describe("rootRedirectRefusal (contract CR4)", () => {
     const parent = realpathSync(mkdtempSync(path.join(tmpdir(), "agetor-cr4-rm-")));
     const root = path.join(parent, "acct-home");
     symlinkSync(path.join(documents, "acct"), root);
-    const removed = await removeCopiedPaths([path.join(root, "projects", "enc", "s.jsonl")], root, "claude-code");
+    const removed = await removeCopiedPaths([path.join(root, "projects", "enc", "s.jsonl")], root, "claude-code", "s");
     expect(removed).toEqual([]);
     expect(readFileSync(recorded, "utf8")).toBe("theirs");
+  });
+});
+
+describe("removeCopiedPathsDetailed shouldStop", () => {
+  test("asked before the first file: a yes retains everything, a no removes everything", async () => {
+    const { mkdtempSync, mkdirSync, writeFileSync, existsSync } = await import("node:fs");
+    const { tmpdir } = await import("node:os");
+    const path = (await import("node:path")).default;
+    const ft = await import("./harness-file-transfer.ts");
+    const root = mkdtempSync(path.join(tmpdir(), "agetor-stop-"));
+    const sid = "12121212-1212-4212-8212-121212121212";
+    const dir = path.join(root, "projects", "enc", sid, "subagents");
+    mkdirSync(dir, { recursive: true });
+    const files = ["a.jsonl", "b.jsonl", "c.jsonl"].map((n) => path.join(dir, n));
+    for (const f of files) writeFileSync(f, "x");
+    const stopped = await ft.removeCopiedPathsDetailed(files, root, "claude-code", sid, { shouldStop: () => true });
+    expect(stopped.removed).toEqual([]);
+    expect(stopped.retained).toEqual(files);
+    for (const f of files) expect(existsSync(f)).toBe(true);
+    let calls = 0;
+    const done = await ft.removeCopiedPathsDetailed(files, root, "claude-code", sid, { shouldStop: () => (calls++, false) });
+    expect(done.removed).toEqual(files);
+    // Asked once, not per file: nothing else can run between two yields.
+    expect(calls).toBe(1);
+  });
+});
+
+describe("stale .agetor-tmp-* leftovers (review N3)", () => {
+  afterEach(() => setStaleTempAgeForTests(null));
+
+  function plant(dir: string) {
+    const outside = path.join(mkdtempSync(path.join(tmpdir(), "agetor-sweep-outside-")), "target.txt");
+    writeFileSync(outside, "keep");
+    const file = path.join(dir, `.agetor-tmp-${randomUUID()}`);
+    const link = path.join(dir, `.agetor-tmp-${randomUUID()}`);
+    const folder = path.join(dir, `.agetor-tmp-${randomUUID()}`);
+    const lookalike = path.join(dir, ".agetor-tmp-backup.json");
+    writeFileSync(file, "half a write");
+    symlinkSync(outside, link);
+    mkdirSync(folder);
+    writeFileSync(path.join(folder, "inner"), "x");
+    writeFileSync(lookalike, "not ours");
+    return { outside, file, link, folder, lookalike };
+  }
+
+  test("a write into a folder removes old temp files and temp links there, never a folder, a look-alike or a link's target", async () => {
+    const dir = mkdtempSync(path.join(tmpdir(), "agetor-sweep-"));
+    const t = plant(dir);
+    setStaleTempAgeForTests(0);
+    await atomicWriteFile(path.join(dir, "settings.json"), "{}");
+    expect(existsSync(t.file)).toBe(false);
+    expect(existsSync(t.link)).toBe(false);
+    expect(readFileSync(t.outside, "utf8")).toBe("keep");
+    expect(readFileSync(path.join(t.folder, "inner"), "utf8")).toBe("x");
+    expect(readFileSync(t.lookalike, "utf8")).toBe("not ours");
+    expect(readFileSync(path.join(dir, "settings.json"), "utf8")).toBe("{}");
+  });
+
+  test("a session-transfer style file copy sweeps its destination folder too", async () => {
+    const src = mkdtempSync(path.join(tmpdir(), "agetor-sweep-src-"));
+    const dest = mkdtempSync(path.join(tmpdir(), "agetor-sweep-dest-"));
+    writeFileSync(path.join(src, "s.jsonl"), "{}\n");
+    const t = plant(dest);
+    setStaleTempAgeForTests(0);
+    await copyRegularFileDetailed(path.join(src, "s.jsonl"), path.join(dest, "s.jsonl"));
+    expect(existsSync(t.file)).toBe(false);
+    expect(existsSync(t.link)).toBe(false);
+    expect(readFileSync(path.join(dest, "s.jsonl"), "utf8")).toBe("{}\n");
+  });
+
+  test("a fresh temp file (a write in progress) is kept, even with an old mtime stamped on it", async () => {
+    const dir = mkdtempSync(path.join(tmpdir(), "agetor-sweep-fresh-"));
+    const live = path.join(dir, `.agetor-tmp-${randomUUID()}`);
+    writeFileSync(live, "copying");
+    // A mirror copy stamps the source's mtime on its temp file before the
+    // rename; the inode change time stays fresh.
+    const old = new Date(Date.now() - 24 * 60 * 60 * 1000);
+    utimesSync(live, old, old);
+    setStaleTempAgeForTests(null);
+    expect(sweepStaleTempFiles(dir)).toBe(0);
+    expect(existsSync(live)).toBe(true);
+  });
+
+  test("one sweep per folder per interval", () => {
+    const dir = mkdtempSync(path.join(tmpdir(), "agetor-sweep-memo-"));
+    setStaleTempAgeForTests(0);
+    expect(sweepStaleTempFiles(dir)).toBe(0);
+    writeFileSync(path.join(dir, `.agetor-tmp-${randomUUID()}`), "later");
+    expect(sweepStaleTempFiles(dir)).toBe(0);
+    setStaleTempAgeForTests(0);
+    expect(sweepStaleTempFiles(dir)).toBe(1);
+  });
+});
+
+describe("temp-file mode is set by descriptor (re-review nit)", () => {
+  test("a link swapped in at the temp name is never chmod-ed through", async () => {
+    const dir = mkdtempSync(path.join(tmpdir(), "agetor-fchmod-"));
+    const victim = path.join(mkdtempSync(path.join(tmpdir(), "agetor-fchmod-victim-")), "victim.txt");
+    writeFileSync(victim, "outside");
+    chmodSync(victim, 0o600);
+    const writing = atomicWriteFile(path.join(dir, "out.sh"), "x".repeat(4 * 1024 * 1024), { mode: 0o755 });
+    let done = false;
+    const settled = writing.then(() => { done = true; }, () => { done = true; });
+    let swapped = false;
+    const { renameSync } = await import("node:fs");
+    while (!done) {
+      if (!swapped) {
+        const tmp = readdirSync(dir).find((n) => n.startsWith(".agetor-tmp-"));
+        if (tmp) {
+          // An agent replaces the temp file with a link before the mode is set.
+          const link = path.join(path.dirname(victim), "link");
+          symlinkSync(victim, link);
+          renameSync(link, path.join(dir, tmp));
+          swapped = true;
+        }
+      }
+      await Bun.sleep(0);
+    }
+    await settled;
+    expect(swapped).toBe(true);
+    expect(statSync(victim).mode & 0o777).toBe(0o600);
   });
 });
