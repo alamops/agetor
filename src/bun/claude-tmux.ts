@@ -5242,9 +5242,14 @@ interface ScrapeMatch {
  *
  * Deliberately generic (matches the footer text, not "is this the /model
  * picker") so a future claude version that offers the same session-only
- * escape hatch on some other modal is covered without a new branch.
+ * escape hatch on some other modal is covered without a new branch. claude
+ * 2.1.322's bare `/effort` slider is the second one, with its own phrasing:
+ * `←/→ to adjust · Enter to confirm · s for this session only · Esc to cancel`
+ * (live capture; in the binary `s` is `effortSlider:thisSessionOnly` and
+ * Enter persists the level as the user's default). `matchSliderModal`
+ * consults this regex for its own footer.
  */
-const SESSION_ONLY_CONFIRM_RE = /\bs to use this session only\b/;
+const SESSION_ONLY_CONFIRM_RE = /\bs (?:to use|for) this session only\b/;
 
 /** Recognise claude's standard numbered-choice modal:
  *
@@ -5414,8 +5419,16 @@ function sha1(s: string): string {
  *  (docs/plans/model-effort-local-command-turns.md §2). The character class
  *  on either side of the `▲` excludes `▲` itself, so a second marker on the
  *  same line fails the whole-line match — "exactly one `▲`" falls out of the
- *  regex shape rather than needing a separate count check. */
-const SLIDER_TRACK_RE = /^\s*[─┆]*▲[─┆]*\s*$/;
+ *  regex shape rather than needing a separate count check.
+ *
+ *  claude 2.1.322 draws a side panel to the RIGHT of the track on the same
+ *  row (live capture, 80/100/200 columns alike):
+ *  `──────────▲───────────────────────────────      Ultracode  off`
+ *  so the track may be followed by 2+ spaces and trailing text that holds no
+ *  `▲` and no track character. Capture group 1 is the track itself — the
+ *  only part counted toward `SLIDER_TRACK_MIN_CHARS`, and whose end column
+ *  bounds the label row (see `matchSliderModal`, signal b). */
+const SLIDER_TRACK_RE = /^\s*([─┆]*▲[─┆]*)(?:\s{2,}[^▲─┆]*[^▲─┆\s])?\s*$/;
 
 /** Minimum number of `─`/`┆` track characters a `SLIDER_TRACK_RE` match must
  *  carry to count as a real slider track, rather than a lone `▲` glyph on its
@@ -5468,7 +5481,30 @@ const FOOTER_SEARCH_NONBLANK = 3;
  *    ←/→ to adjust · Enter to confirm · Esc to cancel
  *
  * (cursor on `xhigh` at `▲` column 59; a second capture with the `▲` at
- * column 49 lands on `high`). Unlike `matchNumberedModal`, there is no
+ * column 49 lands on `high`).
+ *
+ * claude 2.1.322 (live capture, the same at 80, 100 and 200 columns) moved
+ * Ultracode out of the slider into a side panel on the track and label rows,
+ * and added a session-only confirm to the footer:
+ *
+ *   Effort
+ *
+ *            Faster                             Smarter
+ *            ──────────▲───────────────────────────────      Ultracode  off
+ *            low     medium     high     xhigh      max      Tab to toggle
+ *
+ *                       The default effort for this model
+ *
+ *
+ *    ←/→ to adjust · Enter to confirm · s for this session only · Esc to cancel
+ *
+ * With Ultracode toggled on, a `Ultracode: dynamic workflows on every task`
+ * row appears under the labels, which puts the footer exactly at
+ * `FOOTER_SEARCH_NONBLANK`. The side panel is tolerated by `SLIDER_TRACK_RE`
+ * (trailing text after the track) and by signal (b) (label tokens starting
+ * past the track's end column are dropped); the panel itself is never a
+ * choice. The match carries `confirmKey: "s"` when the footer offers the
+ * session-only confirm, so a card click never saves a new default effort. Unlike `matchNumberedModal`, there is no
  * numbered text on screen at all — the effort levels are read off the label
  * row beneath the track and keyed `"1".."N"` positionally so the existing
  * generic tmux_prompt card can render them as ordinary buttons; clicking one
@@ -5543,12 +5579,16 @@ function matchSliderModal(tail: string): ScrapeMatch | null {
   // so a too-short line is skipped rather than accepted, letting the
   // bottom-up search keep looking further up the pane for a genuine one.
   let trackIdx = -1;
+  let trackEndCol = -1;
   for (let i = lines.length - 1; i >= 0; i--) {
     const line = lines[i]!;
-    if (!SLIDER_TRACK_RE.test(line)) continue;
-    const trackChars = (line.match(/[─┆]/g) ?? []).length;
+    const tm = SLIDER_TRACK_RE.exec(line);
+    if (!tm) continue;
+    const track = tm[1]!;
+    const trackChars = (track.match(/[─┆]/g) ?? []).length;
     if (trackChars < SLIDER_TRACK_MIN_CHARS) continue;
     trackIdx = i;
+    trackEndCol = line.indexOf(track) + track.length;
     break;
   }
   if (trackIdx < 0) return null;
@@ -5559,33 +5599,31 @@ function matchSliderModal(tail: string): ScrapeMatch | null {
   // below the track for one shaped like a label row, rather than assuming
   // the very next non-blank line is it. The captured layout has it
   // immediately below (distance 1), so this bound is slack, not tight.
+  // A label row's tokens are runs separated by 2+ spaces. Tokens that START
+  // at or past the track's end column are the 2.1.322 side panel's second
+  // row (`Tab to toggle` under `Ultracode  off`), not slider positions, and
+  // are dropped before the shape check; everything under the track must
+  // still look like a label.
   let labelIdx = -1;
-  let tokens: string[] = [];
+  let labels: Array<{ label: string; start: number }> = [];
   {
     let nonBlankSeen = 0;
     for (let i = trackIdx + 1; i < lines.length && nonBlankSeen < LABEL_ROW_SEARCH_NONBLANK; i++) {
       if (lines[i]!.trim().length === 0) continue;
       nonBlankSeen++;
-      const candidateTokens = lines[i]!.split(/\s{2,}/).map((s) => s.trim()).filter((s) => s.length > 0);
-      if (candidateTokens.length >= 2 && candidateTokens.every((t) => /^[a-z][a-z0-9+]*$/.test(t))) {
+      const candidates: Array<{ label: string; start: number }> = [];
+      for (const tm of lines[i]!.matchAll(/\S+(?: \S+)*/g)) {
+        if (tm.index! >= trackEndCol) continue;
+        candidates.push({ label: tm[0], start: tm.index! });
+      }
+      if (candidates.length >= 2 && candidates.every((t) => /^[a-z][a-z0-9+]*$/.test(t.label))) {
         labelIdx = i;
-        tokens = candidateTokens;
+        labels = candidates;
         break;
       }
     }
   }
   if (labelIdx < 0) return null;
-  const labelLine = lines[labelIdx]!;
-  // Column of each label's start on the label line, walked left-to-right so
-  // the search-from cursor always advances past the token just found.
-  const labels: Array<{ label: string; start: number }> = [];
-  let searchFrom = 0;
-  for (const t of tokens) {
-    const idx = labelLine.indexOf(t, searchFrom);
-    if (idx < 0) return null; // unreachable — every token came from this line
-    labels.push({ label: t, start: idx });
-    searchFrom = idx + t.length;
-  }
 
   // (c) Footer within FOOTER_SEARCH_NONBLANK non-blank lines BELOW THE LABEL
   // ROW (finding #5) — anchoring to the label row is what keeps this signal
@@ -5641,7 +5679,13 @@ function matchSliderModal(tail: string): ScrapeMatch | null {
   const choices: TmuxPromptChoice[] = labels.map((l, i) => ({ key: String(i + 1), label: l.label }));
   const paneText = lines.slice(-12).join("\n").trimEnd();
   const fingerprint = sha1(`slider:${labels.map((l) => l.label).join("/")}|@${cursorIndex}`);
-  return { paneText, choices, cursorIndex, fingerprint, highConfidence: true, nav: "horizontal" };
+  // 2.1.322's footer offers `s for this session only`; plain Enter there
+  // saves the level as the user's default. A card click must not rewrite the
+  // user's global claude config, so confirm with `s` whenever the footer
+  // offers it — same rule as the /model picker (`SESSION_ONLY_CONFIRM_RE`).
+  // Read from THIS slider's own footer line, and kept out of the fingerprint.
+  const confirmKey = SESSION_ONLY_CONFIRM_RE.test(lines[footerIdx]!) ? "s" : undefined;
+  return { paneText, choices, cursorIndex, fingerprint, highConfidence: true, nav: "horizontal", confirmKey };
 }
 
 /** Upper bound on the contiguous choice rows `matchUnnumberedModal` will
