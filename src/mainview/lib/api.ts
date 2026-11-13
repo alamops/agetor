@@ -293,6 +293,11 @@ export interface PendingTmuxPrompt {
    *  that case. The RunPanel renders an "Open in Terminal" fallback card
    *  instead of choice buttons. */
   unparsable?: boolean;
+  /** True when the pane's own widget shows no `N.` prefixes, so the card
+   *  hides the synthetic keys too (`matchUnnumberedModal` — issue #298's
+   *  Chrome startup prompt). Display-only: `choices[].key` is still what the
+   *  answer route validates. See `tmuxChoiceLabel`. */
+  hideKeys?: boolean;
 }
 
 /** The ACP tool call an fx permission request is asking about — mirrors

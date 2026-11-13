@@ -72,6 +72,71 @@ export function bundledTmuxAvailable(): boolean {
 }
 
 /**
+ * macOS's system terminfo database. Present on every supported macOS and the
+ * second — fallback — entry of the runtime `TERMINFO_DIRS` built below, so a
+ * `TERM` the vendored five-entry DB doesn't carry (a custom Terminal profile)
+ * still resolves.
+ */
+export const SYSTEM_TERMINFO_DIR = "/usr/share/terminfo";
+
+/**
+ * Pure: the `TERMINFO_DIRS` value for the tmux binary at `binPath` — its
+ * sibling `terminfo/` directory first (the vendored DB; see
+ * `scripts/terminfo/README.md`), then `systemDir`. Only directories that
+ * actually exist are included, and `null` means "nothing to override" so the
+ * caller leaves the env alone.
+ *
+ * Why this exists: the bundled tmux links a vendored `libncursesw` whose
+ * COMPILED-IN default terminfo path is the build machine's Homebrew Cellar
+ * directory. The bundle ships no DB of its own, so a tty client (`tmux
+ * attach` from Terminal.app) printed `can't find terminfo database` and
+ * exited — issue #298's "Open in Terminal" dead end. A headless client (no
+ * tty) never resolves terminfo, which is why only the attach path broke.
+ *
+ * Pure (no spawning, no `resolveTmuxBin`) so the search-path construction is
+ * unit-testable and so the open-tmux route can inline the value into its
+ * shell command (where the env must live, not on osascript).
+ */
+export function terminfoDirsFor(binPath: string, systemDir = SYSTEM_TERMINFO_DIR): string | null {
+  const dirs = [path.join(path.dirname(binPath), "terminfo"), systemDir].filter((d) => existsSync(d));
+  return dirs.length ? dirs.join(":") : null;
+}
+
+/** True when `bin` resolves to the same file as `bundledTmuxPath()` (packaged
+ *  or dev). Paths are resolved first so `…/bin/../bin/tmux` and an
+ *  `AGETOR_TMUX_BIN` pointing at the bundle both count. */
+export function isBundledTmuxBin(bin: string): boolean {
+  return path.resolve(bin) === path.resolve(bundledTmuxPath());
+}
+
+/**
+ * Env for a tmux CLIENT spawn: `childEnv()` semantics (the live environment,
+ * master API token scrubbed) plus a `TERMINFO_DIRS` override —
+ * but ONLY when the resolved binary is the bundled one. System tmux keeps its
+ * own lookup untouched.
+ *
+ * The computed dirs are PREPENDED to any existing `TERMINFO_DIRS`, which is
+ * never replaced, so a user's own setting stays further down the search path.
+ * (`TERMINFO`, a single directory, still wins over `TERMINFO_DIRS` by ncurses
+ * semantics — a deliberate user override we don't stomp on.)
+ *
+ * Deliberately NOT named `tmuxClientEnv`: that helper was removed in favour of
+ * `childEnv` and `core-spawn-allowlist.test.ts` pins its absence. This is a
+ * thin bundled-tmux-only wrapper over `childEnv`, not a resurrection.
+ */
+export function tmuxEnv(
+  bin: string = resolveTmuxBin(),
+  extra?: Record<string, string | undefined>,
+): Record<string, string | undefined> {
+  const env = childEnv(extra);
+  if (!isBundledTmuxBin(bin)) return env;
+  const dirs = terminfoDirsFor(bin);
+  if (!dirs) return env;
+  env.TERMINFO_DIRS = env.TERMINFO_DIRS ? `${dirs}:${env.TERMINFO_DIRS}` : dirs;
+  return env;
+}
+
+/**
  * Derive a stable per-instance tmux socket name from the data dir — pure so
  * it's unit-testable without touching env/preferences. `~/.agetor` ->
  * `"agetor"`, `~/.agetor-dev` -> `"agetor-dev"`: strip leading dot(s) off
@@ -178,15 +243,19 @@ export function __resetTmuxServerEnvClearedForTest(): void {
  */
 export async function ensureDisclaimedServer(): Promise<void> {
   try {
-    const argv = buildEnsureServerArgv(resolveTmuxBin());
+    const bin = resolveTmuxBin();
+    const argv = buildEnsureServerArgv(bin);
     // Ignore stdio rather than pipe: `start-server` emits nothing and this is
     // best-effort, so there's no output to capture and a drain-free pipe is
     // pointless. `disclaim`'s exec-replace preserves these fd choices.
+    // `tmuxEnv(bin)`: a panes-inherit-env concern for a bundled client (see
+    // `tmuxEnv`) — the started server and its panes get the real terminfo
+    // search path, which is harmless for the agent CLIs inside them.
     const proc = coreSpawn(argv, {
       stdin: "ignore",
       stdout: "ignore",
       stderr: "ignore",
-      env: childEnv(),
+      env: tmuxEnv(bin),
     });
     await proc.exited;
     if (!staleServerTokenCleared) {
@@ -198,8 +267,8 @@ export async function ensureDisclaimedServer(): Promise<void> {
       // long-lived, so repeating it before every new session would only add
       // an exec per launch. Best effort like the rest of this function.
       const clear = coreSpawn(
-        [resolveTmuxBin(), ...tmuxSocketArgs(), "set-environment", "-g", "-u", "AGETOR_API_TOKEN"],
-        { stdin: "ignore", stdout: "ignore", stderr: "ignore", env: childEnv() },
+        [bin, ...tmuxSocketArgs(), "set-environment", "-g", "-u", "AGETOR_API_TOKEN"],
+        { stdin: "ignore", stdout: "ignore", stderr: "ignore", env: tmuxEnv(bin) },
       );
       await clear.exited;
     }
@@ -236,7 +305,7 @@ export async function spawnTmuxNewSession(
       stdin: "ignore",
       stdout: "pipe",
       stderr: "pipe",
-      env: childEnv(),
+      env: tmuxEnv(tmux),
     }) as Bun.Subprocess<"ignore", "pipe", "pipe">;
     const [, stderr] = await Promise.all([
       new Response(proc.stdout).text(),

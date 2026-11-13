@@ -13,8 +13,8 @@ import {
 import { StringDecoder } from "node:string_decoder";
 import path from "node:path";
 import { dataDir } from "./db.ts";
-import { resolveTmuxBin, tmuxSocketArgs, spawnTmuxNewSession } from "./tmux-resolution.ts";
-import { childEnv, coreSpawn } from "./core-spawn.ts";
+import { resolveTmuxBin, tmuxSocketArgs, spawnTmuxNewSession, tmuxEnv } from "./tmux-resolution.ts";
+import { coreSpawn } from "./core-spawn.ts";
 import { openReadNoFollow, readTextNoFollow } from "./no-follow.ts";
 import { createDeathProbe } from "./session-liveness.ts";
 import { opencodeQuotaHint, opencodeResumeFailedStatusLine } from "../shared/opencode.ts";
@@ -435,13 +435,15 @@ const RECONCILE_EXPORT_TIMEOUT_MS = 10_000;
 async function tmuxRun(args: string[]): Promise<boolean> {
   try {
     // coreSpawn like every tmux client call (D22): the client binary comes
-    // from a PATH an agent can influence, and `childEnv()` keeps the master
-    // token out of its env.
-    const proc = coreSpawn([resolveTmuxBin(), ...tmuxSocketArgs(), ...args], {
+    // from a PATH an agent can influence, and `tmuxEnv()` keeps the master
+    // token out of its env (childEnv semantics) while adding the vendored
+    // terminfo search path when this is the bundled binary (issue #298).
+    const bin = resolveTmuxBin();
+    const proc = coreSpawn([bin, ...tmuxSocketArgs(), ...args], {
       stdin: "ignore",
       stdout: "pipe",
       stderr: "pipe",
-      env: childEnv(),
+      env: tmuxEnv(bin),
     }) as Bun.Subprocess<"ignore", "pipe", "pipe">;
     await Promise.all([new Response(proc.stdout).text(), new Response(proc.stderr).text()]);
     return (await proc.exited) === 0;

@@ -96,6 +96,7 @@ import { Select } from "@/components/ui/select";
 import { Switch } from "@/components/ui/switch";
 import { Textarea } from "@/components/ui/textarea";
 import { abbreviateHome, cn } from "@/lib/utils";
+import { tmuxChoiceLabel } from "@/lib/tmux-prompt";
 import {
   formatHarnessSwapNotice,
   isHarnessStackContinuation,
@@ -9613,7 +9614,18 @@ function TmuxPromptCard({
   // `PlanCard` summary button now (see `RunEventList`'s `blocks` memo),
   // not an inline expanded body, so this card is the only place the full
   // text is shown at decision time.
-  const isPlan = CLAUDE_PLAN_PROMPT_RE.test(req.paneText);
+  // `req.unparsable` must win over the plan layout: an unparsable card's only
+  // correct action is the terminal hand-off below, even if its pane text
+  // happens to quote plan wording.
+  // `hideKeys` is set only for an UNNUMBERED menu (the Chrome startup prompt,
+  // the workspace-trust dialog). A genuine ExitPlanMode approval is a
+  // NUMBERED prompt, so it can never carry the flag — while an unnumbered
+  // card's wider preview could quote "written up a plan" / "Would you like to
+  // proceed" from scrollback above the dialog. Without this guard that quote
+  // would swap the card to the plan layout, whose button filter keeps only
+  // `Yes …` rows and would drop the Chrome prompt's "No, keep browser tools
+  // off" choice.
+  const isPlan = req.unparsable !== true && !req.hideKeys && CLAUDE_PLAN_PROMPT_RE.test(req.paneText);
   if (isPlan) {
     const planLabel = (label: string): string => {
       const l = label.toLowerCase();
@@ -9756,7 +9768,7 @@ function TmuxPromptCard({
               variant={isNegative ? "outline" : "secondary"}
               disabled={submitting !== null}
             >
-              {submitting === c.key ? "Sending…" : `${c.key}. ${c.label}`}
+              {submitting === c.key ? "Sending…" : tmuxChoiceLabel(c, req.hideKeys)}
             </Button>
           );
         })}

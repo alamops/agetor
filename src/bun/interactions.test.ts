@@ -390,6 +390,59 @@ test("registerTmuxPrompt without the unparsable flag leaves it undefined (back-c
   expect("unparsable" in roundTripped).toBe(false);
 });
 
+/* ── hideKeys (issue #298): display-only, threaded for unnumbered menus ── */
+
+test("registerTmuxPrompt with hideKeys:true creates a request carrying the flag, broadcast + listPendingForTask included, and it survives JSON serialization", async () => {
+  const { registerTmuxPrompt, listPendingForTask, setBroadcaster } = await import("./interactions.ts");
+  const broadcasted: unknown[] = [];
+  setBroadcaster((req) => broadcasted.push(req));
+
+  const { req } = registerTmuxPrompt({
+    taskId: "tHideKeys", runId: "rH",
+    paneText: "❯ No, keep browser tools off\n  Yes, use my browser\n\nEnter to confirm · Esc to keep browser tools off",
+    choices: [{ key: "1", label: "No, keep browser tools off" }, { key: "2", label: "Yes, use my browser" }],
+    fingerprint: "fp-hide-keys",
+    hideKeys: true,
+  });
+
+  expect(req.hideKeys).toBe(true);
+  // The keys themselves are untouched — the answer route validates them and
+  // `dismissTmuxPrompt` navigates by arrow keys, never by typing them.
+  expect(req.choices.map((c) => c.key)).toEqual(["1", "2"]);
+
+  // Broadcast payload carries the flag.
+  expect(broadcasted).toHaveLength(1);
+  expect((broadcasted[0] as { hideKeys?: boolean }).hideKeys).toBe(true);
+
+  // listPendingForTask (the SSE-replay / snapshot path) carries it too.
+  const pending = listPendingForTask("tHideKeys");
+  expect(pending).toHaveLength(1);
+  expect((pending[0] as { hideKeys?: boolean }).hideKeys).toBe(true);
+
+  // Must survive JSON round-tripping the way the SSE path serializes events.
+  const roundTripped = JSON.parse(JSON.stringify(pending[0]));
+  expect(roundTripped.hideKeys).toBe(true);
+  expect(roundTripped.choices.map((c: { key: string }) => c.key)).toEqual(["1", "2"]);
+});
+
+test("registerTmuxPrompt without hideKeys leaves it undefined (numbered/yes-no/slider prompts keep their visible keys)", async () => {
+  const { registerTmuxPrompt, listPendingForTask } = await import("./interactions.ts");
+  const { req } = registerTmuxPrompt({
+    taskId: "tNoHideKeys", runId: "rNH",
+    paneText: "Do you want to proceed?",
+    choices: [{ key: "1", label: "Yes" }, { key: "2", label: "No" }],
+    fingerprint: "fp-no-hide-keys",
+  });
+
+  expect(req.hideKeys).toBeUndefined();
+  const pending = listPendingForTask("tNoHideKeys");
+  expect((pending[0] as { hideKeys?: boolean }).hideKeys).toBeUndefined();
+
+  // Round-tripping through JSON must not invent the key.
+  const roundTripped = JSON.parse(JSON.stringify(pending[0]));
+  expect("hideKeys" in roundTripped).toBe(false);
+});
+
 test("an unparsable prompt resolves via the __external__ sentinel (scrapeOnce sweep path), leaves the pending list, and fans out a resolved event", async () => {
   const { registerTmuxPrompt, answerTmuxPrompt, listPendingForTask, setResolvedBroadcaster } =
     await import("./interactions.ts");

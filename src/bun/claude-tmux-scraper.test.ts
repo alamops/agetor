@@ -1,14 +1,22 @@
 import { test, expect, describe } from "bun:test";
+import { randomUUID } from "node:crypto";
 import { mkdtempSync, readFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import path from "node:path";
 
 // Set data dir before db.ts is loaded transitively (claude-tmux.ts imports
 // it now that the scraper looks up the task's runId).
-process.env.AGETOR_DATA_DIR = mkdtempSync(path.join(tmpdir(), "agetor-scraper-"));
+const SCRAPER_DATA_DIR = mkdtempSync(path.join(tmpdir(), "agetor-scraper-"));
+process.env.AGETOR_DATA_DIR = SCRAPER_DATA_DIR;
 
-import { __forTest } from "./claude-tmux.ts";
+// Dynamic on purpose: a static `import` is hoisted ahead of the env assignment
+// above, so db.ts (loaded transitively by claude-tmux.ts) would open the
+// process default data dir before this file's temp one is in place.
+const { __forTest } = await import("./claude-tmux.ts");
 import { detectAskModal } from "./claude-questions.ts";
+import { makeTask } from "../cli/test-fixtures.ts";
+import type { TmuxPromptRequest } from "./interactions.ts";
+import { cleanPromptPane } from "../mainview/lib/prompt-noise.ts";
 
 const {
   matchNumberedModal,
@@ -30,6 +38,9 @@ const {
   SLIDER_TRACK_RE,
   SLIDER_TRACK_MIN_CHARS,
   SLIDER_FOOTER_RE,
+  matchUnnumberedModal,
+  UNNUMBERED_MAX_CHOICE_ROWS,
+  UNNUMBERED_PREVIEW_CONTEXT_LINES,
   matchSlashConfirmModal,
   paneShowsIdleInputBox,
   STATUS_BAR_RE,
@@ -445,6 +456,628 @@ test("matchNumberedModal — Chrome-extension startup prompt surfaces as an inte
   ]);
 });
 
+/* ── Issue #298: the UNNUMBERED "Claude in Chrome extension detected" prompt ──
+   claude 2.1.322 renders it as an Ink `er` select with `hideIndexes` — two
+   rows, no `N.` prefixes, cursor pre-focused on the "No" row, footer
+   `Enter to confirm · Esc to keep browser tools off`. Reconstructed from the
+   issue screenshot + the 2.1.322 component props (the #298
+   investigation). The numbered
+   CHROME_EXTENSION_PANE above stays as coverage for older CLIs. */
+
+const CHROME_UNNUMBERED_PANE = `Claude in Chrome extension detected
+
+Claude will use your Chrome browser by default — navigating sites, filling
+forms, and capturing screenshots in your existing session.
+
+This session is in Auto mode, which checks routine browser actions — you are
+only prompted when it is unsure. Turn browser tools off for future sessions
+with /chrome.
+
+❯ No, keep browser tools off
+  Yes, use my browser
+
+Enter to confirm · Esc to keep browser tools off`;
+
+test("matchUnnumberedModal — the 2.1.322 Chrome prompt parses into its two rows, cursor on 'No', keys hidden, never unparsable/high-confidence", () => {
+  // Regression for #298's defect A: at base this pane fell through to
+  // `matchUnparsableModal` (zero choices → "Agetor can't read" card with only
+  // Open in Terminal), so the test's first two assertions failed before the
+  // unnumbered matcher existed.
+  const m = matchUnnumberedModal(CHROME_UNNUMBERED_PANE)!;
+  expect(m).not.toBeNull();
+  expect(m.choices.map((c) => c.label)).toEqual([
+    "No, keep browser tools off",
+    "Yes, use my browser",
+  ]);
+  // Synthetic 1-based keys are still what the answer route validates...
+  expect(m.choices.map((c) => c.key)).toEqual(["1", "2"]);
+  expect(m.cursorIndex).toBe(0);
+  // ...but the card must not render them: the widget has no visible numbers.
+  expect(m.hideKeys).toBe(true);
+  expect(m.unparsable).toBeUndefined();
+  // The footer is a shape gate, not a required signal like the slider's — a
+  // single tick must not register, so the caller's two-tick gate applies.
+  expect(m.highConfidence).toBeUndefined();
+});
+
+test("matchUnnumberedModal — the fingerprint is stable tick-to-tick and moves with the cursor", () => {
+  const a1 = matchUnnumberedModal(CHROME_UNNUMBERED_PANE)!;
+  const a2 = matchUnnumberedModal(CHROME_UNNUMBERED_PANE)!;
+  expect(a1.fingerprint).toBe(a2.fingerprint);
+  const moved = CHROME_UNNUMBERED_PANE.replace(
+    "❯ No, keep browser tools off\n  Yes, use my browser",
+    "  No, keep browser tools off\n❯ Yes, use my browser",
+  );
+  const m2 = matchUnnumberedModal(moved)!;
+  expect(m2).not.toBeNull();
+  expect(m2.cursorIndex).toBe(1);
+  expect(m2.fingerprint).not.toBe(a1.fingerprint);
+});
+
+test("matchUnnumberedModal — the card preview keeps the dialog's title (the user decides a persistent setting from it)", () => {
+  // Review finding: a fixed last-12-lines window cut the heading off this
+  // 13-line dialog, so the card showed two paragraphs and two buttons with no
+  // "Claude in Chrome extension detected" anywhere.
+  const m = matchUnnumberedModal(CHROME_UNNUMBERED_PANE)!;
+  expect(m.paneText.split("\n")[0]).toBe("Claude in Chrome extension detected");
+  const shown = cleanPromptPane(m.paneText);
+  expect(shown.startsWith("Claude in Chrome extension detected\n")).toBe(true);
+  expect(shown).toContain("❯ No, keep browser tools off");
+  expect(shown).not.toContain("Enter to confirm");
+});
+
+test("matchUnnumberedModal — the preview starts below the dialog's top rule, so a banner or transcript above it is not shown", () => {
+  const banner = [
+    "╭─── Claude Code v2.1.322 ───────────────────────────╮",
+    "│                 Welcome back!                     │",
+    "╰───────────────────────────────────────────────────╯",
+    "",
+    "─".repeat(80),
+  ].join("\n");
+  const m = matchUnnumberedModal(`${banner}\n${CHROME_UNNUMBERED_PANE}`)!;
+  expect(m).not.toBeNull();
+  expect(m.paneText.split("\n")[0]).toBe("Claude in Chrome extension detected");
+  expect(m.paneText).not.toContain("Welcome back");
+  expect(m.paneText).not.toContain("─".repeat(80));
+  // Display-only: the preview window never changes card identity.
+  expect(m.fingerprint).toBe(matchUnnumberedModal(CHROME_UNNUMBERED_PANE)!.fingerprint);
+});
+
+test(`matchUnnumberedModal — with no rule, the preview reaches at most ${UNNUMBERED_PREVIEW_CONTEXT_LINES} lines above the first choice row`, () => {
+  const body = Array.from({ length: 30 }, (_, i) => `body line ${i + 1}`).join("\n");
+  const pane = `${body}\n\n❯ No\n  Yes\n\nEnter to confirm · Esc to cancel`;
+  const m = matchUnnumberedModal(pane)!;
+  expect(m).not.toBeNull();
+  const shown = m.paneText.split("\n");
+  // 30 body lines + 1 blank sit above the rows; the window keeps the last 16
+  // of them (15 body lines + the blank).
+  expect(shown[0]).toBe("body line 16");
+  expect(m.paneText).not.toContain("body line 15\n");
+  expect(shown.slice(-4)).toEqual(["❯ No", "  Yes", "", "Enter to confirm · Esc to cancel"]);
+});
+
+test("pickScrapeMatch — the live Chrome prompt resolves to the unnumbered choice card", () => {
+  const direct = matchUnnumberedModal(CHROME_UNNUMBERED_PANE)!;
+  const dispatched = pickScrapeMatch(CHROME_UNNUMBERED_PANE, {
+    paneWorking: false,
+    paneIdle: false,
+    watchdogArmed: false,
+  });
+  expect(dispatched).toEqual(direct);
+  expect(dispatched!.hideKeys).toBe(true);
+  expect(dispatched!.unparsable).toBeUndefined();
+});
+
+test("pickScrapeMatch — the same Chrome prompt on a WORKING or IDLE pane never produces the unnumbered card", () => {
+  // The idle gate is what protects a finished transcript that quotes the
+  // menu: the same rows + footer are still in the tail, but the composer sits
+  // below them. See the dedicated transcript test further down.
+  expect(pickScrapeMatch(CHROME_UNNUMBERED_PANE, {
+    paneWorking: true,
+    paneIdle: false,
+    watchdogArmed: true,
+  })).toBeNull();
+  expect(pickScrapeMatch(CHROME_UNNUMBERED_PANE, {
+    paneWorking: false,
+    paneIdle: true,
+    watchdogArmed: false,
+  })).toBeNull();
+});
+
+test("pickScrapeMatch / matchUnnumberedModal — the OLD numbered Chrome pane keeps the numbered matcher (real digit labels, no hideKeys)", () => {
+  // Regression guard for the generic matcher's numbered-row guard: the
+  // unnumbered parser happily collects the `  2. No, …` rows here, but a
+  // numbered menu belongs to `matchNumberedModal`, which runs first and must
+  // keep its on-screen `1.`/`2.` labels.
+  expect(matchUnnumberedModal(CHROME_EXTENSION_PANE)).toBeNull();
+  const dispatched = pickScrapeMatch(CHROME_EXTENSION_PANE, {
+    paneWorking: false,
+    paneIdle: false,
+    watchdogArmed: false,
+  })!;
+  expect(dispatched).toEqual(matchNumberedModal(CHROME_EXTENSION_PANE)!);
+  expect(dispatched.choices.map((c) => c.label)).toEqual([
+    "Yes, use my browser",
+    "No, keep browser tools off",
+  ]);
+  expect(dispatched.hideKeys).toBeUndefined();
+});
+
+test("matchUnnumberedModal / pickScrapeMatch — the effort slider keeps its horizontal-nav match (precedence: slider before unnumbered)", () => {
+  // The slider's footer also contains `Enter to confirm`; without precedence
+  // the unnumbered parser would be handed its indented track/label rows.
+  expect(matchUnnumberedModal(EFFORT_SLIDER_XHIGH_PANE)).toBeNull();
+  const dispatched = pickScrapeMatch(EFFORT_SLIDER_XHIGH_PANE, {
+    paneWorking: false,
+    paneIdle: false,
+    watchdogArmed: false,
+  })!;
+  expect(dispatched).toEqual(matchSliderModal(EFFORT_SLIDER_XHIGH_PANE)!);
+  expect(dispatched.nav).toBe("horizontal");
+  expect(dispatched.hideKeys).toBeUndefined();
+});
+
+test("matchUnnumberedModal — an idle pane that QUOTES the menu keeps the composer (no unnumbered card), and pickScrapeMatch returns nothing at all", () => {
+  // The reported failure mode's evil twin: the two rows + footer scroll into
+  // finished output, then claude's live composer redraws below them. The
+  // footer is still among the last 3 non-blank lines, so shape alone would
+  // match — the idle gate is what rejects it, and the same idle gate keeps
+  // the unparsable footer arm from replacing it with a "can't read" card.
+  const quotedAtIdle = `❯ No, keep browser tools off
+  Yes, use my browser
+Enter to confirm · Esc to keep browser tools off
+❯ 
+  ⏵⏵ auto mode on (shift+tab to cycle) · ← 1 agent`;
+  expect(paneShowsIdleInputBox(quotedAtIdle)).toBe(true);
+  // Sanity: the shape IS what the matcher would otherwise accept.
+  expect(matchUnnumberedModal("❯ No, keep browser tools off\n  Yes, use my browser\n\nEnter to confirm · Esc to keep browser tools off")).not.toBeNull();
+  expect(matchUnnumberedModal(quotedAtIdle)).not.toBeNull();
+  expect(pickScrapeMatch(quotedAtIdle, {
+    paneWorking: paneShowsClaudeWorking(quotedAtIdle),
+    paneIdle: paneShowsIdleInputBox(quotedAtIdle),
+    watchdogArmed: false,
+  })).toBeNull();
+  expect(paneShowsBlockingPrompt(quotedAtIdle)).toBe(true);
+  // ^ Card registration is idle-gated; the PASTE guard deliberately is not
+  //   (its pre-#298 behavior — a harmless, self-healing withhold), so it
+  //   still reads the quoted menu as blocking.
+  // And the LIVE prompt on a pane with no composer does block a paste.
+  expect(paneShowsBlockingPrompt(CHROME_UNNUMBERED_PANE)).toBe(true);
+});
+
+test("paneShowsIdleInputBox — an all-dim focused row on the Chrome prompt is NOT an idle composer (the modal replaces the status bar, so there is no live prompt row to anchor on)", () => {
+  // The mid-session counterpart of the quoted-transcript case: `scrapeOnce`
+  // reads the styled capture, and the Chrome prompt's focused "No" row could
+  // be rendered dim. Idle detection is anchored on the status bar, which a
+  // modal replaces — so the styled row can never turn the live prompt into a
+  // composer placeholder and suppress the card.
+  expect(paneShowsIdleInputBox(CHROME_UNNUMBERED_PANE)).toBe(false);
+  const styled = CHROME_UNNUMBERED_PANE.replace(
+    "❯ No, keep browser tools off",
+    "\x1b[2m❯ No, keep browser tools off\x1b[0m",
+  );
+  expect(paneShowsIdleInputBox(CHROME_UNNUMBERED_PANE, styled)).toBe(false);
+  expect(pickScrapeMatch(CHROME_UNNUMBERED_PANE, {
+    paneWorking: paneShowsClaudeWorking(CHROME_UNNUMBERED_PANE),
+    paneIdle: paneShowsIdleInputBox(CHROME_UNNUMBERED_PANE, styled),
+    watchdogArmed: false,
+  })!.hideKeys).toBe(true);
+});
+
+/* ── Issue #298: the registration hop — scrapeOnce → registerTmuxPrompt ──
+   Everything above stops at the pure matcher/chain. This section drives the
+   PRODUCTION tick (`scrapeOnce`) with a real task row carrying an active
+   `runId`, an installed session and a captured pane, so the card the reporter
+   never got is proven end to end: two stable ticks register exactly one
+   answerable `tmux_prompt` carrying `hideKeys`, the next tick's
+   `__external__` sweep clears it once the pane moves on (the "task resumes"
+   half of the issue), and the idle-composer twin — the same rows plus a live
+   composer — registers nothing at all, not even the unparsable fallback.
+   Before this test the registration hop was only ever exercised by hand. */
+
+type ScrapeTaskCtx = {
+  taskId: string;
+  runId: string;
+  state: ReturnType<typeof __forTest.installSession>;
+  pending: () => TmuxPromptRequest[];
+  tick: () => Promise<void>;
+  /** Swap the pane the next tick will capture (simulates claude repainting). */
+  setPane: (pane: string) => void;
+};
+
+/** Install a running task + session whose captured pane is `initialPane`, run
+ *  `fn`, then remove the card (so nothing leaks into another file's registry
+ *  reads), the task row, the session and the capture seams. */
+async function withScrapeTask(
+  initialPane: string,
+  fn: (ctx: ScrapeTaskCtx) => Promise<void>,
+): Promise<void> {
+  const { tasks } = await import("./db.ts");
+  const { activeTmuxPromptsForTask, answerTmuxPrompt } = await import("./interactions.ts");
+  const taskId = randomUUID();
+  const runId = randomUUID();
+  let pane = initialPane;
+  tasks.insert(makeTask({ id: taskId, runId, column: "running" }));
+  const state = __forTest.installSession(taskId, path.join(SCRAPER_DATA_DIR, `${taskId}.jsonl`));
+  const prevCapture = __forTest.setCaptureScrapePane(async () => ({ ok: true, stdout: pane, stderr: "" }));
+  const prevStyled = __forTest.setCaptureStyledTail(async () => null);
+  try {
+    await fn({
+      taskId,
+      runId,
+      state,
+      pending: () => activeTmuxPromptsForTask(taskId),
+      tick: () => __forTest.scrapeOnce(state),
+      setPane: (next) => { pane = next; },
+    });
+  } finally {
+    for (const p of activeTmuxPromptsForTask(taskId)) answerTmuxPrompt(p.id, { key: "__external__" });
+    __forTest.setCaptureScrapePane(prevCapture);
+    __forTest.setCaptureStyledTail(prevStyled);
+    __forTest.uninstallSession(taskId);
+    tasks.delete(taskId);
+  }
+}
+
+test("scrapeOnce → registerTmuxPrompt — two stable ticks on the reconstructed Chrome prompt register one answerable card, hideKeys included", async () => {
+  await withScrapeTask(CHROME_UNNUMBERED_PANE, async ({ taskId, runId, pending, tick }) => {
+    // The unnumbered matcher is NOT high-confidence, so the first sighting only
+    // records the fingerprint (the shared two-tick stability gate).
+    await tick();
+    expect(pending()).toHaveLength(0);
+
+    await tick();
+    const cards = pending();
+    expect(cards).toHaveLength(1);
+    const card = cards[0]!;
+    expect(card.kind).toBe("tmux_prompt");
+    expect(card.taskId).toBe(taskId);
+    expect(card.runId).toBe(runId);
+    expect(card.unparsable).toBeUndefined();
+    expect(card.hideKeys).toBe(true);
+    expect(card.cursorIndex).toBe(0);
+    // The pane has no numbers: the synthetic 1-based keys stay internal (the
+    // answer route + dismissTmuxPrompt navigate by them), the labels are the
+    // pane's own.
+    expect(card.choices).toEqual([
+      { key: "1", label: "No, keep browser tools off" },
+      { key: "2", label: "Yes, use my browser" },
+    ]);
+    // The fingerprint is the matcher's own — the same one the sweep compares
+    // against on later ticks.
+    expect(card.fingerprint).toBe(matchUnnumberedModal(CHROME_UNNUMBERED_PANE)!.fingerprint);
+
+    // Idempotent tick: a third stable sighting must not double-register.
+    await tick();
+    expect(pending()).toHaveLength(1);
+  });
+});
+
+test("scrapeOnce → __external__ sweep — once the pane moves on, the next tick clears the registered card so the run can continue", async () => {
+  await withScrapeTask(CHROME_UNNUMBERED_PANE, async ({ pending, tick, setPane }) => {
+    await tick();
+    await tick();
+    expect(pending()).toHaveLength(1);
+
+    // The user answered (in the card or via a real terminal attach) and claude
+    // repainted its composer: the prompt is gone from the pane. The sweep must
+    // resolve the card instead of leaving it stuck in the run panel.
+    setPane(idlePane("⏵⏵ auto mode on (shift+tab to cycle) · ← 1 agent"));
+    await tick();
+    expect(pending()).toEqual([]);
+    // …and a following tick on the same idle pane registers nothing new.
+    await tick();
+    expect(pending()).toEqual([]);
+  });
+});
+
+test("scrapeOnce → no card — an idle composer that quotes the same menu never cards, not even as unparsable", async () => {
+  // The evil twin from the matcher section, now through the real tick: the
+  // rows and footer are in scrollback, the composer sits below. The idle gate
+  // must veto BOTH trailing arms — the unnumbered one and the unparsable
+  // footer card that used to be the only outcome.
+  const quotedAtIdle = `❯ No, keep browser tools off
+  Yes, use my browser
+Enter to confirm · Esc to keep browser tools off
+❯ 
+  ⏵⏵ auto mode on (shift+tab to cycle) · ← 1 agent`;
+  await withScrapeTask(quotedAtIdle, async ({ pending, tick }) => {
+    for (let i = 0; i < UNPARSABLE_STABILITY_TICKS + 1; i++) await tick();
+    expect(pending()).toEqual([]);
+  });
+});
+
+describe("matchUnnumberedModal — negative truth table (each guard in isolation)", () => {
+  const confirmFooter = "Enter to confirm · Esc to cancel";
+
+  test("auto-mode wizard footer ('Enter to continue') is not a confirm footer", () => {
+    const pane = `Set up auto mode for your environment?
+
+❯ Yes
+  No
+
+Enter to continue · Esc to cancel`;
+    expect(matchUnnumberedModal(pane)).toBeNull();
+  });
+
+  test("a footer outside the last 3 non-blank lines is stale scrollback, not a live menu", () => {
+    const pane = `${CHROME_UNNUMBERED_PANE}
+
+● Working on it
+● Still going
+● Almost done`;
+    expect(matchUnnumberedModal(pane)).toBeNull();
+  });
+
+  test("checkbox rows ([ ] / [x] / [✔]) are rejected whether the token is leading or trailing", () => {
+    // Leading form (`[ ] Cheese`).
+    expect(matchUnnumberedModal(`Pick toppings\n\n❯ [ ] Cheese\n  [x] Ham\n\n${confirmFooter}`)).toBeNull();
+    expect(matchUnnumberedModal(`Pick toppings\n\n❯ [✔] Cheese\n  [ ] Ham\n\n${confirmFooter}`)).toBeNull();
+    // Trailing form — what claude's auto-mode wizard actually draws
+    // (`Also scan shell history    [ ]`), so a leading-only guard would
+    // present a multi-select checklist as a single-choice card.
+    expect(matchUnnumberedModal(`Pick options\n\n❯ Also scan shell history    [ ]\n  Also scan your other repos [x]\n\n${confirmFooter}`)).toBeNull();
+    expect(matchUnnumberedModal(`Pick options\n\n❯ Also scan shell history    [ ]\n  Also scan your other repos [✔]\n\n${confirmFooter}`)).toBeNull();
+  });
+
+  test("the footer anchor is case-insensitive in both the chain gate and the parser", () => {
+    // The matcher's gate has always been /i; the parser used to be
+    // case-sensitive, so a footer whose casing differed passed the gate and
+    // then silently failed to parse. Pin the two together.
+    const pane = `Pick one\n\n❯ No, keep browser tools off\n  Yes, use my browser\n\nENTER TO CONFIRM · ESC KEEP BROWSER TOOLS OFF`;
+    expect(matchUnnumberedModal(pane)).not.toBeNull();
+  });
+
+  test("value-selector rows (◂ … ▸) are rejected", () => {
+    expect(matchUnnumberedModal(`Pick a level\n\n❯ Low ◂───▸ High\n  Slow ◂───▸ Fast\n\n${confirmFooter}`)).toBeNull();
+  });
+
+  test("numbered rows stay with matchNumberedModal", () => {
+    const pane = `Do you want to proceed?\n\n❯ 1. Yes\n  2. No\n\n${confirmFooter}`;
+    expect(matchUnnumberedModal(pane)).toBeNull();
+    expect(matchNumberedModal(pane)).not.toBeNull();
+  });
+
+  test("a wrapped option label is not a phantom choice — mixed label columns fall to the unparsable card", () => {
+    // Ink draws every option label at the same column; a 2+-space-indented
+    // row whose label starts deeper is the previous option's wrap. Counting
+    // it as a choice would add a phantom button and shift the arrow indices
+    // `dismissTmuxPrompt` drives, so the parser must refuse the list.
+    const wrapped = `Pick one\n\n❯ No, keep browser tools off\n  Yes, use my browser — this connects\n    to your signed-in Chrome session\n\n${confirmFooter}`;
+    expect(matchUnnumberedModal(wrapped)).toBeNull();
+    const fallback = pickScrapeMatch(wrapped, {
+      paneWorking: false,
+      paneIdle: false,
+      watchdogArmed: false,
+    })!;
+    expect(fallback.unparsable).toBe(true);
+    expect(fallback.choices).toEqual([]);
+  });
+
+  test("zero cursor rows or two cursor rows are rejected (exactly one required)", () => {
+    expect(matchUnnumberedModal(`Pick one\n\n  No, keep browser tools off\n  Yes, use my browser\n\n${confirmFooter}`)).toBeNull();
+    expect(matchUnnumberedModal(`Pick one\n\n❯ No, keep browser tools off\n❯ Yes, use my browser\n\n${confirmFooter}`)).toBeNull();
+  });
+
+  test("a single row is rejected (>= 2 choices required)", () => {
+    expect(matchUnnumberedModal(`Pick one\n\n❯ Only choice\n\n${confirmFooter}`)).toBeNull();
+  });
+
+  test(`more than ${UNNUMBERED_MAX_CHOICE_ROWS} contiguous rows fall to the unparsable card rather than presenting prose as choices`, () => {
+    const rows = (n: number): string =>
+      ["❯ Option 1", ...Array.from({ length: n - 1 }, (_, i) => `  Option ${i + 2}`)].join("\n");
+    expect(UNNUMBERED_MAX_CHOICE_ROWS).toBe(9);
+    expect(matchUnnumberedModal(`Pick one\n\n${rows(UNNUMBERED_MAX_CHOICE_ROWS)}\n\n${confirmFooter}`)).not.toBeNull();
+    expect(matchUnnumberedModal(`Pick one\n\n${rows(UNNUMBERED_MAX_CHOICE_ROWS + 1)}\n\n${confirmFooter}`)).toBeNull();
+  });
+});
+
+/* ── Issue #298 evidence: LIVE claude 2.1.322 captures (2026-11-12) ──
+   The Chrome prompt itself can't be shown on demand (it needs the extension,
+   a server-side flag, and an unset `claudeInChromeDefaultEnabled`), so its
+   fixture above is a reconstruction. These pin it to real evidence instead:
+     - The 2.1.322 binary renders `ChromeAutoEnableDialog` as the shared
+       `Dialog` (title, `color: "permission"`, `inputGuide` footer) around the
+       confirm select with `hideIndexes: true, cancelFirst: true,
+       focus: "cancel"` — exactly the props `TrustDialog` passes to the same
+       two components. So a live capture of the trust dialog IS a capture of
+       the Chrome prompt's chrome: top rule, 1-space body indent,
+       ` ❯ <cancel>` / `   <confirm>` rows, footer last.
+     - Two independent third-party pastes of the real Chrome prompt (2.1.283 /
+       2.1.296) show the same shape and the footer wording
+       `Enter to confirm · Esc to keep browser tools off`.
+   Captured with `tmux capture-pane -p` on 80x24 detached panes; trailing
+   blanks trimmed; the trust dialog's workspace path is replaced by a
+   placeholder. `CHROME_2_1_322_PANE` is the Chrome dialog's own strings
+   (from the 2.1.322 binary) laid into the captured trust-dialog chrome. */
+
+const TRUST_2_1_322_PANE = `────────────────────────────────────────────────────────────────────────────────
+ Accessing workspace:
+
+ /private/tmp/agetor-spike/untrusted-31220
+
+ Quick safety check: Is this a project you created or one you trust? (Like your
+ own code, a well-known open source project, or work from your team). If not,
+ take a moment to review what's in this folder first.
+
+ Claude Code'll be able to read, edit, and execute files here.
+
+ Security guide
+
+ ❯ No, exit
+   Yes, I trust this folder
+
+ Enter to confirm · Esc to cancel`;
+
+const CHROME_2_1_322_PANE = `────────────────────────────────────────────────────────────────────────────────
+ Claude in Chrome extension detected
+
+ Claude will use your Chrome browser by default — navigating sites, filling
+ forms, and capturing screenshots in your existing session.
+
+ This session is in Auto mode, which checks routine browser actions — you are
+ only prompted when it is unsure. Turn browser tools off for future sessions
+ with /chrome.
+
+ ❯ No, keep browser tools off
+   Yes, use my browser
+
+ Enter to confirm · Esc to keep browser tools off`;
+
+/** Live 2.1.322 `/theme` picker: unnumbered rows with a cursor, but an
+ *  `Enter to select` footer — not a confirm menu. */
+const THEME_PICKER_2_1_322_PANE = `❯ /effort
+  ⎿  Cancelled
+
+❯ /resume
+  ⎿  Resume cancelled
+▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔ ◐ medium · /effort ▔
+   Theme
+
+   Choose the text style that looks best with your terminal
+
+       Auto (match terminal)
+   ❯ ✔ Dark mode
+       Light mode
+       Dark mode (colorblind-friendly)
+       Light mode (colorblind-friendly)
+       Dark mode (ANSI colors only)
+       Light mode (ANSI colors only)
+       New custom theme…
+
+   ╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌
+    1  function greet() {
+    2 -  console.log("Hello, World!");
+    2 +  console.log("Hello, Claude!");
+    3  }
+   ╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌
+    Syntax theme: Monokai Extended (ctrl+t to disable)
+
+   Enter to select · Esc to cancel`;
+
+/** Live 2.1.322 `/effort` slider (grew an Ultracode toggle row and a longer
+ *  footer since 2.1.245; `matchSliderModal` no longer recognises it — a
+ *  separate, pre-existing gap). Its footer contains `Enter to confirm`. */
+const EFFORT_SLIDER_2_1_322_PANE = ` ▐▛███▛█   Claude Code v2.1.322
+▝▜██████▀  Haiku 5.5 · Claude Ultra
+ ▝▝   ▝▝   ~/.agetor/worktrees/1c345ab1-d22f-4ee3-a67e-66d42d952b32/vendor/q298-probe
+
+
+❯ /model
+  ⎿  Kept model as Haiku 5.5
+
+
+
+
+
+
+
+
+
+
+
+ tmux detected · scroll with PgUp/PgDn · or add 'set -g mouse on' to ~/.tmux.conf for wheel scroll ▔
+   Effort
+
+                   Faster                             Smarter
+                   ──────────▲───────────────────────────────      Ultracode  off
+                   low     medium     high     xhigh      max      Tab to toggle
+
+                                  The default effort for this model
+
+
+   ←/→ to adjust · Enter to confirm · s for this session only · Esc to cancel`;
+
+/** Live 2.1.322 idle composer frame: hint row, rule, prompt row (with the
+ *  dim `Try "…"` placeholder, which plain text can't tell from typed text),
+ *  rule, status bar. */
+const IDLE_FRAME_2_1_322 = `                                                                                ◐ medium · /effort
+────────────────────────────────────────────────────────────────────────────────────────────────────
+❯ Try "fix lint errors"
+────────────────────────────────────────────────────────────────────────────────────────────────────
+  ⏵⏵ auto mode on (shift+tab to cycle) · ← 1 agent`;
+
+describe("issue #298 — live claude 2.1.322 evidence", () => {
+  const gates = (pane: string) => ({
+    paneWorking: paneShowsClaudeWorking(pane),
+    paneIdle: paneShowsIdleInputBox(pane),
+    watchdogArmed: false,
+  });
+
+  test("the real trust dialog (same Dialog + hideIndexes select as the Chrome prompt) becomes a two-choice card; before, only the unparsable fallback caught it", () => {
+    const m = pickScrapeMatch(TRUST_2_1_322_PANE, gates(TRUST_2_1_322_PANE))!;
+    expect(m).not.toBeNull();
+    expect(m.unparsable).toBeUndefined();
+    expect(m.hideKeys).toBe(true);
+    expect(m.choices.map((c) => c.label)).toEqual(["No, exit", "Yes, I trust this folder"]);
+    expect(m.cursorIndex).toBe(0);
+    expect(m.fingerprint).toBe(matchUnnumberedModal(TRUST_2_1_322_PANE)!.fingerprint);
+    // What the chain produced before the unnumbered arm existed:
+    expect(matchNumberedModal(TRUST_2_1_322_PANE)).toBeNull();
+    expect(matchUnparsableModal(TRUST_2_1_322_PANE, false)?.unparsable).toBe(true);
+    // The preview starts at the dialog's title, below its top rule.
+    expect(m.paneText.split("\n")[0]).toBe(" Accessing workspace:");
+    expect(m.paneText).not.toContain("────");
+    // The boot auto-confirmer still owns this dialog (it runs first).
+    const consent = matchStartupConsentDialog(TRUST_2_1_322_PANE)!;
+    expect(consent.name).toBe("trust-folder");
+    expect(consent.acceptIndex).toBe(1);
+  });
+
+  test("the Chrome prompt in the 2.1.322 dialog chrome becomes a two-choice card with its title, and is never auto-confirmed", () => {
+    const m = pickScrapeMatch(CHROME_2_1_322_PANE, gates(CHROME_2_1_322_PANE))!;
+    expect(m).not.toBeNull();
+    expect(m.unparsable).toBeUndefined();
+    expect(m.hideKeys).toBe(true);
+    expect(m.choices).toEqual([
+      { key: "1", label: "No, keep browser tools off" },
+      { key: "2", label: "Yes, use my browser" },
+    ]);
+    expect(m.cursorIndex).toBe(0);
+    const shown = cleanPromptPane(m.paneText);
+    expect(shown.split("\n")[0]).toBe(" Claude in Chrome extension detected");
+    expect(shown).not.toContain("Enter to confirm");
+    expect(matchStartupConsentDialog(CHROME_2_1_322_PANE)).toBeNull();
+    // Same answer on either the boot poller's or the runtime scraper's gates.
+    expect(paneShowsBlockingPrompt(CHROME_2_1_322_PANE)).toBe(true);
+  });
+
+  test("the real /theme picker (unnumbered rows, 'Enter to select') is not read as a confirm menu", () => {
+    expect(matchUnnumberedModal(THEME_PICKER_2_1_322_PANE)).toBeNull();
+    const m = pickScrapeMatch(THEME_PICKER_2_1_322_PANE, gates(THEME_PICKER_2_1_322_PANE));
+    expect(m?.hideKeys).toBeUndefined();
+  });
+
+  test("the real /effort slider (footer contains 'Enter to confirm') is not read as an unnumbered menu", () => {
+    expect(matchUnnumberedModal(EFFORT_SLIDER_2_1_322_PANE)).toBeNull();
+    const m = pickScrapeMatch(EFFORT_SLIDER_2_1_322_PANE, gates(EFFORT_SLIDER_2_1_322_PANE));
+    expect(m?.hideKeys).toBeUndefined();
+  });
+
+  test("the 2.1.322 composer is framed by rules, so a menu quoted above it can't put its footer in the last 3 non-blank lines — no card even with the idle gate OFF", () => {
+    const quoted = `${CHROME_2_1_322_PANE}\n\n${IDLE_FRAME_2_1_322}`;
+    const nonBlank = quoted.split("\n").filter((l) => l.trim().length > 0);
+    expect(nonBlank.slice(-3).some((l) => MODAL_FOOTER_RE.test(l))).toBe(false);
+    // Plain text can't see the dim placeholder, so this frame is NOT idle to
+    // the plain predicate — the geometry alone keeps both trailing arms quiet.
+    expect(paneShowsIdleInputBox(quoted)).toBe(false);
+    expect(pickScrapeMatch(quoted, { paneWorking: false, paneIdle: false, watchdogArmed: false })).toBeNull();
+  });
+
+  test("scrapeOnce registers one answerable card for the 2.1.322-chrome Chrome prompt after two stable ticks", async () => {
+    await withScrapeTask(CHROME_2_1_322_PANE, async ({ pending, tick }) => {
+      await tick();
+      expect(pending()).toHaveLength(0);
+      await tick();
+      const cards = pending();
+      expect(cards).toHaveLength(1);
+      expect(cards[0]!.hideKeys).toBe(true);
+      expect(cards[0]!.choices.map((c) => c.label)).toEqual(["No, keep browser tools off", "Yes, use my browser"]);
+      expect(cards[0]!.paneText.split("\n")[0]).toBe(" Claude in Chrome extension detected");
+    });
+  });
+});
+
 test("dispatchLine updates permissionMode BEFORE the dedup guard (reattach safety)", async () => {
   const { __forTest } = await import("./claude-tmux.ts");
   const { mkdtempSync, writeFileSync } = await import("node:fs");
@@ -843,12 +1476,12 @@ Line D`;
 // ── Precedence sanity ─────────────────────────────────────────────────────
 
 test("matchUnparsableModal — precedence: a numbered tool-permission modal is caught by matchNumberedModal first, but WOULD also match the fallback alone", () => {
-  // scrapeOnce's real dispatch is `matchNumberedModal(tail) ?? matchYesNoModal(tail)
-  // ?? matchUnparsableModal(...)` — the fallback is the final `??` arm, so a
+  // Real dispatch is `pickScrapeMatch` (numbered > yes-no > slider >
+  // unnumbered > unparsable) — the fallback is the final `??` arm, so a
   // parseable numbered modal never reaches it in practice. This test documents
   // that ordering is load-bearing: in isolation, matchUnparsableModal WOULD
   // also fire on the same pane (it carries a recognised footer), so if the
-  // `??` chain were ever reordered, a real numbered modal would silently
+  // chain were ever reordered, a real numbered modal would silently
   // downgrade to the "read it in the terminal" fallback card instead of
   // rendering real clickable choices.
   const pane = `Do you want to proceed?
@@ -866,8 +1499,12 @@ Esc to cancel · Tab to amend`;
   expect(fallbackAlone).not.toBeNull();
   expect(fallbackAlone!.unparsable).toBe(true);
 
-  // scrapeOnce's actual `??` chain: numbered wins.
-  const dispatched = matchNumberedModal(pane) ?? matchYesNoModal(pane) ?? matchUnparsableModal(pane, false);
+  // The production chain (shared by scrapeOnce and the boot poller): numbered wins.
+  const dispatched = pickScrapeMatch(pane, {
+    paneWorking: paneShowsClaudeWorking(pane),
+    paneIdle: paneShowsIdleInputBox(pane),
+    watchdogArmed: false,
+  });
   expect(dispatched).toEqual(numbered);
 });
 
@@ -964,10 +1601,10 @@ test("clearedStabilityGate — an unparsable match never has highConfidence, so 
 // BOTH matchUnparsableModal arms, (C) that the veto/gate doesn't over-
 // suppress genuinely actionable notices or the existing wizard fixture, (D)
 // that the working-gate — not the matcher itself — is what suppresses a
-// footer-bearing pane that also shows working chrome (mirrors scrapeOnce's
-// real `paneShowsClaudeWorking(tail) ? null : matchUnparsableModal(...)`
-// dispatch), (E) fingerprint stability across the new volatile forms, and
-// (F) the raised 3-tick stability constant.
+// footer-bearing pane that also shows working chrome (driven through
+// `pickScrapeMatch`, the production chain — its quiet gate, not the matcher,
+// is what suppresses it), (E) fingerprint stability across the new volatile
+// forms, and (F) the raised 3-tick stability constant.
 
 // ── A. paneShowsClaudeWorking truth table ──────────────────────────────────
 
@@ -1070,9 +1707,11 @@ test("paneShowsClaudeWorking — only inspects the bottom widget area (last WORK
     + "\n" + AUTO_MODE_WIZARD_PANE;
   expect(paneShowsClaudeWorking(echoedChromeAboveWizard)).toBe(false);
   // …and the real scrapeOnce dispatch therefore still cards the wizard.
-  const dispatched = paneShowsClaudeWorking(echoedChromeAboveWizard)
-    ? null
-    : matchUnparsableModal(echoedChromeAboveWizard, false);
+  const dispatched = pickScrapeMatch(echoedChromeAboveWizard, {
+    paneWorking: paneShowsClaudeWorking(echoedChromeAboveWizard),
+    paneIdle: paneShowsIdleInputBox(echoedChromeAboveWizard),
+    watchdogArmed: false,
+  });
   expect(dispatched).not.toBeNull();
   expect(dispatched!.unparsable).toBe(true);
   // Boundary: a working line exactly WORKING_CHROME_WINDOW_LINES non-blank
@@ -1176,6 +1815,26 @@ test("matchUnparsableModal — the auto-mode wizard fixture still cards (unchang
   expect(m!.unparsable).toBe(true);
 });
 
+test("pickScrapeMatch — the auto-mode wizard reaches the unparsable footer card through the production chain", () => {
+  // The wizard is the canonical shape the unnumbered matcher must NOT claim
+  // (trailing checkboxes + a `◂ … ▸` value selector) and the footer arm of
+  // the fallback must still catch. Driving the shared chain — not the matcher
+  // in isolation — is what pins the re-gated unparsable arm: if `paneIdle`
+  // were computed wrong or the quiet gate dropped the footer arm, this pane
+  // would resolve to nothing instead of a card.
+  expect(paneShowsClaudeWorking(AUTO_MODE_WIZARD_PANE)).toBe(false);
+  expect(paneShowsIdleInputBox(AUTO_MODE_WIZARD_PANE)).toBe(false);
+  expect(matchUnnumberedModal(AUTO_MODE_WIZARD_PANE)).toBeNull();
+  const dispatched = pickScrapeMatch(AUTO_MODE_WIZARD_PANE, {
+    paneWorking: false,
+    paneIdle: false,
+    watchdogArmed: false,
+  });
+  expect(dispatched).not.toBeNull();
+  expect(dispatched!.unparsable).toBe(true);
+  expect(dispatched!.choices).toEqual([]);
+});
+
 // ── D. Working-gate composition (mirrors scrapeOnce's real dispatch) ───────
 
 test("matchUnparsableModal + paneShowsClaudeWorking — a footer-bearing pane that ALSO shows working chrome is only suppressed by the gate, not the matcher", () => {
@@ -1194,7 +1853,11 @@ Enter to continue · Esc to cancel`;
   // this is what actually suppresses it. Documents the gate is load-bearing:
   // if it were ever dropped at the call site, this exact pane would flicker
   // a card during a normal background-agent wait.
-  const gated = paneShowsClaudeWorking(pane) ? null : matchUnparsableModal(pane, false);
+  const gated = pickScrapeMatch(pane, {
+    paneWorking: paneShowsClaudeWorking(pane),
+    paneIdle: paneShowsIdleInputBox(pane),
+    watchdogArmed: false,
+  });
   expect(gated).toBeNull();
 });
 
@@ -1404,7 +2067,7 @@ test("idle+done tail (a completed turn's summary row still on screen 3 minutes l
   const pane = idlePaneWithDoneRow("⏵⏵ auto mode on (shift+tab to cycle) · ← 1 agent");
   expect(paneShowsClaudeWorking(pane)).toBe(false);
   expect(paneShowsIdleInputBox(pane)).toBe(true);
-  expect(pickScrapeMatch(pane, { paneWorking: paneShowsClaudeWorking(pane), watchdogArmed: false })).toBeNull();
+  expect(pickScrapeMatch(pane, { paneWorking: paneShowsClaudeWorking(pane), paneIdle: paneShowsIdleInputBox(pane), watchdogArmed: false })).toBeNull();
   expect(paneShowsBlockingPrompt(pane)).toBe(false);
 });
 
@@ -1455,7 +2118,7 @@ test("matchNumberedModal — 2.1.245 bare /model picker: confirmKey is 's' (foot
 test("pickScrapeMatch — the /model picker's confirmKey rides along through the shared chain", () => {
   const direct = matchNumberedModal(MODEL_PICKER_PANE)!;
   expect(direct.confirmKey).toBe("s");
-  const dispatched = pickScrapeMatch(MODEL_PICKER_PANE, { paneWorking: false, watchdogArmed: false });
+  const dispatched = pickScrapeMatch(MODEL_PICKER_PANE, { paneWorking: false, paneIdle: false, watchdogArmed: false });
   expect(dispatched!.confirmKey).toBe("s");
 });
 
@@ -1555,16 +2218,16 @@ test("matchNumberedModal / matchYesNoModal — the effort slider has no digits o
   expect(matchYesNoModal(EFFORT_SLIDER_HIGH_PANE)).toBeNull();
 });
 
-// ── pickScrapeMatch — the shared numbered > yes-no > slider > unparsable
-// chain used by BOTH scrapeOnce and the boot poller (docs/plans/model-
-// effort-local-command-turns.md §10 review finding #9) — tests exercise the
-// production function directly rather than re-implementing the `??` chain
+// ── pickScrapeMatch — the shared numbered > yes-no > slider > unnumbered >
+// unparsable chain used by BOTH scrapeOnce and the boot poller (docs/plans/
+// model-effort-local-command-turns.md §10 review finding #9) — tests exercise
+// the production function directly rather than re-implementing the `??` chain
 // in the test body, so a future reorder of the real chain would fail here
 // too.
 
 test("pickScrapeMatch — a slider pane resolves to the slider match, never unparsable, even with the watchdog armed", () => {
   const direct = matchSliderModal(EFFORT_SLIDER_XHIGH_PANE)!;
-  const dispatched = pickScrapeMatch(EFFORT_SLIDER_XHIGH_PANE, { paneWorking: false, watchdogArmed: true });
+  const dispatched = pickScrapeMatch(EFFORT_SLIDER_XHIGH_PANE, { paneWorking: false, paneIdle: false, watchdogArmed: true });
   expect(dispatched).not.toBeNull();
   expect(dispatched).toEqual(direct);
   expect((dispatched as any).unparsable).toBeUndefined();
@@ -1572,36 +2235,37 @@ test("pickScrapeMatch — a slider pane resolves to the slider match, never unpa
 
 test("pickScrapeMatch — the /model picker resolves to the numbered match", () => {
   const direct = matchNumberedModal(MODEL_PICKER_PANE)!;
-  expect(pickScrapeMatch(MODEL_PICKER_PANE, { paneWorking: false, watchdogArmed: false })).toEqual(direct);
+  expect(pickScrapeMatch(MODEL_PICKER_PANE, { paneWorking: false, paneIdle: false, watchdogArmed: false })).toEqual(direct);
 });
 
 test("pickScrapeMatch — a (y/N) pane resolves to the yes-no match", () => {
   const pane = `Continue with the operation? (y/N)`;
   const direct = matchYesNoModal(pane)!;
-  expect(pickScrapeMatch(pane, { paneWorking: false, watchdogArmed: false })).toEqual(direct);
+  expect(pickScrapeMatch(pane, { paneWorking: false, paneIdle: false, watchdogArmed: false })).toEqual(direct);
 });
 
 test("pickScrapeMatch — an idle input box with watchdogArmed:true (paneWorking:false) resolves to the unparsable watchdog match", () => {
-  // pickScrapeMatch itself has no independent notion of "idle" — it trusts
-  // whatever paneWorking/watchdogArmed the caller computed. Production never
-  // actually calls it this way for a real idle pane (stuckTurnFallbackArmed's
-  // own paneIdle term keeps watchdogArmed false there — see the paired
-  // assertion further below), but this pins the shared chain's own dispatch
-  // logic in isolation from that caller-side guard.
+  // pickScrapeMatch itself has no independent notion of "idle beyond the two
+  // gates it applies" — this hands it the synthetic combination production
+  // never builds (stuckTurnFallbackArmed's own paneIdle term keeps
+  // watchdogArmed false on a real idle pane, so `paneIdle: true` there would
+  // short-circuit both trailing arms). Passing `paneIdle: false` here pins
+  // the shared chain's own dispatch logic in isolation from that caller-side
+  // guard: a non-idle, non-working pane with the watchdog armed still cards.
   const pane = idlePane("⏵⏵ auto mode on (shift+tab to cycle) · ← 1 agent");
-  const dispatched = pickScrapeMatch(pane, { paneWorking: false, watchdogArmed: true });
+  const dispatched = pickScrapeMatch(pane, { paneWorking: false, paneIdle: false, watchdogArmed: true });
   expect(dispatched).not.toBeNull();
   expect(dispatched!.unparsable).toBe(true);
 });
 
 test("pickScrapeMatch — the same idle pane with paneWorking:true resolves to null (the paneWorking gate skips the unparsable arm outright)", () => {
   const pane = idlePane("⏵⏵ auto mode on (shift+tab to cycle) · ← 1 agent");
-  expect(pickScrapeMatch(pane, { paneWorking: true, watchdogArmed: true })).toBeNull();
+  expect(pickScrapeMatch(pane, { paneWorking: true, paneIdle: true, watchdogArmed: true })).toBeNull();
 });
 
 test("pickScrapeMatch — a footer-bearing unknown modal resolves to the unparsable footer match even with the watchdog NOT armed", () => {
   const direct = matchUnparsableModal(SHORT_UNPARSABLE_PANE, false)!;
-  const dispatched = pickScrapeMatch(SHORT_UNPARSABLE_PANE, { paneWorking: false, watchdogArmed: false });
+  const dispatched = pickScrapeMatch(SHORT_UNPARSABLE_PANE, { paneWorking: false, paneIdle: false, watchdogArmed: false });
   expect(dispatched).toEqual(direct);
   expect(dispatched!.unparsable).toBe(true);
 });
@@ -1611,7 +2275,7 @@ test("pickScrapeMatch — boot semantics: the boot poller always passes watchdog
 
 Still going, no visible progress, nothing that looks like a modal or a
 footer — just a wedged TUI.`;
-  expect(pickScrapeMatch(stuckPane, { paneWorking: false, watchdogArmed: false })).toBeNull();
+  expect(pickScrapeMatch(stuckPane, { paneWorking: false, paneIdle: false, watchdogArmed: false })).toBeNull();
 });
 
 // ── Effort slider negatives (one of the three required signals missing) ────
@@ -1753,7 +2417,7 @@ ${EFFORT_SLIDER_XHIGH_PANE}`;
   // pickScrapeMatch's own paneWorking gate (see its doc) only ever wraps the
   // TRAILING unparsable arm — a real slider match still wins outright, even
   // with paneWorking AND the watchdog both true.
-  const dispatched = pickScrapeMatch(pane, { paneWorking: true, watchdogArmed: true });
+  const dispatched = pickScrapeMatch(pane, { paneWorking: true, paneIdle: false, watchdogArmed: true });
   expect(dispatched).toEqual(direct);
   expect((dispatched as any).unparsable).toBeUndefined();
 
@@ -2278,9 +2942,17 @@ describe("createStartupConfirmTracker — the boot poller's per-dialog state mac
   });
 
   test("N4: the dialog that survived give-up is still cardable by the generic path (pickScrapeMatch), so the fall-through registers a tmux_prompt", () => {
-    const generic = __forTest.pickScrapeMatch(TRUST(true), { paneWorking: false, watchdogArmed: false });
+    const generic = __forTest.pickScrapeMatch(TRUST(true), { paneWorking: false, paneIdle: false, watchdogArmed: false });
     expect(generic).not.toBeNull();
-    expect(generic!.unparsable).toBe(true);
+    // Since issue #298 the generic chain parses this UNNUMBERED trust dialog
+    // into a clickable choice card (arrow-nav from the observed cursor) rather
+    // than the old "can't read it" fallback — the positive side effect of the
+    // shared unnumbered matcher. `matchStartupConsentDialog` (the boot
+    // auto-confirmer) is unchanged; this is only what happens after it gives up.
+    expect(generic!.choices.map((c) => c.label)).toEqual(["No, exit", "Yes, I trust this folder"]);
+    expect(generic!.cursorIndex).toBe(0);
+    expect(generic!.hideKeys).toBe(true);
+    expect(generic!.unparsable).toBeUndefined();
     expect(generic!.paneText).toContain("Yes, I trust this folder");
   });
 
@@ -2698,7 +3370,7 @@ describe("placeholder keeps the unknown-prompt watchdog chain quiet", () => {
     const watchdogArmed = stuckTurnFallbackArmed({ ...ALL_ARMED, paneWorking, paneIdle });
     expect(watchdogArmed).toBe(false);
     expect(matchUnparsableModal(plain, watchdogArmed)).toBeNull();
-    expect(pickScrapeMatch(plain, { paneWorking, watchdogArmed })).toBeNull();
+    expect(pickScrapeMatch(plain, { paneWorking, paneIdle, watchdogArmed })).toBeNull();
     expect(paneShowsBlockingPrompt(plain)).toBe(false);
   });
 
@@ -2710,7 +3382,7 @@ describe("placeholder keeps the unknown-prompt watchdog chain quiet", () => {
 
     const watchdogArmed = stuckTurnFallbackArmed({ ...ALL_ARMED, paneWorking, paneIdle });
     expect(watchdogArmed).toBe(true);
-    expect(pickScrapeMatch(plain, { paneWorking, watchdogArmed })).not.toBeNull();
+    expect(pickScrapeMatch(plain, { paneWorking, paneIdle, watchdogArmed })).not.toBeNull();
   });
 
   test("typed text in the composer is NOT idle even with a styled tail, so the watchdog still arms (genuinely stranded text keeps today's behaviour)", () => {

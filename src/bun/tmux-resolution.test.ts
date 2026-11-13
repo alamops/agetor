@@ -1,5 +1,5 @@
 import { test, expect, beforeAll, afterAll, beforeEach, afterEach } from "bun:test";
-import { chmodSync, mkdtempSync, readFileSync, writeFileSync } from "node:fs";
+import { chmodSync, mkdirSync, mkdtempSync, readFileSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import path from "node:path";
 import { rmTestDataDir } from "./test-data-dir.ts";
@@ -21,6 +21,15 @@ let ensureDisclaimedServer: () => Promise<void>;
 let resetTmuxServerEnvCleared: () => void;
 let setDisclaimSwitch: (on: boolean) => void;
 let dataDir: string;
+let bundledTmuxPath: () => string;
+let isBundledTmuxBin: (bin: string) => boolean;
+let terminfoDirsFor: (binPath: string, systemDir?: string) => string | null;
+let tmuxEnv: (
+  bin?: string,
+  extra?: Record<string, string | undefined>,
+) => Record<string, string | undefined>;
+let SYSTEM_TERMINFO_DIR: string;
+let childEnv: (extra?: Record<string, string | undefined>) => Record<string, string | undefined>;
 
 beforeAll(async () => {
   ({
@@ -30,9 +39,15 @@ beforeAll(async () => {
     buildEnsureServerArgv,
     ensureDisclaimedServer,
     __resetTmuxServerEnvClearedForTest: resetTmuxServerEnvCleared,
+    bundledTmuxPath,
+    isBundledTmuxBin,
+    terminfoDirsFor,
+    tmuxEnv,
+    SYSTEM_TERMINFO_DIR,
   } = await import("./tmux-resolution.ts"));
   ({ setDisclaimSwitch } = await import("./disclaim.ts"));
   ({ dataDir } = await import("./db.ts"));
+  ({ childEnv } = await import("./core-spawn.ts"));
 });
 
 afterAll(() => {
@@ -46,6 +61,9 @@ const ORIGINAL = {
   AGETOR_TMUX_SOCKET: process.env.AGETOR_TMUX_SOCKET,
   AGETOR_TMUX_BIN: process.env.AGETOR_TMUX_BIN,
   AGETOR_DISCLAIM_BIN: process.env.AGETOR_DISCLAIM_BIN,
+  AGETOR_API_TOKEN: process.env.AGETOR_API_TOKEN,
+  TERMINFO: process.env.TERMINFO,
+  TERMINFO_DIRS: process.env.TERMINFO_DIRS,
   NODE_ENV: process.env.NODE_ENV,
 };
 
@@ -191,4 +209,99 @@ test("tmuxSocketArgs: mirrors tmuxSocketName() as -L flags, or [] for the defaul
   expect(tmuxSocketArgs()).toEqual(["-L", "foo"]);
   process.env.AGETOR_TMUX_SOCKET = "default";
   expect(tmuxSocketArgs()).toEqual([]);
+});
+
+// --- terminfoDirsFor / isBundledTmuxBin / tmuxEnv ---------------------------
+// The bundled tmux links a vendored libncursesw whose compiled-in terminfo
+// directory is the BUILD MACHINE's Homebrew Cellar path, and the bundle ships
+// no DB of its own — so a tty attach (`Open in Terminal`) printed
+// `can't find terminfo database` and exited (issue #298). These pin the
+// runtime search path and its bundled-only application.
+
+test("terminfoDirsFor: the binary's sibling terminfo/ comes FIRST, then the system DB", () => {
+  const root = mkdtempSync(path.join(tmpdir(), "agetor-ti-"));
+  const binDir = path.join(root, "bin");
+  const vendored = path.join(binDir, "terminfo");
+  const system = path.join(root, "system-terminfo");
+  mkdirSync(vendored, { recursive: true });
+  mkdirSync(system, { recursive: true });
+  expect(terminfoDirsFor(path.join(binDir, "tmux"), system)).toBe(`${vendored}:${system}`);
+});
+
+test("terminfoDirsFor: only the system DB, or null when neither directory exists", () => {
+  const root = mkdtempSync(path.join(tmpdir(), "agetor-ti-"));
+  const binDir = path.join(root, "bin");
+  const system = path.join(root, "system-terminfo");
+  mkdirSync(binDir, { recursive: true });
+  mkdirSync(system, { recursive: true });
+  expect(terminfoDirsFor(path.join(binDir, "tmux"), system)).toBe(system);
+  expect(terminfoDirsFor(path.join(binDir, "tmux"), path.join(root, "missing"))).toBeNull();
+});
+
+test("terminfoDirsFor: a directory that does not exist is never included (default system dir)", () => {
+  const root = mkdtempSync(path.join(tmpdir(), "agetor-ti-"));
+  const binDir = path.join(root, "bin");
+  mkdirSync(binDir, { recursive: true });
+  const dirs = terminfoDirsFor(path.join(binDir, "tmux"));
+  // The sibling does not exist → it must be dropped. What remains is the
+  // host's system DB (or nothing), never the fabricated sibling path.
+  expect(dirs ?? "").not.toContain(path.join(binDir, "terminfo"));
+  expect(SYSTEM_TERMINFO_DIR).toBe("/usr/share/terminfo");
+});
+
+test("isBundledTmuxBin: true for the bundled path (and a lexical variant), false for a system tmux", () => {
+  const bundled = bundledTmuxPath();
+  expect(isBundledTmuxBin(bundled)).toBe(true);
+  expect(isBundledTmuxBin(path.join(path.dirname(bundled), ".", "tmux"))).toBe(true);
+  expect(isBundledTmuxBin("/usr/bin/tmux")).toBe(false);
+  expect(isBundledTmuxBin("/opt/homebrew/bin/tmux")).toBe(false);
+});
+
+test("tmuxEnv: system tmux is byte-equal to childEnv(), adds no TERMINFO_DIRS, and still scrubs the master token", () => {
+  delete process.env.TERMINFO_DIRS;
+  process.env.AGETOR_API_TOKEN = "master-token-for-test";
+  try {
+    const env = tmuxEnv("/usr/bin/tmux");
+    expect(env).toEqual(childEnv());
+    expect(env.TERMINFO_DIRS).toBeUndefined();
+    expect(env.AGETOR_API_TOKEN).toBeUndefined();
+  } finally {
+    restoreEnv("AGETOR_API_TOKEN");
+    restoreEnv("TERMINFO_DIRS");
+  }
+});
+
+test("tmuxEnv: bundled tmux gets a real terminfo search path, keeps the master token out, and keeps an existing TERMINFO_DIRS AFTER the bundled dirs (never replaced)", () => {
+  delete process.env.TERMINFO_DIRS;
+  process.env.AGETOR_API_TOKEN = "master-token-for-test";
+  try {
+    const env = tmuxEnv(bundledTmuxPath());
+    expect(env.TERMINFO_DIRS).toBeDefined();
+    const dirs = env.TERMINFO_DIRS!.split(":");
+    // The system DB is always second (or, with no sibling vendor dir on this
+    // checkout, the only entry) — a custom TERM still resolves.
+    expect(dirs[dirs.length - 1]).toBe(SYSTEM_TERMINFO_DIR);
+    expect(env.AGETOR_API_TOKEN).toBeUndefined();
+    // A user's own setting is preserved in the search path, not replaced.
+    process.env.TERMINFO_DIRS = "/custom/terminfo";
+    expect(tmuxEnv(bundledTmuxPath()).TERMINFO_DIRS).toBe(`${env.TERMINFO_DIRS}:/custom/terminfo`);
+  } finally {
+    restoreEnv("AGETOR_API_TOKEN");
+    restoreEnv("TERMINFO_DIRS");
+  }
+});
+
+test("tmuxEnv: extra env keys ride along for both sources, and an undefined value deletes", () => {
+  delete process.env.TERMINFO_DIRS;
+  process.env.AGETOR_EXTRA_FOR_TEST = "live";
+  try {
+    const system = tmuxEnv("/usr/bin/tmux", { AGETOR_TEST_ONLY: "1", AGETOR_EXTRA_FOR_TEST: undefined });
+    expect(system.AGETOR_TEST_ONLY).toBe("1");
+    expect(system.AGETOR_EXTRA_FOR_TEST).toBeUndefined();
+    expect(system.TERMINFO_DIRS).toBeUndefined();
+    expect(tmuxEnv(bundledTmuxPath(), { AGETOR_TEST_ONLY: "1" }).AGETOR_TEST_ONLY).toBe("1");
+  } finally {
+    delete process.env.AGETOR_EXTRA_FOR_TEST;
+    restoreEnv("TERMINFO_DIRS");
+  }
 });

@@ -25,8 +25,8 @@ import {
   type AskQuestion,
   type TmuxPromptChoice,
 } from "./interactions.ts";
-import { resolveTmuxBin, tmuxSocketArgs, ensureDisclaimedServer } from "./tmux-resolution.ts";
-import { childEnv, coreSpawn } from "./core-spawn.ts";
+import { resolveTmuxBin, tmuxSocketArgs, ensureDisclaimedServer, tmuxEnv } from "./tmux-resolution.ts";
+import { coreSpawn } from "./core-spawn.ts";
 import { createDeathProbe } from "./session-liveness.ts";
 import { detectAskModal, isLossyAskPane, parseModalPane, type AskModalKind, type DriveStep, type NavKey, type ParsedQuestionPane } from "./claude-questions.ts";
 
@@ -1673,13 +1673,16 @@ interface RunResult {
  *  token out of the client's env. */
 async function tmux(args: string[], opts: { stdinText?: string } = {}): Promise<RunResult> {
   try {
-    const proc = coreSpawn([resolveTmuxBin(), ...tmuxSocketArgs(), ...args], {
+    const bin = resolveTmuxBin();
+    const proc = coreSpawn([bin, ...tmuxSocketArgs(), ...args], {
       stdin: opts.stdinText !== undefined
         ? new TextEncoder().encode(opts.stdinText)
         : "ignore",
       stdout: "pipe",
       stderr: "pipe",
-      env: childEnv(),
+      // `tmuxEnv(bin)`: childEnv's scrubbed env, plus the vendored terminfo
+      // search path only when this is the bundled binary (issue #298).
+      env: tmuxEnv(bin),
     }) as Bun.Subprocess<"pipe" | "ignore", "pipe", "pipe">;
     const [stdout, stderr] = await Promise.all([
       new Response(proc.stdout).text(),
@@ -5210,6 +5213,17 @@ interface ScrapeMatch {
    *  `ctx.confirmKey`, which sends it in place of Enter on the arrow-nav
    *  path. */
   confirmKey?: string;
+  /** DISPLAY-ONLY flag: the real widget shows no `N.` prefixes on its rows
+   *  (an Ink select with `hideIndexes`), so the card must not invent a
+   *  visible number that isn't on the pane. Set only by
+   *  `matchUnnumberedModal`. The synthetic 1-based `choices[].key`s stay
+   *  exactly as the parser produced them — `dismissTmuxPrompt` navigates by
+   *  arrow keys and never types the key, and the answer route validates a
+   *  click against those keys — so this flag never participates in a
+   *  fingerprint, an answer key, or a keystroke. Consumed by exactly one
+   *  place: `tmuxChoiceLabel` (src/mainview/lib/tmux-prompt.ts), rendered by
+   *  the generic `TmuxPromptCard` branch in `RunPanel.tsx`. */
+  hideKeys?: boolean;
 }
 
 /**
@@ -5630,6 +5644,136 @@ function matchSliderModal(tail: string): ScrapeMatch | null {
   return { paneText, choices, cursorIndex, fingerprint, highConfidence: true, nav: "horizontal" };
 }
 
+/** Upper bound on the contiguous choice rows `matchUnnumberedModal` will
+ *  present (issue #298). The
+ *  parser itself has no upper bound, so a dialog whose body happens to be
+ *  uniformly 2-space indented with no blank separator before the footer
+ *  could hand it a paragraph as a "choice list". Nine is far above any real
+ *  claude startup menu (the Chrome dialog has two, the trust dialog two) and
+ *  small enough that prose can't fit: past the cap the pane falls to the
+ *  unparsable card, which is safe rather than silently wrong. */
+const UNNUMBERED_MAX_CHOICE_ROWS = 9;
+
+/** A checkbox row: a `[ ]` / `[x]` / `[X]` / `[✔]` / `[✓]` token at the START
+ *  (`[ ] Cheese`) or END (`Also scan shell history    [ ]`) of the label.
+ *  Both ends matter: claude's auto-mode wizard draws its checkboxes TRAILING
+ *  (`AUTO_MODE_WIZARD_PANE` in claude-tmux-scraper.test.ts), and a checklist
+ *  with an `Enter to confirm` footer would otherwise be offered to the
+ *  unnumbered parser — which reads each row as a choice and would present a
+ *  multi-select widget as a single-choice card. The token is deliberately
+ *  narrow (only a blank/x/X/✔/✓ inside the brackets) so prose that merely
+ *  mentions `[something]` is not swept up. */
+const CHECKBOX_ROW_RE = /^\[[ xX✔✓]?\]\s|(?:^|\s)\[[ xX✔✓]?\]$/;
+
+/** How many pane lines ABOVE the first choice row `unnumberedPreview` may
+ *  show. The card's preview is the user's only view of the dialog, and both
+ *  Chrome answers change a persistent claude setting, so the dialog's title
+ *  must survive: the fixed last-12-lines window the other matchers use cut
+ *  "Claude in Chrome extension detected" off a 13-line dialog. Sixteen covers
+ *  that dialog (9 lines above its rows) with room for a longer body. */
+const UNNUMBERED_PREVIEW_CONTEXT_LINES = 16;
+
+/** A full-width horizontal rule — claude draws one above its full-pane
+ *  dialogs (the captured workspace-trust fixture in claude-tmux-scraper.test.ts
+ *  starts with one), separating the dialog from the transcript or welcome
+ *  banner above it. */
+const DIALOG_RULE_RE = /^\s*[─━]{8,}\s*$/;
+
+/**
+ * The card preview for an unnumbered menu: from the top of the dialog to the
+ * end of the pane. Starts up to `UNNUMBERED_PREVIEW_CONTEXT_LINES` lines above
+ * the first choice row, then drops everything up to and including the last
+ * horizontal rule in that window (the dialog's own top edge), and any leading
+ * blank lines. Display-only: the fingerprint is the parser's, so a different
+ * preview window never changes card identity or the stability gate.
+ */
+function unnumberedPreview(lines: string[], firstRowAt: number): string {
+  let start = Math.max(0, firstRowAt - UNNUMBERED_PREVIEW_CONTEXT_LINES);
+  for (let i = firstRowAt - 1; i >= start; i--) {
+    if (DIALOG_RULE_RE.test(lines[i]!)) {
+      start = i + 1;
+      break;
+    }
+  }
+  while (start < firstRowAt && lines[start]!.trim() === "") start++;
+  return lines.slice(start).join("\n").trimEnd();
+}
+
+/**
+ * Recognise a footer-terminated UNNUMBERED choice menu that none of the
+ * numbered / yes-no / slider matchers parsed — today claude 2.1.322's
+ * "Claude in Chrome extension detected" startup prompt (issue #298):
+ *
+ *   Claude in Chrome extension detected
+ *
+ *   Claude will use your Chrome browser by default — navigating sites, filling
+ *   forms, and capturing screenshots in your existing session.
+ *
+ *   ❯ No, keep browser tools off
+ *     Yes, use my browser
+ *
+ *   Enter to confirm · Esc to keep browser tools off
+ *
+ * This matcher only *presents* the rows — it never answers one. Both of the
+ * Chrome prompt's choices change a persistent claude setting ("Yes" connects
+ * the user's logged-in browser; "No"/Esc turns browser tools off and stops
+ * offering setup), so the choice is the user's alone (grill decisions 3, 8).
+ * The dismissal path (`dismissTmuxPrompt`) walks arrows from `cursorIndex`
+ * and presses Enter, which is exactly what a real user does on this widget —
+ * the same `er` select family the 2.1.284 unnumbered trust dialog is already
+ * driven with.
+ *
+ * Built on the existing `parseUnnumberedChoices` (the trust dialog's parser)
+ * rather than a second copy, with guards that keep it away from every other
+ * widget shape the pane can show:
+ *   (a) an `Enter to confirm` footer among the LAST 3 non-blank tail lines —
+ *       the widget is genuinely live at the bottom of the pane, not a
+ *       transcript that quotes a menu. Deliberately reuses the footer
+ *       `MODAL_FOOTER_RE` already has captured evidence for; no new footer
+ *       phrasing is introduced here (see that constant's doc);
+ *   (b) the parser's own shape requirements — ≥2 contiguous rows, exactly
+ *       one `❯`/`›` cursor row;
+ *   (c) no checkbox row (`CHECKBOX_ROW_RE` — `[ ]` / `[x]` / `[✔]` at either
+ *       END of the label; claude draws them trailing on the auto-mode
+ *       wizard), no value-selector row (`◂ … ▸`), and no `N. ` row — a
+ *       numbered menu belongs to
+ *       `matchNumberedModal`, which runs first and must keep its real digit
+ *       labels. The last guard also makes this matcher honest in isolation:
+ *       `parseUnnumberedChoices`' 2-space rule happily collects the OLD
+ *       numbered Chrome pane's `  2. No, …` rows, and those must never be
+ *       re-presented as a digit-less menu;
+ *   (d) at most `UNNUMBERED_MAX_CHOICE_ROWS` rows.
+ *
+ * Never `highConfidence`: unlike the slider (whose footer is a required
+ * signal for the match to exist at all), the footer here is a shape gate on
+ * top of a parser that can also read a quoted transcript. The caller's
+ * two-tick stability gate is what turns a single repaint frame into nothing.
+ *
+ * The idle/working gates are NOT here — they are applied by
+ * `pickScrapeMatch`, the one shared chain both call sites go through, so a
+ * working pane or an idle composer can never produce this card. */
+function matchUnnumberedModal(tail: string): ScrapeMatch | null {
+  const lines = tail.split("\n");
+  const nonBlank = lines.filter((l) => l.trim().length > 0);
+  if (!nonBlank.slice(-3).some((l) => /\benter to confirm\b/i.test(l))) return null;
+  const parsed = parseUnnumberedChoices(tail);
+  if (!parsed) return null;
+  for (const c of parsed.choices) {
+    const label = c.label.trim();
+    if (CHECKBOX_ROW_RE.test(label)) return null;       // checkbox row (leading OR trailing)
+    if (/[◂◀▸▶]/.test(label)) return null;             // value selector row
+    if (/^\d+\.\s/.test(label)) return null;           // numbered row (matchNumberedModal owns it)
+  }
+  if (parsed.choices.length > UNNUMBERED_MAX_CHOICE_ROWS) return null;
+  return {
+    paneText: unnumberedPreview(lines, parsed.firstRowAt),
+    choices: parsed.choices,
+    cursorIndex: parsed.cursorIndex,
+    fingerprint: parsed.fingerprint,
+    hideKeys: true,
+  };
+}
+
 /**
  * Footer phrasings claude's Ink modals draw. Every entry is evidence-backed —
  * a false hit here gates the user's composer, so this allow-list only carries
@@ -5683,20 +5827,26 @@ function stuckTurnFallbackArmed(p: {
 
 /**
  * Last-resort fallback for a pane no other matcher parsed: strictly after
- * `matchNumberedModal`, `matchYesNoModal`, AND `matchSliderModal` have all
- * had a chance (both chain sites — the runtime scraper and the boot poller —
- * try this only once none of the three real matchers hit). What's left by
- * then is an unnumbered arrow-key widget, a free-text/device-code prompt, a
- * single-option modal (`matchNumberedModal` requires ≥2), a slider-shaped
- * pane missing one of `matchSliderModal`'s four required signals, a prose
+ * EVERY real matcher — `matchNumberedModal`, `matchYesNoModal`,
+ * `matchSliderModal`, `matchUnnumberedModal` — has had a chance. Both chain
+ * sites (the runtime scraper and the boot poller) reach this only through
+ * `pickScrapeMatch`, so the precedence is defined in exactly one place. What's
+ * left by then is a free-text/device-code prompt, a single-option modal
+ * (`matchNumberedModal` requires ≥2), a slider-shaped pane missing one of
+ * `matchSliderModal`'s four required signals, a checkbox/value-selector
+ * wizard the unnumbered matcher's row-family guards reject, a prose
  * confirmation, or a genuinely wedged turn. Registers a `tmux_prompt` with
  * empty `choices` — there's no keystroke this scraper can plan, so the UI's
  * job is just "tell the user to go answer it in the attached terminal", not
  * drive an answer back.
  *
- * Fires under either of two independent arms, both gated at the call site on
- * `!paneShowsClaudeWorking(tail)` (a real prompt/wizard replaces the working
- * chrome, so this can't hide a genuine one — see `paneShowsClaudeWorking`):
+ * Fires under either of two independent arms, both reached only on a QUIET
+ * pane — `pickScrapeMatch` skips this arm entirely when
+ * `paneShowsClaudeWorking(tail)` (a real prompt/wizard replaces the working
+ * chrome, so this can't hide a genuine one — see `paneShowsClaudeWorking`)
+ * OR `paneShowsIdleInputBox(tail)` (an idle composer is proof the turn is
+ * over, so carding it would be wrong — that case is closed out by
+ * `scrapeOnce`'s `signalIdleSettle` net instead):
  *   (1) Footer arm — the last 3 NON-BLANK tail lines contain a recognised
  *       modal footer (`MODAL_FOOTER_RE`) AND none of those same lines is a
  *       usage-limit auto-continue notice (`MODAL_NOTICE_RE`) — claude resumes
@@ -5772,17 +5922,43 @@ function matchUnparsableModal(tail: string, watchdogArmed: boolean): ScrapeMatch
  * boot poller's generic-modal branch — factored out (docs/plans/model-
  * effort-local-command-turns.md §10 review finding #9) so the two can't
  * silently drift apart, and so the precedence itself
- * (numbered > yes-no > slider > unparsable, gated on `paneWorking`) is
- * unit-testable without a live tmux pane.
+ * (numbered > yes-no > slider > unnumbered > unparsable, gated on
+ * `paneWorking`/`paneIdle`) is unit-testable without a live tmux pane.
+ *
+ * The unnumbered arm sits AFTER the slider deliberately: the slider's own
+ * footer also contains `Enter to confirm`, so its indented track/label rows
+ * would otherwise be offered to the unnumbered parser. It runs only on a
+ * pane that is neither visibly working (`paneWorking` — a real modal replaces
+ * the working chrome) nor sitting idle at claude's composer (`paneIdle` — an
+ * idle input box is proof a turn is over, and a transcript that quotes a menu
+ * must never become a card). Both signals are REQUIRED fields (not optional)
+ * so a new call site cannot silently skip the gate — see issue #298.
+ *
+ * `paneIdle` also gates the trailing UNPARSABLE arm. That arm's own doc (and
+ * `stuckTurnFallbackArmed`'s) already states the principle — "an idle input
+ * box is proof the turn is over, not a stuck/unparsable modal, so carding it
+ * would be wrong" — but the FOOTER arm was only ever reached through
+ * `!paneWorking`, relying on a real modal replacing the composer. A pane that
+ * quotes a footer-terminated menu in finished transcript output while sitting
+ * at its composer is exactly the false card that assumption misses; with the
+ * unnumbered arm now claiming those shapes, leaving the fallback free to
+ * card the same pane on an idle tick would just re-introduce the bug as a
+ * "can't read" card. Idle panes already have a handler in `scrapeOnce`
+ * (`signalIdleSettle`), not a prompt card.
  *
  * `watchdogArmed` is the caller's own `stuckTurnFallbackArmed` decision at
  * runtime; the boot poller always passes `false` — no turn is in flight yet
  * during boot, so only `matchUnparsableModal`'s FOOTER arm can ever fire
  * there, never its watchdog arm.
  */
-function pickScrapeMatch(tail: string, opts: { paneWorking: boolean; watchdogArmed: boolean }): ScrapeMatch | null {
+function pickScrapeMatch(
+  tail: string,
+  opts: { paneWorking: boolean; paneIdle: boolean; watchdogArmed: boolean },
+): ScrapeMatch | null {
+  const quiet = !opts.paneWorking && !opts.paneIdle;
   return matchNumberedModal(tail) ?? matchYesNoModal(tail) ?? matchSliderModal(tail)
-    ?? (opts.paneWorking ? null : matchUnparsableModal(tail, opts.watchdogArmed));
+    ?? (quiet ? matchUnnumberedModal(tail) : null)
+    ?? (quiet ? matchUnparsableModal(tail, opts.watchdogArmed) : null);
 }
 
 /**
@@ -5844,29 +6020,39 @@ function matchSlashConfirmModal(tail: string, kind: "model" | "effort"): ScrapeM
 
 /**
  * Pure predicate: does this pane tail show a modal the scraper would
- * register a card for? Mirrors the matcher union `scrapeOnce` tries — same
- * order, same `paneWorking` gate on the footer arm — but is deliberately NOT
- * a full replica of `scrapeOnce`'s gate (docs/plans/model-effort-local-
- * command-turns.md §10):
+ * register a card for? Used by `queuePaste`'s modal guard (see
+ * `capturePastePane` / `PASTE_MODAL_GRACE_MS`) to decide whether a pending
+ * paste would land IN a live modal instead of claude's composer — pasting
+ * text into a modal confirms whatever the cursor happens to be on (or is
+ * silently swallowed), neither of which is "deliver this as the next chat
+ * message." Naming mirrors `paneShowsClaudeWorking` / `paneShowsIdleInputBox`:
+ * a pane-state question, not an action.
  *
- *   - `matchNumberedModal(tail) ?? matchYesNoModal(tail) ?? matchSliderModal(tail)`
- *     non-null — a numbered / yes-no / slider modal is on screen.
- *   - `detectAskModal(tail) === "question"` — a live AskUserQuestion
- *     question screen (the OTHER kind, `"review"`, is deliberately excluded
- *     here, mirroring `scrapeOnce`'s own `askOnPane` gate: a review screen's
- *     `❯ 1. Submit answers` / `2. Cancel` already satisfies the numbered-modal
- *     arm above, so this function would already have returned `true` for it
- *     via that arm regardless).
- *   - the FOOTER arm of `matchUnparsableModal(tail, false)` (watchdogArmed
- *     forced `false` — this function has no `SessionState` to compute
- *     `stuckTurnFallbackArmed` from, and doesn't need one: the watchdog arm
- *     exists to catch a turn that's been silently stuck for 60s+, a
- *     different question from "is a modal drawn on the pane right now"),
- *     but ONLY when `!paneShowsClaudeWorking(tail)` — mirroring `scrapeOnce`'s
- *     own `paneWorking ? null : matchUnparsableModal(...)` gate on that same
- *     arm. Without it, a long-running tool call's own footer-ish output
- *     (`esc to cancel`, a busy spinner's chrome) could false-fire the guard
- *     while claude is plainly still working, not blocked on a modal.
+ * Built directly on the shared `pickScrapeMatch` chain (docs/plans/model-
+ * effort-local-command-turns.md §10 re-review finding #10), so the precedence
+ * is the SAME code the runtime scraper and the boot poller use. This function
+ * had drifted into a THIRD hand-copy of that chain (alongside `scrapeOnce`
+ * and the boot poller), which is exactly the kind of duplication that let one
+ * copy silently fall behind — including the footer arm of
+ * `matchUnparsableModal`, which is now reached through `pickScrapeMatch`'s
+ * working gate rather than a separately written `!paneShowsClaudeWorking`
+ * check here.
+ *
+ * It passes `watchdogArmed: false` deliberately: this predicate has no
+ * `SessionState` to compute `stuckTurnFallbackArmed` from, and doesn't need
+ * one — the watchdog arm exists to catch a turn that's been silently stuck
+ * for 60s+, a different question from "is a modal drawn on the pane right
+ * now". So only `matchUnparsableModal`'s FOOTER arm can fire here, and only
+ * while the pane is not working. Without the working gate, a long-running
+ * tool call's own footer-ish output (`esc to cancel`, a busy spinner's
+ * chrome) could false-fire the guard while claude is plainly still working,
+ * not blocked on a modal.
+ *
+ * The `detectAskModal(tail) === "question"` check stays separate — it's not
+ * part of `pickScrapeMatch` (see below for why the `"review"` kind is
+ * deliberately excluded here): a review screen's `❯ 1. Submit answers` /
+ * `2. Cancel` already satisfies the numbered-modal arm above, so this function
+ * would already have returned `true` for it via that arm regardless.
  *
  * Two things this function deliberately does NOT replicate from
  * `scrapeOnce`'s full gate, and why that's fine for THIS caller:
@@ -5887,29 +6073,20 @@ function matchSlashConfirmModal(tail: string, kind: "model" | "effort"): ScrapeM
  *     withhold self-heals the moment the caller resends (or the guard's own
  *     next poll tick sees the pane clear); an under-strict, single-tick
  *     over-fire here costs a retry, not a wrong action.
- *
- * Used by `queuePaste`'s modal guard (see `capturePastePane` /
- * `PASTE_MODAL_GRACE_MS`) to decide whether a pending paste would land IN a
- * live modal instead of claude's composer — pasting text into a modal
- * confirms whatever the cursor happens to be on (or is silently swallowed),
- * neither of which is "deliver this as the next chat message." Naming
- * mirrors `paneShowsClaudeWorking` / `paneShowsIdleInputBox`: a pane-state
- * question, not an action.
- *
- * Built directly on the shared `pickScrapeMatch` chain (docs/plans/model-
- * effort-local-command-turns.md §10 re-review finding #10) rather than
- * re-listing `matchNumberedModal ?? matchYesNoModal ?? matchSliderModal` and
- * the `paneWorking`-gated `matchUnparsableModal` fallback by hand — this
- * function had drifted into a THIRD hand-copy of that same chain (alongside
- * `scrapeOnce` and the boot poller), which is exactly the kind of duplication
- * that lets one copy silently fall behind when the chain's precedence or
- * gating changes. The `detectAskModal(tail) === "question"` check stays
- * separate — it's not part of `pickScrapeMatch` (see the doc above for why
- * the `"review"` kind is deliberately excluded here).
  */
 function paneShowsBlockingPrompt(tail: string): boolean {
   if (detectAskModal(tail) === "question") return true;
-  return pickScrapeMatch(tail, { paneWorking: paneShowsClaudeWorking(tail), watchdogArmed: false }) !== null;
+  // `paneIdle` is deliberately OFF here: the modal guard keeps its pre-#298
+  // behavior (working chrome is the only quiet signal it consults). The idle
+  // gate belongs to card registration; here it would change paste withholding
+  // for a pane that merely quotes a menu, which is a separate concern. A
+  // false positive only ever withholds a paste, and the guard's next poll
+  // self-heals.
+  return pickScrapeMatch(tail, {
+    paneWorking: paneShowsClaudeWorking(tail),
+    paneIdle: false,
+    watchdogArmed: false,
+  }) !== null;
 }
 
 /**
@@ -6038,7 +6215,7 @@ export function matchStartupConsentDialog(pane: string): StartupDialogMatch | nu
   const modal =
     numbered && numbered.cursorIndex !== undefined
       ? { choices: numbered.choices, cursorIndex: numbered.cursorIndex, fingerprint: numbered.fingerprint }
-      : parseUnnumberedConsentChoices(pane);
+      : parseUnnumberedChoices(pane);
   if (!modal) return null;
   const acceptIndex = modal.choices.findIndex((c) => dialog.affirmative.test(c.label));
   if (acceptIndex < 0) return null;
@@ -6052,21 +6229,45 @@ export function matchStartupConsentDialog(pane: string): StartupDialogMatch | nu
 }
 
 /**
- * Pure: parse an UNNUMBERED choice list (claude 2.1.284's workspace-trust
- * dialog) anchored on the dialog's `Enter to confirm` footer. Walks upward
- * from the footer (skipping blank rows between it and the list), collecting
- * contiguous choice rows — a `❯`/`›` cursor row or a row indented 2+ spaces —
- * and stopping at the first row that is neither. Requires at least two choices
- * and exactly one cursor row. Choices get 1-based keys like the numbered path
- * so the fingerprint/label plumbing stays identical.
+ * Pure: parse an UNNUMBERED choice list anchored on the dialog's
+ * `Enter to confirm` footer (matched case-insensitively, like
+ * `matchUnnumberedModal`'s footer gate). Serves BOTH the claude 2.1.284
+ * workspace-trust dialog (via `matchStartupConsentDialog`) and the generic
+ * footer-terminated unnumbered menu (via `matchUnnumberedModal`, issue #298's
+ * Chrome prompt).
+ * Walks upward from the footer (skipping blank rows between it and the list),
+ * collecting contiguous choice rows — a `❯`/`›` cursor row or a row indented
+ * 2+ spaces — and stopping at the first row that is neither. Requires at
+ * least two choices and exactly one cursor row. Choices get 1-based keys like
+ * the numbered path so the fingerprint/label plumbing stays identical.
+ * `firstRowAt` is the raw line index (into `pane.split("\n")`) of the top
+ * choice row, so a caller can show the dialog text above the menu
+ * (`unnumberedPreview`).
+ *
+ * Deliberately shape-only: it does NOT know whether the widget is live at the
+ * bottom of the pane, nor which widget family a row belongs to. Every caller
+ * layers those gates on top (`matchStartupConsentDialog` its marker;
+ * `matchUnnumberedModal` the last-3-non-blank footer, the row-family guards,
+ * and the row cap), because the parser alone also reads a transcript that
+ * quotes such a menu.
+ *
+ * Wrapped labels: an Ink select draws every option label at the SAME column
+ * (the cursor glyph replaces the leading indent, so `❯ label` and
+ * `  label` share the label column). A 2+-space-indented row whose label
+ * starts deeper is a wrap continuation of the option above, NOT another
+ * option — counting it would add a phantom choice and shift the arrow
+ * indices `dismissTmuxPrompt` drives. Plain `capture-pane` text has no style
+ * bit that would let us join it unambiguously, so any mixed label columns
+ * make the whole menu unparsable: callers fall back to the safe unparsable
+ * card instead of presenting a wrong list.
  */
-function parseUnnumberedConsentChoices(
+function parseUnnumberedChoices(
   pane: string,
-): { choices: TmuxPromptChoice[]; cursorIndex: number; fingerprint: string } | null {
+): { choices: TmuxPromptChoice[]; cursorIndex: number; fingerprint: string; firstRowAt: number } | null {
   const lines = pane.split("\n");
   let footerAt = -1;
   for (let i = lines.length - 1; i >= 0; i--) {
-    if (/Enter to confirm/.test(lines[i]!)) {
+    if (/enter to confirm/i.test(lines[i]!)) {
       footerAt = i;
       break;
     }
@@ -6074,29 +6275,37 @@ function parseUnnumberedConsentChoices(
   if (footerAt < 0) return null;
   let i = footerAt - 1;
   while (i >= 0 && lines[i]!.trim() === "") i--;
-  const rows: Array<{ label: string; cursor: boolean }> = [];
+  const rows: Array<{ label: string; cursor: boolean; column: number }> = [];
+  let firstRowAt = -1;
   for (; i >= 0; i--) {
     const raw = lines[i]!;
     const cur = raw.match(/^\s*[❯›]\s+(\S.*?)\s*$/);
     if (cur) {
-      rows.unshift({ label: cur[1]!, cursor: true });
+      rows.unshift({ label: cur[1]!, cursor: true, column: raw.indexOf(cur[1]!) });
+      firstRowAt = i;
       continue;
     }
     const plain = raw.match(/^\s{2,}(\S.*?)\s*$/);
     if (plain) {
-      rows.unshift({ label: plain[1]!, cursor: false });
+      rows.unshift({ label: plain[1]!, cursor: false, column: raw.indexOf(plain[1]!) });
+      firstRowAt = i;
       continue;
     }
     break;
   }
   if (rows.length < 2) return null;
   if (rows.filter((r) => r.cursor).length !== 1) return null;
+  // All option labels must share the cursor row's label column; a deeper row
+  // is a wrapped continuation (see the doc above), and an ambiguous list is
+  // not offered to the user at all.
+  const labelColumn = rows.find((r) => r.cursor)!.column;
+  if (rows.some((r) => r.column !== labelColumn)) return null;
   const cursorIndex = rows.findIndex((r) => r.cursor);
   const choices: TmuxPromptChoice[] = rows.map((r, idx) => ({ key: String(idx + 1), label: r.label }));
   const fingerprint = sha1(
     `unnumbered:${choices.map((c) => `${c.key}|${c.label}`).join("/")}|@${cursorIndex}`,
   );
-  return { choices, cursorIndex, fingerprint };
+  return { choices, cursorIndex, fingerprint, firstRowAt };
 }
 
 /**
@@ -7423,8 +7632,10 @@ async function scrapeOnce(state: SessionState): Promise<void> {
   const paneWorking = sessionPaneWorking(state, tail);
   // Claude idle at its own input box (see `paneShowsIdleInputBox`) is proof a
   // turn is over even when no `end_turn` JSONL line ever confirmed it — used
-  // below to keep the watchdog arm from carding an idle pane, and to drive
-  // the idle-settle net that closes such a turn out instead.
+  // below to gate BOTH trailing arms of `pickScrapeMatch` (the unnumbered menu
+  // and the unparsable fallback: a quoted menu must not card), to keep the
+  // watchdog arm from carding an idle pane, and to drive the idle-settle net
+  // that closes such a turn out instead.
   const paneIdle = paneShowsIdleInputBox(tail, styledTail);
   // Claude's background-sessions view (Left on an empty composer) is
   // navigation, not a prompt — never a card. See the return net below.
@@ -7450,6 +7661,7 @@ async function scrapeOnce(state: SessionState): Promise<void> {
     ? null
     : pickScrapeMatch(tail, {
         paneWorking,
+        paneIdle,
         watchdogArmed: stuckTurnFallbackArmed({
           turnInFlight: turnInFlight(state),
           lastJsonlAppendAt: state.lastJsonlAppendAt,
@@ -7620,6 +7832,7 @@ async function scrapeOnce(state: SessionState): Promise<void> {
     fingerprint: match.fingerprint,
     unparsable: match.unparsable,
     confirmKey: match.confirmKey,
+    hideKeys: match.hideKeys,
   });
 }
 
@@ -9036,8 +9249,17 @@ export async function spawnClaudeViaTmux(opts: ClaudeLaunchOptions): Promise<Spa
           // the `MODAL_NOTICE_RE` auto-continue veto lives inside
           // `matchUnparsableModal` itself, so it already applies here too.
           // `pickScrapeMatch` (finding #9) is the SAME chain the runtime
-          // scraper uses, with `watchdogArmed: false` — see its own doc.
-          const generic = pickScrapeMatch(tail, { paneWorking: paneShowsClaudeWorking(tail), watchdogArmed: false });
+          // scraper uses, with `watchdogArmed: false` — see its own doc. Both
+          // gates are computed here as the runtime scraper computes them: a
+          // startup wizard has no working chrome and no idle composer, so it
+          // still surfaces, while a pane that has settled at claude's input
+          // box (or is streaming) never turns a quoted menu into a card.
+          const paneWorking = paneShowsClaudeWorking(tail);
+          const generic = pickScrapeMatch(tail, {
+            paneWorking,
+            paneIdle: paneShowsIdleInputBox(tail),
+            watchdogArmed: false,
+          });
           if (!generic) { lastGenericFingerprint = null; continue; }
           // External dismissal: a previously surfaced startup prompt whose
           // content no longer matches the pane (user answered it from a real
@@ -9075,6 +9297,7 @@ export async function spawnClaudeViaTmux(opts: ClaudeLaunchOptions): Promise<Spa
             fingerprint: generic.fingerprint,
             unparsable: generic.unparsable,
             confirmKey: generic.confirmKey,
+            hideKeys: generic.hideKeys,
           });
           sawStartupPromptThisWindow = true;
           opts.onChunk("status", "claude is asking a question on startup — answer it to continue");
@@ -10770,6 +10993,13 @@ export const __forTest = {
   SLIDER_TRACK_RE,
   SLIDER_TRACK_MIN_CHARS,
   SLIDER_FOOTER_RE,
+  /** The generic footer-terminated UNNUMBERED menu matcher (issue #298's
+   *  Chrome startup prompt) plus its row cap — exposed so the reconstructed
+   *  2.1.322 pane, the older numbered pane, the slider pane, and the full
+   *  negative truth table can be asserted without a live tmux pane. */
+  matchUnnumberedModal,
+  UNNUMBERED_MAX_CHOICE_ROWS,
+  UNNUMBERED_PREVIEW_CONTEXT_LINES,
   /** Fallback matcher for prompts no real matcher parsed, plus its pure
    *  watchdog-arm decision and tuning constants — exposed so the scraper
    *  test suite can assert footer/watchdog firing and non-firing without a
@@ -11134,10 +11364,11 @@ export const __forTest = {
    *  recency requirement layered on at the call site) is unit-testable
    *  without a live tmux pane. */
   idleSettleTick,
-  /** The matcher-chain union shared by `scrapeOnce` and the boot poller —
-   *  exposed so the numbered > yes-no > slider > unparsable precedence (and
-   *  the `paneWorking` gate on the last arm) is unit-testable directly,
-   *  without duplicating it against each call site separately. */
+  /** The matcher-chain union shared by `scrapeOnce`, the boot poller and
+   *  `paneShowsBlockingPrompt` — exposed so the numbered > yes-no > slider >
+   *  unnumbered > unparsable precedence (and the `paneWorking`/`paneIdle`
+   *  gates on the two trailing arms) is unit-testable directly, without
+   *  duplicating it against each call site separately. */
   pickScrapeMatch,
   /** Compiled-once `esc to interrupt` matcher shared by `paneShowsIdleInputBox`
    *  and `paneShowsComposerText` — exposed for tests that want to assert
