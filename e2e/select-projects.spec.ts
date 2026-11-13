@@ -39,7 +39,16 @@ import { uniqueRepoSlugs } from "../src/shared/multi-repo.ts";
  *  g. a submit keeps the selection and its refs while the branch name resets;
  *  h. a plain non-git folder alone with Isolate off creates with
  *     `workdir` + `isolation:"none"` (never a `repositories[]` payload);
- *  i. with no project registered the form cannot create a task.
+ *  i. with no project registered the form cannot create a task;
+ *  j. Cancel discards the dialog's draft and reopening reseeds from the saved
+ *     selection;
+ *  k. unchecking and re-checking a project inside one dialog keeps its base
+ *     ref (the opening entry's root/ref are restored, not rebuilt empty);
+ *  l. each project's own Pull and Fetch act on that project's checkout, not
+ *     on the first selected one;
+ *  m. while a Save's git-root lookup is in flight the draft controls are
+ *     disabled (a late edit cannot overwrite the resolved snapshot);
+ *  n. Add folder opens at the current selection and selects what it adds.
  *
  * Non-current branch names are mandatory: a picker wired to nothing still
  * shows the current branch, so only a different ref proves the row reaches the
@@ -142,6 +151,63 @@ async function awaitTask(
 
 const slugFor = (projectPath: string): string => uniqueRepoSlugs([projectPath])[0]!;
 
+/** The webview and the per-worker API are different origins, so a routed
+ *  answer must carry the preflight/permissive headers the real core sends. */
+const CORS_HEADERS = {
+  "access-control-allow-origin": "*",
+  "access-control-allow-headers": "*",
+  "access-control-allow-methods": "GET, POST, PUT, PATCH, DELETE, OPTIONS",
+};
+
+/** Holds every request whose pathname is `pathname` until `release()` runs. */
+async function holdRequests(
+  page: Page,
+  pathname: string,
+): Promise<{ release: () => void; seen: () => number }> {
+  let release!: () => void;
+  const gate = new Promise<void>((resolve) => (release = resolve));
+  let count = 0;
+  await page.route(
+    (url) => url.pathname === pathname,
+    async (route) => {
+      count += 1;
+      await gate;
+      await route.continue();
+    },
+  );
+  return { release, seen: () => count };
+}
+
+/** Answers the native folder panel (headless 501 in a real e2e backend) with
+ *  `projectPath` and records the request body, so the starting folder and the
+ *  add+select behavior are both observable. */
+async function stubPick(
+  page: Page,
+  projectPath: string,
+  name: string,
+): Promise<() => { startingFolder?: string } | null> {
+  let body: { startingFolder?: string } | null = null;
+  await page.route(
+    (url) => url.pathname === "/projects/pick",
+    async (route) => {
+      if (route.request().method() === "OPTIONS") {
+        await route.fulfill({ status: 204, headers: CORS_HEADERS });
+        return;
+      }
+      body = route.request().postDataJSON() as { startingFolder?: string } | null;
+      await route.fulfill({
+        status: 200,
+        headers: CORS_HEADERS,
+        contentType: "application/json",
+        body: JSON.stringify({
+          project: { path: projectPath, name, addedAt: Date.now(), branchConfig: null },
+        }),
+      });
+    },
+  );
+  return () => body;
+}
+
 test.beforeAll(async ({ request, backend }) => {
   repoA = await initRepo("a");
   repoB = await initRepo("b");
@@ -149,6 +215,14 @@ test.beforeAll(async ({ request, backend }) => {
   git(repoB, ["branch", BRANCH]);
   branchShaA = git(repoA, ["rev-parse", BRANCH]);
   branchShaB = git(repoB, ["rev-parse", BRANCH]);
+
+  // repoB gets a real upstream so its inline row's Pull button is enabled:
+  // Pull only makes sense for a local branch tracking a remote. The push
+  // doesn't move main, so every `branchShaB` assertion above stays exact.
+  const origin = await mkdtemp(path.join(tmpdir(), "agetor-e2e-select-origin-"));
+  git(origin, ["init", "-q", "--bare"]);
+  git(repoB, ["remote", "add", "origin", origin]);
+  git(repoB, ["push", "-q", "-u", "origin", "main"]);
 
   // A subdirectory of repoA, registered as its own project — it must dedupe
   // onto repoA's git root.
@@ -245,6 +319,60 @@ test("two projects: count label, forced Isolate, per-project refs in repositorie
   expect(created.isolation).toBe("worktree");
   expect(created.repositories.map((r) => r.path)).toEqual([repoA, repoB]);
   expect(created.repositories.map((r) => r.baseRef)).toEqual([branchShaA, branchShaB]);
+});
+
+test("unchecking and rechecking a project inside one dialog keeps its base ref", async ({ page, request, backend }) => {
+  await gotoApp(page, backend.bootBase);
+  const form = newTaskForm(page);
+  await form.getByPlaceholder("Short description").fill("select-projects recheck ref");
+  await form.getByTestId("prompt-textarea").fill("the pinned ref must survive a recheck");
+
+  await chooseProjects(page, form, [repoA, repoB]);
+  // Pin a NON-current ref on B's inline row. If the recheck rebuilt the draft
+  // entry as a bare `{ path, root: null }` the ref would be gone by Save.
+  await selectBaseBranch(page, form, slugFor(repoB), BRANCH);
+  await expect(branchRow(form, slugFor(repoB))).toContainText(BRANCH);
+
+  const dialog = await openSelectProjects(page, form);
+  const b = dialog.getByLabel(`Select ${repoB}`, { exact: true });
+  await b.uncheck();
+  await expect(b).not.toBeChecked();
+  await b.check();
+  await expect(b).toBeChecked();
+  await dialog.getByRole("button", { name: "Save", exact: true }).click();
+  await expect(dialog).toBeHidden({ timeout: CONVERGE_TIMEOUT });
+
+  await expect(form.getByTestId("select-projects-button")).toContainText("2 projects selected");
+  await expect(branchRow(form, slugFor(repoB))).toContainText(BRANCH);
+
+  await form.getByRole("button", { name: "Run task", exact: true }).click();
+  const created = await awaitTask(request, backend, "select-projects recheck ref");
+  expect(created.repositories.map((r) => r.path)).toEqual([repoA, repoB]);
+  expect(created.repositories.find((r) => r.path === repoB)?.baseRef).toBe(branchShaB);
+});
+
+test("each project's Pull and Fetch act on that project's own checkout", async ({ page, backend }) => {
+  await gotoApp(page, backend.bootBase);
+  const form = newTaskForm(page);
+  await chooseProjects(page, form, [repoA, repoB]);
+
+  const rowB = branchRow(form, slugFor(repoB));
+  // Both rows auto-select their own current branch, so B's Pull is enabled
+  // (its `main` tracks origin/main) and its actions carry B's path.
+  const pullB = rowB.getByRole("button", { name: "Pull", exact: true });
+  await expect(pullB).toBeEnabled({ timeout: CONVERGE_TIMEOUT });
+
+  const fetchRequest = page.waitForRequest(
+    (r) => r.method() === "POST" && new URL(r.url()).pathname === "/projects/fetch",
+  );
+  await rowB.getByRole("button", { name: "Fetch", exact: true }).click();
+  expect((await fetchRequest).postDataJSON()).toEqual({ path: repoB });
+
+  const pullRequest = page.waitForRequest(
+    (r) => r.method() === "POST" && new URL(r.url()).pathname === "/projects/pull",
+  );
+  await pullB.click();
+  expect((await pullRequest).postDataJSON()).toEqual({ path: repoB, branch: "main" });
 });
 
 test("unchecking Isolate, going multi, then collapsing keeps it checked", async ({ page, backend }) => {
@@ -351,6 +479,31 @@ test("outside clicks leave the dialog open; Escape and Cancel close it", async (
   await expect(selectProjectsDialog(page)).toBeHidden();
 });
 
+test("Cancel discards the draft and reopening reseeds from the saved selection", async ({ page, backend }) => {
+  await gotoApp(page, backend.bootBase);
+  const form = newTaskForm(page);
+  await chooseProjects(page, form, [repoA]);
+  await expect(form.getByTestId("select-projects-button")).toContainText(path.basename(repoA));
+
+  // A check inside the dialog is a draft: only Save applies it.
+  const dialog = await openSelectProjects(page, form);
+  await dialog.getByLabel(`Select ${repoB}`, { exact: true }).check();
+  await expect(dialog.getByLabel(`Select ${repoB}`, { exact: true })).toBeChecked();
+  await dialog.getByRole("button", { name: "Cancel", exact: true }).click();
+  await expect(dialog).toBeHidden();
+
+  await expect(form.getByTestId("select-projects-button")).toContainText(path.basename(repoA));
+  await expect(form.getByTestId("select-projects-button")).not.toContainText("projects selected");
+  await expect(form.locator('[data-testid^="branch-row-"]')).toHaveCount(1);
+
+  // Reopening reseeds from the saved value, not the abandoned draft.
+  const reopened = await openSelectProjects(page, form);
+  await expect(reopened.getByLabel(`Select ${repoA}`, { exact: true })).toBeChecked();
+  await expect(reopened.getByLabel(`Select ${repoB}`, { exact: true })).not.toBeChecked();
+  await reopened.getByRole("button", { name: "Cancel", exact: true }).click();
+  await expect(reopened).toBeHidden();
+});
+
 test("search filters project rows", async ({ page, backend }) => {
   await gotoApp(page, backend.bootBase);
   const form = newTaskForm(page);
@@ -362,6 +515,28 @@ test("search filters project rows", async ({ page, backend }) => {
   await search.fill(path.basename(repoB));
   await expect(dialog.getByLabel(`Select ${repoB}`, { exact: true })).toBeVisible();
   await expect(dialog.getByLabel(`Select ${repoA}`, { exact: true })).toBeHidden();
+});
+
+test("Add folder opens at the current selection and selects what it adds", async ({ page, request, freshBackend }) => {
+  const base = await initRepo("add-folder-base");
+  const added = await initRepo("add-folder-added");
+  await registerProject(request, freshBackend, base, "add-folder-base");
+  await gotoApp(page, freshBackend.bootBase);
+  const form = newTaskForm(page);
+  await chooseProjects(page, form, [base]);
+  const dialog = await openSelectProjects(page, form);
+
+  const pickedBody = await stubPick(page, added, "add-folder-added");
+  await dialog.getByRole("button", { name: "Add folder", exact: true }).click();
+  // The native panel starts where the selection already is (the retired
+  // single-project picker's behavior), not at the home directory.
+  await expect.poll(pickedBody, { timeout: CONVERGE_TIMEOUT }).toEqual({ startingFolder: base });
+  // Adding a folder also selects it, and the Save then includes both.
+  await expect(dialog.getByLabel(`Select ${added}`, { exact: true })).toBeChecked();
+  await dialog.getByRole("button", { name: "Save", exact: true }).click();
+  await expect(dialog).toBeHidden({ timeout: CONVERGE_TIMEOUT });
+  await expect(form.getByTestId("select-projects-button")).toContainText("2 projects selected");
+  await expect(branchRow(form, slugFor(added))).toBeVisible();
 });
 
 test("a zero draft disables Save and shows the hint", async ({ page, backend }) => {
@@ -379,6 +554,40 @@ test("a zero draft disables Save and shows the hint", async ({ page, backend }) 
 
   await expect(dialog.getByText("Select at least one project.")).toBeVisible();
   await expect(dialog.getByRole("button", { name: "Save", exact: true })).toBeDisabled();
+});
+
+test("a Save in flight disables the draft while the git roots resolve", async ({ page, request, freshBackend }) => {
+  // A fresh backend whose projects were never selected before: their roots
+  // are still unknown, so this Save actually calls /projects/repo-root.
+  const repoX = await initRepo("save-lock-x");
+  const repoY = await initRepo("save-lock-y");
+  await registerProject(request, freshBackend, repoX, "save-lock-x");
+  await registerProject(request, freshBackend, repoY, "save-lock-y");
+  await gotoApp(page, freshBackend.bootBase);
+  const form = newTaskForm(page);
+  const dialog = await openSelectProjects(page, form);
+
+  const boxes = dialog.locator('input[type="checkbox"]');
+  for (let i = (await boxes.count()) - 1; i >= 0; i--) {
+    const box = boxes.nth(i);
+    if (await box.isDisabled()) continue;
+    if (await box.isChecked()) await box.uncheck();
+  }
+  await dialog.getByLabel(`Select ${repoX}`, { exact: true }).check();
+
+  const gate = await holdRequests(page, "/projects/repo-root");
+  const save = dialog.getByRole("button", { name: "Save", exact: true });
+  await save.click();
+  await expect.poll(gate.seen, { timeout: CONVERGE_TIMEOUT }).toBeGreaterThan(0);
+  await expect(save).toBeDisabled();
+  await expect(dialog.getByRole("button", { name: "Add folder", exact: true })).toBeDisabled();
+  await expect(dialog.getByLabel(`Select ${repoX}`, { exact: true })).toBeDisabled();
+  await expect(dialog.getByLabel(`Remove ${repoX}`, { exact: true })).toBeDisabled();
+
+  gate.release();
+  await expect(dialog).toBeHidden({ timeout: CONVERGE_TIMEOUT });
+  await expect(form.getByTestId("select-projects-button")).toContainText(path.basename(repoX));
+  await expect(form.locator('[data-testid^="branch-row-"]')).toHaveCount(1);
 });
 
 test("a submit keeps the selection and refs and resets the branch name", async ({ page, backend }) => {

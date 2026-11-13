@@ -1378,4 +1378,40 @@ test.describe("task from a Git issue", () => {
     await expect(issueTaskDialog).toBeHidden({ timeout: CONVERGE_TIMEOUT });
     await expect(page.getByTestId("pipelines-page")).toBeVisible({ timeout: CONVERGE_TIMEOUT });
   });
+
+  test("pipeline picker: a user-picked base ref counts as a dirty draft", async ({ page, backend }) => {
+    test.setTimeout(90_000);
+    await gotoApp(page, backend.bootBase);
+    const issueTaskDialog = await openIssueTaskDialog(page);
+    const worktreeOptions = issueTaskDialog.getByTestId("worktree-options");
+
+    // BranchPicker's automatic "preselect the current branch" seed must not
+    // count as a user edit (covered by the clean case above), but a ref the
+    // user picks themselves must: `setBaseRef` sets `refDirty`, the only
+    // signal that separates the two.
+    const trigger = worktreeOptions.getByTitle(BRANCH_PICKER_TITLE);
+    await expect(trigger).toContainText("main", { timeout: CONVERGE_TIMEOUT });
+    await trigger.click();
+    const search = worktreeOptions.getByPlaceholder("Search branches…");
+    await expect(search).toBeVisible({ timeout: CONVERGE_TIMEOUT });
+    await search.fill("develop");
+    const popover = worktreeOptions.locator("[data-popover-open]");
+    const developRow = popover.locator("button").filter({ hasText: "develop" }).first();
+    await expect(developRow).toBeVisible({ timeout: CONVERGE_TIMEOUT });
+    await developRow.click();
+    await expect(trigger).toContainText("develop", { timeout: CONVERGE_TIMEOUT });
+
+    const manage = await openPipelineManageRow(issueTaskDialog);
+    await manage.click();
+    await expect(page.getByText("Discard this task draft and open Pipelines?")).toBeVisible({
+      timeout: CONVERGE_TIMEOUT,
+    });
+    // Cancel keeps the dialog and the picked ref.
+    const confirmDialog = page
+      .locator('[role="dialog"]')
+      .filter({ has: page.getByText("Discard this task draft and open Pipelines?") });
+    await confirmDialog.getByRole("button", { name: "Cancel", exact: true }).click();
+    await expect(issueTaskDialog).toBeVisible();
+    await expect(trigger).toContainText("develop");
+  });
 });

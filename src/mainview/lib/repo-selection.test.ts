@@ -152,6 +152,16 @@ describe("project selection label", () => {
     ).toBe("a");
   });
 
+  test("the count grows with every distinct project (3+ reads as a count)", () => {
+    expect(
+      projectSelectionLabel([
+        { path: "/r/a", root: "/r/a" },
+        { path: "/r/b", root: "/r/b" },
+        { path: "/r/c", root: "/r/c" },
+      ]),
+    ).toBe("3 projects selected");
+  });
+
   test("unknown roots are never silently collapsed", () => {
     expect(
       projectSelectionLabel([

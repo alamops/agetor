@@ -354,3 +354,18 @@ The re-review of `fd02ea3b` found no blockers; these should-fix items and nits l
 - **Coverage nits closed.** The two-project scenario asserts each row's own Pull and Fetch and that the dialog hosts Add folder / Clone repository / Import sessions; the search scenario asserts initial focus.
 - **README corrected.** Quick start says the most recently added project is preselected (`/projects` is `ORDER BY added_at DESC`), not "the last one you used".
 - **Re-verified on the final tree:** typecheck clean; focused unit 67/67; `e2e/select-projects.spec.ts` 11/11; core-four batch (multi-repo-task, issue-task, resolve-conflicts, identifier-inputs) 35/35 under `retries: 0`.
+
+### 10.3 Test-writer round (2026-11-13)
+
+The write-tests step added coverage for behavior that the implementation rounds had only exercised by hand or left to the dialog's internals:
+
+| Layer | File | Added |
+| --- | --- | --- |
+| unit (new) | `src/mainview/components/kanban/ProjectSelection.test.tsx` | `SelectProjectsButton` label 0/1/2, full-width dialog trigger, explicit `disabled`, and the locked variant (disabled, lock icon, no chevron, PR-repo title). |
+| unit (new) | `src/mainview/components/kanban/WorktreeOptions.test.tsx` | Button-before-Isolate order; zero/one/many-selection renders; `Branch · <project>` rows with `branch-row-<slug>` ids (including basename collisions); forced+disabled Isolate read from `effectiveIsolate` while the raw toggle is still false; isolate-off hides the branch name; the locked PR variant (repo name, read-only branch, checked+disabled Isolate). |
+| unit | `repo-selection.test.ts` | `3 projects selected` count case. |
+| unit | `worktree-payload.test.ts` | `selectionPayload` never mutates the live selection. |
+| e2e | `e2e/select-projects.spec.ts` | (j) Cancel discards the draft and reopening reseeds from the saved selection; (k) uncheck→recheck inside one dialog keeps a project's non-current base ref and it reaches `repositories[].baseRef`; (l) each row's Pull/Fetch POSTs that project's own path (repoB gets a bare origin so Pull is enabled); (m) a Save in flight disables the rows/remove/Add folder until the gated `/projects/repo-root` completes; (n) Add folder opens at the current selection and selects the added project. |
+| e2e | `e2e/issue-task.spec.ts` | A user-picked base ref in the issue dialog's inline row makes the draft dirty (`refDirty`), so “Manage pipelines…” asks before discarding; cancelling keeps the pick. The existing clean-draft case already pins the automatic current-branch seed as *not* dirty. |
+
+**Verification:** `bun run typecheck` clean; focused unit 81/81 across the five files; `e2e/select-projects.spec.ts` 16/16 with `--retries=0`; the new `issue-task` scenario passes on its own. Red proofs (mutation, then restored): slug-labelled rows and a non-disabled locked button each turn the new unit tests red; a hard-coded 2-project label turns the 3+ case red; a collapsed recheck that rebuilds `{path, root:null}`, a row wired to `repos[0]`, a checkbox that ignores `busy`, `pickProject()` without the starting folder, a removed re-seed, and `refDirty` forced to `false` each turn their e2e scenario red. `quality_gates.py hygiene --worktree` → 0 leads.

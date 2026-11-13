@@ -191,4 +191,14 @@ describe("selectionPayload — 2+ projects", () => {
     });
     expect(payload.branch).toBeUndefined();
   });
+
+  test("never mutates the live selection it was handed", () => {
+    const repos = [
+      { path: "/a", root: "/a", baseRef: "  main  " },
+      { path: "/b", root: "/b" },
+    ];
+    const snapshot = JSON.parse(JSON.stringify(repos)) as typeof repos;
+    selectionPayload({ repos, isolate: true, branchSubmitValue: "feature/x" });
+    expect(repos).toEqual(snapshot);
+  });
 });
