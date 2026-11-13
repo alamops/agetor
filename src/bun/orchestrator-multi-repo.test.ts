@@ -920,6 +920,12 @@ test("a retained multi workspace is listed and can be cleaned by a repeat archiv
  * only after every microtask) is enough to see it. The real `archivedAt` is
  * restored before that task's last gate opens, so the real teardown runs.
  */
+/** Each FIFO test creates three repositories, prepares two multi workspaces
+ *  (four `git worktree add`) and tears both down for real. None of its
+ *  ordering depends on time, so a longer limit only absorbs slow git on a
+ *  loaded machine; a deadlock still fails. */
+const FIFO_TEST_TIMEOUT_MS = 30_000;
+
 async function fifoFixture(label: string) {
   const { createTask, archiveTask, tasks } = await load();
   const { prepareTaskWorkdir } = await import("./worktree.ts");
@@ -1037,7 +1043,7 @@ test("multi teardown parks on its FIRST key: holding the shared repository parks
     f.releaseAll();
     cleanup(f.a, f.b, f.c);
   }
-});
+}, FIFO_TEST_TIMEOUT_MS);
 
 test("multi teardown parks on its SECOND key too: each task waits for its non-shared repository", async () => {
   // Companion to the test above: a "first sorted key only" regression passes
@@ -1082,7 +1088,7 @@ test("multi teardown parks on its SECOND key too: each task waits for its non-sh
     f.releaseAll();
     cleanup(f.a, f.b, f.c);
   }
-});
+}, FIFO_TEST_TIMEOUT_MS);
 
 test("archiving a multi task with one dirty repository archives it and keeps that checkout intact", async () => {
   // Contract (docs/architecture/multi-repo-tasks.md, Teardown): archive is per

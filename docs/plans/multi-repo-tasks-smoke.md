@@ -404,7 +404,7 @@ spawn time.
 | codex | codex-cli 0.166.0 | auto / default | yes | succeeded; a commit in each checkout; the session recorded `sandbox_policy: danger-full-access` and `approval_policy: never` (escalated through the verified `codexWorkspaceRepos`); `--add-dir` accepted. A follow-up turn (`POST /runs/:id/input`) resumed, committed `smoke-2` in both and stayed escalated | `agents-codex-workspace-roots.test.ts`, `worktree.test.ts` |
 | fx | 0.0.15 | yolo / deepseek/deepseek-v4-flash | no | succeeded; a commit in each checkout (fx's ACP session accepted the non-git cwd) | argv (`agents.test.ts`) |
 | opencode | v2.1.3 (2.x server driver) | auto / `opencode-go/deepseek-v4.1-flash` (re-run) | no | first attempt (Zen provider `opencode/…`, pay-as-you-go balance empty) was refused with "Insufficient balance", exit 1. Re-run with an OpenCode Go subscription model: succeeded (exit 0) in about 25 s, one `smoke` commit in each checkout; a follow-up turn through the same server session committed `smoke-2` in both; delete removed the workspace and both branches. See "Post-round-15 verification" | — |
-| copilot | 1.0.109 (downloaded from npm for `--help` only; no GitHub Copilot login) | — | yes (argv) | not run live. Confirmed from GitHub Copilot CLI 1.0.109's own `--help` and GitHub's CLI command reference: Auto's `--allow-all` includes `--allow-all-paths` (path verification off), so a commit's writes under the source repository's `.git` are allowed; Read-only/Plan pass no allow flags and deny writes by design. Opt-in real-binary case added, pending a run. See "Post-round-15 verification" | argv (`agents.test.ts`); `copilot-real-binary.test.ts` (opt-in, not yet run) |
+| copilot | 1.0.109 (downloaded from npm for `--help` only; no GitHub Copilot login) | — | yes (argv) | not run live. Confirmed from GitHub Copilot CLI 1.0.109's own `--help` and GitHub's CLI command reference: Auto's `--allow-all` includes `--allow-all-paths` (path verification off), so a commit's writes under the source repository's `.git` are allowed; Read-only/Plan pass no allow flags and deny writes by design. Opt-in real-binary case run 2026-11-12 (real CLI 1.0.109, fake BYOK provider): Auto committed in the checkout, Read-only was denied. See "Post-round-15 verification" | argv (`agents.test.ts`); `copilot-real-binary.test.ts` (opt-in, 11 pass) |
 | cursor | present | — | no | not run (plan-limited account) | argv (`agents.test.ts`) |
 | gemini | not installed | — | no | not run; include-directories not used (plan A6) | — |
 | antigravity (`agy`) | not installed | — | no | not run | — |
@@ -455,13 +455,21 @@ not run.
    Copilot binary through agetor's `buildCommand` + tmux driver against the in-process fake
    OpenAI-compatible provider (BYOK; no GitHub auth, network or billing). Source repositories live
    outside the workspace, the checkouts are passed as `--add-dir`, and `AGETOR_COPILOT_ARGS` adds
-   `--disallow-temp-dir`, so only `--allow-all-paths` can let the commit through. It asserts Auto
+   `--disallow-temp-dir`, so the default temp-dir grant can't admit the commit. It asserts Auto
    commits in `alpha` and Read-only's tool results are all errors with no commit in `beta`, and
    records (does not assert) a control with `--allow-all-tools` but path verification on. The fake
    provider gained a `SHELLCMD<<<cmd>>>` marker
-   (`src/bun/test-support/copilot-fake-provider.ts`) to run an exact shell command. **Added, pending
-   a run**: running the downloaded binary needs the owner's go-ahead. Command (also in "Commands"):
+   (`src/bun/test-support/copilot-fake-provider.ts`) to run an exact shell command. Command (also in
+   "Commands"):
    `AGETOR_COPILOT_REAL_BIN=/path/to/copilot bun test src/bun/copilot-real-binary.test.ts`.
+3. **Run 2026-11-12 by the owner** against the npm-downloaded Copilot CLI 1.0.109: 11 pass, 0 fail
+   (53 s). The multi-repo case: Auto's tool result was `committed-alpha` with no error and
+   `feat-alpha` holds `multi-commit`; Read-only was denied with no commit. The control
+   (`--allow-all-tools`, path verification on) **also committed**: Copilot's path check looks at
+   the paths a command names, not at the writes git makes under the source repository's `.git`,
+   so tool approval is what a multi-repository commit needs and Auto grants it. Point 1's reading
+   (that `--allow-all-paths` is what admits the commit) is superseded; the conclusion (Auto works,
+   Read-only and Plan deny, no code change) stands.
 
 ## Known limitations
 
@@ -472,5 +480,5 @@ workspace and may orphan secondary worktrees (the CLI detects an older core at c
 else does); Gemini's include-directories is not used; a pipeline step's PR stamp stays on the step,
 so the parent's "Create all PRs" can retry that repository and show GitHub's 422; live smoke covered
 claude-code, codex, fx and OpenCode (2.x server, Go subscription model) end to end; copilot was not
-run live (no login; its permission flags were confirmed from the CLI's `--help`, and the opt-in
-real-binary case is pending a run); cursor, gemini, antigravity and harness failover not run.
+run against a GitHub account (no login), but its real binary passed the opt-in multi-repo case with a
+fake provider; cursor, gemini, antigravity and harness failover not run.

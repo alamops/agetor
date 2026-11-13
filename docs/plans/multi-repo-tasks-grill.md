@@ -26,7 +26,7 @@ Confidence is **high** for every row because every row is the owner's direct ans
 | 3 | Isolation | Must a multi-repo task use worktree isolation? | **Yes.** Multi-repo requires `isolation: "worktree"`; `none` stays single-repo. This reverses round 1's `support-none-live`, which contradicted the workspace-root cwd and the accepted create rejection. | owner (round-2/answers.json#isolation-none-final, accepted recommendation; supersedes round-1/answers.json#isolation-none) | high |
 | 4 | Repo set | When may the repository set change? | **Create-only.** The set is fixed at creation; changing it means a new card. This consciously narrows the issue's "creating or editing a card" to creation. **Amended after implementation (owner):** one repository can be removed from an existing multi-repo task; adding one still needs a new card. See "Owner decisions after implementation" below. | owner (round-1/answers.json#repo-set-editing; confirmed in round-2/answers.json#create-only-confirm) | high |
 | 5 | Failure | What happens when one repo's worktree cannot be created at start? | All-or-nothing: validate every repo, create all worktrees, then spawn. On failure remove the worktrees created in that attempt and return an error; the error must list every repo that failed. | owner (round-1/answers.json#partial-failure, accepted recommendation + note) | high |
-| 6 | Harnesses | Which harnesses get multi-repo? | All eight, with a smoke matrix: Claude/Codex/Cursor/fx live-smoked; Gemini/Copilot/Antigravity/OpenCode layout-supported but smoke-pending until accounts exist. **Status (post-implementation):** live smoke run on 2026-11-12: Claude, Codex (first turn and a follow-up, escalated) and fx succeeded end to end; OpenCode 2.x succeeded end to end on a re-run with an OpenCode Go subscription model (the first attempt hit an empty Zen balance), including a follow-up turn; Copilot was not run live (no login), but its Auto flags were confirmed from the CLI's `--help` and an opt-in real-binary case was added, pending a run; Cursor was not run; a harness-stack failover was not run. See "Amendments after implementation" below. | owner (round-1/answers.json#harness-scope, accepted recommendation) | high |
+| 6 | Harnesses | Which harnesses get multi-repo? | All eight, with a smoke matrix: Claude/Codex/Cursor/fx live-smoked; Gemini/Copilot/Antigravity/OpenCode layout-supported but smoke-pending until accounts exist. **Status (post-implementation):** live smoke run on 2026-11-12: Claude, Codex (first turn and a follow-up, escalated) and fx succeeded end to end; OpenCode 2.x succeeded end to end on a re-run with an OpenCode Go subscription model (the first attempt hit an empty Zen balance), including a follow-up turn; Copilot was not run against a GitHub account (no login), but its real CLI 1.0.109 passed an opt-in multi-repo case against a fake provider (Auto commits, Read-only denied); Cursor was not run; a harness-stack failover was not run. See "Amendments after implementation" below. | owner (round-1/answers.json#harness-scope, accepted recommendation) | high |
 | 7 | Prompt | How do the repo directories reach the agent? | A new machine-added `Repositories:` paragraph in the launch prompt. Exact shape in row 20. | owner (round-1/answers.json#prompt-context, override of the references-block recommendation) | high |
 | 8 | Branches | How are branch names and base refs chosen? | One shared branch name across repositories by default; a base ref per repo. If a repo's config/validation/git refuses the shared name, that repo falls back to its own derived name and the dialog shows it. | owner (round-1/answers.json#branch-base; fallback confirmed in round-2/answers.json#same-branch-fallback) | high |
 | 9 | Commit/PR | How do commit/push and PR creation work? | One aggregate commit/push prompt lists every repo and branch and asks for one PR proposal per repo. A single `Create all PRs` action walks the repos with per-repo best effort: one failure does not block the others; results and retries are per repo. | owner (round-1/answers.json#commit-pr; failure policy in round-2/answers.json#aggregate-result) | high |
@@ -80,8 +80,8 @@ Confidence is **high** for every row because every row is the owner's direct ans
 - **No hard cap.** A task with dozens of repositories is allowed. The plan bounds concurrency and
   warns above 10; if the runtime cost is unacceptable, a cap is a small follow-up. Wrong → the
   task may be slow to start, not incorrect.
-- **Uninstalled harnesses are smoke-pending** (OpenCode has since passed live; Copilot's flags were
-  checked against its `--help`, not live). If Gemini/Copilot/Antigravity/OpenCode behave
+- **Uninstalled harnesses are smoke-pending** (OpenCode has since passed live; Copilot's real binary
+  passed the multi-repo case with a fake provider, not against a GitHub account). If Gemini/Copilot/Antigravity/OpenCode behave
   differently under a non-git workspace, the fix is a per-kind follow-up; the workspace layout
   does not change.
 - **Older builds are not guarded.** A multi-repo row shows a non-git workspace to an older build,
@@ -141,10 +141,11 @@ Taken by the owner after the first implementation and review rounds; the shipped
   `COPILOT_ALLOW_ALL=true` and gets the checkouts as `--add-dir`; Read-only and Plan deny writes by
   design. Not run live (no GitHub Copilot login on the smoke machine). Confirmed from Copilot CLI
   1.0.109's own `--help` and GitHub's CLI command reference: `--allow-all` includes
-  `--allow-all-paths` ("Disable file path verification"), which covers a commit's writes under the
-  source repository's `.git`, outside the workspace and every `--add-dir`. An opt-in real-binary case
-  in `src/bun/copilot-real-binary.test.ts` (fake BYOK provider, `--disallow-temp-dir`) was added and
-  is pending a run (ledger: "Post-round-15 verification").
+  `--allow-all-paths` ("Disable file path verification"). An opt-in real-binary case in
+  `src/bun/copilot-real-binary.test.ts` (fake BYOK provider, `--disallow-temp-dir`) ran on
+  2026-11-12: Auto committed in the checkout and Read-only was denied. A control with
+  `--allow-all-tools` and path verification on also committed, so tool approval, not
+  `--allow-all-paths`, is what the commit needs (ledger: "Post-round-15 verification").
 - **Pipeline-step PR stamps stay on the step.** The parent card doesn't show a step's PR, and the
   parent's "Create all PRs" can retry that repository and show GitHub's 422 as a failure: a
   documented limitation, no code change.

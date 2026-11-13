@@ -240,12 +240,13 @@ some CLIs refuse an `--add-dir` that names a missing path.
   source repository's `.git/worktrees` included) and gets every checkout as
   `--add-dir`; Read-only and Plan deny writes by design, in any repository, the
   same as for a single-repository task
-  ([harness-copilot.md](harness-copilot.md)). Copilot CLI 1.0.109's `--help`
-  confirms `--allow-all` includes `--allow-all-paths` (file path verification
-  off), which is what lets a commit write under the source repository's `.git`,
-  outside the workspace and every `--add-dir`. Not run live (no GitHub Copilot
-  login on the smoke machine); the opt-in real-binary case in
-  `src/bun/copilot-real-binary.test.ts` covers it and is pending a run.
+  ([harness-copilot.md](harness-copilot.md)). The opt-in real-binary case in
+  `src/bun/copilot-real-binary.test.ts` ran against Copilot CLI 1.0.109 with a
+  fake provider: Auto committed in a checkout whose `.git` is outside the
+  workspace and every `--add-dir`, and Read-only was denied. A control with
+  `--allow-all-tools` but path verification on committed too, so Copilot's
+  path check doesn't see git's own writes; tool approval is what matters. Not
+  run against a GitHub account (no login on the smoke machine).
 - `codexWorkspaceRepos` pairs each checkout with its source repository for
   codex's sandbox decision. `gitWritableRoots` grants a checkout's git common
   dir only when the checkout is strictly inside the cwd, its toplevel is that
@@ -584,7 +585,7 @@ subdirectory selections under one root are not serialized against each other.)
   Go subscription model, after a first attempt hit an empty Zen balance) ran
   end to end at the non-git workspace directory, committed in each checkout and
   again on a follow-up turn through the same server session. Copilot was not
-  run live (no login; its Auto flags were confirmed from the CLI's `--help`, and
-  an opt-in real-binary case is pending a run), and a harness-stack failover of
+  run against a GitHub account (no login), but its real binary passed the
+  opt-in multi-repo case with a fake provider, and a harness-stack failover of
   a multi task was not run. Cursor, Gemini and Antigravity were not run. Details:
   `docs/plans/multi-repo-tasks-smoke.md` ("Live harness smoke matrix").

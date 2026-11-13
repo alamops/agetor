@@ -164,12 +164,12 @@ coordinate changes across every repository in that card.
   side (prepare, reuse, rollback, diff, status, teardown, removal) against temporary repositories.
 - Copilot (owner decision, no code change): Auto already passes `--allow-all` and
   `COPILOT_ALLOW_ALL=true` and gets the checkouts as `--add-dir`; Read-only and Plan deny writes by
-  design. Not run live (no login). Confirmed from Copilot CLI 1.0.109's own `--help` and GitHub's
-  CLI command reference: `--allow-all` is equivalent to `--allow-all-tools --allow-all-paths
-  --allow-all-urls`, and `--allow-all-paths` disables file path verification, which covers a commit's
-  writes under the source repository's `.git` (outside the workspace and every `--add-dir`). An
-  opt-in real-binary case in `src/bun/copilot-real-binary.test.ts` (real binary, fake BYOK provider,
-  `--disallow-temp-dir`) was added and is pending a run.
+  design. Not run against a GitHub account (no login). An opt-in real-binary case in
+  `src/bun/copilot-real-binary.test.ts` (real Copilot CLI 1.0.109, fake BYOK provider,
+  `--disallow-temp-dir`) ran on 2026-11-12: Auto committed in a checkout whose `.git` is outside the
+  workspace, and Read-only was denied. A control with `--allow-all-tools` and path verification on
+  also committed: Copilot's path check doesn't see git's own writes, so tool approval is what the
+  commit needs, and Auto (`--allow-all`) grants it.
 
 ## Non-goals
 

@@ -234,9 +234,10 @@ suite(`copilot real binary (${binVersion.trim().split("\n")[0] ?? ""})`, () => {
   // `git commit` inside a checkout writes the source repository's `.git`
   // (objects, refs, `.git/worktrees/<id>`), which is outside the cwd and
   // outside every `--add-dir`. Copilot also grants the system temp dir by
-  // default and this scratch lives there, so `--disallow-temp-dir` is added:
-  // only `--allow-all-paths` (part of Auto's `--allow-all`) can then let the
-  // commit through.
+  // default and this scratch lives there, so `--disallow-temp-dir` is added
+  // to keep the temp grant from admitting the commit. Ran 2026-11-12 on CLI
+  // 1.0.109: Auto commits, Read-only is denied, and the control below commits
+  // too, so tool approval (not `--allow-all-paths`) is what the commit needs.
   test("multi-repo workspace: Auto commits in a checkout whose git dir is outside the workspace; Read-only is denied", async () => {
     const git = (cwd: string, ...args: string[]) => {
       const res = Bun.spawnSync(["git", "-c", "user.email=tt8@example.invalid", "-c", "user.name=tt8", ...args], { cwd, stdout: "pipe", stderr: "pipe" });
@@ -287,8 +288,10 @@ suite(`copilot real binary (${binVersion.trim().split("\n")[0] ?? ""})`, () => {
 
       // Control, recorded not asserted: tools allowed but path verification
       // left on (no --allow-all-paths). Shows whether Copilot's path check
-      // alone would stop a commit into the outside `.git` — i.e. whether
-      // Auto's --allow-all-paths is what makes multi-repo commits work.
+      // alone would stop a commit into the outside `.git`. On 1.0.109 it did
+      // not (the control commits): the check doesn't see git's own writes.
+      // Recorded rather than asserted so a CLI that starts blocking it shows
+      // up in the TT8-RECORD output without failing Auto's contract.
       process.env.AGETOR_COPILOT_ARGS = "--disallow-temp-dir --allow-all-tools";
       const ctl = multiWorkspace();
       const c = await runTurn({ prompt: commitIn("alpha"), mode: "ask", home: ctl.home, cwd: ctl.cwd, extraDirectories: ctl.dirs });
