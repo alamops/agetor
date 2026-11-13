@@ -6,6 +6,7 @@ import { randomUUID } from "node:crypto";
 import { SESSION_DIED_STATUS_PREFIX } from "../shared/types.ts";
 import type { LocalSettingInfo } from "./claude-tmux.ts";
 import { registerTmuxPrompt, activeTmuxPromptsForTask } from "./interactions.ts";
+import { fakeBinDir } from "./test-fake-bin-dir.ts";
 
 // Pre-set AGETOR_DATA_DIR before claude-tmux.ts's transitive db.ts import —
 // mirrors claude-tmux-unknown-command.test.ts / claude-tmux-queue.test.ts. A
@@ -208,7 +209,7 @@ const ansiModelStdoutLine = JSON.stringify({
  * both the order and content of tmux calls without a real tmux server.
  */
 function withRecordingTmuxBin<T>(fn: (logPath: string) => Promise<T>): Promise<T> {
-  const dir = mkdtempSync(path.join(tmpdir(), "agetor-tmux-rec-"));
+  const dir = fakeBinDir("agetor-tmux-rec-");
   const binPath = path.join(dir, "tmux");
   const logPath = path.join(dir, "log.jsonl");
   writeFileSync(
@@ -1693,7 +1694,7 @@ test("mirrorModelViaPicker: state.drivingPrompt is true for every confirm-pane p
  * the tmux level (finding #4, wave-5 re-review).
  */
 function withFailingSingleEscapeTmuxBin<T>(fn: (logPath: string) => Promise<T>): Promise<T> {
-  const dir = mkdtempSync(path.join(tmpdir(), "agetor-tmux-failesc-"));
+  const dir = fakeBinDir("agetor-tmux-failesc-");
   const binPath = path.join(dir, "tmux");
   const logPath = path.join(dir, "log.jsonl");
   writeFileSync(
@@ -2840,7 +2841,7 @@ test("markTmuxPromptAnswered resets scrapeIdleSettleStreak (alongside the unpars
  * specifically, leaving the paste itself untouched.
  */
 function withFailingNthEnterTmuxBin<T>(targetOrdinal: number, fn: (logPath: string) => Promise<T>): Promise<T> {
-  const dir = mkdtempSync(path.join(tmpdir(), "agetor-tmux-failn-"));
+  const dir = fakeBinDir("agetor-tmux-failn-");
   const binPath = path.join(dir, "tmux");
   const logPath = path.join(dir, "log.jsonl");
   const counterPath = path.join(dir, "enter-count");
@@ -2956,7 +2957,7 @@ test("sendTurn: opts.onPasteFailure still fires with op 'modal-guard' even when 
  * `send-keys ... Enter` call).
  */
 function withFailingComposerClearTmuxBin<T>(fn: (logPath: string) => Promise<T>): Promise<T> {
-  const dir = mkdtempSync(path.join(tmpdir(), "agetor-tmux-failclear-"));
+  const dir = fakeBinDir("agetor-tmux-failclear-");
   const binPath = path.join(dir, "tmux");
   const logPath = path.join(dir, "log.jsonl");
   const clearTail = COMPOSER_CLEAR_KEYS.join(",");

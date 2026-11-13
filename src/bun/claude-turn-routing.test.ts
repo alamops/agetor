@@ -39,6 +39,90 @@ afterAll(() => {
 });
 
 /**
+ * Wall-clock ceilings for this file. Every helper below POLLS, so a passing
+ * test never waits these out; they only bound how long a broken chain takes
+ * to fail. They are deliberately far above the fast path because each test
+ * here drives a real spawn chain (kill-session → new-session → has-session
+ * polls → load-buffer → paste-buffer → send-keys) through a fake tmux, and
+ * on a loaded host each fork+exec, plus the production poll sleeps between
+ * them, stretches out. The old 4 s ceiling and Bun-script fakes (~2 s per
+ * call at load 60) failed these tests on any busy machine.
+ */
+const CHAIN_WAIT_MS = 20_000;
+/** Per-test timeout: above `CHAIN_WAIT_MS` plus the cleanup wait in each
+ *  test's `finally`, so a slow-but-correct run never trips bun's 5 s default. */
+const CHAIN_TEST_TIMEOUT_MS = 60_000;
+
+/** A Perl single-quoted string literal for `s`. */
+function perlStr(s: string): string {
+  return `'${s.replace(/\\/g, "\\\\").replace(/'/g, "\\'")}'`;
+}
+
+/**
+ * Write an executable fake tmux as a `/usr/bin/perl` script (it ships with
+ * macOS; `JSON::PP`, `Encode` and `Time::HiRes` are core modules). It starts
+ * in ~30 ms even at load 60, where a Bun-script fake took ~2 s per call and
+ * made every spawn chain in this file miss its budget. Each invocation
+ * appends ONE JSON line, `{ argv, stdin? }`, under an exclusive `flock`, so
+ * concurrent pollers never interleave records and `readLog` parses exactly
+ * what the old Bun fakes wrote.
+ *
+ *  - `recordStdin`: drain and record stdin (how `load-buffer -b <buf> -`
+ *    receives the pasted prompt). Only for fakes whose callers never inherit
+ *    a terminal stdin.
+ *  - `hasSession`: `{ fixed: [code, stderr] }` — one verdict for the whole
+ *    test; `"markers"` — real create/kill order via one marker file per
+ *    session name; `{ aliveAfterMs }` — alive, after a synchronous delay.
+ *  - `failLoadBuffer`: `load-buffer` always fails (dead socket mid-paste).
+ *  Everything else exits 0.
+ */
+function writePerlFakeTmux(
+  dir: string,
+  opts: {
+    recordStdin?: boolean;
+    hasSession: { fixed: [number, string] } | "markers" | { aliveAfterMs: number };
+    failLoadBuffer?: boolean;
+  },
+): { bin: string; logPath: string } {
+  const bin = path.join(dir, "tmux");
+  const logPath = path.join(dir, "log.jsonl");
+  const markerDir = path.join(dir, "markers");
+  if (opts.hasSession === "markers") mkdirSync(markerDir, { recursive: true });
+  const hs = opts.hasSession;
+  const hasSessionPerl =
+    hs === "markers"
+      ? `my $n = session_arg(); exit 0 if defined $n && -e "$MARKERS/$n"; print STDERR "can't find session: =" . (defined $n ? $n : "unknown"); exit 1;`
+      : "fixed" in hs
+        ? `print STDERR ${perlStr(hs.fixed[1])}; exit ${hs.fixed[0]};`
+        : `sleep(${hs.aliveAfterMs / 1000}) if ${hs.aliveAfterMs} > 0; exit 0;`;
+  const lines = [
+    "#!/usr/bin/perl",
+    "use strict; use warnings; use JSON::PP; use Encode qw(decode); use Fcntl qw(:flock); use Time::HiRes qw(sleep);",
+    `my $LOG = ${perlStr(logPath)}; my $MARKERS = ${perlStr(markerDir)};`,
+    "my @argv = map { decode('UTF-8', $_) } @ARGV;",
+    "my %rec = (argv => \\@argv);",
+    opts.recordStdin ? "{ local $/; my $in = <STDIN>; $rec{stdin} = decode('UTF-8', defined $in ? $in : ''); }" : "",
+    "{ open(my $fh, '>>', $LOG) or die \"log: $!\"; flock($fh, LOCK_EX); print $fh JSON::PP->new->utf8->canonical->encode(\\%rec), \"\\n\"; close $fh; }",
+    "sub has { my $w = shift; return scalar grep { $_ eq $w } @argv; }",
+    "sub session_arg {",
+    "  for my $i (0 .. $#argv - 1) { return $argv[$i + 1] if $argv[$i] eq '-s'; }",
+    "  for my $i (0 .. $#argv - 1) { if ($argv[$i] eq '-t') { my $v = $argv[$i + 1]; $v =~ s/^=//; return $v; } }",
+    "  return undef;",
+    "}",
+    opts.hasSession === "markers"
+      ? "if (has('new-session')) { my $n = session_arg(); if (defined $n) { open(my $m, '>', \"$MARKERS/$n\"); close $m; } exit 0; }\n" +
+        "if (has('kill-session')) { my $n = session_arg(); unlink \"$MARKERS/$n\" if defined $n; exit 0; }"
+      : "",
+    `if (has('has-session')) { ${hasSessionPerl} }`,
+    opts.failLoadBuffer ? "if (has('load-buffer')) { print STDERR 'no such file or directory'; exit 1; }" : "",
+    "exit 0;",
+  ];
+  writeFileSync(bin, lines.filter((l) => l !== "").join("\n") + "\n");
+  chmodSync(bin, 0o755);
+  return { bin, logPath };
+}
+
+/**
  * Write an executable fake tmux that:
  *  - logs every invocation's full argv (including the leading
  *    `tmuxSocketArgs()` pair, e.g. `-L agetor-test` — irrelevant to these
@@ -51,22 +135,7 @@ afterAll(() => {
  */
 function fakeRoutingTmuxBin(probeCode: number, probeStderr: string): { bin: string; logPath: string } {
   const dir = mkdtempSync(path.join(tmpdir(), "agetor-routing-tmux-"));
-  const bin = path.join(dir, "tmux");
-  const logPath = path.join(dir, "log.jsonl");
-  writeFileSync(
-    bin,
-    `#!${process.execPath}\n` +
-      `import { appendFileSync } from "node:fs";\n` +
-      `const argv = process.argv.slice(2);\n` +
-      `appendFileSync(${JSON.stringify(logPath)}, JSON.stringify({ argv }) + "\\n");\n` +
-      `if (argv.includes("has-session")) {\n` +
-      `  process.stderr.write(${JSON.stringify(probeStderr)});\n` +
-      `  process.exit(${probeCode});\n` +
-      `}\n` +
-      `process.exit(0);\n`,
-  );
-  chmodSync(bin, 0o755);
-  return { bin, logPath };
+  return writePerlFakeTmux(dir, { hasSession: { fixed: [probeCode, probeStderr] } });
 }
 
 function readLog(logPath: string): Array<{ argv: string[]; stdin?: string }> {
@@ -93,7 +162,7 @@ function readLog(logPath: string): Array<{ argv: string[]; stdin?: string }> {
  * never assert a fixed sleep is enough for a fake-tmux spawn chain to
  * settle; either poll for the recorded outcome or use a >=5x margin.
  */
-async function waitForLog(logPath: string, token: string, maxMs = 4000): Promise<Array<{ argv: string[]; stdin?: string }>> {
+async function waitForLog(logPath: string, token: string, maxMs = CHAIN_WAIT_MS): Promise<Array<{ argv: string[]; stdin?: string }>> {
   const deadline = Date.now() + maxMs;
   for (;;) {
     const entries = readLog(logPath);
@@ -104,7 +173,7 @@ async function waitForLog(logPath: string, token: string, maxMs = 4000): Promise
 
 /** General-purpose poll: same rationale as `waitForLog`, for conditions that
  *  aren't a logged tmux invocation (e.g. a run row's status settling). */
-async function waitUntil(check: () => boolean, maxMs = 4000): Promise<boolean> {
+async function waitUntil(check: () => boolean, maxMs = CHAIN_WAIT_MS): Promise<boolean> {
   const deadline = Date.now() + maxMs;
   for (;;) {
     if (check()) return true;
@@ -143,7 +212,7 @@ async function waitForRunStatus(
   runsModule: { events(runId: string): Array<{ stream: string; data: string }> },
   runId: string,
   substr: string,
-  maxMs = 4000,
+  maxMs = CHAIN_WAIT_MS,
 ): Promise<boolean> {
   const deadline = Date.now() + maxMs;
   for (;;) {
@@ -179,47 +248,7 @@ async function waitForRunStatus(
  */
 function fakeDeferredPasteTmuxBin(): { bin: string; logPath: string } {
   const dir = mkdtempSync(path.join(tmpdir(), "agetor-deferred-tmux-"));
-  const bin = path.join(dir, "tmux");
-  const logPath = path.join(dir, "log.jsonl");
-  const markerDir = path.join(dir, "markers");
-  mkdirSync(markerDir, { recursive: true });
-  writeFileSync(
-    bin,
-    `#!${process.execPath}\n` +
-      `import { appendFileSync, existsSync, readFileSync, rmSync, writeFileSync } from "node:fs";\n` +
-      `import path from "node:path";\n` +
-      `const argv = process.argv.slice(2);\n` +
-      `let stdin = "";\n` +
-      `try { stdin = readFileSync(0, "utf8"); } catch {}\n` +
-      `appendFileSync(${JSON.stringify(logPath)}, JSON.stringify({ argv, stdin }) + "\\n");\n` +
-      `function sessionArg() {\n` +
-      `  const sIdx = argv.indexOf("-s");\n` +
-      `  if (sIdx !== -1) return argv[sIdx + 1];\n` +
-      `  const tIdx = argv.indexOf("-t");\n` +
-      `  if (tIdx !== -1) { let v = argv[tIdx + 1]; if (v && v.startsWith("=")) v = v.slice(1); return v; }\n` +
-      `  return null;\n` +
-      `}\n` +
-      `const markerDir = ${JSON.stringify(markerDir)};\n` +
-      `if (argv.includes("new-session")) {\n` +
-      `  const name = sessionArg();\n` +
-      `  if (name) writeFileSync(path.join(markerDir, name), "1");\n` +
-      `  process.exit(0);\n` +
-      `}\n` +
-      `if (argv.includes("kill-session")) {\n` +
-      `  const name = sessionArg();\n` +
-      `  if (name) { try { rmSync(path.join(markerDir, name)); } catch {} }\n` +
-      `  process.exit(0);\n` +
-      `}\n` +
-      `if (argv.includes("has-session")) {\n` +
-      `  const name = sessionArg();\n` +
-      `  if (name && existsSync(path.join(markerDir, name))) process.exit(0);\n` +
-      `  process.stderr.write("can't find session: =" + (name ?? "unknown"));\n` +
-      `  process.exit(1);\n` +
-      `}\n` +
-      `process.exit(0);\n`,
-  );
-  chmodSync(bin, 0o755);
-  return { bin, logPath };
+  return writePerlFakeTmux(dir, { recordStdin: true, hasSession: "markers" });
 }
 
 test("a transient/unreachable tmux probe routes a follow-up through the existing-session path, never the resume pre-kill", async () => {
@@ -312,7 +341,7 @@ test("a transient/unreachable tmux probe routes a follow-up through the existing
     __forTest.setBracketedEnterGapMs(prevGap);
     __forTest.setSlashCommandSettleMs(prevSettle);
   }
-});
+}, CHAIN_TEST_TIMEOUT_MS);
 
 test("an unambiguous 'gone' probe routes a follow-up through the resume path (kill-session then new-session, in order)", async () => {
   // Fake bin: has-session fails with tmux's unambiguous "session not found"
@@ -407,7 +436,11 @@ test("an unambiguous 'gone' probe routes a follow-up through the resume path (ki
     expect(result.delivered).toBe(true);
     const newRunId = result.delivered ? result.runId : undefined;
 
-    const entries = readLog(logPath);
+    // `sendInput` waits at most SPAWN_RESPONSE_BUDGET_MS for the spawn and
+    // then answers `pending` while it continues (docs/architecture/core-
+    // responsiveness.md), so the respawn's tmux calls may not have run yet.
+    // Poll for the `new-session` that ends the kill → new-session pair.
+    const entries = await waitForLog(logPath, "new-session");
     const killIdx = entries.findIndex((e) => e.argv.includes("kill-session"));
     const newIdx = entries.findIndex((e) => e.argv.includes("new-session"));
     expect(killIdx).toBeGreaterThanOrEqual(0);
@@ -427,7 +460,7 @@ test("an unambiguous 'gone' probe routes a follow-up through the resume path (ki
     dropSession(taskId);
     rmSync(path.dirname(expectedJsonlPath), { recursive: true, force: true });
   }
-});
+}, CHAIN_TEST_TIMEOUT_MS);
 
 // Regression tests for the fix in commit de27191 (see
 // docs/plans/fix-claude-resume-large-prompt-tmux-argv.md): a follow-up whose
@@ -596,7 +629,7 @@ test("a large (>4KB) follow-up resume never embeds the prompt in new-session arg
     dropSession(taskId);
     rmSync(path.dirname(expectedJsonlPath), { recursive: true, force: true });
   }
-});
+}, CHAIN_TEST_TIMEOUT_MS);
 
 // A resume spawn's JSONL already exists, so the boot JSONL wait ends at once —
 // while the oversized first prompt is still waiting for claude's composer. The
@@ -702,7 +735,7 @@ test("a resume spawn with a deferred large prompt stays counted in flight until 
     dropSession(taskId);
     rmSync(path.dirname(expectedJsonlPath), { recursive: true, force: true });
   }
-});
+}, CHAIN_TEST_TIMEOUT_MS);
 
 // Regression tests for the opus code-review findings on the deferred-paste
 // fix above (commits de27191 + c6242ae): cancel-during-wait must abort the
@@ -717,7 +750,7 @@ test("cancelling a run while its large prompt is deferred (composer never confir
 
   const { tasks, runs } = await import("./db.ts");
   const { sendInput, cancelRun } = await import("./orchestrator.ts");
-  const { __forTest, dropSession, jsonlPathFor } = await import("./claude-tmux.ts");
+  const { __forTest, dropSession, jsonlPathFor, claudeBootsInFlight } = await import("./claude-tmux.ts");
   const { CLAUDE_PROMPT_ARGV_MAX_BYTES } = await import("./agents.ts");
 
   const taskId = `task-cancel-deferred-${randomUUID()}`;
@@ -789,26 +822,35 @@ test("cancelling a run while its large prompt is deferred (composer never confir
       cursorSessionId: null, geminiSessionId: null, fxSessionId: null,
     });
 
+    const baseline = claudeBootsInFlight();
     const result = await sendInput(priorRunId, largePrompt);
     expect(result.delivered).toBe(true);
     if (!result.delivered) throw new Error(result.reason);
     newRunId = result.runId;
+    const runId = newRunId;
 
-    // Give the spawn a moment to run `new-session` and let the deferred-paste
-    // IIFE reach its poll loop (composer stays "" so it never breaks out).
-    await new Promise((r) => setTimeout(r, 150));
+    // Wait until the deferred-paste loop is actually polling: its first tick
+    // is a `has-session` AFTER the respawn's `new-session` (the composer stays
+    // "" so it never breaks out). Deterministic signals only — the fixed
+    // 150/700/700 ms sleeps this test used to rely on failed on a busy host.
+    expect(await waitUntil(() => {
+      const entries = readLog(logPath);
+      const created = entries.findIndex((e) => e.argv.includes("new-session"));
+      return created >= 0 && entries.slice(created + 1).some((e) => e.argv.includes("has-session"));
+    })).toBe(true);
+    expect(claudeBootsInFlight()).toBe(baseline + 1);
 
-    expect(await cancelRun(newRunId)).toBe(true);
+    expect(await cancelRun(runId)).toBe(true);
 
-    // Let the poll loop wake at least once (DEFERRED_PROMPT_POLL_MS = 400ms)
-    // after the cancel and observe the slot is gone.
-    await new Promise((r) => setTimeout(r, 700));
-
-    // Now flip the composer to "ready" — if the abort check were missing,
-    // the very next poll tick would go ahead and paste. Give it another
-    // full poll interval to prove it doesn't.
+    // Flip the composer to "ready" right away — if the abort check were
+    // missing, the loop's very next tick would paste the cancelled prompt.
     __forTest.setCaptureModePane(async () => "? for shortcuts");
-    await new Promise((r) => setTimeout(r, 700));
+
+    // The loop has exited once the boot is released: `claudeBootsInFlight`
+    // only drops back after the deferred-paste IIFE's `finally` runs. From
+    // then on nothing can paste, so the log below is final.
+    expect(await waitUntil(() => claudeBootsInFlight() === baseline)).toBe(true);
+    expect(await waitUntil(() => runs.listForTask(taskId).find((r) => r.id === runId)?.status === "cancelled")).toBe(true);
 
     const entries = readLog(logPath);
     // The whole point of the fix: a cancelled launch must never paste the
@@ -830,58 +872,13 @@ test("cancelling a run while its large prompt is deferred (composer never confir
     dropSession(taskId);
     rmSync(path.dirname(expectedJsonlPath), { recursive: true, force: true });
   }
-});
+}, CHAIN_TEST_TIMEOUT_MS);
 
 test("a failed deferred paste (load-buffer errors) settles the run instead of leaving it running forever", async () => {
   // Same fake tmux as the happy-path deferred test, except `load-buffer`
   // always fails — simulates a dead socket / vanished pane mid-paste.
   const dir = mkdtempSync(path.join(tmpdir(), "agetor-deferred-fail-tmux-"));
-  const bin = path.join(dir, "tmux");
-  const logPath = path.join(dir, "log.jsonl");
-  const markerDir = path.join(dir, "markers");
-  mkdirSync(markerDir, { recursive: true });
-  writeFileSync(
-    bin,
-    `#!${process.execPath}\n` +
-      `import { appendFileSync, existsSync, readFileSync, rmSync, writeFileSync } from "node:fs";\n` +
-      `import path from "node:path";\n` +
-      `const argv = process.argv.slice(2);\n` +
-      `let stdin = "";\n` +
-      `try { stdin = readFileSync(0, "utf8"); } catch {}\n` +
-      `appendFileSync(${JSON.stringify(logPath)}, JSON.stringify({ argv, stdin }) + "\\n");\n` +
-      `function sessionArg() {\n` +
-      `  const sIdx = argv.indexOf("-s");\n` +
-      `  if (sIdx !== -1) return argv[sIdx + 1];\n` +
-      `  const tIdx = argv.indexOf("-t");\n` +
-      `  if (tIdx !== -1) { let v = argv[tIdx + 1]; if (v && v.startsWith("=")) v = v.slice(1); return v; }\n` +
-      `  return null;\n` +
-      `}\n` +
-      `const markerDir = ${JSON.stringify(markerDir)};\n` +
-      `if (argv.includes("new-session")) {\n` +
-      `  const name = sessionArg();\n` +
-      `  if (name) writeFileSync(path.join(markerDir, name), "1");\n` +
-      `  process.exit(0);\n` +
-      `}\n` +
-      `if (argv.includes("kill-session")) {\n` +
-      `  const name = sessionArg();\n` +
-      `  if (name) { try { rmSync(path.join(markerDir, name)); } catch {} }\n` +
-      `  process.exit(0);\n` +
-      `}\n` +
-      `if (argv.includes("has-session")) {\n` +
-      `  const name = sessionArg();\n` +
-      `  if (name && existsSync(path.join(markerDir, name))) process.exit(0);\n` +
-      `  process.stderr.write("can't find session: =" + (name ?? "unknown"));\n` +
-      `  process.exit(1);\n` +
-      `}\n` +
-      // The failure under test: load-buffer (the first step of the deferred
-      // paste) always errors.
-      `if (argv.includes("load-buffer")) {\n` +
-      `  process.stderr.write("no such file or directory");\n` +
-      `  process.exit(1);\n` +
-      `}\n` +
-      `process.exit(0);\n`,
-  );
-  chmodSync(bin, 0o755);
+  const { bin, logPath } = writePerlFakeTmux(dir, { recordStdin: true, hasSession: "markers", failLoadBuffer: true });
 
   process.env.AGETOR_TMUX_BIN = bin;
   delete process.env.AGETOR_CLAUDE_DRIVER; // force the real spawnClaudeViaTmux path
@@ -994,7 +991,7 @@ test("a failed deferred paste (load-buffer errors) settles the run instead of le
     dropSession(taskId);
     rmSync(path.dirname(expectedJsonlPath), { recursive: true, force: true });
   }
-});
+}, CHAIN_TEST_TIMEOUT_MS);
 
 test("a small (<=4KB) follow-up resume still embeds the prompt in new-session argv — deferral doesn't fire for the common case", async () => {
   // Reuse the fixed-verdict stub (uniform "gone" so the routing gate always
@@ -1094,7 +1091,7 @@ test("a small (<=4KB) follow-up resume still embeds the prompt in new-session ar
     dropSession(taskId);
     rmSync(path.dirname(expectedJsonlPath), { recursive: true, force: true });
   }
-});
+}, CHAIN_TEST_TIMEOUT_MS);
 
 // ─── launchEffort (wave 5): the effort a live session was actually launched
 // with, read back off the launch env rather than re-derived — see
@@ -1154,7 +1151,7 @@ test("spawnClaudeViaTmux pins state.launchEffort from CLAUDE_CODE_EFFORT_LEVEL i
     rmSync(path.dirname(jsonlPath), { recursive: true, force: true });
     rmSync(cwd, { recursive: true, force: true });
   }
-});
+}, CHAIN_TEST_TIMEOUT_MS);
 
 test("spawnClaudeViaTmux with no CLAUDE_CODE_EFFORT_LEVEL in the launch env leaves getSessionLaunchEffort null (a model that declines effort)", async () => {
   const { bin } = fakeRoutingTmuxBin(1, "can't find session: =agetor-launch-effort-none");
@@ -1193,7 +1190,7 @@ test("spawnClaudeViaTmux with no CLAUDE_CODE_EFFORT_LEVEL in the launch env leav
     rmSync(path.dirname(jsonlPath), { recursive: true, force: true });
     rmSync(cwd, { recursive: true, force: true });
   }
-});
+}, CHAIN_TEST_TIMEOUT_MS);
 
 // ─── RC2 + D12: the fold-vs-mint decision is one synchronous section ────────
 //
@@ -1214,21 +1211,7 @@ test("spawnClaudeViaTmux with no CLAUDE_CODE_EFFORT_LEVEL in the launch env leav
  */
 function fakeAliveTmuxBin(hasSessionDelayMs: number): { bin: string; logPath: string } {
   const dir = mkdtempSync(path.join(tmpdir(), "agetor-alive-tmux-"));
-  const bin = path.join(dir, "tmux");
-  const logPath = path.join(dir, "log.jsonl");
-  writeFileSync(
-    bin,
-    `#!${process.execPath}\n` +
-      `import { appendFileSync } from "node:fs";\n` +
-      `const argv = process.argv.slice(2);\n` +
-      `appendFileSync(${JSON.stringify(logPath)}, JSON.stringify({ argv }) + "\\n");\n` +
-      `if (argv.includes("has-session") && ${hasSessionDelayMs} > 0) {\n` +
-      `  Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, ${hasSessionDelayMs});\n` +
-      `}\n` +
-      `process.exit(0);\n`,
-  );
-  chmodSync(bin, 0o755);
-  return { bin, logPath };
+  return writePerlFakeTmux(dir, { hasSession: { aliveAfterMs: hasSessionDelayMs } });
 }
 
 /** The `<task-notification>` user line claude writes when a background agent
@@ -1352,7 +1335,7 @@ test("RC2(a): a task-notification already on disk but untailed is adopted by sen
     __forTest.setBracketedEnterGapMs(prevGap);
     __forTest.setSlashCommandSettleMs(prevSettle);
   }
-});
+}, CHAIN_TEST_TIMEOUT_MS);
 
 test("RC2(b): a continuation adopted DURING sendClaudeTurn's has-session await is seen — the send re-reads the task and folds instead of minting", async () => {
   // has-session takes ~600 ms, so the tailer tick below lands inside the await.
@@ -1396,7 +1379,7 @@ test("RC2(b): a continuation adopted DURING sendClaudeTurn's has-session await i
     __forTest.setBracketedEnterGapMs(prevGap);
     __forTest.setSlashCommandSettleMs(prevSettle);
   }
-});
+}, CHAIN_TEST_TIMEOUT_MS);
 
 // A claude send awaits a `has-session` fork before it pastes or claims the
 // task's "starting" slot. `sendInput` checked the freeze and the archive before
@@ -1432,7 +1415,7 @@ test("a freeze that lands during sendClaudeTurn's has-session await refuses the 
     __forTest.setBracketedEnterGapMs(prevGap);
     __forTest.setSlashCommandSettleMs(prevSettle);
   }
-});
+}, CHAIN_TEST_TIMEOUT_MS);
 
 test("an idle-only claude send frozen during the has-session await reads busy, like sendInput's entry check", async () => {
   const { bin, logPath } = fakeAliveTmuxBin(600);
@@ -1457,7 +1440,7 @@ test("an idle-only claude send frozen during the has-session await reads busy, l
     __resetLaunchFreezeForTest();
     await cleanupRc2(f);
   }
-});
+}, CHAIN_TEST_TIMEOUT_MS);
 
 test("a task archived during sendClaudeTurn's has-session await gets no paste and no new run", async () => {
   const { bin, logPath } = fakeAliveTmuxBin(600);
@@ -1489,7 +1472,7 @@ test("a task archived during sendClaudeTurn's has-session await gets no paste an
     __forTest.setBracketedEnterGapMs(prevGap);
     __forTest.setSlashCommandSettleMs(prevSettle);
   }
-});
+}, CHAIN_TEST_TIMEOUT_MS);
 
 test("D12: a notification landing in the mint window (sendTurn's flushSync) does not displace the freshly minted run — it stays task.runId, one in-flight run, no continuation row", async () => {
   const { bin } = fakeAliveTmuxBin(0);
@@ -1528,4 +1511,4 @@ test("D12: a notification landing in the mint window (sendTurn's flushSync) does
     __forTest.setBracketedEnterGapMs(prevGap);
     __forTest.setSlashCommandSettleMs(prevSettle);
   }
-});
+}, CHAIN_TEST_TIMEOUT_MS);

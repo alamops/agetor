@@ -12,6 +12,7 @@ import {
 import { tmpdir } from "node:os";
 import path from "node:path";
 import { randomUUID } from "node:crypto";
+import { fakeBinDir } from "./test-fake-bin-dir.ts";
 
 // Pre-set AGETOR_DATA_DIR before claude-tmux.ts's transitive db.ts import.
 process.env.AGETOR_DATA_DIR = mkdtempSync(path.join(tmpdir(), "agetor-tmux-queue-"));
@@ -557,7 +558,7 @@ function withFakeTmuxBin<T>(fn: () => Promise<T>): Promise<T> {
  * observed delta past any tight upper bound.
  */
 function withRecordingTmuxBin<T>(fn: (logPath: string) => Promise<T>): Promise<T> {
-  const dir = mkdtempSync(path.join(tmpdir(), "agetor-tmux-rec-"));
+  const dir = fakeBinDir("agetor-tmux-rec-");
   const binPath = path.join(dir, "tmux");
   const logPath = path.join(dir, "log.jsonl");
   writeFileSync(
@@ -1146,7 +1147,7 @@ test("queuePaste(bracketed): a load-buffer failure reports op \"load-buffer\" an
   // A recording stub that fails the FIRST `load-buffer` call outright. With
   // the lead-in retired, nothing is typed before `load-buffer` runs, so a
   // failure there must leave the composer untouched.
-  const dir = mkdtempSync(path.join(tmpdir(), "agetor-tmux-fail-loadbuf-"));
+  const dir = fakeBinDir("agetor-tmux-fail-loadbuf-");
   const binPath = path.join(dir, "tmux");
   const logPath = path.join(dir, "log.jsonl");
   writeFileSync(
@@ -1690,7 +1691,7 @@ test("queuePaste: a background-sessions view that stays is withheld (pre-paste) 
 /** A tmux bin that logs every call (like `withRecordingTmuxBin`) and answers
  *  `capture-pane` with the current contents of a pane file the test rewrites. */
 function withPaneFileTmuxBin<T>(fn: (logPath: string, panePath: string) => Promise<T>): Promise<T> {
-  const dir = mkdtempSync(path.join(tmpdir(), "agetor-tmux-pane-"));
+  const dir = fakeBinDir("agetor-tmux-pane-");
   const binPath = path.join(dir, "tmux");
   const logPath = path.join(dir, "log.jsonl");
   const panePath = path.join(dir, "pane.txt");

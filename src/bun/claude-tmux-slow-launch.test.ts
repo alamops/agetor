@@ -4,6 +4,7 @@ import { randomUUID } from "node:crypto";
 import { tmpdir } from "node:os";
 import path from "node:path";
 import { rmTestDataDir } from "./test-data-dir.ts";
+import { fakeBinDir } from "./test-fake-bin-dir.ts";
 
 /* ────────────────────────────────────────────────────────────────────────── *
  * U3 — docs/plans/task-details-blank-while-session-restores.md §3.2/§4 (T2)
@@ -137,7 +138,7 @@ type Chunk = { stream: string; data: string };
  *  presence of the literal `"new-session"` argv element rather than
  *  `"has-session"`. */
 function makeSlowNewSessionTmuxBin(sleepMs: number): { bin: string; dir: string } {
-  const dir = mkdtempSync(path.join(tmpdir(), "agetor-slow-launch-tmux-"));
+  const dir = fakeBinDir("agetor-slow-launch-tmux-");
   const bin = path.join(dir, "tmux");
   writeFileSync(
     bin,
