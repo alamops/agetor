@@ -282,8 +282,7 @@ async function vendorTerminfo(): Promise<void> {
  * found by a directory lookup — not that the bundled library reads them.
  * That half rests on the files being byte copies of `/usr/share/terminfo`,
  * which the bundled tmux was shown to read through `TERMINFO_DIRS`
- * (docs/plans/issue-298-chrome-prompt-investigation.md, spike J), and on the
- * manual attach smoke in docs/plans/issue-298-chrome-prompt.md §8.3.
+ * (the issue #298 investigation, spike J), and on the manual attach smoke.
  */
 async function verifyTerminfo(): Promise<void> {
   const relativeDb = path.relative(REPO_ROOT, TERMINFO_DIR);

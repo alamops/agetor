@@ -211,32 +211,3 @@ equals the plain row. Typed text and the `[Pasted text …]` / `[Image #N]` chip
 Agetor also launches every claude session with `CLAUDE_CODE_ENABLE_PROMPT_SUGGESTION=false`,
 which removes suggestions and the startup sample on fresh launches. See
 `docs/plans/claude-code-placeholder.md`.
-
-## Addendum (2026-11-12) — unnumbered, footer-terminated menus are carded before the fallback
-
-Issue #298's "Claude in Chrome extension detected" startup prompt (claude 2.1.322) is an
-Ink `er` select with `hideIndexes`: two rows, no `N.` prefixes, cursor pre-focused on the
-"No" row, and an `Enter to confirm · Esc to keep browser tools off` footer. It failed every
-older matcher, so the boot poller's footer arm carded it as `unparsable` — the
-"Claude is asking something Agetor can't read" card whose only action is **Open in
-Terminal** — and the task could not proceed.
-
-A generic `matchUnnumberedModal` now sits in the shared `pickScrapeMatch` chain AFTER
-`matchNumberedModal` / `matchYesNoModal` / `matchSliderModal` and BEFORE this fallback. It
-reuses the trust dialog's `parseUnnumberedChoices` parser plus strict guards: an
-`Enter to confirm` footer among the last 3 non-blank lines, exactly one `❯`/`›` cursor row,
-2+ contiguous rows, rejection of checkbox (leading OR trailing `[ ]`/`[✔]` — claude draws
-them trailing on the auto-mode wizard) / value-selector / numbered rows, a 9-row cap,
-and — in the chain — `!paneWorking` and `!paneIdle`. It only *presents* the rows as choice
-buttons (`hideKeys: true`); it never auto-answers, because both Chrome answers change a
-persistent Claude setting. Both `scrapeOnce` and the boot poller apply the same gates.
-
-The fallback is unchanged and remains the final arm: genuinely unknown widgets, footerless
-prompts, free-text/device-code screens and stuck turns still get the `unparsable` card with
-its terminal hand-off. One positive side effect: an unnumbered workspace-trust dialog that
-survives the boot auto-confirmer's 4 attempts now falls through to clickable choices
-instead of the "can't read it" card. `paneIdle` also gates this fallback's footer arm now —
-an idle composer proves the turn is over, so a finished transcript that quotes a
-footer-terminated menu can't card either.
-
-See `docs/plans/issue-298-chrome-prompt.md`.

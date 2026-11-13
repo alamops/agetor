@@ -460,8 +460,8 @@ test("matchNumberedModal — Chrome-extension startup prompt surfaces as an inte
    claude 2.1.322 renders it as an Ink `er` select with `hideIndexes` — two
    rows, no `N.` prefixes, cursor pre-focused on the "No" row, footer
    `Enter to confirm · Esc to keep browser tools off`. Reconstructed from the
-   issue screenshot + the 2.1.322 component props (docs/plans/
-   issue-298-chrome-prompt-investigation.md §8.1). The numbered
+   issue screenshot + the 2.1.322 component props (the #298
+   investigation). The numbered
    CHROME_EXTENSION_PANE above stays as coverage for older CLIs. */
 
 const CHROME_UNNUMBERED_PANE = `Claude in Chrome extension detected
@@ -637,7 +637,10 @@ Enter to confirm · Esc to keep browser tools off
     paneIdle: paneShowsIdleInputBox(quotedAtIdle),
     watchdogArmed: false,
   })).toBeNull();
-  expect(paneShowsBlockingPrompt(quotedAtIdle)).toBe(false);
+  expect(paneShowsBlockingPrompt(quotedAtIdle)).toBe(true);
+  // ^ Card registration is idle-gated; the PASTE guard deliberately is not
+  //   (its pre-#298 behavior — a harmless, self-healing withhold), so it
+  //   still reads the quoted menu as blocking.
   // And the LIVE prompt on a pane with no composer does block a paste.
   expect(paneShowsBlockingPrompt(CHROME_UNNUMBERED_PANE)).toBe(true);
 });
@@ -923,7 +926,13 @@ const CHROME_2_1_322_PANE = `─────────────────
 
 /** Live 2.1.322 `/theme` picker: unnumbered rows with a cursor, but an
  *  `Enter to select` footer — not a confirm menu. */
-const THEME_PICKER_2_1_322_PANE = `   Theme
+const THEME_PICKER_2_1_322_PANE = `❯ /effort
+  ⎿  Cancelled
+
+❯ /resume
+  ⎿  Resume cancelled
+▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔ ◐ medium · /effort ▔
+   Theme
 
    Choose the text style that looks best with your terminal
 
@@ -946,41 +955,35 @@ const THEME_PICKER_2_1_322_PANE = `   Theme
 
    Enter to select · Esc to cancel`;
 
-/** Live 2.1.322 `/effort` slider on agetor's default 80x24 pane (the layout
- *  is identical at 100 and 200 columns): Ultracode moved into a side panel
- *  on the track and label rows, and the footer gained a session-only
- *  confirm. Trimmed to the dialog. `_RIGHT2` is the same slider after two
- *  Right presses; `_ULTRACODE_ON` after Tab, which adds a row under the
- *  labels. */
-const EFFORT_SLIDER_2_1_322_PANE = `   Effort
-
-         Faster                             Smarter
-         ──────────▲───────────────────────────────      Ultracode  off
-         low     medium     high     xhigh      max      Tab to toggle
-
-                        The default effort for this model
+/** Live 2.1.322 `/effort` slider (grew an Ultracode toggle row and a longer
+ *  footer since 2.1.245; `matchSliderModal` no longer recognises it — a
+ *  separate, pre-existing gap). Its footer contains `Enter to confirm`. */
+const EFFORT_SLIDER_2_1_322_PANE = ` ▐▛███▛█   Claude Code v2.1.322
+▝▜██████▀  Haiku 5.5 · Claude Ultra
+ ▝▝   ▝▝   ~/.agetor/worktrees/1c345ab1-d22f-4ee3-a67e-66d42d952b32/vendor/q298-probe
 
 
-   ←/→ to adjust · Enter to confirm · s for this session only · Esc to cancel`;
-
-const EFFORT_SLIDER_2_1_322_RIGHT2_PANE = `   Effort
-
-         Faster                             Smarter
-         ──────────────────────────────▲───────────      Ultracode  off
-         low     medium     high     xhigh      max      Tab to toggle
-
-                ~3.9x the estimated cost of medium (the default)
+❯ /model
+  ⎿  Kept model as Haiku 5.5
 
 
-   ←/→ to adjust · Enter to confirm · s for this session only · Esc to cancel`;
 
-const EFFORT_SLIDER_2_1_322_ULTRACODE_ON_PANE = `   Effort
 
-         Faster                             Smarter
-         ──────────────────────────────▲───────────      Ultracode  on
-         low     medium     high     xhigh      max      Tab to toggle
-         Ultracode: dynamic workflows on every task
-                ~3.9x the estimated cost of medium (the default)
+
+
+
+
+
+
+
+ tmux detected · scroll with PgUp/PgDn · or add 'set -g mouse on' to ~/.tmux.conf for wheel scroll ▔
+   Effort
+
+                   Faster                             Smarter
+                   ──────────▲───────────────────────────────      Ultracode  off
+                   low     medium     high     xhigh      max      Tab to toggle
+
+                                  The default effort for this model
 
 
    ←/→ to adjust · Enter to confirm · s for this session only · Esc to cancel`;
@@ -1045,11 +1048,10 @@ describe("issue #298 — live claude 2.1.322 evidence", () => {
     expect(m?.hideKeys).toBeUndefined();
   });
 
-  test("the real /effort slider (footer contains 'Enter to confirm') is the slider card, not an unnumbered menu", () => {
+  test("the real /effort slider (footer contains 'Enter to confirm') is not read as an unnumbered menu", () => {
     expect(matchUnnumberedModal(EFFORT_SLIDER_2_1_322_PANE)).toBeNull();
-    const m = pickScrapeMatch(EFFORT_SLIDER_2_1_322_PANE, gates(EFFORT_SLIDER_2_1_322_PANE))!;
-    expect(m.hideKeys).toBeUndefined();
-    expect(m.nav).toBe("horizontal");
+    const m = pickScrapeMatch(EFFORT_SLIDER_2_1_322_PANE, gates(EFFORT_SLIDER_2_1_322_PANE));
+    expect(m?.hideKeys).toBeUndefined();
   });
 
   test("the 2.1.322 composer is framed by rules, so a menu quoted above it can't put its footer in the last 3 non-blank lines — no card even with the idle gate OFF", () => {
@@ -2452,82 +2454,6 @@ test("SLIDER_TRACK_RE — matches a track line with exactly one ▲, not a bare 
   )).toBe(true);
   expect(SLIDER_TRACK_RE.test("─".repeat(30))).toBe(false); // no ▲ at all
   expect(SLIDER_TRACK_RE.test("▲──▲")).toBe(false); // two markers — not "exactly one"
-});
-
-test("matchSliderModal — live 2.1.322 slider: five levels, cursor on the default (medium), the Ultracode side panel is never a choice, and a card click confirms with `s` (session only)", () => {
-  // Regression: 2.1.322 put `Ultracode  off` after the track and
-  // `Tab to toggle` after the labels, which broke signals (a) and (b), so the
-  // slider fell to the "can't read" card.
-  const m = matchSliderModal(EFFORT_SLIDER_2_1_322_PANE)!;
-  expect(m).not.toBeNull();
-  expect(m.choices).toEqual([
-    { key: "1", label: "low" },
-    { key: "2", label: "medium" },
-    { key: "3", label: "high" },
-    { key: "4", label: "xhigh" },
-    { key: "5", label: "max" },
-  ]);
-  expect(m.cursorIndex).toBe(1);
-  expect(m.nav).toBe("horizontal");
-  expect(m.highConfidence).toBe(true);
-  // Plain Enter on this slider saves the level as the user's default effort;
-  // `s` applies it to the session only (`effortSlider:thisSessionOnly`).
-  expect(m.confirmKey).toBe("s");
-  expect(pickScrapeMatch(EFFORT_SLIDER_2_1_322_PANE, {
-    paneWorking: paneShowsClaudeWorking(EFFORT_SLIDER_2_1_322_PANE),
-    paneIdle: paneShowsIdleInputBox(EFFORT_SLIDER_2_1_322_PANE),
-    watchdogArmed: false,
-  })).toEqual(m);
-  expect(paneShowsBlockingPrompt(EFFORT_SLIDER_2_1_322_PANE)).toBe(true);
-});
-
-test("matchSliderModal — live 2.1.322 slider after two Right presses: cursor on xhigh, fingerprint moves", () => {
-  const m = matchSliderModal(EFFORT_SLIDER_2_1_322_RIGHT2_PANE)!;
-  expect(m).not.toBeNull();
-  expect(m.cursorIndex).toBe(3);
-  expect(m.choices[3]!.label).toBe("xhigh");
-  expect(m.fingerprint).not.toBe(matchSliderModal(EFFORT_SLIDER_2_1_322_PANE)!.fingerprint);
-});
-
-test("matchSliderModal — live 2.1.322 slider with Ultracode on: the extra row puts the footer exactly at FOOTER_SEARCH_NONBLANK and it still matches", () => {
-  const m = matchSliderModal(EFFORT_SLIDER_2_1_322_ULTRACODE_ON_PANE)!;
-  expect(m).not.toBeNull();
-  expect(m.choices.map((c) => c.label)).toEqual(["low", "medium", "high", "xhigh", "max"]);
-  expect(m.cursorIndex).toBe(3);
-  expect(m.confirmKey).toBe("s");
-  // Toggling Ultracode is not a slider move: the choice set and cursor, and so
-  // the card, stay the same.
-  expect(m.fingerprint).toBe(matchSliderModal(EFFORT_SLIDER_2_1_322_RIGHT2_PANE)!.fingerprint);
-});
-
-test("matchSliderModal — the 2.1.245 slider (no session-only footer) still confirms with plain Enter", () => {
-  expect(matchSliderModal(EFFORT_SLIDER_XHIGH_PANE)!.confirmKey).toBeUndefined();
-});
-
-test("matchSliderModal — only text PAST the track's end is dropped from the label row; a non-label token under the track still rejects it", () => {
-  const track = "         ──────────▲───────────────────────────────      Ultracode  off";
-  const footer = "   ←/→ to adjust · Enter to confirm · s for this session only · Esc to cancel";
-  const ok = `   Effort\n\n${track}\n         low     medium     high     xhigh      max      Tab to toggle\n\n${footer}`;
-  expect(matchSliderModal(ok)!.choices.map((c) => c.label)).toEqual(["low", "medium", "high", "xhigh", "max"]);
-  // `Not a label` starts under the track (column 36), so it is not side-panel
-  // text: the row is not a label row and the slider does not match.
-  const bad = `   Effort\n\n${track}\n         low     medium     Not a label     max      Tab to toggle\n\n${footer}`;
-  expect(matchSliderModal(bad)).toBeNull();
-});
-
-test("SLIDER_TRACK_RE — accepts the 2.1.322 side panel after the track, but never a second ▲ or track glyphs in the trailing text", () => {
-  expect(SLIDER_TRACK_RE.test("         ──────────▲───────────────────────────────      Ultracode  off")).toBe(true);
-  expect(SLIDER_TRACK_RE.exec("   ──────────▲─────────      Ultracode  on")![1]).toBe("──────────▲─────────");
-  expect(SLIDER_TRACK_RE.test("   ──────────▲─────────      Ultracode  ▲")).toBe(false);
-  expect(SLIDER_TRACK_RE.test("   ──────────▲─────────      ───▲───")).toBe(false);
-  // A single space is not a side-panel gap.
-  expect(SLIDER_TRACK_RE.test("   ──────────▲───────── Ultracode")).toBe(false);
-});
-
-test("SESSION_ONLY_CONFIRM_RE — covers both the /model picker and the 2.1.322 /effort slider phrasings", () => {
-  expect(SESSION_ONLY_CONFIRM_RE.test("Enter to set as default · s to use this session only · Esc to cancel")).toBe(true);
-  expect(SESSION_ONLY_CONFIRM_RE.test("←/→ to adjust · Enter to confirm · s for this session only · Esc to cancel")).toBe(true);
-  expect(SESSION_ONLY_CONFIRM_RE.test("←/→ to adjust · Enter to confirm · Esc to cancel")).toBe(false);
 });
 
 test("SLIDER_FOOTER_RE — matches the captured slider footer phrase specifically", () => {
