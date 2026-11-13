@@ -10,7 +10,6 @@ process.env.AGETOR_DATA_DIR = mkdtempSync(path.join(tmpdir(), "agetor-askdrive-"
 
 import { __forTest, dismissAskModalForMessage, driveAskAnswers } from "./claude-tmux.ts";
 import type { AskModalKind, DriveStep } from "./claude-questions.ts";
-import { fakeBinDir } from "./test-fake-bin-dir.ts";
 
 const {
   decideAskDriveStep,
@@ -251,7 +250,7 @@ interface FakeTmux {
 }
 
 function makeFakeTmux(opts: { emptyPaneOnEnter: boolean; paneAfterText?: string }): FakeTmux {
-  const dir = fakeBinDir("agetor-askdrive-tmux-");
+  const dir = mkdtempSync(path.join(tmpdir(), "agetor-askdrive-tmux-"));
   scratchDirs.push(dir);
   const binPath = path.join(dir, "tmux");
   const logPath = path.join(dir, "log.jsonl");
@@ -488,7 +487,7 @@ interface ScriptedTmux {
 /** `frames`: the pane is the LAST frame whose `minEsc` <= the cumulative number
  *  of `Escape` arguments sent to `send-keys` so far. */
 function makeScriptedTmux(frames: Array<{ minEsc: number; pane: string }>): ScriptedTmux {
-  const dir = fakeBinDir("agetor-dismiss-tmux-");
+  const dir = mkdtempSync(path.join(tmpdir(), "agetor-dismiss-tmux-"));
   scratchDirs.push(dir);
   const binPath = path.join(dir, "tmux");
   const logPath = path.join(dir, "log.jsonl");

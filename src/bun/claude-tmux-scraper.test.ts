@@ -835,6 +835,22 @@ Enter to continue · Esc to cancel`;
     expect(matchNumberedModal(pane)).not.toBeNull();
   });
 
+  test("a wrapped option label is not a phantom choice — mixed label columns fall to the unparsable card", () => {
+    // Ink draws every option label at the same column; a 2+-space-indented
+    // row whose label starts deeper is the previous option's wrap. Counting
+    // it as a choice would add a phantom button and shift the arrow indices
+    // `dismissTmuxPrompt` drives, so the parser must refuse the list.
+    const wrapped = `Pick one\n\n❯ No, keep browser tools off\n  Yes, use my browser — this connects\n    to your signed-in Chrome session\n\n${confirmFooter}`;
+    expect(matchUnnumberedModal(wrapped)).toBeNull();
+    const fallback = pickScrapeMatch(wrapped, {
+      paneWorking: false,
+      paneIdle: false,
+      watchdogArmed: false,
+    })!;
+    expect(fallback.unparsable).toBe(true);
+    expect(fallback.choices).toEqual([]);
+  });
+
   test("zero cursor rows or two cursor rows are rejected (exactly one required)", () => {
     expect(matchUnnumberedModal(`Pick one\n\n  No, keep browser tools off\n  Yes, use my browser\n\n${confirmFooter}`)).toBeNull();
     expect(matchUnnumberedModal(`Pick one\n\n❯ No, keep browser tools off\n❯ Yes, use my browser\n\n${confirmFooter}`)).toBeNull();

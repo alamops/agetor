@@ -6299,6 +6299,16 @@ export function matchStartupConsentDialog(pane: string): StartupDialogMatch | nu
  * `matchUnnumberedModal` the last-3-non-blank footer, the row-family guards,
  * and the row cap), because the parser alone also reads a transcript that
  * quotes such a menu.
+ *
+ * Wrapped labels: an Ink select draws every option label at the SAME column
+ * (the cursor glyph replaces the leading indent, so `❯ label` and
+ * `  label` share the label column). A 2+-space-indented row whose label
+ * starts deeper is a wrap continuation of the option above, NOT another
+ * option — counting it would add a phantom choice and shift the arrow
+ * indices `dismissTmuxPrompt` drives. Plain `capture-pane` text has no style
+ * bit that would let us join it unambiguously, so any mixed label columns
+ * make the whole menu unparsable: callers fall back to the safe unparsable
+ * card instead of presenting a wrong list.
  */
 function parseUnnumberedChoices(
   pane: string,
@@ -6314,19 +6324,19 @@ function parseUnnumberedChoices(
   if (footerAt < 0) return null;
   let i = footerAt - 1;
   while (i >= 0 && lines[i]!.trim() === "") i--;
-  const rows: Array<{ label: string; cursor: boolean }> = [];
+  const rows: Array<{ label: string; cursor: boolean; column: number }> = [];
   let firstRowAt = -1;
   for (; i >= 0; i--) {
     const raw = lines[i]!;
     const cur = raw.match(/^\s*[❯›]\s+(\S.*?)\s*$/);
     if (cur) {
-      rows.unshift({ label: cur[1]!, cursor: true });
+      rows.unshift({ label: cur[1]!, cursor: true, column: raw.indexOf(cur[1]!) });
       firstRowAt = i;
       continue;
     }
     const plain = raw.match(/^\s{2,}(\S.*?)\s*$/);
     if (plain) {
-      rows.unshift({ label: plain[1]!, cursor: false });
+      rows.unshift({ label: plain[1]!, cursor: false, column: raw.indexOf(plain[1]!) });
       firstRowAt = i;
       continue;
     }
@@ -6334,6 +6344,11 @@ function parseUnnumberedChoices(
   }
   if (rows.length < 2) return null;
   if (rows.filter((r) => r.cursor).length !== 1) return null;
+  // All option labels must share the cursor row's label column; a deeper row
+  // is a wrapped continuation (see the doc above), and an ambiguous list is
+  // not offered to the user at all.
+  const labelColumn = rows.find((r) => r.cursor)!.column;
+  if (rows.some((r) => r.column !== labelColumn)) return null;
   const cursorIndex = rows.findIndex((r) => r.cursor);
   const choices: TmuxPromptChoice[] = rows.map((r, idx) => ({ key: String(idx + 1), label: r.label }));
   const fingerprint = sha1(

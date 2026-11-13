@@ -262,34 +262,64 @@ async function vendorTerminfo(): Promise<void> {
 }
 
 /**
- * Prove the freshly copied DB actually resolves: every pinned entry must be
- * found under `TERMINFO_DIRS=<vendor>/terminfo` in the hashed layout, so a
- * missing, misplaced or corrupt copy fails the build here instead of in a
+ * Prove the freshly copied DB is complete and readable: every pinned entry
+ * must exist in the vendored hashed layout AND parse from THAT directory, so
+ * a missing, misplaced or corrupt copy fails the build here instead of in a
  * user's Terminal window.
+ *
+ * Two checks, both needed:
+ *   1. Layout — each entry must be present as `<vendor>/terminfo/<hash>/<entry>`.
+ *      A resolver alone is not proof of completeness: ncurses falls back to
+ *      the system database (and `$HOME/.terminfo`), so a cached tree missing
+ *      an entry would still "resolve" and the cache check would keep shipping
+ *      it (`verifyTerminfo` runs on the cache-hit path).
+ *   2. Content — `/usr/bin/infocmp -A <vendor>/terminfo` reads only that
+ *      directory (no `TERMINFO_DIRS`/system fallback), so a truncated or
+ *      corrupt copy is caught rather than silently accepted.
  *
  * Scope of this check: `/usr/bin/infocmp` links the SYSTEM ncurses, not the
  * bundled `libncursesw`, so it proves the files are complete, well-formed and
- * found by a `TERMINFO_DIRS` lookup — not that the bundled library reads them.
+ * found by a directory lookup — not that the bundled library reads them.
  * That half rests on the files being byte copies of `/usr/share/terminfo`,
  * which the bundled tmux was shown to read through `TERMINFO_DIRS`
  * (docs/plans/issue-298-chrome-prompt-investigation.md, spike J), and on the
  * manual attach smoke in docs/plans/issue-298-chrome-prompt.md §8.3.
  */
 async function verifyTerminfo(): Promise<void> {
-  // A minimal, hermetic env: `infocmp` is invoked by absolute path, so no PATH
-  // is needed, and dropping TERMINFO (a single directory, which wins over
-  // TERMINFO_DIRS by ncurses semantics) makes this measure THIS database.
-  const env: Record<string, string | undefined> = { TERMINFO_DIRS: TERMINFO_DIR };
+  const relativeDb = path.relative(REPO_ROOT, TERMINFO_DIR);
+  let hashedDirs: string[];
+  try {
+    hashedDirs = (await readdir(TERMINFO_DIR, { withFileTypes: true }))
+      .filter((d) => d.isDirectory())
+      .map((d) => d.name);
+  } catch {
+    fail(`vendored terminfo directory ${relativeDb} is missing or unreadable — the bundle would ship a broken database`);
+  }
   for (const entry of TERMINFO_ENTRIES) {
+    const copies = hashedDirs.filter((dir) => existsSync(path.join(TERMINFO_DIR, dir, entry)));
+    if (copies.length !== 1) {
+      fail(
+        `vendored terminfo entry "${entry}" is ${copies.length === 0 ? "missing" : "duplicated"} in ${relativeDb} ` +
+          `(expected exactly one hashed <dir>/${entry}) — the bundle would ship a broken database`,
+      );
+    }
     try {
-      await run(["/usr/bin/infocmp", entry], { env, silent: true });
+      // `-A` pins the lookup to the vendored directory. `infocmp` is invoked
+      // by absolute path and a minimal env keeps a user TERMINFO override out
+      // of the measurement.
+      await run(["/usr/bin/infocmp", "-A", TERMINFO_DIR, entry], {
+        env: { PATH: "/usr/bin:/bin" },
+        silent: true,
+      });
     } catch {
       fail(
-        `vendored terminfo entry "${entry}" does not resolve from ${path.relative(REPO_ROOT, TERMINFO_DIR)} (TERMINFO_DIRS) — the bundle would ship a broken database`,
+        `vendored terminfo entry "${entry}" does not parse from ${relativeDb} — the bundle would ship a broken database`,
       );
     }
   }
-  console.log(`[fetch-tmux] ✓ TERMINFO_DIRS resolves all ${TERMINFO_ENTRIES.length} entries`);
+  console.log(
+    `[fetch-tmux] ✓ all ${TERMINFO_ENTRIES.length} terminfo entries present in the hashed layout and parse from ${relativeDb}`,
+  );
 }
 
 async function main() {

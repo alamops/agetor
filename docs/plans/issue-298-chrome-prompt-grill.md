@@ -5,11 +5,11 @@
 | Date | 2026-11-12 |
 | Source | Issue #298 (`https://github.com/alamops/agetor/issues/298`) + `docs/plans/issue-298-chrome-prompt-investigation.md` |
 | Mode | Interactive via decision form, answered by the owner in 2 rounds (13 + 4 questions; no skips, no blanks) |
-| Answers | `docs/plans/issue-298-chrome-prompt-grill/round-1/answers.json`, `docs/plans/issue-298-chrome-prompt-grill/round-2/answers.json` |
+| Answers | Raw round JSONs (`round-N/{questions,answers}.json`) are review-scope process artifacts and are **not part of this change**; the decisions themselves are recorded in the table below. |
 | Flags | none |
 | Spec | Outside the repo: issue #298. The in-repo evidence/acceptance brief is `docs/plans/issue-298-chrome-prompt-investigation.md`. |
 
-**Commit note:** the record and both round folders are left uncommitted in the worktree so they can ride the single local `Fixes #298` commit chosen in decision 11; the implementation step owns that commit.
+**Commit note:** this human-readable record ships with the `Fixes #298` change because `src/bun/claude-tmux.ts` cites it; the per-round question/answer JSONs were dropped from the PR at review time (they stay in the branch's earlier history).
 
 No one-way door is awaiting a human: the only one (the Chrome auto-answer policy) was answered **card-only**.
 
