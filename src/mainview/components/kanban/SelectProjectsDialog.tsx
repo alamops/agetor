@@ -110,6 +110,7 @@ export function SelectProjectsDialog({ open, onClose, value, onSave, lockedPath,
   useEffect(() => {
     sessionRef.current.invalidate();
     setBusy(false);
+    setPicking(false);
     setConflicts([]);
     setQuery("");
     if (!open) return;
@@ -205,6 +206,10 @@ export function SelectProjectsDialog({ open, onClose, value, onSave, lockedPath,
 
   const addFolder = async () => {
     if (busy) return;
+    // Claim this dialog session before the native panel opens. Closing or
+    // reopening the dialog invalidates it, so a late pick can't land in a
+    // draft the user has already left (or started over).
+    const session = sessionRef.current.begin();
     setPicking(true);
     try {
       // Start the native panel at the current selection, like the retired
@@ -212,7 +217,7 @@ export function SelectProjectsDialog({ open, onClose, value, onSave, lockedPath,
       // project is the closest equivalent (and empty when nothing is picked
       // yet).
       const picked = await api.pickProject(draft[0]?.path);
-      if (!picked.project) return;
+      if (!sessionRef.current.isCurrent(session) || !picked.project) return;
       const path = picked.project.path;
       if (!paths.has(path)) setDraft((cur) => [...cur, { path, root: null }]);
       if (!projects.some((project) => project.path === path)) {
@@ -221,7 +226,7 @@ export function SelectProjectsDialog({ open, onClose, value, onSave, lockedPath,
     } catch {
       /* the native picker can be cancelled or fail; nothing to do */
     } finally {
-      setPicking(false);
+      if (sessionRef.current.isCurrent(session)) setPicking(false);
     }
   };
 

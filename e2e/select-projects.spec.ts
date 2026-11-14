@@ -57,7 +57,9 @@ import { uniqueRepoSlugs } from "../src/shared/multi-repo.ts";
  *     reads "current branch" and the task gets the HEAD sha;
  *  q. the dialog's branch list opens in flow, so the scrolling project list
  *     never clips it;
- *  n. Add folder opens at the current selection and selects what it adds.
+ *  n. Add folder opens at the current selection and selects what it adds;
+ *  n2. a folder pick that answers after the dialog closed and reopened is
+ *      dropped instead of landing in the new draft.
  *
  * Non-current branch names are mandatory: a picker wired to nothing still
  * shows the current branch, so only a different ref proves the row reaches the
@@ -217,13 +219,55 @@ async function stubPick(
   return () => body;
 }
 
+/** Answers /projects/pick only after `release()`, so a test can close the
+ *  dialog while the native folder panel is still open. */
+async function holdPick(
+  page: Page,
+  projectPath: string,
+  name: string,
+): Promise<{ release: () => void; seen: () => number }> {
+  let release!: () => void;
+  const gate = new Promise<void>((resolve) => (release = resolve));
+  let seen = 0;
+  await page.route(
+    (url) => url.pathname === "/projects/pick",
+    async (route) => {
+      if (route.request().method() === "OPTIONS") {
+        await route.fulfill({ status: 204, headers: CORS_HEADERS });
+        return;
+      }
+      seen += 1;
+      await gate;
+      await route.fulfill({
+        status: 200,
+        headers: CORS_HEADERS,
+        contentType: "application/json",
+        body: JSON.stringify({
+          project: { path: projectPath, name, addedAt: Date.now(), branchConfig: null },
+        }),
+      });
+    },
+  );
+  return { release: () => release(), seen: () => seen };
+}
+
 test.beforeAll(async ({ request, backend }) => {
   repoA = await initRepo("a");
   repoB = await initRepo("b");
-  git(repoA, ["branch", BRANCH]);
-  git(repoB, ["branch", BRANCH]);
+  // A commit that exists only on `topic`. With the branch pointing at `main`,
+  // a baseRef wired to HEAD would produce the same sha and pass by accident.
+  for (const [dir, name] of [[repoA, "a"], [repoB, "b"]] as const) {
+    git(dir, ["checkout", "-q", "-b", BRANCH]);
+    await writeFile(path.join(dir, `${name}-topic.txt`), `${name} topic\n`);
+    git(dir, ["add", "."]);
+    git(dir, ["commit", "-q", "-m", `${name} topic`]);
+    git(dir, ["checkout", "-q", "main"]);
+  }
   branchShaA = git(repoA, ["rev-parse", BRANCH]);
   branchShaB = git(repoB, ["rev-parse", BRANCH]);
+  expect(branchShaA).not.toBe(git(repoA, ["rev-parse", "main"]));
+  expect(branchShaB).not.toBe(git(repoB, ["rev-parse", "main"]));
+  expect(branchShaA).not.toBe(branchShaB);
 
   // repoB gets a real upstream so its inline row's Pull button is enabled:
   // Pull only makes sense for a local branch tracking a remote. The push
@@ -573,6 +617,43 @@ test("Add folder opens at the current selection and selects what it adds", async
   await expect(dialog).toBeHidden({ timeout: CONVERGE_TIMEOUT });
   await expect(form.getByTestId("select-projects-button")).toContainText("2 projects selected");
   await expect(branchRow(form, slugFor(added))).toBeVisible();
+});
+
+test("a pending Add folder result cannot leak into a reopened dialog", async ({ page, request, freshBackend }) => {
+  const base = await initRepo("stale-pick-base");
+  const stale = await initRepo("stale-pick-result");
+  await registerProject(request, freshBackend, base, "stale-pick-base");
+  await gotoApp(page, freshBackend.bootBase);
+  const form = newTaskForm(page);
+  await chooseProjects(page, form, [base]);
+
+  const dialog = await openSelectProjects(page, form);
+  const held = await holdPick(page, stale, "stale-pick-result");
+  await dialog.getByRole("button", { name: "Add folder", exact: true }).click();
+  await expect.poll(held.seen, { timeout: CONVERGE_TIMEOUT }).toBe(1);
+
+  // Walk away while the native panel is still open, then start a new session.
+  await page.keyboard.press("Escape");
+  await expect(dialog).toBeHidden({ timeout: CONVERGE_TIMEOUT });
+  const reopened = await openSelectProjects(page, form);
+
+  const answered = page.waitForResponse(
+    (response) => new URL(response.url()).pathname === "/projects/pick",
+    { timeout: CONVERGE_TIMEOUT },
+  );
+  held.release();
+  await answered;
+  // Let React commit any state update the late response produced.
+  await page.evaluate(() => new Promise<void>((resolve) => {
+    requestAnimationFrame(() => requestAnimationFrame(() => resolve()));
+  }));
+
+  // The old session's pick is dropped: no row, and the reopened draft is
+  // still exactly the project it opened with.
+  await expect(reopened.getByLabel(`Select ${stale}`, { exact: true })).toHaveCount(0);
+  await expect(reopened.locator('[data-testid^="select-projects-row-"]')).toHaveCount(1);
+  await expect(reopened.getByRole("button", { name: "Add folder", exact: true })).toBeEnabled();
+  await reopened.getByRole("button", { name: "Cancel", exact: true }).click();
 });
 
 test("a zero draft disables Save and shows the hint", async ({ page, backend }) => {

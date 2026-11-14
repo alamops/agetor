@@ -197,15 +197,26 @@ async function createPushedMultiTask(
 test.beforeAll(async ({ backend, request }) => {
   repoA = await initRepo("frontend");
   repoB = await initRepo("backend");
+  // A commit that exists only on `topic` in each repository: with the branch
+  // pointing at `main`, a baseRef wired to HEAD would produce the same sha and
+  // the payload assertion would pass by accident.
+  for (const [dir, name] of [[repoA, "frontend"], [repoB, "backend"]] as const) {
+    git(dir, ["checkout", "-q", "-b", TOPIC_BRANCH]);
+    await writeFile(path.join(dir, `${name}-topic.txt`), `${name} topic\n`);
+    git(dir, ["add", "."]);
+    git(dir, ["commit", "-q", "-m", `${name} topic`]);
+    git(dir, ["checkout", "-q", "main"]);
+  }
+  topicShaA = git(repoA, ["rev-parse", TOPIC_BRANCH]);
+  topicShaB = git(repoB, ["rev-parse", TOPIC_BRANCH]);
+  expect(topicShaA).not.toBe(git(repoA, ["rev-parse", "main"]));
+  expect(topicShaB).not.toBe(git(repoB, ["rev-parse", "main"]));
+  expect(topicShaA).not.toBe(topicShaB);
   // A registered path under repoA's git root. Selecting it alongside repoA in
   // the dialog must collapse to one repository (dedupeSelections), which the
   // first scenario asserts by still creating a two-repository task.
   repoSibling = path.join(repoA, "packages", "feature");
   await mkdir(repoSibling, { recursive: true });
-  git(repoA, ["branch", TOPIC_BRANCH]);
-  git(repoB, ["branch", TOPIC_BRANCH]);
-  topicShaA = git(repoA, ["rev-parse", TOPIC_BRANCH]);
-  topicShaB = git(repoB, ["rev-parse", TOPIC_BRANCH]);
   // GitHub-shaped origins for the issue-sourced / Create-all-PRs scenario.
   // Pushing uses a separate local bare remote, so nothing leaves the machine
   // while `repoForDir`/`providerRepoForDir` still resolve a GitHub identity.
