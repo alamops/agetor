@@ -22,6 +22,7 @@ Finally, `dialog.tsx`'s Escape/Tab handling is load-bearing for every consumer t
 — or when the key event arrives already `defaultPrevented`; Tab yields on `defaultPrevented` alone.
 A carrier that wants Escape yielded to it but doesn't want to also swallow other document-level shortcuts opts out via `data-popover-keys="escape-only"` next to the marker — `AtFileAutocomplete` carries it too, same as `SlashAutocomplete` — honored by RunPanel's Cmd/Ctrl+F handler (`[data-popover-open]:not([data-popover-keys="escape-only"])`) so an open `/` or `@` autocomplete or Extensions popover doesn't block Cmd+F too.
 Without this, Escape on the `/` autocomplete menu inside a modal closed the whole modal instead of just the menu.
+`Dialog` renders inline (no portal), so its `fixed inset-0` overlay is often a sibling inside a spacing utility (`WorktreeOptions`' `space-y-3` holds both `SelectProjectsDialog` and `BranchNamingDialog`). The overlay carries `!m-0` because `space-y-*`'s sibling rule would otherwise give it a top margin and leave a strip of the page uncovered above the backdrop (`e2e/select-projects.spec.ts` asserts the backdrop's box equals the viewport).
 
 ## Multiple repositories in one task
 

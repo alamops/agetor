@@ -128,8 +128,10 @@ describe("WorktreeOptions — live", () => {
     const markup = live([repo("/a/api"), repo("/b/api")]);
     expect(markup).toContain('data-testid="branch-row-api"');
     expect(markup).toContain('data-testid="branch-row-api-2"');
-    expect(markup).toContain("Branch · api — /a/api");
-    expect(markup).toContain("Branch · api — /b/api");
+    expect(markup).toContain("Branch · a/api");
+    expect(markup).toContain("Branch · b/api");
+    // The full path stays one hover away.
+    expect(markup).toContain('title="/a/api"');
   });
 });
 

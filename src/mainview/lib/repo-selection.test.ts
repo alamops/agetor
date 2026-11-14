@@ -173,13 +173,34 @@ describe("project selection label", () => {
 });
 
 describe("projectRowLabels", () => {
-  test("uses the raw basename, appending the full path only on a collision", () => {
+  test("uses the raw basename, and only colliding names get their parent folders", () => {
     expect(projectRowLabels(["/x/App One", "/y/Backend"])).toEqual(["App One", "Backend"]);
-    expect(projectRowLabels(["/a/api", "/b/api", "/c/db"])).toEqual([
-      "api — /a/api",
-      "api — /b/api",
+    expect(projectRowLabels(["/work/billing/api", "/work/identity/api", "/c/db"])).toEqual([
+      "billing/api",
+      "identity/api",
       "db",
     ]);
+  });
+
+  test("a collision label keeps the distinguishing end, not a long shared prefix", () => {
+    const long = "/var/folders/ww/5s1q5h1d6kv4ycv8tl2yc23h0000gn/T/agetor-shots-NEp3Fr";
+    expect(projectRowLabels([`${long}/billing/api`, `${long}/identity/api`])).toEqual([
+      "billing/api",
+      "identity/api",
+    ]);
+  });
+
+  test("adds folders until each colliding label is unique", () => {
+    expect(projectRowLabels(["/a/svc/api", "/b/svc/api", "/c/web/api"])).toEqual([
+      "a/svc/api",
+      "b/svc/api",
+      "web/api",
+    ]);
+  });
+
+  test("falls back to the full path when no shorter suffix is unique", () => {
+    expect(projectRowLabels(["/api", "/x/api"])).toEqual(["/api", "x/api"]);
+    expect(projectRowLabels(["/srv/api/", "/opt/api"])).toEqual(["srv/api", "opt/api"]);
   });
 
   test("a trailing slash does not produce an empty name", () => {

@@ -331,7 +331,8 @@ function LiveWorktreeOptions({
 
   // Workspace names, in order — the same slugs the server uses. They key the
   // summary lines' test ids (stable, sanitized, unique) but are NOT
-  // user-facing: the label is the project's own name, with the full path
+  // user-facing: the label is the project's own name, with just enough parent
+  // folders to tell apart two projects that share one (`billing/api`)
   // appended when two selected projects share a basename (grill decision 11),
   // so the user can tell which repository a line belongs to.
   const names = useMemo(() => selectionNames(repos), [repos]);

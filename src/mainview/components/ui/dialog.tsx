@@ -215,7 +215,12 @@ export function Dialog({
       aria-modal="true"
       aria-labelledby={labelledBy}
       aria-describedby={describedBy}
-      className="fixed inset-0 z-50 flex items-center justify-center bg-black/60 p-4"
+      // `!m-0`: a Dialog is often rendered inline as a sibling inside a
+      // spacing utility (`WorktreeOptions`' `space-y-3`), whose
+      // `> :not([hidden]) ~ :not([hidden])` rule would otherwise give this
+      // fixed overlay a top margin and leave a strip of the page uncovered
+      // above the backdrop. A full-window overlay never takes layout margins.
+      className="fixed inset-0 z-50 !m-0 flex items-center justify-center bg-black/60 p-4"
       onClick={() => {
         if (closeOnBackdrop) onCloseRef.current();
       }}

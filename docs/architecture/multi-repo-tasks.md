@@ -484,7 +484,10 @@ subdirectory selections under one root are not serialized against each other.)
   keeps no base ref (HEAD at create time) and a seed can never conflict with a
   pick on the same root. The form shows one read-only `Branch · <project>`
   summary line per project (the saved ref, or "current branch") that reopens
-  the dialog. Each saved ref rides `repositories[].baseRef` through the one
+  the dialog. Two projects that share a basename are labelled with the fewest
+  trailing folders that tell them apart (`billing/api`, `identity/api`;
+  `projectRowLabels`), so a truncated label still shows the difference; the
+  full path is the line's tooltip. Each saved ref rides `repositories[].baseRef` through the one
   `selectionPayload` mapping. Exactly one project sends the
   single-repository shape (`workdir` + top-level `baseRef`) so a non-git folder
   with isolation off still creates; 2+ force `isolation: "worktree"` and send

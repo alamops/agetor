@@ -68,14 +68,34 @@ export function projectSelectionLabel(entries: readonly Pick<RepoSelection, "pat
   return `${kept.length} projects selected`;
 }
 
-/** One row label per path, in order. When two displayed names collide
- *  (`/a/api`, `/b/api`), every colliding row appends its full path so the
- *  user — and the tests — can tell them apart. */
+/** One row label per path, in order: the raw basename, or — when two
+ *  displayed names collide (`/work/billing/api`, `/work/identity/api`) — the
+ *  fewest trailing folders that tell that path apart from the others with the
+ *  same name (`billing/api`, `identity/api`). A full path would put the
+ *  distinguishing part at the end, which is exactly what a narrow label
+ *  truncates away. When no shorter suffix is unique (`/api` vs `/x/api`) the
+ *  full path is used. */
 export function projectRowLabels(paths: readonly string[]): string[] {
   const names = paths.map(projectDisplayName);
-  const seen = new Map<string, number>();
-  for (const name of names) seen.set(name, (seen.get(name) ?? 0) + 1);
-  return names.map((name, i) => (seen.get(name)! > 1 ? `${name} — ${paths[i]}` : name));
+  const groups = new Map<string, number[]>();
+  names.forEach((name, i) => groups.set(name, [...(groups.get(name) ?? []), i]));
+  return names.map((name, i) => {
+    const group = groups.get(name)!;
+    if (group.length < 2) return name;
+    const others = group.filter((j) => j !== i).map((j) => paths[j]!);
+    for (let k = 2; ; k++) {
+      const label = trailingSegments(paths[i]!, k);
+      if (others.every((other) => trailingSegments(other, k) !== label)) return label;
+      if (label === paths[i]) return label;
+    }
+  });
+}
+
+/** The last `k` segments of `path` joined with `/`, or the whole path once it
+ *  has fewer than `k` segments (so the search always ends on a unique label). */
+function trailingSegments(path: string, k: number): string {
+  const segments = path.replace(/[\\/]+$/, "").split(/[\\/]/).filter(Boolean);
+  return segments.length < k ? path : segments.slice(-k).join("/");
 }
 
 /** Replace one entry's base ref, preserving order, roots and every other

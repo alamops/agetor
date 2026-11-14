@@ -36,7 +36,8 @@ import { uniqueRepoSlugs } from "../src/shared/multi-repo.ts";
  *      and distinct workspace test ids;
  *  c3. Isolate unchecked on one project → 2+ forces it on → collapsing back to
  *      one leaves it checked and editable (the load-bearing forced-on effect);
- *  d. outside clicks leave the dialog open; Escape and Cancel close it;
+ *  d. outside clicks leave the dialog open; Escape and Cancel close it; the
+ *     backdrop covers the whole window (no inherited sibling margin);
  *  e. search filters the rows (and the box is focused on open);
  *  f. a zero draft disables Save and shows the hint;
  *  g. a submit keeps the selection and its refs while the branch name resets;
@@ -479,10 +480,12 @@ test("projects sharing a basename keep distinct labeled rows and test ids", asyn
   expect(slugB).toBe("api-2");
 
   await expect(form.getByTestId("select-projects-button")).toContainText("2 projects selected");
-  // Rows are labelled with the project name, disambiguated by the full path
+  // Rows are labelled with the project name, disambiguated by its parent
   // when two names collide — never by the sanitized workspace slug alone.
-  await expect(branchRow(form, slugA!)).toContainText(`Branch · api — ${repoDupA}`);
-  await expect(branchRow(form, slugB!)).toContainText(`Branch · api — ${repoDupB}`);
+  await expect(branchRow(form, slugA!)).toContainText(`Branch · ${path.basename(path.dirname(repoDupA))}/api`);
+  await expect(branchRow(form, slugB!)).toContainText(`Branch · ${path.basename(path.dirname(repoDupB))}/api`);
+  // The full path is one hover away on each line.
+  await expect(branchRow(form, slugA!).locator(`[title="${repoDupA}"]`)).toHaveCount(1);
 
   const isolate = form.getByTestId("isolate-toggle");
   await expect(isolate).toBeChecked();
@@ -493,6 +496,13 @@ test("outside clicks leave the dialog open; Escape and Cancel close it", async (
   await gotoApp(page, backend.bootBase);
   const form = newTaskForm(page);
   const dialog = await openSelectProjects(page, form);
+
+  // The backdrop covers the whole window. The dialog renders inside
+  // WorktreeOptions' `space-y-3` column, whose sibling margin once pushed the
+  // fixed overlay 12px down and left a strip of the board uncovered on top.
+  const viewport = page.viewportSize()!;
+  const box = await dialog.boundingBox();
+  expect(box).toEqual({ x: 0, y: 0, width: viewport.width, height: viewport.height });
 
   await page.mouse.click(10, 10);
   await expect(dialog).toBeVisible();
