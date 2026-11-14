@@ -468,18 +468,37 @@ subdirectory selections under one root are not serialized against each other.)
 
 ## Surfaces
 
-- **New Task / issue dialog** — `RepositoriesDialog` selects two or more
-  projects (add folder, per-repo base, remove, dedupe by git root, non-blocking
-  warning above 10). One repository keeps today's inline project/branch/base,
-  and the dialog offers **no** per-repository base input for it. The inline
-  base ref seeds the first entry when the dialog opens, so adding a second
-  repository keeps it; saving back down to one repository hands that entry's
-  base ref back to the inline picker, and promoting a different first
-  repository resets it (or takes that entry's own pin). Entries that collapse
-  onto one git root keep a base ref set on any of them; two different base
-  refs on one root block the save with a message naming both. Closing the
-  dialog while its git-root lookup is in flight drops the result. 2+ shows a
-  summary and forces worktree isolation.
+- **New Task / issue dialog** — one **Select Projects** control
+  (`src/mainview/components/kanban/ProjectSelection.tsx` +
+  `SelectProjectsDialog.tsx`, rendered by `WorktreeOptions`): a full-width
+  button above Isolate whose label is the project name (one) or
+  `N projects selected` (2+, post-dedupe), opening a Save-based dialog with
+  search, multi-select, Add folder, Clone repository…, Import sessions… and
+  remove. Every checked row in the dialog carries its own `BranchPicker`
+  (branch list, Pull and Fetch on that project's checkout), opened with
+  `placement="inline"` so the dialog's scrolling list can't clip it; base refs
+  are part of the dialog's draft, applied by Save and discarded by Cancel.
+  Each picker preselects its project's current branch, but that seed only
+  fills the trigger: Save drops every ref the user didn't pick
+  (`keepUserPickedRefs`, before the root merge), so an untouched project
+  keeps no base ref (HEAD at create time) and a seed can never conflict with a
+  pick on the same root. The form shows one read-only `Branch · <project>`
+  summary line per project (the saved ref, or "current branch") that reopens
+  the dialog. Two projects that share a basename are labelled with the fewest
+  trailing folders that tell them apart (`billing/api`, `identity/api`;
+  `projectRowLabels`), so a truncated label still shows the difference; the
+  full path is the line's tooltip. Each saved ref rides `repositories[].baseRef` through the one
+  `selectionPayload` mapping. Exactly one project sends the
+  single-repository shape (`workdir` + top-level `baseRef`) so a non-git folder
+  with isolation off still creates; 2+ force `isolation: "worktree"` and send
+  one entry per project. 2+ also forces the checkbox on and disables it;
+  collapsing back to one leaves it checked and editable. Save resolves git
+  roots first: entries that collapse onto one root keep a base ref set on any
+  of them, two different base refs on one root keep the dialog open with an
+  error naming both, and closing while that lookup runs drops the result.
+  At least one project is required. The issue dialog locks its own repository
+  first in the same control; the PR-conflict dialog renders a disabled locked
+  button for the PR repo with its branch read-only and Isolate checked/disabled.
 - **`@` files** — client-side union over one `/files/index` per repository
   scope, entries prefixed `<name>/`, plus a `<name>/` root row per repository
   so `@frontend` itself resolves. Named scopes are passed only for a multi

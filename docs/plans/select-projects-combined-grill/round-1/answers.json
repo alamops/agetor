@@ -1,0 +1,170 @@
+{
+  "version": 1,
+  "formId": "select-projects-combined-grill-r1",
+  "title": "Grill — one Select Projects control for New Task",
+  "round": 1,
+  "mode": "served",
+  "specFile": "questions.json",
+  "specSha256": "e148c6111b89c99030082ce89bd20226fd6347802d3d438330d5f7707024dad9",
+  "submittedAt": "2026-11-13T16:00:52.897Z",
+  "receivedAt": "2026-11-13T16:00:52.907Z",
+  "answeredBy": null,
+  "summary": {
+    "total": 14,
+    "answered": 14,
+    "skipped": 0,
+    "unanswered": 0,
+    "optionalLeftBlank": 0,
+    "notApplicable": 0,
+    "acceptedRecommendations": 14,
+    "overrodeRecommendations": [],
+    "oneWayDoorsNotAnswered": [],
+    "withNotes": [
+      "branch-rows",
+      "apply-boundary",
+      "scope",
+      "button-label"
+    ],
+    "needsAnswer": [],
+    "complete": true
+  },
+  "answers": {
+    "branch-rows": {
+      "n": 1,
+      "title": "Where do the per-project Branch / Pull / Fetch rows live, and in what order?",
+      "type": "single",
+      "status": "answered",
+      "impact": "blocking",
+      "value": "inline-above",
+      "display": "Inline: button → branch rows → Isolate → Branch name",
+      "acceptedRecommendation": true,
+      "note": "btw, we're removing the one project/branch selection"
+    },
+    "apply-boundary": {
+      "n": 2,
+      "title": "Does the selection apply on Save, or immediately on every toggle?",
+      "type": "single",
+      "status": "answered",
+      "impact": "shape",
+      "value": "save",
+      "display": "Save / Cancel boundary (today's dialog)",
+      "acceptedRecommendation": true,
+      "note": "and avoid closing the modal/dialog when clicking outside"
+    },
+    "scope": {
+      "n": 3,
+      "title": "Does the combined control apply to the issue dialog too, or only New Task?",
+      "type": "single",
+      "status": "answered",
+      "impact": "blocking",
+      "value": "both",
+      "display": "Both surfaces; the issue's repo stays locked first",
+      "acceptedRecommendation": true,
+      "note": "issues, pr, resolve conflicts from the pr, new task, etc."
+    },
+    "minimum-one": {
+      "n": 4,
+      "title": "“One selection is required” — what happens when the user tries to deselect the last project?",
+      "type": "single",
+      "status": "answered",
+      "impact": "blocking",
+      "value": "zero-draft",
+      "display": "Allow zero in the draft; Save disabled with a “select at least one” hint",
+      "acceptedRecommendation": true
+    },
+    "button-label": {
+      "n": 5,
+      "title": "What exactly does the button say for 1 and for 2+ selected projects?",
+      "type": "single",
+      "status": "answered",
+      "impact": "shape",
+      "value": "name-count",
+      "display": "1 → project name; 2+ → “2 projects selected”",
+      "acceptedRecommendation": true,
+      "note": "but keep listing the project and branch selected under that, like we have today"
+    },
+    "tag-sha": {
+      "n": 6,
+      "title": "Do we keep a way to pin a tag or commit SHA per project?",
+      "type": "single",
+      "status": "answered",
+      "impact": "shape",
+      "value": "branch-only",
+      "display": "Branch rows only (parity with the single project)",
+      "acceptedRecommendation": true
+    },
+    "auto-select": {
+      "n": 7,
+      "title": "Auto-select the most recently added project when the form opens with nothing selected",
+      "type": "confirm",
+      "status": "answered",
+      "impact": "minor",
+      "value": "Keep it (today's `autoSelectFirst` behavior)",
+      "acceptedRecommendation": true
+    },
+    "isolate-collapse": {
+      "n": 8,
+      "title": "When a 2+ selection drops back to one project, what happens to Isolate?",
+      "type": "confirm",
+      "status": "answered",
+      "impact": "minor",
+      "value": "Stays checked and becomes editable",
+      "acceptedRecommendation": true
+    },
+    "pull-fetch": {
+      "n": 9,
+      "title": "Per-project Pull/Fetch exactly as today, with no “Pull all” / “Fetch all”",
+      "type": "confirm",
+      "status": "answered",
+      "impact": "minor",
+      "value": "Per-row Pull/Fetch only; no bulk action",
+      "acceptedRecommendation": true
+    },
+    "dialog-actions": {
+      "n": 10,
+      "title": "Dialog affordances: search, the three management actions, and the zero-project state",
+      "type": "confirm",
+      "status": "answered",
+      "impact": "minor",
+      "value": "Add a search filter; move Browse for folder / Clone repository / Import sessions into the dialog; keep the button enabled even with no projects registered",
+      "acceptedRecommendation": true
+    },
+    "row-label-remove": {
+      "n": 11,
+      "title": "How each per-project row is identified, and how a project is removed",
+      "type": "confirm",
+      "status": "answered",
+      "impact": "minor",
+      "value": "Rows read “Branch · <project name>” (path added when two names collide); removal happens only in the Select Projects dialog — no per-row X",
+      "acceptedRecommendation": true
+    },
+    "branch-name": {
+      "n": 12,
+      "title": "One shared Branch name for all projects, previewed from the first selected project's naming config",
+      "type": "confirm",
+      "status": "answered",
+      "impact": "minor",
+      "value": "One shared field; the preview uses the first selected project's `branchConfig`; the server applies one name with a per-repo `-N` fallback",
+      "acceptedRecommendation": true
+    },
+    "deduped-count": {
+      "n": 13,
+      "title": "The button count and the forced Isolate both use the git-root-deduped set",
+      "type": "confirm",
+      "status": "answered",
+      "impact": "minor",
+      "value": "Yes — count what the server will create, and keep the “(some share a git root)” note",
+      "acceptedRecommendation": true
+    },
+    "keep-selection": {
+      "n": 14,
+      "title": "After creating a task, keep the whole project selection for the next task",
+      "type": "confirm",
+      "status": "answered",
+      "impact": "minor",
+      "value": "Keep every selected project (and each branch ref) for the next task",
+      "acceptedRecommendation": true
+    }
+  },
+  "generalNotes": null
+}

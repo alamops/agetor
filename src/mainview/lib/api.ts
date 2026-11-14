@@ -943,7 +943,7 @@ export const api = {
     ),
   listProjects: () => j<Project[]>("/projects"),
   /** Resolve a selected path to its git top-level (issue #291) — used by the
-   *  Repositories dialog to dedupe a selection by repository root. */
+   *  Select Projects dialog to dedupe a selection by repository root. */
   getProjectRepoRoot: (path: string) =>
     j<{ root: string }>(`/projects/repo-root?path=${encodeURIComponent(path)}`),
   /** The native folder panel; registers the pick as a project. */

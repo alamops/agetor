@@ -1,0 +1,468 @@
+import { useEffect, useMemo, useRef, useState } from "react";
+import { FolderGit2, FolderPlus, GitBranch, Import, Loader2, Search, Trash2, TriangleAlert } from "lucide-react";
+import { api } from "@/lib/api";
+import { Button } from "@/components/ui/button";
+import { Dialog } from "@/components/ui/dialog";
+import { Input } from "@/components/ui/input";
+import { IDENTIFIER_INPUT_PROPS } from "@/lib/identifier-input";
+import {
+  dedupeSelections,
+  projectRowLabels,
+  selectionNames,
+  tooManyRepositories,
+  updateSelectionBaseRef,
+  type RepoSelection,
+} from "@/lib/repo-selection";
+import {
+  createSessionGuard,
+  describeRootConflict,
+  keepUserPickedRefs,
+  mergeSelectionsByRoot,
+  type RootConflict,
+} from "@/lib/multi-repo-ui";
+import { uniqueRepoSlugs } from "../../../shared/multi-repo.ts";
+import type { Project } from "../../../shared/types.ts";
+import { BranchPicker } from "./BranchPicker";
+import { CloneProjectDialog } from "./CloneProjectDialog";
+import { ImportSessionsDialog } from "./ImportSessionsDialog";
+
+interface Props {
+  open: boolean;
+  onClose: () => void;
+  /** The current selection (paths + already-resolved roots/refs). */
+  value: RepoSelection[];
+  /** Called with the deduped, ordered selection on Save. */
+  onSave: (next: RepoSelection[]) => void;
+  /** A path that must stay selected (the issue / PR dialog's own repository).
+   *  The row cannot be unchecked or removed; it is always first. */
+  lockedPath?: string | null;
+  /** The form's effective Isolate state, for the branch pickers' tooltip. A
+   *  draft of 2+ projects is always isolated regardless. */
+  isolate?: boolean;
+}
+
+/** Branch picker tooltip while the task will run in a worktree. The e2e specs
+ *  find the picker trigger by this exact text. */
+export const BASE_REF_TITLE =
+  "Base ref the worktree branches from. Pick the current branch row to use what's checked out at task start.";
+
+/** Branch picker tooltip when the single project runs with Isolate off. */
+export const BASE_REF_OFF_TITLE =
+  "Isolation is off — the value is recorded but the agent will run directly in the project workdir.";
+
+/**
+ * The combined project picker behind the full-width Select Projects button.
+ * One dialog for one project and for many: pick at least one registered
+ * project (or add a folder), search the list, choose the branch each selected
+ * project starts from, and dedupe by git root on Save.
+ *
+ * Every checked row carries the same `BranchPicker` the form used to show for
+ * a single project: the branch list plus Pull and Fetch, acting on that row's
+ * own checkout. The picker opens `placement="inline"` (in flow, under its
+ * trigger) because the list is a scrolling box that would clip a floating
+ * popover — see `docs/architecture/multi-repo-tasks.md`. Base refs are part of
+ * the draft: Save applies them with the selection, Cancel discards both.
+ *
+ * Each picker preselects its project's current branch on its own. That seed
+ * only fills the trigger: Save drops every ref the user didn't pick
+ * (`keepUserPickedRefs`), so the saved selection carries user picks only and an
+ * untouched project keeps "no base ref" (HEAD at create time).
+ *
+ * Save resolves each path's git root before applying: two subdirectories of one
+ * repository collapse to the first selected path (the server's own dedupe), a
+ * base ref set on a collapsed duplicate survives, and two different refs on one
+ * root block the save with a message naming both. Unchecking and re-checking a
+ * project within one dialog session restores its opening root and base ref, so
+ * a round-trip through the list can't silently drop a pin.
+ *
+ * Closing (Cancel, Escape) while a root lookup is in flight abandons it — the
+ * result is never applied after the user walked away. Outside clicks do not
+ * close it (`closeOnBackdrop={false}`): the draft only changes through Save.
+ */
+export function SelectProjectsDialog({ open, onClose, value, onSave, lockedPath, isolate = true }: Props) {
+  const [projects, setProjects] = useState<Project[]>([]);
+  const [draft, setDraft] = useState<RepoSelection[]>(value);
+  const [query, setQuery] = useState("");
+  const [picking, setPicking] = useState(false);
+  const [busy, setBusy] = useState(false);
+  const [conflicts, setConflicts] = useState<RootConflict[]>([]);
+  const [cloneOpen, setCloneOpen] = useState(false);
+  const [importOpen, setImportOpen] = useState(false);
+  // The entries this dialog opened with, so uncheck → recheck restores a root
+  // and base ref instead of rebuilding a bare `{ path, root: null }`.
+  const [opened, setOpened] = useState<RepoSelection[]>(value);
+  // Paths whose base ref the user picked (or that opened with one — a saved
+  // selection only ever holds picks). Everything else is a picker's automatic
+  // current-branch seed and is dropped on Save.
+  const [userRefs, setUserRefs] = useState<Set<string>>(() => userPickedPaths(value));
+  // Invalidated on every open, close and save attempt. A save's root lookup
+  // only applies while its own session is current.
+  const sessionRef = useRef(createSessionGuard());
+  // Opened with the cursor in the search box: the list can be long, and the
+  // first thing a user does here is narrow it.
+  const searchRef = useRef<HTMLInputElement>(null);
+
+  const refreshProjects = async () => {
+    try { setProjects(await api.listProjects()); }
+    catch { /* leave the previous list; the dialog still shows the draft */ }
+  };
+
+  useEffect(() => {
+    sessionRef.current.invalidate();
+    setBusy(false);
+    setPicking(false);
+    setConflicts([]);
+    setQuery("");
+    if (!open) return;
+    const seed = value;
+    setDraft(seed);
+    setOpened(seed);
+    setUserRefs(userPickedPaths(seed));
+    api.listProjects().then(setProjects).catch(() => setProjects([]));
+    // Re-seed only when the dialog opens; edits inside must not be reset by a
+    // parent re-render.
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [open]);
+
+  const paths = useMemo(() => new Set(draft.map((entry) => entry.path)), [draft]);
+  const names = useMemo(() => selectionNames(draft), [draft]);
+  const dedupedCount = useMemo(() => dedupeSelections(draft).length, [draft]);
+  // Every row shown, in a stable order: registered projects, then draft extras
+  // (from "Add folder"). Test ids are derived from the whole list so two
+  // projects sharing a basename (`/a/api`, `/b/api`) stay distinguishable.
+  const displayPaths = useMemo(() => {
+    const all = [
+      ...projects.map((project) => project.path),
+      ...draft.map((entry) => entry.path).filter((path) => !projects.some((p) => p.path === path)),
+    ];
+    return [...new Set(all)];
+  }, [projects, draft]);
+  const labels = useMemo(() => projectRowLabels(displayPaths), [displayPaths]);
+  const rowTestIds = useMemo(() => uniqueRepoSlugs(displayPaths), [displayPaths]);
+  const projectNames = useMemo(
+    () => new Map(projects.map((project) => [project.path, project.name])),
+    [projects],
+  );
+  const visible = useMemo(() => {
+    const q = query.trim().toLowerCase();
+    if (!q) return displayPaths.map((path, i) => ({ path, label: labels[i]!, testId: rowTestIds[i]! }));
+    return displayPaths
+      .map((path, i) => ({ path, label: labels[i]!, testId: rowTestIds[i]! }))
+      .filter((row) =>
+        row.label.toLowerCase().includes(q)
+        || row.path.toLowerCase().includes(q)
+        // A project can be registered under a friendly name that differs from
+        // its directory basename; users search for the name they gave it.
+        || (projectNames.get(row.path) ?? "").toLowerCase().includes(q));
+  }, [displayPaths, labels, rowTestIds, projectNames, query]);
+
+  const close = () => {
+    sessionRef.current.invalidate();
+    setBusy(false);
+    onClose();
+  };
+
+  const toggle = (path: string) => {
+    // While a Save's root lookup is in flight its resolved list (captured at
+    // click time) is what would be applied; ignore and disable late edits so a
+    // selection change can't be silently overwritten.
+    if (path === lockedPath || busy) return;
+    setConflicts([]);
+    const removing = draft.some((entry) => entry.path === path);
+    const original = opened.find((entry) => entry.path === path);
+    setDraft((cur) => {
+      if (cur.some((entry) => entry.path === path)) return cur.filter((entry) => entry.path !== path);
+      return [...cur, original ? { ...original } : { path, root: null }];
+    });
+    // The pick marker follows the row: gone with it, and back only when the
+    // restored opening entry brings its (saved, so user-picked) ref back.
+    setUserRefs((cur) => {
+      const next = new Set(cur);
+      next.delete(path);
+      if (!removing && original?.baseRef?.trim()) next.add(path);
+      return next;
+    });
+  };
+
+  // A branch the user picked in a row's picker. A blank pick (the synthetic
+  // HEAD row) clears the ref and its marker.
+  const pickRef = (path: string, ref: string) => {
+    if (busy) return;
+    setConflicts([]);
+    setDraft((cur) => updateSelectionBaseRef(cur, path, ref));
+    setUserRefs((cur) => {
+      const next = new Set(cur);
+      if (ref.trim()) next.add(path);
+      else next.delete(path);
+      return next;
+    });
+  };
+
+  // The picker's automatic "current branch" seed: shown in the trigger, never
+  // marked as a pick, dropped on Save.
+  const seedRef = (path: string, ref: string) => {
+    setDraft((cur) => updateSelectionBaseRef(cur, path, ref));
+  };
+
+  const addFolder = async () => {
+    if (busy) return;
+    // Claim this dialog session before the native panel opens. Closing or
+    // reopening the dialog invalidates it, so a late pick can't land in a
+    // draft the user has already left (or started over).
+    const session = sessionRef.current.begin();
+    setPicking(true);
+    try {
+      // Start the native panel at the current selection, like the retired
+      // single-project picker did with its own value. The first selected
+      // project is the closest equivalent (and empty when nothing is picked
+      // yet).
+      const picked = await api.pickProject(draft[0]?.path);
+      if (!sessionRef.current.isCurrent(session) || !picked.project) return;
+      const path = picked.project.path;
+      if (!paths.has(path)) setDraft((cur) => [...cur, { path, root: null }]);
+      if (!projects.some((project) => project.path === path)) {
+        setProjects((cur) => [picked.project!, ...cur]);
+      }
+    } catch {
+      /* the native picker can be cancelled or fail; nothing to do */
+    } finally {
+      if (sessionRef.current.isCurrent(session)) setPicking(false);
+    }
+  };
+
+  const save = async () => {
+    if (draft.length === 0 || busy) return;
+    const session = sessionRef.current.begin();
+    setBusy(true);
+    setConflicts([]);
+    try {
+      // Only refs the user picked are saved (see the component doc), and
+      // dropping the automatic seeds before the merge means a seed can never
+      // conflict with a pick on a sibling path of the same repository.
+      const picked = keepUserPickedRefs(draft, userRefs);
+      // Resolve git roots so two paths under one repository collapse to the
+      // first selected path. A failure leaves the root unknown (kept).
+      const resolved = await Promise.all(
+        picked.map(async (entry) => {
+          if (entry.root) return entry;
+          try {
+            const { root } = await api.getProjectRepoRoot(entry.path);
+            return { ...entry, root };
+          } catch {
+            return entry;
+          }
+        }),
+      );
+      // Cancelled, closed or reopened while the lookup ran: not ours to apply.
+      if (!sessionRef.current.isCurrent(session)) return;
+      const merged = mergeSelectionsByRoot(resolved);
+      if (merged.conflicts.length > 0) {
+        // Keep the dialog open on the resolved roots so the user can settle
+        // the conflicting refs in the rows' branch pickers.
+        setDraft(resolved);
+        setConflicts(merged.conflicts);
+        return;
+      }
+      onSave(merged.kept);
+      onClose();
+    } finally {
+      if (sessionRef.current.isCurrent(session)) setBusy(false);
+    }
+  };
+
+  return (
+    <>
+      <Dialog
+        open={open}
+        onClose={close}
+        labelledBy="select-projects-dialog-title"
+        closeOnBackdrop={false}
+        initialFocusRef={searchRef}
+        className="w-[32rem] max-w-[92vw]"
+      >
+        <div className="flex items-start justify-between gap-3">
+          <div className="min-w-0">
+            <h2 id="select-projects-dialog-title" className="flex items-center gap-2 text-sm font-semibold">
+              <FolderGit2 className="h-4 w-4" /> Select projects
+            </h2>
+            <p className="mt-1 text-xs text-muted-foreground">
+              Pick one or more projects and the branch each one starts from. Two or more use worktree
+              isolation.
+            </p>
+          </div>
+          <Button size="sm" variant="outline" onClick={() => void addFolder()} disabled={picking || busy}>
+            {picking ? <Loader2 className="h-3.5 w-3.5 animate-spin" /> : <FolderPlus className="h-3.5 w-3.5" />}
+            Add folder
+          </Button>
+        </div>
+
+        <div className="mt-3 flex items-center gap-2 rounded-md border border-border/60 px-2 py-1">
+          <Search className="size-3.5 shrink-0 opacity-60" aria-hidden />
+          <Input
+            ref={searchRef}
+            data-testid="select-projects-search"
+            {...IDENTIFIER_INPUT_PROPS}
+            value={query}
+            onChange={(e) => setQuery(e.target.value)}
+            placeholder="Search projects…"
+            aria-label="Search projects"
+            className="h-7 border-0 px-0 text-xs shadow-none focus-visible:ring-0"
+          />
+        </div>
+
+        <div className="mt-2 max-h-[min(60vh,calc(100vh_-_18rem))] space-y-1 overflow-y-auto" data-testid="select-projects-list">
+          {visible.length === 0 ? (
+            query.trim() ? (
+              <p className="py-6 text-center text-xs text-muted-foreground">No matches.</p>
+            ) : (
+              <div className="py-6 text-center text-xs text-muted-foreground">
+                <p>No projects yet.</p>
+                <Button
+                  size="sm"
+                  variant="outline"
+                  className="mt-2"
+                  onClick={() => void addFolder()}
+                  disabled={picking || busy}
+                >
+                  <FolderPlus className="h-3.5 w-3.5" /> Add folder
+                </Button>
+              </div>
+            )
+          ) : null}
+          {visible.map(({ path, label, testId }) => {
+            const selected = paths.has(path);
+            const idx = draft.findIndex((entry) => entry.path === path);
+            const lockedRow = path === lockedPath;
+            return (
+              <div
+                key={path}
+                className="rounded-md border border-border/60 px-2 py-1.5"
+                data-testid={`select-projects-row-${testId}`}
+              >
+                <div className="flex items-center gap-2">
+                  <label className="flex min-w-0 flex-1 cursor-pointer items-center gap-2 text-xs">
+                    <input
+                      type="checkbox"
+                      checked={selected}
+                      disabled={lockedRow || busy}
+                      onChange={() => toggle(path)}
+                      aria-label={`Select ${path}`}
+                    />
+                    <span className="min-w-0 shrink-0 truncate font-medium">{label}</span>
+                    <span className="min-w-0 flex-1 truncate text-muted-foreground" title={path}>{path}</span>
+                    {selected ? (
+                      <span className="shrink-0 text-[10px] text-muted-foreground">{names[idx]}</span>
+                    ) : null}
+                  </label>
+                  {selected ? (
+                    <Button
+                      size="icon"
+                      variant="ghost"
+                      className="h-7 w-7 shrink-0"
+                      aria-label={`Remove ${path}`}
+                      disabled={lockedRow || busy}
+                      title={lockedRow ? "The issue's repository is always included" : undefined}
+                      onClick={() => toggle(path)}
+                    >
+                      <Trash2 className="h-3.5 w-3.5" />
+                    </Button>
+                  ) : null}
+                </div>
+                {selected ? (
+                  <div className="mt-1 pl-6 text-xs" data-testid="select-projects-branch">
+                    <BranchPicker
+                      label="Branch"
+                      workdir={path}
+                      value={draft[idx]?.baseRef ?? ""}
+                      onChange={(next) => pickRef(path, next)}
+                      onAutoSelect={(next) => seedRef(path, next)}
+                      placement="inline"
+                      disabled={busy}
+                      title={isolate || dedupedCount > 1 ? BASE_REF_TITLE : BASE_REF_OFF_TITLE}
+                    />
+                  </div>
+                ) : null}
+              </div>
+            );
+          })}
+        </div>
+
+        {tooManyRepositories(dedupedCount) ? (
+          <p className="mt-2 flex items-center gap-1.5 text-xs text-warning">
+            <TriangleAlert className="h-3.5 w-3.5" />
+            {dedupedCount} repositories — preparation may be slow. There is no hard limit.
+          </p>
+        ) : null}
+
+        {conflicts.length > 0 ? (
+          <p className="mt-2 flex items-start gap-1.5 text-xs text-destructive" role="alert" data-testid="select-projects-save-error">
+            <TriangleAlert className="mt-0.5 h-3.5 w-3.5 shrink-0" />
+            {conflicts.map(describeRootConflict).join(" ")}
+          </p>
+        ) : null}
+
+        {draft.length === 0 ? (
+          <p className="mt-2 text-xs text-warning">Select at least one project.</p>
+        ) : null}
+
+        <div className="mt-3 flex items-center justify-between gap-2">
+          <span className="min-w-0 truncate text-xs text-muted-foreground">
+            {draft.length} selected
+            {draft.length !== dedupeSelections(draft).length ? " (some share a git root)" : ""}
+          </span>
+          <div className="flex shrink-0 items-center gap-2">
+            <button
+              type="button"
+              data-testid="project-clone-open"
+              onClick={() => setCloneOpen(true)}
+              disabled={busy}
+              className="inline-flex items-center gap-1 rounded px-1 text-xs text-muted-foreground transition-colors hover:text-foreground disabled:cursor-not-allowed disabled:opacity-50"
+            >
+              <GitBranch className="size-3.5" aria-hidden />
+              Clone repository…
+            </button>
+            <button
+              type="button"
+              data-testid="project-import-sessions-open"
+              onClick={() => setImportOpen(true)}
+              disabled={busy}
+              className="inline-flex items-center gap-1 rounded px-1 text-xs text-muted-foreground transition-colors hover:text-foreground disabled:cursor-not-allowed disabled:opacity-50"
+            >
+              <Import className="size-3.5" aria-hidden />
+              Import sessions…
+            </button>
+          </div>
+        </div>
+
+        <div className="mt-3 flex items-center justify-end gap-2">
+          <Button size="sm" variant="outline" onClick={close}>
+            Cancel
+          </Button>
+          <Button size="sm" onClick={() => void save()} disabled={busy || picking || draft.length === 0}>
+            {busy ? <Loader2 className="h-3.5 w-3.5 animate-spin" /> : null}
+            Save
+          </Button>
+        </div>
+      </Dialog>
+      {/* Mounted as siblings of the dialog (not in its scrolling body): the
+          nested dialog takes focus, and a footer inside the panel would be
+          unmounted mid-flow on some browsers. */}
+      <CloneProjectDialog
+        open={cloneOpen}
+        onClose={() => setCloneOpen(false)}
+        onCloned={() => { void refreshProjects(); }}
+      />
+      <ImportSessionsDialog
+        open={importOpen}
+        onClose={() => setImportOpen(false)}
+        onImported={() => { void refreshProjects(); }}
+      />
+    </>
+  );
+}
+
+/** The paths of a saved selection that carry a base ref: every one of them was
+ *  a user pick when it was saved. */
+function userPickedPaths(entries: readonly RepoSelection[]): Set<string> {
+  return new Set(entries.filter((entry) => !!entry.baseRef?.trim()).map((entry) => entry.path));
+}

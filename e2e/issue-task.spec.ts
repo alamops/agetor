@@ -5,7 +5,7 @@ import { tmpdir } from "node:os";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
 import { test, expect, type APIRequestContext, type E2EBackend, type Locator, type Page } from "./fixtures";
-import { gotoApp } from "./helpers";
+import { dialogBranchPicker, gotoApp, openSelectProjects, selectBaseBranch } from "./helpers";
 import { startGitHubStub, type GitHubStub, type StubRoute } from "./github-stub";
 
 /**
@@ -738,7 +738,7 @@ test.describe("task from a Git issue", () => {
     createdTaskIds.splice(createdTaskIds.indexOf(taskId), 1);
   });
 
-  test("repositories dialog: the issue's repository is locked and an extra repo is added", async ({
+  test("select projects: the issue's repository is locked and an extra repo is added", async ({
     page,
     request,
     backend,
@@ -747,8 +747,11 @@ test.describe("task from a Git issue", () => {
     await gotoApp(page, backend.bootBase);
     const issueTaskDialog = await openIssueTaskDialog(page);
 
-    await issueTaskDialog.getByTestId("issue-repositories").getByRole("button", { name: "Manage" }).click();
-    const reposDialog = page.getByRole("dialog", { name: "Repositories" });
+    // The old separate "Repositories / Manage" control is gone: the same
+    // full-width Select Projects button New Task uses is the only surface.
+    await expect(issueTaskDialog.getByRole("button", { name: "Manage", exact: true })).toHaveCount(0);
+    await issueTaskDialog.getByTestId("select-projects-button").click();
+    const reposDialog = page.getByRole("dialog", { name: "Select projects" });
     await expect(reposDialog).toBeVisible({ timeout: CONVERGE_TIMEOUT });
 
     // The issue's own repository is pinned by `lockedPath`: it starts
@@ -763,6 +766,10 @@ test.describe("task from a Git issue", () => {
     await reposDialog.getByLabel(`Select ${extraRepoDir}`, { exact: true }).check();
     await reposDialog.getByRole("button", { name: "Save", exact: true }).click();
     await expect(reposDialog).toBeHidden({ timeout: CONVERGE_TIMEOUT });
+    await expect(issueTaskDialog.getByTestId("select-projects-button")).toContainText("2 projects selected");
+    // Two projects force (and disable) worktree isolation.
+    await expect(issueTaskDialog.getByTestId("isolate-toggle")).toBeChecked();
+    await expect(issueTaskDialog.getByTestId("isolate-toggle")).toBeDisabled();
 
     await expect(issueTaskDialog.getByTestId("issue-task-submit")).toBeEnabled({
       timeout: CONVERGE_TIMEOUT,
@@ -834,23 +841,24 @@ test.describe("task from a Git issue", () => {
 
     const worktreeOptions = issueTaskDialog.getByTestId("worktree-options");
 
-    // BranchPicker's label and its SearchSelect trigger aren't DOM siblings
-    // (the label shares a flex row with the Git Pull/Fetch buttons), so find
-    // the trigger by its tooltip instead — WorktreeOptions.tsx sets this
-    // exact title while isolated.
-    const branchTrigger = worktreeOptions.getByTitle(BRANCH_PICKER_TITLE);
-    await branchTrigger.scrollIntoViewIfNeeded();
+    // The issue repo's branch picker lives under its row in the Select
+    // Projects dialog (nested in this one). Its trigger carries this exact
+    // tooltip while isolated (SelectProjectsDialog.tsx's BASE_REF_TITLE).
+    const projects = await openSelectProjects(page, issueTaskDialog);
+    const branchTrigger = projects.getByTitle(BRANCH_PICKER_TITLE);
     await branchTrigger.click();
 
-    const search = worktreeOptions.getByPlaceholder("Search branches…");
+    const search = projects.getByPlaceholder("Search branches…");
     await expect(search).toBeVisible({ timeout: CONVERGE_TIMEOUT });
     await search.fill("develop");
 
-    const popover = worktreeOptions.locator("[data-popover-open]");
+    const popover = projects.locator("[data-popover-open]");
     const developRow = popover.locator("button").filter({ hasText: "develop" }).first();
     await expect(developRow).toBeVisible({ timeout: CONVERGE_TIMEOUT });
-    await developRow.scrollIntoViewIfNeeded();
     await developRow.click();
+    await projects.getByRole("button", { name: "Save", exact: true }).click();
+    await expect(projects).toBeHidden({ timeout: CONVERGE_TIMEOUT });
+    await expect(worktreeOptions.getByTestId("selected-branches")).toContainText("develop");
 
     const branchNameInput = worktreeOptions.getByTestId("branch-name-input");
     await expect(branchNameInput).toBeVisible();
@@ -1359,16 +1367,47 @@ test.describe("task from a Git issue", () => {
     await page.getByTestId("pipelines-back").click();
     await expect(page.getByTestId("pipelines-page")).toHaveCount(0, { timeout: CONVERGE_TIMEOUT });
     issueTaskDialog = await openIssueTaskDialog(page);
-    // Wait for BranchPicker's automatic "preselect the current branch" seed
-    // (`main`) to land BEFORE opening Manage: that seed must not count as a
-    // user edit, or a pristine draft would ask "Discard…?" here (execution
-    // note 1: `baseRefDirty` split from the auto-selected `baseRef`).
-    await expect(
-      issueTaskDialog.getByTestId("worktree-options").getByTitle(BRANCH_PICKER_TITLE),
-    ).toContainText("main", { timeout: CONVERGE_TIMEOUT });
+    // Open Select Projects, let BranchPicker's automatic "preselect the
+    // current branch" seed (`main`) land, and Save without touching it: the
+    // seed is dropped on Save, so it must not count as a user edit, or a
+    // pristine draft would ask "Discard…?" here.
+    const projects = await openSelectProjects(page, issueTaskDialog);
+    await expect(dialogBranchPicker(projects, projectDir).getByTitle(BRANCH_PICKER_TITLE)).toContainText("main", {
+      timeout: CONVERGE_TIMEOUT,
+    });
+    await projects.getByRole("button", { name: "Save", exact: true }).click();
+    await expect(projects).toBeHidden({ timeout: CONVERGE_TIMEOUT });
+    await expect(issueTaskDialog.getByTestId("selected-branches")).toContainText("current branch");
     manage = await openPipelineManageRow(issueTaskDialog);
     await manage.click();
     await expect(issueTaskDialog).toBeHidden({ timeout: CONVERGE_TIMEOUT });
     await expect(page.getByTestId("pipelines-page")).toBeVisible({ timeout: CONVERGE_TIMEOUT });
+  });
+
+  test("pipeline picker: a user-picked base ref counts as a dirty draft", async ({ page, backend }) => {
+    test.setTimeout(90_000);
+    await gotoApp(page, backend.bootBase);
+    const issueTaskDialog = await openIssueTaskDialog(page);
+    const summary = issueTaskDialog.getByTestId("worktree-options").getByTestId("selected-branches");
+
+    // BranchPicker's automatic "preselect the current branch" seed must not
+    // count as a user edit (covered by the clean case above), but a ref the
+    // user picks themselves and saves must: only picks are saved, and a saved
+    // ref is what sets `refDirty`.
+    await selectBaseBranch(page, issueTaskDialog, projectDir, "develop");
+    await expect(summary).toContainText("develop", { timeout: CONVERGE_TIMEOUT });
+
+    const manage = await openPipelineManageRow(issueTaskDialog);
+    await manage.click();
+    await expect(page.getByText("Discard this task draft and open Pipelines?")).toBeVisible({
+      timeout: CONVERGE_TIMEOUT,
+    });
+    // Cancel keeps the dialog and the picked ref.
+    const confirmDialog = page
+      .locator('[role="dialog"]')
+      .filter({ has: page.getByText("Discard this task draft and open Pipelines?") });
+    await confirmDialog.getByRole("button", { name: "Cancel", exact: true }).click();
+    await expect(issueTaskDialog).toBeVisible();
+    await expect(summary).toContainText("develop");
   });
 });

@@ -174,8 +174,8 @@ export const ROUTE_POLICY: Record<string, PolicyEntry> = {
   "/projects/clone/:cloneId": { DELETE: CLI },
   "/projects/pick": { POST: app({ headless501: true }) },
   "/projects/branches": { GET: cli({ pathParams: QUERY_PATH }) },
-  // Only the webview's Repositories dialog resolves a selection's git root; no
-  // CLI or TUI caller exists, so it stays off the CLI token's surface.
+  // Only the webview's Select Projects dialog resolves a selection's git root;
+  // no CLI or TUI caller exists, so it stays off the CLI token's surface.
   "/projects/repo-root": { GET: APP },
   "/projects/settings": {
     GET: cli({ pathParamsExempt: EXEMPT_DB }),

@@ -12,9 +12,9 @@ interface Props {
   /**
    * Called instead of `onChange` for the automatic "pre-select the current
    * branch" seed when branches first arrive. Lets a caller distinguish a
-   * programmatic seed from a real user pick — `WorktreeOptions` uses it so a
-   * dialog's unsaved-draft check doesn't count the auto-selected current
-   * branch as a user change. Defaults to `onChange`.
+   * programmatic seed from a real user pick — the shared worktree block uses
+   * it so a dialog's unsaved-draft check doesn't count the auto-selected
+   * current branch as a user change. Defaults to `onChange`.
    */
   onAutoSelect?: (next: string) => void;
   className?: string;
@@ -26,7 +26,9 @@ interface Props {
   label?: string;
   /** Tooltip on the trigger. */
   title?: string;
-  placement?: "top" | "bottom";
+  /** Forwarded to `SearchSelect`; "inline" keeps the branch list in flow so a
+   *  scrolling parent (the Select Projects dialog's list) can't clip it. */
+  placement?: "top" | "bottom" | "inline";
   disabled?: boolean;
 }
 
@@ -295,6 +297,7 @@ export function BranchPicker({ workdir, value, onChange, onAutoSelect, className
         disabled={disabled}
         title={title ?? (error ? `Couldn't list branches: ${error}` : undefined)}
         placeholder="Search branches…"
+        triggerTestId="branch-picker-trigger"
         emptyLabel="HEAD"
         leadingIcon={<GitBranch className="size-3.5" />}
         displayValue={(v) => (v === HEAD_VALUE ? "HEAD" : v)}

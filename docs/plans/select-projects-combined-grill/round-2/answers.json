@@ -1,0 +1,73 @@
+{
+  "version": 1,
+  "formId": "select-projects-combined-grill-r2",
+  "title": "Grill round 2 — PR surfaces, the summary under the button, and dialog dismissal",
+  "round": 2,
+  "mode": "served",
+  "specFile": "questions.json",
+  "specSha256": "4799c5dec8a139b6795a7722be9a76a0969edb0948bce24029f4bb4e0b588a9b",
+  "submittedAt": "2026-11-13T16:11:00.188Z",
+  "receivedAt": "2026-11-13T16:11:00.206Z",
+  "answeredBy": null,
+  "summary": {
+    "total": 4,
+    "answered": 4,
+    "skipped": 0,
+    "unanswered": 0,
+    "optionalLeftBlank": 0,
+    "notApplicable": 0,
+    "acceptedRecommendations": 4,
+    "overrodeRecommendations": [],
+    "oneWayDoorsNotAnswered": [],
+    "withNotes": [],
+    "needsAnswer": [],
+    "complete": true
+  },
+  "answers": {
+    "scope-surfaces": {
+      "n": 1,
+      "title": "Which task-creation surfaces must use the combined Select Projects control?",
+      "type": "multi",
+      "status": "answered",
+      "impact": "blocking",
+      "value": [
+        "new-task",
+        "issue-dialog",
+        "pr-conflict-dialog"
+      ],
+      "display": "New Task panel; Issue task dialog (“Work on this with Agetor”); PR conflict dialog (“Resolve with Agetor”)",
+      "acceptedRecommendation": true
+    },
+    "pr-selection": {
+      "n": 2,
+      "title": "On the PR side, what may the combined control change?",
+      "type": "single",
+      "status": "answered",
+      "impact": "blocking",
+      "value": "locked-only",
+      "display": "Show the PR's repo locked in the same control; no extra projects",
+      "acceptedRecommendation": true
+    },
+    "summary-under-button": {
+      "n": 3,
+      "title": "What does “keep listing the project and branch selected under that” mean on the form?",
+      "type": "single",
+      "status": "answered",
+      "impact": "shape",
+      "value": "rows-are-the-list",
+      "display": "The per-project rows are the listing; no extra summary line",
+      "acceptedRecommendation": true
+    },
+    "dismiss-behavior": {
+      "n": 4,
+      "title": "Outside click is ignored — what about Escape, and which dialogs does that cover?",
+      "type": "single",
+      "status": "answered",
+      "impact": "shape",
+      "value": "select-escape",
+      "display": "Select Projects only: outside click ignored; Escape and Cancel still close",
+      "acceptedRecommendation": true
+    }
+  },
+  "generalNotes": null
+}

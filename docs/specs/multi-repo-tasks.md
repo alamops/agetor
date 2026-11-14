@@ -123,10 +123,21 @@ coordinate changes across every repository in that card.
 
 ### UI and CLI
 
-- One shared `Repositories` dialog is used by the New Task panel and `CreateTaskFromIssueDialog`.
-  It offers multi-select of registered projects, an `Add folder…` native picker, a per-repo base
-  branch and remove. The New Task panel shows a summary line with a `Manage` button; with exactly
-  one repo, today's inline branch/base fields stay.
+- One shared **Select Projects** control is used by the New Task panel and
+  `CreateTaskFromIssueDialog`: a single full-width button above the Isolate checkbox, labelled with
+  the selected project's name (one) or `N projects selected` (2+, post-dedupe). It opens a Save-based
+  dialog with a search box, multi-select of registered projects, `Add folder…`, Clone repository…,
+  Import sessions… and remove. Every checked project in the dialog gets the same branch picker the
+  single project always had (branch list, Pull, Fetch), listed in place under its row; the branches
+  apply with the selection on Save and Cancel discards both. A project whose branch the user didn't
+  pick keeps no base ref (HEAD at create time). The form shows a read-only `Branch · <project>` line
+  per project with the saved branch (or "current branch"), and each chosen base ref rides
+  `repositories[].baseRef`. At least one
+  project is required (Save is disabled at zero). Two or more deduped projects force worktree
+  isolation and disable the Isolate checkbox; collapsing back to one leaves it checked and editable.
+  Exactly one project keeps the historical single-repository payload shape (`workdir` + top-level
+  `baseRef`), so a plain non-git folder with isolation off still creates. The issue dialog locks its
+  own repository first in the same control; the PR-conflict dialog renders it locked to the PR repo.
 - The card shows a worktree icon plus the repository count, with a hover tooltip naming every repository.
 - Repo filter and text search match any selected repo.
 - Full CLI/TUI parity: `agetor add --repo` (repeatable), `show`/`shell`/`rm` are repo-aware, the

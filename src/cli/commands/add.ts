@@ -938,7 +938,7 @@ export async function wizard(
       // (issue #291): one repository keeps today's single-pick flow, 2+ send
       // the whole set. Clack has no per-row editor, so multi selections are
       // followed by one optional base-ref prompt per repository — the same
-      // fields the webview's `RepositoriesDialog` exposes.
+      // fields the webview's `SelectProjectsDialog` + inline Branch rows expose.
       const OTHER = "__other__";
       const picked = await p.multiselect<string>({
         message: fixed

@@ -1,0 +1,243 @@
+{
+  "version": 1,
+  "id": "select-projects-combined-grill-r2",
+  "title": "Grill round 2 — PR surfaces, the summary under the button, and dialog dismissal",
+  "skill": "grill",
+  "slug": "select-projects-combined",
+  "round": 2,
+  "summary": "Round 1 is complete: all 14 answers accepted, no skips. Four notes added requirements I can't turn into plan items without guessing. This round is **4 short questions**.\n\nYour notes, quoted:\n\n1. `branch-rows`: “btw, we're removing the one project/branch selection” — folded into the record as an acceptance criterion (the single Project picker and single Branch row are gone; the combined control replaces them).\n2. `scope`: “issues, pr, resolve conflicts from the pr, new task, etc.” — Q1/Q2 below pin the exact surfaces and what selection means on the PR side.\n3. `button-label`: “but keep listing the project and branch selected under that, like we have today” — Q3 below.\n4. `apply-boundary`: “and avoid closing the modal/dialog when clicking outside” — Q4 below.",
+  "sections": [
+    {
+      "id": "surfaces",
+      "title": "Which surfaces",
+      "questions": [
+        {
+          "id": "scope-surfaces",
+          "type": "multi",
+          "title": "Which task-creation surfaces must use the combined Select Projects control?",
+          "impact": "blocking",
+          "why": "Each surface is a separate wiring job, dirty-check rewrite and e2e file. The PR side is the ambiguous one because it has no project selector today.",
+          "context": "Your note named “issues, pr, resolve conflicts from the pr, new task, etc.” I found three existing task-creation surfaces: New Task, `CreateTaskFromIssueDialog` (“Work on this with Agetor” on an issue), and `ResolveConflictsDialog` (“Resolve with Agetor” on a conflicted PR, which renders only the locked Branch row). A PR “work on this” entry does **not** exist today. The CLI/TUI already take repeatable `--repo`; there is no visual picker to combine there.",
+          "min": 1,
+          "evidence": [
+            {
+              "label": "issue surface",
+              "path": "src/mainview/components/kanban/CreateTaskFromIssueDialog.tsx",
+              "line": 414,
+              "lang": "tsx",
+              "code": "              <WorktreeOptions state={wt} variant={multiRepo ? \"multi\" : \"default\"} />"
+            },
+            {
+              "label": "PR conflict surface is locked",
+              "path": "src/mainview/components/kanban/ResolveConflictsDialog.tsx",
+              "line": 252,
+              "lang": "tsx",
+              "code": "              <WorktreeOptions locked={{ branch: context.headRef }} />"
+            },
+            {
+              "label": "PR opens straight from the GitHub dialog",
+              "path": "src/mainview/components/kanban/GitHubDialog.tsx",
+              "line": 8169,
+              "lang": "tsx",
+              "code": "      <ResolveConflictsDialog\n        open={resolveOpen}"
+            }
+          ],
+          "options": [
+            {
+              "id": "new-task",
+              "label": "New Task panel",
+              "description": "The surface the task text names; already decided.",
+              "consequence": "The baseline: button, per-project rows, forced Isolate."
+            },
+            {
+              "id": "issue-dialog",
+              "label": "Issue task dialog (“Work on this with Agetor”)",
+              "description": "Shares `CreateTaskFromIssueDialog`; the issue's repo is locked first.",
+              "consequence": "Same control as New Task; the issue repo cannot be unchecked, and the draft-dirty check must see every repo."
+            },
+            {
+              "id": "pr-conflict-dialog",
+              "label": "PR conflict dialog (“Resolve with Agetor”)",
+              "description": "Today it has only a read-only Branch row; the PR fixes the repo and the head branch.",
+              "consequence": "The combined control needs a locked-repo mode; a multi selection here is a new behaviour, not just a UI move."
+            },
+            {
+              "id": "pr-task-entry",
+              "label": "A new “Work on this PR with Agetor” entry",
+              "description": "Does not exist today; PRs only offer conflict resolution.",
+              "consequence": "New feature: a PR task flow, its prompt, and its acceptance coverage; larger than this change."
+            }
+          ],
+          "recommendation": {
+            "value": ["new-task", "issue-dialog", "pr-conflict-dialog"],
+            "reason": "The three existing task-creation surfaces; the PR entry would be a new feature rather than a consolidation of today's selectors."
+          }
+        },
+        {
+          "id": "pr-selection",
+          "type": "single",
+          "title": "On the PR side, what may the combined control change?",
+          "impact": "blocking",
+          "showIf": { "question": "scope-surfaces", "in": ["pr-conflict-dialog", "pr-task-entry"] },
+          "why": "Conflict resolution is defined on one PR's head branch. Extra repositories would produce a multi-repo task where only one repo has PR context.",
+          "context": "The PR dialog creates a task with `existingBranch: context.headRef` on `context.path`; the server rejects `existingBranch` for a multi-repo create (`orchestrator.ts:12518-12519`). So “lock the PR's repo and add extras” is not just a UI choice — it would need a different branch story for the extras.",
+          "evidence": [
+            {
+              "label": "multi + existingBranch is rejected",
+              "path": "src/bun/orchestrator.ts",
+              "line": 12518,
+              "lang": "ts",
+              "code": "  if (multiRepo && existingBranch) {\n    return { error: \"existingBranch isn't supported with multiple repositories — create the task on a fresh branch\" };"
+            },
+            {
+              "label": "PR head branch is the task branch",
+              "path": "src/mainview/components/kanban/ResolveConflictsDialog.tsx",
+              "line": 34,
+              "code": "\"Resolve with Agetor\" dialog for a PR's merge conflicts. Creates a task ON\nthe PR's head branch (`existingBranch: context.headRef`)"
+            }
+          ],
+          "options": [
+            {
+              "id": "locked-only",
+              "label": "Show the PR's repo locked in the same control; no extra projects",
+              "description": "The dialog has the same button/row language, but the repo and branch are fixed.",
+              "consequence": "Visual consistency and no contract change; the button opens a selection with one locked row."
+            },
+            {
+              "id": "extras",
+              "label": "Lock the PR's repo first, allow extra repositories",
+              "description": "A multi-repo conflict task.",
+              "consequence": "The server rejects `existingBranch` for 2+; the PR repo would need a different branch story and the prompt/diff/PR surfaces need a story for the extras. Large."
+            },
+            {
+              "id": "no-control",
+              "label": "Keep today's locked Branch row; no Select Projects on the PR side",
+              "description": "The PR dialog does not adopt the control.",
+              "consequence": "Least change; the combined control exists on New Task and the issue dialog only."
+            }
+          ],
+          "recommendation": {
+            "value": "locked-only",
+            "reason": "It honours “resolve conflicts from the PR” without inventing multi-repo conflict tasks the server cannot represent today."
+          }
+        }
+      ]
+    },
+    {
+      "id": "form",
+      "title": "The listing under the button",
+      "questions": [
+        {
+          "id": "summary-under-button",
+          "type": "single",
+          "title": "What does “keep listing the project and branch selected under that” mean on the form?",
+          "impact": "shape",
+          "why": "Decides whether the form gains a second listing above the per-project rows, or the rows themselves are the listing.",
+          "context": "You chose `1 → project name; 2+ → “2 projects selected”`, and the layout is button → branch rows → Isolate. Each branch row already reads `Branch · <project>` and shows the selected ref in its trigger. A separate summary line would repeat the same project/ref pairs directly above the rows.",
+          "evidence": [
+            {
+              "label": "the row that would be the listing",
+              "path": "src/mainview/components/kanban/WorktreeOptions.tsx",
+              "line": 316,
+              "lang": "tsx",
+              "code": "        <BranchPicker\n          label=\"Branch\"\n          workdir={workdir}\n          value={baseRef}"
+            },
+            {
+              "label": "today's 2+ summary lists names only",
+              "path": "src/mainview/components/kanban/NewTaskForm.tsx",
+              "line": 894,
+              "lang": "tsx",
+              "code": "                    <p className=\"text-muted-foreground\">\n                      {repos.map((r) => selectionName(r)).join(\", \")}\n                    </p>"
+            }
+          ],
+          "options": [
+            {
+              "id": "rows-are-the-list",
+              "label": "The per-project rows are the listing; no extra summary line",
+              "description": "Button label, then one `Branch · <project>` row per selected project.",
+              "consequence": "No duplicate information; the row label must always name the project (which Q11 of round 1 already requires)."
+            },
+            {
+              "id": "summary-line",
+              "label": "Add a compact summary line under the button, above the rows",
+              "description": "One line per project: name plus its selected branch.",
+              "consequence": "A second listing to keep in sync with the rows; the form grows by N lines."
+            },
+            {
+              "id": "keep-summary-card",
+              "label": "Keep the current 2+ summary card (project names) under the button, plus the rows",
+              "description": "The existing names-only card survives above the per-project rows.",
+              "consequence": "Keeps a familiar block, but it duplicates the row labels and still does not show branches."
+            }
+          ],
+          "recommendation": {
+            "value": "rows-are-the-list",
+            "reason": "The rows already show exactly the project + branch pair; a summary line would repeat it and drift when a ref changes."
+          }
+        }
+      ]
+    },
+    {
+      "id": "dismiss",
+      "title": "Dismissal",
+      "questions": [
+        {
+          "id": "dismiss-behavior",
+          "type": "single",
+          "title": "Outside click is ignored — what about Escape, and which dialogs does that cover?",
+          "impact": "shape",
+          "why": "The shared `Dialog` closes on both backdrop click and Escape. Changing it for one caller needs a scoped prop; changing it for all task dialogs changes every modal's manners.",
+          "context": "The shared primitive documents “Escape and backdrop click invoke `onClose`” and implements both (`dialog.tsx:57`, `:108`, `:211`). The issue and PR dialogs use the same primitive. Your note was on the Select Projects dialog, so the rule can be scoped to it or applied to every task-creation dialog.",
+          "evidence": [
+            {
+              "label": "documented behaviour",
+              "path": "src/mainview/components/ui/dialog.tsx",
+              "line": 57,
+              "code": " *  - Escape and backdrop click invoke `onClose`. `onClose` is captured into a"
+            },
+            {
+              "label": "Escape closes",
+              "path": "src/mainview/components/ui/dialog.tsx",
+              "line": 108,
+              "lang": "ts",
+              "code": "      if (e.key === \"Escape\") {"
+            },
+            {
+              "label": "backdrop click closes",
+              "path": "src/mainview/components/ui/dialog.tsx",
+              "line": 211,
+              "lang": "tsx",
+              "code": "      onClick={() => onCloseRef.current()}"
+            }
+          ],
+          "options": [
+            {
+              "id": "select-escape",
+              "label": "Select Projects only: outside click ignored; Escape and Cancel still close",
+              "consequence": "One scoped `closeOnBackdrop={false}`; keyboard exit remains, so the dialog is never trapped."
+            },
+            {
+              "id": "select-no-escape",
+              "label": "Select Projects only: outside click and Escape ignored; only Cancel/Save close",
+              "consequence": "Protects an in-progress selection hardest, but removes the keyboard exit and can feel stuck."
+            },
+            {
+              "id": "all-escape",
+              "label": "All task-creation dialogs: outside click ignored; Escape and Cancel still close",
+              "consequence": "Consistent across New Task, issue and PR dialogs; every backdrop-click close in those flows changes."
+            },
+            {
+              "id": "all-no-escape",
+              "label": "All task-creation dialogs: outside click and Escape ignored; only Cancel/Save close",
+              "consequence": "Most protective and most intrusive; a user without a mouse has only the buttons."
+            }
+          ],
+          "recommendation": {
+            "value": "select-escape",
+            "reason": "The note was about the new selection dialog; keeping Escape preserves a keyboard exit and avoids changing every other modal."
+          }
+        }
+      ]
+    }
+  ]
+}

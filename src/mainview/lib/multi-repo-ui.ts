@@ -1,8 +1,8 @@
 // Pure helpers behind the multi-repository webview surfaces (issue #291):
-// New Task / issue dialog base-ref carry, the Repositories dialog's git-root
-// merge, board search, the delete confirm, the open-folder guard and the run
-// panel's "Create all PRs" in-flight registry. Kept free of React and `api`
-// so each rule is unit-testable without a DOM harness.
+// the Select Projects dialog's git-root merge, board search, the delete
+// confirm, the open-folder guard and the run panel's "Create all PRs"
+// in-flight registry. Kept free of React and `api` so each rule is
+// unit-testable without a DOM harness.
 // Contract: docs/architecture/multi-repo-tasks.md.
 import type { Task, TaskRepository } from "../../shared/types.ts";
 import type { RepoSelection } from "./repo-selection.ts";
@@ -14,70 +14,7 @@ function refOf(entry: Pick<RepoSelection, "baseRef">): string | null {
   return ref ? ref : null;
 }
 
-// ── Base ref carry between the inline Branch picker and the dialog ─────────
-
-/**
- * The value the Repositories dialog opens with. While the task is a single
- * repository the inline Branch picker owns the base ref, so it is mirrored
- * into the first entry: adding a second repository then keeps it (and shows
- * it in that entry's own base-ref input) instead of silently branching the
- * first repository from HEAD. A multi selection is already per-entry and is
- * passed through unchanged.
- */
-export function seedRepositoriesDialogValue(
-  repos: readonly RepoSelection[],
-  primaryPath: string,
-  inlineBaseRef: string,
-): RepoSelection[] {
-  if (repos.length > 1) return [...repos];
-  const first: RepoSelection | null = repos[0] ?? (primaryPath ? { path: primaryPath, root: null } : null);
-  if (!first) return [];
-  const { baseRef: _stale, ...rest } = first;
-  const ref = inlineBaseRef.trim();
-  return [ref ? { ...rest, baseRef: ref } : rest];
-}
-
-/** What the inline Branch picker should do after a Repositories save. */
-export type InlineBaseRefChange = { kind: "keep" } | { kind: "set"; value: string };
-
-/**
- * Applies a saved selection to a form whose inline Branch picker owns the
- * single-repository base ref. Returns the selection to store (a single entry
- * never keeps a per-entry base ref, so a stale one can't resurface later),
- * the task's new primary project path, and what to do with the inline base
- * ref:
- * - a different first repository resets it, or takes that entry's own pin
- *   when the selection collapsed to it (the pin the user typed survives);
- * - the same first repository collapsing back to one carries its per-entry
- *   pin back into the inline picker when the user edited it in the dialog;
- * - otherwise the inline value is kept.
- */
-export function applyRepositoriesSave(
-  next: readonly RepoSelection[],
-  current: { primaryPath: string; inlineBaseRef: string },
-): { repos: RepoSelection[]; primaryPath: string; inlineBaseRef: InlineBaseRefChange } {
-  const first = next[0];
-  if (!first) return { repos: [], primaryPath: current.primaryPath, inlineBaseRef: { kind: "keep" } };
-  const promoted = first.path !== current.primaryPath;
-  if (next.length > 1) {
-    return {
-      repos: [...next],
-      primaryPath: first.path,
-      inlineBaseRef: promoted ? { kind: "set", value: "" } : { kind: "keep" },
-    };
-  }
-  const single: RepoSelection = { path: first.path, root: first.root };
-  const ref = first.baseRef === undefined ? undefined : first.baseRef.trim();
-  if (promoted) {
-    return { repos: [single], primaryPath: first.path, inlineBaseRef: { kind: "set", value: ref ?? "" } };
-  }
-  if (ref !== undefined && ref !== current.inlineBaseRef.trim()) {
-    return { repos: [single], primaryPath: first.path, inlineBaseRef: { kind: "set", value: ref } };
-  }
-  return { repos: [single], primaryPath: first.path, inlineBaseRef: { kind: "keep" } };
-}
-
-// ── Git-root merge in the Repositories dialog ──────────────────────────────
+// ── Git-root merge in the Select Projects dialog ───────────────────────────
 
 export interface RootMerge {
   /** The kept (first selected) path for the root. */
@@ -142,10 +79,31 @@ export function mergeSelectionsByRoot(entries: readonly RepoSelection[]): {
 /** One sentence naming a base-ref conflict, for the dialog's error line. */
 export function describeRootConflict(conflict: RootConflict): string {
   const parts = conflict.entries.map((e) => `${e.path} (${e.baseRef})`);
-  return `${parts.join(" and ")} are in the same repository but have different base refs. Keep one base ref, or remove one of them.`;
+  return `${parts.join(" and ")} are in the same repository but have different base refs. Remove one, or pick the same branch in both rows.`;
 }
 
-// ── Repositories dialog: abandoning a save ─────────────────────────────────
+/**
+ * The Select Projects dialog's draft with every base ref the user did not pick
+ * removed. Each selected row's branch picker preselects the project's current
+ * branch on its own; that seed only fills the trigger, it is not a choice.
+ * Dropping it before the git-root merge means an automatic seed can never
+ * conflict with (or be saved as) a pick, and a project nobody touched keeps
+ * "no base ref", which the server resolves to the same current HEAD at create
+ * time. `userPicked` holds the paths whose ref the user chose in the picker
+ * (or that arrived already chosen from the saved selection).
+ */
+export function keepUserPickedRefs(
+  entries: readonly RepoSelection[],
+  userPicked: ReadonlySet<string>,
+): RepoSelection[] {
+  return entries.map((entry) => {
+    if (userPicked.has(entry.path) || entry.baseRef === undefined) return entry;
+    const { baseRef: _auto, ...rest } = entry;
+    return rest;
+  });
+}
+
+// ── Select Projects dialog: abandoning a save ──────────────────────────────
 
 /**
  * A request-id guard: `begin()` hands out a token, `invalidate()` (on close,

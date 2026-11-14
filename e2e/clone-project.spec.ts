@@ -5,12 +5,12 @@ import { tmpdir } from "node:os";
 import path from "node:path";
 import { randomUUID } from "node:crypto";
 import { test, expect, type APIRequestContext, type E2EBackend, type Locator, type Page } from "./fixtures";
-import { gotoApp } from "./helpers";
+import { gotoApp, openSelectProjects } from "./helpers";
 
 /**
  * E2e coverage for docs/plans/clone-repository-launch-pickers.md §5 TT3: the
- * "Clone repository" dialog (`CloneProjectDialog.tsx`, opened from
- * `ProjectPicker.tsx`'s footer) lets the user pick an Agent profile or a
+ * "Clone repository" dialog (`CloneProjectDialog.tsx`, opened from the
+ * Select Projects dialog's footer) lets the user pick an Agent profile or a
  * manual Harness/Mode/Model/Effort for the auto-created ELI5 explainer task,
  * exactly like the New Task form and the two shared launch dialogs
  * (`useTaskLaunch`/`TaskLaunchPickers` — see `e2e/agent-profiles-launch.spec
@@ -76,11 +76,6 @@ const CONVERGE_TIMEOUT = 20_000;
 const CLONE_URL = "someowner/somerepo";
 const ELI5_TITLE = "ELI5: somerepo";
 
-// Tooltip ProjectPicker's trigger carries, set by NewTaskForm.tsx — used to
-// open the project popover the "Clone repository…" entry lives in.
-const PROJECT_PICKER_TITLE =
-  "Pick the working directory the agent runs in. Add new ones with the folder picker at the bottom of the list.";
-
 function newTaskForm(page: Page): Locator {
   return page.locator("aside").filter({ hasText: "New task" });
 }
@@ -93,7 +88,7 @@ function auth(backend: E2EBackend): { authorization: string } {
  *  open `CloneProjectDialog`. */
 async function openCloneDialog(page: Page): Promise<Locator> {
   const form = newTaskForm(page);
-  await form.getByTitle(PROJECT_PICKER_TITLE).click();
+  await openSelectProjects(page, form);
   const cloneEntry = page.getByTestId("project-clone-open");
   await expect(cloneEntry).toBeVisible({ timeout: CONVERGE_TIMEOUT });
   await cloneEntry.click();
@@ -185,7 +180,7 @@ test.describe("Clone repository dialog", () => {
   test("naming, switch gating, and empty-URL disables submit", async ({ page, freshBackend }) => {
     await gotoApp(page, freshBackend.bootBase);
     const form = newTaskForm(page);
-    await form.getByTitle(PROJECT_PICKER_TITLE).click();
+    await openSelectProjects(page, form);
 
     const cloneEntry = page.getByTestId("project-clone-open");
     await expect(cloneEntry).toBeVisible({ timeout: CONVERGE_TIMEOUT });

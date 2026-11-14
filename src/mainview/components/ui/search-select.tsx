@@ -35,14 +35,20 @@ interface Props {
   /**
    * Where the popover opens relative to the trigger. Default "top" suits the
    * always-anchored-at-the-bottom new-task form; dialogs that render the
-   * picker near the top of a modal should pass "bottom".
+   * picker near the top of a modal should pass "bottom". "inline" renders the
+   * panel in normal flow right under the trigger (pushing what follows down)
+   * instead of floating it: the only placement a scrolling container can't
+   * clip, e.g. the per-project branch pickers inside the Select Projects
+   * dialog's project list.
    */
-  placement?: "top" | "bottom";
+  placement?: "top" | "bottom" | "inline";
   /** Show the search box and filter items as the user types. Default true;
    *  pass false for short enumerated lists where search adds no value. */
   searchable?: boolean;
   /** Let the item hint wrap across lines instead of truncating to one. */
   wrapHints?: boolean;
+  /** `data-testid` on the trigger button. */
+  triggerTestId?: string;
 }
 
 /**
@@ -66,11 +72,13 @@ export function SearchSelect({
   placement = "top",
   searchable = true,
   wrapHints = false,
+  triggerTestId,
 }: Props) {
   const [open, setOpen] = useState(false);
   const [query, setQuery] = useState("");
   const rootRef = useRef<HTMLDivElement>(null);
   const searchRef = useRef<HTMLInputElement>(null);
+  const panelRef = useRef<HTMLDivElement>(null);
 
   useEffect(() => {
     if (!open) return;
@@ -82,13 +90,18 @@ export function SearchSelect({
     };
     document.addEventListener("mousedown", onDown);
     document.addEventListener("keydown", onKey);
-    // Focus the search box once the panel is mounted.
-    if (searchable) queueMicrotask(() => searchRef.current?.focus());
+    // Focus the search box once the panel is mounted. An inline panel grows
+    // its scrolling container, so bring the whole panel into view first (the
+    // focus call alone would only reveal the search box).
+    queueMicrotask(() => {
+      if (placement === "inline") panelRef.current?.scrollIntoView({ block: "nearest" });
+      if (searchable) searchRef.current?.focus({ preventScroll: placement === "inline" });
+    });
     return () => {
       document.removeEventListener("mousedown", onDown);
       document.removeEventListener("keydown", onKey);
     };
-  }, [open, searchable]);
+  }, [open, searchable, placement]);
 
   // Reset the query each time the panel closes so the next open starts clean.
   useEffect(() => {
@@ -121,6 +134,7 @@ export function SearchSelect({
     <div ref={rootRef} className={cn("relative", className)}>
       <button
         type="button"
+        data-testid={triggerTestId}
         disabled={disabled}
         title={title}
         onClick={() => setOpen((v) => !v)}
@@ -139,12 +153,18 @@ export function SearchSelect({
 
       {open && (
         <div
-          // Marker for enclosing Esc handlers (RunPanel) to bail and let
-          // this popover consume Escape first.
+          ref={panelRef}
+          // Marker for enclosing Esc handlers (RunPanel, Dialog) to bail and
+          // let this popover consume Escape first.
           data-popover-open=""
           className={cn(
-            "absolute left-0 right-0 z-50 overflow-hidden rounded-md border border-border bg-card text-card-foreground shadow-xl",
-            placement === "top" ? "bottom-full mb-1" : "top-full mt-1",
+            "overflow-hidden rounded-md border border-border bg-card text-card-foreground",
+            placement === "inline"
+              ? "relative mt-1 shadow-sm"
+              : cn(
+                "absolute left-0 right-0 z-50 shadow-xl",
+                placement === "top" ? "bottom-full mb-1" : "top-full mt-1",
+              ),
           )}
         >
           {searchable && (

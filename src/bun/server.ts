@@ -2166,7 +2166,7 @@ export function startApiServer(
       },
 
       // Resolve the git top-level for a selected project path (issue #291).
-      // The Repositories dialog uses it to dedupe a selection by repository
+      // The Select Projects dialog uses it to dedupe a selection by repository
       // root before the task exists. Only the webview calls it, so it is
       // desktop-only in ROUTE_POLICY (no CLI path gate needed).
       "/projects/repo-root": {

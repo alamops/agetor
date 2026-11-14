@@ -5,7 +5,7 @@ import { tmpdir } from "node:os";
 import path from "node:path";
 import { randomUUID } from "node:crypto";
 import { test, expect, type APIRequestContext, type E2EBackend, type Locator, type Page } from "./fixtures";
-import { gotoApp } from "./helpers";
+import { gotoApp, openSelectProjects } from "./helpers";
 import { makeBareSourceRepo } from "../src/bun/clone-test-util.ts";
 import { startSlowGitServer } from "./slow-git-server.ts";
 
@@ -110,10 +110,6 @@ test.afterAll(async () => {
 
 const CONVERGE_TIMEOUT = 20_000;
 
-// Mirrors clone-project.spec.ts's identical constant.
-const PROJECT_PICKER_TITLE =
-  "Pick the working directory the agent runs in. Add new ones with the folder picker at the bottom of the list.";
-
 function newTaskForm(page: Page): Locator {
   return page.locator("aside").filter({ hasText: "New task" });
 }
@@ -122,12 +118,12 @@ function auth(backend: E2EBackend): { authorization: string } {
   return { authorization: `Bearer ${backend.apiToken}` };
 }
 
-/** Opens the project popover and clicks "Clone repository…", landing on the
- *  open `CloneProjectDialog`. Copied from clone-project.spec.ts's helper of
+/** Opens the Select Projects dialog and clicks "Clone repository…", landing on
+ *  the open `CloneProjectDialog`. Copied from clone-project.spec.ts's helper of
  *  the same name/behavior. */
 async function openCloneDialog(page: Page): Promise<Locator> {
   const form = newTaskForm(page);
-  await form.getByTitle(PROJECT_PICKER_TITLE).click();
+  await openSelectProjects(page, form);
   const cloneEntry = page.getByTestId("project-clone-open");
   await expect(cloneEntry).toBeVisible({ timeout: CONVERGE_TIMEOUT });
   await cloneEntry.click();

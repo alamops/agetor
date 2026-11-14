@@ -1,0 +1,511 @@
+{
+  "version": 1,
+  "id": "select-projects-combined-grill-r1",
+  "title": "Grill — one Select Projects control for New Task",
+  "skill": "grill",
+  "slug": "select-projects-combined",
+  "round": 1,
+  "summary": "Before the plan: **6 decisions** that change the shape of the build, plus **8 defaults** I'd bet on. Start with **Q1** — where the per-project Branch / Pull / Fetch rows live. It is the only answer that decides whether `SearchSelect` needs a portal: every picker popover is `position: absolute`, and the dialog's list is a `max-h-72 overflow-y-auto` box, so branch rows inside that list are clipped.\n\nI've read the code and the prior investigation, so settled facts are below instead of being asked. The whole change is webview-only: no server, schema, migration or route change.\n\nSource: the task text + screenshot (outside the repo). The committed contract this supersedes is `docs/specs/multi-repo-tasks.md:126-129` and `docs/plans/multi-repo-tasks-grill.md:39` (decision 16).",
+  "proven": [
+    {
+      "text": "**The combined control replaces both old selectors; there is no third path.** New Task renders a single `ProjectPicker`, then `WorktreeOptions`, then a `Repositories` block whose only 2+ entry is “Use multiple repositories…”. The ask removes that split.",
+      "evidence": [
+        {
+          "label": "single Project picker",
+          "path": "src/mainview/components/kanban/NewTaskForm.tsx",
+          "line": 865,
+          "lang": "tsx",
+          "code": "              <div className=\"min-w-0 space-y-1\">\n                <label className=\"text-muted-foreground\">Project</label>\n                <ProjectPicker"
+        },
+        {
+          "label": "the separate 2+ entry",
+          "path": "src/mainview/components/kanban/NewTaskForm.tsx",
+          "line": 909,
+          "lang": "tsx",
+          "code": "                    Use multiple repositories…"
+        }
+      ]
+    },
+    {
+      "text": "**No server, schema, migration or route change.** `/projects/branches`, `/projects/fetch`, `/projects/pull` and `/projects/repo-root` already exist, and `BranchPicker` already calls the first three for any `workdir`.",
+      "evidence": [
+        {
+          "label": "existing branch/fetch/pull routes",
+          "path": "src/mainview/lib/api.ts",
+          "line": 1031,
+          "lang": "ts",
+          "code": "  listBranches: (workdir: string) =>"
+        },
+        {
+          "label": "BranchPicker already owns Pull/Fetch",
+          "path": "src/mainview/components/kanban/BranchPicker.tsx",
+          "line": 123,
+          "lang": "tsx",
+          "code": "  const handleFetch = async () => {"
+        }
+      ]
+    },
+    {
+      "text": "**Exactly one selection must keep the old payload shape.** A 1-entry `repositories` array is rejected when the path is not a git repository, so a plain folder with Isolate off must still send `workdir` + top-level `baseRef`.",
+      "evidence": [
+        {
+          "label": "non-git path rejected",
+          "path": "src/bun/task-repos.ts",
+          "line": 59,
+          "lang": "ts",
+          "code": "    const root = await opts.resolveRoot(projectPath);\n    if (!root) {\n      errors.push(`${label}: not inside a git repository`);"
+        }
+      ]
+    },
+    {
+      "text": "**Count and forced Isolate must use the git-root-deduped set.** Two subdirectories of one repository collapse to one repository at create time, so a raw checkbox count would claim “2 projects” and disable Isolate for a single-repo task.",
+      "evidence": [
+        {
+          "label": "server dedupes by root",
+          "path": "src/bun/task-repos.ts",
+          "line": 64,
+          "lang": "ts",
+          "code": "    if (seenRoots.has(root)) continue;\n    seenRoots.add(root);"
+        },
+        {
+          "label": "create decides multi after dedupe",
+          "path": "src/bun/orchestrator.ts",
+          "line": 12513,
+          "lang": "ts",
+          "code": "  const keptRepositories = resolvedSet && resolvedSet.ok ? resolvedSet.repositories : [];\n  const multiRepo = keptRepositories.length > 1;"
+        }
+      ]
+    },
+    {
+      "text": "**This supersedes documented decisions.** The spec says one repo keeps the inline fields and 2+ uses the dialog; the architecture doc repeats it. Both must be amended in the same change, per `CLAUDE.md:5`.",
+      "evidence": [
+        {
+          "label": "spec UI section",
+          "path": "docs/specs/multi-repo-tasks.md",
+          "line": 126,
+          "code": "- One shared `Repositories` dialog is used by the New Task panel and `CreateTaskFromIssueDialog`."
+        },
+        {
+          "label": "superseded decision 16",
+          "path": "docs/plans/multi-repo-tasks-grill.md",
+          "line": 39,
+          "code": "| 16 | UI | … A shared `Repositories` dialog … instead of per-repo rows in the New Task panel; with one repo, today's inline branch/base fields stay. |"
+        }
+      ]
+    },
+    {
+      "text": "**e2e is the only coverage.** No unit test renders `NewTaskForm`; 11 specs drive the ProjectPicker trigger and 2 clone specs use its footer. A UI-only change that never wires base refs into the create payload stays green in `bun test`.",
+      "evidence": [
+        {
+          "label": "the only real-UI multi creation",
+          "path": "e2e/multi-repo-task.spec.ts",
+          "line": 251,
+          "lang": "ts",
+          "code": "  await form.getByRole(\"button\", { name: \"Use multiple repositories…\" }).click();"
+        }
+      ]
+    }
+  ],
+  "sections": [
+    {
+      "id": "shape",
+      "title": "Shape of the control",
+      "intro": "These decide the component architecture, the create payload and every e2e locator.",
+      "questions": [
+        {
+          "id": "branch-rows",
+          "type": "single",
+          "title": "Where do the per-project Branch / Pull / Fetch rows live, and in what order?",
+          "impact": "blocking",
+          "why": "This is the only answer that changes component architecture: rows in the dialog need a portal/fixed popover, rows inline do not. It also decides every e2e locator.",
+          "context": "The ask says the button goes “on top of the Isolate checkbox” and that every selected project gets the branch picker + Pull + Fetch that one project has today. Those two statements pull in different directions: today one Branch picker sits above Isolate (`WorktreeOptions.tsx:315-345`), while 2+ projects hide it and read base refs from the dialog's free-text inputs (`RepositoriesDialog.tsx:229-241`). Three layouts fit; the two inline ones differ only in whether the button sits immediately above Isolate (literal reading) or above the per-project rows (today's Project → Branch → Isolate order).",
+          "evidence": [
+            {
+              "label": "one Branch picker, hidden for multi",
+              "path": "src/mainview/components/kanban/WorktreeOptions.tsx",
+              "line": 315,
+              "lang": "tsx",
+              "code": "      {!multi && (\n        <BranchPicker\n          label=\"Branch\"\n          workdir={workdir}\n          value={baseRef}"
+            },
+            {
+              "label": "2+ uses free-text refs in the dialog",
+              "path": "src/mainview/components/kanban/RepositoriesDialog.tsx",
+              "line": 229,
+              "lang": "tsx",
+              "code": "                  {multiSelection || conflictPaths.has(path) ? (\n                    <Input\n                      value={entry.baseRef ?? \"\"}"
+            },
+            {
+              "label": "every picker popover is absolute",
+              "path": "src/mainview/components/ui/search-select.tsx",
+              "line": 146,
+              "lang": "tsx",
+              "code": "            \"absolute left-0 right-0 z-50 overflow-hidden rounded-md border border-border bg-card text-card-foreground shadow-xl\","
+            },
+            {
+              "label": "dialog list would clip it",
+              "path": "src/mainview/components/kanban/RepositoriesDialog.tsx",
+              "line": 201,
+              "lang": "tsx",
+              "code": "      <div className=\"mt-3 max-h-72 space-y-1 overflow-y-auto\">"
+            }
+          ],
+          "options": [
+            {
+              "id": "inline-above",
+              "label": "Inline: button → branch rows → Isolate → Branch name",
+              "description": "One Branch row per selected project directly under the Select Projects button; Isolate and the shared Branch name follow.",
+              "consequence": "Keeps today's Project → Branch → Isolate order; base refs always visible; no portal work; the dialog drops its per-repo text input; the form grows with N."
+            },
+            {
+              "id": "inline-below",
+              "label": "Inline: button → Isolate → branch rows → Branch name",
+              "description": "The button sits immediately above Isolate; the per-project rows come after it.",
+              "consequence": "Most literal reading of “on top of the Isolate checkbox”; the refs that feed isolation appear below the toggle."
+            },
+            {
+              "id": "dialog",
+              "label": "Inside the Select Projects dialog: form is button → Isolate → Branch name",
+              "description": "Every selected project's Branch / Pull / Fetch row is configured inside the dialog.",
+              "consequence": "Compact form, but `SearchSelect` must gain a portal/fixed mode (its popover is absolute inside a `max-h-72 overflow-y-auto` list); base refs are invisible when the dialog is closed."
+            }
+          ],
+          "recommendation": {
+            "value": "inline-above",
+            "reason": "Branch is a property of the selected projects, so it belongs inside the project block; this keeps today's field order and needs no popover rework."
+          }
+        },
+        {
+          "id": "apply-boundary",
+          "type": "single",
+          "title": "Does the selection apply on Save, or immediately on every toggle?",
+          "impact": "shape",
+          "why": "Git-root dedupe and the same-root base-ref conflict are currently enforced on Save; a live surface has to run them on every toggle.",
+          "context": "The existing dialog resolves roots and merges on Save (`RepositoriesDialog.tsx:146-177`), and Save is disabled at zero. `MultiSearchSelect` applies each toggle immediately (`multi-search-select.tsx:110-113`). Either can back the new control; the difference is when dedupe runs and whether Cancel can abandon an edit.",
+          "evidence": [
+            {
+              "label": "dedupe happens on Save",
+              "path": "src/mainview/components/kanban/RepositoriesDialog.tsx",
+              "line": 166,
+              "lang": "tsx",
+              "code": "      const merged = mergeSelectionsByRoot(resolved);"
+            },
+            {
+              "label": "the live multi-select precedent",
+              "path": "src/mainview/components/ui/multi-search-select.tsx",
+              "line": 110,
+              "lang": "tsx",
+              "code": "  const toggle = (value: T) => {\n    if (valueSet.has(value)) onChange(values.filter((v) => v !== value));\n    else onChange([...values, value]);\n  };"
+            }
+          ],
+          "options": [
+            {
+              "id": "save",
+              "label": "Save / Cancel boundary (today's dialog)",
+              "consequence": "Git-root dedupe and base-ref conflicts stay on one code path; Cancel and Escape abandon; one extra click per selection."
+            },
+            {
+              "id": "live",
+              "label": "Apply every toggle immediately",
+              "consequence": "Count updates live and there is no Save click, but dedupe/conflict checks become async on every toggle and there is no Cancel."
+            }
+          ],
+          "recommendation": {
+            "value": "save",
+            "reason": "The dedupe and conflict rules already live on Save and are load-bearing; moving them live adds async states with no user-facing gain."
+          }
+        },
+        {
+          "id": "scope",
+          "type": "single",
+          "title": "Does the combined control apply to the issue dialog too, or only New Task?",
+          "impact": "blocking",
+          "why": "Both surfaces share `WorktreeOptions` and `RepositoriesDialog`; changing one and not the other means a mode flag, a fork, or a stale parity claim.",
+          "context": "`CreateTaskFromIssueDialog` renders the same `WorktreeOptions` (`:414`) and the same `RepositoriesDialog` (`:428-450`), with the issue's repo locked first (`:436`). `docs/architecture/issue-tasks.md:19` says the dialog sends worktree fields “exactly like the panel”. Its “discard this draft?” check reads `wt.baseRefDirty` (`:214-221`), which stops being the whole truth once every repo owns a ref.",
+          "evidence": [
+            {
+              "label": "same worktree row",
+              "path": "src/mainview/components/kanban/CreateTaskFromIssueDialog.tsx",
+              "line": 414,
+              "lang": "tsx",
+              "code": "              <WorktreeOptions state={wt} variant={multiRepo ? \"multi\" : \"default\"} />"
+            },
+            {
+              "label": "issue repo locked first",
+              "path": "src/mainview/components/kanban/CreateTaskFromIssueDialog.tsx",
+              "line": 436,
+              "lang": "tsx",
+              "code": "                  lockedPath={context.path}"
+            },
+            {
+              "label": "dirty check reads one base ref",
+              "path": "src/mainview/components/kanban/CreateTaskFromIssueDialog.tsx",
+              "line": 214,
+              "lang": "tsx",
+              "code": "  const draftDirty =\n    promptDirty ||\n    references.length > 0 ||\n    typeDirty ||\n    !wt.isolate ||\n    wt.baseRefDirty ||"
+            },
+            {
+              "label": "documented parity",
+              "path": "docs/architecture/issue-tasks.md",
+              "line": 19,
+              "code": "sends `isolation`/`baseRef`/`branch`/`references` exactly like the panel"
+            }
+          ],
+          "options": [
+            {
+              "id": "both",
+              "label": "Both surfaces; the issue's repo stays locked first",
+              "consequence": "Keeps the shared component and the parity doc true; the issue dialog's dirty check must be rewired to see every ref."
+            },
+            {
+              "id": "new-task-only",
+              "label": "New Task only",
+              "consequence": "The shared dialog needs a 1+-selection mode for New Task and a 2+ mode for the issue dialog (or a fork); amend the parity claim."
+            }
+          ],
+          "recommendation": {
+            "value": "both",
+            "reason": "Same component, same contract, and leaving one surface behind is exactly the drift the architecture doc warns about."
+          }
+        },
+        {
+          "id": "minimum-one",
+          "type": "single",
+          "title": "“One selection is required” — what happens when the user tries to deselect the last project?",
+          "impact": "blocking",
+          "why": "Decides whether the dialog can hold an empty draft and how switching a single project works.",
+          "context": "I read this as **at least one**, not exactly one, because the same ask describes 2+ behavior; if you meant exactly one, the multi path disappears. Today the dialog allows zero but disables Save (`RepositoriesDialog.tsx:282`), the form requires `repos.length > 0` (`NewTaskForm.tsx:646-648`), and the picker auto-selects a project on open (`ProjectPicker.tsx:67-76`).",
+          "evidence": [
+            {
+              "label": "Save disabled at zero",
+              "path": "src/mainview/components/kanban/RepositoriesDialog.tsx",
+              "line": 282,
+              "lang": "tsx",
+              "code": "          <Button size=\"sm\" onClick={() => void save()} disabled={busy || draft.length === 0}>"
+            },
+            {
+              "label": "form requires at least one",
+              "path": "src/mainview/components/kanban/NewTaskForm.tsx",
+              "line": 646,
+              "lang": "tsx",
+              "code": "  const canSubmit =\n    title.trim() && prompt.trim() && workdir.trim() && repos.length > 0 && wt.valid"
+            }
+          ],
+          "options": [
+            {
+              "id": "zero-draft",
+              "label": "Allow zero in the draft; Save disabled with a “select at least one” hint",
+              "consequence": "Switching one project is uncheck-old-then-check-new; the saved form never holds zero because Save cannot apply it."
+            },
+            {
+              "id": "block-last",
+              "label": "Prevent unchecking/removing the last project",
+              "consequence": "Guarantees at least one everywhere, but switching a single selection requires checking the new one first."
+            }
+          ],
+          "recommendation": {
+            "value": "zero-draft",
+            "reason": "Today's dialog already behaves this way; blocking the last uncheck makes the common “replace one project” flow awkward."
+          }
+        },
+        {
+          "id": "button-label",
+          "type": "single",
+          "title": "What exactly does the button say for 1 and for 2+ selected projects?",
+          "impact": "shape",
+          "why": "This is the button's accessible name and every e2e locator; it also decides whether the form shows a count at all for one project.",
+          "context": "The ask says the number must show “just like currently”. There are three current precedents: the single Project trigger shows the project's name (`ProjectPicker.tsx:117`), `MultiSearchSelect` shows `1 → label, N → “N selected”` (`multi-search-select.tsx:103-107`), and the 2+ summary shows `N repositories` (`NewTaskForm.tsx:889`). Only the last two contain a number.",
+          "evidence": [
+            {
+              "label": "multi-select trigger rule",
+              "path": "src/mainview/components/ui/multi-search-select.tsx",
+              "line": 103,
+              "lang": "tsx",
+              "code": "  const triggerLabel = useMemo(() => {\n    if (values.length === 0) return emptyLabel;\n    if (values.length === 1) return selectedSingle?.label ?? values[0]!;\n    return `${values.length} selected`;\n  }, [values, selectedSingle, emptyLabel]);"
+            },
+            {
+              "label": "single trigger shows the name",
+              "path": "src/mainview/components/kanban/ProjectPicker.tsx",
+              "line": 117,
+              "lang": "tsx",
+              "code": "        displayValue={(v) => basename(v) || v}"
+            },
+            {
+              "label": "multi summary shows N repositories",
+              "path": "src/mainview/components/kanban/NewTaskForm.tsx",
+              "line": 889,
+              "lang": "tsx",
+              "code": "                      <span className=\"font-medium\">{repos.length} repositories</span>"
+            }
+          ],
+          "options": [
+            {
+              "id": "name-count",
+              "label": "1 → project name; 2+ → “2 projects selected”",
+              "consequence": "Keeps the informative single case; 2+ carries the count, and the noun “projects” matches the button."
+            },
+            {
+              "id": "count-only",
+              "label": "1 → “1 project selected”; 2+ → “N projects selected”",
+              "consequence": "The number is always visible, but one project's name disappears from the trigger."
+            },
+            {
+              "id": "name-short",
+              "label": "1 → project name; 2+ → “N selected”",
+              "consequence": "Matches the existing `MultiSearchSelect` component exactly; slightly terser."
+            },
+            {
+              "id": "name-repos",
+              "label": "1 → project name; 2+ → “N repositories”",
+              "consequence": "Matches today's 2+ summary; “repositories” is the older noun."
+            }
+          ],
+          "recommendation": {
+            "value": "name-count",
+            "reason": "It follows the existing multi-select trigger convention while keeping the single case as informative as today."
+          }
+        }
+      ]
+    },
+    {
+      "id": "refs",
+      "title": "Branch refs per project",
+      "questions": [
+        {
+          "id": "tag-sha",
+          "type": "single",
+          "title": "Do we keep a way to pin a tag or commit SHA per project?",
+          "impact": "shape",
+          "why": "Replacing the 2+ dialog's free-text ref with a branch picker removes an input the server still supports.",
+          "context": "`BranchPicker` only picks an existing branch row (`BranchPicker.tsx:194-220`); it can render a custom value if one is already set, but offers no way to type one. The current 2+ dialog has a free-text `Base ref (default HEAD)` input (`RepositoriesDialog.tsx:229-236`), and the server accepts any ref. The single-project picker has never offered tag/SHA entry.",
+          "evidence": [
+            {
+              "label": "free-text ref only in the 2+ dialog",
+              "path": "src/mainview/components/kanban/RepositoriesDialog.tsx",
+              "line": 230,
+              "lang": "tsx",
+              "code": "                    <Input\n                      value={entry.baseRef ?? \"\"}\n                      onChange={(e) => setBaseRef(path, e.target.value)}\n                      placeholder=\"Base ref (default HEAD)\""
+            },
+            {
+              "label": "BranchPicker lists branch rows only",
+              "path": "src/mainview/components/kanban/BranchPicker.tsx",
+              "line": 194,
+              "lang": "tsx",
+              "code": "  const items: { value: string; label: string; hint: string; pinned: boolean }[] = [];"
+            }
+          ],
+          "options": [
+            {
+              "id": "branch-only",
+              "label": "Branch rows only (parity with the single project)",
+              "consequence": "One control per project and a smaller change; tag/SHA pinning remains available only through the API/CLI."
+            },
+            {
+              "id": "custom-ref",
+              "label": "Branch picker + a small custom-ref input per row",
+              "consequence": "Keeps today's 2+ capability; one extra control and validation path per selected project."
+            }
+          ],
+          "recommendation": {
+            "value": "branch-only",
+            "reason": "The ask is “the branch picker, Pull and Fetch we have for one project”; tag/SHA was never part of that row, and the API/CLI escape hatch stays."
+          }
+        }
+      ]
+    },
+    {
+      "id": "confirm",
+      "title": "Confirm or override",
+      "intro": "Defaults I'd bet on. One click each; override any you disagree with.",
+      "questions": [
+        {
+          "id": "auto-select",
+          "type": "confirm",
+          "title": "Auto-select the most recently added project when the form opens with nothing selected",
+          "impact": "minor",
+          "context": "Today's `ProjectPicker` does this (`ProjectPicker.tsx:67-76`), and several e2e specs register a project and type a prompt without selecting one. If overridden: the form opens with “Select projects…” and Create stays disabled until a pick, and those specs need an explicit selection.",
+          "recommendation": {
+            "value": "Keep it (today's `autoSelectFirst` behavior)",
+            "reason": "It makes the form valid on open and avoids an extra click for the returning user."
+          }
+        },
+        {
+          "id": "isolate-collapse",
+          "type": "confirm",
+          "title": "When a 2+ selection drops back to one project, what happens to Isolate?",
+          "impact": "minor",
+          "context": "Today an effect force-sets it true for 2+ (`NewTaskForm.tsx:268-270`). Restoring the previous value would make the task's layout change without a visible action.",
+          "recommendation": {
+            "value": "Stays checked and becomes editable",
+            "reason": "No silent layout change; the user can uncheck it deliberately."
+          }
+        },
+        {
+          "id": "pull-fetch",
+          "type": "confirm",
+          "title": "Per-project Pull/Fetch exactly as today, with no “Pull all” / “Fetch all”",
+          "impact": "minor",
+          "context": "Each button already mutates the user's source checkout (`BranchPicker.tsx:123-159`). With N rows there are N possible network operations before creation; the per-row spinner and error behavior are already built.",
+          "recommendation": {
+            "value": "Per-row Pull/Fetch only; no bulk action",
+            "reason": "The ask asks for the per-project controls; a bulk action is new scope with partial-failure states."
+          }
+        },
+        {
+          "id": "dialog-actions",
+          "type": "confirm",
+          "title": "Dialog affordances: search, the three management actions, and the zero-project state",
+          "impact": "minor",
+          "context": "`ProjectPicker`'s footer is the only entry for Clone repository and Import sessions (`ProjectPicker.tsx:118-148`), its search is the only way to find a project by name, and the new button must be able to register the first project. `RepositoriesDialog` already owns “Add folder” and the native picker (`:124-139`).",
+          "recommendation": {
+            "value": "Add a search filter; move Browse for folder / Clone repository / Import sessions into the dialog; keep the button enabled even with no projects registered",
+            "reason": "All three footer actions need a home once `ProjectPicker` is retired, and the button is the only way to add the first project."
+          }
+        },
+        {
+          "id": "row-label-remove",
+          "type": "confirm",
+          "title": "How each per-project row is identified, and how a project is removed",
+          "impact": "minor",
+          "context": "Today the dialog's row shows the name plus path (`RepositoriesDialog.tsx:223-224`) and a trash button that toggles the same selection (`:242-252`).",
+          "recommendation": {
+            "value": "Rows read “Branch · <project name>” (path added when two names collide); removal happens only in the Select Projects dialog — no per-row X",
+            "reason": "The button only shows a count for 2+, so the row label must name the project; keeping selection in one place avoids two paths mutating the same state."
+          }
+        },
+        {
+          "id": "branch-name",
+          "type": "confirm",
+          "title": "One shared Branch name for all projects, previewed from the first selected project's naming config",
+          "impact": "minor",
+          "context": "The server anchors the shared name on the first kept repository (`orchestrator.ts:12551`) and reads that project's config (`12807`). If per-project branch names are wanted instead, that is a server/schema change (a branch per `repositories[]` entry) and rewrites the launch-prompt and PR docs. This is not a “primary repo” in the model (prior decision 13).",
+          "recommendation": {
+            "value": "One shared field; the preview uses the first selected project's `branchConfig`; the server applies one name with a per-repo `-N` fallback",
+            "reason": "The server already behaves this way, so the preview matches what will be created without a contract change."
+          }
+        },
+        {
+          "id": "deduped-count",
+          "type": "confirm",
+          "title": "The button count and the forced Isolate both use the git-root-deduped set",
+          "impact": "minor",
+          "context": "Two subdirectories of one repo create a single-repo task, so counting checked paths would disable Isolate and claim “2 projects” for a one-repo create (`orchestrator.ts:12513-12514`). The dialog already dedupes on Save and shows the note (`RepositoriesDialog.tsx:276`); the form sees the saved, deduped list.",
+          "recommendation": {
+            "value": "Yes — count what the server will create, and keep the “(some share a git root)” note",
+            "reason": "The count and the Isolate decision must not lie about a single-repo create."
+          }
+        },
+        {
+          "id": "keep-selection",
+          "type": "confirm",
+          "title": "After creating a task, keep the whole project selection for the next task",
+          "impact": "minor",
+          "context": "Today the form deliberately keeps `workdir` and does not reset `repos` after submit (`NewTaskForm.tsx:713-721`); rapid-fire task creation is the stated workflow.",
+          "recommendation": {
+            "value": "Keep every selected project (and each branch ref) for the next task",
+            "reason": "It preserves today's “same project for the next task” behavior and the rapid-fire workflow."
+          }
+        }
+      ]
+    }
+  ]
+}

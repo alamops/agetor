@@ -1,4 +1,5 @@
-// Client-side helpers for the multi-repository selector (issue #291).
+// Client-side helpers for the combined single/multi project selection (the
+// Select Projects control, issue #291).
 import { isMultiRepoTask, repoNameForPath, uniqueRepoSlugs } from "../../shared/multi-repo.ts";
 
 /** One selected repository in the dialog, before it becomes a create payload. */
@@ -25,7 +26,7 @@ export function tooManyRepositories(count: number): boolean {
  * on a guess could silently lose the repository the user picked. Pure, so
  * the dialog can show the count before and after without a round trip.
  */
-export function dedupeSelections(entries: RepoSelection[]): RepoSelection[] {
+export function dedupeSelections(entries: readonly RepoSelection[]): RepoSelection[] {
   const seenRoots = new Set<string>();
   const out: RepoSelection[] = [];
   for (const entry of entries) {
@@ -46,6 +47,73 @@ export function selectionNames(entries: Pick<RepoSelection, "path">[]): string[]
 /** The display name for one selected repository. */
 export function selectionName(entry: Pick<RepoSelection, "path">): string {
   return repoNameForPath(entry.path);
+}
+
+/** The raw last path segment — the label the single-project trigger used to
+ *  show, not the sanitized workspace slug. */
+export function projectDisplayName(path: string): string {
+  const trimmed = path.replace(/[\\/]+$/, "");
+  const idx = Math.max(trimmed.lastIndexOf("/"), trimmed.lastIndexOf("\\"));
+  return idx >= 0 ? trimmed.slice(idx + 1) : trimmed;
+}
+
+/** The full-width Select Projects button's label: a zero-selection prompt,
+ *  the project's own name for one project, the count for 2+ (the same
+ *  convention `MultiSearchSelect`'s trigger uses). Counted after git-root
+ *  dedupe, so two subdirectories of one repository read as one project. */
+export function projectSelectionLabel(entries: readonly Pick<RepoSelection, "path" | "root">[]): string {
+  const kept = dedupeSelections(entries);
+  if (kept.length === 0) return "Select projects…";
+  if (kept.length === 1) return projectDisplayName(kept[0]!.path);
+  return `${kept.length} projects selected`;
+}
+
+/** One row label per path, in order: the raw basename, or — when two
+ *  displayed names collide (`/work/billing/api`, `/work/identity/api`) — the
+ *  fewest trailing folders that tell that path apart from the others with the
+ *  same name (`billing/api`, `identity/api`). A full path would put the
+ *  distinguishing part at the end, which is exactly what a narrow label
+ *  truncates away. When no shorter suffix is unique (`/api` vs `/x/api`) the
+ *  full path is used. */
+export function projectRowLabels(paths: readonly string[]): string[] {
+  const names = paths.map(projectDisplayName);
+  const groups = new Map<string, number[]>();
+  names.forEach((name, i) => groups.set(name, [...(groups.get(name) ?? []), i]));
+  return names.map((name, i) => {
+    const group = groups.get(name)!;
+    if (group.length < 2) return name;
+    const others = group.filter((j) => j !== i).map((j) => paths[j]!);
+    for (let k = 2; ; k++) {
+      const label = trailingSegments(paths[i]!, k);
+      if (others.every((other) => trailingSegments(other, k) !== label)) return label;
+      if (label === paths[i]) return label;
+    }
+  });
+}
+
+/** The last `k` segments of `path` joined with `/`, or the whole path once it
+ *  has fewer than `k` segments (so the search always ends on a unique label). */
+function trailingSegments(path: string, k: number): string {
+  const segments = path.replace(/[\\/]+$/, "").split(/[\\/]/).filter(Boolean);
+  return segments.length < k ? path : segments.slice(-k).join("/");
+}
+
+/** Replace one entry's base ref, preserving order, roots and every other
+ *  entry. An unknown path is a no-op (the row was removed while its branch
+ *  list was still loading). A blank ref drops the key so the create payload
+ *  omits it (HEAD). */
+export function updateSelectionBaseRef(
+  entries: readonly RepoSelection[],
+  path: string,
+  baseRef: string,
+): RepoSelection[] {
+  if (!entries.some((entry) => entry.path === path)) return [...entries];
+  const ref = baseRef.trim();
+  return entries.map((entry) => {
+    if (entry.path !== path) return entry;
+    const { baseRef: _stale, ...rest } = entry;
+    return ref ? { ...rest, baseRef: ref } : rest;
+  });
 }
 
 /**
@@ -111,46 +179,4 @@ export function issueProjectPath(
     return task.issueRepoPath ?? activeRepo?.path ?? taskProjectPath(task);
   }
   return task.workdir;
-}
-
-/**
- * Merge an existing selection with the ProjectPicker's currently chosen path:
- * choosing a project collapses a multi selection back to that one repository
- * (and seeds its base ref), matching the plan's "changing the ProjectPicker
- * while 2+ are selected collapses back to that one repo".
- */
-export function collapseToProject(path: string, previous: RepoSelection[]): RepoSelection[] {
-  if (!path) return [];
-  const known = previous.find((e) => e.path === path);
-  return [known ?? { path, root: null }];
-}
-
-/**
- * Merge the repositories dialog's saved selection back into a selection with a
- * fixed primary repository — the create-from-issue dialog's issue repo, which
- * is always first and cannot be removed. A per-repository base ref the user
- * set for it (in this dialog round or an earlier one) is preserved: rebuilding
- * the entry from only its path silently dropped the pin, so the issue's own
- * repository always branched from HEAD regardless of what the user picked.
- */
-export function pinPrimaryRepository(
-  path: string,
-  next: readonly RepoSelection[],
-  previous: readonly RepoSelection[] = [],
-): RepoSelection[] {
-  const chosen = next.find((e) => e.path === path);
-  const prior = previous.find((e) => e.path === path);
-  const baseRef = chosen?.baseRef ?? prior?.baseRef;
-  const primary: RepoSelection = {
-    path,
-    root: chosen?.root ?? prior?.root ?? null,
-    ...(baseRef === undefined ? {} : { baseRef }),
-  };
-  // Dedupe again after re-adding the primary: when the dialog resolved the
-  // primary's git root, a same-root sibling (e.g. a subdirectory of the issue
-  // repo added through "Add folder") collapses here, so the client's view
-  // matches the server's createTask dedupe instead of showing a multi-repo
-  // task that the server creates as single. Unknown roots are kept (see
-  // `dedupeSelections`).
-  return dedupeSelections([primary, ...next.filter((e) => e.path !== path)]);
 }

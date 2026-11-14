@@ -3,7 +3,7 @@ import { mkdirSync } from "node:fs";
 import { tmpdir } from "node:os";
 import path from "node:path";
 import { test, expect, type APIRequestContext, type E2EBackend, type Locator, type Page } from "./fixtures";
-import { gotoApp } from "./helpers";
+import { gotoApp, selectProject } from "./helpers";
 
 /**
  * E2E coverage for docs/plans/fx-0.0.14-and-cursor-updates.md E3 (D33 flow
@@ -104,20 +104,6 @@ async function registerProject(backend: E2EBackend, name: string): Promise<void>
   if (!res.ok) throw new Error(`POST /projects -> ${res.status}: ${await res.text()}`);
 }
 
-async function selectProject(form: Locator, projectName: string): Promise<void> {
-  await form
-    .getByTitle(
-      "Pick the working directory the agent runs in. Add new ones with the folder picker at the bottom of the list.",
-    )
-    .click();
-  const search = form.getByPlaceholder("Search projects…");
-  await expect(search).toBeVisible();
-  await search.fill(projectName);
-  const row = form.getByRole("button", { name: projectName });
-  await expect(row).toBeVisible();
-  await row.click();
-}
-
 test.describe("cursor stream (worker backend)", () => {
   test.describe.configure({ mode: "serial" });
   const createdTaskIds: string[] = [];
@@ -147,7 +133,7 @@ test.describe("cursor stream (worker backend)", () => {
     const cursorButton = form.getByRole("button", { name: "Cursor", exact: true });
     await expect(cursorButton).toBeVisible({ timeout: 20_000 });
     await cursorButton.click();
-    await selectProject(form, projectName);
+    await selectProject(page, form, projectName);
 
     // The Mode label's first sibling is the Code/Plan pill pair; the second
     // is the exact-mode picker, whose trigger then also reads "Plan".

@@ -121,8 +121,8 @@ export function CloneProjectDialog({ open, onClose, onCloned }: Props) {
   // Fresh form every open — a stale URL from the previous clone is never
   // what the user wants pre-filled. Harness/model/prefs fetching is owned
   // by useTaskLaunch, which re-seeds the manual block on every open but
-  // never clears the selected profile — and this dialog stays mounted
-  // (ProjectPicker renders it permanently), so clear it here too.
+  // never clears the selected profile — and this dialog stays mounted by the
+  // Select Projects dialog, so clear it here too.
   useEffect(() => {
     if (!open) return;
     setUrl("");

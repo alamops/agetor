@@ -467,3 +467,154 @@ export async function deleteAll(backend: E2EBackend, paths: string[]): Promise<v
     await fetch(`${backend.apiBase}${p}`, { method: "DELETE", headers: bearerHeaders(backend) }).catch(() => {});
   }
 }
+
+/* ───────────── Select Projects (combined single/multi picker) ───────────── */
+
+/** Generous readiness ceiling: the dialog's first open fetches `GET /projects`
+ *  and a Save resolves every selected path's git root. */
+const SELECT_PROJECTS_TIMEOUT = 30_000;
+
+function escapeRegExp(value: string): string {
+  return value.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+}
+
+/** The Select Projects dialog (New Task, issue dialog). The accessible name is
+ *  the dialog's own title, so both surfaces resolve the same way. */
+export function selectProjectsDialog(page: Page): Locator {
+  return page.getByRole("dialog", { name: "Select projects" });
+}
+
+/** Opens the full-width Select Projects control inside `scope` and waits for
+ *  the dialog. `scope` is the New Task aside or the issue dialog. */
+export async function openSelectProjects(page: Page, scope: Locator): Promise<Locator> {
+  const trigger = scope.getByTestId("select-projects-button");
+  await expect(trigger).toBeVisible({ timeout: SELECT_PROJECTS_TIMEOUT });
+  await trigger.click();
+  const dialog = selectProjectsDialog(page);
+  await expect(dialog).toBeVisible({ timeout: SELECT_PROJECTS_TIMEOUT });
+  return dialog;
+}
+
+/** A project row's checkbox. Accepts an absolute path (exact) or a basename
+ *  (matching the row's own project directory) so specs that only know their
+ *  worker-unique project name keep working. */
+function projectCheckbox(dialog: Locator, pathOrName: string): Locator {
+  return projectCheckboxIn(dialog, pathOrName);
+}
+
+function projectCheckboxIn(root: Locator | Page, pathOrName: string): Locator {
+  const anchor = pathOrName.startsWith("/") ? escapeRegExp(pathOrName) : `(?:.*/)?${escapeRegExp(pathOrName)}`;
+  return root.getByLabel(new RegExp(`^Select ${anchor}$`));
+}
+
+/** Unchecks every row the user could uncheck (the auto-selected project is
+ *  checked on open). */
+async function clearProjects(dialog: Locator): Promise<void> {
+  const boxes = dialog.locator('input[type="checkbox"]');
+  const count = await boxes.count();
+  for (let i = count - 1; i >= 0; i--) {
+    const box = boxes.nth(i);
+    if (await box.isDisabled()) continue;
+    if (await box.isChecked()) await box.uncheck();
+  }
+}
+
+/**
+ * Opens the dialog, clears every row the user could uncheck (the auto-selected
+ * project is checked on open), then checks `paths` in order — so the first path
+ * is truly first in the saved selection (the server keeps the first entry per
+ * git root). Saves and waits for the dialog to close.
+ */
+export async function chooseProjects(page: Page, scope: Locator, paths: string[]): Promise<void> {
+  const dialog = await openSelectProjects(page, scope);
+  for (const path of paths) {
+    await expect(projectCheckbox(dialog, path)).toBeVisible({ timeout: SELECT_PROJECTS_TIMEOUT });
+  }
+  await clearProjects(dialog);
+  for (const path of paths) await projectCheckbox(dialog, path).check();
+  await dialog.getByRole("button", { name: "Save", exact: true }).click();
+  await expect(dialog).toBeHidden({ timeout: SELECT_PROJECTS_TIMEOUT });
+}
+
+/**
+ * Selects exactly one project (clearing any auto-selected one first). Accepts
+ * an absolute path or a registered project name — the latter searches the
+ * dialog first, so specs can keep addressing a project by the name they
+ * registered it under even when its directory basename differs.
+ */
+export async function selectProject(page: Page, scope: Locator, pathOrName: string): Promise<void> {
+  if (pathOrName.startsWith("/")) {
+    await chooseProjects(page, scope, [pathOrName]);
+    return;
+  }
+  const dialog = await openSelectProjects(page, scope);
+  await clearProjects(dialog);
+  await dialog.getByTestId("select-projects-search").fill(pathOrName);
+  // The search also matches a project's registered name, which the row's
+  // visible text (basename + path) need not contain. A unique, worker-wide
+  // project name must leave exactly one row; anything else is an ambiguous
+  // test setup, not a selection to guess at.
+  const rows = dialog.locator('[data-testid^="select-projects-row-"]');
+  await expect(rows).toHaveCount(1, { timeout: SELECT_PROJECTS_TIMEOUT });
+  await rows.first().locator('input[type="checkbox"]').check();
+  await dialog.getByRole("button", { name: "Save", exact: true }).click();
+  await expect(dialog).toBeHidden({ timeout: SELECT_PROJECTS_TIMEOUT });
+}
+
+/** One selected project's read-only `Branch · <project>` summary line in the
+ *  form (`name` is the project's workspace slug). The line shows the base ref
+ *  the Select Projects dialog saved, or "current branch". */
+export function branchRow(scope: Locator, name: string): Locator {
+  return scope.getByTestId(`branch-row-${name}`);
+}
+
+/** A project's row inside the open Select Projects dialog, by absolute path
+ *  (exact) or basename — the same matching `chooseProjects` uses. */
+export function dialogProjectRow(dialog: Locator, pathOrName: string): Locator {
+  return dialog
+    .locator('[data-testid^="select-projects-row-"]')
+    // A page-rooted inner locator: `has` queries it relative to each row.
+    .filter({ has: projectCheckboxIn(dialog.page(), pathOrName) });
+}
+
+/** The branch picker (label, Pull, Fetch, trigger) under one checked project
+ *  in the open Select Projects dialog. */
+export function dialogBranchPicker(dialog: Locator, pathOrName: string): Locator {
+  return dialogProjectRow(dialog, pathOrName).getByTestId("select-projects-branch");
+}
+
+/**
+ * Picks an existing branch in one checked project's picker inside the open
+ * Select Projects dialog. The list opens in flow under the trigger and is
+ * scoped by its `data-popover-open` marker so the trigger's own label can't be
+ * mistaken for a list row. Does not Save.
+ */
+export async function pickDialogBranch(dialog: Locator, pathOrName: string, branch: string): Promise<void> {
+  const picker = dialogBranchPicker(dialog, pathOrName);
+  await expect(picker).toBeVisible({ timeout: SELECT_PROJECTS_TIMEOUT });
+  const trigger = picker.getByTestId("branch-picker-trigger");
+  await trigger.click();
+  const popover = picker.locator("[data-popover-open]");
+  await expect(popover).toBeVisible({ timeout: SELECT_PROJECTS_TIMEOUT });
+  await popover.getByPlaceholder("Search branches…").fill(branch);
+  await popover.getByText(branch, { exact: true }).click();
+  await expect(popover).toBeHidden();
+  await expect(trigger).toContainText(branch);
+}
+
+/**
+ * Picks `branch` for one selected project the way a user does: open Select
+ * Projects, choose it in that project's branch picker, Save. `pathOrName` is
+ * the project's absolute path or basename.
+ */
+export async function selectBaseBranch(
+  page: Page,
+  scope: Locator,
+  pathOrName: string,
+  branch: string,
+): Promise<void> {
+  const dialog = await openSelectProjects(page, scope);
+  await pickDialogBranch(dialog, pathOrName, branch);
+  await dialog.getByRole("button", { name: "Save", exact: true }).click();
+  await expect(dialog).toBeHidden({ timeout: SELECT_PROJECTS_TIMEOUT });
+}
