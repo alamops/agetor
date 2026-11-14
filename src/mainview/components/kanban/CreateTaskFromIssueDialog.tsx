@@ -82,8 +82,7 @@ export function CreateTaskFromIssueDialog({ open, onClose, context, onCreated, o
   // open. The issue repo is always first and locked; extras are added through
   // the same Select Projects control New Task uses. No auto-select here: the
   // issue's repo is the only correct starting point.
-  const { repos, setRepos, multiRepo, setBaseRef, setBaseRefAuto, refDirty, resetRefDirty } =
-    useProjectSelection({ enabled: open });
+  const { repos, setRepos, multiRepo, refDirty } = useProjectSelection({ enabled: open });
 
   // The branch-name field derives live from the current title + taskType
   // (same `issueTaskTitle` the submit path uses), so it shows e.g.
@@ -145,8 +144,8 @@ export function CreateTaskFromIssueDialog({ open, onClose, context, onCreated, o
     setReferences([]);
     setTaskType(DEFAULT_TASK_TYPE);
     setTypeDirty(false);
+    // A fresh seed carries no base ref, so `refDirty` starts false.
     setRepos(context?.path ? [{ path: context.path, root: null }] : []);
-    resetRefDirty();
     launch.setPipelineId(null);
     if (!open || !context) return;
     setThreadLoading(true);
@@ -210,9 +209,10 @@ export function CreateTaskFromIssueDialog({ open, onClose, context, onCreated, o
     wt.valid;
 
   // Anything the user changed since the dialog opened: the prompt, attached
-  // references, the Type picker, a worktree option, a user-picked base ref, a
-  // second project, or a selected pipeline. Auto-selected refs and the
-  // automatic issue-repo seed deliberately don't count.
+  // references, the Type picker, a worktree option, a base ref picked in the
+  // Select Projects dialog, a second project, or a selected pipeline. The
+  // pickers' automatic current-branch seeds are never saved (so never count),
+  // and neither does the automatic issue-repo seed.
   const draftDirty =
     promptDirty ||
     references.length > 0 ||
@@ -415,8 +415,6 @@ export function CreateTaskFromIssueDialog({ open, onClose, context, onCreated, o
                 state={wt}
                 repos={repos}
                 onReposChange={setRepos}
-                onBaseRefChange={setBaseRef}
-                onBaseRefAuto={setBaseRefAuto}
                 lockedPath={context.path}
               />
 

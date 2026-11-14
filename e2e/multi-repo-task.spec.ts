@@ -20,8 +20,8 @@ import { uniqueRepoSlugs } from "../src/shared/multi-repo.ts";
  * Arrange: two throwaway git repos, registered through the real
  * `POST /projects`. The FIRST scenario creates the multi-repository task
  * through the real New Task form's combined Select Projects control (pick
- * both repositories, then a non-current base ref in each project's own inline
- * Branch row), then "Run task" starts it — so the multi selection, the
+ * both repositories, then a non-current base ref in each project's own branch
+ * picker inside the same dialog), then "Run task" starts it — so the multi selection, the
  * per-project refs and the create payload are exercised end to end, not just
  * through `POST /tasks`. The worker backend already runs the fake claude
  * driver, so the start materializes one worktree per repository without a real
@@ -260,13 +260,13 @@ test("create via the real UI: Select Projects sends both repos and start materia
   await expect(button).toContainText("2 projects selected");
   const dialog = selectProjectsDialog(page);
 
-  // Selection lives in the dialog; base refs live in the form's inline rows,
-  // so no per-repository input may be offered here any more.
+  // Each project's base ref is picked in its own branch picker inside the
+  // Select Projects dialog; the form shows one read-only summary line each.
   await expect(dialog).toBeHidden();
   const names = uniqueRepoSlugs([repoA, repoB]);
   await expect(form.locator('[data-testid^="branch-row-"]')).toHaveCount(2);
-  await selectBaseBranch(page, form, names[0]!, TOPIC_BRANCH);
-  await selectBaseBranch(page, form, names[1]!, TOPIC_BRANCH);
+  await selectBaseBranch(page, form, repoA, TOPIC_BRANCH);
+  await selectBaseBranch(page, form, repoB, TOPIC_BRANCH);
   await expect(branchRow(form, names[0]!)).toContainText(TOPIC_BRANCH);
   await expect(branchRow(form, names[1]!)).toContainText(TOPIC_BRANCH);
 

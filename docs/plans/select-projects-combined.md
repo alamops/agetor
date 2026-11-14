@@ -386,3 +386,19 @@ Full-suite run of the whole tree at `755b2c71`. **No product or test defect was 
 | Static gates | `quality_gates.py wiring --worktree` / `hygiene --worktree` | 10 new exports, **0 not reached**; **0 hygiene leads** |
 
 No flaky *product* path surfaced: every rerun of the feature's own specs (`select-projects`, `multi-repo-task`, `issue-task`, `resolve-conflicts`, `identifier-inputs`) was green under `retries: 0`.
+
+### 10.5 Owner revision: branch pickers move into the dialog (2026-11-13)
+
+Reviewing the screenshots, the owner reversed grill decision 1: each selected project's branch picker, Pull and Fetch now sit **inside the Select Projects dialog**, under that project's checked row, instead of as inline rows in the form. Decision 1 is marked superseded in the grill record; decision 5's listing survives as a read-only summary in the form.
+
+| Area | Change |
+| --- | --- |
+| `SearchSelect` / `BranchPicker` | New `placement="inline"`: the panel renders in flow under its trigger (still `data-popover-open` while open, still closes on Escape) and scrolls itself into view. It is the only placement the dialog's scrolling project list can't clip — the reason decision 1 kept the rows out of the dialog. `triggerTestId` (`branch-picker-trigger`) for e2e. |
+| `SelectProjectsDialog` | Every checked row renders a `BranchPicker` (label `Branch`, Pull, Fetch) with `placement="inline"`. Base refs are part of the draft: Save applies them, Cancel discards them; uncheck → recheck restores the opening ref and its pick marker. The pickers' automatic current-branch seed is tracked apart from user picks and **dropped on Save** (`keepUserPickedRefs`, applied before `mergeSelectionsByRoot`), so a seed can never conflict with a pick on the same root or be saved as one. `BASE_REF_TITLE` / `BASE_REF_OFF_TITLE` moved here. List height `min(60vh, 100vh − 18rem)`. |
+| `useProjectSelection` | `setBaseRef`, `setBaseRefAuto`, `resetRefDirty` and the user-pick marker set are gone: refs only arrive through Save and every saved ref is a pick, so `refDirty` is simply "any selected project has a base ref". |
+| `WorktreeOptions` | The inline `BranchPicker` rows are replaced by one read-only `Branch · <project>` line per project (saved ref or "current branch", `branch-row-<slug>` ids kept), inside a button that reopens the dialog. Labels truncate with a path tooltip, which also fixes the review finding that a long same-name label overflowed the sidebar. |
+| Payload | Unchanged mapping. An untouched project now sends no `baseRef` instead of its current branch name; the server resolves both to the same HEAD sha. |
+| Tests | Unit: `SelectProjectsDialog.test.tsx` (new; picker per checked row, saved ref shown, tooltip vs Isolate, locked row, entries), `keepUserPickedRefs` cases in `multi-repo-ui.test.ts`, branch-summary cases in `WorktreeOptions.test.tsx`. E2E: helpers `dialogBranchPicker` / `pickDialogBranch`, `selectBaseBranch` now picks in the dialog and saves; `select-projects` gains (o) Cancel discards a pick, (p) the seed is not saved (summary "current branch", HEAD sha stored), (q) the branch list is never clipped and Escape closes it before the dialog; `multi-repo-task`, `issue-task`, `identifier-inputs`, `branch-scoped-capabilities` drive the dialog pickers. |
+| Docs | `docs/architecture/multi-repo-tasks.md`, `docs/specs/multi-repo-tasks.md`, `docs/architecture/prompt-composer.md`, `docs/architecture/issue-tasks.md`, README quick start. |
+
+**Verification:** `bun run typecheck` clean (includes `e2e/`); `bun test src/mainview` 2,252/2,252; `e2e/select-projects.spec.ts` 19/19; affected e2e batch (`select-projects`, `multi-repo-task`, `issue-task`, `resolve-conflicts`, `identifier-inputs`, `branch-scoped-capabilities`, `--workers=2`, `retries: 0`) **58/58** on the final tree. Red proofs (mutation, then restored): a floating (`bottom`) picker in the dialog fails (q); saving the draft without `keepUserPickedRefs` fails (p).

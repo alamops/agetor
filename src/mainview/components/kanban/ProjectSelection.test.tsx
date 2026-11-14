@@ -37,7 +37,7 @@ describe("SelectProjectsButton", () => {
     ).toContain("2 projects selected");
   });
 
-  test("is a full-width button that opens a dialog and advertises per-project rows", () => {
+  test("is a full-width button that opens a dialog and advertises the per-project branch pickers", () => {
     const markup = html({ label: "api", onClick: () => {} });
     const tag = openingTag(markup);
     expect(tag).toContain('data-testid="select-projects-button"');
@@ -47,7 +47,7 @@ describe("SelectProjectsButton", () => {
     // The single control is the only selection surface, so it must span the
     // form and hint at the Branch/Pull/Fetch row every project gets.
     expect(tag).toContain("w-full");
-    expect(markup).toContain("Each selected project gets its own branch, Pull and Fetch row");
+    expect(markup).toContain("Pick one or more projects and the branch each one starts from (with Pull and Fetch).");
     expect(markup).toContain("lucide-folder-open");
     expect(markup).toContain("lucide-chevron-down");
     expect(markup).toContain(">api<");

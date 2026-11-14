@@ -8,6 +8,7 @@ import {
   describeRootConflict,
   endPrBatch,
   isPrBatchRunning,
+  keepUserPickedRefs,
   markRepositoryPrOpened,
   mergeSelectionsByRoot,
   multiRepoDeleteFallback,
@@ -70,6 +71,63 @@ describe("mergeSelectionsByRoot (W5)", () => {
 
   test("unknown roots are always kept", () => {
     expect(mergeSelectionsByRoot([{ path: "/a", root: null }, { path: "/b", root: null }]).kept).toHaveLength(2);
+  });
+
+  test("the conflict copy points at the dialog's own branch pickers", () => {
+    const { conflicts } = mergeSelectionsByRoot([
+      { path: "/repo/a", root: "/repo", baseRef: "main" },
+      { path: "/repo/b", root: "/repo", baseRef: "dev" },
+    ]);
+    expect(describeRootConflict(conflicts[0]!)).toContain("pick the same branch in both rows");
+  });
+});
+
+describe("keepUserPickedRefs (Select Projects Save)", () => {
+  test("drops the pickers' automatic seeds and keeps user picks", () => {
+    const out = keepUserPickedRefs(
+      [
+        { path: "/a", root: "/a", baseRef: "main" },
+        { path: "/b", root: "/b", baseRef: "topic" },
+        { path: "/c", root: null },
+      ],
+      new Set(["/b"]),
+    );
+    expect(out).toEqual([
+      { path: "/a", root: "/a" },
+      { path: "/b", root: "/b", baseRef: "topic" },
+      { path: "/c", root: null },
+    ]);
+    // The key is gone, not blanked: the create payload must omit it (HEAD).
+    expect("baseRef" in out[0]!).toBe(false);
+  });
+
+  test("an automatic seed on a sibling path can't conflict with a pick on the same root", () => {
+    // `/repo` and its subfolder are both checked; the user picks `topic` on the
+    // root row while the subfolder row's picker seeds the current `main`.
+    const draft = [
+      { path: "/repo", root: "/repo", baseRef: "topic" },
+      { path: "/repo/pkg", root: "/repo", baseRef: "main" },
+    ];
+    expect(mergeSelectionsByRoot(draft).conflicts).toHaveLength(1);
+    const merged = mergeSelectionsByRoot(keepUserPickedRefs(draft, new Set(["/repo"])));
+    expect(merged.conflicts).toEqual([]);
+    expect(merged.kept).toEqual([{ path: "/repo", root: "/repo", baseRef: "topic" }]);
+  });
+
+  test("a pick on a collapsed duplicate still survives the merge", () => {
+    const merged = mergeSelectionsByRoot(keepUserPickedRefs(
+      [
+        { path: "/repo", root: "/repo", baseRef: "main" },
+        { path: "/repo/pkg", root: "/repo", baseRef: "release" },
+      ],
+      new Set(["/repo/pkg"]),
+    ));
+    expect(merged.kept).toEqual([{ path: "/repo", root: "/repo", baseRef: "release" }]);
+  });
+
+  test("returns the same entries when every ref is a pick", () => {
+    const draft = [{ path: "/a", root: "/a", baseRef: "dev" }];
+    expect(keepUserPickedRefs(draft, new Set(["/a"]))).toEqual(draft);
   });
 });
 

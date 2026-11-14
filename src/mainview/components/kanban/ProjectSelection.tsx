@@ -2,11 +2,7 @@ import { type Dispatch, type SetStateAction, useEffect, useMemo, useState } from
 import { ChevronDown, FolderOpen, Lock } from "lucide-react";
 import { api } from "@/lib/api";
 import { cn } from "@/lib/utils";
-import {
-  dedupeSelections,
-  updateSelectionBaseRef,
-  type RepoSelection,
-} from "@/lib/repo-selection";
+import { dedupeSelections, type RepoSelection } from "@/lib/repo-selection";
 
 /**
  * The combined single/multi project selection that replaced the old split
@@ -14,6 +10,11 @@ import {
  * `repos` is the single source of truth for the selection *and* every
  * per-project base ref; `workdir` is derived from its first entry and there is
  * no separate selected-project state.
+ *
+ * Base refs are picked in the Select Projects dialog, one branch picker per
+ * selected project, and only reach `repos` through the dialog's Save. The
+ * dialog drops each picker's automatic "current branch" seed before saving
+ * (`keepUserPickedRefs`), so every `baseRef` in `repos` is one the user chose.
  */
 export interface ProjectSelectionState {
   repos: RepoSelection[];
@@ -24,16 +25,10 @@ export interface ProjectSelectionState {
   /** True when 2+ *deduped* projects are selected. Feeds the forced isolate
    *  state and the `@` multi-scope list — never the raw checkbox count. */
   multiRepo: boolean;
-  /** A user-picked base ref for one project (marks the draft dirty). */
-  setBaseRef: (path: string, baseRef: string) => void;
-  /** `BranchPicker`'s "preselect the current branch" seed — not a user pick. */
-  setBaseRefAuto: (path: string, baseRef: string) => void;
-  /** True once the user picked any non-blank base ref that is still selected.
-   *  The issue dialog's "discard this draft?" check reads this instead of a
-   *  per-ref comparison, because a ref could be an automatic seed. */
+  /** True while any selected project carries a base ref. Because only user
+   *  picks are ever saved (see above), this is the issue dialog's "discard this
+   *  draft?" signal for branch changes. */
   refDirty: boolean;
-  /** Clears the user-pick markers (post-submit / fresh-open reset). */
-  resetRefDirty: () => void;
 }
 
 /**
@@ -48,10 +43,6 @@ export function useProjectSelection({
   enabled = true,
 }: { autoSelect?: boolean; enabled?: boolean } = {}): ProjectSelectionState {
   const [repos, setRepos] = useState<RepoSelection[]>([]);
-  // Paths the user picked a ref for themselves (as opposed to the picker's
-  // automatic current-branch seed). Deriving `refDirty` from the live selection
-  // means removing a project can never leave a stale dirty flag behind.
-  const [userRefPaths, setUserRefPaths] = useState<Set<string>>(() => new Set());
 
   useEffect(() => {
     if (!autoSelect || !enabled) return;
@@ -68,52 +59,11 @@ export function useProjectSelection({
     return () => { cancelled = true; };
   }, [autoSelect, enabled]);
 
-  const setBaseRef = (path: string, baseRef: string) => {
-    setRepos((cur) => updateSelectionBaseRef(cur, path, baseRef));
-    setUserRefPaths((cur) => {
-      const next = new Set(cur);
-      if (baseRef.trim()) next.add(path);
-      else next.delete(path);
-      return next;
-    });
-  };
-
-  const setBaseRefAuto = (path: string, baseRef: string) => {
-    setRepos((cur) => updateSelectionBaseRef(cur, path, baseRef));
-  };
-
-  const resetRefDirty = () => setUserRefPaths(new Set());
-
-  // Drop user-pick markers for projects that are no longer selected. Without
-  // this, removing a project (e.g. through the dialog's Save) and later adding
-  // it back would resurrect the old marker and read as dirty even though the
-  // re-added entry starts with a fresh automatic ref.
-  useEffect(() => {
-    setUserRefPaths((cur) => {
-      if (cur.size === 0) return cur;
-      const selected = new Set(repos.map((entry) => entry.path));
-      const next = new Set([...cur].filter((path) => selected.has(path)));
-      return next.size === cur.size ? cur : next;
-    });
-  }, [repos]);
-
   const workdir = repos[0]?.path ?? "";
   const multiRepo = useMemo(() => dedupeSelections(repos).length > 1, [repos]);
-  const refDirty = useMemo(
-    () => repos.some((entry) => userRefPaths.has(entry.path) && !!entry.baseRef?.trim()),
-    [repos, userRefPaths],
-  );
+  const refDirty = useMemo(() => repos.some((entry) => !!entry.baseRef?.trim()), [repos]);
 
-  return {
-    repos,
-    setRepos,
-    workdir,
-    multiRepo,
-    setBaseRef,
-    setBaseRefAuto,
-    refDirty,
-    resetRefDirty,
-  };
+  return { repos, setRepos, workdir, multiRepo, refDirty };
 }
 
 interface ButtonProps {
@@ -143,7 +93,7 @@ export function SelectProjectsButton({ label, onClick, locked = false, disabled 
       title={
         locked
           ? "The PR's repository is fixed for this task."
-          : "Pick one or more projects. Each selected project gets its own branch, Pull and Fetch row."
+          : "Pick one or more projects and the branch each one starts from (with Pull and Fetch)."
       }
       className={cn(
         "flex w-full items-center gap-2 rounded-md border border-border/60 bg-background px-2 py-1.5 text-left text-xs",

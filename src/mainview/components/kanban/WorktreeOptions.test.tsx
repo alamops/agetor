@@ -1,7 +1,8 @@
 // The shared worktree block's rendered contract (issue #291): one full-width
-// Select Projects control above Isolate, one Branch · <project> row per
-// selected project, and the forced/disabled Isolate state for 2+ projects —
-// plus the locked PR-conflict variant. Static markup, like StackBadge.test.tsx;
+// Select Projects control above Isolate, one read-only Branch · <project>
+// summary line per selected project (the pickers themselves live in the
+// Select Projects dialog), and the forced/disabled Isolate state for 2+
+// projects — plus the locked PR-conflict variant. Static markup, like StackBadge.test.tsx;
 // the interactive flows live in e2e/select-projects.spec.ts.
 import { describe, expect, test } from "bun:test";
 import { renderToStaticMarkup } from "react-dom/server";
@@ -51,8 +52,6 @@ function live(repos: RepoSelection[], over: Partial<WorktreeOptionsState> = {}):
       state={state({ workdir: repos[0]?.path ?? "", ...over })}
       repos={repos}
       onReposChange={() => {}}
-      onBaseRefChange={() => {}}
-      onBaseRefAuto={() => {}}
     />,
   );
 }
@@ -89,7 +88,7 @@ describe("WorktreeOptions — live", () => {
     expect(markup).toContain('data-testid="branch-name-input"');
   });
 
-  test("one project gets its own Branch · <project> row and an editable Isolate", () => {
+  test("one project gets its own Branch · <project> line and an editable Isolate", () => {
     const markup = live([repo("/repos/api")]);
     expect(markup).toContain('data-testid="branch-row-api"');
     expect(markup).toContain("Branch · api");
@@ -118,7 +117,7 @@ describe("WorktreeOptions — live", () => {
     expect(markup).toContain("This name is used in every project");
   });
 
-  test("isolate off hides the branch-name field but keeps every project's row", () => {
+  test("isolate off hides the branch-name field but keeps every project's line", () => {
     const markup = live([repo("/repos/api")], { isolate: false, effectiveIsolate: false });
     expect(markup).toContain('data-testid="branch-row-api"');
     expect(openingTag(markup, "isolate-toggle")).not.toContain("checked");
@@ -131,6 +130,46 @@ describe("WorktreeOptions — live", () => {
     expect(markup).toContain('data-testid="branch-row-api-2"');
     expect(markup).toContain("Branch · api — /a/api");
     expect(markup).toContain("Branch · api — /b/api");
+  });
+});
+
+describe("WorktreeOptions — branch summary", () => {
+  test("is read-only: no branch picker, Pull or Fetch in the form", () => {
+    const markup = live([repo("/repos/api"), repo("/repos/web")], { forceIsolate: true });
+    // The pickers moved into the Select Projects dialog; the form only shows
+    // what was saved.
+    expect(markup).not.toContain("Search branches");
+    expect(markup).not.toContain(">Pull<");
+    expect(markup).not.toContain(">Fetch<");
+    expect(markup).not.toContain("lucide-refresh-cw");
+  });
+
+  test("an untouched project reads as its current branch", () => {
+    const markup = live([repo("/repos/api")]);
+    expect(markup).toContain(">current branch<");
+  });
+
+  test("each project shows the base ref picked for it", () => {
+    const markup = live([
+      { path: "/repos/api", root: "/repos/api", baseRef: "release/2.4" },
+      { path: "/repos/web", root: "/repos/web" },
+    ], { forceIsolate: true });
+    const api = markup.slice(markup.indexOf('data-testid="branch-row-api"'), markup.indexOf('data-testid="branch-row-web"'));
+    const web = markup.slice(markup.indexOf('data-testid="branch-row-web"'));
+    expect(api).toContain(">release/2.4<");
+    expect(api).not.toContain("current branch");
+    expect(web).toContain(">current branch<");
+  });
+
+  test("the summary is one button that reopens the dialog", () => {
+    const tag = openingTag(live([repo("/repos/api")]), "selected-branches");
+    expect(tag.startsWith("<button")).toBe(true);
+    expect(tag).toContain('type="button"');
+    expect(disabled(tag)).toBe(false);
+  });
+
+  test("no selection renders no summary", () => {
+    expect(live([])).not.toContain('data-testid="selected-branches"');
   });
 });
 

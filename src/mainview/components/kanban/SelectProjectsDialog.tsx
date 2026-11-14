@@ -7,15 +7,22 @@ import { Input } from "@/components/ui/input";
 import { IDENTIFIER_INPUT_PROPS } from "@/lib/identifier-input";
 import {
   dedupeSelections,
-  projectDisplayName,
   projectRowLabels,
   selectionNames,
   tooManyRepositories,
+  updateSelectionBaseRef,
   type RepoSelection,
 } from "@/lib/repo-selection";
-import { createSessionGuard, describeRootConflict, mergeSelectionsByRoot, type RootConflict } from "@/lib/multi-repo-ui";
+import {
+  createSessionGuard,
+  describeRootConflict,
+  keepUserPickedRefs,
+  mergeSelectionsByRoot,
+  type RootConflict,
+} from "@/lib/multi-repo-ui";
 import { uniqueRepoSlugs } from "../../../shared/multi-repo.ts";
 import type { Project } from "../../../shared/types.ts";
+import { BranchPicker } from "./BranchPicker";
 import { CloneProjectDialog } from "./CloneProjectDialog";
 import { ImportSessionsDialog } from "./ImportSessionsDialog";
 
@@ -29,18 +36,37 @@ interface Props {
   /** A path that must stay selected (the issue / PR dialog's own repository).
    *  The row cannot be unchecked or removed; it is always first. */
   lockedPath?: string | null;
+  /** The form's effective Isolate state, for the branch pickers' tooltip. A
+   *  draft of 2+ projects is always isolated regardless. */
+  isolate?: boolean;
 }
+
+/** Branch picker tooltip while the task will run in a worktree. The e2e specs
+ *  find the picker trigger by this exact text. */
+export const BASE_REF_TITLE =
+  "Base ref the worktree branches from. Pick the current branch row to use what's checked out at task start.";
+
+/** Branch picker tooltip when the single project runs with Isolate off. */
+export const BASE_REF_OFF_TITLE =
+  "Isolation is off — the value is recorded but the agent will run directly in the project workdir.";
 
 /**
  * The combined project picker behind the full-width Select Projects button.
  * One dialog for one project and for many: pick at least one registered
- * project (or add a folder), search the list, and dedupe by git root on Save.
+ * project (or add a folder), search the list, choose the branch each selected
+ * project starts from, and dedupe by git root on Save.
  *
- * This dialog owns **selection only**. Every selected project's base ref is
- * picked in the form's own inline `Branch · <project>` rows, which is why there
- * is no per-project ref input here and why the list can stay a scrolling box
- * (a `SearchSelect` branch popover would be clipped by it — see
- * `docs/architecture/multi-repo-tasks.md`).
+ * Every checked row carries the same `BranchPicker` the form used to show for
+ * a single project: the branch list plus Pull and Fetch, acting on that row's
+ * own checkout. The picker opens `placement="inline"` (in flow, under its
+ * trigger) because the list is a scrolling box that would clip a floating
+ * popover — see `docs/architecture/multi-repo-tasks.md`. Base refs are part of
+ * the draft: Save applies them with the selection, Cancel discards both.
+ *
+ * Each picker preselects its project's current branch on its own. That seed
+ * only fills the trigger: Save drops every ref the user didn't pick
+ * (`keepUserPickedRefs`), so the saved selection carries user picks only and an
+ * untouched project keeps "no base ref" (HEAD at create time).
  *
  * Save resolves each path's git root before applying: two subdirectories of one
  * repository collapse to the first selected path (the server's own dedupe), a
@@ -53,7 +79,7 @@ interface Props {
  * result is never applied after the user walked away. Outside clicks do not
  * close it (`closeOnBackdrop={false}`): the draft only changes through Save.
  */
-export function SelectProjectsDialog({ open, onClose, value, onSave, lockedPath }: Props) {
+export function SelectProjectsDialog({ open, onClose, value, onSave, lockedPath, isolate = true }: Props) {
   const [projects, setProjects] = useState<Project[]>([]);
   const [draft, setDraft] = useState<RepoSelection[]>(value);
   const [query, setQuery] = useState("");
@@ -65,6 +91,10 @@ export function SelectProjectsDialog({ open, onClose, value, onSave, lockedPath 
   // The entries this dialog opened with, so uncheck → recheck restores a root
   // and base ref instead of rebuilding a bare `{ path, root: null }`.
   const [opened, setOpened] = useState<RepoSelection[]>(value);
+  // Paths whose base ref the user picked (or that opened with one — a saved
+  // selection only ever holds picks). Everything else is a picker's automatic
+  // current-branch seed and is dropped on Save.
+  const [userRefs, setUserRefs] = useState<Set<string>>(() => userPickedPaths(value));
   // Invalidated on every open, close and save attempt. A save's root lookup
   // only applies while its own session is current.
   const sessionRef = useRef(createSessionGuard());
@@ -86,6 +116,7 @@ export function SelectProjectsDialog({ open, onClose, value, onSave, lockedPath 
     const seed = value;
     setDraft(seed);
     setOpened(seed);
+    setUserRefs(userPickedPaths(seed));
     api.listProjects().then(setProjects).catch(() => setProjects([]));
     // Re-seed only when the dialog opens; edits inside must not be reset by a
     // parent re-render.
@@ -136,11 +167,40 @@ export function SelectProjectsDialog({ open, onClose, value, onSave, lockedPath 
     // selection change can't be silently overwritten.
     if (path === lockedPath || busy) return;
     setConflicts([]);
+    const removing = draft.some((entry) => entry.path === path);
+    const original = opened.find((entry) => entry.path === path);
     setDraft((cur) => {
       if (cur.some((entry) => entry.path === path)) return cur.filter((entry) => entry.path !== path);
-      const original = opened.find((entry) => entry.path === path);
       return [...cur, original ? { ...original } : { path, root: null }];
     });
+    // The pick marker follows the row: gone with it, and back only when the
+    // restored opening entry brings its (saved, so user-picked) ref back.
+    setUserRefs((cur) => {
+      const next = new Set(cur);
+      next.delete(path);
+      if (!removing && original?.baseRef?.trim()) next.add(path);
+      return next;
+    });
+  };
+
+  // A branch the user picked in a row's picker. A blank pick (the synthetic
+  // HEAD row) clears the ref and its marker.
+  const pickRef = (path: string, ref: string) => {
+    if (busy) return;
+    setConflicts([]);
+    setDraft((cur) => updateSelectionBaseRef(cur, path, ref));
+    setUserRefs((cur) => {
+      const next = new Set(cur);
+      if (ref.trim()) next.add(path);
+      else next.delete(path);
+      return next;
+    });
+  };
+
+  // The picker's automatic "current branch" seed: shown in the trigger, never
+  // marked as a pick, dropped on Save.
+  const seedRef = (path: string, ref: string) => {
+    setDraft((cur) => updateSelectionBaseRef(cur, path, ref));
   };
 
   const addFolder = async () => {
@@ -171,10 +231,14 @@ export function SelectProjectsDialog({ open, onClose, value, onSave, lockedPath 
     setBusy(true);
     setConflicts([]);
     try {
+      // Only refs the user picked are saved (see the component doc), and
+      // dropping the automatic seeds before the merge means a seed can never
+      // conflict with a pick on a sibling path of the same repository.
+      const picked = keepUserPickedRefs(draft, userRefs);
       // Resolve git roots so two paths under one repository collapse to the
       // first selected path. A failure leaves the root unknown (kept).
       const resolved = await Promise.all(
-        draft.map(async (entry) => {
+        picked.map(async (entry) => {
           if (entry.root) return entry;
           try {
             const { root } = await api.getProjectRepoRoot(entry.path);
@@ -189,7 +253,7 @@ export function SelectProjectsDialog({ open, onClose, value, onSave, lockedPath 
       const merged = mergeSelectionsByRoot(resolved);
       if (merged.conflicts.length > 0) {
         // Keep the dialog open on the resolved roots so the user can settle
-        // the refs in the inline Branch rows and reopen.
+        // the conflicting refs in the rows' branch pickers.
         setDraft(resolved);
         setConflicts(merged.conflicts);
         return;
@@ -217,8 +281,8 @@ export function SelectProjectsDialog({ open, onClose, value, onSave, lockedPath 
               <FolderGit2 className="h-4 w-4" /> Select projects
             </h2>
             <p className="mt-1 text-xs text-muted-foreground">
-              Pick one or more projects. Each selected project gets its own branch row with Pull and Fetch;
-              two or more use worktree isolation.
+              Pick one or more projects and the branch each one starts from. Two or more use worktree
+              isolation.
             </p>
           </div>
           <Button size="sm" variant="outline" onClick={() => void addFolder()} disabled={picking || busy}>
@@ -241,7 +305,7 @@ export function SelectProjectsDialog({ open, onClose, value, onSave, lockedPath 
           />
         </div>
 
-        <div className="mt-2 max-h-72 space-y-1 overflow-y-auto" data-testid="select-projects-list">
+        <div className="mt-2 max-h-[min(60vh,calc(100vh_-_18rem))] space-y-1 overflow-y-auto" data-testid="select-projects-list">
           {visible.length === 0 ? (
             query.trim() ? (
               <p className="py-6 text-center text-xs text-muted-foreground">No matches.</p>
@@ -270,29 +334,26 @@ export function SelectProjectsDialog({ open, onClose, value, onSave, lockedPath 
                 className="rounded-md border border-border/60 px-2 py-1.5"
                 data-testid={`select-projects-row-${testId}`}
               >
-                <label className="flex cursor-pointer items-center gap-2 text-xs">
-                  <input
-                    type="checkbox"
-                    checked={selected}
-                    disabled={lockedRow || busy}
-                    onChange={() => toggle(path)}
-                    aria-label={`Select ${path}`}
-                  />
-                  <span className="min-w-0 shrink-0 truncate font-medium">{label}</span>
-                  <span className="min-w-0 flex-1 truncate text-muted-foreground">{path}</span>
+                <div className="flex items-center gap-2">
+                  <label className="flex min-w-0 flex-1 cursor-pointer items-center gap-2 text-xs">
+                    <input
+                      type="checkbox"
+                      checked={selected}
+                      disabled={lockedRow || busy}
+                      onChange={() => toggle(path)}
+                      aria-label={`Select ${path}`}
+                    />
+                    <span className="min-w-0 shrink-0 truncate font-medium">{label}</span>
+                    <span className="min-w-0 flex-1 truncate text-muted-foreground" title={path}>{path}</span>
+                    {selected ? (
+                      <span className="shrink-0 text-[10px] text-muted-foreground">{names[idx]}</span>
+                    ) : null}
+                  </label>
                   {selected ? (
-                    <span className="shrink-0 text-[10px] text-muted-foreground">{names[idx]}</span>
-                  ) : null}
-                </label>
-                {selected ? (
-                  <div className="mt-1 flex items-center justify-between gap-2 pl-6">
-                    <span className="min-w-0 flex-1 truncate text-[10px] text-muted-foreground">
-                      {projectDisplayName(path)} — branch, Pull and Fetch are set in the form.
-                    </span>
                     <Button
                       size="icon"
                       variant="ghost"
-                      className="h-7 w-7"
+                      className="h-7 w-7 shrink-0"
                       aria-label={`Remove ${path}`}
                       disabled={lockedRow || busy}
                       title={lockedRow ? "The issue's repository is always included" : undefined}
@@ -300,6 +361,20 @@ export function SelectProjectsDialog({ open, onClose, value, onSave, lockedPath 
                     >
                       <Trash2 className="h-3.5 w-3.5" />
                     </Button>
+                  ) : null}
+                </div>
+                {selected ? (
+                  <div className="mt-1 pl-6 text-xs" data-testid="select-projects-branch">
+                    <BranchPicker
+                      label="Branch"
+                      workdir={path}
+                      value={draft[idx]?.baseRef ?? ""}
+                      onChange={(next) => pickRef(path, next)}
+                      onAutoSelect={(next) => seedRef(path, next)}
+                      placement="inline"
+                      disabled={busy}
+                      title={isolate || dedupedCount > 1 ? BASE_REF_TITLE : BASE_REF_OFF_TITLE}
+                    />
                   </div>
                 ) : null}
               </div>
@@ -379,4 +454,10 @@ export function SelectProjectsDialog({ open, onClose, value, onSave, lockedPath 
       />
     </>
   );
+}
+
+/** The paths of a saved selection that carry a base ref: every one of them was
+ *  a user pick when it was saved. */
+function userPickedPaths(entries: readonly RepoSelection[]): Set<string> {
+  return new Set(entries.filter((entry) => !!entry.baseRef?.trim()).map((entry) => entry.path));
 }

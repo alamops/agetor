@@ -34,8 +34,8 @@ import {
  * Covers, all inside the New Task left panel (`<aside>`, expanded by
  * default in a fresh browser context) unless noted:
  *  1. Select Projects dialog search box (the combined picker's search input).
- *  2. Branch picker search box (`SearchSelect`, via `BranchPicker` inside
- *     `WorktreeOptions`).
+ *  2. Branch picker search box (`SearchSelect`, via `BranchPicker` under the
+ *     selected project inside the Select Projects dialog).
  *  3. The branch-name input (`branch-name-input`, visible because Isolate
  *     defaults on).
  *  4. The Kanban filter bar's harness filter search box (`MultiSearchSelect`)
@@ -135,16 +135,21 @@ test.describe("identifier inputs opt out of autocorrect", () => {
     expect(branchProjectRes.ok()).toBeTruthy();
     await selectProject(page, newTaskPanel, branchProjectName);
 
-    // 2. Branch picker search box, inside worktree-options.
+    // 2. Branch picker search box, under the selected project inside the
+    //    Select Projects dialog. The first Escape closes the branch list (the
+    //    dialog yields it to the open popover), the second the dialog.
     const worktreeOptions = newTaskPanel.getByTestId("worktree-options");
     await expect(worktreeOptions).toBeVisible();
-    const branchTrigger = worktreeOptions.getByTitle(BRANCH_PICKER_TITLE);
+    const branchDialog = await openSelectProjects(page, newTaskPanel);
+    const branchTrigger = branchDialog.getByTitle(BRANCH_PICKER_TITLE);
     await branchTrigger.click();
-    const branchSearch = worktreeOptions.getByPlaceholder("Search branches…");
+    const branchSearch = branchDialog.getByPlaceholder("Search branches…");
     await expect(branchSearch).toBeVisible({ timeout: CONVERGE_TIMEOUT });
     await expectIdentifierInput(branchSearch);
     await page.keyboard.press("Escape");
     await expect(branchSearch).toBeHidden();
+    await page.keyboard.press("Escape");
+    await expect(selectProjectsDialog(page)).toBeHidden();
 
     // 3. Branch-name input — visible because Isolate defaults on.
     const branchNameInput = worktreeOptions.getByTestId("branch-name-input");

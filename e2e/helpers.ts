@@ -499,8 +499,12 @@ export async function openSelectProjects(page: Page, scope: Locator): Promise<Lo
  *  (matching the row's own project directory) so specs that only know their
  *  worker-unique project name keep working. */
 function projectCheckbox(dialog: Locator, pathOrName: string): Locator {
+  return projectCheckboxIn(dialog, pathOrName);
+}
+
+function projectCheckboxIn(root: Locator | Page, pathOrName: string): Locator {
   const anchor = pathOrName.startsWith("/") ? escapeRegExp(pathOrName) : `(?:.*/)?${escapeRegExp(pathOrName)}`;
-  return dialog.getByLabel(new RegExp(`^Select ${anchor}$`));
+  return root.getByLabel(new RegExp(`^Select ${anchor}$`));
 }
 
 /** Unchecks every row the user could uncheck (the auto-selected project is
@@ -557,29 +561,60 @@ export async function selectProject(page: Page, scope: Locator, pathOrName: stri
   await expect(dialog).toBeHidden({ timeout: SELECT_PROJECTS_TIMEOUT });
 }
 
-/** One selected project's inline Branch · <name> row in the form. */
+/** One selected project's read-only `Branch · <project>` summary line in the
+ *  form (`name` is the project's workspace slug). The line shows the base ref
+ *  the Select Projects dialog saved, or "current branch". */
 export function branchRow(scope: Locator, name: string): Locator {
   return scope.getByTestId(`branch-row-${name}`);
 }
 
+/** A project's row inside the open Select Projects dialog, by absolute path
+ *  (exact) or basename — the same matching `chooseProjects` uses. */
+export function dialogProjectRow(dialog: Locator, pathOrName: string): Locator {
+  return dialog
+    .locator('[data-testid^="select-projects-row-"]')
+    // A page-rooted inner locator: `has` queries it relative to each row.
+    .filter({ has: projectCheckboxIn(dialog.page(), pathOrName) });
+}
+
+/** The branch picker (label, Pull, Fetch, trigger) under one checked project
+ *  in the open Select Projects dialog. */
+export function dialogBranchPicker(dialog: Locator, pathOrName: string): Locator {
+  return dialogProjectRow(dialog, pathOrName).getByTestId("select-projects-branch");
+}
+
 /**
- * Picks an existing branch in one selected project's inline row. The row's
- * last button is its `SearchSelect` trigger (Pull/Fetch precede it), and the
- * open popover is scoped by its `data-popover-open` marker so the trigger's own
- * label can't be mistaken for a list row.
+ * Picks an existing branch in one checked project's picker inside the open
+ * Select Projects dialog. The list opens in flow under the trigger and is
+ * scoped by its `data-popover-open` marker so the trigger's own label can't be
+ * mistaken for a list row. Does not Save.
  */
-export async function selectBaseBranch(
-  page: Page,
-  scope: Locator,
-  name: string,
-  branch: string,
-): Promise<void> {
-  const row = branchRow(scope, name);
-  await expect(row).toBeVisible({ timeout: SELECT_PROJECTS_TIMEOUT });
-  await row.locator("button").last().click();
-  const popover = row.locator("[data-popover-open]");
+export async function pickDialogBranch(dialog: Locator, pathOrName: string, branch: string): Promise<void> {
+  const picker = dialogBranchPicker(dialog, pathOrName);
+  await expect(picker).toBeVisible({ timeout: SELECT_PROJECTS_TIMEOUT });
+  const trigger = picker.getByTestId("branch-picker-trigger");
+  await trigger.click();
+  const popover = picker.locator("[data-popover-open]");
   await expect(popover).toBeVisible({ timeout: SELECT_PROJECTS_TIMEOUT });
   await popover.getByPlaceholder("Search branches…").fill(branch);
   await popover.getByText(branch, { exact: true }).click();
   await expect(popover).toBeHidden();
+  await expect(trigger).toContainText(branch);
+}
+
+/**
+ * Picks `branch` for one selected project the way a user does: open Select
+ * Projects, choose it in that project's branch picker, Save. `pathOrName` is
+ * the project's absolute path or basename.
+ */
+export async function selectBaseBranch(
+  page: Page,
+  scope: Locator,
+  pathOrName: string,
+  branch: string,
+): Promise<void> {
+  const dialog = await openSelectProjects(page, scope);
+  await pickDialogBranch(dialog, pathOrName, branch);
+  await dialog.getByRole("button", { name: "Save", exact: true }).click();
+  await expect(dialog).toBeHidden({ timeout: SELECT_PROJECTS_TIMEOUT });
 }

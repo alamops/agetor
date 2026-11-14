@@ -20,24 +20,25 @@ import {
   type TaskType,
 } from "../../../shared/types.ts";
 import { BranchNamingDialog } from "@/components/settings/BranchNamingDialog";
-import { BranchPicker } from "./BranchPicker";
 import { SelectProjectsButton } from "./ProjectSelection";
 import { SelectProjectsDialog } from "./SelectProjectsDialog";
 
 /**
- * The shared worktree block: the full-width **Select Projects** control, one
- * inline `Branch · <project>` row (picker + Pull + Fetch) per selected
- * project, the "Isolate (worktree)" checkbox, and — while isolated — the
- * shared editable branch-name field with its settings gear and
- * `BranchNamingDialog`.
+ * The shared worktree block: the full-width **Select Projects** control, a
+ * read-only `Branch · <project>` summary line per selected project, the
+ * "Isolate (worktree)" checkbox, and — while isolated — the shared editable
+ * branch-name field with its settings gear and `BranchNamingDialog`.
  *
  * One control serves one project and many: the old split (a single project
  * trigger plus a separate multi-repository dialog, with a different branch UI
- * per mode) is gone. Selection lives in `repos` (owned by
- * `useProjectSelection` in the forms); every per-project base ref rides that
- * same entry. With 2+ projects isolation is forced: the checkbox is checked
- * and disabled, and `effectiveIsolate` (not the raw toggle) drives the
- * branch-name field, `valid` and the create payload.
+ * per mode) is gone. Projects *and* their base refs are chosen in the Select
+ * Projects dialog, where every selected project has its own branch picker with
+ * Pull and Fetch; the summary lines here only show the result and reopen the
+ * dialog. Selection lives in `repos` (owned by `useProjectSelection` in the
+ * forms); every per-project base ref rides that same entry. With 2+ projects
+ * isolation is forced: the checkbox is checked and disabled, and
+ * `effectiveIsolate` (not the raw toggle) drives the branch-name field,
+ * `valid` and the create payload.
  *
  * The branch-name field follows the clean/dirty model documented in
  * `src/mainview/lib/branch-field.ts`. `src/mainview/lib/worktree-payload.ts`'s
@@ -247,22 +248,13 @@ const isolateTitle =
 const forcedIsolateTitle =
   "Two or more projects always use worktree isolation: each project gets its own worktree and branch.";
 
-const baseRefTitle =
-  "Base ref the worktree branches from. Pick the current branch row to use what's checked out at task start.";
-
-const baseRefOffTitle =
-  "Isolation is off — the value is recorded but the agent will run directly in the project workdir.";
-
 type Props =
   | {
       state: WorktreeOptionsState;
-      /** The selected projects (its first entry is the primary). */
+      /** The selected projects (its first entry is the primary), each with
+       *  the base ref picked in the Select Projects dialog. */
       repos: RepoSelection[];
       onReposChange: Dispatch<SetStateAction<RepoSelection[]>>;
-      /** A user-picked base ref for one project. */
-      onBaseRefChange: (path: string, baseRef: string) => void;
-      /** `BranchPicker`'s automatic "preselect the current branch" seed. */
-      onBaseRefAuto: (path: string, baseRef: string) => void;
       /** A project that must stay selected (the issue dialog's own repo). */
       lockedPath?: string | null;
     }
@@ -270,8 +262,8 @@ type Props =
 
 /**
  * Renders the worktree block. Live variant (`{ state, repos, … }`): Select
- * Projects → one Branch row per project → Isolate → (while isolated) the
- * branch-name field + `BranchNamingDialog`. Locked variant (`{ locked }`): the
+ * Projects → one read-only Branch summary line per project → Isolate →
+ * (while isolated) the branch-name field + `BranchNamingDialog`. Locked variant (`{ locked }`): the
  * PR-conflicts modal, where the PR's head branch is checked out as-is in its
  * own worktree — a disabled Select Projects control showing the PR's repo, a
  * read-only branch row, and a checked/disabled isolate checkbox.
@@ -317,8 +309,6 @@ function LiveWorktreeOptions({
   state,
   repos,
   onReposChange,
-  onBaseRefChange,
-  onBaseRefAuto,
   lockedPath,
 }: Extract<Props, { state: WorktreeOptionsState }>) {
   const [selectOpen, setSelectOpen] = useState(false);
@@ -340,10 +330,10 @@ function LiveWorktreeOptions({
   } = state;
 
   // Workspace names, in order — the same slugs the server uses. They key the
-  // rows' test ids (stable, sanitized, unique) but are NOT user-facing: the
-  // label is the project's own name, with the full path appended when two
-  // selected projects share a basename (grill decision 11), so the user can
-  // tell which repository a row belongs to.
+  // summary lines' test ids (stable, sanitized, unique) but are NOT
+  // user-facing: the label is the project's own name, with the full path
+  // appended when two selected projects share a basename (grill decision 11),
+  // so the user can tell which repository a line belongs to.
   const names = useMemo(() => selectionNames(repos), [repos]);
   const labels = useMemo(() => projectRowLabels(repos.map((repo) => repo.path)), [repos]);
 
@@ -356,6 +346,7 @@ function LiveWorktreeOptions({
         value={repos}
         onSave={onReposChange}
         lockedPath={lockedPath}
+        isolate={effectiveIsolate}
       />
 
       {repos.length === 0 ? (
@@ -363,21 +354,38 @@ function LiveWorktreeOptions({
           Select a project to choose its branch and worktree options.
         </p>
       ) : (
-        <div className="space-y-2">
-          {repos.map((repo, i) => (
-            <div key={repo.path} data-testid={`branch-row-${names[i]}`}>
-              <BranchPicker
-                label={`Branch · ${labels[i]}`}
-                workdir={repo.path}
-                value={repo.baseRef ?? ""}
-                onChange={(next) => onBaseRefChange(repo.path, next)}
-                onAutoSelect={(next) => onBaseRefAuto(repo.path, next)}
-                placement="bottom"
-                title={effectiveIsolate ? baseRefTitle : baseRefOffTitle}
-              />
-            </div>
-          ))}
-        </div>
+        // Read-only summary of what the dialog saved: one line per project
+        // with the branch it starts from ("current branch" until the user
+        // picks one — the server resolves that to HEAD at create time).
+        // Clicking it reopens the dialog, where the pickers live.
+        <button
+          type="button"
+          data-testid="selected-branches"
+          onClick={() => setSelectOpen(true)}
+          title="Change the branch for each project in Select projects"
+          className="block w-full space-y-1 rounded-md px-1 py-0.5 text-left transition-colors hover:bg-accent/40 focus-visible:outline-none focus-visible:ring-1 focus-visible:ring-ring"
+        >
+          {repos.map((repo, i) => {
+            const ref = repo.baseRef?.trim();
+            return (
+              <span key={repo.path} data-testid={`branch-row-${names[i]}`} className="flex min-w-0 items-center gap-2 text-[11px]">
+                <span className="min-w-0 flex-1 truncate text-muted-foreground" title={repo.path}>
+                  {`Branch · ${labels[i]}`}
+                </span>
+                <span
+                  className={cn(
+                    "flex min-w-0 max-w-[60%] shrink-0 items-center gap-1 font-mono",
+                    !ref && "text-muted-foreground",
+                  )}
+                  title={ref ?? "The project's current branch when the task starts"}
+                >
+                  <GitBranch className="size-3 shrink-0" aria-hidden />
+                  <span className="truncate">{ref ?? "current branch"}</span>
+                </span>
+              </span>
+            );
+          })}
+        </button>
       )}
 
       <div className="space-y-1">

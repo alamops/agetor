@@ -244,8 +244,7 @@ export function NewTaskForm({ onSubmit, agents, harnesses, stacks = [], profiles
   // the most-recently-added project once the list resolves, so a returning user
   // lands on their previous project without an extra click. After a submit the
   // selection (and every chosen ref) is kept for the next task.
-  const { repos, setRepos, workdir, multiRepo, setBaseRef, setBaseRefAuto, resetRefDirty } =
-    useProjectSelection({ autoSelect: true });
+  const { repos, setRepos, workdir, multiRepo } = useProjectSelection({ autoSelect: true });
   // Owns the isolate toggle (forced for 2+) and the branch-name field state —
   // see `WorktreeOptions.tsx`. Declared here (before the mode/model state) since
   // `wt.effectiveIsolate` is read further down by the `fileScope` memo passed to
@@ -696,9 +695,7 @@ export function NewTaskForm({ onSubmit, agents, harnesses, stacks = [], profiles
     setReferences([]);
     capture.clearDropHint();
     wt.resetAfterSubmit();
-    // The project selection and its per-project refs stay; only the draft's
-    // user-pick markers reset so a freshly seeded ref doesn't read as dirty.
-    resetRefDirty();
+    // The project selection and its per-project refs stay for the next task.
     setAgentProfileId(null);
     setPipelineId(null);
     // Keep the selection, `model`, `effort`, `mode` set on purpose — the next
@@ -851,8 +848,6 @@ export function NewTaskForm({ onSubmit, agents, harnesses, stacks = [], profiles
                 state={wt}
                 repos={repos}
                 onReposChange={setRepos}
-                onBaseRefChange={setBaseRef}
-                onBaseRefAuto={setBaseRefAuto}
               />
 
               {/* "One selection" (plan D1/D5): a picked pipeline replaces

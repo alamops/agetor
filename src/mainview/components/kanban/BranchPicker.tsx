@@ -26,7 +26,9 @@ interface Props {
   label?: string;
   /** Tooltip on the trigger. */
   title?: string;
-  placement?: "top" | "bottom";
+  /** Forwarded to `SearchSelect`; "inline" keeps the branch list in flow so a
+   *  scrolling parent (the Select Projects dialog's list) can't clip it. */
+  placement?: "top" | "bottom" | "inline";
   disabled?: boolean;
 }
 
@@ -295,6 +297,7 @@ export function BranchPicker({ workdir, value, onChange, onAutoSelect, className
         disabled={disabled}
         title={title ?? (error ? `Couldn't list branches: ${error}` : undefined)}
         placeholder="Search branches…"
+        triggerTestId="branch-picker-trigger"
         emptyLabel="HEAD"
         leadingIcon={<GitBranch className="size-3.5" />}
         displayValue={(v) => (v === HEAD_VALUE ? "HEAD" : v)}

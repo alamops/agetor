@@ -3,7 +3,7 @@ import { mkdir, mkdtemp, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import path from "node:path";
 import { test, expect, type Locator, type Page } from "./fixtures";
-import { gotoApp } from "./helpers";
+import { gotoApp, openSelectProjects } from "./helpers";
 
 /**
  * E2E coverage for branch-scoped skills/commands discovery (docs/plans/
@@ -184,19 +184,23 @@ test.describe("branch-scoped skills/commands discovery", () => {
     const worktreeOptions = form.getByTestId("worktree-options");
     await expect(worktreeOptions.getByTestId("isolate-toggle")).toBeChecked();
 
-    const branchTrigger = worktreeOptions.getByTitle(BRANCH_PICKER_TITLE);
-    await branchTrigger.scrollIntoViewIfNeeded();
+    // The base-ref picker lives under the selected project inside the Select
+    // Projects dialog; the pick applies on Save.
+    const projects = await openSelectProjects(page, form);
+    const branchTrigger = projects.getByTitle(BRANCH_PICKER_TITLE);
     await branchTrigger.click();
 
-    const search = worktreeOptions.getByPlaceholder("Search branches…");
+    const search = projects.getByPlaceholder("Search branches…");
     await expect(search).toBeVisible({ timeout: CONVERGE_TIMEOUT });
     await search.fill("feature/skills");
 
-    const popover = worktreeOptions.locator("[data-popover-open]");
+    const popover = projects.locator("[data-popover-open]");
     const branchRow = popover.locator("button").filter({ hasText: "feature/skills" }).first();
     await expect(branchRow).toBeVisible({ timeout: CONVERGE_TIMEOUT });
-    await branchRow.scrollIntoViewIfNeeded();
     await branchRow.click();
+    await projects.getByRole("button", { name: "Save", exact: true }).click();
+    await expect(projects).toBeHidden({ timeout: CONVERGE_TIMEOUT });
+    await expect(worktreeOptions.getByTestId("selected-branches")).toContainText("feature/skills");
 
     await textarea.click();
     await page.keyboard.type("/e2e-");

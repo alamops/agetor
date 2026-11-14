@@ -474,10 +474,18 @@ subdirectory selections under one root are not serialized against each other.)
   button above Isolate whose label is the project name (one) or
   `N projects selected` (2+, post-dedupe), opening a Save-based dialog with
   search, multi-select, Add folder, Clone repository…, Import sessions… and
-  remove. The dialog owns selection only; every selected project gets an
-  inline `Branch · <project>` row (the existing `BranchPicker`, so Pull/Fetch
-  are per project), and each row's ref rides `repositories[].baseRef` through
-  the one `selectionPayload` mapping. Exactly one project sends the
+  remove. Every checked row in the dialog carries its own `BranchPicker`
+  (branch list, Pull and Fetch on that project's checkout), opened with
+  `placement="inline"` so the dialog's scrolling list can't clip it; base refs
+  are part of the dialog's draft, applied by Save and discarded by Cancel.
+  Each picker preselects its project's current branch, but that seed only
+  fills the trigger: Save drops every ref the user didn't pick
+  (`keepUserPickedRefs`, before the root merge), so an untouched project
+  keeps no base ref (HEAD at create time) and a seed can never conflict with a
+  pick on the same root. The form shows one read-only `Branch · <project>`
+  summary line per project (the saved ref, or "current branch") that reopens
+  the dialog. Each saved ref rides `repositories[].baseRef` through the one
+  `selectionPayload` mapping. Exactly one project sends the
   single-repository shape (`workdir` + top-level `baseRef`) so a non-git folder
   with isolation off still creates; 2+ force `isolation: "worktree"` and send
   one entry per project. 2+ also forces the checkbox on and disables it;

@@ -6,8 +6,10 @@ import { test, expect, type APIRequestContext, type E2EBackend, type Page } from
 import {
   branchRow,
   chooseProjects,
+  dialogBranchPicker,
   gotoApp,
   openSelectProjects,
+  pickDialogBranch,
   selectBaseBranch,
   selectProjectsDialog,
 } from "./helpers";
@@ -17,9 +19,10 @@ import { uniqueRepoSlugs } from "../src/shared/multi-repo.ts";
  * E2E coverage for the combined Select Projects control (replaces the old
  * split between a single project picker and the separate multi-repository
  * dialog). One full-width button above Isolate is the only selection surface:
- * its label carries the project name / selected count, every selected project
- * gets the same inline Branch · Pull · Fetch row, and 2+ projects force and
- * disable Isolate. The issue dialog and the PR-conflict modal reuse the same
+ * its label carries the project name / selected count, every checked project
+ * in its dialog gets the same branch picker with Pull and Fetch, the form shows
+ * a read-only `Branch · <project>` summary line per project, and 2+ projects
+ * force and disable Isolate. The issue dialog and the PR-conflict modal reuse the same
  * control (e2e/issue-task.spec.ts + e2e/resolve-conflicts.spec.ts).
  *
  * Scenarios:
@@ -48,6 +51,11 @@ import { uniqueRepoSlugs } from "../src/shared/multi-repo.ts";
  *     on the first selected one;
  *  m. while a Save's git-root lookup is in flight the draft controls are
  *     disabled (a late edit cannot overwrite the resolved snapshot);
+ *  o. a branch picked in the dialog is a draft: Cancel discards it;
+ *  p. a picker's automatic current-branch seed is never saved: the summary
+ *     reads "current branch" and the task gets the HEAD sha;
+ *  q. the dialog's branch list opens in flow, so the scrolling project list
+ *     never clips it;
  *  n. Add folder opens at the current selection and selects what it adds.
  *
  * Non-current branch names are mandatory: a picker wired to nothing still
@@ -264,7 +272,9 @@ test("one project: name label, enabled Isolate, one Branch row, single-repo payl
   await expect(isolate).toBeChecked();
   await expect(isolate).toBeEnabled();
 
-  await selectBaseBranch(page, form, slugFor(repoA), BRANCH);
+  // Until a branch is picked the summary reads "current branch".
+  await expect(branchRow(form, slugFor(repoA))).toContainText("current branch");
+  await selectBaseBranch(page, form, repoA, BRANCH);
   await expect(branchRow(form, slugFor(repoA))).toContainText(BRANCH);
 
   await form.getByRole("button", { name: "Run task", exact: true }).click();
@@ -286,18 +296,26 @@ test("two projects: count label, forced Isolate, per-project refs in repositorie
   await expect(form.getByTestId("select-projects-button")).toContainText("2 projects selected");
   await expect(form.locator('[data-testid^="branch-row-"]')).toHaveCount(2);
 
-  // Every selected project gets the same row affordances the single project
-  // had: its own Pull and Fetch act on its own workdir.
-  for (const repo of [repoA, repoB]) {
-    const row = branchRow(form, slugFor(repo));
-    await expect(row.getByRole("button", { name: "Pull", exact: true })).toBeVisible();
-    await expect(row.getByRole("button", { name: "Fetch", exact: true })).toBeVisible();
-  }
+  // The form only summarizes: no branch picker, Pull or Fetch lives there.
+  const worktreeOptions = form.getByTestId("worktree-options");
+  await expect(worktreeOptions.getByTestId("branch-picker-trigger")).toHaveCount(0);
+  await expect(worktreeOptions.getByRole("button", { name: "Pull", exact: true })).toHaveCount(0);
+  await expect(worktreeOptions.getByRole("button", { name: "Fetch", exact: true })).toHaveCount(0);
 
-  // Base refs live in the inline Branch rows, never in the dialog.
-  await form.getByTestId("select-projects-button").click();
+  // Clicking the summary reopens the dialog, where every checked project has
+  // the same picker the single project had, with its own Pull and Fetch —
+  // and an unchecked project has none.
+  await form.getByTestId("selected-branches").click();
   const dialog = selectProjectsDialog(page);
   await expect(dialog).toBeVisible({ timeout: CONVERGE_TIMEOUT });
+  for (const repo of [repoA, repoB]) {
+    const picker = dialogBranchPicker(dialog, repo);
+    await expect(picker.getByTestId("branch-picker-trigger")).toContainText("main", { timeout: CONVERGE_TIMEOUT });
+    await expect(picker.getByRole("button", { name: "Pull", exact: true })).toBeVisible();
+    await expect(picker.getByRole("button", { name: "Fetch", exact: true })).toBeVisible();
+  }
+  await expect(dialogBranchPicker(dialog, repoPlain)).toHaveCount(0);
+  // The old free-text per-repository base-ref inputs stay gone.
   await expect(dialog.getByLabel(/^Base ref for /)).toHaveCount(0);
   // The dialog hosts every management entry the spec promises.
   await expect(dialog.getByRole("button", { name: "Add folder", exact: true })).toBeVisible();
@@ -310,8 +328,14 @@ test("two projects: count label, forced Isolate, per-project refs in repositorie
   await expect(isolate).toBeChecked();
   await expect(isolate).toBeDisabled();
 
-  await selectBaseBranch(page, form, slugFor(repoA), BRANCH);
-  await selectBaseBranch(page, form, slugFor(repoB), BRANCH);
+  // Both picks in one dialog session, applied by one Save.
+  const picking = await openSelectProjects(page, form);
+  await pickDialogBranch(picking, repoA, BRANCH);
+  await pickDialogBranch(picking, repoB, BRANCH);
+  await picking.getByRole("button", { name: "Save", exact: true }).click();
+  await expect(picking).toBeHidden({ timeout: CONVERGE_TIMEOUT });
+  await expect(branchRow(form, slugFor(repoA))).toContainText(BRANCH);
+  await expect(branchRow(form, slugFor(repoB))).toContainText(BRANCH);
 
   await form.getByRole("button", { name: "Run task", exact: true }).click();
   const created = await awaitTask(request, backend, "select-projects multi");
@@ -328,9 +352,9 @@ test("unchecking and rechecking a project inside one dialog keeps its base ref",
   await form.getByTestId("prompt-textarea").fill("the pinned ref must survive a recheck");
 
   await chooseProjects(page, form, [repoA, repoB]);
-  // Pin a NON-current ref on B's inline row. If the recheck rebuilt the draft
-  // entry as a bare `{ path, root: null }` the ref would be gone by Save.
-  await selectBaseBranch(page, form, slugFor(repoB), BRANCH);
+  // Pin a NON-current ref on B. If the recheck rebuilt the draft entry as a
+  // bare `{ path, root: null }` the ref would be gone by Save.
+  await selectBaseBranch(page, form, repoB, BRANCH);
   await expect(branchRow(form, slugFor(repoB))).toContainText(BRANCH);
 
   const dialog = await openSelectProjects(page, form);
@@ -339,6 +363,7 @@ test("unchecking and rechecking a project inside one dialog keeps its base ref",
   await expect(b).not.toBeChecked();
   await b.check();
   await expect(b).toBeChecked();
+  await expect(dialogBranchPicker(dialog, repoB).getByTestId("branch-picker-trigger")).toContainText(BRANCH);
   await dialog.getByRole("button", { name: "Save", exact: true }).click();
   await expect(dialog).toBeHidden({ timeout: CONVERGE_TIMEOUT });
 
@@ -356,8 +381,9 @@ test("each project's Pull and Fetch act on that project's own checkout", async (
   const form = newTaskForm(page);
   await chooseProjects(page, form, [repoA, repoB]);
 
-  const rowB = branchRow(form, slugFor(repoB));
-  // Both rows auto-select their own current branch, so B's Pull is enabled
+  const dialog = await openSelectProjects(page, form);
+  const rowB = dialogBranchPicker(dialog, repoB);
+  // Both pickers auto-select their own current branch, so B's Pull is enabled
   // (its `main` tracks origin/main) and its actions carry B's path.
   const pullB = rowB.getByRole("button", { name: "Pull", exact: true });
   await expect(pullB).toBeEnabled({ timeout: CONVERGE_TIMEOUT });
@@ -583,6 +609,7 @@ test("a Save in flight disables the draft while the git roots resolve", async ({
   await expect(dialog.getByRole("button", { name: "Add folder", exact: true })).toBeDisabled();
   await expect(dialog.getByLabel(`Select ${repoX}`, { exact: true })).toBeDisabled();
   await expect(dialog.getByLabel(`Remove ${repoX}`, { exact: true })).toBeDisabled();
+  await expect(dialogBranchPicker(dialog, repoX).getByTestId("branch-picker-trigger")).toBeDisabled();
 
   gate.release();
   await expect(dialog).toBeHidden({ timeout: CONVERGE_TIMEOUT });
@@ -597,7 +624,7 @@ test("a submit keeps the selection and refs and resets the branch name", async (
   await form.getByTestId("prompt-textarea").fill("keep my picks");
 
   await chooseProjects(page, form, [repoA]);
-  await selectBaseBranch(page, form, slugFor(repoA), BRANCH);
+  await selectBaseBranch(page, form, repoA, BRANCH);
   const branchName = form.getByTestId("branch-name-input");
   await branchName.fill("custom/one-off");
   await expect(branchName).toHaveValue("custom/one-off");
@@ -644,4 +671,84 @@ test("with no project selected the form cannot create a task", async ({ page, fr
   await expect(form.getByTestId("select-projects-empty")).toBeVisible();
   await expect(form.getByRole("button", { name: "To backlog", exact: true })).toBeDisabled();
   await expect(form.getByRole("button", { name: "Run task", exact: true })).toBeDisabled();
+});
+
+test("a branch picked in the dialog is a draft: Cancel discards it", async ({ page, backend }) => {
+  await gotoApp(page, backend.bootBase);
+  const form = newTaskForm(page);
+  await chooseProjects(page, form, [repoA]);
+  await expect(branchRow(form, slugFor(repoA))).toContainText("current branch");
+
+  const dialog = await openSelectProjects(page, form);
+  await pickDialogBranch(dialog, repoA, BRANCH);
+  await dialog.getByRole("button", { name: "Cancel", exact: true }).click();
+  await expect(dialog).toBeHidden();
+
+  // Nothing was applied, and reopening reseeds from the saved selection: the
+  // picker is back on the project's current branch.
+  await expect(branchRow(form, slugFor(repoA))).toContainText("current branch");
+  await expect(branchRow(form, slugFor(repoA))).not.toContainText(BRANCH);
+  const reopened = await openSelectProjects(page, form);
+  await expect(dialogBranchPicker(reopened, repoA).getByTestId("branch-picker-trigger")).toContainText("main", {
+    timeout: CONVERGE_TIMEOUT,
+  });
+  await reopened.getByRole("button", { name: "Cancel", exact: true }).click();
+});
+
+test("a picker's automatic current-branch seed is not saved as a pick", async ({ page, request, backend }) => {
+  await gotoApp(page, backend.bootBase);
+  const form = newTaskForm(page);
+  await form.getByPlaceholder("Short description").fill("select-projects seed not saved");
+  await form.getByTestId("prompt-textarea").fill("leave the branch alone");
+  await chooseProjects(page, form, [repoA, repoB]);
+
+  // Open, let both pickers preselect `main`, pick only B, and Save.
+  const dialog = await openSelectProjects(page, form);
+  await expect(dialogBranchPicker(dialog, repoA).getByTestId("branch-picker-trigger")).toContainText("main", {
+    timeout: CONVERGE_TIMEOUT,
+  });
+  await pickDialogBranch(dialog, repoB, BRANCH);
+  await dialog.getByRole("button", { name: "Save", exact: true }).click();
+  await expect(dialog).toBeHidden({ timeout: CONVERGE_TIMEOUT });
+
+  // A's seed was only shown in the trigger; B's pick is saved.
+  await expect(branchRow(form, slugFor(repoA))).toContainText("current branch");
+  await expect(branchRow(form, slugFor(repoB))).toContainText(BRANCH);
+
+  await form.getByRole("button", { name: "To backlog", exact: true }).click();
+  const created = await awaitTask(request, backend, "select-projects seed not saved");
+  // No ref for A means HEAD at create time, which is A's `main`.
+  expect(created.repositories.map((r) => r.path)).toEqual([repoA, repoB]);
+  expect(created.repositories[0]!.baseRef).toBe(git(repoA, ["rev-parse", "main"]));
+  expect(created.repositories[1]!.baseRef).toBe(branchShaB);
+});
+
+test("the dialog's branch list opens in flow and is never clipped by the project list", async ({ page, backend }) => {
+  await gotoApp(page, backend.bootBase);
+  const form = newTaskForm(page);
+  await chooseProjects(page, form, [repoB, repoA]);
+
+  // `/projects` lists the newest first, so repoA (registered first) is the
+  // bottom row: a floating popover there would hang below the list's
+  // scrolling box and be cut off.
+  const dialog = await openSelectProjects(page, form);
+  const picker = dialogBranchPicker(dialog, repoA);
+  await picker.getByTestId("branch-picker-trigger").click();
+  const popover = picker.locator("[data-popover-open]");
+  await expect(popover).toBeVisible({ timeout: CONVERGE_TIMEOUT });
+  await expect(popover.getByText(BRANCH, { exact: true })).toBeVisible({ timeout: CONVERGE_TIMEOUT });
+
+  const list = dialog.getByTestId("select-projects-list");
+  await expect.poll(async () => {
+    const [p, l] = await Promise.all([popover.boundingBox(), list.boundingBox()]);
+    if (!p || !l) return false;
+    return p.y >= l.y - 1 && p.y + p.height <= l.y + l.height + 1;
+  }, { timeout: CONVERGE_TIMEOUT }).toBe(true);
+
+  // Escape closes the branch list first, then the dialog.
+  await page.keyboard.press("Escape");
+  await expect(popover).toBeHidden();
+  await expect(dialog).toBeVisible();
+  await page.keyboard.press("Escape");
+  await expect(dialog).toBeHidden();
 });

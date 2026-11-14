@@ -79,7 +79,28 @@ export function mergeSelectionsByRoot(entries: readonly RepoSelection[]): {
 /** One sentence naming a base-ref conflict, for the dialog's error line. */
 export function describeRootConflict(conflict: RootConflict): string {
   const parts = conflict.entries.map((e) => `${e.path} (${e.baseRef})`);
-  return `${parts.join(" and ")} are in the same repository but have different base refs. Remove one, or close and keep one base ref in the Branch rows.`;
+  return `${parts.join(" and ")} are in the same repository but have different base refs. Remove one, or pick the same branch in both rows.`;
+}
+
+/**
+ * The Select Projects dialog's draft with every base ref the user did not pick
+ * removed. Each selected row's branch picker preselects the project's current
+ * branch on its own; that seed only fills the trigger, it is not a choice.
+ * Dropping it before the git-root merge means an automatic seed can never
+ * conflict with (or be saved as) a pick, and a project nobody touched keeps
+ * "no base ref", which the server resolves to the same current HEAD at create
+ * time. `userPicked` holds the paths whose ref the user chose in the picker
+ * (or that arrived already chosen from the saved selection).
+ */
+export function keepUserPickedRefs(
+  entries: readonly RepoSelection[],
+  userPicked: ReadonlySet<string>,
+): RepoSelection[] {
+  return entries.map((entry) => {
+    if (userPicked.has(entry.path) || entry.baseRef === undefined) return entry;
+    const { baseRef: _auto, ...rest } = entry;
+    return rest;
+  });
 }
 
 // ── Select Projects dialog: abandoning a save ──────────────────────────────

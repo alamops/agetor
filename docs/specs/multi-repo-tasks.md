@@ -127,9 +127,12 @@ coordinate changes across every repository in that card.
   `CreateTaskFromIssueDialog`: a single full-width button above the Isolate checkbox, labelled with
   the selected project's name (one) or `N projects selected` (2+, post-dedupe). It opens a Save-based
   dialog with a search box, multi-select of registered projects, `Add folder…`, Clone repository…,
-  Import sessions… and remove; the dialog owns **selection only** and offers no per-project base-ref
-  input. Every selected project then gets the same inline `Branch · <project>` row (branch picker,
-  Pull, Fetch) in the form, and its chosen base ref rides `repositories[].baseRef`. At least one
+  Import sessions… and remove. Every checked project in the dialog gets the same branch picker the
+  single project always had (branch list, Pull, Fetch), listed in place under its row; the branches
+  apply with the selection on Save and Cancel discards both. A project whose branch the user didn't
+  pick keeps no base ref (HEAD at create time). The form shows a read-only `Branch · <project>` line
+  per project with the saved branch (or "current branch"), and each chosen base ref rides
+  `repositories[].baseRef`. At least one
   project is required (Save is disabled at zero). Two or more deduped projects force worktree
   isolation and disable the Isolate checkbox; collapsing back to one leaves it checked and editable.
   Exactly one project keeps the historical single-repository payload shape (`workdir` + top-level
