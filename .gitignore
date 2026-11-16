@@ -57,3 +57,7 @@ skills-lock.json
 
 # Finder (MacOS) folder config
 .DS_Store
+
+# jubarteai: private Codex network setting
+/.codex/config.toml
+/.jubarteai
