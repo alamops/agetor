@@ -24,6 +24,7 @@ import {
   resolveScrapedAskQuestions,
   type AskQuestion,
   type TmuxPromptChoice,
+  type TmuxPromptRequest,
 } from "./interactions.ts";
 import { resolveTmuxBin, tmuxSocketArgs, ensureDisclaimedServer, tmuxEnv } from "./tmux-resolution.ts";
 import { coreSpawn } from "./core-spawn.ts";
@@ -1735,6 +1736,9 @@ async function tmux(args: string[], opts: { stdinText?: string } = {}): Promise<
  *  and can report a live, unrelated session as "exists" (empirically proven
  *  on this task's sibling `agetor-<id>` names). */
 export async function sessionExists(taskId: string): Promise<boolean> {
+  // An e2e fake pane (only ever registered under AGETOR_CLAUDE_DRIVER=fake)
+  // stands in for the tmux session its card is answered through.
+  if (process.env.AGETOR_CLAUDE_DRIVER === "fake" && fakePromptPanes.has(taskId)) return true;
   return (await tmux(["has-session", "-t", "=" + sessionNameFor(taskId)])).ok;
 }
 
@@ -2212,6 +2216,11 @@ export function getCurrentPermissionMode(taskId: string): string | null {
  * either the guarded paste lands or is withheld and this click's op
  * becomes current. The server route at `server.ts:1420` awaits this
  * Promise, so the modal-click HTTP response inherits the wait.
+ *
+ * NOTE (docs/plans/claude-enter-to-confirm-prompts.md T9): production answers a
+ * card through `answerTmuxPromptInPane`, which re-reads the live pane before
+ * every key; this registered-cursor variant is kept only as the unit seam for
+ * the shared walk + `confirmKey` choreography. Do not add a production caller.
  */
 export async function dismissTmuxPrompt(
   taskId: string,
@@ -2327,6 +2336,257 @@ async function walkCursor(
     if (!stillCurrent()) return false;
   }
   return true;
+}
+
+/* ────────────────────────────────────────────────────────────────────────── *
+ * Card drive: answering a `tmux_prompt` card from a live read of the pane
+ * ────────────────────────────────────────────────────────────────────────── */
+
+/** What a card answer asks the drive to do. `code` carries the user's OAuth
+ *  code; it exists only as a function argument here (never logged, thrown or
+ *  returned). */
+export type PromptAction =
+  | { kind: "choice"; key: string }
+  | { kind: "enter" }
+  | { kind: "code"; code: string };
+
+/** `recarded`: the dialog refused the confirm, the old card was settled and a
+ *  fresh one (`held: true`) registered in its place. */
+export type PromptDriveResult =
+  | { ok: true; recarded?: boolean }
+  | { ok: false; reason: "no-session" | "dialog-changed" | "wrong-kind" | "send-failed" };
+
+/** The pane the drive reads and types into: tmux, or the e2e fake pane. */
+interface CardPaneIo {
+  /** The live pane text, or `null` when it cannot be read. */
+  capture(): Promise<string | null>;
+  key(name: string): Promise<boolean>;
+  literal(text: string): Promise<boolean>;
+}
+
+/** A fake pane for e2e: honoured only under `AGETOR_CLAUDE_DRIVER=fake`. */
+interface FakePromptPane { text: string; onKeys: (keys: string[]) => void }
+const fakePromptPanes = new Map<string, FakePromptPane>();
+
+/** Wait after the confirm before checking the dialog left (claude repaints). */
+const CARD_VERIFY_DELAY_MS = 700;
+/** Gap between keys on an add-dir dialog: the same 150 ms as
+ *  `STARTUP_CONFIRM_KEY_GAP_MS` (a literal here, that const is declared further
+ *  down this module). */
+const ADD_DIR_KEY_GAP_MS = 150;
+
+/**
+ * Register a fake pane for `taskId` and card it through the SAME matcher chain
+ * the real scraper uses, so an e2e exercises the real answer route, closed
+ * allow-list, matchers and card. No-op unless `AGETOR_CLAUDE_DRIVER=fake`.
+ * `onKeys` receives every key name (and typed text) the card drive sends.
+ */
+export function registerFakePromptPane(taskId: string, pane: FakePromptPane): void {
+  if (process.env.AGETOR_CLAUDE_DRIVER !== "fake") return;
+  fakePromptPanes.set(taskId, pane);
+  const runId = tasks.get(taskId)?.runId;
+  if (!runId) return;
+  const lines = pane.text.split("\n");
+  const tail = lines.slice(Math.max(0, lines.length - SCRAPE_TAIL_LINES)).join("\n");
+  const match = pickScrapeMatch(tail, { paneWorking: false, paneIdle: false, watchdogArmed: false, boot: true });
+  if (!match) return;
+  registerTmuxPrompt({
+    taskId,
+    runId,
+    paneText: match.paneText,
+    choices: match.choices,
+    cursorIndex: match.cursorIndex,
+    nav: match.nav,
+    fingerprint: match.fingerprint,
+    unparsable: match.unparsable,
+    confirmKey: match.confirmKey,
+    hideKeys: match.hideKeys,
+    answerKind: match.answerKind,
+    identity: identityOf(match),
+  });
+}
+
+/** Drop the fake pane (the fake turn finished or was killed). */
+export function clearFakePromptPane(taskId: string): void {
+  fakePromptPanes.delete(taskId);
+}
+
+function realPaneIo(state: SessionState): CardPaneIo {
+  return {
+    capture: async () => {
+      const r = await tmux(["capture-pane", "-p", "-t", state.sessionName]);
+      return r.ok ? r.stdout : null;
+    },
+    key: async (name) => {
+      bumpKeystroke(state);
+      return (await tmux(["send-keys", "-t", state.sessionName, name])).ok;
+    },
+    literal: async (text) => {
+      bumpKeystroke(state);
+      return (await tmux(["send-keys", "-t", state.sessionName, "-l", "--", text])).ok;
+    },
+  };
+}
+
+function fakePaneIo(pane: FakePromptPane): CardPaneIo {
+  return {
+    capture: async () => pane.text,
+    key: async (name) => { pane.onKeys([name]); return true; },
+    literal: async (text) => { pane.onKeys([text]); return true; },
+  };
+}
+
+/**
+ * Answer a `tmux_prompt` card by typing into its pane. The ONLY path the answer
+ * route uses to send keys for a card, and every key is computed from a LIVE
+ * read taken inside the task's `queueTmuxOp` chain (so no paste can slip between
+ * the read and the keys): the pane is re-captured, re-matched, and the dialog on
+ * screen must have the same cursor-free identity as the one the card was
+ * registered for, else nothing is sent (`dialog-changed`, which the route maps
+ * to a 409 and the card refreshes). Arrows come from the live cursor, never the
+ * registered one, and never from an unreadable cursor (the two-row select wraps
+ * onto "No, exit").
+ *
+ * - `choice`: arrows to the picked row, then Enter (or the card's `confirmKey`).
+ *   On the add-dir family the keys are ≥150 ms apart, a held dialog is waited
+ *   out for its arm window, and if the dialog is still there after the confirm
+ *   the card is replaced by a `held: true` one.
+ * - `enter`: exactly one Enter, only when the live pane is the same Enter-only
+ *   screen. Never sent automatically.
+ * - `code`: only on an `answerKind: "code"` card whose live pane still shows
+ *   the OAuth prompt; the text goes in with `send-keys -l -- …` and then Enter.
+ *   The code is never in a thrown message, a log line, a chunk or the result.
+ */
+export async function answerTmuxPromptInPane(
+  pending: TmuxPromptRequest,
+  action: PromptAction,
+): Promise<PromptDriveResult> {
+  const fake = process.env.AGETOR_CLAUDE_DRIVER === "fake" ? fakePromptPanes.get(pending.taskId) : undefined;
+  const state = sessions.get(pending.taskId);
+  if (!fake && !state) return { ok: false, reason: "no-session" };
+  if (action.kind !== (pending.answerKind ?? "choice")) return { ok: false, reason: "wrong-kind" };
+  let result: PromptDriveResult = { ok: false, reason: "send-failed" };
+  if (fake) {
+    try {
+      result = await driveCard(pending, action, fakePaneIo(fake), () => fakePromptPanes.get(pending.taskId) === fake);
+    } catch {
+      result = { ok: false, reason: "send-failed" };
+    }
+    return result;
+  }
+  await queueTmuxOp(pending.taskId, async (stillCurrent) => {
+    try {
+      result = await driveCard(pending, action, realPaneIo(state!), stillCurrent);
+    } catch {
+      // Deliberately no message: a thrown error could carry the typed code.
+      result = { ok: false, reason: "send-failed" };
+    }
+  }, state);
+  return result;
+}
+
+async function driveCard(
+  pending: TmuxPromptRequest,
+  action: PromptAction,
+  io: CardPaneIo,
+  stillCurrent: () => boolean,
+): Promise<PromptDriveResult> {
+  const live = await io.capture();
+  if (live === null) return { ok: false, reason: "dialog-changed" };
+  const lines = live.split("\n");
+  const tail = lines.slice(Math.max(0, lines.length - SCRAPE_TAIL_LINES)).join("\n");
+
+  if (action.kind === "enter") {
+    const screen = matchEnterOnlyScreen(tail);
+    if (!screen || screen.fingerprint !== pending.fingerprint) return { ok: false, reason: "dialog-changed" };
+    return (await io.key("Enter")) ? { ok: true } : { ok: false, reason: "send-failed" };
+  }
+
+  if (action.kind === "code") {
+    const screen = matchPasteCodeScreen(tail);
+    if (!screen || screen.fingerprint !== pending.fingerprint) return { ok: false, reason: "dialog-changed" };
+    if (!(await io.literal(escapeTypedTrailingSemicolon(action.code)))) return { ok: false, reason: "send-failed" };
+    await Bun.sleep(STARTUP_CONFIRM_KEY_GAP_MS);
+    if (!stillCurrent()) return { ok: false, reason: "send-failed" };
+    return (await io.key("Enter")) ? { ok: true } : { ok: false, reason: "send-failed" };
+  }
+
+  // choice
+  const match = pickScrapeMatch(tail, {
+    paneWorking: paneShowsClaudeWorking(tail),
+    paneIdle: paneShowsIdleInputBox(tail),
+    watchdogArmed: false,
+    boot: true,
+  });
+  if (!match || match.answerKind === "enter" || match.answerKind === "code" || match.unparsable) {
+    return { ok: false, reason: "dialog-changed" };
+  }
+  const sameDialog = pending.identity
+    ? identityOf(match) === pending.identity
+    : match.choices.map((c) => c.label).join("\u0001") === pending.choices.map((c) => c.label).join("\u0001");
+  if (!sameDialog) return { ok: false, reason: "dialog-changed" };
+  const targetIndex = pending.choices.findIndex((c) => c.key === action.key);
+  if (targetIndex < 0) return { ok: false, reason: "dialog-changed" };
+
+  const addDir = parseAddDirDialog(tail);
+  const arrowNav = typeof pending.cursorIndex === "number";
+  if (!arrowNav) {
+    // y/N: the literal keystroke, then Enter (no cursor to read).
+    if (!(await io.key(action.key))) return { ok: false, reason: "send-failed" };
+    await Bun.sleep(50);
+    if (!stillCurrent()) return { ok: false, reason: "send-failed" };
+    return (await io.key("Enter")) ? { ok: true } : { ok: false, reason: "send-failed" };
+  }
+  // Arrow navigation needs a readable cursor on the live pane.
+  if (typeof match.cursorIndex !== "number") return { ok: false, reason: "dialog-changed" };
+  const gap = addDir ? ADD_DIR_KEY_GAP_MS : 30;
+  let arrows: string[];
+  if (addDir) {
+    // A held dialog accepts keys again only ≥500 ms after the refusal.
+    if (addDir.footer === "held") await Bun.sleep(STARTUP_DIALOG_ARM_MS);
+    arrows = planConfirmArrows({
+      cursorIndex: match.cursorIndex,
+      acceptIndex: targetIndex,
+      heldAddDir: addDir.footer === "held" && targetIndex === addDir.yesIndex,
+    });
+  } else {
+    const delta = targetIndex - match.cursorIndex;
+    const arrow = pending.nav === "horizontal" ? (delta >= 0 ? "Right" : "Left") : (delta >= 0 ? "Down" : "Up");
+    arrows = Array.from({ length: Math.abs(delta) }, () => arrow);
+  }
+  for (const arrow of arrows) {
+    if (!stillCurrent()) return { ok: false, reason: "send-failed" };
+    if (!(await io.key(arrow))) return { ok: false, reason: "send-failed" };
+    await Bun.sleep(gap);
+  }
+  if (!stillCurrent()) return { ok: false, reason: "send-failed" };
+  if (!(await io.key(pending.confirmKey ?? "Enter"))) return { ok: false, reason: "send-failed" };
+
+  if (!addDir) return { ok: true };
+  // The add-dir select refuses a confirm it did not count: check the dialog left.
+  await Bun.sleep(CARD_VERIFY_DELAY_MS);
+  const after = await io.capture();
+  const afterLines = after === null ? [] : after.split("\n");
+  const afterTail = afterLines.slice(Math.max(0, afterLines.length - SCRAPE_TAIL_LINES)).join("\n");
+  const still = after === null ? null : parseAddDirDialog(afterTail);
+  if (!still || still.identity !== addDir.identity) return { ok: true };
+  // Still on screen (refused): replace the card with one that says so.
+  const card = pickScrapeMatch(afterTail, { paneWorking: false, paneIdle: false, watchdogArmed: false });
+  if (!card || typeof card.cursorIndex !== "number") return { ok: true };
+  answerTmuxPrompt(pending.id, { key: "__external__" });
+  registerTmuxPrompt({
+    taskId: pending.taskId,
+    runId: pending.runId,
+    paneText: card.paneText,
+    choices: card.choices,
+    cursorIndex: card.cursorIndex,
+    nav: card.nav,
+    fingerprint: card.fingerprint,
+    hideKeys: card.hideKeys,
+    identity: identityOf(card),
+    held: true,
+  });
+  return { ok: true, recarded: true };
 }
 
 /**

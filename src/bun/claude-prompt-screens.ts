@@ -283,7 +283,10 @@ export function matchEnterOnlyScreen(tail: string): { paneText: string; fingerpr
   if (region.some((l) => CURSOR_ROW_RE.test(l))) return null;
   if (region.some((l) => /\benter to confirm\b/i.test(l))) return null;
   const paneText = region.join("\n");
-  return { paneText: redactPaneSecrets(paneText), fingerprint: sha1(`enter-only:${paneText}`) };
+  // Leading whitespace is not part of the screen's identity: `tmux capture-pane`
+  // output is trimmed by the callers, which strips the first line's indent.
+  const stable = region.map((l) => l.trim()).join("\n");
+  return { paneText: redactPaneSecrets(paneText), fingerprint: sha1(`enter-only:${stable}`) };
 }
 
 /**
@@ -297,7 +300,11 @@ export function matchPasteCodeScreen(tail: string): { paneText: string; fingerpr
   if (!region.slice(-6).some((l) => PASTE_CODE_RE.test(l))) return null;
   if (region.some((l) => CURSOR_ROW_RE.test(l))) return null;
   const paneText = redactPaneSecrets(region.join("\n"));
-  const stable = paneText.replace(/(Paste code here if prompted\s*>)\s*•+/i, "$1");
+  const stable = paneText
+    .split("\n")
+    .map((l) => l.trim())
+    .join("\n")
+    .replace(/(Paste code here if prompted\s*>)\s*•+/i, "$1");
   return { paneText, fingerprint: sha1(`paste-code:${stable}`) };
 }
 

@@ -19,9 +19,11 @@ import { attachSubagentWatcher, settleSubagentById, type SubagentWatcherHandle }
 import {
   CLAUDE_API_ERROR_STATUS_PREFIX,
   CLAUDE_UNKNOWN_COMMAND_STATUS_PREFIX,
+  clearFakePromptPane,
   encodeProjectPath,
   jsonlPathFor,
   openContinuationRun,
+  registerFakePromptPane,
   spawnClaudeViaTmux,
   toClaudeModeString,
   type ChunkHandler,
@@ -1369,6 +1371,32 @@ export const FAKE_CLAUDE_LIMIT_PANE_PROMPT_MARKER = "__agetor_fake_claude_limit_
  *  column flip must NOT pre-empt a stacked swap. */
 export const FAKE_CLAUDE_API_LIMIT_PROMPT_MARKER = "__agetor_fake_claude_api_limit__";
 export const FAKE_CODEX_LIMIT_PROMPT_MARKER = "__agetor_fake_codex_limit__";
+
+/**
+ * Enter-only / OAuth-code card seams (docs/plans/claude-enter-to-confirm-
+ * prompts.md T13). The fake claude turn registers a fake pane
+ * (`registerFakePromptPane`, claude-tmux.ts, honoured only under
+ * `AGETOR_CLAUDE_DRIVER=fake`) that goes through the SAME matcher chain the real
+ * scraper uses, so an e2e drives the real answer route, its closed allow-list,
+ * the matcher and the card. The turn is held until the card is answered:
+ *
+ * - `ENTER`: the pane is the binary-shaped `Login successful. Press Enter to
+ *   continue…`. An `Enter` key clears the pane and completes the turn with the
+ *   assistant text `continued`.
+ * - `PASTE_CODE`: the pane is the OAuth `Paste code here if prompted >` screen.
+ *   The typed text then `Enter` completes the turn with `code received (<n>
+ *   chars)`; the code itself is never emitted anywhere.
+ *
+ * Like every other marker these ride `task.prompt`, since the fixture backend's
+ * env is fixed per worker.
+ */
+export const FAKE_CLAUDE_ENTER_PROMPT_MARKER = "__agetor_fake_claude_enter_prompt__";
+export const FAKE_CLAUDE_PASTE_CODE_PROMPT_MARKER = "__agetor_fake_claude_paste_code__";
+const FAKE_ENTER_ONLY_PANE = "\n Login successful. Press Enter to continue…\n";
+const FAKE_PASTE_CODE_PANE =
+  "\n Browser didn't open? Use the url below to sign in\n\n"
+  + " https://claude.ai/oauth/authorize?code=true&client_id=00000000-0000-0000-0000-000000000000\n\n"
+  + " Paste code here if prompted > \n";
 
 /** Per-task turn counter for the fake failover scenario. Stamped so a
  *  long-lived test process can prune entries for tasks no longer in play — the
@@ -3361,6 +3389,31 @@ function makeFakeAgent(
       onChunk("status", "turn complete");
       resolveDone(0);
     });
+  } else if (
+    fakeOpts.kind !== "codex"
+    && (prompt.includes(FAKE_CLAUDE_ENTER_PROMPT_MARKER) || prompt.includes(FAKE_CLAUDE_PASTE_CODE_PROMPT_MARKER))
+  ) {
+    // Held until the card is answered; see the marker constants' doc comment.
+    const wantsCode = prompt.includes(FAKE_CLAUDE_PASTE_CODE_PROMPT_MARKER);
+    const typed: string[] = [];
+    const finish = (): void => {
+      if (killed) return;
+      clearFakePromptPane(taskId);
+      onChunk("assistant", wantsCode ? `code received (${typed.join("").length} chars)` : "continued");
+      onChunk("status", "turn complete");
+      resolveDone(0);
+    };
+    after(20, () => {
+      registerFakePromptPane(taskId, {
+        text: wantsCode ? FAKE_PASTE_CODE_PANE : FAKE_ENTER_ONLY_PANE,
+        onKeys: (keys) => {
+          for (const key of keys) {
+            if (key === "Enter") finish();
+            else typed.push(key); // the OAuth code text: counted, never emitted
+          }
+        },
+      });
+    });
   } else if (prompt.includes(FAKE_CLAUDE_DONE_REJECT_PROMPT_MARKER)) {
     // Test hook: reject `done` (see FAKE_CLAUDE_DONE_REJECT_PROMPT_MARKER's
     // doc comment). The orchestrator has already echoed the prompt by now;
@@ -3593,6 +3646,7 @@ function makeFakeAgent(
       // (clearTimeout on an elapsed timer, resolveDone on an already-settled
       // promise).
       for (const t of timers) clearTimeout(t);
+      clearFakePromptPane(taskId);
       realWatcherHandle?.detach();
       realWatcherHandle = undefined;
       // Mirror the real fx driver's settlement discipline: a still-open
