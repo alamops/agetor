@@ -257,6 +257,9 @@ export function matchAddDirAutoTrust(
 const CURSOR_ROW_RE = /^\s*[❯›]/;
 const PRESS_ENTER_RE = /\bPress Enter to (?:continue|retry)\b/i;
 const PASTE_CODE_RE = /Paste code here if prompted\s*>/i;
+/** Non-blank lines read for the OAuth-code screen, and the fixed window (ending at the prompt line) its card and fingerprint use. */
+const PASTE_CODE_SCAN_LINES = 40;
+const PASTE_CODE_WINDOW_LINES = 12;
 const VOLATILE_RE = /^\s*(?:[✻✶✳✢·*]\s+\S.*…|.*\(\d+s ·.*\)|.*Tip:.*)$/;
 
 function tailNonBlank(tail: string, n: number): string[] {
@@ -296,21 +299,27 @@ export function matchEnterOnlyScreen(tail: string): { paneText: string; fingerpr
  * fingerprint, and typing it does not make the card look "dismissed".
  */
 export function matchPasteCodeScreen(tail: string): { paneText: string; fingerprint: string } | null {
-  const region = tailNonBlank(tail, 12);
-  if (!region.slice(-6).some((l) => PASTE_CODE_RE.test(l))) return null;
-  if (region.some((l) => CURSOR_ROW_RE.test(l))) return null;
-  const paneText = redactPaneSecrets(region.join("\n"));
-  // The identity is everything up to and including the prompt line, with what
-  // was typed after the marker removed. Lines below it are not part of it:
-  // redaction drops them once a code is typed (a wrapped code continues there),
-  // so including them would let typing a code change the fingerprint.
-  const lines = paneText.split("\n").map((l) => l.trim());
-  const markerAt = lines.findIndex((l) => PASTE_CODE_RE.test(l));
-  const stable = lines
-    .slice(0, markerAt + 1)
+  // A wrapped code adds lines BELOW the prompt, which would push the lines above
+  // it out of a bottom-anchored window and change the fingerprint mid-typing.
+  // So read a deeper tail, redact it, and cut a fixed window that ENDS at the
+  // prompt line instead.
+  const all = tailNonBlank(tail, PASTE_CODE_SCAN_LINES);
+  if (!all.slice(-6).some((l) => PASTE_CODE_RE.test(l))) return null;
+  if (all.slice(-12).some((l) => CURSOR_ROW_RE.test(l))) return null;
+  const lines = redactPaneSecrets(all.join("\n")).split("\n");
+  let markerAt = -1;
+  for (let i = lines.length - 1; i >= 0; i--) {
+    if (PASTE_CODE_RE.test(lines[i]!)) { markerAt = i; break; }
+  }
+  if (markerAt < 0) return null;
+  // Lines under the prompt are not part of the identity: redaction drops them
+  // once a code is typed (a wrapped code continues there).
+  const ctxLines = lines.slice(Math.max(0, markerAt - (PASTE_CODE_WINDOW_LINES - 1)), markerAt + 1);
+  const stable = ctxLines
+    .map((l) => l.trim())
     .join("\n")
     .replace(/(Paste code here if prompted\s*>)\s*•+/i, "$1");
-  return { paneText, fingerprint: sha1(`paste-code:${stable}`) };
+  return { paneText: ctxLines.join("\n"), fingerprint: sha1(`paste-code:${stable}`) };
 }
 
 /**

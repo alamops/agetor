@@ -2214,8 +2214,8 @@ export function getCurrentPermissionMode(taskId: string): string | null {
  * (docs/plans/model-effort-local-command-turns.md §10) waits out that
  * guard too — up to `PASTE_MODAL_GRACE_MS` (default 1500ms) — before
  * either the guarded paste lands or is withheld and this click's op
- * becomes current. The server route at `server.ts:1420` awaits this
- * Promise, so the modal-click HTTP response inherits the wait.
+ * becomes current. `answerTmuxPromptInPane` shares this serialization, so the
+ * modal-click HTTP response inherits the same wait.
  *
  * NOTE (docs/plans/claude-enter-to-confirm-prompts.md T9): production answers a
  * card through `answerTmuxPromptInPane`, which re-reads the live pane before
@@ -6660,9 +6660,11 @@ export function matchStartupConsentDialog(
   // earlier transcript, and the bypass / trust-folder arms below match a marker
   // ANYWHERE in the pane (they are not bottom-anchored), so a transcript that
   // quotes one of those dialogs would make the tracker type arrows and Enter
-  // into the live composer. Neither dialog is re-asked on resume (the answer is
-  // persisted), and the add-dir arm above is footer-anchored, so it alone is
-  // safe to run over a pane with history.
+  // into the live composer. Bypass is persisted and not re-asked on resume;
+  // workspace trust can be re-asked after a harness-stack account swap (the
+  // config mirror never copies project trust), and that dialog is carded by the
+  // generic path instead. The add-dir arm above is footer-anchored, so it alone
+  // is safe to run over a pane with history.
   if (ctx?.addDirOnly) return null;
   const dialog = STARTUP_CONSENT_DIALOGS.find((d) => d.marker.test(pane));
   if (!dialog) return null;
@@ -8382,10 +8384,10 @@ async function scrapeOnce(state: SessionState): Promise<void> {
  * Stamp a fingerprint as "just answered" so the next scrape tick
  * doesn't immediately re-register a ghost copy while tmux/claude
  * finish repainting. Called by the `/tmux-prompts/:id/answer` route
- * right after `dismissTmuxPrompt`.
+ * right after `answerTmuxPromptInPane` has driven the pane.
  *
- * No-op when there's no session for the task — same idempotent
- * behaviour as `dismissTmuxPrompt` on a torn-down session.
+ * No-op when there's no session for the task — the same idempotent
+ * behaviour as `answerTmuxPromptInPane` on a torn-down session.
  */
 export function markTmuxPromptAnswered(taskId: string, fingerprint: string): void {
   const state = sessions.get(taskId);
@@ -9784,6 +9786,11 @@ export async function spawnClaudeViaTmux(opts: ClaudeLaunchOptions): Promise<Spa
           if (activeTmuxPromptsForTask(opts.taskId).length > 0) {
             sawStartupPromptThisWindow = true;
             state.startupDialogSeenAt = now;
+            // A card still awaiting the user (a workspace-trust re-ask after a
+            // harness-stack account swap, say) keeps the resume window's
+            // no-dialog timer from running out, so the add-dir dialogs queued
+            // behind it are still auto-confirmed once it is answered.
+            lastDialogAt = now;
           }
           const m = matchStartupConsentDialog(pane, consentCtx);
           const identity = m ? startupDialogIdentity(m) : null;

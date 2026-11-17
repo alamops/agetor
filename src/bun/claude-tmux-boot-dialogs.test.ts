@@ -26,6 +26,7 @@ const {
   markTmuxPromptAnswered,
   sessionNameFor,
   claudeBootsInFlight,
+  answerTmuxPromptInPane,
 } = await import("./claude-tmux.ts");
 const { activeTmuxPromptsForTask, answerTmuxPrompt, findTmuxPromptById } = await import("./interactions.ts");
 const { tasks, runs } = await import("./db.ts");
@@ -360,6 +361,35 @@ describe("boot poller — resume consent window", () => {
   }, 50_000);
 });
 
+describe("boot poller — resume window waits behind a pending card", () => {
+  test("a card still awaiting the user past the boot timeout keeps the window open, so a later add-dir dialog is still auto-confirmed", async () => {
+    // After a harness-stack account swap claude re-asks workspace trust on
+    // resume; that dialog is carded and the user may take longer than the boot
+    // timeout. The add-dir dialogs queued behind it must still be handled.
+    setBootTimeoutMs(2_500);
+    const trust = [
+      " Quick safety check: Is this a project you created or one you trust?",
+      " ❯ No, exit",
+      "   Yes, I trust this folder",
+      " Enter to confirm · Esc to cancel",
+    ].join("\n");
+    const b = await boot({ dialogs: [{ kind: "raw", text: trust }] }, { autoTrustDirectories: DIRS, resume: true, withRun: true });
+    try {
+      // The runtime scraper cards the trust dialog; it stays pending well past
+      // the 2.5 s window timeout while the user decides.
+      await until(() => activeTmuxPromptsForTask(b.taskId).length === 1, 15_000, "the trust card");
+      await new Promise((r) => setTimeout(r, 4_000));
+      expect(activeTmuxPromptsForTask(b.taskId)).toHaveLength(1);
+      // The user answers; claude moves on to the re-asked add-dir dialog.
+      b.tmux.patch({ cfg: { dialogs: [REPO_E] }, i: 0, cursor: 0, held: false, mountedAt: Date.now() });
+      await until(() => b.tmux.state().done === true, 15_000, "the add-dir dialog accepted");
+      expect(b.tmux.keys().map((k) => k.k)).toEqual(["Down", "Enter"]);
+    } finally {
+      await b.stop();
+    }
+  }, 40_000);
+});
+
 describe("boot poller — resume window never acts on a quoted dialog", () => {
   test("a resumed pane whose transcript quotes the trust-folder and bypass dialogs above the idle composer gets no keys", async () => {
     // The old transcript of a resumed session can contain a pasted/quoted
@@ -409,6 +439,87 @@ describe("deferred prompt paste (defect 3)", () => {
       await b.stop();
     }
   }, 40_000);
+});
+
+/** What the answer route does once `answerTmuxPromptInPane` reports success. */
+function settleLikeTheRoute(taskId: string, card: { id: string; fingerprint: string }, key: string, recarded?: boolean): void {
+  markTmuxPromptAnswered(taskId, card.fingerprint);
+  if (!recarded) answerTmuxPrompt(card.id, { key });
+}
+
+describe("deferred prompt paste lands once the startup card is answered (defect 3)", () => {
+  test("the prompt waits behind the card through several readiness windows, then is pasted exactly once after the user answers it", async () => {
+    setDeferredPromptTimeoutMs(700);
+    const b = await boot({ dialogs: [REPO_E] }, { autoTrustDirectories: [], deferredPrompt: "a very large prompt", withRun: true });
+    const pastes = () => b.tmux.calls().filter((c) => c.argv[0] === "paste-buffer");
+    try {
+      await until(() => activeTmuxPromptsForTask(b.taskId).length === 1, 15_000, "card");
+      // Three readiness windows pass with the card unanswered: nothing is typed.
+      await new Promise((r) => setTimeout(r, 2_200));
+      expect(pastes()).toHaveLength(0);
+      expect(b.statuses().some((s) => s.includes("delivering prompt anyway"))).toBe(false);
+
+      // The user clicks "Yes, add it" on the card (the route's drive).
+      const card = activeTmuxPromptsForTask(b.taskId)[0]!;
+      const driven = await answerTmuxPromptInPane(card, { kind: "choice", key: "2" });
+      expect(driven.ok).toBe(true);
+      settleLikeTheRoute(b.taskId, card, "2", driven.ok ? driven.recarded : undefined);
+      expect(b.tmux.state().done).toBe(true);
+
+      // claude's composer is up: the deferred prompt is pasted, after the dialog's Enter.
+      await until(() => pastes().length === 1, 15_000, "the deferred paste");
+      const dialogEnter = b.tmux.keys().find((k) => k.k === "Enter" && !k.literal)!;
+      expect(pastes()[0]!.t).toBeGreaterThan(dialogEnter.t);
+      await until(() => b.statuses().some((s) => s.includes("ready (jsonl:")), 15_000, "ready status");
+      // Exactly once: no second paste lands while the run settles.
+      await new Promise((r) => setTimeout(r, 1_000));
+      expect(pastes()).toHaveLength(1);
+      expect(b.statuses().some((s) => s.includes("delivering prompt anyway"))).toBe(false);
+      expect(b.stderr()).not.toContain("paste failed");
+      expect(b.stderr()).not.toContain("never appeared");
+      expect(b.fileReady).toEqual([b.sessionId]);
+    } finally {
+      await b.stop();
+    }
+  }, 50_000);
+});
+
+describe("boot poller — auto-confirm gives up and hands the dialog to a card", () => {
+  test("claude refusing every confirm: 4 attempts, one 'answer it in the terminal' line, then a card the user answers and the boot proceeds", async () => {
+    const b = await boot({ dialogs: [REPO_E], refuseEnters: 99 }, { autoTrustDirectories: DIRS, withRun: true });
+    const enters = () => b.tmux.keys().filter((k) => k.k === "Enter").length;
+    try {
+      await until(() => activeTmuxPromptsForTask(b.taskId).length === 1, 40_000, "the give-up card");
+      expect(enters()).toBe(4);
+      expect(b.statuses().filter((s) => s.includes("could not be confirmed after 4 attempts"))).toEqual([
+        "claude startup dialog could not be confirmed after 4 attempts (add-dir:repo-e) — answer it in the terminal",
+      ]);
+      expect(b.statuses().some((s) => s.startsWith("auto-confirmed Claude's"))).toBe(false);
+      expect(b.tmux.state().exited).toBeUndefined();
+      const card = activeTmuxPromptsForTask(b.taskId)[0]!;
+      expect(card.choices.map((c) => c.label)).toEqual(["No, exit", "Yes, add it"]);
+
+      // The poller stopped typing: the card is now the only way through, and the
+      // boot (3 s timeout) stays open while it waits.
+      await new Promise((r) => setTimeout(r, 4_000));
+      expect(enters()).toBe(4);
+      expect(b.stderr()).not.toContain("never appeared");
+      expect(activeTmuxPromptsForTask(b.taskId).map((r) => r.id)).toEqual([card.id]);
+
+      // claude takes the user's click.
+      b.tmux.patch({ refuse: 0 });
+      const driven = await answerTmuxPromptInPane(card, { kind: "choice", key: "2" });
+      expect(driven.ok).toBe(true);
+      settleLikeTheRoute(b.taskId, card, "2", driven.ok ? driven.recarded : undefined);
+      await until(() => b.statuses().some((s) => s.includes("ready (jsonl:")), 15_000, "ready status");
+      expect(b.tmux.state().done).toBe(true);
+      expect(b.fileReady).toEqual([b.sessionId]);
+      // The dialog the user confirmed is never reported as auto-confirmed.
+      expect(b.statuses().some((s) => s.startsWith("auto-confirmed Claude's"))).toBe(false);
+    } finally {
+      await b.stop();
+    }
+  }, 70_000);
 });
 
 // Silence "unused" for helpers kept for readability in failures.

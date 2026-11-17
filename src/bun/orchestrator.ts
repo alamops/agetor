@@ -2609,7 +2609,8 @@ async function startTaskInner(
     if (!moved.ok || !moved.moved) return { error: moved.error ?? failure };
     await dropSessionAfterAccountMove(taskId, moved.moved.from);
     task = tasks.get(taskId) ?? task;
-    accountMoveNotes.push(...(moved.warnings ?? []));
+    // Say why the account was left: the failure that forced the move.
+    accountMoveNotes.push(failure, ...(moved.warnings ?? []));
     harness = resolveHarness(task.agent);
   }
   if (!harness || !status) {

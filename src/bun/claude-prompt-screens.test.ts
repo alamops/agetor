@@ -231,6 +231,17 @@ describe("matchPasteCodeScreen + redactPaneSecrets", () => {
     expect(typed.fingerprint).toBe(base.fingerprint);
   });
 
+  test("the fingerprint is stable on a full login screen when a wrapped code adds lines below the prompt", () => {
+    const head = Array.from({ length: 14 }, (_, i) => ` Login screen line ${i + 1}`).join("\n");
+    const base = matchPasteCodeScreen(`${head}\n Paste code here if prompted >\n Esc to cancel\n`)!;
+    const typed = matchPasteCodeScreen(
+      `${head}\n Paste code here if prompted > wrapped-secret-part-one-abcdefghijklmnop\nqrstuvwxyz-wrapped-secret-part-two\nmore-wrapped-secret-part-three#state-value\n Esc to cancel\n`,
+    )!;
+    expect(typed.fingerprint).toBe(base.fingerprint);
+    expect(typed.paneText).not.toContain("wrapped-secret");
+    expect(typed.paneText).not.toContain("state-value");
+  });
+
   test("redaction is idempotent", () => {
     const once = redactPaneSecrets("Paste code here if prompted > abc");
     expect(redactPaneSecrets(once)).toBe(once);
