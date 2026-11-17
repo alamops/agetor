@@ -136,6 +136,29 @@ export function speedOptionsFor(
 }
 
 /**
+ * The explanatory text a Speed control shows under itself: the CLI's own cost
+ * description for Fast where it reports one (codex service tier), agetor's
+ * own line where it does not (claude), and a note on a model whose own
+ * default tier is already a fast one (Off then passes nothing, so that
+ * default applies). Empty for every other case.
+ */
+export function speedNoticeFor(
+  kind: AgentKind,
+  model: string | null,
+  speed: Speed,
+  rows: readonly ModelOption[],
+): { fastHint?: string; note?: string } {
+  const row = rowFor(rows, model);
+  if (speed === "fast") {
+    if (kind === "codex") return { fastHint: row?.fastHint ?? "Faster service tier — uses more of your usage." };
+    if (kind === "claude-code") return { fastHint: "Claude's Fast mode — faster output at a higher usage rate." };
+    return {};
+  }
+  if (kind === "codex" && row?.defaultFast === true) return { note: "This model's default tier applies." };
+  return {};
+}
+
+/**
  * Whether the Speed tiers on offer are known yet. Cursor derives them from
  * its own variant specs, so always; fx, codex and claude learn them from
  * discovery, so only once a trusted catalog has loaded. Until then a form

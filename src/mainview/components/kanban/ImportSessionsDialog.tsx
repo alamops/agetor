@@ -13,6 +13,8 @@ import {
   opencodeWarningCopy,
 } from "@/lib/import-sessions";
 import { LONG_PATH_IMPORT_ERROR, MISSING_FOLDER_IMPORT_ERROR } from "../../../shared/claude-session-meta.ts";
+import { claudeIdFromCliModel } from "../../../shared/claude-model-id.ts";
+import { modelDisplayName } from "../../../shared/model-display.ts";
 import {
   CLAUDE_SESSIONS_LIVENESS_STALE_MS,
   type DiscoveredAccount,
@@ -488,7 +490,7 @@ export function ImportSessionsDialog({ open, onClose, onImported }: Props) {
                         {row.session.gitBranch ? ` · ${row.session.gitBranch}` : ""}
                         {row.session.branchMismatch && row.session.liveBranch ? ` (folder is on ${row.session.liveBranch})` : ""}
                         {row.session.model ? (
-                          <span data-testid="import-claude-session-model">{` · ${row.session.model}`}</span>
+                          <span data-testid="import-claude-session-model">{` · ${modelDisplayName("claude-code", (claudeIdFromCliModel(row.session.model) ?? row.session.model))}`}</span>
                         ) : null}
                         {activity ? (
                           <span data-testid="import-claude-session-activity">{` · ${activity}`}</span>

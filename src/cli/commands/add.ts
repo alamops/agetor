@@ -24,11 +24,7 @@ import {
 } from "../../shared/issue-task.ts";
 import {
   AGENT_OPTIONS,
-  DEFAULT_MODEL,
   DEFAULT_EFFORT,
-  CATALOG_SCOPED_KINDS,
-  supportedEfforts,
-  cursorModelIdCoveredByCatalog,
   defaultModeFor,
   type AgentKind,
   type AgentOption,
@@ -37,13 +33,17 @@ import {
   type Speed,
   type Task,
 } from "../../shared/types.ts";
-import { isSpeed, supportedSpeeds, SPEED_OPTIONS } from "../../shared/speed.ts";
+import { isSpeed, SPEED_OPTIONS } from "../../shared/speed.ts";
+import type { DiscoveredModel, ModelOption } from "../../shared/model-options.ts";
 import {
-  mergeModelOptions,
-  discoveredEffortsFor,
-  type DiscoveredModel,
-  type ModelOption,
-} from "../../shared/model-options.ts";
+  buildModelOptions,
+  effortOptionsFor,
+  resolveDefaultEffort,
+  resolveDefaultModel,
+  resolveSeedModel,
+  speedOptionsFor,
+} from "../../shared/model-catalog.ts";
+import { asAgentKind, modelDisplayName } from "../../shared/model-display.ts";
 import { agentProfileSummary, asProfileError, matchAgentProfileRef } from "../../shared/agent-profile.ts";
 import { matchPipelineRef } from "../../shared/pipeline.ts";
 import { escapeControlChars, escapeFreeText } from "../../shared/terminal-text.ts";
@@ -658,28 +658,24 @@ function baseInput(
 
 /** Seed for the interactive model picker: the stored `lastModel:<kind>` pref
  *  when it is still offerable — a curated row for the kind, or an id the
- *  harness's discovered catalog actually lists (fx accounts can carry
- *  discovered-only ids) — else the kind's default. Mirrors the two webview
- *  pickers' validation so a retired id (e.g. gemini-3-pro-preview, shut down
- *  2026-03-09 and cleared by migration 049) can't be re-offered as the
- *  pre-selected default via mergeModelOptions' unlisted-row rule. `loggedIn`
- *  mirrors mergeModelOptions rule 7: a logged-out harness's discovered
- *  catalog is untrustworthy (an expired login reads back the unauthenticated
- *  catalog), so it is not consulted — only curated rows can keep the pref. */
+ *  harness's discovered catalog actually lists (a model only the CLI knows,
+ *  an fx account's discovered-only id) — else the default (the owner's pick,
+ *  or the CLI's own default model when a trusted catalog lacks it). Mirrors
+ *  the webview pickers' validation (`resolveSeedModel`) so a retired id (e.g.
+ *  gemini-3-pro-preview, shut down 2026-03-09 and cleared by migration 049)
+ *  can't be re-offered as the pre-selected default via mergeModelOptions'
+ *  unlisted-row rule. `loggedIn` mirrors mergeModelOptions rule 7: a
+ *  logged-out harness's discovered catalog is untrustworthy (an expired login
+ *  reads back the unauthenticated catalog), so it is not consulted — only
+ *  curated rows can keep the pref. */
 export function resolveInitialModel(
   kind: AgentKind,
   stored: string | undefined | null,
   discovered: readonly DiscoveredModel[],
   loggedIn: boolean | null = null,
 ): string {
-  const offerable = loggedIn === false ? [] : discovered;
-  if (
-    stored &&
-    (AGENT_OPTIONS[kind].models.some((m) => m.id === stored) || offerable.some((m) => m.id === stored))
-  ) {
-    return stored;
-  }
-  return DEFAULT_MODEL[kind];
+  const rows = buildModelOptions(kind, { discovered, loggedIn });
+  return resolveSeedModel(kind, stored, rows) ?? resolveDefaultModel(kind, discovered, loggedIn);
 }
 
 /** The interactive add wizard. Exported for unit tests (the repo's
@@ -793,7 +789,7 @@ export async function wizard(
               hint: escapeControlChars(
                 agentProfileSummary({
                   harnessLabel: harnesses.find((h) => h.id === pr.harness)?.label ?? pr.harness,
-                  model: pr.model,
+                  model: modelDisplayName(asAgentKind(harnesses.find((h) => h.id === pr.harness)?.kind ?? pr.harness), pr.model),
                   effort: pr.effort,
                   mode: pr.mode,
                 }),
@@ -841,10 +837,9 @@ export async function wizard(
     // Computed once agent/kind are known so the model picker and the effort
     // prompt below read the same discovered list.
     // Spec'd cursor models show as one base row + effort dropdown, not N
-    // suffixed rows — same filter as the webview pickers (NewTaskForm.tsx).
-    const catalog: DiscoveredModel[] = ((agent && harnessModels.byHarness[agent]) || discovered[kind] || []).filter(
-      (m) => kind !== "cursor" || !cursorModelIdCoveredByCatalog(m.id),
-    );
+    // suffixed rows — `buildModelOptions` does that, the same composition the
+    // webview pickers use.
+    const catalog: DiscoveredModel[] = (agent && harnessModels.byHarness[agent]) || discovered[kind] || [];
     const loggedIn = statuses.find((s) => s.harnessId === agent)?.loggedIn ?? null;
 
     // Picker seed: an explicit `--model` wins verbatim (unknown ids pass
@@ -858,13 +853,7 @@ export async function wizard(
     // same merged rows — computed unconditionally (not just inside the
     // `!model` branch) since `--model` can be passed without `--effort`, and
     // the effort prompt still needs rule-7/8-honoring `efforts` per model.
-    const modelOptions = mergeModelOptions({
-      curated: AGENT_OPTIONS[kind].models,
-      discovered: catalog,
-      selected: initial,
-      scoped: CATALOG_SCOPED_KINDS.has(kind),
-      loggedIn,
-    });
+    const modelOptions = buildModelOptions(kind, { discovered: catalog, selected: initial, loggedIn });
 
     if (!model) {
       const picked = await pickOption("Model", modelOptions, initial);
@@ -882,9 +871,13 @@ export async function wizard(
       // harness's discovered catalog is untrusted) and rule 8 (`efforts` is
       // computed per merged row), so reading `catalog` directly here would
       // bypass both.
-      const efforts = supportedEfforts(kind, model ?? null, discoveredEffortsFor(modelOptions, model));
+      const efforts = effortOptionsFor(kind, model ?? null, modelOptions);
       if (efforts.length > 0) {
-        const picked = await pickOption("Effort", efforts, prefs[`lastEffort:${kind}`] ?? DEFAULT_EFFORT[kind]);
+        const picked = await pickOption(
+          "Effort",
+          efforts,
+          prefs[`lastEffort:${kind}`] ?? resolveDefaultEffort(kind, model ?? null, modelOptions) ?? DEFAULT_EFFORT[kind],
+        );
         if (picked === null) return cancelled();
         effort = picked;
       }
@@ -1018,18 +1011,18 @@ export async function wizard(
   );
 }
 
-/** The Speed step's rows for the wizard: the tiers `supportedSpeeds` offers
- *  for this kind/model/effort — fed the selected merged model row's
- *  `fast`/`ultrafast` flags (rule 8 copies them from discovery; fx only
- *  knows its speed options that way) — or `[]` when only `off` is on offer,
- *  in which case the wizard skips the step and launches at `off`. */
+/** The Speed step's rows for the wizard: the tiers `speedOptionsFor` offers
+ *  for this kind/model/effort — read from the selected merged model row
+ *  (rule 8 copies the flags from discovery; fx, codex and claude only know
+ *  their speed options that way) — or `[]` when only `off` is on offer, in
+ *  which case the wizard skips the step and launches at `off`. */
 export function wizardSpeedChoices(
   kind: AgentKind,
   model: string | null,
   effort: string | null,
   modelOptions: readonly ModelOption[],
 ): AgentOption[] {
-  const speeds = supportedSpeeds(kind, model, effort, modelOptions.find((m) => m.id === model));
+  const speeds = speedOptionsFor(kind, model, effort, modelOptions);
   if (speeds.length <= 1) return [];
   return SPEED_OPTIONS.filter((opt) => speeds.includes(opt.id as Speed));
 }
@@ -1047,7 +1040,13 @@ async function pickOption(
 ): Promise<string | null> {
   const pick = await p.select({
     message,
-    options: opts.map((opt) => ({ value: opt.id, label: opt.label, hint: opt.hint })),
+    // Labels and hints come from third-party catalogs: escape them for the
+    // terminal (`escapeFreeText`); the value stays the raw id.
+    options: opts.map((opt) => ({
+      value: opt.id,
+      label: escapeFreeText(opt.label),
+      hint: opt.hint === undefined ? undefined : escapeFreeText(opt.hint),
+    })),
     initialValue: opts.some((opt) => opt.id === initial) ? initial : opts[0]?.id,
   });
   return p.isCancel(pick) ? null : (pick as string);

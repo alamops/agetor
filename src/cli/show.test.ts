@@ -618,7 +618,7 @@ test("show: a blocked stack prints the earliest reset, each member reason, the H
   expect(rendered).toContain("- Claude A");
   expect(rendered).toContain("logged out");
   expect(rendered).toContain("cooling: usage limit until");
-  expect(rendered).toContain("for opus");
+  expect(rendered).toContain("for Opus"); // the cooldown model, as a person reads it
   expect(rendered).not.toContain("other-model");
   expect(rendered).toContain("You've hit your limit");
   expect(rendered).not.toContain("\u001b");
@@ -653,4 +653,28 @@ test("show: a scheduled switch and a switch-now move read in words", async () =>
   t.harnessState = { ...t.harnessState!, lastMove: { from: "a", to: "b", at: 1, reason: "switch-now" } };
   await cmdShow([TASK_ID], flags);
   expect(outputs.join("\n")).not.toContain("Switched to the next account");
+});
+
+test("show: the model prints as a person reads it (curated label, prettified id for a model agetor has no row for)", async () => {
+  for (const [agent, model, expected] of [
+    ["claude-code", "opus-5.5", "Opus 5.5"],
+    ["claude-code", "opus-6", "Opus 6"],
+    ["codex", "gpt-6.2-sol", "GPT-6.2 Sol"],
+  ] as const) {
+    outputs.length = 0;
+    currentClient = makeClient(task({ agent, model }), { harnesses: [] });
+    await cmdShow([TASK_ID], flags);
+    const line = outputs.find((l) => l.includes("model"))!;
+    expect(line).toContain(`model: ${expected}`);
+    expect(line).not.toContain(model);
+  }
+});
+
+test("show: a hostile model name from third-party data is escaped, never written raw to the terminal", async () => {
+  outputs.length = 0;
+  currentClient = makeClient(task({ agent: "claude-code", model: "evil\u001b[2J-model\u0007" }), { harnesses: [] });
+  await cmdShow([TASK_ID], flags);
+  const line = outputs.find((l) => l.includes("model"))!;
+  expect(line).not.toContain("\u001b");
+  expect(line).not.toContain("\u0007");
 });

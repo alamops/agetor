@@ -8,6 +8,7 @@ import { pipelineStepProgress, stepNameById } from "../../shared/pipeline.ts";
 import { harnessMoveNote, harnessStackBannerMode, memberReasonText, memberStateText, stackPositionText } from "../../shared/harness-stack.ts";
 import { coolingText, limitRowsForModel } from "../stack-display.ts";
 import { escapeControlChars, escapeFreeText, truncateText } from "../../shared/terminal-text.ts";
+import { asAgentKind, modelDisplayName } from "../../shared/model-display.ts";
 import { isMultiRepoTask } from "../../shared/multi-repo.ts";
 import { colorRunStatus } from "./pipeline.ts";
 import { profileHarnessContext, type ProfileHarnessContext } from "./agent-profile.ts";
@@ -77,7 +78,7 @@ export async function cmdShow(args: string[], flags: Flags): Promise<void> {
   const agentNote = task.pipelineId ? c.dim(" (start step's harness — steps own the launch)") : "";
   out(
     `  ${label("column")} ${colorColumn(task.column)}   ${label("agent")} ${escapeControlChars(task.agent)}${agentNote}` +
-      `   ${label("model")} ${escapeControlChars(task.model ?? "-")}   ${label("mode")} ${escapeControlChars(modeText)}`,
+      `   ${label("model")} ${task.model ? escapeFreeText(modelDisplayName(task.agentProfile?.harnessKind ?? asAgentKind(task.agent), task.model)) : "-"}   ${label("mode")} ${escapeControlChars(modeText)}`,
   );
   const stack = (stacksPayload?.stacks ?? []).find((st) => st.members.some((m) => m.harnessId === task.agent));
   if (stack) {

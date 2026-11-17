@@ -9,17 +9,23 @@ import { api, type AgentModelMap } from "@/lib/api";
 import { useAgentProfiles } from "@/lib/agent-profiles";
 import { refreshPipelines, usePipelines } from "@/lib/pipelines";
 import { resolvePipelineLaunch, type PipelineLaunchState } from "@/lib/pipeline-launch";
-import { discoveredEffortsFor, mergeModelOptions, type DiscoveredModel } from "../../../shared/model-options.ts";
-import { supportedSpeeds } from "../../../shared/speed.ts";
+import type { DiscoveredModel } from "../../../shared/model-options.ts";
+import {
+  buildModelOptions,
+  effortOptionsFor,
+  resolveDefaultEffort,
+  resolveDefaultModel,
+  resolveSeedModel,
+  speedNoticeFor,
+  speedOptionsFor,
+  speedTiersKnown,
+} from "../../../shared/model-catalog.ts";
 import {
   AGENT_OPTIONS,
-  CATALOG_SCOPED_KINDS,
   DEFAULT_EFFORT,
   DEFAULT_MODEL,
-  cursorModelIdCoveredByCatalog,
   cursorModelSupportsMaxMode,
   defaultModeFor,
-  supportedEfforts,
   supportedModes,
   type AgentKind,
   type AgentOption,
@@ -414,39 +420,32 @@ export function useTaskLaunch(
         const seedMode = prefs[`lastMode:${nextKind}`];
         const seedModel = prefs[`lastModel:${nextKind}`];
         const seedEffort = prefs[`lastEffort:${nextKind}`];
+        // The catalog is already loaded here, so a remembered model the
+        // curated list lacks (one only the CLI's own catalog carries) is
+        // validated against the merged rows instead of being dropped; with no
+        // remembered pick the default is the owner's, or the CLI's own when a
+        // trusted catalog lacks it. `buildModelOptions` is the same
+        // composition the `models` memo below renders (logged-out distrust
+        // included — rule 7 stays a single source).
+        const nextLoggedIn = payload.statuses.find((a) => a.harnessId === nextAgent)?.loggedIn ?? null;
+        const nextDiscovered = harnessModelPayload.byHarness[nextAgent] ?? models[nextKind] ?? [];
+        const nextRows = buildModelOptions(nextKind, { discovered: nextDiscovered, loggedIn: nextLoggedIn });
         const resolvedModel =
-          seedModel && AGENT_OPTIONS[nextKind].models.some((m) => m.id === seedModel)
-            ? seedModel
-            : DEFAULT_MODEL[nextKind];
+          resolveSeedModel(nextKind, seedModel, nextRows) ?? resolveDefaultModel(nextKind, nextDiscovered, nextLoggedIn);
         const resolvedMode =
           seedMode && supportedModes(nextKind, resolvedModel).some((m) => m.id === seedMode)
             ? seedMode
             : initialMode(nextKind);
-        // Mirror the `models` memo below exactly (curated/discovered/scoped/
-        // loggedIn inputs) rather than reading the raw discovered list, so
-        // effort discovery goes through the same rule-7 logged-out distrust
-        // the Model picker gets — rule 8 stays a single source.
-        const nextLoggedIn = payload.statuses.find((a) => a.harnessId === nextAgent)?.loggedIn ?? null;
-        const nextDiscovered = (harnessModelPayload.byHarness[nextAgent] ?? models[nextKind] ?? [])
-          .filter((m) => nextKind !== "cursor" || !cursorModelIdCoveredByCatalog(m.id));
-        const nextModelRows = mergeModelOptions({
-          curated: AGENT_OPTIONS[nextKind].models,
+        const nextModelRows = buildModelOptions(nextKind, {
           discovered: nextDiscovered,
           selected: resolvedModel,
-          scoped: CATALOG_SCOPED_KINDS.has(nextKind),
           loggedIn: nextLoggedIn,
         });
-        const supportedEff = supportedEfforts(
-          nextKind,
-          resolvedModel,
-          discoveredEffortsFor(nextModelRows, resolvedModel),
-        );
+        const supportedEff = effortOptionsFor(nextKind, resolvedModel, nextModelRows);
         const resolvedEffort =
           seedEffort && supportedEff.some((e) => e.id === seedEffort)
             ? seedEffort
-            : supportedEff.some((e) => e.id === DEFAULT_EFFORT[nextKind])
-              ? DEFAULT_EFFORT[nextKind]
-              : (supportedEff[0]?.id ?? null);
+            : resolveDefaultEffort(nextKind, resolvedModel, nextModelRows);
         setMode(resolvedMode);
         setModel(resolvedModel);
         setEffort(resolvedEffort);
@@ -457,7 +456,6 @@ export function useTaskLaunch(
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [open]);
 
-  const { models: staticModels } = AGENT_OPTIONS[kind];
   const modes = supportedModes(kind, model);
   // Merge the curated list with whatever this harness's CLI catalog
   // discovery surfaced, per the shared rules in `mergeModelOptions` — mirrors
@@ -465,27 +463,24 @@ export function useTaskLaunch(
   // (keyed by harness id — distinguishes a second `fx-2` account from the
   // built-in fx harness) over the kind-level map, which only exists as a
   // fallback for an older daemon predating `GET /agent-models/harnesses`.
-  const models = useMemo(() => {
-    const discoveredForAgent = (harnessModels[agent] ?? agentModels[kind] ?? [])
-      .filter((m) => kind !== "cursor" || !cursorModelIdCoveredByCatalog(m.id));
-    return mergeModelOptions({
-      curated: staticModels,
-      discovered: discoveredForAgent,
-      selected: model,
-      scoped: CATALOG_SCOPED_KINDS.has(kind),
-      loggedIn: selectedStatus?.loggedIn ?? null,
-    });
-  }, [staticModels, harnessModels, agentModels, agent, kind, model, selectedStatus?.loggedIn]);
+  const discoveredForAgent = harnessModels[agent] ?? agentModels[kind] ?? [];
+  const models = useMemo(
+    () => buildModelOptions(kind, { discovered: discoveredForAgent, selected: model, loggedIn: selectedStatus?.loggedIn ?? null }),
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+    [harnessModels, agentModels, agent, kind, model, selectedStatus?.loggedIn],
+  );
   // Discovered-wins, no retain logic — mirrors NewTaskForm: there's no prior
   // intent to preserve for a task that doesn't exist yet. Reads from `models`
   // (the merged rows above), not the raw `harnessModels`/`agentModels` maps,
   // so a logged-out harness's discovery is distrusted here too (rule 7).
-  const efforts = supportedEfforts(kind, model, discoveredEffortsFor(models, model));
+  const efforts = effortOptionsFor(kind, model, models);
   const effortsKey = efforts.map((o) => o.id).join(",");
   const maxModeAvailable = kind === "cursor" && cursorModelSupportsMaxMode(model);
-  const selectedModelOption = models.find((m) => m.id === model);
-  const speedOptions = supportedSpeeds(kind, model, effort, selectedModelOption);
-  const speedOptionsKey = speedOptions.join(",");
+  const speedOptions = speedOptionsFor(kind, model, effort, models);
+  const tiersKnown = speedTiersKnown(kind, discoveredForAgent, selectedStatus?.loggedIn ?? null);
+  // Only offer-checked once the kind's tiers are known: before a discovered
+  // kind's catalog loads its tiers read `["off"]` and must not reset a tier.
+  const speedOptionsKey = tiersKnown ? speedOptions.join(",") : null;
 
   useEffect(() => {
     if (efforts.length === 0) {
@@ -493,16 +488,15 @@ export function useTaskLaunch(
       return;
     }
     if (effort !== null && efforts.some((e) => e.id === effort)) return;
-    const fallback = efforts.some((e) => e.id === DEFAULT_EFFORT[kind]) ? DEFAULT_EFFORT[kind] : efforts[0]!.id;
-    setEffort(fallback);
+    setEffort(resolveDefaultEffort(kind, model, models));
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [kind, model, effortsKey]);
-  // Every kind but fx clears an unoffered tier as soon as it isn't offered
-  // (cursor: the model/effort pair lost its Fast variant — today's rule).
-  // fx never auto-clears here: its tiers come from discovery, which may not
-  // be ready yet; `setModel` below handles the one fx reset.
+  // A tier the kind's (known) options no longer include falls back to Off —
+  // cursor: the model/effort pair lost its Fast variant; fx, codex, claude:
+  // the model's discovered flags changed. Never while the tiers are unknown
+  // (discovery may not be ready); `pickModel` below handles a deliberate pick.
   useEffect(() => {
-    if (speed === "off" || kind === "fx") return;
+    if (speed === "off" || speedOptionsKey === null) return;
     if (!speedOptions.includes(speed)) setSpeed("off");
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [kind, speed, speedOptionsKey]);
@@ -530,17 +524,14 @@ export function useTaskLaunch(
     }
   };
 
-  // The user-facing model pick. fx's one speed reset lives here, not in an
-  // effect: only a deliberate model change may drop the tier, and only when
-  // the harness's discovered catalog is known (non-empty, not distrusted as
-  // logged out) — the merged rows then carry the new model's real flags.
+  // The user-facing model pick. A deliberate model change drops a tier the
+  // new model does not offer, but only when the harness's tiers are known
+  // (discovered catalog non-empty and not distrusted as logged out) — the
+  // merged rows then carry the new model's real flags.
   const pickModel = (next: string) => {
     setModel(next);
-    if (kind !== "fx" || speed === "off" || next === model) return;
-    const discovered = harnessModels[agent] ?? agentModels[kind] ?? [];
-    if (discovered.length === 0 || selectedStatus?.loggedIn === false) return;
-    const nextOption = models.find((m) => m.id === next);
-    if (!supportedSpeeds(kind, next, effort, nextOption).includes(speed)) setSpeed("off");
+    if (speed === "off" || next === model || !tiersKnown) return;
+    if (!speedOptionsFor(kind, next, effort, models).includes(speed)) setSpeed("off");
   };
 
   const seed = (values: Partial<{
@@ -959,7 +950,7 @@ export function TaskLaunchPickers({
               {showsSpeedPicker(speedOptions, speed) && (
                 <div className="space-y-1">
                   <label className="text-muted-foreground">Speed</label>
-                  <SpeedPicker options={speedOptions} value={speed} onChange={setSpeed} testId="launch-speed" />
+                  <SpeedPicker options={speedOptions} value={speed} onChange={setSpeed} testId="launch-speed" {...speedNoticeFor(kind, model, speed, models)} />
                 </div>
               )}
 

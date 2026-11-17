@@ -8,6 +8,8 @@ import { abbreviateHome, cn, formatTokens } from "@/lib/utils";
 import { clampPercent, tierColorVar, warnTier } from "@/lib/usage";
 import type { CooldownChip } from "@/lib/stack-editor";
 import { quotaSummary } from "../../../shared/harness-stack.ts";
+import { claudeIdFromCliModel } from "../../../shared/claude-model-id.ts";
+import { modelDisplayName } from "../../../shared/model-display.ts";
 import type { AgentKind, Harness, HarnessQuota } from "../../../shared/types.ts";
 
 /** Kinds still marked "experimental" in the UI — surfaced with the warning
@@ -283,7 +285,7 @@ export function AccountRow(props: AccountRowProps) {
                 size="sm"
                 variant="ghost"
                 data-testid="harness-cooldown-clear"
-                aria-label={`Clear cooldown on ${h.label}${c.model ? ` for ${c.model}` : ""}`}
+                aria-label={`Clear cooldown on ${h.label}${c.model ? ` for ${modelDisplayName(null, c.model)}` : ""}`}
                 onClick={() => props.onClearCooldown(h, c.model)}
               >
                 Clear
@@ -373,7 +375,7 @@ function AccountUsageTable({ harnessId }: { harnessId: string }) {
           {days.map((d) => (
             <tr key={`${d.day}:${d.model}`} className="border-t border-border/30">
               <td className="px-2 py-1 font-mono">{d.day}</td>
-              <td className="max-w-40 truncate px-2 py-1">{d.model}</td>
+              <td className="max-w-40 truncate px-2 py-1" title={d.model}>{modelDisplayName(null, claudeIdFromCliModel(d.model) ?? d.model)}</td>
               <td className="px-2 py-1 text-right font-mono">{formatTokens(d.inputTokens)}</td>
               <td className="px-2 py-1 text-right font-mono">{formatTokens(d.outputTokens)}</td>
               <td className="px-2 py-1 text-right font-mono">

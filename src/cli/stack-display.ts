@@ -1,6 +1,7 @@
 import { DEFAULT_MODEL, type HarnessLimitState, type HarnessQuota, type HarnessStack, type MirrorPlan, type MirrorPreview, type Task } from "../shared/types.ts";
 import { memberStateText, quotaSummary } from "../shared/harness-stack.ts";
 import { escapeControlChars, escapeFreeText } from "../shared/terminal-text.ts";
+import { modelDisplayName } from "../shared/model-display.ts";
 import { c, out } from "./output.ts";
 
 /** Every cooldown row of one account: there can be an account-wide row and one
@@ -26,7 +27,7 @@ export function limitRowsForModel(
  *  worded by the shared {@link memberStateText}. Model ids are escaped. */
 export function coolingText(state: HarnessLimitState): string {
   const t = memberStateText(state);
-  const model = t.model ? ` for ${escapeControlChars(t.model)}` : "";
+  const model = t.model ? ` for ${escapeFreeText(modelDisplayName(null, t.model))}` : "";
   return `${t.reasonText} until ${new Date(t.until).toLocaleString()}${model}`;
 }
 

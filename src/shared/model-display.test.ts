@@ -1,5 +1,5 @@
 import { describe, expect, test } from "bun:test";
-import { modelDisplayName, prettifyModelId, sanitizeCliLabel } from "./model-display.ts";
+import { asAgentKind, modelDisplayName, prettifyModelId, sanitizeCliLabel } from "./model-display.ts";
 
 describe("prettifyModelId", () => {
   test.each([
@@ -38,5 +38,14 @@ describe("modelDisplayName", () => {
     expect(modelDisplayName("claude-code", "opus-7")).toBe("Opus 7");
     expect(modelDisplayName("claude-code", "stale", rows)).toBe("Stale");
     expect(modelDisplayName("cursor", "grok-4.7")).toBe("Grok 4.7");
+  });
+
+  test("with no kind (a board card knows only a harness alias id) every kind's curated rows are searched", () => {
+    expect(modelDisplayName(null, "opus-5.5")).toBe("Opus 5.5");
+    expect(modelDisplayName(null, "grok-4.7")).toBe("Grok 4.7");
+    expect(modelDisplayName(null, "unheard-of-9")).toBe("Unheard Of 9");
+    expect(asAgentKind("claude-code")).toBe("claude-code");
+    expect(asAgentKind("claude-work")).toBeNull();
+    expect(asAgentKind(null)).toBeNull();
   });
 });

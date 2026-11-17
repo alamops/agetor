@@ -2021,3 +2021,102 @@ describe("add wizard multi-repository (issue #291)", () => {
     expect(input!.workdir).toBe(issueDir);
   });
 });
+
+// ── dynamic model catalog: the wizard offers what the CLI's catalog lists ──────
+
+describe("add wizard — models, efforts and Speed the CLI's own catalog reports", () => {
+  const catalog: Record<string, DiscoveredModel[]> = {
+    "claude-code": [
+      { id: "opus-6", label: "Opus 6", efforts: ["low", "turbo", "max"], fast: true },
+      { id: "opus-5.5", label: "Opus 5.5", efforts: ["low", "medium", "high", "xhigh", "max"] },
+    ],
+    codex: [{ id: "gpt-6.2-sol", label: "GPT-6.2-Sol", efforts: ["low", "high"], fast: true, fastTier: "priority", cliDefault: true }],
+  };
+
+  function clientWith(models: Record<string, DiscoveredModel[]>) {
+    const { client, createTaskCalls } = makeWizardClient([{ path: "/src/backend", name: "backend" }]);
+    (client as unknown as { agentModels: () => Promise<Record<string, DiscoveredModel[]>> }).agentModels = async () => models;
+    return { client, createTaskCalls };
+  }
+
+  test("a model only the CLI lists leads the Model picker, its own effort ladder (with the unknown level) follows, and Speed is offered", async () => {
+    const { client } = clientWith(catalog);
+    resetWizardScript([
+      { kind: "text", value: "T" },
+      { kind: "text", value: "P" },
+      { kind: "select", value: "opus-6" }, // Model
+      { kind: "select", value: "turbo" }, // Effort
+      { kind: "select", value: "fast" }, // Speed
+      { kind: "multiselect", value: ["/src/backend"] },
+      { kind: "confirm", value: false },
+    ]);
+    const input = await wizard(client, parseAdd(["--agent", "claude-code", "--mode", "auto"]), undefined);
+    const select = (message: string) => clackCalls.find((c) => c.kind === "select" && c.message === message)!;
+    const modelRows = select("Model").options as { value: string; label: string }[];
+    expect(modelRows[0]).toMatchObject({ value: "opus-6", label: "Opus 6" });
+    expect(modelRows.map((r) => r.value)).toContain("mythos-5.2"); // curated-only rows still follow
+    const effortRows = select("Effort").options as { value: string; label: string }[];
+    expect(effortRows.map((r) => r.value)).toEqual(["max", "turbo", "low"]);
+    expect(effortRows.find((r) => r.value === "turbo")?.label).toBe("Turbo");
+    expect((select("Speed").options as { value: string }[]).map((r) => r.value)).toEqual(["off", "fast"]);
+    expect(input).toMatchObject({ model: "opus-6", effort: "turbo", speed: "fast" });
+  });
+
+  test("a hostile CLI label is escaped before it reaches the picker", async () => {
+    const hostile: Record<string, DiscoveredModel[]> = {
+      "claude-code": [{ id: "opus-6", label: "Opus\u001b[31m 6", description: "evil\u001b]0;pwned\u0007", efforts: ["high"] }],
+    };
+    const { client } = clientWith(hostile);
+    resetWizardScript([
+      { kind: "text", value: "T" },
+      { kind: "text", value: "P" },
+      { kind: "select", value: "opus-6" },
+      { kind: "select", value: "high" },
+      { kind: "multiselect", value: ["/src/backend"] },
+      { kind: "confirm", value: false },
+    ]);
+    await wizard(client, parseAdd(["--agent", "claude-code", "--mode", "auto"]), undefined);
+    const rows = clackCalls.find((c) => c.kind === "select" && c.message === "Model")!.options as { label: string; hint?: string }[];
+    const row = rows.find((r) => r.label.includes("Opus"))!;
+    expect(JSON.stringify(row)).not.toContain("\u001b");
+    expect(JSON.stringify(row)).not.toContain("\u0007");
+  });
+
+  test("codex: the Speed step appears from the discovered tier flag, and the CLI's default model is the picker's seed when the owner's pick is missing", async () => {
+    const { client } = clientWith(catalog);
+    (client as unknown as { listHarnesses: () => Promise<unknown> }).listHarnesses = async () => ({
+      harnesses: [{ id: "codex", kind: "codex", label: "Codex", isBuiltin: true, home: null, bin: null, env: {}, enabled: true }],
+      statuses: [],
+    });
+    resetWizardScript([
+      { kind: "text", value: "T" },
+      { kind: "text", value: "P" },
+      { kind: "select", value: "gpt-6.2-sol" },
+      { kind: "select", value: "high" },
+      { kind: "select", value: "fast" },
+      { kind: "multiselect", value: ["/src/backend"] },
+      { kind: "confirm", value: false },
+    ]);
+    const input = await wizard(client, parseAdd(["--agent", "codex", "--mode", "auto"]), undefined);
+    expect(clackCalls.some((c) => c.message === "Speed")).toBe(true);
+    expect(input).toMatchObject({ model: "gpt-6.2-sol", speed: "fast" });
+  });
+
+  test("non-interactive: --model opus-6 and an unknown --effort are accepted verbatim", async () => {
+    reset();
+    const { client, createTaskCalls } = makePlainClient();
+    currentClient = client;
+    await cmdAdd(["--title", "T", "--prompt", "P", "--agent", "claude-code", "--model", "opus-6", "--effort", "turbo"], flags());
+    expect(createTaskCalls[0]).toMatchObject({ model: "opus-6", effort: "turbo" });
+  });
+
+  test("wizardSpeedChoices: claude and codex offer Fast only for a model whose row says so", () => {
+    const rows = [
+      { id: "a", label: "A", fast: true },
+      { id: "b", label: "B" },
+    ];
+    expect(wizardSpeedChoices("claude-code", "a", "high", rows).map((o) => o.id)).toEqual(["off", "fast"]);
+    expect(wizardSpeedChoices("claude-code", "b", "high", rows)).toEqual([]);
+    expect(wizardSpeedChoices("codex", "a", "high", rows).map((o) => o.id)).toEqual(["off", "fast"]);
+  });
+});

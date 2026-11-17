@@ -5,6 +5,7 @@ import { Button } from "@/components/ui/button";
 import { Dialog } from "@/components/ui/dialog";
 import type { SubagentSatellite } from "@/lib/pipelines";
 import type { AgentProfile, AgentProfileSnapshot, Subagent } from "../../../shared/types.ts";
+import { modelDisplayName } from "../../../shared/model-display.ts";
 
 const TITLE_ID = "subagent-details-title";
 
@@ -108,7 +109,7 @@ export function SubagentDetailsDialog({
                 <dt className="text-muted-foreground">Harness</dt>
                 <dd className="min-w-0">{harnessLabel ?? "—"}</dd>
                 <dt className="text-muted-foreground">Model</dt>
-                <dd className="min-w-0">{profile?.model ?? "—"}</dd>
+                <dd className="min-w-0">{profile?.model ? modelDisplayName("harnessKind" in profile ? profile.harnessKind : null, profile.model) : "—"}</dd>
                 <dt className="text-muted-foreground">Effort</dt>
                 <dd className="min-w-0">{profile?.effort ?? "default"}</dd>
                 <dt className="text-muted-foreground">Mode</dt>

@@ -80,21 +80,32 @@ export function prettifyModelId(id: string): string {
 /**
  * The name to show for `id` on `kind`: the label of a non-`unlisted` catalog
  * row (`rows`, the merged picker rows) → the curated label → the prettified
- * id. Never used for matching; ids stay the identity everywhere else.
+ * id. `kind` may be null when the caller only has a harness alias id (a board
+ * card): the curated rows of every kind are then searched. Never used for
+ * matching; ids stay the identity everywhere else.
  */
 export function modelDisplayName(
-  kind: AgentKind,
+  kind: AgentKind | null,
   id: string,
   rows?: readonly { id: string; label: string; unlisted?: boolean }[],
 ): string {
   if (!id) return id;
   const row = rows?.find((r) => r.id === id && !r.unlisted && r.label);
   if (row) return row.label;
-  const curated = AGENT_OPTIONS[kind]?.models.find((m) => m.id === id);
-  if (curated?.label) return curated.label;
-  if (kind === "cursor") {
-    const spec = CURSOR_MODEL_SPECS[id];
-    if (spec?.label) return spec.label;
+  const kinds = kind ? [kind] : (Object.keys(AGENT_OPTIONS) as AgentKind[]);
+  for (const k of kinds) {
+    const curated = AGENT_OPTIONS[k]?.models.find((m) => m.id === id);
+    if (curated?.label) return curated.label;
+    if (k === "cursor") {
+      const spec = CURSOR_MODEL_SPECS[id];
+      if (spec?.label) return spec.label;
+    }
   }
   return prettifyModelId(id);
+}
+
+/** True for a value that is one of agetor's harness kinds (a built-in
+ *  harness's id equals its kind; an alias's does not). */
+export function asAgentKind(value: string | null | undefined): AgentKind | null {
+  return value && Object.prototype.hasOwnProperty.call(AGENT_OPTIONS, value) ? (value as AgentKind) : null;
 }

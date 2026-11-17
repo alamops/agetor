@@ -153,7 +153,7 @@ describe("resolveTaskProfileDisplay", () => {
       name: "Snap Name",
       harnessKind: "codex",
       harnessLabel: "Codex",
-      summary: agentProfileSummary({ harnessLabel: "Codex", model: "snap-model", effort: "high", mode: "ask" }),
+      summary: agentProfileSummary({ harnessLabel: "Codex", model: "Snap Model", effort: "high", mode: "ask" }),
       deleted: false,
     });
   });
@@ -186,7 +186,7 @@ describe("resolveTaskProfileDisplay", () => {
       name: "Old Name",
       harnessKind: "codex",
       harnessLabel: "Codex (snapshot)",
-      summary: agentProfileSummary({ harnessLabel: "Codex (snapshot)", model: "old-model", effort: "low", mode: "auto" }),
+      summary: agentProfileSummary({ harnessLabel: "Codex (snapshot)", model: "Old Model", effort: "low", mode: "auto" }),
       deleted: false,
     });
   });
@@ -227,7 +227,7 @@ describe("resolveTaskProfileDisplay", () => {
       name: "Gone Profile",
       harnessKind: "fx",
       harnessLabel: "Fx",
-      summary: agentProfileSummary({ harnessLabel: "Fx", model: "gone-model", effort: "ultra", mode: "yolo" }),
+      summary: agentProfileSummary({ harnessLabel: "Fx", model: "Gone Model", effort: "ultra", mode: "yolo" }),
       deleted: true,
     });
   });
