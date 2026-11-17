@@ -6,7 +6,7 @@
 | Source | The pipeline prompt (the owner's pasted run log, quoted in the brief §0); investigation `docs/plans/claude-enter-to-confirm-prompts-investigation.md`; decision record `docs/plans/claude-enter-to-confirm-prompts-grill.md` (D1–D28) with `docs/plans/claude-enter-to-confirm-prompts-grill/round-{1,2}/answers.json` |
 | Flags | none |
 | Gates | grilled (2 rounds, every required question answered) + plan approved by owner as written (2026-11-17, one branch, wave-ordered checkpoint commits; the mid-boot-restart orphan consequence in §3.7 / §8 P-2 accepted) |
-| Status | executing (W1) |
+| Status | executed on branch `fix/agetor-claude-code-press-enter` (W1–W4 committed; code review and the full-suite run follow) |
 | Branch | `fix/agetor-claude-code-press-enter` |
 | Base SHA | `32aa7c3a974c5b89b3b94b91ecbb6a0a0cce1935` |
 
@@ -397,3 +397,22 @@ No unratified one-way door. D14 and D15 relax guards the grill recommended keepi
 | Resizing the boot pane | Out of scope | owner, D26 |
 | Persisting add-dir trust in `~/.claude.json` | Out of scope | owner, round 1 (rejected option) |
 | Fleet knowledge: the `claude auth status` spike facts, the add-dir guard | In this run | captured at planning (spike) and after T6 (guard) |
+
+## 10. Execution notes (deviations from the plan, recorded at the end of the build)
+
+None of these changes a decision the owner made; each is a smaller or safer reading of a task.
+
+| # | Plan said | Built | Why |
+| --- | --- | --- | --- |
+| E1 | `resolveClaudeResume({ jsonlExists: boolean })` | `jsonlExists: (id) => boolean` | The file check only runs when there is an id to resume |
+| E2 | `dismissTmuxPrompt` becomes a thin wrapper or is removed | Kept as the registered-cursor primitive, with a doc note that production uses `answerTmuxPromptInPane`; its 26 unit-test usages pin the shared walk and `confirmKey` choreography | Porting them added risk and no coverage; the route no longer calls it |
+| E3 | T6 widens `matchUnnumberedModal` to every allow-listed Enter hint | Only `enter to confirm` and the held footer; `MODAL_FOOTER_RE` (unparsable arm, paste guard) takes every allow-listed hint | An existing test pins that the auto-mode wizard's `Enter to continue` stays an unparsable card (its answer changes a persistent setting) |
+| E4 | `TmuxPromptRequest` gains `answerKind`, `held` | Also a server-side `identity` (cursor-free dialog identity), used by the card drive to refuse a changed dialog | The fingerprint of a menu includes its cursor, which moves |
+| E5 | `OAUTH_CODE_MAX_LEN` / `validateOAuthCode` in `claude-prompt-screens.ts` | Implemented in `src/shared/oauth-code.ts` and re-exported there | One implementation for the route, the webview and the CLI/TUI (CLAUDE.md: extend `src/shared`, never fork) |
+| E6 | `warmStackLogins` before every planner | Awaited before `prepareTaskHarness`, the limit swap and the all-exhausted retry; only started (not awaited) in `switchTaskAccountNow` and `applyScheduledSwitch` | Those two check state and take a claim in one synchronous run; an await let a start slip in (the S5 test caught it) |
+| E7 | After a refused confirm a held dialog with the cursor on Yes gets `Up`, `Down`, `Enter` | Kept as a safety net; the live spike showed a refusal puts the cursor back on "No, exit", so the normal retry is `Down`, `Enter` | Live evidence, `claude-enter-to-confirm-prompts-spikes.md` |
+| E8 | T14 (codex/copilot fixes) | Closed with no change: codex verified, copilot unverified on the current version | `claude-enter-to-confirm-prompts-spikes.md` |
+| E9 | T1 fixtures captured live | The startup, held and cut-off dialogs are the live captures of the investigation (paths scrubbed); the mid-session `/add-dir`, `/cd` and apply variants, `Login successful`, `Security notes`, `Press Enter to retry` and the OAuth-code prompt are built from the binary's strings and tagged `binary` in their header (A4) | An OAuth round trip is needed for the last four |
+
+The run-insert dispositions asked for by T7(4) are code comments at the four `runs.insert` sites in `orchestrator.ts`: all four **keep** their pre-stamp, because an id is now recorded only after its session file exists (so an inherited id names a real session, and boot reconcile's reattach key needs it from the start), and a legacy never-created id heals in `spawnAgent`.
+

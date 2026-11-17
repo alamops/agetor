@@ -6760,8 +6760,9 @@ function parseUnnumberedChoices(
 }
 
 /**
- * Send the keystrokes that confirm a startup consent dialog: arrow from the
- * cursor's current position to the affirmative option, then Enter. Talks to
+ * Send the keystrokes that confirm a startup consent dialog: wait out the
+ * dialog's 500 ms arm window, re-read the pane, and only if it is the SAME dialog
+ * arrow from the cursor's LIVE position to the affirmative option, then Enter. Talks to
  * tmux directly (not via `queueTmuxOp`) because this runs during the boot
  * window — before any turn slot or paste chain exists for the session. Each
  * arrow is its own `send-keys` with a small gap, mirroring `dismissTmuxPrompt`
@@ -6834,12 +6835,13 @@ async function confirmStartupDialog(
  * row, before the Enter. Computed from the LIVE cursor only.
  *
  * The add-dir select accepts "Yes" only when the input event right before the
- * Enter was a counted Down, so a cursor already parked on Yes in the HELD state
- * (an Enter was refused there) would be refused again by a bare Enter. In that
- * one case the cursor is walked off Yes and back (`Up` lands on "No, exit" —
- * the select wraps, and an Up never confirms — then `Down`), which guarantees
- * the Down the guard wants. On any armed dialog a cursor already on Yes means a
- * Down just landed, so Enter alone is right.
+ * Enter was a counted Down. Live on 2.1.326 (spike 2026-11-17) a refused key
+ * puts the cursor back on "No, exit", so a held dialog is normally read with the
+ * cursor on No and gets `Down`, `Enter`. A held dialog whose cursor IS on Yes (a
+ * Down was counted and then something else refused the Enter) would refuse a bare
+ * Enter again, so that one case walks off Yes and back (`Up` lands on "No, exit":
+ * the select wraps, and an Up never confirms; then `Down`). On any armed dialog
+ * a cursor already on Yes means a Down just landed, so Enter alone is right.
  */
 function planConfirmArrows(a: { cursorIndex: number; acceptIndex: number; heldAddDir: boolean }): string[] {
   const delta = a.acceptIndex - a.cursorIndex;
@@ -9929,6 +9931,12 @@ export async function spawnClaudeViaTmux(opts: ClaudeLaunchOptions): Promise<Spa
           sawStartupPromptThisWindow = true;
           opts.onChunk("status", "claude is asking a question on startup — answer it to continue");
         }
+        // The window closed while an iteration was mid-flight (its awaits), so the
+        // in-loop flush never ran: report the dialogs the tracker still holds now.
+        // A found session file proves claude got past every dialog; on a timeout
+        // only one seen ABSENT on the latest poll counts as confirmed.
+        const closing = bootFoundJsonl ? startupConfirm.flushConfirmed() : startupConfirm.flushAbsent();
+        for (const line of closing) opts.onChunk("status", line);
       } catch { /* never let the boot poller crash the spawn */ }
     })();
 

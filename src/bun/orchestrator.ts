@@ -4240,7 +4240,11 @@ async function finishSwitchNow(taskId: string, behindQueue = false): Promise<voi
 export async function switchTaskAccountNow(taskId: string): Promise<SwitchAccountResult> {
   const task = tasks.get(taskId);
   if (!task) throw new Error(`task not found: ${taskId}`);
-  await warmStackLogins(task);
+  // Not awaited: this function checks the task's state and takes its claim in one
+  // synchronous run, and an await here would let a start slip in between. The
+  // `/harnesses` poll keeps the login cache warm in the app; this refresh only
+  // helps the next plan, and a cold cache fails open.
+  void warmStackLogins(task).catch(() => {});
   const plan = planManualSwitchTarget(task);
   if (plan.kind === "refused") {
     throw new SwitchAccountRefusedError({
@@ -4357,7 +4361,9 @@ async function applyScheduledSwitch(taskId: string, behindQueue = false): Promis
   // turn ends. `reconcileTaskSession` must never see a live run, or it would
   // take its "start fresh" branch.
   if (backgroundAgentsHoldTask(taskId) || runs.hasRunning(taskId)) return;
-  await warmStackLogins(task);
+  // Not awaited, for the reason `switchTaskAccountNow` gives: the checks above and
+  // the claim below must stay one synchronous run.
+  void warmStackLogins(task).catch(() => {});
   const plan = planManualSwitchTarget(task);
   if (plan.kind === "refused") {
     dropScheduledSwitch(
@@ -5805,6 +5811,13 @@ async function spawnSwapContinuation(args: {
       endedAt: null,
       exitCode: null,
       tmuxSession: kind === "opencode" ? null : sessionNameFor(taskId),
+      // Keeps its pre-stamp (docs/plans/claude-enter-to-confirm-prompts.md T7/P-3):
+      // `resumeSessionId` is the destination account's TRANSFERRED session, whose
+      // file was copied before this insert, so it names a real session; boot
+      // reconcile's reattach key and `lastSessionIdForTask` need it from the start.
+      // An id an older build stamped without a file heals in `spawnAgent`
+      // (`resolveClaudeResume`: fresh under the same id) and is re-stamped by
+      // `onSessionFileReady`.
       claudeSessionId: kind === "claude-code" ? resumeSessionId : null,
       codexSessionId: kind === "codex" ? resumeSessionId : null,
       cursorSessionId: null,
@@ -11853,6 +11866,10 @@ async function sendTurnInExistingSession(
       endedAt: null,
       exitCode: null,
       tmuxSession: sessionNameFor(taskId),
+      // Keeps its pre-stamp (T7/P-3): the inherited id was recorded only once its
+      // session file existed (`onSessionFileReady`), so it names a real session, and
+      // the reattach key / `lastSessionIdForTask` read it from the start. A legacy id
+      // with no file heals in `spawnAgent` (`resolveClaudeResume`).
       claudeSessionId: inheritedSessionId,
       codexSessionId: null,
       cursorSessionId: null,
@@ -12145,6 +12162,8 @@ function startContinuationRun(
     endedAt: null,
     exitCode: null,
     tmuxSession: sessionNameFor(taskId),
+    // Keeps its pre-stamp (T7/P-3): see the sibling insert above (a real, recorded
+    // session id; a legacy one heals in `spawnAgent`).
     claudeSessionId: inheritedSessionId,
     codexSessionId: null,
     cursorSessionId: null,
@@ -12249,6 +12268,9 @@ async function spawnResumedSessionInner(
     endedAt: null,
     exitCode: null,
     tmuxSession: sessionNameFor(taskId),
+    // Keeps its pre-stamp (T7/P-3): `priorSessionId` was recorded only once its file
+    // existed. If it names none (a row an older build stamped before the file),
+    // `spawnAgent` starts fresh under the same id and `onSessionFileReady` re-stamps.
     claudeSessionId: priorSessionId,
     codexSessionId: null,
     cursorSessionId: null,

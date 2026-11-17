@@ -20,7 +20,7 @@ process.env.AGETOR_DATA_DIR = testDataDir;
 process.env.AGETOR_CLAUDE_BIN = "claude";
 
 const { spawnAgent, resolveClaudeResume } = await import("./agents.ts");
-const { dropSession, jsonlPathFor, setBootTimeoutMs, sessionNameFor } = await import("./claude-tmux.ts");
+const { dropSession, jsonlPathFor, setBootTimeoutMs, sessionNameFor, claudeBootsInFlight } = await import("./claude-tmux.ts");
 const { snapshotHarnessState } = await import("./test-harness-state.ts");
 const restoreHarnesses = snapshotHarnessState();
 
@@ -53,8 +53,15 @@ interface Launch {
   done: Promise<number>;
 }
 
+/** A boot still unwinding when its test ends would read as a launch in flight to
+ *  every later file in this process (`launch-settle.test.ts`). */
+const DEFAULT_TEST_BOOT_TIMEOUT_MS = 2_000;
+
 async function launch(o: { resumeSessionId?: string | null; writeJsonlFor?: string; dialogs: Array<{ kind: "enter-only" }> | []; autoTrustDirectories?: Array<{ name: string; paths: string[] }> }): Promise<Launch> {
   const taskId = randomUUID();
+  const bootsBefore = claudeBootsInFlight();
+  const timeoutOverride = setBootTimeoutMs(null);
+  setBootTimeoutMs(timeoutOverride ?? DEFAULT_TEST_BOOT_TIMEOUT_MS);
   const cwd = mkdtempSync(path.join(tmpdir(), "agetor-claude-session-cwd-"));
   const configDir = mkdtempSync(path.join(tmpdir(), "agetor-claude-session-cfg-"));
   const jsonl = (id: string) => jsonlPathFor(cwd, id, configDir);
@@ -98,6 +105,8 @@ async function launch(o: { resumeSessionId?: string | null; writeJsonlFor?: stri
     cwd,
     stop: async () => {
       await dropSession(taskId);
+      const deadline = Date.now() + 15_000;
+      while (claudeBootsInFlight() > bootsBefore && Date.now() < deadline) await new Promise((r) => setTimeout(r, 50));
       rmSync(cwd, { recursive: true, force: true });
       rmSync(configDir, { recursive: true, force: true });
     },

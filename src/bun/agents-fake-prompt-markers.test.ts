@@ -16,6 +16,10 @@ const testDataDir = mkdtempSync(path.join(tmpdir(), "agetor-fake-prompt-markers-
 process.env.AGETOR_DATA_DIR = testDataDir;
 process.env.AGETOR_CLAUDE_DRIVER = "fake";
 process.env.AGETOR_CLAUDE_BIN = "/bin/echo";
+// `sessionExists` must reflect ONLY the fake pane: a tmux that never has a
+// session (not the `/bin/echo` another file in this process may have left).
+const savedTmuxBin = process.env.AGETOR_TMUX_BIN;
+process.env.AGETOR_TMUX_BIN = "/usr/bin/false";
 
 const { spawnAgent, FAKE_CLAUDE_ENTER_PROMPT_MARKER, FAKE_CLAUDE_PASTE_CODE_PROMPT_MARKER } = await import("./agents.ts");
 const { answerTmuxPromptInPane, registerFakePromptPane, clearFakePromptPane, sessionExists } = await import("./claude-tmux.ts");
@@ -25,6 +29,8 @@ const { makeTask } = await import("../cli/test-fixtures.ts");
 
 afterAll(() => {
   delete process.env.AGETOR_CLAUDE_DRIVER;
+  if (savedTmuxBin === undefined) delete process.env.AGETOR_TMUX_BIN;
+  else process.env.AGETOR_TMUX_BIN = savedTmuxBin;
   rmTestDataDir(testDataDir);
 });
 

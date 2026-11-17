@@ -25,6 +25,7 @@ const {
   setDeferredPromptTimeoutMs,
   markTmuxPromptAnswered,
   sessionNameFor,
+  claudeBootsInFlight,
 } = await import("./claude-tmux.ts");
 const { activeTmuxPromptsForTask, answerTmuxPrompt, findTmuxPromptById } = await import("./interactions.ts");
 const { tasks, runs } = await import("./db.ts");
@@ -82,6 +83,11 @@ interface Boot {
   stop: () => Promise<void>;
 }
 
+/** A boot still unwinding when its test ends would show up as a launch in
+ *  flight to every later file in this process (`launch-settle.test.ts`): keep
+ *  the window short and wait for it to finish in `stop()`. */
+const DEFAULT_TEST_BOOT_TIMEOUT_MS = 3_000;
+
 async function boot(
   cfg: Omit<ScriptedConfig, "jsonlPath">,
   o: {
@@ -94,6 +100,9 @@ async function boot(
   // The tmux session name keeps only the first 12 characters of the id.
   const taskId = randomUUID();
   const sessionId = randomUUID();
+  const bootsBefore = claudeBootsInFlight();
+  const timeoutOverride = setBootTimeoutMs(null);
+  setBootTimeoutMs(timeoutOverride ?? DEFAULT_TEST_BOOT_TIMEOUT_MS);
   const cwd = mkdtempSync(path.join(tmpdir(), "agetor-boot-cwd-"));
   const jsonlPath = jsonlPathFor(cwd, sessionId, null);
   // The scratch config dir: keep the session file out of the real ~/.claude.
@@ -135,6 +144,8 @@ async function boot(
   done.catch(() => {});
   const stop = async (): Promise<void> => {
     await dropSession(taskId);
+    // The boot wait ends at its (short) timeout once the session is gone.
+    await until(() => claudeBootsInFlight() <= bootsBefore, 15_000, "the boot to unwind");
   };
   cleanups.push(() => {
     rmSync(cwd, { recursive: true, force: true });
@@ -177,17 +188,16 @@ describe("boot poller — add-dir auto-confirm (preference on)", () => {
     }
   }, 40_000);
 
-  test("claude ignoring the first Enter (held footer): retried from the live cursor, never from a stale one", async () => {
+  test("claude ignoring the first Enter (held footer, cursor back on No): retried from the live cursor", async () => {
     const b = await boot({ dialogs: [REPO_E], refuseEnters: 1 }, { autoTrustDirectories: DIRS });
     try {
       await until(() => b.statuses().some((s) => s.includes("ready (jsonl:")), 30_000, "ready status");
       await until(() => b.statuses().some((s) => s.startsWith("auto-confirmed Claude's")), 5_000, "status line");
       const names = b.tmux.keys().map((k) => k.k);
-      // 1st attempt: Down, Enter (refused → held, cursor on Yes). The retry must not
-      // press a bare Enter (a refused Enter is not "follows a counted Down") and must
-      // never press Down from Yes (that wraps onto "No, exit").
-      expect(names.slice(0, 2)).toEqual(["Down", "Enter"]);
-      expect(names.slice(2)).toEqual(["Up", "Down", "Enter"]);
+      // 1st attempt: Down, Enter (refused → held, and claude puts the cursor back on
+      // "No, exit": live spike 2026-11-17). The retry reads that cursor and walks
+      // Down, Enter; it never repeats a bare Enter and never presses Down from Yes.
+      expect(names).toEqual(["Down", "Enter", "Down", "Enter"]);
       expect(b.tmux.state().exited).toBeUndefined();
       expect(b.statuses().filter((s) => s.startsWith("auto-confirmed Claude's"))).toHaveLength(1);
     } finally {

@@ -149,11 +149,12 @@ describe("answerTmuxPromptInPane — choice cards", () => {
     expect(held!.held).toBe(true);
     expect(held!.id).not.toBe(card.id);
     expect(held!.identity).toBe(card.identity);
-    // Cursor on Yes in the held state; the held card's own click re-arms with Up, Down, Enter.
-    expect(held!.cursorIndex).toBe(1);
+    // A refusal puts the cursor back on "No, exit" (live spike 2026-11-17), so the
+    // held card's own click reads it and walks Down, Enter.
+    expect(held!.cursorIndex).toBe(0);
     const second = await answerTmuxPromptInPane(held!, { kind: "choice", key: "2" });
     expect(second).toEqual({ ok: true });
-    expect(d.session.keys().map((k) => k.k)).toEqual(["Down", "Enter", "Up", "Down", "Enter"]);
+    expect(d.session.keys().map((k) => k.k)).toEqual(["Down", "Enter", "Down", "Enter"]);
     expect(d.session.state().done).toBe(true);
     expect(d.session.state().exited).toBeUndefined();
   }, 20_000);

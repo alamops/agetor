@@ -3,11 +3,12 @@
  * startup dialogs closely enough to drive `spawnClaudeViaTmux`'s boot poller
  * and the card drive end to end (`AGETOR_TMUX_BIN` points at it).
  *
- * It models the two guard facts the fix depends on (decoded from the binary
- * and proved live, docs/plans/claude-enter-to-confirm-prompts-investigation.md
- * §2): an add-dir select ignores any key inside 500 ms of mounting (and of the
- * last refusal) and flips its footer to the "held" text, and Enter on "Yes" is
- * accepted only if the input event right before it was a counted Down. It is
+ * It models the guard facts the fix depends on (decoded from the binary and
+ * proved live, docs/plans/claude-enter-to-confirm-prompts-investigation.md §2
+ * and the 2026-11-17 held-state spike): an add-dir select ignores any key inside
+ * 500 ms of mounting (and of the last refusal) and flips its footer to the
+ * "held" text, a refusal puts the cursor back on "No, exit", and Enter on "Yes"
+ * is accepted only if the input event right before it was a counted Down. It is
  * NOT claude: just the part of its behaviour the driver has to survive.
  *
  * Not a test file (no `.test.` in the name), so `bun test` does not run it.
@@ -159,14 +160,14 @@ if (cmd === "new-session") {
     const rows = d.kind === "theme" ? 3 : 2;
     if (d.kind === "add-dir") {
       if (armed()) { st.cursor = (st.cursor + (key === "Down" ? 1 : rows - 1)) % rows; st.lastKey = key === "Down" ? "down-counted" : "up"; }
-      else { st.held = true; st.refusedAt = now; st.lastKey = "arrow-refused"; }
+      else { st.held = true; st.refusedAt = now; st.cursor = 0; st.lastKey = "arrow-refused"; }
     } else { st.cursor = (st.cursor + (key === "Down" ? 1 : rows - 1)) % rows; st.lastKey = key; }
   } else if (d && key === "Enter") {
     if (d.kind === "add-dir") {
       if (st.cursor === 1 && st.lastKey === "down-counted" && armed() && st.refuse <= 0) { advance(); }
-      else if (st.cursor === 1 && st.refuse > 0 && st.lastKey === "down-counted") { st.refuse -= 1; st.held = true; st.refusedAt = now; st.lastKey = "enter-refused"; }
+      else if (st.cursor === 1 && st.refuse > 0 && st.lastKey === "down-counted") { st.refuse -= 1; st.held = true; st.refusedAt = now; st.cursor = 0; st.lastKey = "enter-refused"; }
       else if (st.cursor === 0 && armed() && st.lastKey === "down-counted") { st.exited = true; st.killed = true; }
-      else { st.held = true; st.refusedAt = now; st.lastKey = "enter-refused"; }
+      else { st.held = true; st.refusedAt = now; st.cursor = 0; st.lastKey = "enter-refused"; }
     } else if (d.kind === "paste-code") {
       st.submitted = st.typed; advance();
     } else { advance(); }

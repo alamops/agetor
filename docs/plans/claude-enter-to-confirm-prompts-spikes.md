@@ -36,3 +36,32 @@ Status: **unverified on the current copilot version.** No fix is planned for it.
 | --- | --- | --- | --- |
 | codex | none | — | T14 closes with "no change" |
 | copilot | not re-verified | — | T14 closes with "no change"; listed as unverified |
+
+## Live held-state spike (claude 2.1.326, 2026-11-17)
+
+A real `claude --add-dir <untrusted scratch repo>` on a private tmux socket (80x24). After the workspace-trust dialog was confirmed and the add-dir dialog was armed (>500 ms), the keys were sent by `python3` with `tmux send-keys`:
+
+| Step | Pane after |
+| --- | --- |
+| `Down` (armed) | cursor on `Yes, add it`, footer `Enter to confirm · Esc to cancel` |
+| `Right`, then `Enter` (an Enter that does not follow a counted Down) | **refused**: footer `Esc to exit · To add it, press ↓ to Yes, then Enter`, **cursor back on `No, exit`** |
+| bare `Enter` (held, cursor on No) | **refused again**; claude did not exit |
+| `Up`, `Down` | cursor on Yes, then back on No, footer still held |
+| `Enter` after that counted arrow, cursor on `No, exit` | the dialog closed because **claude exited** ("To go on without it…") |
+
+What this settled: a refusal puts the cursor back on "No, exit", so the live-cursor drive (`Down`, `Enter` from No) is the real recovery, and an Enter after a counted arrow on "No, exit" exits claude, which is the wrap hazard the drive guards against by never sending a key from a cursor it did not just read. The `Up`, `Down`, `Enter` branch of `planConfirmArrows` (a held dialog whose cursor is on Yes) is a safety net the live run did not need.
+
+
+## Live smoke of the branch (TT9, claude 2.1.326, 2026-11-17)
+
+A headless core of this branch (`AGETOR_DATA_DIR=$HOME/.agetor-dev AGETOR_API_PORT=4319`) driven with curl; two scratch git repositories that were not in `~/.claude.json`; a multi-repository claude task (haiku 5.5, Auto). Every smoke task, the scratch account and the scratch stack were deleted afterwards.
+
+| Scenario | Result |
+| --- | --- |
+| First run, preference on (default) | `status: auto-confirmed Claude's "Adding a new directory" prompt for smoke-a`, then `… for smoke-b`, both within 6 s of the start; `claude session … ready`; the reply `ok`; the run `succeeded`; `claude_session_id` recorded only after the session file existed |
+| Hibernate (tmux session killed) then a follow-up | `resuming claude session 60468492…`, the same two auto-confirm lines again (the resume consent window), reply `again` |
+| Preference off, hibernate, follow-up | Both dialogs became cards (one pending `tmux_prompt` per repository, each with `identity`), each answered through `POST /tmux-prompts/:id/answer {"key":"2"}`; reply `third`. The second dialog was not suppressed after the first was answered |
+| A logged-out Claude account (`home` = an empty directory) | `/harnesses` reports `loggedIn: false` with `authHelp` "run `claude auth login`, or open a terminal for this account from Settings → Harnesses"; starting a task on it is refused with `zz smoke logged-out isn't logged in — run \`claude auth login\`, …` |
+| A stack [logged-out account, built-in account], task on the logged-out one | The start moved the task to the built-in account (`agent=claude-code`) and the turn ran |
+
+Not exercised live: the OAuth `Paste code here if prompted >` and `Login successful…` screens (an OAuth round trip is needed; built from the binary's strings, plan A4), the held-state auto-retry inside a real boot (the held behaviour itself was proved by the spike above), and `agetor answer` against the smoke core (the CLI would have used the production core, memory "CLI smoke hits prod core"; its code path is unit-tested against the same route).
