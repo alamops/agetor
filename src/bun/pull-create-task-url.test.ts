@@ -405,3 +405,39 @@ test("pull-create stamps only the matching multi-repository entry, appending eac
   expect(reread.repositories?.find((r) => r.name === "backend")?.prUrl).toBe("https://github.com/o/be/pull/5");
   expect(reread.prUrl).toBeNull();
 });
+
+test("pull-create stamps a single-repo task when the PR is opened from its worktree, and a repeated URL is recorded once", async () => {
+  const { tasks } = await import("./db.ts");
+  const sourceDir = await makeGitHubRepo("o", "wt-src");
+  const worktreeDir = await makeGitHubRepo("o", "wt-src");
+  const task = tasks.insert(
+    fakeTask({ workdir: sourceDir, isolation: "worktree", worktreePath: worktreeDir, branch: "feature/wt" }),
+  );
+
+  const create = async (htmlUrl: string) => {
+    fetchMock = mockPullCreateRoute(htmlUrl);
+    try {
+      const res = await realFetch(url("/github/pull-create"), {
+        method: "POST",
+        headers: { authorization: `Bearer ${token}`, "content-type": "application/json" },
+        body: JSON.stringify({ path: worktreeDir, title: "From worktree", head: "feature/wt", base: "develop", taskId: task.id }),
+      });
+      expect(res.status).toBe(200);
+    } finally {
+      fetchMock.restore();
+      fetchMock = null;
+    }
+  };
+
+  await create("https://github.com/o/wt-src/pull/42");
+  let reread = tasks.get(task.id)!;
+  expect(reread.prs).toMatchObject([
+    { url: "https://github.com/o/wt-src/pull/42", head: "feature/wt", base: "develop", number: 42 },
+  ]);
+  expect(reread.prUrl).toBe("https://github.com/o/wt-src/pull/42");
+
+  // The forge answering with the same PR again (a retried create) appends nothing.
+  await create("https://github.com/o/wt-src/pull/42");
+  reread = tasks.get(task.id)!;
+  expect(reread.prs?.map((p) => p.url)).toEqual(["https://github.com/o/wt-src/pull/42"]);
+});

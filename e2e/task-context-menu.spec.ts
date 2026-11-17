@@ -4,6 +4,7 @@ import { mkdtemp, rm } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import path from "node:path";
 import { test, expect, type APIRequestContext, type E2EBackend, type Locator, type Page } from "./fixtures";
+import { startGitHubStub, type StubRequest } from "./github-stub";
 import { gotoApp } from "./helpers";
 
 /**
@@ -554,5 +555,152 @@ test.describe("task context menu", () => {
     await expect(menu(page)).toBeVisible();
     await page.keyboard.press("Escape");
     await expect(menu(page)).toBeHidden();
+  });
+
+  // docs/plans/create-all-prs-title-and-base.md T4/T11: a task with more than
+  // three pull requests groups them under one "View pull requests" entry whose
+  // child panel opens on click/hover/ArrowRight. The first Escape (or
+  // ArrowLeft) closes only the child and hands focus back to its parent item;
+  // the next Escape closes the menu. Choosing a child opens THAT pull request.
+  // The PRs are recorded through the real `POST /github/pull-create` stamping
+  // path against the GitHub stub, not seeded into the DB.
+  test("four pull requests collapse into a submenu: keyboard and mouse open it, Escape closes one level at a time, a child opens its own PR", async ({
+    page,
+    request,
+    backend,
+  }) => {
+    test.setTimeout(90_000);
+    const auth = { authorization: `Bearer ${backend.apiToken}` };
+    const title = `ctxmenu-prs ${randomUUID()}`;
+    const numbers = [71, 72, 73, 74];
+    let next = 0;
+    // Everything the test creates is released in `finally`, even when setup fails part-way.
+    let repoDir: string | null = null;
+    let task: (TaskRow & { workdir: string }) | null = null;
+    let projectPath: string | null = null;
+    const stub = await startGitHubStub(backend.githubStubPort, [
+      {
+        method: "POST",
+        path: "/repos/agetor-e2e/menu/pulls",
+        body: (req: StubRequest) => {
+          const number = numbers[next++]!;
+          const head = (req.body as { head: string }).head;
+          return {
+            status: 201,
+            body: { number, title: head, state: "open", html_url: `https://github.com/agetor-e2e/menu/pull/${number}` },
+          };
+        },
+      },
+    ]);
+    try {
+      repoDir = await initGitRepo();
+      git(repoDir, ["remote", "add", "origin", "https://github.com/agetor-e2e/menu.git"]);
+      task = (await createTask(request, backend, { title, prompt: title, workdir: repoDir })) as TaskRow & {
+        workdir: string;
+      };
+      const project = await request.post(`${backend.apiBase}/projects`, { headers: auth, data: { path: task.workdir } });
+      expect(project.ok(), `POST /projects -> ${project.status()}`).toBeTruthy();
+      projectPath = task.workdir;
+      const taskId = task.id;
+
+      for (let i = 1; i <= 4; i++) {
+        const res = await request.post(`${backend.apiBase}/github/pull-create`, {
+          headers: auth,
+          data: { path: task.workdir, title: `PR ${i}`, head: `e2e-menu-${i}`, base: "main", taskId },
+        });
+        expect(res.ok(), `pull-create ${i} -> ${res.status()}: ${await res.text()}`).toBeTruthy();
+      }
+      await expect
+        .poll(async () => {
+          const res = await request.get(`${backend.apiBase}/tasks/${taskId}`, { headers: auth });
+          return ((await res.json()) as { prs?: unknown[] }).prs?.length ?? 0;
+        })
+        .toBe(4);
+
+      await gotoApp(page, backend.bootBase);
+      await rightClickCard(page, title);
+      await expect(menu(page)).toBeVisible();
+      // One grouped entry, no flat per-PR entries, and no child panel until asked.
+      const parent = menuItem(page, "view-prs");
+      const submenu = page.getByTestId("task-context-menu-view-prs-submenu");
+      await expect(parent).toHaveText("View pull requests");
+      await expect(parent).toHaveAttribute("aria-haspopup", "menu");
+      await expect(page.locator('[data-testid^="task-context-menu-view-pr-"]')).toHaveCount(0);
+      await expect(submenu).toHaveCount(0);
+
+      // Keyboard: walk the roving focus down to the parent, ArrowRight opens the
+      // child with its first item focused, arrows move inside the child.
+      for (let i = 0; i < 12; i++) {
+        if (await parent.evaluate((el) => el === document.activeElement)) break;
+        await page.keyboard.press("ArrowDown");
+      }
+      await expect(parent).toBeFocused();
+      await page.keyboard.press("ArrowRight");
+      await expect(submenu).toBeVisible();
+      await expect(parent).toHaveAttribute("aria-expanded", "true");
+      await expect(submenu.getByRole("menuitem")).toHaveText([
+        "View PR: e2e-menu-1",
+        "View PR: e2e-menu-2",
+        "View PR: e2e-menu-3",
+        "View PR: e2e-menu-4",
+      ]);
+      await expect(menuItem(page, "view-pr-0")).toBeFocused();
+      await page.keyboard.press("ArrowDown");
+      await expect(menuItem(page, "view-pr-1")).toBeFocused();
+
+      // The first Escape closes only the child; focus returns to the parent item.
+      await page.keyboard.press("Escape");
+      await expect(submenu).toHaveCount(0);
+      await expect(menu(page)).toBeVisible();
+      await expect(parent).toBeFocused();
+      // ArrowLeft closes the child the same way.
+      await page.keyboard.press("ArrowRight");
+      await expect(submenu).toBeVisible();
+      await page.keyboard.press("ArrowLeft");
+      await expect(submenu).toHaveCount(0);
+      await expect(parent).toBeFocused();
+      // The next Escape closes the whole menu.
+      await page.keyboard.press("Escape");
+      await expect(menu(page)).toBeHidden();
+
+      // Mouse first, keyboard after: hovering the parent opens the child and
+      // leaves focus on the parent; ArrowRight then moves focus into the
+      // already-positioned child, and Tab there closes the whole menu.
+      await rightClickCard(page, title);
+      await expect(menu(page)).toBeVisible();
+      await parent.hover();
+      await expect(submenu).toBeVisible();
+      await expect(parent).toBeFocused();
+      await page.keyboard.press("ArrowRight");
+      await expect(menuItem(page, "view-pr-0")).toBeFocused();
+      await page.keyboard.press("Tab");
+      await expect(submenu).toHaveCount(0);
+      await expect(menu(page)).toBeHidden();
+
+      // Mouse: hovering the parent opens the child; clicking a child opens that
+      // PR (#73, the third) and closes both panels.
+      await rightClickCard(page, title);
+      await expect(menu(page)).toBeVisible();
+      await parent.hover();
+      await expect(submenu).toBeVisible();
+      await menuItem(page, "view-pr-2").click();
+      await expect(submenu).toHaveCount(0);
+      await expect(menu(page)).toBeHidden();
+      await expect
+        .poll(() => stub.callsMatching(/^\/repos\/agetor-e2e\/menu\/pulls\/73$/, "GET"), { timeout: 15_000 })
+        .toBeGreaterThan(0);
+      for (const other of [71, 72, 74]) {
+        expect(stub.callsMatching(new RegExp(`^/repos/agetor-e2e/menu/pulls/${other}$`), "GET")).toBe(0);
+      }
+    } finally {
+      if (task) await deleteTask(request, backend, task.id);
+      if (projectPath) {
+        await request
+          .delete(`${backend.apiBase}/projects`, { headers: auth, data: { path: projectPath } })
+          .catch(() => {});
+      }
+      await stub.close();
+      if (repoDir) await rm(repoDir, { recursive: true, force: true }).catch(() => {});
+    }
   });
 });

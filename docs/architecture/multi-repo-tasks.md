@@ -348,6 +348,11 @@ the one git prints on push always targets the default branch:
 | GitLab | `…/<namespace>/<project>/-/merge_requests/new?merge_request[source_branch]=<head>&merge_request[target_branch]=<base>` |
 | Bitbucket | `…/<workspace>/<repo>/pull-requests/new?source=<head>&dest=<base>` |
 
+The prompt asks for the forge's web host: when the remote uses an ssh host alias
+from `~/.ssh/config`, the agent uses the HostName it points to, so the link opens
+from the transcript. Either host attributes, since `linkMatchesRepo` canonicalizes
+both sides with `canonicalGitHost` (`src/shared/git-host.ts`).
+
 The parser also reads GitHub's `compare/<head>` and the legacy `pull/new/<head>`.
 Names are percent-decoded; a fork head (`owner:branch`) is never attributed. The
 prompt names the product nowhere. With a stored base it names it, with the

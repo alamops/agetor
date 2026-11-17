@@ -131,10 +131,13 @@ export function ContextMenu({ open, x, y, items, onClose, label = "Context menu"
     );
   }, [open, sub]);
 
+  // Wait for the child panel's real position: until `subPos` is set it is
+  // still `visibility: hidden`, which refuses focus, so focus would stay on
+  // the parent and the next ArrowDown/Escape would act on the root menu.
   useEffect(() => {
-    if (subIndex === -1) return;
+    if (subIndex === -1 || !subPos) return;
     subPanelRef.current?.querySelector<HTMLElement>(`[data-sub-index="${subIndex}"]`)?.focus();
-  }, [subIndex]);
+  }, [subIndex, subPos]);
 
   // Snapshot whatever had focus right before the menu opened, and restore it
   // once the menu closes OR is unmounted outright — the cleanup fires either

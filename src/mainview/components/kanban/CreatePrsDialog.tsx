@@ -188,7 +188,10 @@ export function CreatePrsDialogView(props: CreatePrsDialogViewProps) {
                       {row.repoName} · <span className="font-mono">{row.head || "(not pushed yet)"}</span>
                     </span>
                     <span className="text-xs text-muted-foreground">→</span>
-                    <div className="min-w-0 flex-1">
+                    {/* A floor, not min-w-0: with a zero flex-basis the long
+                        repo · head label would squeeze the base select to
+                        zero width and hide the base that will be posted. */}
+                    <div className="min-w-[9rem] flex-1">
                       <Select
                         aria-label={`Base branch for ${row.repoName} ${row.head}`}
                         data-testid={`create-prs-base-${slug}`}

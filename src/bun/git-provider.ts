@@ -16,7 +16,7 @@ import { tokenForHost } from "./github-tokens.ts";
  * Raw-host-is-identity convention: a user pins per-identity SSH keys via
  * `~/.ssh/config` host aliases (`git@gitlab-work.io:group/app.git`), so the
  * host in a remote URL is often not the provider's real hostname.
- * `canonicalGitHost` (github.ts) maps any such alias to the provider's cloud
+ * `canonicalGitHost` (`src/shared/git-host.ts`) maps any such alias to the provider's cloud
  * hostname (`gitlab.com`, `bitbucket.org`, …) for API-base-URL purposes, but
  * the RAW pre-canonicalization host is what identifies this specific
  * account/workspace — that's the key the token store (`github-tokens.ts`) is

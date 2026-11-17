@@ -16,7 +16,7 @@
 // that and because the same alias can mean different things to different
 // users' `~/.ssh/config`. Provider classification here is the same cheap
 // substring heuristic already used elsewhere in the shared layer
-// (`canonicalGitHost` in `src/bun/github.ts`, mirrored inline in
+// (`canonicalGitHost` in `src/shared/git-host.ts`, mirrored inline in
 // `issue-task.ts`): a lowercased host that merely *contains* "github" /
 // "gitlab" / "bitbucket" counts. The server's `resolveCloneRepo` (see
 // `docs/plans/clone-repository-all-providers.md` §3 D2) layers the git
@@ -340,7 +340,7 @@ function parseFormStructure(raw: string): FormStructure | null {
 }
 
 /** Provider from a (lowercased) host by substring, mirroring the same cheap
- *  heuristic `canonicalGitHost` (`src/bun/github.ts`) and `issue-task.ts`
+ *  heuristic `canonicalGitHost` (`src/shared/git-host.ts`) and `issue-task.ts`
  *  already use elsewhere in this codebase: a host merely *containing* the
  *  provider's name counts, since users pin per-identity ssh aliases
  *  (`gitlab-work`, `github-personal`, …) that don't literally equal the

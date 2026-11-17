@@ -6850,12 +6850,16 @@ function shellQuoteInner(s: string): string {
  * The per-forge link shapes the Commit & push prompt asks for. The Create-all-
  * PRs parser (`src/mainview/lib/pr-link.ts`) reads exactly these, plus GitHub's
  * legacy `pull/new/<head>`. Names are URL-encoded; `<base>...<head>` is split on
- * the three dots (git forbids `..` in a ref name).
+ * the three dots (git forbids `..` in a ref name). The host may be an ssh alias
+ * or its real web host: `linkMatchesRepo` canonicalizes both sides, so either
+ * attributes, but only the web host opens when clicked in the transcript.
  */
 const PR_LINK_FORMS =
   `For GitHub use https://<host>/<owner>/<repo>/compare/<base>...<head>?quick_pull=1; ` +
   `for GitLab use https://<host>/<namespace>/<project>/-/merge_requests/new?merge_request[source_branch]=<head>&merge_request[target_branch]=<base>; ` +
-  `for Bitbucket use https://<host>/<workspace>/<repo>/pull-requests/new?source=<head>&dest=<base>.`;
+  `for Bitbucket use https://<host>/<workspace>/<repo>/pull-requests/new?source=<head>&dest=<base>. ` +
+  `<host> is the forge's web host: when the remote uses an ssh host alias from ~/.ssh/config, ` +
+  `use the HostName that alias points to, so the link opens in a browser.`;
 
 /**
  * A working directory the user has registered as a "project". Surfaced in the
@@ -6913,7 +6917,7 @@ export type AgentStatus = HarnessStatus;
 
 /**
  * Multi-provider git-forge support (docs/plans/multi-provider-git-modal.md).
- * `canonicalGitHost` in `src/bun/github.ts` already maps any host containing
+ * `canonicalGitHost` in `src/shared/git-host.ts` already maps any host containing
  * "github"/"gitlab"/"bitbucket" to the provider's cloud hostname — this is
  * the provider identifier that maps to that canonical host 1:1.
  */

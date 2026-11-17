@@ -57,6 +57,9 @@ import { uniqueRepoSlugs } from "../src/shared/multi-repo.ts";
  * 14. Create all PRs is per-repository best effort, and a reloaded retry shows
  *     an "already exists" answer as already open (S5).
  * 15. The single Create PR chip prefills the composer's base (S6).
+ * 16. The Commit & push chip's message names the base the task was created
+ *     from and asks for a link that targets it (C3), single- and
+ *     multi-repository.
  *
  * The proposals come from the fake claude driver's PR-proposal marker: a
  * literal copy of `FAKE_CLAUDE_PR_PROPOSAL_PROMPT_MARKER` (specs can't import
@@ -699,6 +702,12 @@ test("Create all PRs: each PR gets its own repository's title and body, targets 
     await expect(dialog.getByTestId(`create-prs-title-${beSlug}`)).toHaveValue("Backend proposal title");
     await expect(dialog.getByTestId(`create-prs-base-${feSlug}`)).toHaveValue(TOPIC_BRANCH);
     await expect(dialog.getByTestId(`create-prs-base-${beSlug}`)).toHaveValue(TOPIC_BRANCH);
+    // The agetor/<id>-<slug> head makes the row label long; the base select
+    // must still be wide enough to read, not squeezed to zero by the label.
+    for (const slug of [feSlug, beSlug]) {
+      const box = await dialog.getByTestId(`create-prs-base-${slug}`).boundingBox();
+      expect(box?.width ?? 0).toBeGreaterThanOrEqual(100);
+    }
     await expect(dialog.getByTestId(`create-prs-base-source-${feSlug}`)).toContainText("from the task");
     await expect(dialog.getByTestId("create-prs-submit")).toContainText("Create 2 pull requests");
     await dialog.getByTestId("create-prs-submit").click();
@@ -1103,6 +1112,107 @@ test("the single Create PR chip opens the composer on the task's base branch (S6
     if (prTaskId) await request.delete(`${backend.apiBase}/tasks/${prTaskId}`, { headers: auth }).catch(() => {});
     await stub.close();
     if (bareDir) await rm(bareDir, { recursive: true, force: true }).catch(() => {});
+  }
+});
+
+/** Every persisted event of a task, oldest first (one page is plenty here). */
+async function taskEvents(request: APIRequestContext, backend: E2EBackend, id: string) {
+  const res = await request.get(
+    `${backend.apiBase}/tasks/${id}/events/page?beforeId=${Number.MAX_SAFE_INTEGER}&limit=500`,
+    { headers: { authorization: `Bearer ${backend.apiToken}` } },
+  );
+  expect(res.ok(), `GET /tasks/${id}/events/page -> ${res.status()}`).toBeTruthy();
+  return ((await res.json()) as { events: Array<{ stream: string; data: string }> }).events;
+}
+
+/** Click the run panel's Commit & push chip and return the message it delivered to the agent. */
+async function sendCommitPush(page: Page, request: APIRequestContext, backend: E2EBackend, id: string, title: string) {
+  await gotoApp(page, backend.bootBase);
+  await page.getByText(title, { exact: true }).first().click();
+  const chip = page.getByRole("button", { name: "Commit & push" });
+  await expect(chip).toBeVisible({ timeout: CONVERGE_TIMEOUT });
+  await chip.click();
+  let sent: string | undefined;
+  await expect
+    .poll(
+      async () => {
+        sent = (await taskEvents(request, backend, id)).find(
+          (e) => e.stream === "user" && e.data.includes("Commit all changes"),
+        )?.data;
+        return sent !== undefined;
+      },
+      { timeout: CONVERGE_TIMEOUT },
+    )
+    .toBe(true);
+  return sent!;
+}
+
+// C3 (docs/plans/create-all-prs-title-and-base.md): the Commit & push chip's
+// message asks for a `Base:` line naming the base recorded when the task was
+// created (not the repo default), and for a link built to target it, because
+// git's push-output link always targets the default branch.
+test("Commit & push asks for a Base: line naming the branch the task was created from, and a link that targets it", async ({
+  backend,
+  page,
+  request,
+}) => {
+  test.setTimeout(120_000);
+  const auth = { authorization: `Bearer ${backend.apiToken}`, "content-type": "application/json" };
+  const title = "Commit push base single e2e";
+  let id: string | null = null;
+  let bareDir: string | null = null;
+  try {
+    const prepared = await createPushedSingleTask(request, backend, { title, baseRef: TOPIC_BRANCH });
+    id = prepared.taskId;
+    bareDir = prepared.bareDir;
+    const row = await getTaskRow(request, backend, id);
+    expect(row.baseBranch).toBe(TOPIC_BRANCH);
+    // Uncommitted work is what offers the chip.
+    await writeFile(path.join(row.worktreePath!, "commit-push.txt"), "change\n");
+
+    const sent = await sendCommitPush(page, request, backend, id, title);
+    expect(sent).toContain(`git push -u origin '${prepared.branch}'`);
+    expect(sent).toContain('"Base: <branch>"');
+    expect(sent).toContain(`the base recorded for this task, '${TOPIC_BRANCH}'`);
+    expect(sent).toContain("compare/<base>...<head>?quick_pull=1");
+    expect(sent).toContain("always targets the default branch");
+    // The Base line comes before the link, and both before the PR blocks.
+    expect(sent.indexOf('"Base: <branch>"')).toBeLessThan(sent.indexOf("full link to open a"));
+    expect(sent.indexOf("full link to open a")).toBeLessThan(sent.indexOf('"PR title:"'));
+  } finally {
+    if (id) await request.delete(`${backend.apiBase}/tasks/${id}`, { headers: auth }).catch(() => {});
+    if (bareDir) await rm(bareDir, { recursive: true, force: true }).catch(() => {});
+  }
+});
+
+test("Commit & push on a multi-repository task lists each repository's own recorded base", async ({
+  backend,
+  page,
+  request,
+}) => {
+  test.setTimeout(120_000);
+  const auth = { authorization: `Bearer ${backend.apiToken}`, "content-type": "application/json" };
+  const title = "Commit push base multi e2e";
+  let id: string | null = null;
+  let bareDirs: string[] = [];
+  try {
+    const prepared = await createPushedMultiTask(request, backend, { title, baseRef: TOPIC_BRANCH });
+    id = prepared.taskId;
+    bareDirs = prepared.bareDirs;
+    const row = await getTaskRow(request, backend, id);
+    expect(row.repositories.map((r) => r.baseBranch)).toEqual([TOPIC_BRANCH, TOPIC_BRANCH]);
+    await writeFile(path.join(row.repositories[1]!.worktreePath!, "commit-push.txt"), "change\n");
+
+    const sent = await sendCommitPush(page, request, backend, id, title);
+    for (const repo of row.repositories) {
+      expect(sent).toContain(`- ${repo.name}: branch '${repo.branch}', base '${TOPIC_BRANCH}'`);
+    }
+    expect(sent).toContain('a "Repository: <name>" line; a "Base: <branch>" line');
+    expect(sent).toContain("merge_request[target_branch]=<base>");
+    expect(sent).toContain("dest=<base>");
+  } finally {
+    if (id) await request.delete(`${backend.apiBase}/tasks/${id}`, { headers: auth }).catch(() => {});
+    for (const d of bareDirs) await rm(d, { recursive: true, force: true }).catch(() => {});
   }
 });
 
