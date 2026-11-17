@@ -14,6 +14,8 @@ import {
   refreshFxHarnessModels,
   refreshHarnessTarget,
   refreshKindModels,
+  seedDiscoveryCache,
+  setDiscoverySettleHook,
   type FxHarnessTarget,
   type HarnessTarget,
 } from "./agent-discovery.ts";
@@ -149,7 +151,7 @@ test("discoverCodex (via refreshKindModels): one page with a hidden row surfaces
     await refreshKindModels("codex");
   });
   expect(getDiscoveredModels("codex")).toEqual([
-    { id: "m1", label: "M One", efforts: ["low", "high", "ultra"] },
+    { id: "m1", label: "M One", efforts: ["low", "high", "ultra"], defaultEffort: "low" },
   ]);
 });
 
@@ -1463,4 +1465,175 @@ test("getDiscoveredEfforts: passes an explicit [] through (opencode 'no variants
   expect(getDiscoveredEfforts("opencode", "p/unknown", "opencode-efforts")).toBeNull();
   expect(getDiscoveredEfforts("opencode", "p/missing", "opencode-efforts")).toBeNull();
   expect(getDiscoveredEfforts("opencode", null, "opencode-efforts")).toBeNull();
+});
+
+/* ── dynamic model catalog: new codex fields, cursor grouping, copilot ACP,
+ * claude/gemini probes, the settle hook, seeding and late kind targets ─────── */
+
+const FIXTURE_DIR = new URL("./fixtures/model-discovery/", import.meta.url);
+const fixtureText = (name: string) => readFileSync(new URL(name, FIXTURE_DIR), "utf8");
+
+test("parseCodexModelList: the 0.166.0 fixture carries default, default effort and the Fast tier", () => {
+  const rows = __testing.parseCodexModelList(JSON.parse(fixtureText("codex-model-list-0.166.0.json")));
+  expect(rows.length).toBe(10);
+  const sol = rows.find((r) => r.id === "gpt-6.2-sol");
+  expect(sol).toMatchObject({
+    cliDefault: true,
+    defaultEffort: "medium",
+    fast: true,
+    fastTier: "priority",
+    fastHint: "2x speed, increased usage",
+  });
+  expect(sol).not.toHaveProperty("defaultFast");
+  expect(sol?.efforts).toEqual(["low", "medium", "high", "xhigh", "max", "ultra"]);
+  const astra = rows.find((r) => r.id === "gpt-6.2-astra");
+  expect(astra).toMatchObject({ defaultEffort: "low", defaultFast: true });
+  expect(astra).not.toHaveProperty("cliDefault");
+  expect(rows.filter((r) => r.cliDefault)).toHaveLength(1);
+});
+
+test("parseCodexModelList: a model with no tiers has no fast fields; labels are sanitized", () => {
+  const rows = __testing.parseCodexModelList({
+    data: [{ id: "m", displayName: "M​ One", additionalSpeedTiers: [], serviceTiers: [], defaultServiceTier: null }],
+  });
+  expect(rows).toEqual([{ id: "m", label: "M One" }]);
+});
+
+test("parseCursorModels: the fixture is grouped into base rows, not 280 flat ids", () => {
+  const rows = __testing.parseCursorModels(fixtureText("cursor-models-2026.10.22.txt"));
+  expect(rows.length).toBeLessThan(100);
+  expect(rows.map((r) => r.id)).toContain("auto");
+});
+
+test("discoverCursor: --list-models output from a stub binary is parsed through the grouping parser", async () => {
+  __testing.resetForTests();
+  const listing = path.join(mkdtempSync(path.join("/tmp", "agetor-cursor-list-")), "list.txt");
+  writeFileSync(listing, "Available models\n\ngpt-7-low - GPT-7 Low\ngpt-7-high - GPT-7 High\ngpt-7-high-fast - GPT-7 High Fast\n");
+  const bin = plantBin("cursor-agent", `cat "${listing}"`);
+  await withEnvOverride("AGETOR_CURSOR_BIN", bin, async () => {
+    await refreshKindModels("cursor");
+  });
+  expect(getDiscoveredModels("cursor")).toEqual([
+    {
+      id: "gpt-7",
+      label: "GPT-7",
+      efforts: ["low", "high"],
+      fast: true,
+      cursor: { effortIds: { low: "gpt-7-low", high: "gpt-7-high" }, fastEfforts: ["high"] },
+    },
+  ]);
+});
+
+test("discoverCopilot: ACP models win when a cwd is given; the kill switch and an empty answer fall back to help config", async () => {
+  const dir = mkdtempSync(path.join("/tmp", "agetor-copilot-disc-"));
+  const reply = path.join(dir, "reply.json");
+  writeFileSync(
+    reply,
+    `${JSON.stringify({ jsonrpc: "2.0", id: 2, result: JSON.parse(fixtureText("copilot-acp-session-new.json")) })}\n`,
+  );
+  const helpConfig = `  \`model\`: the model\n    - "help-model-a"\n    - "help-model-b"\n`;
+  const bin = path.join(dir, "copilot");
+  writeFileSync(
+    bin,
+    `#!/bin/sh
+if [ "$1" = "help" ]; then printf '%s' '${helpConfig}'; exit 0; fi
+while read line; do
+  case "$line" in
+    *'"method":"initialize"'*) echo '{"jsonrpc":"2.0","id":1,"result":{}}';;
+    *'"method":"session/new"'*) cat "${reply}";;
+  esac
+done
+`,
+    { mode: 0o755 },
+  );
+  const viaAcp = await __testing.discoverCopilot({}, bin, dir);
+  expect(viaAcp.map((r) => r.id)).toEqual(["claude-sonnet-4.5", "gpt-5", "gpt-5-mini"]);
+  // No cwd: the ACP probe is not attempted (it needs an empty directory of its own).
+  const noCwd = await __testing.discoverCopilot({}, bin);
+  expect(noCwd.map((r) => r.id)).toEqual(["help-model-a", "help-model-b"]);
+  await withEnvOverride("AGETOR_COPILOT_ACP_PROBE", "0", async () => {
+    const off = await __testing.discoverCopilot({}, bin, dir);
+    expect(off.map((r) => r.id)).toEqual(["help-model-a", "help-model-b"]);
+  });
+});
+
+test("discoverClaude: no target (or a skipped one) never spawns; a target runs the initialize probe", async () => {
+  const dir = mkdtempSync(path.join("/tmp", "agetor-claude-disc-"));
+  const marker = path.join(dir, "ran");
+  const response = path.join(dir, "init.json");
+  writeFileSync(response, JSON.stringify(JSON.parse(fixtureText("claude-init-2.1.326.json"))));
+  const bin = path.join(dir, "claude");
+  writeFileSync(
+    bin,
+    `#!/bin/sh\ntouch "${marker}"\nread line\nprintf '{"type":"control_response","response":{"subtype":"success","request_id":"init-1","response":%s}}\\n' "$(cat "${response}")"\nsleep 2\n`,
+    { mode: 0o755 },
+  );
+  expect(await __testing.discoverClaude()).toEqual([]);
+  expect(await __testing.discoverClaude({ env: {}, bin, skip: true })).toEqual([]);
+  expect(await Bun.file(marker).exists()).toBe(false);
+  const rows = await __testing.discoverClaude({ env: {}, bin, cwd: dir });
+  expect(rows).toHaveLength(13);
+  expect(rows[0]?.id).toBe("opus-5.5");
+});
+
+test("the settle hook sees every write path and decides what is cached", async () => {
+  __testing.resetForTests();
+  const seen: string[] = [];
+  setDiscoverySettleHook((key, fresh, previous) => {
+    seen.push(key.scope === "kind" ? `kind:${key.kind}` : `harness:${key.harnessId}`);
+    // Keep the previous catalog across an empty probe.
+    return fresh.length === 0 && previous ? previous : fresh;
+  });
+  try {
+    const bin = plantFakeCodexAppServer({ pages: [[{ id: "keep-me", displayName: "Keep" }]] });
+    await withEnvOverride("AGETOR_CODEX_BIN", bin, async () => {
+      await refreshKindModels("codex");
+    });
+    expect(getDiscoveredModels("codex").map((m) => m.id)).toEqual(["keep-me"]);
+    const broken = plantFakeCodexAppServer({ pages: [[{ id: "x" }]], error: true });
+    await withEnvOverride("AGETOR_CODEX_BIN", broken, async () => {
+      await refreshKindModels("codex");
+    });
+    expect(getDiscoveredModels("codex").map((m) => m.id)).toEqual(["keep-me"]);
+    // A full sweep with a harness target also routes through the hook.
+    await refreshDiscoveredModels({ fxHarnesses: [{ harnessId: "h-1", kind: "codex", env: { X: "1" }, bin: broken }] });
+    expect(seen).toContain("kind:codex");
+    expect(seen).toContain("kind:claude-code");
+    expect(seen).toContain("harness:h-1");
+    await refreshHarnessTarget({ harnessId: "h-2", kind: "codex", env: { X: "1" }, bin: broken });
+    expect(seen).toContain("harness:h-2");
+  } finally {
+    setDiscoverySettleHook(null);
+    __testing.resetForTests();
+  }
+});
+
+test("seedDiscoveryCache fills a slot until a probe settles it, then is ignored", async () => {
+  __testing.resetForTests();
+  seedDiscoveryCache({ scope: "kind", kind: "claude-code" }, [{ id: "seeded" }]);
+  seedDiscoveryCache({ scope: "harness", kind: "codex", harnessId: "h-seed" }, [{ id: "h-seeded" }]);
+  expect(getDiscoveredModels("claude-code").map((m) => m.id)).toEqual(["seeded"]);
+  expect(getHarnessDiscoveredModels("h-seed").map((m) => m.id)).toEqual(["h-seeded"]);
+  await refreshKindModels("claude-code"); // no target: settles to []
+  expect(getDiscoveredModels("claude-code")).toEqual([]);
+  seedDiscoveryCache({ scope: "kind", kind: "claude-code" }, [{ id: "late-seed" }]);
+  expect(getDiscoveredModels("claude-code")).toEqual([]);
+  __testing.resetForTests();
+});
+
+test("kindTargets is resolved inside the queued run, so a later change is honoured", async () => {
+  __testing.resetForTests();
+  const dir = mkdtempSync(path.join("/tmp", "agetor-claude-late-"));
+  const bin = path.join(dir, "claude");
+  writeFileSync(
+    bin,
+    `#!/bin/sh\nread line\nprintf '{"type":"control_response","response":{"subtype":"success","request_id":"init-1","response":{"models":[{"value":"claude-opus-6","resolvedModel":"claude-opus-6","displayName":"Opus 6"}]}}}\\n'\nsleep 2\n`,
+    { mode: 0o755 },
+  );
+  let target: { env: Record<string, string>; bin: string; cwd: string } | undefined;
+  const first = refreshDiscoveredModels({ kindTargets: async () => (target ? { "claude-code": target } : {}) });
+  target = { env: {}, bin, cwd: dir }; // set AFTER the call, before the queued run starts
+  await first;
+  expect(getDiscoveredModels("claude-code").map((m) => m.id)).toEqual(["opus-6"]);
+  __testing.resetForTests();
 });

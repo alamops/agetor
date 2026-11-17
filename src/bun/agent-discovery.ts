@@ -5,8 +5,16 @@ import pkg from "../../package.json" with { type: "json" };
 import type { AgentKind } from "../shared/types.ts";
 import { coreSpawn } from "./core-spawn.ts";
 import { disambiguateOpencodeLabels, opencodeMajor } from "../shared/opencode.ts";
+import type { DiscoveredModel } from "../shared/model-options.ts";
+import { parseCursorModelList } from "../shared/cursor-catalog.ts";
+import { sanitizeCliDescription, sanitizeCliLabel } from "../shared/model-display.ts";
+import { probeClaudeModels } from "./discovery/claude-probe.ts";
+import { probeGeminiModels } from "./discovery/gemini-probe.ts";
+import { copilotAcpProbeEnabled, probeCopilotAcp } from "./discovery/copilot-acp-probe.ts";
 
-/**
+export type { DiscoveredModel } from "../shared/model-options.ts";
+
+/*
  * A model id (and optional human label) surfaced by the agent CLI itself.
  * Discovery is best-effort — a missing or unparseable CLI just returns an
  * empty list and the UI falls back to the hardcoded AGENT_OPTIONS.
@@ -26,17 +34,8 @@ import { disambiguateOpencodeLabels, opencodeMajor } from "../shared/opencode.ts
  * argument (`src/shared/types.ts`), where a non-empty discovered set wins over
  * the curated `MODEL_EFFORT_SUPPORT` table.
  */
-export interface DiscoveredModel {
-  id: string;
-  label?: string;
-  efforts?: string[];
-  /** fx ≥0.0.14 only (`models --json` `models[].fast === true`): the model
-   *  offers the ACP `fast` session option. Never attached as `false`. */
-  fast?: boolean;
-  /** fx ≥0.0.14 only (`models[].ultrafast === true`): the model offers the
-   *  ACP `ultrafast` session option. Never attached as `false`. */
-  ultrafast?: boolean;
-}
+// `DiscoveredModel` (`src/shared/model-options.ts`) is the one shared shape; the
+// webview and CLI API rows are the same type.
 
 /**
  * Run an external command with a 3-second timeout. Designed for cheap CLI
@@ -121,8 +120,36 @@ function parseCodexModelList(result: unknown): DiscoveredModel[] {
 
     const model: DiscoveredModel = { id };
     if (typeof e.displayName === "string" && e.displayName.length > 0) {
-      model.label = e.displayName;
+      model.label = sanitizeCliLabel(e.displayName) || e.displayName;
     }
+    if (typeof e.description === "string") {
+      const description = sanitizeCliDescription(e.description);
+      if (description) model.description = description;
+    }
+    if (e.isDefault === true) model.cliDefault = true;
+    if (typeof e.defaultReasoningEffort === "string" && e.defaultReasoningEffort.length > 0) {
+      model.defaultEffort = e.defaultReasoningEffort;
+    }
+    // Speed: a `fast` additional tier or any service tier means the model has
+    // a faster lane. The tier to request is the first service tier's id
+    // (`priority`), described by its own text; a non-null `defaultServiceTier`
+    // means the model already runs on one by default.
+    const tiers = Array.isArray(e.serviceTiers)
+      ? e.serviceTiers.filter((t): t is Record<string, unknown> => !!t && typeof t === "object")
+      : [];
+    const fastTiers = Array.isArray(e.additionalSpeedTiers) && e.additionalSpeedTiers.includes("fast");
+    if (fastTiers || tiers.length > 0) {
+      model.fast = true;
+      const tier = tiers.find((t) => typeof t.id === "string" && t.id.length > 0);
+      if (tier && typeof tier.id === "string") {
+        model.fastTier = tier.id;
+        if (typeof tier.description === "string") {
+          const hint = sanitizeCliDescription(tier.description);
+          if (hint) model.fastHint = hint;
+        }
+      }
+    }
+    if (typeof e.defaultServiceTier === "string" && e.defaultServiceTier.length > 0) model.defaultFast = true;
     if (Array.isArray(e.supportedReasoningEfforts)) {
       const efforts: string[] = [];
       const effortsSeen = new Set<string>();
@@ -142,28 +169,14 @@ function parseCodexModelList(result: unknown): DiscoveredModel[] {
 }
 
 /**
- * Parse `cursor-agent --list-models` output. Like codex, the exact format
- * isn't formally specified (and the binary isn't installed on this
- * machine to verify against), so we lean on the same loose heuristic:
- * any line whose first whitespace-separated token looks like a model id
- * (`<word>-<word>...`, lowercase, alphanumeric + dashes/dots, at least one
- * dash) is taken as a model. Header rows / banner chatter are dropped.
+ * Parse `cursor-agent --list-models` output (one `id - Label` line per flat
+ * variant) into one row per base model with its effort ladder and Fast twin;
+ * ids a curated `CURSOR_MODEL_SPECS` entry covers collapse to the spec's key.
+ * See `src/shared/cursor-catalog.ts` for the grammar. Header rows and the
+ * trailing tip line are dropped.
  */
 function parseCursorModels(stdout: string): DiscoveredModel[] {
-  const out: DiscoveredModel[] = [];
-  const seen = new Set<string>();
-  for (const raw of stdout.split("\n")) {
-    const line = raw.trim();
-    if (!line) continue;
-    if (/^(available|models|model\s+id|---|=+)/i.test(line)) continue;
-    const first = line.split(/\s+/)[0]!;
-    if (!/^[a-z0-9][a-z0-9.\-_]*[a-z0-9]$/i.test(first)) continue;
-    if (!first.includes("-")) continue;
-    if (seen.has(first)) continue;
-    seen.add(first);
-    out.push({ id: first });
-  }
-  return out;
+  return parseCursorModelList(stdout);
 }
 
 async function discoverCursor(): Promise<DiscoveredModel[]> {
@@ -457,23 +470,51 @@ async function discoverCodex(env?: Record<string, string>, bin?: string): Promis
 }
 
 /**
- * claude-code intentionally has no programmatic model-list command (open
- * feature request at the time of writing). Returning an empty list keeps the
- * UI on the hardcoded AGENT_OPTIONS, which is the only source of truth that
- * works today.
+ * Where and how a kind-level probe runs: the harness's own env and binary, an
+ * empty working directory for probes that start a session-like context
+ * (claude, copilot ACP), and `skip` for "do not probe at all" (a logged-out
+ * account). Built by `model-discovery.ts` from the built-in harness row —
+ * this module never reads the database.
  */
-async function discoverClaude(): Promise<DiscoveredModel[]> {
-  return [];
+export interface KindProbeTarget {
+  env: Record<string, string>;
+  bin?: string;
+  cwd?: string;
+  skip?: boolean;
 }
 
 /**
- * Gemini CLI has no documented programmatic model-list command either
- * (checked `gemini --help` on CLI 0.54.0 — no such flag/subcommand exists).
- * Same treatment as claude: empty list, UI stays on the hardcoded
- * AGENT_OPTIONS.gemini.
+ * Claude Code lists its own models through the SDK `initialize` control
+ * request (`discovery/claude-probe.ts`: no prompt, no quota, no session, user
+ * hooks and MCP servers disabled). Probed only when `model-discovery.ts`
+ * hands over a target — the built-in claude harness — so the bare no-target
+ * call stays `[]`, which keeps the curated table in charge for an old CLI, a
+ * logged-out account or a unit test.
+ */
+async function discoverClaude(target?: KindProbeTarget): Promise<DiscoveredModel[]> {
+  if (!target || target.skip) return [];
+  try {
+    const fallback = process.env.AGETOR_CLAUDE_BIN ?? "claude";
+    const bin = target.bin ?? (Bun.which(fallback, { PATH: process.env.PATH }) ?? fallback);
+    return await probeClaudeModels({ bin, env: target.env, ...(target.cwd ? { cwd: target.cwd } : {}) });
+  } catch {
+    return [];
+  }
+}
+
+/**
+ * Gemini CLI ≥ 0.67.0 lists its models with `gemini models -o json`
+ * (`discovery/gemini-probe.ts`); an older CLI has no list and answers `[]`,
+ * so the curated `AGENT_OPTIONS.gemini` stays in charge there.
  */
 async function discoverGemini(): Promise<DiscoveredModel[]> {
-  return [];
+  try {
+    const fallback = process.env.AGETOR_GEMINI_BIN ?? "gemini";
+    const bin = Bun.which(fallback, { PATH: process.env.PATH }) ?? fallback;
+    return await probeGeminiModels({ bin });
+  } catch {
+    return [];
+  }
 }
 
 function parseAntigravityModels(stdout: string): DiscoveredModel[] {
@@ -1202,6 +1243,65 @@ const cache = new Map<AgentKind, DiscoveredModel[]>();
 const harnessCache = new Map<string, DiscoveredModel[]>();
 let ready = false;
 
+/** A cache slot: the kind-level entry or one harness's own entry. */
+export type DiscoveryCacheKey =
+  | { scope: "kind"; kind: AgentKind }
+  | { scope: "harness"; kind: AgentKind; harnessId: string };
+
+/**
+ * Called with every freshly probed list before it lands in the cache; returns
+ * what to cache. `model-discovery.ts` installs it to persist non-empty lists
+ * and keep the previous catalog across a transient empty probe. `null` (the
+ * default) is the original "fresh replaces" behavior.
+ */
+export type DiscoverySettleHook = (
+  key: DiscoveryCacheKey,
+  fresh: DiscoveredModel[],
+  previous: DiscoveredModel[] | undefined,
+) => DiscoveredModel[];
+
+let settleHook: DiscoverySettleHook | null = null;
+
+/** Install (or clear) the settle hook. A hook that throws is ignored for that write. */
+export function setDiscoverySettleHook(hook: DiscoverySettleHook | null): void {
+  settleHook = hook;
+}
+
+/** Slots a probe has settled; `seedDiscoveryCache` never overwrites one. */
+const settledKeys = new Set<string>();
+
+function cacheKeyId(key: DiscoveryCacheKey): string {
+  return key.scope === "kind" ? `kind:${key.kind}` : `harness:${key.harnessId}`;
+}
+
+/** Every cache write goes through here: the settle hook, then the slot. */
+function commitDiscovery(key: DiscoveryCacheKey, fresh: DiscoveredModel[]): DiscoveredModel[] {
+  const previous = key.scope === "kind" ? cache.get(key.kind) : harnessCache.get(key.harnessId);
+  let result = fresh;
+  if (settleHook) {
+    try {
+      result = settleHook(key, fresh, previous);
+    } catch {
+      result = fresh;
+    }
+  }
+  if (key.scope === "kind") cache.set(key.kind, result);
+  else harnessCache.set(key.harnessId, result);
+  settledKeys.add(cacheKeyId(key));
+  return result;
+}
+
+/**
+ * Pre-fill a slot (the catalog persisted by an earlier run) so the first
+ * `GET /agent-models` after a restart already has rows. Ignored once a probe
+ * has settled that slot, so a late seed can never overwrite fresh data.
+ */
+export function seedDiscoveryCache(key: DiscoveryCacheKey, models: DiscoveredModel[]): void {
+  if (settledKeys.has(cacheKeyId(key))) return;
+  if (key.scope === "kind") cache.set(key.kind, models);
+  else harnessCache.set(key.harnessId, models);
+}
+
 /**
  * Serializes every `refreshDiscoveredModels` / `refreshFxHarnessModels` call
  * into a single FIFO queue. This replaces a previous `inflight` short-circuit
@@ -1368,13 +1468,20 @@ const COPILOT_PROBE_TIMEOUT_MS = 4_000;
  * `COPILOT_OFFLINE`) and `bin` are test seams.
  * Never throws; an unresolvable binary, non-zero exit or empty output is `[]`.
  */
-async function discoverCopilot(env?: Record<string, string>, bin?: string): Promise<DiscoveredModel[]> {
+async function discoverCopilot(env?: Record<string, string>, bin?: string, cwd?: string): Promise<DiscoveredModel[]> {
   try {
     const resolved = bin ?? defaultCopilotBin();
     const resolvable = isAbsolute(resolved)
       ? existsSync(resolved)
       : Bun.which(resolved, { PATH: process.env.PATH }) !== null;
     if (!resolvable) return [];
+    // ACP first (models plus the current model's efforts), when enabled and
+    // given an empty working directory to open its throwaway session in; an
+    // empty or failed answer falls through to `help config`.
+    if (cwd && copilotAcpProbeEnabled()) {
+      const viaAcp = await probeCopilotAcp({ bin: resolved, ...(env ? { env } : {}), cwd });
+      if (viaAcp.length > 0) return viaAcp;
+    }
     const probe = await runProbe(
       [resolved, "help", "config"],
       { ...(env ?? {}), COPILOT_OFFLINE: "true" },
@@ -1408,8 +1515,17 @@ export function isDiscoveryReady(): boolean {
  */
 export type FxHarnessTargetsOption = HarnessTarget[] | (() => HarnessTarget[]);
 
-async function runRefresh(opts?: { fxHarnesses?: FxHarnessTargetsOption }): Promise<void> {
+/** Per-kind probe targets, resolved inside the enqueued run (see `runRefresh`). */
+export type KindTargetsOption = () => Promise<Partial<Record<AgentKind, KindProbeTarget>>>;
+
+async function runRefresh(opts?: { fxHarnesses?: FxHarnessTargetsOption; kindTargets?: KindTargetsOption }): Promise<void> {
   try {
+    // Resolved late, like the fx thunk: the built-in claude/copilot harness
+    // rows may change while a sweep waits in the queue.
+    let kindTargets: Partial<Record<AgentKind, KindProbeTarget>> = {};
+    if (opts?.kindTargets) {
+      try { kindTargets = await opts.kindTargets(); } catch { kindTargets = {}; }
+    }
     // Promise.allSettled, not Promise.all: every discoverer above is already
     // internally best-effort (probe failures resolve to []), but this is the
     // backstop against one of them throwing anyway (a stray import-time or
@@ -1422,18 +1538,18 @@ async function runRefresh(opts?: { fxHarnesses?: FxHarnessTargetsOption }): Prom
     // even though only one kind actually failed.
     const results = await Promise.allSettled([
       discoverCodex(),
-      discoverClaude(),
+      discoverClaude(kindTargets["claude-code"]),
       discoverCursor(),
       discoverGemini(),
       discoverFx(),
       discoverAntigravity(),
       discoverOpencode(),
-      discoverCopilot(),
+      discoverCopilot(kindTargets.copilot?.env, kindTargets.copilot?.bin, kindTargets.copilot?.cwd),
     ]);
     // Index-aligned with the discoverer list above — append to both together.
     const kinds: AgentKind[] = ["codex", "claude-code", "cursor", "gemini", "fx", "antigravity", "opencode", "copilot"];
     results.forEach((result, i) => {
-      cache.set(kinds[i]!, result.status === "fulfilled" ? result.value : []);
+      commitDiscovery({ scope: "kind", kind: kinds[i]! }, result.status === "fulfilled" ? result.value : []);
     });
 
     // Resolve a thunk *here*, inside the enqueued run, not back at the
@@ -1463,7 +1579,10 @@ async function runRefresh(opts?: { fxHarnesses?: FxHarnessTargetsOption }): Prom
       const seen = new Set<string>();
       targets.forEach((target, i) => {
         const result = targetResults[i]!;
-        harnessCache.set(target.harnessId, result.status === "fulfilled" ? result.value : []);
+        commitDiscovery(
+          { scope: "harness", kind: target.kind ?? "fx", harnessId: target.harnessId },
+          result.status === "fulfilled" ? result.value : [],
+        );
         seen.add(target.harnessId);
       });
       // Prune any harness that isn't in this call's target list — a deleted
@@ -1493,7 +1612,10 @@ async function runRefresh(opts?: { fxHarnesses?: FxHarnessTargetsOption }): Prom
  * *run* time, not at the moment this function was called and possibly left
  * waiting behind another in-flight refresh.
  */
-export function refreshDiscoveredModels(opts?: { fxHarnesses?: FxHarnessTargetsOption }): Promise<void> {
+export function refreshDiscoveredModels(opts?: {
+  fxHarnesses?: FxHarnessTargetsOption;
+  kindTargets?: KindTargetsOption;
+}): Promise<void> {
   return enqueue(() => runRefresh(opts));
 }
 
@@ -1514,7 +1636,7 @@ async function runRefreshHarnessTarget(target: HarnessTarget): Promise<Discovere
   } catch {
     models = [];
   }
-  harnessCache.set(target.harnessId, models);
+  models = commitDiscovery({ scope: "harness", kind, harnessId: target.harnessId }, models);
   // A target indistinguishable from the built-in kind-level probe (empty
   // env, no distinguishing bin — see `isBuiltinLikeTarget`) drift-corrects
   // the kind-level cache too — otherwise a manual refresh of just the
@@ -1525,7 +1647,7 @@ async function runRefreshHarnessTarget(target: HarnessTarget): Promise<Discovere
   // correct the shared kind-level cache — that would blend a harness
   // alias's catalog into the built-in's.
   if (builtinLike) {
-    cache.set(kind, models);
+    commitDiscovery({ scope: "kind", kind }, models);
   }
   return models;
 }
@@ -1554,7 +1676,7 @@ export function refreshFxHarnessModels(target: FxHarnessTarget): Promise<Discove
   return refreshHarnessTarget(target);
 }
 
-async function runRefreshKind(kind: AgentKind): Promise<void> {
+async function runRefreshKind(kind: AgentKind, target?: KindProbeTarget): Promise<void> {
   let models: DiscoveredModel[];
   try {
     switch (kind) {
@@ -1562,7 +1684,7 @@ async function runRefreshKind(kind: AgentKind): Promise<void> {
         models = await discoverCodex();
         break;
       case "claude-code":
-        models = await discoverClaude();
+        models = await discoverClaude(target);
         break;
       case "cursor":
         models = await discoverCursor();
@@ -1580,13 +1702,13 @@ async function runRefreshKind(kind: AgentKind): Promise<void> {
         models = await discoverOpencode();
         break;
       case "copilot":
-        models = await discoverCopilot();
+        models = await discoverCopilot(target?.env, target?.bin, target?.cwd);
         break;
     }
   } catch {
     models = [];
   }
-  cache.set(kind, models);
+  commitDiscovery({ scope: "kind", kind }, models);
 }
 
 /**
@@ -1608,8 +1730,8 @@ async function runRefreshKind(kind: AgentKind): Promise<void> {
  * alias, there rather than here), since those two kinds' catalogs vary per
  * harness while every other kind's is shared.
  */
-export function refreshKindModels(kind: AgentKind): Promise<void> {
-  return enqueue(() => runRefreshKind(kind));
+export function refreshKindModels(kind: AgentKind, target?: KindProbeTarget): Promise<void> {
+  return enqueue(() => runRefreshKind(kind, target));
 }
 
 /**
@@ -1657,6 +1779,8 @@ function setOpencodeProbeTimeouts(t: { budgetMs?: number; versionMs?: number } |
 function resetForTests(): void {
   cache.clear();
   harnessCache.clear();
+  settledKeys.clear();
+  settleHook = null;
   chain = Promise.resolve();
   ready = false;
   codexProbeTimeoutMs = DEFAULT_CODEX_PROBE_TIMEOUT_MS;
@@ -1676,6 +1800,10 @@ export const __testing = {
   discoverOpencode,
   parseCopilotModels,
   discoverCopilot,
+  discoverClaude,
+  discoverGemini,
+  discoverCursor,
+  discoverCodex,
   resetForTests,
   setCodexProbeTimeoutMs,
   setOpencodeProbeTimeouts,

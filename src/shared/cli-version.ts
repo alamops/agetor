@@ -131,3 +131,31 @@ export function formatMinCliVersionError(input: MinCliVersionErrorInput): string
   }
   return message;
 }
+
+/** Input to `formatModelNotOfferedError`. */
+export interface ModelNotOfferedErrorInput {
+  /** Human-facing harness name, e.g. "Codex". */
+  harnessLabel: string;
+  /** The raw probe line the harness reported, e.g. "codex-cli 0.166.0"; null when unknown. */
+  installedRaw: string | null;
+  /** Human-facing model name, e.g. "GPT-6.1 Sol". */
+  modelLabel: string;
+  /** Upgrade command to suggest, or `null` to omit that sentence. */
+  installHint: string | null;
+}
+
+/**
+ * The user-facing error for a model that the CLI's own (non-empty, trusted)
+ * catalog does not list: "<model> isn't in <harness>'s model list (<cli>
+ * <version>). Upgrade the CLI (<hint>) or pick a model it offers." The
+ * discovery-first sibling of `formatMinCliVersionError`.
+ */
+export function formatModelNotOfferedError(input: ModelNotOfferedErrorInput): string {
+  const parsed = parseCliVersion(input.installedRaw);
+  const version = parsed
+    ? `${parsed.major}.${parsed.minor}.${parsed.patch}` + (parsed.prerelease !== undefined ? `-${parsed.prerelease}` : "")
+    : input.installedRaw;
+  const where = version ? ` (${version})` : "";
+  const upgrade = input.installHint ? `Upgrade the CLI (${input.installHint})` : "Upgrade the CLI";
+  return `${input.modelLabel} isn't in ${input.harnessLabel}'s model list${where}. ${upgrade} or pick a model it offers.`;
+}
