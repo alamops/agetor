@@ -364,7 +364,7 @@ describe("proposalHeadsNeedingPr", () => {
     const out = proposalHeadsNeedingPr({
       taskId: "t1",
       multi: true,
-      events: [ev(REAL_REPLY)],
+      proposals: collectRunProposals([ev(REAL_REPLY)]),
       repos: [repo({ name: "app", prs: [pr] }), repo({ name: "infra" })],
     });
     expect(out).toEqual([

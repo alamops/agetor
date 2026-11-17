@@ -239,7 +239,6 @@ export function resolveConflictsKey(multiRepo: boolean, activeRepoName: string |
 // the first one had just opened PRs for, and GitHub's 422 showed as a failure.
 
 const runningBatches = new Set<string>();
-const stampedByBatch = new Map<string, Set<string>>();
 const batchListeners = new Set<() => void>();
 
 function notifyBatches(): void {
@@ -294,33 +293,9 @@ export function prOpenedInSession(taskId: string, repoName: string, head: string
   return openedHeadsByTask.get(taskId)?.has(headKey(repoName, head)) ?? false;
 }
 
-/** Records that a batch opened a PR for this repository of the task. */
-export function markRepositoryPrOpened(taskId: string, repoName: string): void {
-  let set = stampedByBatch.get(taskId);
-  if (!set) {
-    set = new Set();
-    stampedByBatch.set(taskId, set);
-  }
-  set.add(repoName);
-}
-
-/**
- * The repositories a "Create all PRs" press may target: no `prUrl` on the
- * row, and not opened by an earlier batch this session whose stamp the board
- * poll hasn't delivered yet.
- */
-export function repositoriesForPrBatch<T extends { name: string; prUrl: string | null }>(
-  taskId: string,
-  repos: readonly T[],
-): T[] {
-  const opened = stampedByBatch.get(taskId);
-  return repos.filter((r) => !r.prUrl && !opened?.has(r.name));
-}
-
 /** Test seam: forget every batch. */
 export function resetPrBatchesForTest(): void {
   runningBatches.clear();
-  stampedByBatch.clear();
   openedHeadsByTask.clear();
   notifyBatches();
 }

@@ -34,9 +34,23 @@ interface TaskRepository {
   worktreePath: string | null;
   baseRef: string | null;  // pinned sha in this repo
   checkoutBranch: string | null;
-  prUrl: string | null;    // first PR opened from this repo
+  baseBranch?: string | null; // the base BRANCH NAME baseRef was resolved from (migration 092)
+  prs?: TaskPr[];          // every PR opened from this repo, oldest first, append-only
+  prUrl: string | null;    // deprecated, derived: prs[0]?.url; never read by agetor code
 }
+
+interface TaskPr { url: string; head: string | null; base: string | null; number: number | null; createdAt: number }
 ```
+
+`prs`/`baseBranch` are optional at the type level only for fixture
+compatibility (the repo's precedent for a new `Task` field); `toTask` and
+`parseTaskRepositories` always set them. Agetor code reads PRs through
+`taskPrsOf` (`src/shared/task-prs.ts`), which falls back to a legacy `prUrl`
+only when `prs` is absent (JSON from an older core). The same fields exist on a
+single-repo `Task` (`prs`, `baseBranch`, derived `prUrl`); a multi task's
+task-level `prs` is always `[]`, so its `prUrl` stays null. A stored entry that
+still carries a single `prUrl` (written before migration 092) converts on read
+to a `head`-only record; stored JSON never carries a `prUrl` key.
 
 - **Multi or single is `Task.multiRepo`**, not the entry count. `toTask`
   (`db.ts`) derives it: true exactly when the stored `repositories` column is
@@ -63,7 +77,7 @@ interface TaskRepository {
   (`src/shared/multi-repo.ts`, the same derivation the webview and CLI use), so
   those columns stay authoritative as they update. No backfill.
 - `repositories`/`issue_repo_path` are server-managed: written by `createTask`,
-  `tasks.setRepositories`, `tasks.setRepositoryPrUrl`,
+  `tasks.setRepositories`, `tasks.appendRepositoryPr`,
   `tasks.setRepositoryCheckout` and `tasks.clearIssueRepoPath`; skipped by the
   generic `tasks.update` SET clause; never bump `updated_at`; not in the PATCH
   allow-list. Repositories are chosen at creation and can't be added later;
@@ -79,7 +93,8 @@ interface TaskRepository {
   an empty one leaves the row untouched. On a single row a one-entry set
   still stores `'[]'`.
 - `tasks.setRepositories` is called with a snapshot taken before awaits, so it
-  keeps a stored `prUrl` and `checkoutBranch` over the incoming one. A fresh
+  keeps stored `prs`, `baseBranch` and `checkoutBranch` over the incoming
+  ones. A fresh
   checkout reading is recorded separately through `setRepositoryCheckout`
   (compare-then-write by workspace name), which, like `setCheckoutBranch`,
   mirrors a pipeline step's write onto its parent's same-named entry in the
@@ -290,20 +305,23 @@ workspace root **and** every repository checkout to exist.
   repository's path/workspace name; `agetor ls --search` and the board search
   also match each repository's branch and last-seen checkout branch.
 - `POST /github/pull-create` matches the task's entry by worktree path (then
-  selected path) and stamps only that entry; first write wins; `task.prUrl`
-  stays null. The run panel's "Create all PRs" walks the repositories that have
-  no PR yet and are pushed, best-effort, appending `Closes #N` only for
-  `issueRepoPath` ([run-panel.md](run-panel.md) has the in-flight rules).
+  selected path) and **appends** a `TaskPr` (`url`, `head`, `base`, `number`,
+  `createdAt`) to that entry through `tasks.appendRepositoryPr` (a single-repo
+  task: `tasks.appendPr`), deduped by URL; `task.prs` stays `[]` for a multi
+  task. A task can open several PRs, one per branch and per repository. The
+  run panel's "Create all PRs" opens a confirm list
+  ([run-panel.md](run-panel.md) has the in-flight rules); `Closes #N` goes only
+  on the `issueRepoPath` repository's live-head PR. A forge's "already exists"
+  answer reaches the webview as `{ error, code: "already-exists", existingUrl? }`
+  and shows as "already open" (it is not stamped onto the task).
 - A PR opened from a pipeline step's panel is stamped on the **step** row only
   (single and multi alike; `body.taskId` names the step). The parent card does
   not show it, and the parent's "Create all PRs" still counts that repository
   as having no PR, so it can try it again and show GitHub's 422 ("a pull
   request already exists") as that repository's failure. Owner decision: a
   documented limitation, no code change.
-- PR proposal prefill is repository-scoped: the single "Create PR" chip only
-  accepts the active repository's `Repository:` block, and "Create all PRs"
-  attributes an unlabeled proposal only when exactly one repository is being
-  targeted (`latestProposalForRepository` / `latestProposalsForTargets`).
+- PR proposals are attributed to a (repository, head), never guessed; see
+  [Pull requests: titles, bodies and bases](#pull-requests-titles-bodies-and-bases).
 - "Resolve Conflicts" for a per-repository PR sends a prompt that names that
   checkout's absolute path (the run's cwd is the non-git workspace root) and
   runs every git command inside it; the single-repository prompt is unchanged.
@@ -311,6 +329,75 @@ workspace root **and** every repository checkout to exist.
   dirty repository means no note, "push only" when all are clean and one is
   ahead, "nothing to commit or push" only when every repository is clean and
   level; an uninspectable repository next to clean ones suppresses the note.
+
+## Pull requests: titles, bodies and bases
+
+Create all PRs (and the single "Create PR" chip) plan every pull request in one
+pure module, `src/mainview/lib/pr-plan.ts`. The rules live there and in
+`pr-proposal.ts`, `pr-link.ts` and `src/bun/pr-targets.ts`.
+
+**What the agent prints.** `commitPushPrompt` asks, per repository, for a
+`Repository: <name>` line, a `Base: <branch>` line, the full link that opens a
+PR **from the branch into that base**, then the `PR title:` / `PR description:`
+blocks, repeated for each PR. The link is built by the agent per forge, because
+the one git prints on push always targets the default branch:
+
+| Forge | Link |
+|---|---|
+| GitHub | `…/<owner>/<repo>/compare/<base>...<head>?quick_pull=1` |
+| GitLab | `…/<namespace>/<project>/-/merge_requests/new?merge_request[source_branch]=<head>&merge_request[target_branch]=<base>` |
+| Bitbucket | `…/<workspace>/<repo>/pull-requests/new?source=<head>&dest=<base>` |
+
+The parser also reads GitHub's `compare/<head>` and the legacy `pull/new/<head>`.
+Names are percent-decoded; a fork head (`owner:branch`) is never attributed. The
+prompt names the product nowhere. With a stored base it names it, with the
+escape clause "unless you moved the work onto a different base".
+
+**Parsing** (`parsePrProposals`): every complete proposal in a reply, each with
+the link and `Base:` line nearest above its own title (searched back only to the
+end of the previous proposal, so one never inherits a sibling's) and the most
+recent `Repository:` label above it. `collectRunProposals` orders them across
+runs.
+
+**Attribution** (`attributeProposals`): a proposal belongs to repository R and
+head H when its link's host and full `owner/name` path equal R's forge identity
+(`providerRemoteForDir`; GitLab nested groups compare as one slash-joined path)
+and the link names H, or its `Repository:` label equals R's workspace name and
+its link, if any, doesn't name another repository (H is then the link's head,
+else R's live head). On a single-repo task an unlabeled proposal with no PR link
+goes to the live head. Anything else is unattributed: there is no blind
+"one proposal, one target" fallback. The newest proposal per (R, H) wins.
+
+**Base** (`chooseBase`, the only place it is decided): a live-head PR targets
+the base stored at task creation (`Task.baseBranch` / `repositories[].baseBranch`,
+resolved by `resolveBaseBranchName` beside the pinned `baseRef` sha) unless git
+proves it stale, then the agent's `Base:` line (else its link's base), then the
+remote default (`<remote>/HEAD`, else the forge's default branch, never a guessed
+`main`). An extra head never uses the stored base. A base missing on the remote
+errors that row only. The agent's value is normalized (`refs/heads/` and
+`<remote>/` stripped; an invalid branch name is dropped).
+
+**Stale** (`pullTargets`, `src/bun/pr-targets.ts`): the stored base is stale when
+the pinned create-time sha is not an ancestor of the live head AND the base's
+remote tip is not a known ancestor either. Either being an ancestor means the
+branch is still on, or was rebased or merged forward onto, the base; a base that
+merely advanced on the remote is not stale. When neither can be proven the answer
+is unknown, treated as not stale. No `git fetch` runs: the pinned sha is always
+local, and the tip is used only when that object is already present.
+
+**Remote facts** come from the forge's REST API, not `git ls-remote`
+(`GET /github/pull-targets`: identity, remotes, default branch, up to 1,000
+branch names, whether each head and the stored base exist). The forge is the
+system that accepts or rejects the PR, its API is reachable with the token the PR
+needs anyway, and it is the only source the e2e GitHub stub can serve. Branch
+names reach git argv only after `validateBranchName` and a leading-`-` check.
+
+**Rows.** The live head's row starts checked; an extra head (a branch the agent
+proposed besides the live checkout) starts unchecked and is disabled unless the
+forge lists it. A head that already has a PR (recorded, or opened this session)
+has no row. A proposal-less row gets the root task's title (the pipeline parent's
+for a step), an empty body and a hint. The user edits the base (a native select
+of remote branches) and the title before anything is created.
 
 ## Removing a repository
 

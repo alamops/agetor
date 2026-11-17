@@ -365,8 +365,8 @@ function isValidBranchName(name: string): boolean {
   return name.length > 0 && !name.startsWith("-") && validateBranchName(name).ok;
 }
 
-/** Whether a head already has a PR, recorded or opened this session. */
-function hasPr(taskId: string, repo: PrPlanRepo, head: string): boolean {
+/** Whether a head already has a PR: recorded on the task, or opened by a batch this session. */
+export function headHasPr(taskId: string, repo: Pick<PrPlanRepo, "name" | "prs">, head: string): boolean {
   return !!prForHead(repo.prs, head) || prOpenedInSession(taskId, repo.name, head);
 }
 
@@ -377,13 +377,13 @@ function hasPr(taskId: string, repo: PrPlanRepo, head: string): boolean {
  * head's own state.
  */
 export function proposalHeadsNeedingPr(
-  input: Pick<PrPlanInput, "taskId" | "repos" | "events" | "multi">,
+  input: Pick<PrPlanInput, "taskId" | "repos" | "multi"> & { proposals: readonly RunProposal[] },
 ): Array<{ repoName: string; head: string }> {
-  const attribution = attributeProposals(collectRunProposals(input.events), input.repos, { multi: input.multi });
+  const attribution = attributeProposals(input.proposals, input.repos, { multi: input.multi });
   const out: Array<{ repoName: string; head: string }> = [];
   for (const repo of input.repos) {
     for (const head of attribution.get(repo.name)?.keys() ?? []) {
-      if (!hasPr(input.taskId, repo, head)) out.push({ repoName: repo.name, head });
+      if (!headHasPr(input.taskId, repo, head)) out.push({ repoName: repo.name, head });
     }
   }
   return out;
@@ -431,7 +431,7 @@ export function planPrRows(input: PrPlanInput, facts: RepoFacts): PrRow[] {
 
   const heads = input.liveHeadOnly ? (repo.liveHead ? [repo.liveHead] : []) : headsOf(repo, attributed);
   for (const head of heads) {
-    if (hasPr(input.taskId, repo, head)) continue;
+    if (headHasPr(input.taskId, repo, head)) continue;
     const isLiveHead = head === repo.liveHead;
     const proposal = attributed?.get(head) ?? null;
     const hints: string[] = [];
@@ -515,7 +515,7 @@ export async function buildPrPlan(input: PrPlanInput, deps: PrPlanDeps): Promise
       const attributed = attribution.get(repo.name);
       const heads = input.liveHeadOnly ? (repo.liveHead ? [repo.liveHead] : []) : headsOf(repo, attributed);
       // A name the core would refuse (the route 400s on it) never goes into the query.
-      const candidates = heads.filter((h) => !hasPr(input.taskId, repo, h) && isValidBranchName(h));
+      const candidates = heads.filter((h) => !headHasPr(input.taskId, repo, h) && isValidBranchName(h));
       if (candidates.length === 0) return { repo, attributed, targets: null, targetsError: null };
       try {
         const targets = await deps.pullTargets({

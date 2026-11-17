@@ -3,7 +3,7 @@ import ReactMarkdown from "react-markdown";
 import remarkGfm from "remark-gfm";
 import { toast } from "sonner";
 import {
-  AlertTriangle, Archive, ArchiveRestore, ArrowDown, ArrowUp, BookmarkPlus, Bot, Check, ChevronDown, ChevronRight, ChevronUp, CircleDot, ClipboardList, CornerDownRight, Eye, FolderOpen, FileText, FilePenLine, FilePlus, Folder,  GitCommit, GitCompare, GitMerge, GitPullRequest, Globe, HelpCircle, ListTodo, Paperclip, Plug, Radar, RefreshCw, Search, Send, ShieldAlert, Slash, SquareSlash,
+  AlertTriangle, Archive, ArchiveRestore, ArrowDown, ArrowUp, BookmarkPlus, Bot, Check, ChevronDown, ChevronRight, ChevronUp, CircleDot, ClipboardList, CornerDownRight, Eye, FolderOpen, FileText, FilePenLine, FilePlus, Folder,  GitCommit, GitCompare, GitMerge, GitPullRequest, Globe, HelpCircle, ListTodo, Loader2, Paperclip, Plug, Radar, RefreshCw, Search, Send, ShieldAlert, Slash, SquareSlash,
   Play, Sparkles, Square, Terminal, Trash2, Workflow, Wrench, X,
 } from "lucide-react";
 import { api, ApiError, commitPushPrompt, type AgentModelMap, type PendingInteraction } from "@/lib/api";
@@ -18,19 +18,20 @@ import { EXPAND_EVENT } from "@/lib/expand-on-jump";
 import { publishHandoffSearchSession } from "@/lib/handoff-search-hint";
 import { contentSignature, reuseIfSameContent, type Signed } from "@/lib/pipeline-run-signature";
 import { useExpandOnJump } from "@/lib/use-expand-on-jump";
+import { collectRunProposals, type RunProposal } from "@/lib/pr-proposal";
+import { buildPrPlan, headHasPr, planReposForTask, proposalHeadsNeedingPr } from "@/lib/pr-plan";
 import {
-  latestPrProposal,
-  latestProposalForRepository,
-  latestProposalsForTargets,
-  repositoriesNeedingPr,
-} from "@/lib/pr-proposal";
+  cachedProviderIdentity,
+  loadProviderIdentity,
+  providerInfoVersion,
+  subscribeProviderInfo,
+} from "@/lib/provider-info-cache";
+import { headerPr, livePr, taskPrsOf } from "../../../shared/task-prs.ts";
+import { ContextMenu } from "@/components/ui/context-menu";
+import { CreatePrsDialog } from "./CreatePrsDialog";
 import {
-  beginPrBatch,
-  endPrBatch,
   isPrBatchRunning,
-  markRepositoryPrOpened,
   openFolderUnavailableReason,
-  repositoriesForPrBatch,
   resolveConflictsKey,
   selectedRepositoryName,
   subscribePrBatches,
@@ -397,27 +398,6 @@ const STREAM_READY_FALLBACK_MS = 400;
 
 // Computed once at module load — see `lib/platform.ts`; used by the Cmd/Ctrl+F handler below.
 const IS_MAC_PLATFORM = isMacPlatform();
-
-/**
- * Prefills the "Closes #N" (GitHub/GitLab) / "Issue #N" (Bitbucket) line
- * into a Create-PR body when the task was created from an issue — the
- * counterpart to `buildIssueTaskPrompt`'s in-prompt directive, but applied
- * at PR-open time since the body itself is only assembled here (the "Create
- * PR" click handler below, which builds the `GitHubPullPrefill` passed to
- * `onOpenPullRequest`). No-op when `issueUrl` doesn't parse (not an
- * issue-sourced task) or the body already references the issue number, so a
- * user-edited body already mentioning the issue is never double-appended.
- * The re-check is a word-boundary regex (`#7` must not match `#71`) rather
- * than a plain substring test.
- */
-function appendIssueCloseDirective(body: string, issueUrl: string | null | undefined): string {
-  const parsed = parseIssueUrl(issueUrl);
-  if (!parsed) return body;
-  const marker = `#${parsed.number}`;
-  if (new RegExp(`#${parsed.number}(?!\\d)`).test(body)) return body;
-  const directive = parsed.provider === "bitbucket" ? `Issue ${marker}` : `Closes ${marker}`;
-  return body ? `${body}\n\n${directive}` : directive;
-}
 
 function formatDuration(r: Run): string {
   const end = r.endedAt ?? Date.now();
@@ -1107,6 +1087,11 @@ function RunPanelBody({
     // module-level registry keyed by task id (`isPrBatchRunning`), so a
     // switch away and back still shows the walk that is running for it.
     setRepoTab(null);
+    // The Create-PRs dialog, the single chip's planning flag and the header PR
+    // menu belong to the task they were opened for.
+    setCreatePrsOpen(false);
+    setChipBusy(false);
+    setPrMenu(null);
     // `editingId` (the backlog tray's inline-editor state) lives inside the
     // `BacklogTray` child component, not here — it's reset by keying that
     // component on `task.id` at its call site below instead (a fresh mount
@@ -2992,7 +2977,12 @@ function RunPanelBody({
   // its own entry, so a multi task follows the selected tab's PR (task.prUrl
   // stays null by design). The status fetch also needs that repository's path
   // to resolve its provider remote.
-  const headerPrUrl = multiRepo ? (activeRepo?.prUrl ?? null) : task.prUrl;
+  // A task can open several PRs (one per branch, one per repository): the
+  // header follows the live-head PR, else the first (`headerPr`).
+  const scopePrs = multiRepo ? (activeRepo ? taskPrsOf(activeRepo) : []) : taskPrsOf(task);
+  const liveHeadNow = activeGitStatus && !activeGitStatus.ignored ? activeGitStatus.branch : null;
+  const scopeTaskBranch = multiRepo ? (activeRepo?.branch ?? null) : (task.branch ?? null);
+  const headerPrUrl = headerPr(scopePrs, [liveHeadNow, scopeTaskBranch])?.url ?? null;
   // A multi task's workspace only exists after its first run (issue #291).
   const openFolderUnavailable = openFolderUnavailableReason(task);
   const prStatusPath = multiRepo
@@ -3776,88 +3766,70 @@ function RunPanelBody({
   // Head branch a "Create PR" would open from — agetor's worktree branch, or
   // the workdir's live non-default branch for an isolation:"none" task. `null`
   // means "nothing sensible to PR from", which is also the chip's gate.
-  /**
-   * "Create all PRs" (issue #291): open one pull request per repository,
-   * best-effort, stamping each through the ordinary `/github/pull-create`
-   * route (which matches the repository by worktree path). `Closes #N` is
-   * appended only for the repository the issue came from.
-   */
-  const createAllPrs = async () => {
-    if (!multiRepo) return;
-    const taskId = task.id;
-    const repos = task.repositories ?? [];
-    // Only repositories that don't have a PR yet. This is what makes the
-    // action safe to press again after a partial failure (the stamped entries
-    // are skipped) and stops a second press from opening duplicate PRs —
-    // including one made before the 2 s board poll delivers the stamps of a
-    // walk that just finished (`repositoriesForPrBatch` remembers them).
-    // Each candidate also has to be pushed/synced, and its PR head is the
-    // branch actually checked out (drift is tolerated, never corrected) —
-    // same rules as the single-repository "Open PR" chip.
-    const needing = repositoriesForPrBatch(taskId, repos);
-    const todo = needing.filter((repo) => repositoryPrHead(repo, gitStatusForRepo(repo.name)) !== null);
-    if (todo.length === 0) {
-      toast(
-        needing.length === 0
-          ? "Every repository already has a pull request"
-          : "No repository is ready for a pull request yet",
-      );
-      return;
-    }
-    // One walk per task, whichever panel instance (or task switch) started it.
-    if (!beginPrBatch(taskId)) return;
-    const failures: string[] = [];
-    let opened = 0;
-    // Attribute an unlabeled proposal only when there is exactly one PR
-    // target; with several it could belong to any repository, and the old
-    // `repos[0]` fallback stamped the wrong repo's title/description.
-    const proposals = latestProposalsForTargets(events, todo.map((repo) => repo.name));
-    try {
-      for (const repo of todo) {
-        const head = repositoryPrHead(repo, gitStatusForRepo(repo.name));
-        if (!head) {
-          failures.push(`${repo.name}: branch is not pushed yet`);
-          continue;
-        }
-        const projectPath = repo.worktreePath ?? repo.path;
-        const proposal = proposals.get(repo.name);
-        try {
-          const defaults = await api.getGitHubPullDefaults({ path: projectPath });
-          await api.createGitHubPull({
-            path: projectPath,
-            title: proposal?.title || task.title,
-            head,
-            base: defaults.base,
-            body: appendIssueCloseDirective(
-              proposal?.description ?? "",
-              repo.path === task.issueRepoPath ? task.issueUrl : null,
-            ),
-            taskId,
-          });
-          markRepositoryPrOpened(taskId, repo.name);
-          opened += 1;
-        } catch (e) {
-          failures.push(`${repo.name}: ${e instanceof Error ? e.message : String(e)}`);
-        }
+  // ── Create all PRs ──────────────────────────────────────────────────────
+  //
+  // The button opens a confirm list (`CreatePrsDialog`): one row per pull
+  // request, each with the title and description the agent proposed for THAT
+  // (repository, head), and a base chosen by `chooseBase`
+  // (docs/architecture/multi-repo-tasks.md). Nothing is created until the user
+  // confirms. The gate parses proposals only while the task is idle, memoized on
+  // the event list, and reads each repository's forge identity from a module
+  // cache so a render is never a network call.
+  const [createPrsOpen, setCreatePrsOpen] = useState(false);
+  const [chipBusy, setChipBusy] = useState(false);
+  const [prMenu, setPrMenu] = useState<{ x: number; y: number } | null>(null);
+  const identityVersion = useSyncExternalStore(subscribeProviderInfo, providerInfoVersion);
+  const prRepos = useMemo(
+    () => planReposForTask(task, gitStatus).map((r) => ({ ...r, identity: cachedProviderIdentity(r.projectPath) })),
+    // `task` carries every field `planReposForTask` reads; `identityVersion` re-reads the cache.
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+    [task, gitStatus, identityVersion],
+  );
+  const prRepoPathsKey = prRepos.map((r) => r.projectPath).join("\0");
+  useEffect(() => {
+    for (const path of prRepoPathsKey.split("\0")) if (path) void loadProviderIdentity(path);
+  }, [prRepoPathsKey]);
+  const proposalsIdle = task.column !== "running";
+  const runProposals = useMemo<readonly RunProposal[]>(
+    () => (proposalsIdle ? collectRunProposals(events) : []),
+    [events, proposalsIdle],
+  );
+  const proposalHeads = useMemo(
+    () => proposalHeadsNeedingPr({ taskId: task.id, repos: prRepos, proposals: runProposals, multi: multiRepo }),
+    // `allPrsBusy` flips when a walk ends, which is when the session's opened heads change.
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+    [task.id, prRepos, runProposals, multiRepo, allPrsBusy],
+  );
+  const liveHeadsNeedingPr = prRepos.filter((r) => r.liveHead !== null && !headHasPr(task.id, r, r.liveHead));
+  // A multi task: any repository without a PR on its live head, or a proposal
+  // for another branch. A single-repo task has no per-repository gap to fill, so
+  // the button only appears once two or more branches could open a PR.
+  const showCreateAllPrs = multiRepo
+    ? liveHeadsNeedingPr.length > 0 || proposalHeads.length > 0
+    : new Set([...liveHeadsNeedingPr.map((r) => r.liveHead!), ...proposalHeads.map((h) => h.head)]).size >= 2;
+  const onPrsStamped = useCallback(
+    async (taskId: string) => {
+      // Pull the stamped PRs now rather than waiting for the board poll, so the
+      // header link and the button's gate update at once. `onTaskFieldsChanged`
+      // merges by id, so it is safe after a task switch.
+      try {
+        const fresh = await api.getTask(taskId);
+        onTaskFieldsChanged?.(taskId, { prs: fresh.prs, prUrl: fresh.prUrl, repositories: fresh.repositories });
+      } catch {
+        // The 2 s poll reconciles.
       }
-      if (failures.length === 0) {
-        toast.success(
-          opened === repos.length
-            ? "Pull requests created for every repository"
-            : `Pull requests created for ${opened} of ${repos.length} repositories`,
-        );
-      } else toast.error(`Could not open ${failures.length} pull request(s): ${failures.join("; ")}`);
-    } finally {
-      endPrBatch(taskId);
-    }
-    // Pull the stamped `prUrl`s now rather than waiting for the board poll,
-    // so the per-repository PR links (and the button's gate) update at once.
-    // `onTaskFieldsChanged` merges by id, so it is safe after a task switch.
-    try {
-      const fresh = await api.getTask(taskId);
-      onTaskFieldsChanged?.(taskId, { repositories: fresh.repositories });
-    } catch {
-      // The 2 s poll reconciles.
+    },
+    [onTaskFieldsChanged],
+  );
+  /** Open a PR page in the app when the URL names a PR, else in the browser. */
+  const viewPr = (url: string) => {
+    if (parsePullNumber(url) != null) {
+      onViewPullRequest({
+        projectPath: multiRepo ? (activeRepo?.worktreePath ?? activeRepo?.path ?? task.workdir) : task.workdir,
+        prUrl: url,
+      });
+    } else {
+      void api.openExternal(url).catch(() => {});
     }
   };
 
@@ -3870,6 +3842,47 @@ function RunPanelBody({
   // recorded value, so the banner must compare against the live branch the
   // same way the single-repository path does. Drift is tolerated, never
   // corrected — the header and details say where it is.
+  // The single "Create PR" chip: plan the live head only (the same attribution
+  // and base choice as Create all PRs), then open the composer prefilled with
+  // that row's title, description and base. A failed plan opens it unprefilled.
+  const openCreatePrChip = async () => {
+    const head = prHead;
+    if (!head || chipBusy) return;
+    const taskId = task.id;
+    const projectPath = multiRepo
+      ? (activeRepo?.worktreePath ?? activeRepo?.path ?? task.workdir)
+      : task.workdir;
+    setChipBusy(true);
+    let title = "";
+    let body = "";
+    let base: string | undefined;
+    try {
+      const rows = await buildPrPlan(
+        {
+          taskId,
+          repos: prRepos.filter((r) => !multiRepo || r.name === activeRepo?.name),
+          events,
+          rootTitle: task.title,
+          issueUrl: task.issueUrl ?? null,
+          multi: multiRepo,
+          liveHeadOnly: true,
+        },
+        { providerInfo: loadProviderIdentity, pullTargets: (q) => api.getPullTargets(q) },
+      );
+      const row = rows.find((r) => r.isLiveHead && r.head === head);
+      if (row) {
+        title = row.hasProposal ? row.title : "";
+        body = row.body;
+        if (row.base && !row.baseError) base = row.base;
+      }
+    } catch {
+      // The composer still opens; it fetches its own defaults.
+    } finally {
+      if (currentTaskIdRef.current === taskId) setChipBusy(false);
+    }
+    if (currentTaskIdRef.current !== taskId) return;
+    onOpenPullRequest({ projectPath, head, title, body, taskId, ...(base ? { base } : {}) });
+  };
   const activeTaskBranch = multiRepo ? (activeRepo?.branch ?? null) : (task.branch ?? null);
   const activeBranchSource = multiRepo ? (activeRepo?.branchSource ?? "created") : task.branchSource;
   const branchDrift = multiRepo
@@ -4207,7 +4220,24 @@ function RunPanelBody({
               too. When the URL parses to a PR number, open the in-app detail
               subpage directly; otherwise (an unrecognized provider URL
               shape) fall back to the plain external link, as before. */}
-          {prUrl && (
+          {prUrl && scopePrs.length > 1 && (
+            <Tooltip align="end" label={`Open one of the ${scopePrs.length} pull requests created for this task`}>
+              <Button
+                size="icon"
+                variant="outline"
+                aria-label="View PR"
+                aria-haspopup="menu"
+                data-testid="view-pr-menu-button"
+                onClick={(e) => {
+                  const r = e.currentTarget.getBoundingClientRect();
+                  setPrMenu({ x: r.left, y: r.bottom + 4 });
+                }}
+              >
+                <GitPullRequest className="size-4" />
+              </Button>
+            </Tooltip>
+          )}
+          {prUrl && scopePrs.length <= 1 && (
             <Tooltip align="end" label="Open the pull request created for this task">
               {parsePullNumber(prUrl) != null ? (
                 <Button
@@ -5050,7 +5080,7 @@ function RunPanelBody({
                     size="sm"
                     variant="secondary"
                     onClick={() => void sendCommitPush()}
-                    title="Ask the agent to commit the working-tree changes, push the current branch to origin, and reply with the link to open a PR plus a PR title and description in copyable code blocks."
+                    title="Ask the agent to commit the working-tree changes, push the current branch to origin, and reply with the base branch, a link that opens the PR against it, and a PR title and description in copyable code blocks."
                   >
                     <GitCommit className="mr-1 size-3" /> Commit &amp; push
                   </Button>
@@ -5066,48 +5096,27 @@ function RunPanelBody({
                     "View PR" link lives in the panel header). The proposal
                     parse runs on click, not per event flush — the stream can
                     be long. */}
-                {multiRepo && canSend && !sending && repositoriesNeedingPr(task.repositories ?? []).some((repo) => repositoryPrHead(repo, gitStatusForRepo(repo.name)) !== null) && (
+                {canSend && !sending && showCreateAllPrs && (
                   <Button
                     size="sm"
                     variant="secondary"
-                    onClick={() => void createAllPrs()}
+                    onClick={() => setCreatePrsOpen(true)}
                     disabled={allPrsBusy}
-                    title="Open one pull request per repository that doesn't have one yet, prefilled from the agent's labeled proposals"
+                    title="Open one pull request per branch that doesn't have one yet. You review each title, description and base branch before anything is created."
                     data-testid="create-all-prs"
                   >
                     <GitPullRequest className="mr-1 size-3" /> {allPrsBusy ? "Creating PRs…" : "Create all PRs"}
                   </Button>
                 )}
-                {!headerPrUrl && prHead != null && shouldOfferOpenPr(activeGitStatus) && !sending && (
+                {prHead != null && !livePr(scopePrs, [prHead]) && shouldOfferOpenPr(activeGitStatus) && !sending && (
                   <Button
                     size="sm"
                     variant="secondary"
-                    onClick={() => {
-                      // A multi task's reply carries one labeled block per
-                      // repository; only THIS repository's block may prefill
-                      // the chip's composer. Falling back to the newest
-                      // unlabeled/last block attributed a sibling's proposal
-                      // to the active repository. Single tasks are unchanged.
-                      const proposal = multiRepo && activeRepo
-                        ? latestProposalForRepository(events, activeRepo.name)
-                        : latestPrProposal(events);
-                      onOpenPullRequest({
-                        projectPath: multiRepo
-                          ? (activeRepo?.worktreePath ?? activeRepo?.path ?? task.workdir)
-                          : task.workdir,
-                        head: prHead,
-                        title: proposal?.title ?? "",
-                        // Only the repository the issue came from may close it.
-                        body: appendIssueCloseDirective(
-                          proposal?.description ?? "",
-                          !multiRepo || activeRepo?.path === task.issueRepoPath ? task.issueUrl : null,
-                        ),
-                        taskId: task.id,
-                      });
-                    }}
-                    title="Create a pull request for this task's branch — prefilled from the agent's summary when available"
+                    disabled={chipBusy}
+                    onClick={() => void openCreatePrChip()}
+                    title="Create a pull request for this task's branch — prefilled from the agent's proposal and targeting the branch the task started from"
                   >
-                    <GitPullRequest className="mr-1 size-3" /> Create PR
+                    {chipBusy ? <Loader2 className="mr-1 size-3 animate-spin" /> : <GitPullRequest className="mr-1 size-3" />} Create PR
                   </Button>
                 )}
                 {/* Post-PR counterpart to "Open PR" above: offered once the
@@ -5308,6 +5317,35 @@ function RunPanelBody({
           focusComposer={focusComposer}
         />
       )}
+      {/* The Create-all-PRs confirm list. Keyed per task so a switch starts a
+          fresh plan; namespaced like the other keyed children of this fragment
+          (`plan-…`, `backlog-…`): no two children may share a key. */}
+      <CreatePrsDialog
+        key={`create-prs-dialog-${task.id}`}
+        open={createPrsOpen}
+        task={task}
+        events={events}
+        gitStatus={gitStatus}
+        onClose={() => setCreatePrsOpen(false)}
+        onPrsStamped={onPrsStamped}
+      />
+      {/* The header's PR picker for a task with several PRs. Portaled to
+          `document.body` by the primitive (this panel's `<aside>` is
+          transformed, which would rebase a `fixed` overlay onto itself). */}
+      <ContextMenu
+        open={prMenu !== null}
+        x={prMenu?.x ?? 0}
+        y={prMenu?.y ?? 0}
+        label="Pull requests"
+        testId="run-panel-pr-menu"
+        onClose={() => setPrMenu(null)}
+        items={scopePrs.map((p, n) => ({
+          id: `pr-${n}`,
+          label: p.head ? `View PR: ${p.head}${p.base ? ` → ${p.base}` : ""}` : "View pull request",
+          icon: GitPullRequest,
+          onSelect: () => viewPr(p.url),
+        }))}
+      />
     </>
   );
 }
@@ -8919,7 +8957,7 @@ function TaskDetails({
                         <div className="truncate font-mono">
                           <span className="text-muted-foreground">branch </span>
                           <span className={d.drifted ? "text-warning" : undefined}>{d.branchText ?? "—"}</span>
-                          {d.base && <span className="text-muted-foreground"> · base {d.base}</span>}
+                          {d.baseText && <span className="text-muted-foreground"> · base {d.baseText}</span>}
                         </div>
                         <div className="truncate font-mono" title={d.checkoutCreated ? d.checkoutText : undefined}>
                           <span className="text-muted-foreground">checkout </span>
@@ -8927,23 +8965,24 @@ function TaskDetails({
                             ? abbreviateHome(d.checkoutText, homeDir)
                             : <span className="italic text-muted-foreground">{d.checkoutText}</span>}
                         </div>
-                        {d.prUrl && (
+                        {d.prs.map((p, n) => (
                           <button
+                            key={p.url}
                             type="button"
-                            className="max-w-full truncate text-info underline-offset-2 hover:underline"
-                            title={d.prUrl}
-                            data-testid={`task-details-repo-pr-${d.name}`}
+                            className="block max-w-full truncate text-info underline-offset-2 hover:underline"
+                            title={p.url}
+                            data-testid={`task-details-repo-pr-${d.name}-${n}`}
                             onClick={() => {
-                              if (parsePullNumber(d.prUrl!) != null) {
-                                onViewPullRequest({ projectPath: repo.worktreePath ?? repo.path, prUrl: d.prUrl! });
+                              if (parsePullNumber(p.url) != null) {
+                                onViewPullRequest({ projectPath: repo.worktreePath ?? repo.path, prUrl: p.url });
                               } else {
-                                void api.openExternal(d.prUrl!).catch(() => {});
+                                void api.openExternal(p.url).catch(() => {});
                               }
                             }}
                           >
-                            {d.prUrl}
+                            {p.head ? `${p.head} → ${p.base ?? "?"}` : p.url}
                           </button>
-                        )}
+                        ))}
                       </div>
                     );
                   })}

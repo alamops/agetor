@@ -4,6 +4,7 @@
 // harness, like `multi-repo-ui.ts`.
 // Contract: docs/architecture/multi-repo-tasks.md.
 import type { Task, TaskGitStatus, TaskRepository } from "../../shared/types.ts";
+import { taskPrsOf } from "../../shared/task-prs.ts";
 import { driftOf } from "./branch-drift.ts";
 
 /** The task fields the removal gate reads. */
@@ -69,6 +70,12 @@ export function repositoryProblem(
     : "Source repository is missing or unreadable";
 }
 
+function baseTextOf(repo: Pick<TaskRepository, "baseRef" | "baseBranch">): string | null {
+  const sha = repo.baseRef ? repo.baseRef.slice(0, 12) : null;
+  if (repo.baseBranch) return sha ? `${repo.baseBranch} · ${sha}` : repo.baseBranch;
+  return sha;
+}
+
 /** One repository's line in the task details list. */
 export interface RepositoryDetail {
   name: string;
@@ -76,12 +83,17 @@ export interface RepositoryDetail {
   /** "<branch>", "on <checkout> (drifted from <branch>)", or null before one exists. */
   branchText: string | null;
   drifted: boolean;
-  /** Short base sha, or null. */
-  base: string | null;
+  /**
+   * The base this repository was created from: `develop · 1a2b3c4d5e6f` (the
+   * recorded branch name and the short pinned sha), the sha alone when no branch
+   * was recorded, or null when nothing was pinned.
+   */
+  baseText: string | null;
   /** The checkout path, or "not created yet". */
   checkoutText: string;
   checkoutCreated: boolean;
-  prUrl: string | null;
+  /** Every pull request opened from this repository, oldest first. */
+  prs: Array<{ url: string; head: string | null; base: string | null }>;
   problem: string | null;
 }
 
@@ -106,10 +118,10 @@ export function repositoryDetails(
       path: repo.path,
       branchText,
       drifted: drift.drifted,
-      base: repo.baseRef ? repo.baseRef.slice(0, 12) : null,
+      baseText: baseTextOf(repo),
       checkoutText: repo.worktreePath ?? "not created yet",
       checkoutCreated: repo.worktreePath != null,
-      prUrl: repo.prUrl,
+      prs: taskPrsOf(repo).map((p) => ({ url: p.url, head: p.head, base: p.base })),
       problem: repositoryProblem(repo, status),
     };
   });
