@@ -272,6 +272,30 @@ describe("attribution", () => {
     expect(att.get("app")?.get("feature/login")?.title).toBe("New");
   });
 
+  test("a self-hosted GitLab link attributes by link, single-repo and multi-repo", () => {
+    // provider-info's host is canonical (gitlab.com) while the agent's link carries the real host.
+    const gl = (name: string) => ({
+      name,
+      liveHead: "feature/login",
+      identity: { host: "gitlab.com", owner: "acme", name },
+    });
+    const link = (name: string) =>
+      `https://gitlab.corp.example/acme/${name}/-/merge_requests/new?merge_request[source_branch]=feature/login&merge_request[target_branch]=release`;
+    const single = [link("app"), block("Self-hosted", "D")].join("\n");
+    expect(attributeProposals(proposals(single), [gl("app")], { multi: false }).get("app")?.get("feature/login")?.title).toBe(
+      "Self-hosted",
+    );
+    // Unlabeled, so only the link can attribute it; labeled-and-linked must not be discarded as "names another repo".
+    const unlabeled = [link("infra"), block("Infra MR", "D")].join("\n");
+    const att = attributeProposals(proposals(unlabeled), [gl("app"), gl("infra")], { multi: true });
+    expect(att.get("app")).toBeUndefined();
+    expect(att.get("infra")?.get("feature/login")?.title).toBe("Infra MR");
+    const labeled = ["Repository: infra", link("infra"), block("Labeled MR", "D")].join("\n");
+    expect(
+      attributeProposals(proposals(labeled), [gl("app"), gl("infra")], { multi: true }).get("infra")?.get("feature/login")?.title,
+    ).toBe("Labeled MR");
+  });
+
   test("a fork head is never attributed", () => {
     const text = ["https://github.com/acme/app/compare/main...someone:feature", block("T", "D")].join("\n");
     expect(attributeProposals(proposals(text), [app], { multi: false }).size).toBe(0);

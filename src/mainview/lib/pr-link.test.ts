@@ -85,4 +85,17 @@ describe("linkMatchesRepo", () => {
     expect(linkMatchesRepo(nested, { host: "gitlab.com", owner: "group/sub", name: "project" })).toBe(true);
     expect(linkMatchesRepo(nested, { host: "gitlab.com", owner: "group", name: "project" })).toBe(false);
   });
+  test("a self-hosted or aliased host matches the canonical host provider-info reports", () => {
+    // `providerRepoForDir` reports canonicalGitHost(remote host); the agent's link keeps the real one.
+    const selfHosted = parsePrLink("https://gitlab.corp.example/acme/app/-/merge_requests/new?merge_request[source_branch]=x")!;
+    expect(linkMatchesRepo(selfHosted, { host: "gitlab.com", owner: "acme", name: "app" })).toBe(true);
+    expect(linkMatchesRepo(selfHosted, { host: "gitlab.corp.example", owner: "acme", name: "app" })).toBe(true);
+    const aliased = parsePrLink("https://github-work.com/acme/app/compare/main...x")!;
+    expect(linkMatchesRepo(aliased, { host: "github.com", owner: "acme", name: "app" })).toBe(true);
+  });
+  test("a self-hosted host still never matches another provider or repository", () => {
+    const selfHosted = parsePrLink("https://gitlab.corp.example/acme/app/-/merge_requests/new?merge_request[source_branch]=x")!;
+    expect(linkMatchesRepo(selfHosted, { host: "github.com", owner: "acme", name: "app" })).toBe(false);
+    expect(linkMatchesRepo(selfHosted, { host: "gitlab.com", owner: "acme", name: "other" })).toBe(false);
+  });
 });

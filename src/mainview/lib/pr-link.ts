@@ -4,6 +4,8 @@
 // repository by its link instead of guessing. Pure and DOM-free; never throws.
 // Contract: docs/architecture/multi-repo-tasks.md.
 
+import { canonicalGitHost } from "../../shared/git-host.ts";
+
 export type ForgeKind = "github" | "gitlab" | "bitbucket";
 
 export interface PrLink {
@@ -140,14 +142,19 @@ function fullPath(owner: string, name: string): string {
 }
 
 /**
- * Whether a link points at `id`'s repository. Compares the host and the full
- * slash-joined `owner/name` path, case-insensitively with `.git` ignored: a
- * GitLab nested project splits as `{owner:"group", name:"sub/project"}` in the
+ * Whether a link points at `id`'s repository. Compares the canonical host and
+ * the full slash-joined `owner/name` path, case-insensitively with `.git`
+ * ignored. Both hosts go through `canonicalGitHost`: `providerRepoForDir`
+ * reports the canonical host (`gitlab.com` for a self-hosted
+ * `gitlab.corp.example`) while the agent's link carries the real one, so a raw
+ * comparison never matches there. A GitLab nested project splits as
+ * `{owner:"group", name:"sub/project"}` in the
  * remote parser but `{owner:"group/sub", repo:"project"}` here, so a per-field
  * comparison would never match.
  */
 export function linkMatchesRepo(link: PrLink, id: RepoIdentity): boolean {
   return (
-    link.host === id.host.toLowerCase() && fullPath(link.owner, link.repo) === fullPath(id.owner, id.name)
+    canonicalGitHost(link.host) === canonicalGitHost(id.host) &&
+    fullPath(link.owner, link.repo) === fullPath(id.owner, id.name)
   );
 }

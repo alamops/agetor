@@ -65,6 +65,7 @@ import type {
   TaskDiff,
 } from "../shared/types.ts";
 import { GIT_HOST_TOKENS_SECTION } from "../shared/types.ts";
+import { canonicalGitHost } from "../shared/git-host.ts";
 import { contentTypeForPreviewPath, MAX_BLOB_PREVIEW_BYTES } from "../shared/attachments.ts";
 import { MAX_DIFF_FILES, parseGitDiff } from "./git-diff.ts";
 import { tokenForHost } from "./github-tokens.ts";
@@ -582,17 +583,7 @@ export async function run(cmd: string[], cwd?: string, timeoutMs = 10_000): Prom
   }
 }
 
-/** Map a remote's host to its canonical provider host. Users pin per-identity
- *  SSH keys via `~/.ssh/config` host aliases (`github-work.com`, `bitbucket-x.org`,
- *  …), so the host in a remote URL is often not the provider's real hostname.
- *  Any host containing the provider's name resolves to that provider. */
-export function canonicalGitHost(host: string): string {
-  const lower = host.toLowerCase();
-  if (lower.includes("github")) return "github.com";
-  if (lower.includes("gitlab")) return "gitlab.com";
-  if (lower.includes("bitbucket")) return "bitbucket.org";
-  return lower;
-}
+export { canonicalGitHost };
 
 /** Extract host + owner/name from a git remote URL in https, ssh://, or
  *  scp-like (`[user@]host:owner/repo`) form. `host` is canonicalized via

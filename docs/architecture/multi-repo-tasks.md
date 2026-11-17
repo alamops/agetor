@@ -361,7 +361,7 @@ runs.
 
 **Attribution** (`attributeProposals`): a proposal belongs to repository R and
 head H when its link's host and full `owner/name` path equal R's forge identity
-(`providerRemoteForDir`; GitLab nested groups compare as one slash-joined path)
+(`providerRemoteForDir`; GitLab nested groups compare as one slash-joined path, and both hosts go through `canonicalGitHost` from `src/shared/git-host.ts`, since provider-info reports the canonical host while a self-hosted or ssh-aliased link carries the real one)
 and the link names H, or its `Repository:` label equals R's workspace name and
 its link, if any, doesn't name another repository (H is then the link's head,
 else R's live head). On a single-repo task an unlabeled proposal with no PR link
