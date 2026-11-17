@@ -40,6 +40,16 @@ The webview picks it up on next load.
 
 The per-agent env overrides (`AGETOR_<KIND>_BIN` / `AGETOR_<KIND>_ARGS`, `AGETOR_TMUX_BIN`, `AGETOR_HARNESS_AUTO_ENABLE`, `AGETOR_SKIP_CLI_VERSION_FLOOR`, and the always-on-host and headless-notification switches), the stub binaries tests plant for each CLI, and the fake drivers (`AGETOR_<KIND>_DRIVER=fake`) are listed once, in [CLAUDE.md § Agent kinds at a glance](../../CLAUDE.md#agent-kinds-at-a-glance).
 
+## Claude Code login pre-flight
+
+`checkHarness` reports `loggedIn`/`authHelp` for claude-code from `claude auth status` (JSON by default, `{"loggedIn": bool, …}`, exit 0 logged in / 1 logged out, ~0.2 s, no network, no writes on an existing config; spiked 2026-11-17 on 2.1.326 with the network denied through `sandbox-exec`). `startTask`'s existing pre-flight refuses `loggedIn === false` with the hint, a stacked task moves once to a usable backup, and the header status dot shows "logged out" (it is kind-agnostic).
+
+- Only `loggedIn` is read. The same JSON carries the account's email, organisation and plan, so nothing from the child's output is logged, returned or thrown.
+- The probe runs with the harness's own env (`probeEnvFor`), through `coreSpawn`, capped at 5 s, cached for `STATUS_CACHE_TTL_MS` (`freshAuth` bypasses at Start).
+- It is skipped when the account's `.claude.json` does not exist: on a never-launched config dir `claude auth status` bootstraps `.claude.json`, a lock directory and `backups/`, and agetor must not write another program's config from a status poll. `loginEvidence` decides instead (`false` → logged out, anything else unknown).
+- Fail-open: a timeout, a spawn error, non-JSON output or a missing/non-boolean `loggedIn` is `null`, never "logged out".
+- `loggedIn` feeds `mergeModelOptions` rule 7 (kind-agnostic): a logged-out claude account shows only the curated model rows.
+
 ## Adding a new agent kind
 
 **To add a new agent kind**, extending the `AgentKind` union is only the start: the compiler flags every `Record<AgentKind, …>` and `never`-checked switch, but several sites are plain `if`/ternary chains or string whitelists it cannot see, and the old advice ("the orchestrator and UI pick it up automatically") shipped silent codex/fx fallthroughs.

@@ -235,6 +235,25 @@ some CLIs refuse an `--add-dir` that names a missing path.
   codex and copilot. Cursor, fx, OpenCode, Gemini and Antigravity get no extra
   flag and rely on the cwd. Gemini's `--include-directories` /
   `context.includeDirectories` is not used (see "Intentional limits").
+- **Claude's add-dir trust dialog (2.1.326+).** Claude asks `Adding a new directory:`
+  for every `--add-dir` whose source repository it has not trusted, on every
+  launch and every `--resume` (the answer is per session). `withTaskRepositoryRoots`
+  also hands the claude driver `autoTrustDirectories` (each checkout's name and
+  the paths claude may print for it: as passed, plus the same path under the
+  real path of the worktrees root), but only while the **Auto-trust a task's
+  repositories** preference (`claude_auto_trust_repositories`, Settings →
+  Harnesses → Behaviour, default on) is on. The boot poller then answers that
+  dialog for those exact paths and nothing else; with the preference off, or
+  for any other path, it is a card. The contract is in
+  [harness-claude-code.md](harness-claude-code.md#enter-to-confirm-screens-claude-21326).
+  The argv is unchanged by the preference.
+- **codex and copilot `--add-dir` (spike, 2026-11-17).** codex 0.166.0 accepts
+  both flags on the first turn and as parent flags before `resume` on a
+  follow-up, shows no trust prompt, and writes under each extra directory in
+  Auto (`docs/plans/claude-enter-to-confirm-prompts-spikes.md`). copilot was
+  not re-verified on the current version (not installed on the spike machine,
+  and executing a downloaded binary needs the owner's go-ahead); the last
+  real-binary run (1.0.109, below) passed.
 - Copilot needs no escalation of its own: in Auto it already runs with
   `--allow-all` and `COPILOT_ALLOW_ALL=true` (full access, writes under each
   source repository's `.git/worktrees` included) and gets every checkout as

@@ -1,7 +1,7 @@
 import { randomUUID } from "node:crypto";
-import { existsSync, mkdirSync, readdirSync, rmSync, statSync, writeFileSync } from "node:fs";
+import { existsSync, mkdirSync, readdirSync, realpathSync, rmSync, statSync, writeFileSync } from "node:fs";
 import { rm } from "node:fs/promises";
-import { basename, isAbsolute, join, resolve } from "node:path";
+import { basename, isAbsolute, join, relative, resolve } from "node:path";
 import {
   db,
   tasks,
@@ -111,6 +111,7 @@ import {
   clearFailoverState,
   cooldownModelFor,
   deferAutoRetryNow,
+  loggedOutSkipLines,
   memberReasonsFor,
   memberUnusableReason,
   moveTaskToMember,
@@ -130,6 +131,7 @@ import {
   setHarnessFailoverHooks,
   stopAllAutoRetryTimers,
   updateTaskState,
+  warmStackLogins,
 } from "./harness-failover.ts";
 import {
   cascadePipelineArchive,
@@ -341,6 +343,8 @@ import type {
   WorktreeTeardownResult,
 } from "../shared/types.ts";
 import { CONTINUATION_STATUS_TEXT, WORKTREE_STALE_AFTER_MS } from "../shared/types.ts";
+import { CLAUDE_AUTO_TRUST_PREF, isClaudeAutoTrustOn } from "../shared/claude-auto-trust.ts";
+import type { AutoTrustDirectory } from "./claude-prompt-screens.ts";
 import {
   SENT_FILES_DELIVERED_RE,
   parseSentFilesToolResult,
@@ -1749,11 +1753,47 @@ export function withTaskRepositoryRoots(
     (r): r is TaskRepository & { worktreePath: string } => Boolean(r.worktreePath) && existsSync(r.worktreePath!),
   );
   if (materialized.length === 0) return opts;
+  const autoTrust = isClaudeAutoTrustOn(preferences.get(CLAUDE_AUTO_TRUST_PREF))
+    ? autoTrustDirectoriesFor(materialized)
+    : undefined;
   return {
     ...opts,
     extraDirectories: materialized.map((r) => r.worktreePath),
     codexWorkspaceRepos: materialized.map((r) => ({ worktreePath: r.worktreePath, repoPath: r.path })),
+    ...(autoTrust ? { autoTrustDirectories: autoTrust } : {}),
   };
+}
+
+/**
+ * The directories claude's startup `Adding a new directory:` dialog may be
+ * auto-confirmed for: the task's own checkouts, exactly as `--add-dir` passes
+ * them, plus the same path under the REAL path of agetor's worktrees root (the
+ * dialog prints the path claude resolved, so a symlinked data dir — `/tmp` is
+ * `/private/tmp` on macOS — must not defeat the equality). Only the
+ * agetor-owned root is resolved; nothing inside a checkout is stat-ed here.
+ * Pure data, so every spawn path (start, follow-up, swap, retry) gets the same
+ * list through `withTaskRepositoryRoots`.
+ */
+function autoTrustDirectoriesFor(
+  materialized: Array<TaskRepository & { worktreePath: string }>,
+): AutoTrustDirectory[] {
+  let realRoot: string | null = null;
+  try {
+    realRoot = realpathSync(WORKTREES_DIR);
+  } catch {
+    /* the root is missing: only the as-passed spelling can match */
+  }
+  return materialized.map((r) => {
+    const paths = [r.worktreePath];
+    if (realRoot) {
+      const rel = relative(WORKTREES_DIR, r.worktreePath);
+      if (rel !== "" && !rel.startsWith("..") && !isAbsolute(rel)) {
+        const real = join(realRoot, rel);
+        if (!paths.includes(real)) paths.push(real);
+      }
+    }
+    return { name: r.name, paths };
+  });
 }
 
 /**
@@ -4200,6 +4240,7 @@ async function finishSwitchNow(taskId: string, behindQueue = false): Promise<voi
 export async function switchTaskAccountNow(taskId: string): Promise<SwitchAccountResult> {
   const task = tasks.get(taskId);
   if (!task) throw new Error(`task not found: ${taskId}`);
+  await warmStackLogins(task);
   const plan = planManualSwitchTarget(task);
   if (plan.kind === "refused") {
     throw new SwitchAccountRefusedError({
@@ -4316,6 +4357,7 @@ async function applyScheduledSwitch(taskId: string, behindQueue = false): Promis
   // turn ends. `reconcileTaskSession` must never see a live run, or it would
   // take its "start fresh" branch.
   if (backgroundAgentsHoldTask(taskId) || runs.hasRunning(taskId)) return;
+  await warmStackLogins(task);
   const plan = planManualSwitchTarget(task);
   if (plan.kind === "refused") {
     dropScheduledSwitch(
@@ -5284,8 +5326,11 @@ async function settleHarnessLimitInClaim(
     return "handled";
   }
 
+  await warmStackLogins(fetched);
   const plan = planNextMember(tasks.get(taskId) ?? fetched, { currentId: current });
   if (plan.kind === "next") {
+    // A logged-out backup is skipped like an exhausted one; say so on the run.
+    for (const line of loggedOutSkipLines(plan.skipped)) saveStatusLineQuietly(runId, taskId, line);
     const toHarness = resolveHarness(plan.member.harnessId);
     if (!toHarness) {
       await blockStackTask(taskId, runId, "harness-swap-failed", "the backup account no longer exists", signal);
@@ -7725,6 +7770,7 @@ async function fireHarnessAutoRetryInner(taskId: string): Promise<void> {
     return;
   }
   const { stack, current } = resolved;
+  await warmStackLogins(task);
   const now = Date.now();
   const plan = planRetryMember(task, { now });
   if (plan.kind !== "next") {

@@ -28,7 +28,7 @@ import {
 import { pickNextMember, type NextMemberPlan } from "../shared/harness-stack.ts";
 import { HARNESS_QUOTA_STALE_MS, harnessQuotaLooksExhausted, harnessQuotaResetAt } from "../shared/harness-limits.ts";
 import { getHarnessDiscoveredModels } from "./agent-discovery.ts";
-import { peekCachedCliVersion } from "./agent-status.ts";
+import { CLAUDE_LOGIN_HINT, peekCachedCliVersion, peekClaudeLoggedIn, refreshClaudeAuth } from "./agent-status.ts";
 import { cliVersionSatisfies } from "../shared/cli-version.ts";
 import { harnesses, harnessUsage, runs, tasks, type SessionIdColumn } from "./db.ts";
 import { harnessStacks, loginEvidence, memberInstalled } from "./harness-stacks.ts";
@@ -231,6 +231,37 @@ export function clearFailoverState(taskId: string): void {
 
 export type { NextMemberPlan };
 
+/** The reason a logged-out account is skipped with (also the status line's). */
+export const NOT_LOGGED_IN_REASON = "not logged in";
+
+/**
+ * Warm the Claude login cache for every account in the task's stack so the
+ * synchronous planners below (`planNextMember`, `planRetryMember`,
+ * `planManualSwitchTarget`, `memberUnusableReason`) can skip a logged-out
+ * account without blocking: the probes run in parallel, capped at 5 s in all,
+ * and fail open. A task outside a stack is a no-op. Call it before planning.
+ */
+export async function warmStackLogins(task: Pick<Task, "id" | "agent" | "harnessState">): Promise<void> {
+  const resolved = harnessStacks.resolveForTask(task);
+  if (!resolved) return;
+  const members = resolved.stack.members
+    .map((m) => harnesses.getByIdOrKind(m.harnessId))
+    .filter((h): h is NonNullable<typeof h> => h != null);
+  await refreshClaudeAuth(members);
+}
+
+/** The "skipped <account>: not logged in" status lines for a plan's skipped
+ *  members (a stack's logged-out account is skipped like an exhausted one). */
+export function loggedOutSkipLines(skipped: ReadonlyArray<{ harnessId: string; reason: string }>): string[] {
+  const lines: string[] = [];
+  for (const s of skipped) {
+    if (s.reason !== NOT_LOGGED_IN_REASON) continue;
+    const label = harnesses.getByIdOrKind(s.harnessId)?.label ?? s.harnessId;
+    lines.push(`skipped ${label}: ${NOT_LOGGED_IN_REASON}`);
+  }
+  return lines;
+}
+
 /**
  * Why a member cannot run this task's turn right now, or null when it can.
  * Deliberately cheap: no fresh CLI probe on the hot path — the cached version
@@ -241,7 +272,10 @@ export function memberUnusableReason(member: { harnessId: string; enabled: boole
   const harness = harnesses.getByIdOrKind(member.harnessId);
   if (!harness) return "account no longer exists";
   if (!memberInstalled(harness)) return "CLI not installed";
-  if (loginEvidence(harness) === false) return "logged out";
+  // `loginEvidence` is the file/keychain check; `peekClaudeLoggedIn` is the
+  // cached `claude auth status` answer (warmed by `warmStackLogins` before
+  // every planner). Both fail open: `null` means "cannot tell", never "out".
+  if (loginEvidence(harness) === false || peekClaudeLoggedIn(harness) === false) return NOT_LOGGED_IN_REASON;
   // The model the turn would really run: a default-model task (null) resolves
   // exactly like `startTask` does, so a backup that cannot serve the default
   // model is skipped too.
@@ -773,6 +807,7 @@ export async function prepareTaskHarness(
   if (!resolved) return { ok: true };
   if (runs.hasRunning(taskId) || hooks?.isTaskHeld?.(taskId)) return { ok: true };
   const { stack, current } = resolved;
+  await warmStackLogins(task);
   // A stack of fewer than two accounts behaves exactly like a lone account:
   // no failover state, and the normal pre-flight error (with its login help)
   // is what the user sees.
@@ -827,6 +862,10 @@ export async function prepareTaskHarness(
     usable: (m) => memberUnusableReason(m, task),
   });
   if (plan.kind !== "next") {
+    // Every account refused for the same reason: the login. Say how to fix it.
+    if (plan.kind === "none-usable" && plan.reasons.length > 0 && plan.reasons.every((r) => r.reason === NOT_LOGGED_IN_REASON)) {
+      return { ok: false, error: `every account in this stack is ${NOT_LOGGED_IN_REASON} — ${CLAUDE_LOGIN_HINT}` };
+    }
     return { ok: false, error: "no usable account in this stack — enable, install or log in to one" };
   }
   const to = plan.member.harnessId;
@@ -869,7 +908,9 @@ export async function prepareTaskHarness(
   return {
     ok: true,
     moved: { from: current, to },
-    ...(moved.warnings.length > 0 ? { warnings: moved.warnings } : {}),
+    ...(moved.warnings.length > 0 || loggedOutSkipLines(plan.skipped).length > 0
+      ? { warnings: [...loggedOutSkipLines(plan.skipped), ...moved.warnings] }
+      : {}),
   };
 }
 

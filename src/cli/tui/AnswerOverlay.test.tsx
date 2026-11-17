@@ -850,3 +850,105 @@ test("opencode question: card text with control characters is shown escaped", as
   expect(frame).toContain("\\u001b");
   ui.unmount();
 });
+
+// ── tmux enter / OAuth code cards (docs/plans/claude-enter-to-confirm-prompts.md T12) ──
+
+test("tmux enter card: Continue is the first row and Enter sends { enter:true }", async () => {
+  let captured: unknown = null;
+  let done = "";
+  const req = {
+    kind: "tmux_prompt", id: "pe", taskId: "t1", runId: "r1", paneText: "Login successful. Press Enter to continue…",
+    choices: [], answerKind: "enter",
+  } as unknown as AnyRequest;
+  const { stdin, lastFrame } = render(
+    <AnswerOverlay client={fakeClient(req, (a) => { captured = a; })} taskId="t1" onDone={(m) => { done = m; }} onCancel={() => {}} />,
+  );
+  await wait();
+  expect(lastFrame()).toContain("Continue (press Enter)");
+  expect(lastFrame()).toContain("Reject / Esc");
+  stdin.write(ENTER);
+  await wait();
+  expect(captured).toEqual({ id: "pe", body: { enter: true } });
+  expect(done).toBe("✓ answered");
+});
+
+test("tmux enter card: the second row sends { reject:true }", async () => {
+  let captured: unknown = null;
+  const req = {
+    kind: "tmux_prompt", id: "pe2", taskId: "t1", runId: "r1", paneText: "Press Enter to retry.",
+    choices: [], answerKind: "enter",
+  } as unknown as AnyRequest;
+  const { stdin } = render(
+    <AnswerOverlay client={fakeClient(req, (a) => { captured = a; })} taskId="t1" onDone={() => {}} onCancel={() => {}} />,
+  );
+  await wait();
+  stdin.write(DOWN);
+  await wait();
+  stdin.write(ENTER);
+  await wait();
+  expect(captured).toEqual({ id: "pe2", body: { reject: true } });
+});
+
+test("tmux code card: typing shows only masks, Enter submits { code }, nothing echoes the code", async () => {
+  let captured: unknown = null;
+  let done = "";
+  const req = {
+    kind: "tmux_prompt", id: "pc", taskId: "t1", runId: "r1", paneText: "Paste code here if prompted > ••••",
+    choices: [], answerKind: "code",
+  } as unknown as AnyRequest;
+  const { stdin, lastFrame } = render(
+    <AnswerOverlay client={fakeClient(req, (a) => { captured = a; })} taskId="t1" onDone={(m) => { done = m; }} onCancel={() => {}} />,
+  );
+  await wait();
+  stdin.write("test-code-123");
+  await wait();
+  expect(lastFrame()).not.toContain("test-code-123");
+  expect(lastFrame()).toContain("•".repeat(13));
+  stdin.write(ENTER);
+  await wait();
+  expect(captured).toEqual({ id: "pc", body: { code: "test-code-123" } });
+  expect(done).toBe("✓ answered");
+  expect(done).not.toContain("test-code-123");
+});
+
+test("tmux code card: an empty code is refused locally with a hint, nothing is posted", async () => {
+  let captured: unknown = null;
+  const req = {
+    kind: "tmux_prompt", id: "pc2", taskId: "t1", runId: "r1", paneText: "Paste code here if prompted >",
+    choices: [], answerKind: "code",
+  } as unknown as AnyRequest;
+  const { stdin, lastFrame } = render(
+    <AnswerOverlay client={fakeClient(req, (a) => { captured = a; })} taskId="t1" onDone={() => {}} onCancel={() => {}} />,
+  );
+  await wait();
+  stdin.write(ENTER);
+  await wait();
+  expect(captured).toBeNull();
+  expect(lastFrame()).toContain("Paste the code first.");
+});
+
+test("tmux card: a 409 shows the prompt-changed sentence; Esc closes without answering", async () => {
+  let done = "";
+  const req = {
+    kind: "tmux_prompt", id: "pe3", taskId: "t1", runId: "r1", paneText: "Press Enter to continue…",
+    choices: [], answerKind: "enter", held: true,
+  } as unknown as AnyRequest;
+  const client = {
+    pendingInteractions: async () => [req],
+    answerTmuxPrompt: async () => {
+      throw new ApiError(409, { error: "x" }, "x");
+    },
+  } as unknown as AgetorClient;
+  const first = render(<AnswerOverlay client={client} taskId="t1" onDone={(m) => { done = m; }} onCancel={() => {}} />);
+  await wait();
+  expect(first.lastFrame()).toContain("Claude didn't take the first keypress");
+  first.stdin.write(ENTER);
+  await wait();
+  expect(done).toBe("! the prompt changed — run `agetor answer` again");
+  let cancelled = false;
+  const second = render(<AnswerOverlay client={client} taskId="t1" onDone={() => {}} onCancel={() => { cancelled = true; }} />);
+  await wait();
+  second.stdin.write(ESC);
+  await wait(120);
+  expect(cancelled).toBe(true);
+});

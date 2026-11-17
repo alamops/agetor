@@ -1684,6 +1684,10 @@ against a core that predates `cancelled` it decides from the task as read
 before the request), the `⇄` marker in `agetor ls` and the TUI header, the `switch:`
 line in `agetor show`, and the card badge ("switch scheduled").
 
+## Logged-out Claude accounts
+
+A Claude Code account that `claude auth status` reports logged out (`{"loggedIn": false}`, exit 1) is skipped like an exhausted one: `memberUnusableReason` returns `not logged in` when either `loginEvidence` (the file/keychain check) or `peekClaudeLoggedIn` (the cached probe) says so, and `null` ("cannot tell") stays usable (fail-open). The probe is async and the planners are sync, so `warmStackLogins(task)` warms the cache (every account in the stack, in parallel, capped at 5 s) before `prepareTaskHarness`, the limit swap, the all-exhausted retry and both manual-switch paths plan. A skipped account gets the run status line `skipped <account label>: not logged in`; when every account is logged out the start is refused with the login hint (`run \`claude auth login\`, or open a terminal for this account from Settings → Harnesses`). The probe, its cache and its `.claude.json` rule are in [harnesses.md](harnesses.md#claude-code-login-pre-flight).
+
 ## Swap history
 
 `harness_swap_events` (migration 087) is a per-stack, append-only log of every

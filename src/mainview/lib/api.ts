@@ -2256,10 +2256,12 @@ export const api = {
    *  keys advertised on the request — the server validates against the
    *  recorded set before injecting keystrokes via `tmux send-keys`. */
   answerTmuxPrompt: (id: string, body: TmuxPromptAnswerBody) =>
+    // `retry: false`: a replayed answer would type the keys (an Enter, an OAuth
+    // code) into the pane a second time.
     j<{ ok: boolean; error?: string }>(`/tmux-prompts/${id}/answer`, {
       method: "POST",
       body: JSON.stringify(body),
-    }),
+    }, { retry: false }),
   /** Answer an fx ACP permission request. `{ optionId }` must be one of the
    *  option ids the request advertised — the server validates against the
    *  recorded set before echoing it back into the ACP RPC reply.

@@ -567,6 +567,41 @@ test("withTaskRepositoryRoots names only checkouts that exist; a single task get
   }
 });
 
+// ── auto-trust: the dirs claude's add-dir dialog may be answered for ─────
+
+test("withTaskRepositoryRoots hands the claude driver the auto-trust directories only while the preference is on", async () => {
+  const { withTaskRepositoryRoots } = await import("./orchestrator.ts");
+  const { preferences } = await import("./db.ts");
+  const { CLAUDE_AUTO_TRUST_PREF } = await import("../shared/claude-auto-trust.ts");
+  const a = await makeRepo("frontend");
+  const b = await makeRepo("backend");
+  let id = "";
+  try {
+    const task = await materialize(await createMulti("autotrust", [a, b]));
+    id = task.id;
+    const opts = { mode: null };
+    // Default on (no stored value): one entry per checkout, named after the repository.
+    const on = withTaskRepositoryRoots(id, opts)!;
+    expect(on.autoTrustDirectories?.map((d) => d.name)).toEqual(task.repositories!.map((r) => r.name));
+    for (const [i, d] of on.autoTrustDirectories!.entries()) {
+      expect(d.paths[0]).toBe(task.repositories![i]!.worktreePath!);
+      // The realpath spelling of the same checkout is accepted too (a symlinked data dir).
+      for (const p of d.paths) expect(p.endsWith(`/${task.repositories![i]!.name}`)).toBe(true);
+    }
+    // The argv roots are unchanged by the preference.
+    expect(on.extraDirectories).toEqual(task.repositories!.map((r) => r.worktreePath!));
+    preferences.set(CLAUDE_AUTO_TRUST_PREF, "0");
+    const off = withTaskRepositoryRoots(id, opts)!;
+    expect(off.autoTrustDirectories).toBeUndefined();
+    expect(off.extraDirectories).toEqual(on.extraDirectories);
+    preferences.set(CLAUDE_AUTO_TRUST_PREF, "1");
+    expect(withTaskRepositoryRoots(id, opts)!.autoTrustDirectories).toHaveLength(2);
+  } finally {
+    preferences.set(CLAUDE_AUTO_TRUST_PREF, "1"); // back to the default (on) for later tests
+    cleanup(id ? await workspaceOf(id) : undefined, a, b);
+  }
+});
+
 // ── serialization: a start that arrives mid-removal reads the new set ───
 
 test("a start that arrives while a removal is detaching waits for it and prepares only what remains", async () => {

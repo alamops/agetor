@@ -21,6 +21,12 @@ import {
   OPENCODE_REJECT_REASON_PROMPT,
   OPENCODE_SKIP_CHOICE,
   parseAnswerArgs,
+  tmuxAnswerBody,
+  tmuxAnswerFailure,
+  tmuxCardKind,
+  tmuxCardRows,
+  tmuxCodeProblem,
+  TMUX_HELD_HINT,
   type OpencodeAskChoice,
   planOpencodePermissionReply,
   type AnswerArgs,
@@ -319,20 +325,37 @@ async function promptCustom(): Promise<string | null> {
 }
 
 async function answerTmux(client: AgetorClient, req: TmuxPromptRequest): Promise<boolean> {
-  out(c.dim(req.paneText));
-  const choice = await p.select({
-    message: "Choose",
-    options: [
-      ...req.choices.map((ch) => ({ value: ch.key, label: ch.label })),
-      { value: "__reject__", label: "Reject / Esc" },
-    ],
-  });
-  if (p.isCancel(choice)) return cancel();
-  const res =
-    choice === "__reject__"
-      ? await client.answerTmuxPrompt(req.id, { reject: true })
-      : await client.answerTmuxPrompt(req.id, { key: choice });
-  out(res.ok ? c.green("✓ answered") : c.red(res.error ?? "failed to answer"));
+  // The pane is third-party text (claude, and whatever claude printed): it goes
+  // through the terminal-text helper like every other stored string.
+  out(c.dim(escapeFreeText(req.paneText)));
+  if (req.held === true) out(c.yellow(TMUX_HELD_HINT));
+  let body: { key?: string; reject?: boolean; enter?: boolean; code?: string };
+  if (tmuxCardKind(req) === "code") {
+    // A password prompt keeps the code out of the scrollback, and out of the
+    // history of anything that records the screen.
+    const code = await p.password({
+      message: "Sign-in code (typed into Claude's prompt)",
+      validate: (v) => tmuxCodeProblem(v ?? "") ?? undefined,
+    });
+    if (p.isCancel(code)) return cancel();
+    body = { code: (code as string).trim() };
+  } else {
+    const choice = await p.select({ message: "Choose", options: tmuxCardRows(req) });
+    if (p.isCancel(choice)) return cancel();
+    body = tmuxAnswerBody(choice as string);
+  }
+  try {
+    const res = await client.answerTmuxPrompt(req.id, body);
+    out(res.ok ? c.green("✓ answered") : c.red(res.error ?? "failed to answer"));
+  } catch (e) {
+    // The route's refusal (409 the prompt changed, 410 the session is gone, 400
+    // invalid input) carries a fixed sentence that never quotes a typed code.
+    if (e instanceof ApiError) {
+      out(c.red(escapeFreeText(tmuxAnswerFailure(e.status, e.message))));
+      return true;
+    }
+    throw e;
+  }
   return true;
 }
 

@@ -1,3 +1,5 @@
+import { OAUTH_CODE_MAX_LEN, oauthCodeErrorText, validateOAuthCode } from "../../shared/oauth-code.ts";
+
 // Display helpers for `TmuxPromptCard`'s choice buttons (RunPanel.tsx).
 //
 // Background: every `tmux_prompt` choice carries a synthetic 1-based `key`
@@ -32,4 +34,23 @@ export interface TmuxChoiceLike {
  */
 export function tmuxChoiceLabel(choice: TmuxChoiceLike, hideKeys?: boolean): string {
   return hideKeys === true ? choice.label : `${choice.key}. ${choice.label}`;
+}
+
+/** What a `tmux_prompt` card asks of the user (`PendingTmuxPrompt.answerKind`,
+ *  absent ≡ a choice card). Anything but the literal `"enter"` / `"code"` is a
+ *  choice card: the value crosses an SSE JSON boundary, and a wrong guess here
+ *  would offer a text box on a menu. */
+export function tmuxPromptAnswerKind(req: { answerKind?: unknown }): "choice" | "enter" | "code" {
+  return req.answerKind === "enter" || req.answerKind === "code" ? req.answerKind : "choice";
+}
+
+/** The most an OAuth code box accepts (the shared limit; the server validates again). */
+export const OAUTH_CODE_INPUT_MAX_LEN = OAUTH_CODE_MAX_LEN;
+
+/** The shared validator, to disable Submit and say why. Returns the trimmed
+ *  code, or a fixed reason that never quotes the value. The server is the
+ *  authority. */
+export function checkOAuthCodeInput(raw: string): { ok: true; code: string } | { ok: false; reason: string } {
+  const r = validateOAuthCode(raw);
+  return r.ok ? r : { ok: false, reason: oauthCodeErrorText(r.error) };
 }

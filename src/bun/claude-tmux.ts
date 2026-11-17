@@ -62,6 +62,18 @@ import { imageSourceMetaPath } from "../shared/attachments.ts";
 import { sanitizeToolResultAttachments } from "../shared/sent-files.ts";
 import { compactionStatusLine, isCompactionNotice } from "../shared/compaction.ts";
 import { openReadNoFollow, READ_NOFOLLOW } from "./no-follow.ts";
+import {
+  ENTER_HINT_FOOTER_RE,
+  HELD_FOOTER_RE,
+  matchAddDirAutoTrust,
+  matchEnterOnlyScreen,
+  matchPasteCodeScreen,
+  matchThemePicker,
+  parseAddDirDialog,
+  redactPaneSecrets,
+  type AddDirFooter,
+  type AutoTrustDirectory,
+} from "./claude-prompt-screens.ts";
 
 /**
  * Stream chunk callback. `lineUuid` is the JSONL line's `uuid` field (claude
@@ -448,6 +460,25 @@ export interface ClaudeLaunchOptions {
    *  keeps the pre-stack behavior: the notice is not carded and claude's own
    *  auto-continue keeps the turn in flight. See `SessionState.harnessFailover`. */
   harnessFailover?: boolean;
+  /**
+   * The directories this spawn passed to claude as `--add-dir` (a multi-
+   * repository task's checkouts), present only while the "Auto-trust a task's
+   * repositories" preference is on. Claude 2.1.326 asks `Adding a new
+   * directory:` for each one it has not trusted, on every launch and every
+   * `--resume`; the boot poller answers that dialog itself, and only for a
+   * path in this list (`matchAddDirAutoTrust`). Empty/absent: every such
+   * dialog is a card.
+   */
+  autoTrustDirectories?: AutoTrustDirectory[];
+  /**
+   * Called once, with `sessionId`, when claude's session JSONL is on disk: at
+   * once on a `--resume` of an existing session, or as soon as a fresh boot
+   * wrote it. Never called when the boot times out. `agents.ts` hands the
+   * orchestrator's `onSessionId` here so a run records its claude session id
+   * only once the session exists, never a never-created one (a retry would
+   * `--resume` it and claude exits 1).
+   */
+  onSessionFileReady?: (sessionId: string) => void;
 }
 
 /* ────────────────────────────────────────────────────────────────────────── *
@@ -2971,6 +3002,15 @@ interface SessionState {
    *  pending map, and we'd register a ghost duplicate before
    *  tmux/claude actually repainted. */
   recentlyAnsweredFingerprints: Map<string, number>;
+  /** Epoch ms the boot poller last saw a startup dialog on the pane (a consent
+   *  dialog it is driving, or one it is carding). The deferred prompt paste
+   *  waits while this is recent, so it never types into a dialog. 0 = never. */
+  startupDialogSeenAt: number;
+  /** While `Date.now()` is before this, the boot poller's consent tracker owns
+   *  the startup dialog on the pane, and `scrapeOnce` must not register a card
+   *  for it (one owner per dialog). The poller refreshes it each tick it sees
+   *  the dialog and zeroes it once the tracker gives up. */
+  consentOwnedUntil: number;
   /**
    * The structured AskUserQuestion card registered for this session's live
    * native modal, or null when none is up. Detection comes from the tmux pane
@@ -3251,6 +3291,15 @@ const sessions = new Map<string, SessionState>(); // taskId → state
  *  past it. */
 export const CLAUDE_BOOT_TIMEOUT_MS = 30_000;
 
+let bootTimeoutOverrideMs: number | null = null;
+/** Test seam for the boot JSONL wait (`CLAUDE_BOOT_TIMEOUT_MS`). Pass `null`
+ *  to restore the default; returns the previous override. */
+export function setBootTimeoutMs(ms: number | null): number | null {
+  const prev = bootTimeoutOverrideMs;
+  bootTimeoutOverrideMs = ms;
+  return prev;
+}
+
 /** One entry per `spawnClaudeViaTmux` boot that hasn't attached its JSONL tail
  *  (or given up) yet — see `claudeBootsInFlight`. */
 const bootsInFlight = new Set<object>();
@@ -3392,6 +3441,8 @@ function makeSessionState(o: MakeSessionStateOpts): SessionState {
     stallFired: false,
     lastIdleScrapeAt: 0,
     recentlyAnsweredFingerprints: new Map(),
+    startupDialogSeenAt: 0,
+    consentOwnedUntil: 0,
     askCardId: null,
     askCollecting: false,
     askGrowAttempts: 0,
@@ -5224,6 +5275,15 @@ interface ScrapeMatch {
    *  place: `tmuxChoiceLabel` (src/mainview/lib/tmux-prompt.ts), rendered by
    *  the generic `TmuxPromptCard` branch in `RunPanel.tsx`. */
   hideKeys?: boolean;
+  /** What the card asks of the user (absent ≡ a choice card). `"enter"`: an
+   *  Enter-only screen; `"code"`: the OAuth code prompt. Both have empty
+   *  `choices`. */
+  answerKind?: "choice" | "enter" | "code";
+  /** Cursor-independent identity of the dialog: what a card drive compares
+   *  against the live pane to confirm it is answering the SAME dialog (the
+   *  fingerprint of a menu includes its cursor, which moves). Filled in by
+   *  `pickScrapeMatch`. */
+  identity?: string;
 }
 
 /**
@@ -5753,9 +5813,14 @@ function unnumberedPreview(lines: string[], firstRowAt: number): string {
  * `pickScrapeMatch`, the one shared chain both call sites go through, so a
  * working pane or an idle composer can never produce this card. */
 function matchUnnumberedModal(tail: string): ScrapeMatch | null {
+  // The add-dir family (startup `Adding a new directory:`, mid-session
+  // `/add-dir`, `/cd`, the apply dialog) is parsed by its own matcher: its
+  // footer can be held or cut off, and its identity includes the path.
+  const addDir = matchAddDirFamily(tail);
+  if (addDir !== undefined) return addDir;
   const lines = tail.split("\n");
   const nonBlank = lines.filter((l) => l.trim().length > 0);
-  if (!nonBlank.slice(-3).some((l) => /\benter to confirm\b/i.test(l))) return null;
+  if (!nonBlank.slice(-3).some((l) => UNNUMBERED_FOOTER_RE.test(l))) return null;
   const parsed = parseUnnumberedChoices(tail);
   if (!parsed) return null;
   for (const c of parsed.choices) {
@@ -5775,16 +5840,109 @@ function matchUnnumberedModal(tail: string): ScrapeMatch | null {
 }
 
 /**
+ * The add-dir dialog family as a card: `undefined` when the pane is not one
+ * (the caller carries on with the generic unnumbered parser), `null` when it
+ * is one but no cursor row is readable (nothing can be driven from an unknown
+ * cursor — the select wraps, and a wrong Down lands on "No, exit", which exits
+ * claude — so the unparsable "Open in Terminal" card takes it), else the card.
+ *
+ * The fingerprint is the dialog's IDENTITY (title + path + labels), not its
+ * cursor or footer: two dialogs for two repositories are two cards (the old
+ * choices-and-cursor fingerprint was identical for both, which is how the
+ * second one got suppressed), and the card survives the cursor moving or the
+ * footer flipping to "held" under it.
+ */
+function matchAddDirFamily(tail: string): ScrapeMatch | null | undefined {
+  const d = parseAddDirDialog(tail);
+  if (!d) return undefined;
+  if (d.cursorIndex === null) return null;
+  const paneText = tail
+    .split("\n")
+    .map((l) => l.trimEnd())
+    .filter((l) => l.length > 0)
+    .slice(-14)
+    .join("\n");
+  return {
+    paneText,
+    choices: d.labels.map((label, i) => ({ key: String(i + 1), label })),
+    cursorIndex: d.cursorIndex,
+    fingerprint: sha1(`adddir:${d.identity}`),
+    identity: sha1(`adddir-id:${d.identity}`),
+    hideKeys: true,
+  };
+}
+
+/** The Enter-only and OAuth-code screens as cards (never auto-answered). */
+function matchPromptScreen(tail: string): ScrapeMatch | null {
+  const code = matchPasteCodeScreen(tail);
+  if (code) {
+    return { paneText: code.paneText, choices: [], fingerprint: code.fingerprint, answerKind: "code" };
+  }
+  const enter = matchEnterOnlyScreen(tail);
+  if (enter) {
+    return { paneText: enter.paneText, choices: [], fingerprint: enter.fingerprint, answerKind: "enter" };
+  }
+  return null;
+}
+
+/** The first screen of a logged-out boot: a footer-less theme picker. Boot only. */
+function matchThemePickerCard(tail: string): ScrapeMatch | null {
+  const t = matchThemePicker(tail);
+  if (!t) return null;
+  return {
+    paneText: t.paneText,
+    choices: t.choices,
+    cursorIndex: t.cursorIndex,
+    fingerprint: t.fingerprint,
+    hideKeys: true,
+  };
+}
+
+/** Whether a match needs the strict 3-tick stability gate before it becomes a
+ *  card: the footer-less shapes (unparsable fallback, Enter-only, code) have
+ *  no parsed choice set behind them, so a 1-2 tick repaint blip must not card. */
+function needsStrictStability(m: ScrapeMatch): boolean {
+  return m.unparsable === true || m.answerKind === "enter" || m.answerKind === "code";
+}
+
+/** The cursor-free identity a card is registered with (`TmuxPromptRequest.
+ *  identity`): the matcher's own when it set one (the add-dir family), else for
+ *  a choice card the labels, for every other card its fingerprint (which has no
+ *  cursor in it). Applied at the two registration sites, not inside
+ *  `pickScrapeMatch`, which stays the plain union of the matchers. */
+function identityOf(m: ScrapeMatch): string {
+  if (m.identity) return m.identity;
+  return m.unparsable || m.choices.length === 0
+    ? m.fingerprint
+    : sha1(`choices:${m.choices.map((c) => c.label).join("\u0001")}`);
+}
+
+/**
  * Footer phrasings claude's Ink modals draw. Every entry is evidence-backed —
  * a false hit here gates the user's composer, so this allow-list only carries
- * footers observed on a real pane: `esc to cancel` / `enter to confirm` from
- * the tool-permission and trust-folder fixtures in claude-tmux-scraper.test.ts,
- * `enter to continue` from the 2.1.234 auto-mode wizard footer
- * (`←/→ to change usage · Enter to continue · Esc to cancel`). Do not add a
- * phrasing without a captured pane to back it (plan §8); the stuck-turn
+ * footers observed on a real pane or decoded from the claude binary:
+ * `esc to cancel` from the tool-permission and trust-folder fixtures in
+ * claude-tmux-scraper.test.ts; every modal `Enter to <verb>` hint from
+ * `ENTER_HINT_FOOTER_RE` (claude-prompt-screens.ts: the 2.1.326 binary's
+ * `chord:"enter",action:…` table, classified modal vs chrome, with the
+ * background-sessions bar `enter to return · space to reply` as the negative
+ * fixture); and the add-dir dialog's held footer (`HELD_FOOTER_RE`, captured
+ * live on 2.1.326). Do not add a phrasing without a captured pane or a binary
+ * string to back it and a negative fixture for the nearest chrome hint (plan
+ * docs/plans/claude-enter-to-confirm-prompts.md §3.10); the stuck-turn
  * watchdog below is the version-proof net for whatever this list misses.
  */
-const MODAL_FOOTER_RE = /esc to cancel|enter to confirm|enter to continue/i;
+const MODAL_FOOTER_RE = new RegExp(
+  `esc to cancel|${ENTER_HINT_FOOTER_RE.source}|${HELD_FOOTER_RE.source}`,
+  "i",
+);
+
+/** The footer gate of the unnumbered-menu parser: `Enter to confirm` and the
+ *  add-dir dialog's held footer. Deliberately NOT every Enter hint: the
+ *  auto-mode wizard's `Enter to continue` footer sits on a menu whose answer
+ *  changes a persistent setting, so it keeps the unparsable "Open in Terminal"
+ *  card (pinned by the matchUnnumberedModal negative truth table). */
+const UNNUMBERED_FOOTER_RE = new RegExp(`\\benter to confirm\\b|${HELD_FOOTER_RE.source}`, "i");
 
 /** How long a turn can sit silent (no JSONL growth, no working spinner) before
  *  `matchUnparsableModal`'s watchdog arm treats it as stuck rather than just
@@ -5953,10 +6111,16 @@ function matchUnparsableModal(tail: string, watchdogArmed: boolean): ScrapeMatch
  */
 function pickScrapeMatch(
   tail: string,
-  opts: { paneWorking: boolean; paneIdle: boolean; watchdogArmed: boolean },
+  opts: { paneWorking: boolean; paneIdle: boolean; watchdogArmed: boolean; boot?: boolean },
 ): ScrapeMatch | null {
   const quiet = !opts.paneWorking && !opts.paneIdle;
+  // The Enter-only / OAuth-code screens and the theme picker sit before the
+  // unnumbered arm and are disjoint from it: none of them draws a `❯` row
+  // with an Enter-to-confirm footer. The theme picker is a boot-only shape (a
+  // never-onboarded or logged-out config) and has no footer at all.
   return matchNumberedModal(tail) ?? matchYesNoModal(tail) ?? matchSliderModal(tail)
+    ?? (quiet ? matchPromptScreen(tail) : null)
+    ?? (quiet && opts.boot ? matchThemePickerCard(tail) : null)
     ?? (quiet ? matchUnnumberedModal(tail) : null)
     ?? (quiet ? matchUnparsableModal(tail, opts.watchdogArmed) : null);
 }
@@ -6186,11 +6350,15 @@ export interface StartupDialogMatch {
   /** Which consent dialog matched (for the status breadcrumb + dedup key). */
   name: string;
   choices: TmuxPromptChoice[];
-  /** 0-based index the `❯`/`›` cursor sits on right now. */
-  cursorIndex: number;
+  /** 0-based index the `❯`/`›` cursor sits on right now; `null` when no
+   *  cursor row is readable (the drive then sends no arrow at all). */
+  cursorIndex: number | null;
   /** 0-based index of the affirmative ("accept" / "proceed") choice we want
    *  to land on before pressing Enter. */
   acceptIndex: number;
+  /** Set only for an auto-trusted add-dir dialog: its cursor-free identity
+   *  (title + path + labels) and footer shape. */
+  addDir?: { identity: string; footer: AddDirFooter };
   /** Stable hash of the matched dialog — lets the boot poller confirm a given
    *  on-screen dialog exactly once while still acting on a *different*
    *  subsequent dialog (e.g. trust-folder appearing after bypass). */
@@ -6204,7 +6372,30 @@ export interface StartupDialogMatch {
  * recognisable affirmative option — when in doubt we do nothing and let the
  * boot timeout surface the raw pane to the user instead of guessing.
  */
-export function matchStartupConsentDialog(pane: string): StartupDialogMatch | null {
+export function matchStartupConsentDialog(
+  pane: string,
+  ctx?: { autoTrustDirectories?: AutoTrustDirectory[] },
+): StartupDialogMatch | null {
+  // Claude 2.1.326's `Adding a new directory:` — auto-confirmed only for a
+  // directory this spawn itself passed as `--add-dir` (`matchAddDirAutoTrust`
+  // is the single place that decision is made). An empty/absent list (the
+  // preference is off, or a single-repository task) never matches here, and
+  // the dialog is then carded like any other.
+  const dirs = ctx?.autoTrustDirectories;
+  if (dirs && dirs.length > 0) {
+    const trust = matchAddDirAutoTrust(pane, dirs);
+    if (trust) {
+      const parsed = parseAddDirDialog(pane)!;
+      return {
+        name: `add-dir:${trust.name}`,
+        choices: parsed.labels.map((label, i) => ({ key: String(i + 1), label })),
+        cursorIndex: trust.cursorIndex,
+        acceptIndex: trust.acceptIndex,
+        fingerprint: trust.fingerprint,
+        addDir: { identity: parsed.identity, footer: trust.footer },
+      };
+    }
+  }
   const dialog = STARTUP_CONSENT_DIALOGS.find((d) => d.marker.test(pane));
   if (!dialog) return null;
   // Reuse the numbered-modal parser first so the choice list / cursor handling
@@ -6267,7 +6458,7 @@ function parseUnnumberedChoices(
   const lines = pane.split("\n");
   let footerAt = -1;
   for (let i = lines.length - 1; i >= 0; i--) {
-    if (/enter to confirm/i.test(lines[i]!)) {
+    if (UNNUMBERED_FOOTER_RE.test(lines[i]!)) {
       footerAt = i;
       break;
     }
@@ -6335,20 +6526,81 @@ function parseUnnumberedChoices(
  * as a `SessionState` directly so a respawn mid-dialog (unlikely inside the
  * bounded boot window, but not impossible) can't stamp a torn-down state.
  */
-async function confirmStartupDialog(taskId: string, sessionName: string, m: StartupDialogMatch): Promise<boolean> {
+async function confirmStartupDialog(
+  taskId: string,
+  sessionName: string,
+  m: StartupDialogMatch,
+  live: {
+    /** Epoch ms the poller first saw this dialog (its identity), for the 500 ms arm wait. */
+    firstSeenAt: number;
+    /** Re-run the consent matcher with the spawn's own context on a fresh capture. */
+    rematch: (pane: string) => StartupDialogMatch | null;
+  },
+): Promise<boolean> {
   const bumpIfLive = (): void => {
     const state = sessions.get(taskId);
     if (state) bumpKeystroke(state);
   };
-  const delta = m.acceptIndex - m.cursorIndex;
-  const arrow = delta >= 0 ? "Down" : "Up";
-  for (let i = 0; i < Math.abs(delta); i++) {
+  // Keys that arrive before the select is armed are refused (the add-dir
+  // dialog flips to its "held" footer), so wait out the arm window first.
+  const armWait = STARTUP_DIALOG_ARM_MS - (Date.now() - live.firstSeenAt);
+  if (armWait > 0) await Bun.sleep(armWait);
+  // Every keystroke is computed from a LIVE read of the same dialog, never from
+  // the match that scheduled the attempt: the cursor may have moved since, or
+  // the dialog may be gone, and the two-row select WRAPS — a Down from "Yes"
+  // lands on "No, exit", where an accepted Enter exits claude.
+  const cap = await tmux(["capture-pane", "-p", "-t", sessionName]);
+  if (!cap.ok) return false;
+  const fresh = live.rematch(cap.stdout);
+  if (!fresh || startupDialogIdentity(fresh) !== startupDialogIdentity(m)) return false;
+  // No readable cursor: no direction is safe. Send nothing; the tracker retries.
+  if (fresh.cursorIndex === null) return false;
+  const keys = planConfirmArrows({
+    cursorIndex: fresh.cursorIndex,
+    acceptIndex: fresh.acceptIndex,
+    heldAddDir: fresh.addDir?.footer === "held",
+  });
+  for (const arrow of keys) {
     bumpIfLive();
     if (!(await tmux(["send-keys", "-t", sessionName, arrow])).ok) return false;
     await Bun.sleep(STARTUP_CONFIRM_KEY_GAP_MS);
   }
   bumpIfLive();
   return (await tmux(["send-keys", "-t", sessionName, "Enter"])).ok;
+}
+
+/**
+ * The arrow keys that take a dialog's cursor from where it IS to the confirming
+ * row, before the Enter. Computed from the LIVE cursor only.
+ *
+ * The add-dir select accepts "Yes" only when the input event right before the
+ * Enter was a counted Down, so a cursor already parked on Yes in the HELD state
+ * (an Enter was refused there) would be refused again by a bare Enter. In that
+ * one case the cursor is walked off Yes and back (`Up` lands on "No, exit" —
+ * the select wraps, and an Up never confirms — then `Down`), which guarantees
+ * the Down the guard wants. On any armed dialog a cursor already on Yes means a
+ * Down just landed, so Enter alone is right.
+ */
+function planConfirmArrows(a: { cursorIndex: number; acceptIndex: number; heldAddDir: boolean }): string[] {
+  const delta = a.acceptIndex - a.cursorIndex;
+  if (delta === 0) return a.heldAddDir ? ["Up", "Down"] : [];
+  const arrow = delta > 0 ? "Down" : "Up";
+  return Array.from({ length: Math.abs(delta) }, () => arrow);
+}
+
+/** Name prefix of an auto-trusted add-dir dialog (`add-dir:<repository name>`). */
+const ADD_DIR_DIALOG_PREFIX = "add-dir:";
+
+/** Claude's add-dir select ignores keys for this long after it mounts (and
+ *  after each refusal), flipping to the "held" footer instead. */
+const STARTUP_DIALOG_ARM_MS = 500;
+
+/** Cursor-free identity of a startup dialog: the same dialog before and after
+ *  a repaint or a landed arrow. */
+function startupDialogIdentity(m: StartupDialogMatch): string {
+  return m.addDir
+    ? `${ADD_DIR_DIALOG_PREFIX}${m.addDir.identity}`
+    : `${m.name}:${m.choices.map((c) => c.label).join("/")}`;
 }
 
 /** Gap between the arrow key(s) and the Enter of a startup-dialog confirm. */
@@ -6436,7 +6688,10 @@ function createStartupConfirmTracker(): StartupConfirmTracker {
   }
   const entries = new Map<string, Entry>();
   let prevFingerprint: string | null = null;
-  const confirmedText = (name: string): string => `claude startup dialog auto-confirmed (${name})`;
+  const confirmedText = (name: string): string =>
+    name.startsWith(ADD_DIR_DIALOG_PREFIX)
+      ? `auto-confirmed Claude's "Adding a new directory" prompt for ${name.slice(ADD_DIR_DIALOG_PREFIX.length)}`
+      : `claude startup dialog auto-confirmed (${name})`;
   return {
     observe(m, now) {
       const statuses: string[] = [];
@@ -6511,6 +6766,15 @@ function createStartupConfirmTracker(): StartupConfirmTracker {
  *  second; cheap because it's one `capture-pane` per tick and only runs
  *  during the bounded boot window. */
 const STARTUP_DIALOG_POLL_MS = 350;
+
+/** How long after the boot poller last saw a startup dialog the deferred
+ *  prompt paste still counts it as "on the pane": a few polls, so one blank
+ *  frame between two repaints cannot open a window to paste into. */
+const STARTUP_DIALOG_SIGHTING_GRACE_MS = STARTUP_DIALOG_POLL_MS * 4;
+
+function startupDialogOnPane(state: SessionState): boolean {
+  return state.startupDialogSeenAt > 0 && Date.now() - state.startupDialogSeenAt < STARTUP_DIALOG_SIGHTING_GRACE_MS;
+}
 
 /** TTL on the "just answered this fingerprint" suppression. Has to
  *  comfortably exceed the worst-case lag between sending Enter into
@@ -7786,7 +8050,7 @@ async function scrapeOnce(state: SessionState): Promise<void> {
   // for that matcher, footer/watchdog presence IS the whole trigger (there's
   // no already-parsed choice set behind it), so a 1–2 tick blip must not card.
   const sameAsLast = state.scrapeLastFingerprint === match.fingerprint;
-  if (match.unparsable) {
+  if (needsStrictStability(match)) {
     state.scrapeUnparsableStreak = nextUnparsableStreak(state.scrapeUnparsableStreak, sameAsLast);
     state.scrapeLastFingerprint = match.fingerprint;
     if (!unparsableStreakCleared(state.scrapeUnparsableStreak)) return;
@@ -7811,6 +8075,12 @@ async function scrapeOnce(state: SessionState): Promise<void> {
   // dismissal) still auto-cancels normally.
   if (state.drivingPrompt) return;
 
+  // One owner per dialog: while the boot poller's consent tracker holds a
+  // startup dialog (it is auto-confirming it), no card exists for it. The
+  // runtime scraper starts as soon as the session file exists, which on a
+  // `--resume` is at spawn — alongside the poller's resume consent window.
+  if (Date.now() < state.consentOwnedUntil) return;
+
   // Already registered? Nothing to do — the previous tick's broadcast
   // is what the UI is showing.
   if (findTmuxPromptByFingerprint(state.taskId, match.fingerprint)) return;
@@ -7833,6 +8103,8 @@ async function scrapeOnce(state: SessionState): Promise<void> {
     unparsable: match.unparsable,
     confirmKey: match.confirmKey,
     hideKeys: match.hideKeys,
+    answerKind: match.answerKind,
+    identity: identityOf(match),
   });
 }
 
@@ -8684,6 +8956,14 @@ const DEFERRED_PROMPT_POLL_MS = 400;
  *  naturally, but they're independent constants — there's no shared source
  *  and no requirement to change one when the other changes. */
 const DEFERRED_PROMPT_TIMEOUT_MS = 30_000;
+let deferredPromptTimeoutOverrideMs: number | null = null;
+/** Test seam for one deferred-paste readiness window. `null` restores the
+ *  default; returns the previous override. */
+export function setDeferredPromptTimeoutMs(ms: number | null): number | null {
+  const prev = deferredPromptTimeoutOverrideMs;
+  deferredPromptTimeoutOverrideMs = ms;
+  return prev;
+}
 /** Cadence of the post-paste submit-verification loop: after the deferred
  *  prompt is pasted + Enter'd, we poll until claude's JSONL appears (proof
  *  the turn was actually submitted). Each tick that still finds the
@@ -9020,7 +9300,7 @@ export async function spawnClaudeViaTmux(opts: ClaudeLaunchOptions): Promise<Spa
         const slotLive = () => state.turnQueue.includes(initialSlot);
         let ready = false;
         windows: for (;;) {
-          const deadline = Date.now() + DEFERRED_PROMPT_TIMEOUT_MS;
+          const deadline = Date.now() + (deferredPromptTimeoutOverrideMs ?? DEFERRED_PROMPT_TIMEOUT_MS);
           while (Date.now() < deadline) {
             if (!(await tmux(["has-session", "-t", "=" + sessionName])).ok) return; // session died — nothing to paste into
             if (sessions.get(opts.taskId) !== state) return; // superseded by a newer spawn/reattach
@@ -9030,8 +9310,12 @@ export async function spawnClaudeViaTmux(opts: ClaudeLaunchOptions): Promise<Spa
           }
           // Window timed out. Don't paste over an unanswered startup
           // question — re-arm a fresh window instead, as long as there's
-          // still something to wait for.
-          if (activeTmuxPromptsForTask(opts.taskId).length === 0) break;
+          // still something to wait for: a pending card, or a startup dialog
+          // the boot poller saw on the pane within its sighting grace (an
+          // auto-confirm in flight, a dialog it is about to card, or one it
+          // is waiting out a refusal on). The paste only gives up when the
+          // boot itself does.
+          if (activeTmuxPromptsForTask(opts.taskId).length === 0 && !startupDialogOnPane(state)) break;
           if (!(await tmux(["has-session", "-t", "=" + sessionName])).ok) return;
           if (sessions.get(opts.taskId) !== state) return;
           if (!slotLive()) return;
@@ -9140,7 +9424,7 @@ export async function spawnClaudeViaTmux(opts: ClaudeLaunchOptions): Promise<Spa
   // configured servers). Generous because on big projects the local
   // skill scan can take 15s+; the fs.watch trigger means we attach as
   // soon as it appears regardless.
-  const BOOT_TIMEOUT_MS = CLAUDE_BOOT_TIMEOUT_MS;
+  const BOOT_TIMEOUT_MS = bootTimeoutOverrideMs ?? CLAUDE_BOOT_TIMEOUT_MS;
   // Counted until the JSONL is attached or the boot gives up, and — on the
   // deferred-prompt path — until that paste has settled too: until then the
   // first prompt may still be owed to the pane by THIS process (a deferred
@@ -9167,43 +9451,74 @@ export async function spawnClaudeViaTmux(opts: ClaudeLaunchOptions): Promise<Spa
     let bootSettled = false;
     const startupConfirm = createStartupConfirmTracker();
     let lastGenericFingerprint: string | null = null;
+    let genericStreak = 0;
     // Set by the poller whenever a startup question is on the pane during the
     // current boot-wait window; read (and reset) by the wait loop so a window
     // in which the user was being asked something never counts toward the
     // timeout. Shared scope with the wait loop below.
     let sawStartupPromptThisWindow = false;
+    // True once the boot wait found the session file: positive proof claude got
+    // past every startup dialog, so a dialog the tracker last saw PRESENT is
+    // reported as confirmed rather than dropped.
+    let bootFoundJsonl = false;
+    // A `--resume` launch: the session file already exists, so the boot wait
+    // below ends at once, but claude re-asks the add-dir dialog on every
+    // resume (the answer is per session, never persisted). The poller then
+    // keeps one job — the consent dialogs — in a "resume consent window".
+    const resumedAtSpawn = existsSync(jsonlPath);
+    const consentCtx = { autoTrustDirectories: opts.autoTrustDirectories ?? [] };
+    let resumeWindowClosed = false;
+    const windowOver = (): boolean => (resumedAtSpawn ? resumeWindowClosed : bootSettled);
     void (async () => {
       // Wrapped so a stray throw can never become an unhandled rejection on
       // the fire-and-forget IIFE (mirrors `startScraper`'s try/catch posture);
       // in practice none of the calls below throw.
       try {
-        while (!bootSettled) {
+        let dialogIdentity: string | null = null;
+        let dialogFirstSeenAt = 0;
+        let lastDialogAt = Date.now();
+        while (!windowOver()) {
           await Bun.sleep(STARTUP_DIALOG_POLL_MS);
-          // Resume path: when the JSONL already exists at spawn (`--resume`),
-          // this short-circuits on the first tick so the poller is a no-op —
-          // a re-shown consent dialog on resume is out of scope (bypass
-          // acceptance is global + persistent once accepted).
-          if (bootSettled) {
-            // The window closed under us (JSONL found, or the boot timed out).
-            // Only a dialog the tracker saw ABSENT on the latest poll is
-            // reported as confirmed; one still matched at the deadline emits
-            // nothing (the boot-timeout path surfaces the raw pane instead).
-            for (const line of startupConfirm.flushAbsent()) opts.onChunk("status", line);
-            return;
-          }
-          if (existsSync(jsonlPath)) {
-            // claude got past boot — any dialog we confirmed is demonstrably gone.
-            for (const line of startupConfirm.flushConfirmed()) opts.onChunk("status", line);
-            return;
+          if (!resumedAtSpawn) {
+            if (bootSettled) {
+              // The window closed under us (JSONL found, or the boot timed out).
+              // Only a dialog the tracker saw ABSENT on the latest poll is
+              // reported as confirmed; one still matched at the deadline emits
+              // nothing (the boot-timeout path surfaces the raw pane instead).
+              const lines = bootFoundJsonl ? startupConfirm.flushConfirmed() : startupConfirm.flushAbsent();
+              for (const line of lines) opts.onChunk("status", line);
+              return;
+            }
+            if (existsSync(jsonlPath)) {
+              // claude got past boot — any dialog we confirmed is demonstrably gone.
+              for (const line of startupConfirm.flushConfirmed()) opts.onChunk("status", line);
+              return;
+            }
+          } else if (sessions.get(opts.taskId) !== state) {
+            return; // superseded or torn down while the resume window was open
           }
           if (!(await tmux(["has-session", "-t", "=" + sessionName])).ok) return;
           const pane = (await tmux(["capture-pane", "-p", "-t", sessionName])).stdout;
+          const now = Date.now();
+          // Expire "just answered" fingerprints exactly as the runtime scraper
+          // does. Nothing pruned this map at boot, so a SECOND dialog with the
+          // same fingerprint as the one just answered (two repositories gave
+          // identical menus) was suppressed for the whole boot.
+          for (const [fp, ts] of state.recentlyAnsweredFingerprints) {
+            if (now - ts > RECENTLY_ANSWERED_TTL_MS) state.recentlyAnsweredFingerprints.delete(fp);
+          }
           // A startup prompt we already surfaced and is still awaiting the
           // user keeps the boot window from expiring under them.
           if (activeTmuxPromptsForTask(opts.taskId).length > 0) {
             sawStartupPromptThisWindow = true;
+            state.startupDialogSeenAt = now;
           }
-          const m = matchStartupConsentDialog(pane);
+          const m = matchStartupConsentDialog(pane, consentCtx);
+          const identity = m ? startupDialogIdentity(m) : null;
+          if (identity !== dialogIdentity) {
+            dialogIdentity = identity;
+            dialogFirstSeenAt = now;
+          }
           // A consent dialog is confirmed only once its fingerprint was seen on TWO
           // consecutive polls (Ink may still be mounting on the first sighting),
           // and a confirm is VERIFIED against the pane rather than trusted on
@@ -9215,29 +9530,67 @@ export async function spawnClaudeViaTmux(opts: ClaudeLaunchOptions): Promise<Spa
           // reports `auto-confirmed` only after the dialog has been absent on two
           // consecutive polls. After the 4th attempt it gives up and the dialog
           // falls through to the generic card path. A genuinely different
-          // follow-up dialog (bypass, then trust) is tracked under its own name.
-          const step = startupConfirm.observe(m, Date.now());
+          // follow-up dialog (bypass, then trust, then one add-dir per
+          // repository) is tracked under its own name. A "held" add-dir dialog
+          // (claude refused the first keypress) still matches, so it counts as
+          // PRESENT and is retried from its live cursor, never reported gone.
+          const step = startupConfirm.observe(m, now);
           for (const line of step.statuses) opts.onChunk("status", line);
           if (m) {
-            if (step.attempt) await confirmStartupDialog(opts.taskId, sessionName, step.attempt);
+            state.startupDialogSeenAt = now;
+            lastDialogAt = now;
+            if (step.attempt) {
+              await confirmStartupDialog(opts.taskId, sessionName, step.attempt, {
+                firstSeenAt: dialogFirstSeenAt,
+                rematch: (p) => matchStartupConsentDialog(p, consentCtx),
+              });
+            }
             if (!startupConfirm.hasGivenUp(m.name)) {
               // A consent dialog is on the pane — never also treat it as a
               // generic question (its repaint frames must not leak into an
-              // interactive card while we auto-confirm it).
+              // interactive card while we auto-confirm it), and the runtime
+              // scraper must not card it either (one owner per dialog).
+              state.consentOwnedUntil = Date.now() + STARTUP_DIALOG_POLL_MS * 3;
+              sawStartupPromptThisWindow = true;
               lastGenericFingerprint = null;
+              genericStreak = 0;
               continue;
             }
             // Auto-confirm gave up (the "answer it in the terminal" status was
-            // just emitted): the user is now the only way through, so keep the
-            // boot window from expiring under them and fall through to the
-            // generic prompt path below, which cards the dialog for a click.
+            // just emitted): the user is now the only way through, so hand the
+            // dialog to the card path, keep the boot window from expiring under
+            // them and fall through to the generic prompt path below, which
+            // cards the dialog for a click.
+            state.consentOwnedUntil = 0;
             sawStartupPromptThisWindow = true;
+          }
+
+          if (resumedAtSpawn) {
+            // Consent dialogs are this window's only job; every other card is
+            // the runtime scraper's. Close once claude is demonstrably past
+            // startup: its composer or working chrome is up, the session file
+            // grew, or a full boot timeout passed with no dialog on the pane.
+            if (!m) {
+              const resumeLines = pane.split("\n");
+              const resumeTail = resumeLines.slice(Math.max(0, resumeLines.length - SCRAPE_TAIL_LINES)).join("\n");
+              if (
+                resumeJsonlOffset(jsonlPath) > initialOffset
+                || paneShowsIdleInputBox(resumeTail)
+                || paneShowsClaudeWorking(resumeTail)
+                || now - lastDialogAt > BOOT_TIMEOUT_MS
+              ) {
+                for (const line of startupConfirm.flushConfirmed()) opts.onChunk("status", line);
+                resumeWindowClosed = true;
+                return;
+              }
+            }
+            continue;
           }
 
           // Not a known consent dialog. If claude is showing some other
           // numbered / yes-no question, surface it interactively so the user
           // can answer and unblock boot. Mirror the runtime scraper's tail
-          // slice, two-tick stability gate, and external-dismissal sweep.
+          // slice, stability gate, and external-dismissal sweep.
           const paneLines = pane.split("\n");
           const tail = paneLines.slice(Math.max(0, paneLines.length - SCRAPE_TAIL_LINES)).join("\n");
           // Footer arm only — no turn is in flight during boot, so the
@@ -9254,13 +9607,18 @@ export async function spawnClaudeViaTmux(opts: ClaudeLaunchOptions): Promise<Spa
           // startup wizard has no working chrome and no idle composer, so it
           // still surfaces, while a pane that has settled at claude's input
           // box (or is streaming) never turns a quoted menu into a card.
+          // `boot: true` additionally enables the footer-less theme picker a
+          // never-onboarded or logged-out config opens on.
           const paneWorking = paneShowsClaudeWorking(tail);
           const generic = pickScrapeMatch(tail, {
             paneWorking,
             paneIdle: paneShowsIdleInputBox(tail),
             watchdogArmed: false,
+            boot: true,
           });
-          if (!generic) { lastGenericFingerprint = null; continue; }
+          if (!generic) { lastGenericFingerprint = null; genericStreak = 0; continue; }
+          // Something modal is on the pane: the deferred paste must not type into it.
+          state.startupDialogSeenAt = now;
           // External dismissal: a previously surfaced startup prompt whose
           // content no longer matches the pane (user answered it from a real
           // `tmux attach`) — resolve it so the card clears.
@@ -9269,10 +9627,12 @@ export async function spawnClaudeViaTmux(opts: ClaudeLaunchOptions): Promise<Spa
               answerTmuxPrompt(pending.id, { key: "__external__" });
             }
           }
-          if (lastGenericFingerprint !== generic.fingerprint) {
-            lastGenericFingerprint = generic.fingerprint;
-            continue; // require two consecutive identical scrapes
-          }
+          genericStreak = lastGenericFingerprint === generic.fingerprint ? genericStreak + 1 : 1;
+          lastGenericFingerprint = generic.fingerprint;
+          // Same stability bar as the runtime scraper: two identical sightings
+          // for a parsed menu, three for a shape with no parsed choices behind
+          // it (unparsable, Enter-only, OAuth code).
+          if (genericStreak < (needsStrictStability(generic) ? UNPARSABLE_STABILITY_TICKS : 2)) continue;
           if (findTmuxPromptByFingerprint(opts.taskId, generic.fingerprint)) {
             sawStartupPromptThisWindow = true;
             continue; // already on a card
@@ -9281,8 +9641,13 @@ export async function spawnClaudeViaTmux(opts: ClaudeLaunchOptions): Promise<Spa
           // tick while tmux/claude repaint — re-carding it would flash a ghost
           // duplicate. The answer route stamps `recentlyAnsweredFingerprints`
           // on this same SessionState via `markTmuxPromptAnswered`; honour it
-          // here exactly as the runtime scraper (`scrapeOnce`) does.
-          if (state.recentlyAnsweredFingerprints.has(generic.fingerprint)) continue;
+          // here as the runtime scraper (`scrapeOnce`) does — and, unlike
+          // before, keep the boot window open while it is suppressed (it
+          // expires after RECENTLY_ANSWERED_TTL_MS, above).
+          if (state.recentlyAnsweredFingerprints.has(generic.fingerprint)) {
+            sawStartupPromptThisWindow = true;
+            continue;
+          }
           // Need an active run to attach the interaction to. The orchestrator
           // sets task.runId before spawning, so this is populated by boot time.
           const runId = tasks.get(opts.taskId)?.runId;
@@ -9298,6 +9663,8 @@ export async function spawnClaudeViaTmux(opts: ClaudeLaunchOptions): Promise<Spa
             unparsable: generic.unparsable,
             confirmKey: generic.confirmKey,
             hideKeys: generic.hideKeys,
+            answerKind: generic.answerKind,
+            identity: identityOf(generic),
           });
           sawStartupPromptThisWindow = true;
           opts.onChunk("status", "claude is asking a question on startup — answer it to continue");
@@ -9320,7 +9687,7 @@ export async function spawnClaudeViaTmux(opts: ClaudeLaunchOptions): Promise<Spa
     for (;;) {
       sawStartupPromptThisWindow = false;
       found = await waitForJsonlAt(jsonlPath, BOOT_TIMEOUT_MS);
-      if (found) break;
+      if (found) { bootFoundJsonl = true; break; }
       // Re-arm while the deferred-paste flow hasn't settled, exactly like an
       // unanswered startup prompt: on the deferred path the JSONL only
       // appears AFTER the paste submits, so this window is measuring paste
@@ -9355,7 +9722,8 @@ export async function spawnClaudeViaTmux(opts: ClaudeLaunchOptions): Promise<Spa
       reportSlowLaunch();
       opts.onChunk("stderr", `claude session JSONL never appeared: ${detail}`);
       opts.onChunk("stderr", `expected at: ${jsonlPath}`);
-      opts.onChunk("stderr", `--- tmux pane ---\n${pane}\n--- end pane ---`);
+      // A code typed into claude's OAuth prompt can be on the pane: mask it.
+      opts.onChunk("stderr", `--- tmux pane ---\n${redactPaneSecrets(pane)}\n--- end pane ---`);
       await killTaskSession(opts.taskId);
       sessions.delete(opts.taskId);
       // Reject every queued turn so all dependent promises settle. Drop any
@@ -9367,6 +9735,10 @@ export async function spawnClaudeViaTmux(opts: ClaudeLaunchOptions): Promise<Spa
       for (const slot of state.turnQueue.splice(0)) slot.reject?.(err);
       return;
     }
+    // The session file exists: only now may the run record its session id (a
+    // boot that never wrote one must leave no id behind — a later `--resume`
+    // of it makes claude exit 1).
+    try { opts.onSessionFileReady?.(opts.sessionId); } catch { /* a stamp failure never fails the boot */ }
     const { watcherMs } = await attachTailer(state);
     // Disposed (Stop/delete/respawn) while the watcher seeded: the session is
     // gone, so announce nothing about it.
@@ -11064,6 +11436,14 @@ export const __forTest = {
    *  testable without a live boot. */
   startupConfirmDecision,
   createStartupConfirmTracker,
+  startupDialogIdentity,
+  startupDialogOnPane,
+  matchAddDirFamily,
+  planConfirmArrows,
+  identityOf,
+  needsStrictStability,
+  STARTUP_DIALOG_ARM_MS,
+  STARTUP_DIALOG_SIGHTING_GRACE_MS,
   confirmStartupDialog,
   STARTUP_CONFIRM_KEY_GAP_MS,
   STARTUP_CONFIRM_RETRY_MS,

@@ -261,6 +261,12 @@ export interface TmuxPromptRequest {
    *  confirm and now shows its "held" footer (`To add it, press ↓ to Yes,
    *  then Enter`): the user's click did not take, choose again. */
   held?: boolean;
+  /** Cursor-independent identity of the dialog this card was registered for
+   *  (server-side only, never mirrored to the webview). The card drive
+   *  re-reads the live pane and refuses to send a key unless the dialog on
+   *  screen has this same identity: the fingerprint of a menu includes its
+   *  cursor, which moves. Absent on a card the drive does not re-verify. */
+  identity?: string;
 }
 
 /** Answer sentinels for the two non-choice card kinds. The OAuth code itself
@@ -803,6 +809,8 @@ export function registerTmuxPrompt(args: {
   answerKind?: "choice" | "enter" | "code";
   /** See `TmuxPromptRequest.held`. */
   held?: boolean;
+  /** See `TmuxPromptRequest.identity`. */
+  identity?: string;
 }): { id: string; req: TmuxPromptRequest; answer: Promise<TmuxPromptAnswer> } {
   // A non-choice card has nothing to pick from and nothing to hand to the
   // unparsable "answer it in the terminal" branch; mixing them would let the
@@ -856,6 +864,7 @@ export function registerTmuxPrompt(args: {
     hideKeys: args.hideKeys,
     ...(args.answerKind && args.answerKind !== "choice" ? { answerKind: args.answerKind } : {}),
     ...(args.held ? { held: true } : {}),
+    ...(args.identity ? { identity: args.identity } : {}),
   };
   const answer = new Promise<TmuxPromptAnswer>((resolve) => {
     tmuxPrompts.set(id, { req, resolve });

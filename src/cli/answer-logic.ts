@@ -1,4 +1,5 @@
-import type { AnyRequest, AskQuestion, AskQuestionsRequest, FxPermissionRequest } from "../bun/interactions.ts";
+import type { AnyRequest, AskQuestion, AskQuestionsRequest, FxPermissionRequest, TmuxPromptRequest } from "../bun/interactions.ts";
+import { oauthCodeErrorText, validateOAuthCode } from "../shared/oauth-code.ts";
 import { flagValue } from "./args.ts";
 
 /** Sentinel option value for the "type a free-text answer" choice — distinctive
@@ -192,4 +193,56 @@ export function buildOpencodeAnswerByIndex(
   });
   if (picked.length === 0 && text === undefined) return { ok: false, error: "Pick an option or type an answer." };
   return assembleOpencodeEntry(q, picked, text);
+}
+
+/* ────────────────────────────────────────────────────────────────────────── *
+ * tmux_prompt cards (docs/plans/claude-enter-to-confirm-prompts.md T12): a
+ * choice card (one row per choice + Reject / Esc), an Enter-only card (Continue
+ * + Reject / Esc) and the OAuth code card (one masked text field, no rows).
+ * Shared by `agetor answer` and the dashboard's AnswerOverlay.
+ * ────────────────────────────────────────────────────────────────────────── */
+
+export const TMUX_ENTER_VALUE = "__enter__";
+export const TMUX_REJECT_VALUE = "__reject__";
+
+/** What a tmux card asks of the user (absent ≡ a choice card). */
+export function tmuxCardKind(req: Pick<TmuxPromptRequest, "answerKind">): "choice" | "enter" | "code" {
+  return req.answerKind === "enter" || req.answerKind === "code" ? req.answerKind : "choice";
+}
+
+/** The pick list for a tmux card. A code card has none (free text only). */
+export function tmuxCardRows(req: TmuxPromptRequest): Array<{ value: string; label: string }> {
+  const kind = tmuxCardKind(req);
+  if (kind === "code") return [];
+  if (kind === "enter") {
+    return [
+      { value: TMUX_ENTER_VALUE, label: "Continue (press Enter)" },
+      { value: TMUX_REJECT_VALUE, label: "Reject / Esc" },
+    ];
+  }
+  return [...req.choices.map((ch) => ({ value: ch.key, label: ch.label })), { value: TMUX_REJECT_VALUE, label: "Reject / Esc" }];
+}
+
+/** The answer-route body for a picked row. */
+export function tmuxAnswerBody(value: string): { enter: true } | { reject: true } | { key: string } {
+  if (value === TMUX_ENTER_VALUE) return { enter: true };
+  if (value === TMUX_REJECT_VALUE) return { reject: true };
+  return { key: value };
+}
+
+/** Validate a typed OAuth code locally (the route validates again): the fixed
+ *  sentence on failure, never the value. */
+export function tmuxCodeProblem(raw: string): string | null {
+  const r = validateOAuthCode(raw);
+  return r.ok ? null : oauthCodeErrorText(r.error);
+}
+
+/** The hint line for a card that was re-registered after a refused confirm. */
+export const TMUX_HELD_HINT = "Claude didn't take the first keypress — choose again.";
+
+/** The sentence for an answer the route refused (never echoes a typed code). */
+export function tmuxAnswerFailure(status: number, message: string | undefined): string {
+  if (status === 409) return "the prompt changed — run `agetor answer` again";
+  if (status === 410) return "the session is gone — start the task again";
+  return message || "failed to answer";
 }

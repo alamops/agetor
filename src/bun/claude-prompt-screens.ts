@@ -351,27 +351,8 @@ export function matchThemePicker(tail: string): {
 }
 
 /* ────────────────────────────────────────────────────────────────────────── *
- * OAuth code validation
+ * OAuth code validation: the single implementation is shared with the webview
+ * and the CLI/TUI (src/shared/oauth-code.ts), re-exported here for the matchers'
+ * callers.
  * ────────────────────────────────────────────────────────────────────────── */
-
-export const OAUTH_CODE_MAX_LEN = 512;
-
-/**
- * Validate the text a user typed into the OAuth code box before it is typed
- * into the pane. One line, at most {@link OAUTH_CODE_MAX_LEN} characters, no
- * control character (C0, DEL, C1: nothing that tmux or claude's TUI could read
- * as a key). The error code is fixed text; the offending value is never part
- * of the result.
- */
-export function validateOAuthCode(
-  raw: unknown,
-): { ok: true; code: string } | { ok: false; error: "not-a-string" | "empty" | "too-long" | "multi-line" | "control-char" } {
-  if (typeof raw !== "string") return { ok: false, error: "not-a-string" };
-  if (/[\r\n]/.test(raw)) return { ok: false, error: "multi-line" };
-  // eslint-disable-next-line no-control-regex
-  if (/[\u0000-\u001f\u007f-\u009f]/.test(raw)) return { ok: false, error: "control-char" };
-  const code = raw.trim();
-  if (code.length === 0) return { ok: false, error: "empty" };
-  if (code.length > OAUTH_CODE_MAX_LEN) return { ok: false, error: "too-long" };
-  return { ok: true, code };
-}
+export { OAUTH_CODE_MAX_LEN, validateOAuthCode } from "../shared/oauth-code.ts";
