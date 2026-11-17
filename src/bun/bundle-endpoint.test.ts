@@ -1083,3 +1083,32 @@ describe("opencodeServer (D-4)", () => {
     }
   });
 });
+
+describe("known model ids for the bundle planner (dynamic model catalog)", () => {
+  test("opencode is per-harness, a discovered claude model is known, and cursor knows its flat variant ids", async () => {
+    const discovery = await import("./agent-discovery.ts");
+    const { localStateFrom } = await import("./bundle.ts");
+    discovery.__testing.resetForTests();
+    discovery.seedDiscoveryCache({ scope: "kind", kind: "claude-code" }, [{ id: "opus-6", label: "Opus 6" }]);
+    discovery.seedDiscoveryCache({ scope: "harness", kind: "opencode", harnessId: "opencode" }, [{ id: "acme/model-1" }]);
+    discovery.seedDiscoveryCache({ scope: "kind", kind: "opencode" }, [{ id: "kind-level/should-not-count" }]);
+    discovery.seedDiscoveryCache(
+      { scope: "kind", kind: "cursor" },
+      [{ id: "gpt-7", efforts: ["high"], cursor: { effortIds: { high: "gpt-7-high" }, fastEfforts: ["high"] } }],
+    );
+    try {
+      const state = localStateFrom(new Map());
+      expect(state.knownModels["claude-code"]).toContain("opus-6");
+      expect(state.knownModels["claude-code"]).toContain("opus-5.5");
+      const oc = state.knownModels["opencode"];
+      expect(oc).toContain("acme/model-1");
+      expect(oc).not.toContain("kind-level/should-not-count");
+      const cursor = state.knownModels["cursor"];
+      for (const id of ["gpt-7", "gpt-7-high", "gpt-7-high-fast", "grok-4.7-high", "grok-4.7-high-fast"]) {
+        expect(cursor, id).toContain(id);
+      }
+    } finally {
+      discovery.__testing.resetForTests();
+    }
+  });
+});

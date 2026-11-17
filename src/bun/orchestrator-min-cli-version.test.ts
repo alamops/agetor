@@ -404,3 +404,89 @@ test("a pre-release build sitting exactly AT the floor ('0.155.0-alpha.3' vs the
 // fake turn open via the AGETOR_FAKE_CODEX_RESOLVE_DELAY_MS seam and pins
 // `drainCodexQueue`'s stranded-message handling (every queued line behind a
 // refused one restashed to the backlog tray, raw text, send order).
+
+/* ── discovery first (dynamic-model-catalog #14) ───────────────────────────── */
+
+/** Seed the built-in codex harness's discovered catalog, run, and always reset. */
+async function withCodexCatalog(rows: { id: string; cliDefault?: true }[], run: () => Promise<void>): Promise<void> {
+  const discovery = await import("./agent-discovery.ts");
+  discovery.__testing.resetForTests();
+  discovery.seedDiscoveryCache({ scope: "harness", kind: "codex", harnessId: "codex" }, rows);
+  try {
+    await run();
+  } finally {
+    discovery.__testing.resetForTests();
+  }
+}
+
+test("a codex model missing from a non-empty trusted catalog is refused with the upgrade message, even with no table floor", async () => {
+  process.env.FAKE_CODEX_VERSION = "codex-cli 0.166.0";
+  const { startTask } = await import("./orchestrator.ts");
+  const { tasks, runs } = await import("./db.ts");
+  await withCodexCatalog([{ id: "gpt-6.2-sol" }], async () => {
+    const taskId = await createCodexTask("gpt-5.6-sol"); // no MODEL_MIN_CLI_VERSION entry
+    const started = await startTask(taskId);
+    expect("error" in started).toBe(true);
+    if ("error" in started) {
+      expect(started.error).toContain("isn't in Codex's model list");
+      expect(started.error).toContain("0.166.0");
+      expect(started.error).toContain("Upgrade the CLI (npm i -g @openai/codex)");
+    }
+    expect(tasks.get(taskId)!.runId).toBeNull();
+    expect(runs.listForTask(taskId).length).toBe(0);
+  });
+});
+
+test("a model the CLI's catalog lists is allowed even when the frozen table floor would refuse it", async () => {
+  process.env.FAKE_CODEX_VERSION = "codex-cli 0.147.0"; // below gpt-6-sol's 0.155.0 floor
+  const { startTask } = await import("./orchestrator.ts");
+  const { runs } = await import("./db.ts");
+  await withCodexCatalog([{ id: "gpt-6-sol" }, { id: "gpt-6.2-sol" }], async () => {
+    const taskId = await createCodexTask("gpt-6-sol");
+    const started = await startTask(taskId);
+    expect("error" in started).toBe(false);
+    await settle();
+    expect(runs.listForTask(taskId).length).toBe(1);
+  });
+});
+
+test("an empty catalog leaves the table behavior untouched, and the skip env wins over a missing-model verdict", async () => {
+  process.env.FAKE_CODEX_VERSION = "codex-cli 0.147.0";
+  const { startTask } = await import("./orchestrator.ts");
+  // Empty discovery: the table still refuses gpt-6-sol on 0.147.0.
+  const refused = await startTask(await createCodexTask("gpt-6-sol"));
+  expect("error" in refused).toBe(true);
+  if ("error" in refused) expect(refused.error).toContain("0.155.0");
+
+  process.env.AGETOR_SKIP_CLI_VERSION_FLOOR = "1";
+  try {
+    await withCodexCatalog([{ id: "gpt-6.2-sol" }], async () => {
+      const started = await startTask(await createCodexTask("gpt-5.6-sol"));
+      expect("error" in started).toBe(false);
+      await settle();
+    });
+  } finally {
+    delete process.env.AGETOR_SKIP_CLI_VERSION_FLOOR;
+  }
+});
+
+test("createTask with no model: the owner's default unless a trusted catalog lacks it, then the CLI's own default row", async () => {
+  const { createTask } = await import("./orchestrator.ts");
+  const { harnesses } = await import("./db.ts");
+  harnesses.setEnabled("codex", true);
+  const make = async () => {
+    const created = await createTask({ title: "default model", prompt: "x", agent: "codex", workdir: process.cwd(), isolation: "none", taskType: "task" });
+    if ("error" in created) throw new Error(created.error);
+    return created.task;
+  };
+  expect((await make()).model).toBe("gpt-6.1-sol"); // no catalog: DEFAULT_MODEL.codex
+  await withCodexCatalog([{ id: "gpt-6.2-sol", cliDefault: true }, { id: "gpt-6.2-astra" }], async () => {
+    expect((await make()).model).toBe("gpt-6.2-sol");
+  });
+  await withCodexCatalog([{ id: "gpt-6.1-sol" }, { id: "gpt-6.2-sol", cliDefault: true }], async () => {
+    expect((await make()).model).toBe("gpt-6.1-sol");
+  });
+  await withCodexCatalog([{ id: "gpt-6.2-sol" }], async () => {
+    expect((await make()).model).toBe("gpt-6.1-sol"); // trusted catalog without a CLI default: keep the owner's pick
+  });
+});

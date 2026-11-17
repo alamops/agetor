@@ -38,7 +38,7 @@ import {
   type SpawnedAgent,
 } from "./agents.ts";
 import { cachedCliVersion, checkHarness, peekCachedCliVersion, upgradeHintFor } from "./agent-status.ts";
-import { getDiscoveredEfforts, getDiscoveredModels, getHarnessDiscoveredModels } from "./agent-discovery.ts";
+import { getDiscoveredEfforts, getDiscoveredModels, getHarnessDiscoveredModels, type DiscoveredModel } from "./agent-discovery.ts";
 import { OPENCODE_DEFAULT_MODEL, formatOpencodeTurnBreadcrumb, opencodeMajor, type OpencodeTransport } from "../shared/opencode.ts";
 import { importedSessionOf } from "../shared/imported-session.ts";
 import { resolveClaudePlan, upsertClaudePlanFromExitPlanMode, upsertDetectedPlan } from "./task-plans.ts";
@@ -76,7 +76,9 @@ import {
   type RepoTeardownPlan,
   type TaskRepositoryInput,
 } from "../shared/types.ts";
-import { cliVersionSatisfies, formatMinCliVersionError } from "../shared/cli-version.ts";
+import { cliVersionSatisfies, formatMinCliVersionError, formatModelNotOfferedError } from "../shared/cli-version.ts";
+import { buildModelOptions, CLI_AUTHORITATIVE_CATALOG_KINDS, modelCatalogVerdict, resolveDefaultModel } from "../shared/model-catalog.ts";
+import { modelDisplayName } from "../shared/model-display.ts";
 import {
   FX_RESUME_UNSUPPORTED_TEXT,
   fxSupportsContinueRecovery,
@@ -8894,6 +8896,12 @@ async function sendCodexTurn(
 /** Env escape hatch for `minCliVersionError` — see its doc. */
 const SKIP_CLI_VERSION_FLOOR_ENV = "AGETOR_SKIP_CLI_VERSION_FLOOR";
 
+/** The CLI catalog a harness's pre-flight judges a model by: a codex harness's
+ *  own account-scoped list (never another account's), copilot's kind-level one. */
+function catalogForPreflight(harness: Harness): DiscoveredModel[] {
+  return harness.kind === "codex" ? getHarnessDiscoveredModels(harness.id) : getDiscoveredModels(harness.kind);
+}
+
 /**
  * Pre-flight 1b — per-model minimum CLI version (`MODEL_MIN_CLI_VERSION` in
  * `shared/types.ts`, today only codex's GPT-6 rows). OpenAI's codex model
@@ -8919,9 +8927,14 @@ const SKIP_CLI_VERSION_FLOOR_ENV = "AGETOR_SKIP_CLI_VERSION_FLOOR";
  * floors were verified on a ChatGPT-plan account, and an API-key codex
  * account on an older CLI may not be gated the same way.
  *
+ * Discovery first: for codex and copilot, a model the harness's own CLI
+ * catalog lists passes, and one a non-empty, trusted catalog lacks is refused
+ * with `formatModelNotOfferedError` (`modelCatalogVerdict`); the version
+ * table above is consulted only when discovery has nothing to say.
+ *
  * `status` is the caller's already-probed `checkHarness` result; when omitted
  * this probes itself — but only when the model actually has a floor (the
- * version probe is cheap and isn't cached for codex).
+ * version probe is cheap and isn't cached for codex) or a catalog to judge by.
  *
  * Callers — every path that can launch a floored model must call this before
  * minting a run row: `startTaskInner` (a task's first run and every re-run),
@@ -8942,9 +8955,33 @@ export async function minCliVersionError(
   try {
     const skip = process.env[SKIP_CLI_VERSION_FLOOR_ENV]?.trim().toLowerCase();
     if (skip === "1" || skip === "true" || skip === "on" || skip === "yes") return null;
+
+    // Discovery first (dynamic-model-catalog #14): for the kinds whose CLI
+    // catalog is authoritative (codex, copilot), a model the installed CLI
+    // lists is allowed whatever the frozen table says, and one a non-empty,
+    // trusted catalog lacks is refused with an "upgrade the CLI" message. Only
+    // when discovery has nothing to say does the version table below decide.
+    let probedForCatalog: HarnessStatus | undefined = status;
+    if (CLI_AUTHORITATIVE_CATALOG_KINDS.has(harness.kind)) {
+      const catalog = catalogForPreflight(harness);
+      if (catalog.length > 0) {
+        probedForCatalog = status ?? await checkHarness(harness);
+        const verdict = modelCatalogVerdict(harness.kind, modelId, catalog, probedForCatalog.loggedIn);
+        if (verdict === "offered") return null;
+        if (verdict === "missing") {
+          const rows = buildModelOptions(harness.kind, { discovered: catalog, loggedIn: probedForCatalog.loggedIn });
+          return formatModelNotOfferedError({
+            harnessLabel: harness.label,
+            installedRaw: probedForCatalog.version,
+            modelLabel: modelDisplayName(harness.kind, modelId, rows),
+            installHint: probedForCatalog.installHint ?? upgradeHintFor(harness.kind, probedForCatalog.path),
+          });
+        }
+      }
+    }
     const floor = MODEL_MIN_CLI_VERSION[harness.kind]?.[modelId];
     if (floor === undefined) return null;
-    const probed = status ?? await checkHarness(harness);
+    const probed = probedForCatalog ?? await checkHarness(harness);
     if (cliVersionSatisfies(probed.version, floor) !== false) return null;
     const modelLabel = AGENT_OPTIONS[harness.kind]?.models.find((m) => m.id === modelId)?.label ?? modelId;
     return formatMinCliVersionError({
@@ -12429,7 +12466,13 @@ export interface CreateTaskInternal {
 export function defaultEffortFor(kind: AgentKind, model: string, harnessId: string): string | null {
   const support = supportedEfforts(kind, model, getDiscoveredEfforts(kind, model, harnessId));
   if (support.length === 0) return null;
-  return support.some((o) => o.id === DEFAULT_EFFORT[kind]) ? DEFAULT_EFFORT[kind] : support[0]!.id;
+  if (support.some((o) => o.id === DEFAULT_EFFORT[kind])) return DEFAULT_EFFORT[kind];
+  // The owner's pick is not offered: the CLI's own default effort for this
+  // model (codex `defaultReasoningEffort`) is the next best, then the first row.
+  const rows = getHarnessDiscoveredModels(harnessId);
+  const row = (rows.length > 0 ? rows : getDiscoveredModels(kind)).find((m) => m.id === model);
+  if (row?.defaultEffort && support.some((o) => o.id === row.defaultEffort)) return row.defaultEffort;
+  return support[0]!.id;
 }
 
 /**
@@ -12719,7 +12762,9 @@ export async function createTask(
     return { error: `unknown harness "${agentId}"` };
   }
   const kind = harness.kind;
-  const model = defaultsProfile ? defaultsProfile.model : (input.model ?? DEFAULT_MODEL[kind]);
+  const model = defaultsProfile
+    ? defaultsProfile.model
+    : (input.model ?? resolveDefaultModel(kind, catalogForPreflight(harness), null));
   // Discovered efforts (e.g. Codex's own app-server catalog) win when the
   // harness reported a non-empty list for this model; the curated
   // MODEL_EFFORT_SUPPORT table is only the fallback (see

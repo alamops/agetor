@@ -35,6 +35,9 @@ beforeAll(() => {
 afterAll(() => {
   if (prevOpencodeBin === undefined) delete process.env.AGETOR_OPENCODE_BIN;
   else process.env.AGETOR_OPENCODE_BIN = prevOpencodeBin;
+  // `bun test` shares one process: leave no discovered catalog behind for a
+  // later file's pre-flight (a stale codex catalog would refuse its model).
+  __testing.resetForTests();
 });
 
 /* ── codex: parseCodexModelList (pure) ───────────────────────────────────

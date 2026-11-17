@@ -1102,6 +1102,42 @@ describe("a default-model task is checked against the backup's CLI floor (findin
   });
 });
 
+describe("discovery first: a CLI catalog decides model availability, the frozen table only when it says nothing", () => {
+  test("a codex backup whose own catalog lists a floored model is usable on an old CLI; with no catalog the table still refuses", async () => {
+    const { MODEL_MIN_CLI_VERSION } = await import("../shared/types.ts");
+    const discovery = await import("./agent-discovery.ts");
+    const agentStatus = await import("./agent-status.ts");
+    const model = "gpt-6-sol";
+    const floor = MODEL_MIN_CLI_VERSION.codex?.[model];
+    expect(floor).toBeDefined();
+    const binDirLocal = mkdtempSync(path.join("/tmp", "agetor-failover-codexcat-"));
+    const stub = path.join(binDirLocal, "codex");
+    writeFileSync(stub, '#!/bin/sh\necho "codex-cli 0.100.0"\n', { mode: 0o755 });
+    const prevBin = process.env.AGETOR_CODEX_BIN;
+    process.env.AGETOR_CODEX_BIN = stub;
+    seq++;
+    const id = `fo-codexcat-${seq}`;
+    const home = path.join(process.env.AGETOR_DATA_DIR!, "homes", id);
+    mkdirSync(path.join(home, ".codex"), { recursive: true });
+    writeFileSync(path.join(home, ".codex", "auth.json"), "{}");
+    dbm.harnesses.insert({ id, kind: "codex", label: id, home, env: {} } as never);
+    try {
+      await agentStatus.cachedCliVersion(dbm.harnesses.get(id)!);
+      const member = { harnessId: id, enabled: true, label: id };
+      const task = { model } as never;
+      discovery.__testing.resetForTests();
+      expect(fo.memberUnusableReason(member, task)).toBe(`CLI older than ${floor}`);
+      discovery.seedDiscoveryCache({ scope: "harness", kind: "codex", harnessId: id }, [{ id: model }]);
+      expect(fo.memberUnusableReason(member, task)).toBeNull();
+      discovery.seedDiscoveryCache({ scope: "harness", kind: "codex", harnessId: id }, [{ id: model }]);
+    } finally {
+      discovery.__testing.resetForTests();
+      if (prevBin === undefined) delete process.env.AGETOR_CODEX_BIN; else process.env.AGETOR_CODEX_BIN = prevBin;
+      rmSync(binDirLocal, { recursive: true, force: true });
+    }
+  });
+});
+
 describe("a 1-member stack is inert (22a) and prepare moves record `unavailable`", () => {
   let harnessSwapEvents: typeof import("./harness-swap-history.ts").harnessSwapEvents;
   beforeAll(async () => {
