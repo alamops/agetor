@@ -95,7 +95,7 @@ test("rule 3 / named case: scoped with a catalogOnly row present in discovered i
 
 // --- rule 4: unscoped, discovered non-empty -----------------------------
 
-test("rule 4: unscoped keeps all (non-gated) curated rows, then discovered-only ids", () => {
+test("rule 4: unscoped puts the CLI's rows first in CLI order, then curated-only rows", () => {
   const curated = curatedFixture();
   const discovered: DiscoveredModel[] = [
     { id: "openai/gpt-5.2" }, // already curated — should not duplicate
@@ -103,10 +103,73 @@ test("rule 4: unscoped keeps all (non-gated) curated rows, then discovered-only 
   ];
   const result = mergeModelOptions({ curated, discovered, scoped: false, selected: null });
   expect(result).toEqual([
-    { id: "zai/glm-5.3-flash", label: "GLM 5.3 Flash", hint: "Default" },
     { id: "openai/gpt-5.2", label: "GPT-5.2" },
     { id: "e2e/discovered-only", label: "e2e/discovered-only" },
+    { id: "zai/glm-5.3-flash", label: "GLM 5.3 Flash", hint: "Default" },
   ]);
+});
+
+test("rule 4: a new CLI model leads the list; curated label/hint overlay a CLI row; curated-only rows follow in curated order", () => {
+  const curated: CuratedModel[] = [
+    { id: "mythos-5.2", label: "Mythos 5.2" },
+    { id: "opus-5.5", label: "Opus 5.5", hint: "Curated hint" },
+    { id: "haiku-4.5", label: "Haiku 4.5" },
+  ];
+  const discovered: DiscoveredModel[] = [
+    { id: "opus-6", label: "Opus 6", description: "The new one" },
+    { id: "opus-5.5", label: "CLI Opus 5.5", description: "CLI description" },
+  ];
+  const result = mergeModelOptions({ curated, discovered, scoped: false });
+  expect(result).toEqual([
+    { id: "opus-6", label: "Opus 6", hint: "The new one" },
+    { id: "opus-5.5", label: "Opus 5.5", hint: "Curated hint" },
+    { id: "mythos-5.2", label: "Mythos 5.2" },
+    { id: "haiku-4.5", label: "Haiku 4.5" },
+  ]);
+});
+
+test("rule 4: a pinned curated row stays first even when the CLI does not list it", () => {
+  const curated: CuratedModel[] = [
+    { id: "auto", label: "Auto", pinned: true },
+    { id: "gpt-5", label: "GPT-5" },
+  ];
+  const discovered: DiscoveredModel[] = [{ id: "gpt-7", label: "GPT-7" }, { id: "gpt-5" }];
+  const result = mergeModelOptions({ curated, discovered, scoped: false });
+  expect(result.map((r) => r.id)).toEqual(["auto", "gpt-7", "gpt-5"]);
+});
+
+test("rule 4: discovery-empty and logged-out fall back to curated order (rule 2)", () => {
+  const curated: CuratedModel[] = [{ id: "a", label: "A" }, { id: "b", label: "B" }];
+  const discovered: DiscoveredModel[] = [{ id: "z", label: "Z" }];
+  expect(mergeModelOptions({ curated, discovered: [], scoped: false }).map((r) => r.id)).toEqual(["a", "b"]);
+  expect(mergeModelOptions({ curated, discovered, scoped: false, loggedIn: false }).map((r) => r.id)).toEqual(["a", "b"]);
+});
+
+test("rule 8: the new discovery fields are copied from a trusted entry, never as false/empty", () => {
+  const curated: CuratedModel[] = [{ id: "gpt-6", label: "GPT-6" }];
+  const discovered: DiscoveredModel[] = [
+    {
+      id: "gpt-6", efforts: ["low", "high"], effortLabels: { low: "Light" }, defaultEffort: "low", cliDefault: true,
+      fast: true, fastHint: "2x speed", fastTier: "priority", defaultFast: true,
+    },
+    { id: "gpt-7", fast: false, effortLabels: {}, cursor: {} },
+  ];
+  const [a, b] = mergeModelOptions({ curated, discovered, scoped: false });
+  expect(a).toEqual({
+    id: "gpt-6", label: "GPT-6", efforts: ["low", "high"], effortLabels: { low: "Light" }, defaultEffort: "low",
+    cliDefault: true, fast: true, fastHint: "2x speed", fastTier: "priority", defaultFast: true,
+  });
+  expect(b).toEqual({ id: "gpt-7", label: "gpt-7" });
+  // Distrusted (logged out): nothing is copied.
+  const out = mergeModelOptions({ curated, discovered, scoped: false, loggedIn: false });
+  expect(out).toEqual([{ id: "gpt-6", label: "GPT-6" }]);
+});
+
+test("rule 8: a discovered cursor variant map is copied as a fresh object", () => {
+  const cursor = { effortIds: { high: "gpt-7-high" }, fastEfforts: ["high"], fastId: undefined };
+  const [row] = mergeModelOptions({ curated: [], discovered: [{ id: "gpt-7", cursor }], scoped: false });
+  expect(row?.cursor).toEqual({ effortIds: { high: "gpt-7-high" }, fastEfforts: ["high"] });
+  expect(row?.cursor).not.toBe(cursor);
 });
 
 test("named case: unscoped result is byte-identical to [...curated(non-gated), ...extras]", () => {
@@ -118,19 +181,27 @@ test("named case: unscoped result is byte-identical to [...curated(non-gated), .
   ];
   const result = mergeModelOptions({ curated, discovered, scoped: false, selected: null });
 
-  const nonGatedCurated = curated
-    .filter((m) => !m.catalogOnly || discovered.some((d) => d.id === m.id))
+  // The CLI's order wins: its rows first (a curated row supplying the label
+  // when the id has one), then the non-gated curated rows it did not list.
+  const curatedById = new Map(curated.map((m) => [m.id, m] as const));
+  const fromCli = discovered.map((m) => {
+    const c = curatedById.get(m.id);
+    const opt: { id: string; label: string; hint?: string } = c
+      ? { id: c.id, label: c.label }
+      : { id: m.id, label: m.label ?? m.id };
+    if (c?.hint !== undefined) opt.hint = c.hint;
+    return opt;
+  });
+  const listed = new Set(discovered.map((m) => m.id));
+  const curatedOnly = curated
+    .filter((m) => !m.catalogOnly && !listed.has(m.id))
     .map((m) => {
       const opt: { id: string; label: string; hint?: string } = { id: m.id, label: m.label };
       if (m.hint !== undefined) opt.hint = m.hint;
       return opt;
     });
-  const curatedIds = new Set(curated.map((m) => m.id));
-  const extras = discovered
-    .filter((m) => !curatedIds.has(m.id))
-    .map((m) => ({ id: m.id, label: m.label ?? m.id }));
 
-  expect(result).toEqual([...nonGatedCurated, ...extras]);
+  expect(result).toEqual([...fromCli, ...curatedOnly]);
 });
 
 // --- rule 5: dedupe by id, first occurrence wins ------------------------
@@ -311,10 +382,10 @@ test("rule 7: loggedIn true/null/omitted are all identical to today's (unchanged
   const withNull = mergeModelOptions({ curated, discovered, scoped: false, selected: null, loggedIn: null });
   const omitted = mergeModelOptions({ curated, discovered, scoped: false, selected: null });
   const expected: ModelOption[] = [
-    { id: "zai/glm-5.3-flash", label: "GLM 5.3 Flash", hint: "Default" },
     { id: "openai/gpt-5.2", label: "GPT-5.2" },
     { id: "anthropic/claude-opus-5", label: "Claude Opus 5", hint: "Premium" },
     { id: "e2e/discovered-only", label: "e2e/discovered-only" },
+    { id: "zai/glm-5.3-flash", label: "GLM 5.3 Flash", hint: "Default" },
   ];
   expect(withTrue).toEqual(expected);
   expect(withNull).toEqual(expected);
