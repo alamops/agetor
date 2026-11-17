@@ -88,6 +88,8 @@ export interface PullTargetsInput {
   storedBase?: string | null;
   storedBaseSha?: string | null;
   liveHead?: string | null;
+  /** `false`: don't list the forge's branches; existence is asked per name. Default true. */
+  listBranches?: boolean;
 }
 
 /** A branch name that may reach a git argv or a forge URL. */
@@ -169,7 +171,12 @@ export async function pullTargets(
     defaultBranch = forge.ok ? forge.name : null;
   }
 
-  const listing = await deps.listBranches({ dir, info, maxPages: BRANCH_LIST_MAX_PAGES });
+  // Skipping the listing reads as a truncated, empty one: every name is then
+  // asked of the forge individually (one request per name, not up to ten pages).
+  const listing: Awaited<ReturnType<PullTargetsDeps["listBranches"]>> =
+    input.listBranches === false
+      ? { ok: true, branches: [], truncated: true }
+      : await deps.listBranches({ dir, info, maxPages: BRANCH_LIST_MAX_PAGES });
   const listed = listing.ok ? listing.branches.slice(0, BRANCH_CAP) : [];
   const truncated = listing.ok ? listing.truncated || listing.branches.length > BRANCH_CAP : false;
   const byName = new Map(listed.map((b) => [b.name, b]));

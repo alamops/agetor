@@ -1213,9 +1213,12 @@ export const api = {
     storedBase?: string | null;
     storedBaseSha?: string | null;
     liveHead?: string | null;
+    /** `false` skips the forge branch listing (existence is then looked up by name). */
+    listBranches?: boolean;
   }) => {
     const q = new URLSearchParams({ path: input.path });
     for (const head of input.heads) q.append("head", head);
+    if (input.listBranches === false) q.set("branches", "none");
     if (input.storedBase) q.set("storedBase", input.storedBase);
     if (input.storedBaseSha) q.set("storedBaseSha", input.storedBaseSha);
     if (input.liveHead) q.set("liveHead", input.liveHead);

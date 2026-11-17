@@ -184,6 +184,23 @@ describe("branch facts", () => {
     ]);
   });
 
+  test("listBranches:false never lists; each name is asked of the forge individually", async () => {
+    const { dir } = await makeRepo();
+    let listed = 0;
+    const deps = depsFor({ branches: [{ name: "main", sha: null }], extra: { deep: { name: "deep", sha: null } } });
+    const res = await pullTargets(
+      { dir, heads: ["deep", "nope"], storedBase: "deep", listBranches: false },
+      { ...deps, listBranches: async () => { listed += 1; return { ok: true, branches: [], truncated: false }; } },
+    );
+    expect(listed).toBe(0);
+    expect(res.ok && res.branches).toEqual([]);
+    expect(res.ok && res.heads).toEqual([
+      { name: "deep", onRemote: true },
+      { name: "nope", onRemote: false },
+    ]);
+    expect(res.ok && res.storedBase?.onRemote).toBe(true);
+  });
+
   test("a failed listing leaves existence unknown and reports the error", async () => {
     const { dir } = await makeRepo();
     const res = await pullTargets({ dir, heads: ["a"], storedBase: "b" }, depsFor({ listError: "rate limited" }));

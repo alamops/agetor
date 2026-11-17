@@ -3786,9 +3786,12 @@ function RunPanelBody({
     [task, gitStatus, identityVersion],
   );
   const prRepoPathsKey = prRepos.map((r) => r.projectPath).join("\0");
+  // `gitStatus` re-polls every few seconds, which is the revalidation tick: a
+  // fresh entry makes `loadProviderIdentity` a no-op, an expired one refetches
+  // while `cachedProviderIdentity` keeps serving the stale identity.
   useEffect(() => {
     for (const path of prRepoPathsKey.split("\0")) if (path) void loadProviderIdentity(path);
-  }, [prRepoPathsKey]);
+  }, [prRepoPathsKey, gitStatus]);
   const proposalsIdle = task.column !== "running";
   const runProposals = useMemo<readonly RunProposal[]>(
     () => (proposalsIdle ? collectRunProposals(events) : []),

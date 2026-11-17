@@ -690,6 +690,9 @@ function consumeWsTicket(ticket: string | null, terminalId: string): boolean {
   return entry.expiresAt > Date.now() && entry.terminalId === terminalId;
 }
 
+/** `GET /github/pull-targets` takes at most this many `head` parameters. */
+const MAX_PULL_TARGET_HEADS = 20;
+
 /**
  * Fields callers may patch on a task. Everything else is server-managed —
  * including, additively, `agentProfileId`/`agentProfile` (docs/plans/
@@ -716,9 +719,6 @@ function consumeWsTicket(ticket: string | null, terminalId: string): boolean {
  * run start/settle, terminal open and archive — a PATCH carrying it is
  * silently ignored like every other unlisted field.
  */
-/** `GET /github/pull-targets` takes at most this many `head` parameters. */
-const MAX_PULL_TARGET_HEADS = 20;
-
 const ALLOWED_PATCH_FIELDS = new Set<keyof Task>([
   "title", "prompt", "agent", "workdir", "column", "mode", "model", "effort", "speed", "fast", "maxMode", "taskType",
   "opencodeServer",
@@ -3384,7 +3384,14 @@ export function startApiServer(
           if (storedBaseSha !== null && !/^[0-9a-f]{7,64}$/i.test(storedBaseSha)) {
             return json({ error: "storedBaseSha must be a hex commit sha" }, { status: 400, headers: corsHeaders(req) });
           }
-          const result = await pullTargets({ dir, heads, storedBase, storedBaseSha, liveHead });
+          const result = await pullTargets({
+            dir,
+            heads,
+            storedBase,
+            storedBaseSha,
+            liveHead,
+            listBranches: url.searchParams.get("branches") !== "none",
+          });
           if (!result.ok) return json({ error: result.error }, { status: 400, headers: corsHeaders(req) });
           return json(result, { headers: corsHeaders(req) });
         }),

@@ -5,6 +5,13 @@
 // switched panel must not refetch. Entries live 5 minutes (30 s for a failure,
 // so a repository that gains a remote isn't stuck as "unknown"); in-flight
 // requests are shared. `useSyncExternalStore` consumers subscribe for updates.
+//
+// Stale-while-revalidate: an expired entry is still *served* by
+// `cachedProviderIdentity` (a remote's identity almost never changes, and
+// dropping it to `undefined` would make every link-matched proposal head fall
+// out of the Create-all-PRs gate until the next fetch lands), while
+// `loadProviderIdentity` refetches it. A failed refresh keeps the last good
+// identity and retries after the short TTL.
 import type { RepoIdentity } from "./pr-link.ts";
 
 const TTL_MS = 5 * 60_000;
@@ -47,36 +54,57 @@ export function providerInfoVersion(): number {
   return version;
 }
 
-/** The cached identity: `undefined` when not loaded (or expired), `null` when known to have none. */
+/**
+ * The cached identity: `undefined` when never loaded, `null` when known to have
+ * none. An expired entry is returned as is (stale-while-revalidate) unless it
+ * is a failed lookup, which stops counting once its short TTL has passed.
+ */
 export function cachedProviderIdentity(path: string, now = Date.now()): RepoIdentity | null | undefined {
   const e = entries.get(path);
-  if (!e || e.expiresAt <= now) return undefined;
+  if (!e) return undefined;
+  if (e.expiresAt <= now && e.value === null) return undefined;
   return e.value;
 }
 
+/** Whether a path has no entry, or an entry past its TTL (so a load would refetch). */
+export function providerIdentityNeedsRefresh(path: string, now = Date.now()): boolean {
+  const e = entries.get(path);
+  return !e || e.expiresAt <= now;
+}
+
 /**
- * Load a project's identity, deduping in-flight calls. A cache hit resolves
- * immediately. A failed lookup is cached as `null` for 30 s.
+ * Load a project's identity, deduping in-flight calls. A fresh hit resolves
+ * immediately; an expired entry is refetched (readers keep seeing the stale
+ * value meanwhile). A failed lookup is cached as `null` for 30 s, or leaves the
+ * last good identity in place for 30 s.
  */
 export function loadProviderIdentity(path: string): Promise<RepoIdentity | null> {
-  const hit = cachedProviderIdentity(path);
-  if (hit !== undefined) return Promise.resolve(hit);
+  if (!providerIdentityNeedsRefresh(path)) return Promise.resolve(entries.get(path)!.value);
   const pending = inflight.get(path);
   if (pending) return pending;
-  if (!fetcher) return Promise.resolve(null);
+  if (!fetcher) return Promise.resolve(entries.get(path)?.value ?? null);
+  const previous = entries.get(path)?.value ?? null;
   const request = fetcher(path)
     .then(
       (value) => ({ value, ttl: TTL_MS }),
-      () => ({ value: null as RepoIdentity | null, ttl: ERROR_TTL_MS }),
+      // Keep the last good identity across a failed refresh.
+      () => ({ value: previous, ttl: ERROR_TTL_MS }),
     )
     .then(({ value, ttl }) => {
+      const before = entries.get(path);
       entries.set(path, { value, expiresAt: Date.now() + ttl });
       inflight.delete(path);
-      notify();
+      // Readers only need a re-render when what they would read changed.
+      if (!before || !sameIdentity(before.value, value)) notify();
       return value;
     });
   inflight.set(path, request);
   return request;
+}
+
+function sameIdentity(a: RepoIdentity | null, b: RepoIdentity | null): boolean {
+  if (a === b) return true;
+  return a !== null && b !== null && a.host === b.host && a.owner === b.owner && a.name === b.name;
 }
 
 /** Test seam: forget every entry and request. */

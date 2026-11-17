@@ -110,6 +110,8 @@ describe("CreatePrsDialogView", () => {
     expect(createBlocked([])).toBe(true);
     expect(createBlocked([row()])).toBe(false);
     expect(createBlocked([row({ baseError: "e" })])).toBe(true);
+    expect(createBlocked([row({ title: "  " })])).toBe(true);
+    expect(createBlocked([row(), row({ key: "k2", checked: false, title: "" })])).toBe(false);
     // An unchecked row's error doesn't block the others.
     expect(createBlocked([row(), row({ key: "k2", checked: false, baseError: "e" })])).toBe(false);
   });

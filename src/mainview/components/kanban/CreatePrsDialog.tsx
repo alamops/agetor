@@ -1,12 +1,13 @@
 import { useCallback, useEffect, useRef, useState } from "react";
 import { toast } from "sonner";
-import { ExternalLink, GitPullRequest, Loader2, TriangleAlert } from "lucide-react";
+import { ExternalLink as ExternalLinkIcon, GitPullRequest, Loader2, TriangleAlert } from "lucide-react";
 import { api } from "@/lib/api";
 import { Badge } from "@/components/ui/badge";
 import { Button } from "@/components/ui/button";
 import { Dialog } from "@/components/ui/dialog";
 import { Input } from "@/components/ui/input";
 import { Select } from "@/components/ui/select";
+import { ExternalLink } from "./md-components";
 import type { RunEvent, Task } from "../../../shared/types.ts";
 import type { TaskGitStatus } from "@/lib/commit-push";
 import { loadProviderIdentity } from "@/lib/provider-info-cache";
@@ -33,10 +34,17 @@ export function creatableRowCount(rows: readonly PrRow[]): number {
   return rows.filter((r) => r.checked && r.disabledReason === null).length;
 }
 
-/** Whether Create is blocked: nothing to create, or a checked row's base is invalid. */
+/**
+ * Whether Create is blocked: nothing to create, or a checked row has an invalid
+ * base or an empty title. The row shows the problem; the user fixes it or
+ * unchecks the row (the batch itself would skip such a row, never open it).
+ */
 export function createBlocked(rows: readonly PrRow[]): boolean {
   const n = creatableRowCount(rows);
-  return n === 0 || rows.some((r) => r.checked && r.disabledReason === null && r.baseError !== null);
+  return (
+    n === 0 ||
+    rows.some((r) => r.checked && r.disabledReason === null && (r.baseError !== null || r.title.trim() === ""))
+  );
 }
 
 export interface CreatePrsDialogViewProps {
@@ -72,9 +80,9 @@ function ResultLine({ result, slug }: { result: PrRowResult; slug: string }) {
         <p className="flex items-center gap-1 text-xs text-success" data-testid={testId}>
           Created ·{" "}
           {safeHref(result.url) ? (
-            <a className="inline-flex items-center gap-1 underline" href={safeHref(result.url)!} target="_blank" rel="noreferrer">
-              View <ExternalLink className="size-3" />
-            </a>
+            <ExternalLink className="inline-flex items-center gap-1 underline" href={safeHref(result.url)!}>
+              View <ExternalLinkIcon className="size-3" />
+            </ExternalLink>
           ) : (
             "done"
           )}
@@ -87,9 +95,9 @@ function ResultLine({ result, slug }: { result: PrRowResult; slug: string }) {
           {safeHref(result.url) ? (
             <>
               {" · "}
-              <a className="underline" href={safeHref(result.url)!} target="_blank" rel="noreferrer">
+              <ExternalLink className="underline" href={safeHref(result.url)!}>
                 View
-              </a>
+              </ExternalLink>
             </>
           ) : null}
         </p>

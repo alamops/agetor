@@ -8,6 +8,7 @@ import {
   buildPrPlan,
   chooseBase,
   editPrRow,
+  headHasPr,
   normalizeAgentBase,
   proposalHeadsNeedingPr,
   runPrBatch,
@@ -374,6 +375,20 @@ describe("proposalHeadsNeedingPr", () => {
   });
 });
 
+describe("headHasPr", () => {
+  const legacy: TaskPr = { url: "https://x/1", head: null, base: null, number: 1, createdAt: 1 };
+
+  test("a converted legacy PR (no head) covers the live head only", () => {
+    const r = repo({ name: "app", prs: [legacy] });
+    expect(headHasPr("t1", r, "feature/login")).toBe(true);
+    expect(headHasPr("t1", r, "feature/docs")).toBe(false);
+  });
+
+  test("without a live head a legacy PR covers nothing", () => {
+    expect(headHasPr("t1", repo({ name: "app", prs: [legacy], liveHead: null }), "feature/login")).toBe(false);
+  });
+});
+
 describe("runPrBatch", () => {
   const mkRow = (over: Partial<PrRow>): PrRow => ({
     key: "app::a",
@@ -423,6 +438,21 @@ describe("runPrBatch", () => {
     expect(results).toContainEqual(["r4", "skipped"]);
     expect(results).toContainEqual(["r2", "failed"]);
     expect(results.find(([k]) => k === "r3")).toBeUndefined();
+  });
+
+  test("a checked row with an empty title is skipped, never created", async () => {
+    const results: PrRowResult[] = [];
+    let created = 0;
+    const summary = await runPrBatch("t1", [mkRow({ title: "   " })], {
+      createPull: async () => {
+        created += 1;
+        return { url: "u" };
+      },
+      onResult: (_k, r) => results.push(r),
+    });
+    expect(created).toBe(0);
+    expect(summary.created).toBe(0);
+    expect(results).toEqual([{ status: "skipped", reason: "A title is required." }]);
   });
 
   test("an already-exists answer is 'already open' with its URL, not a failure", async () => {

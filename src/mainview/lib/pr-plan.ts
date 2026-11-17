@@ -93,6 +93,8 @@ export interface PullTargetsQuery {
   storedBase?: string | null;
   storedBaseSha?: string | null;
   liveHead?: string | null;
+  /** `false`: skip the forge branch listing (the single chip needs only its own head and base). */
+  listBranches?: boolean;
 }
 
 export interface PrPlanDeps {
@@ -365,9 +367,19 @@ function isValidBranchName(name: string): boolean {
   return name.length > 0 && !name.startsWith("-") && validateBranchName(name).ok;
 }
 
-/** Whether a head already has a PR: recorded on the task, or opened by a batch this session. */
-export function headHasPr(taskId: string, repo: Pick<PrPlanRepo, "name" | "prs">, head: string): boolean {
-  return !!prForHead(repo.prs, head) || prOpenedInSession(taskId, repo.name, head);
+/**
+ * Whether a head already has a PR: recorded on the task, opened by a batch this
+ * session, or (for the live head only) a converted legacy record with no head,
+ * which `livePr` also treats as the live checkout's PR, so the gate and the
+ * header agree.
+ */
+export function headHasPr(
+  taskId: string,
+  repo: Pick<PrPlanRepo, "name" | "prs"> & { liveHead?: string | null },
+  head: string,
+): boolean {
+  if (prForHead(repo.prs, head) || prOpenedInSession(taskId, repo.name, head)) return true;
+  return repo.liveHead === head && repo.prs.some((p) => p.head === null);
 }
 
 /**
@@ -524,6 +536,8 @@ export async function buildPrPlan(input: PrPlanInput, deps: PrPlanDeps): Promise
           storedBase: repo.storedBase,
           storedBaseSha: repo.storedBaseSha,
           liveHead: repo.liveHead,
+          // The single chip needs only its own head and base, which are looked up by name.
+          ...(input.liveHeadOnly ? { listBranches: false } : {}),
         });
         return { repo, attributed, targets, targetsError: null };
       } catch (e) {
@@ -591,6 +605,10 @@ export async function runPrBatch(taskId: string, rows: readonly PrRow[], deps: P
       // Re-checked here, not only when planned: an extra head is opened only after an explicit tick on a branch the forge listed.
       if (row.disabledReason !== null || row.baseError !== null) {
         deps.onResult(row.key, { status: "skipped", reason: row.disabledReason ?? row.baseError ?? "not ready" });
+        continue;
+      }
+      if (!row.title.trim()) {
+        deps.onResult(row.key, { status: "skipped", reason: "A title is required." });
         continue;
       }
       deps.onResult(row.key, { status: "creating" });

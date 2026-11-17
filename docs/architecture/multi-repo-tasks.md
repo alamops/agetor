@@ -374,7 +374,9 @@ resolved by `resolveBaseBranchName` beside the pinned `baseRef` sha) unless git
 proves it stale, then the agent's `Base:` line (else its link's base), then the
 remote default (`<remote>/HEAD`, else the forge's default branch, never a guessed
 `main`). An extra head never uses the stored base. A base missing on the remote
-errors that row only. The agent's value is normalized (`refs/heads/` and
+errors that row: the row shows the error, Create stays disabled until the base is
+changed or the row unchecked, and a batch that is run anyway skips such a row
+(an empty title is handled the same way). The agent's value is normalized (`refs/heads/` and
 `<remote>/` stripped; an invalid branch name is dropped).
 
 **Stale** (`pullTargets`, `src/bun/pr-targets.ts`): the stored base is stale when
@@ -387,7 +389,8 @@ local, and the tip is used only when that object is already present.
 
 **Remote facts** come from the forge's REST API, not `git ls-remote`
 (`GET /github/pull-targets`: identity, remotes, default branch, up to 1,000
-branch names, whether each head and the stored base exist). The forge is the
+branch names, whether each head and the stored base exist; `branches=none` skips
+the listing, which the single chip uses, and asks the forge per name instead). The forge is the
 system that accepts or rejects the PR, its API is reachable with the token the PR
 needs anyway, and it is the only source the e2e GitHub stub can serve. Branch
 names reach git argv only after `validateBranchName` and a leading-`-` check.
