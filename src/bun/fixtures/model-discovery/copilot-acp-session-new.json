@@ -1,0 +1,30 @@
+{
+  "sessionId": "sess_fixture_0001",
+  "modes": { "currentModeId": "agent", "availableModes": [{ "id": "agent", "name": "Agent" }] },
+  "models": {
+    "currentModelId": "claude-sonnet-4.5",
+    "availableModels": [
+      { "modelId": "claude-sonnet-4.5", "name": "Claude Sonnet 4.5", "description": "Balanced model." },
+      { "modelId": "gpt-5", "name": "GPT-5", "description": "OpenAI flagship." }
+    ]
+  },
+  "configOptions": [
+    {
+      "id": "model", "name": "Model", "category": "model", "type": "select", "currentValue": "claude-sonnet-4.5",
+      "options": [
+        { "value": "claude-sonnet-4.5", "name": "Claude Sonnet 4.5", "description": "Balanced model." },
+        { "value": "gpt-5", "name": "GPT-5", "description": "OpenAI flagship." },
+        { "value": "gpt-5-mini", "name": "GPT-5 mini", "description": "Fast and cheap." }
+      ]
+    },
+    {
+      "id": "reasoning_effort", "name": "Reasoning effort", "category": "thought_level", "type": "select", "currentValue": "medium",
+      "options": [
+        { "value": "low", "name": "Low" },
+        { "value": "medium", "name": "Medium" },
+        { "value": "high", "name": "High" },
+        { "value": "turbo", "name": "Turbo Think" }
+      ]
+    }
+  ]
+}

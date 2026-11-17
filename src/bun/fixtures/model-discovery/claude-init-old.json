@@ -1,0 +1,24 @@
+{
+ "models": [
+  {
+   "value": "default",
+   "displayName": "Default (recommended)",
+   "description": "Opus 5.5 \u00b7 Best for everyday, complex tasks"
+  },
+  {
+   "value": "opus",
+   "displayName": "Opus 5.5",
+   "description": "For complex work and everyday tasks"
+  },
+  {
+   "value": "sonnet",
+   "displayName": "Sonnet 5.5",
+   "description": "Most efficient for simpler tasks"
+  },
+  {
+   "value": "haiku",
+   "displayName": "Haiku 5.5",
+   "description": "Fastest for quick answers"
+  }
+ ]
+}

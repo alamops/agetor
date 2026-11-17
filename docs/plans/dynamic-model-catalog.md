@@ -6,9 +6,9 @@
 | Source | Pipeline task "Alamo Pipeline (No Video)" (goal quoted in §1; it lives outside the repo) + `docs/plans/dynamic-model-catalog-investigation.md` + `docs/plans/dynamic-model-catalog-grill.md` (32 decisions, rounds in `docs/plans/dynamic-model-catalog-grill/round-{1,2,3}/`) |
 | Flags | none |
 | Gates | grilled + approved by owner (2026-11-17: one PR; copilot `auto` pinned) |
-| Status | planned |
-| Branch | TBD — set when execution starts (the pipeline worktree is on `feature/agetor-dynamic-model-list`) |
-| Base SHA | TBD — set when execution starts (HEAD at planning: `32aa7c3a`) |
+| Status | executing (wave 0) |
+| Branch | `feature/agetor-dynamic-model-list` |
+| Base SHA | `32aa7c3a` (code base; docs commit `639bc187` on top) |
 
 ## 1. Objective & success criteria
 
