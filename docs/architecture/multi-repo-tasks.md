@@ -398,7 +398,11 @@ names reach git argv only after `validateBranchName` and a leading-`-` check.
 **Rows.** The live head's row starts checked; an extra head (a branch the agent
 proposed besides the live checkout) starts unchecked and is disabled unless the
 forge lists it. A head that already has a PR (recorded, or opened this session)
-has no row. A proposal-less row gets the root task's title (the pipeline parent's
+has no row. A repository whose live checkout isn't pushed (no live head) gets a
+disabled "branch is not pushed yet" placeholder when it has no PR and no proposal
+names that branch, and **still plans every other branch the agent proposed**, so
+the dialog offers exactly the heads `proposalHeadsNeedingPr` counts for the
+button's gate; keep the two in step. A proposal-less row gets the root task's title (the pipeline parent's
 for a step), an empty body and a hint. The user edits the base (a native select
 of remote branches) and the title before anything is created.
 

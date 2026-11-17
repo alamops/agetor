@@ -123,6 +123,28 @@ test("a forge outage degrades to branchesError instead of failing the request", 
   }
 });
 
+test("branches=none skips the branch listing and looks each name up on its own", async () => {
+  const dir = await makeGitHubRepo("acme", "chip");
+  fetchMock = mockGitHubFetch([
+    // No route for the list: a listing request would throw and surface as branchesError.
+    { match: /\/branches\/feature\/x$/, json: { name: "feature/x", commit: { sha: "c".repeat(40) } } },
+    { match: "https://api.github.com/repos/acme/chip", json: { default_branch: "main" } },
+  ]);
+  try {
+    const q = new URLSearchParams({ path: dir, head: "feature/x", branches: "none" });
+    const res = await get(`/github/pull-targets?${q}`);
+    expect(res.status).toBe(200);
+    const body = await res.json();
+    expect(body.branches).toEqual([]);
+    expect(body.branchesError).toBeNull();
+    expect(body.heads).toEqual([{ name: "feature/x", onRemote: true }]);
+    expect(fetchMock.calls.some((c) => c.url.includes("/branches?per_page"))).toBe(false);
+  } finally {
+    fetchMock.restore();
+    fetchMock = null;
+  }
+});
+
 test("pull-create passes a forge's already-exists classification through as code and existingUrl", async () => {
   const dir = await makeGitHubRepo("acme", "dupe");
   fetchMock = mockGitHubFetch([

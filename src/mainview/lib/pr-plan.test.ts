@@ -317,6 +317,53 @@ describe("row states", () => {
     expect(rows[0]).toMatchObject({ disabledReason: "branch is not pushed yet", checked: false });
   });
 
+  test("a repository with no pushed live head still plans its attributed extra branches, in step with the button's gate", async () => {
+    const reply = [
+      "https://github.com/acme/app/pull/new/feature/a",
+      block("A", "a body"),
+      "",
+      "https://github.com/acme/app/pull/new/feature/b",
+      block("B", "b body"),
+    ].join("\n");
+    const repos = [repo({ name: "app", liveHead: null, branch: "agetor/x" })];
+    const rows = await buildPrPlan(
+      input({ repos, events: [ev(reply)] }),
+      depsFor({ "/work/app": { branches: ["main", "feature/a", "feature/b"] } }),
+    );
+    expect(rows.map((r) => r.head).sort()).toEqual(["agetor/x", "feature/a", "feature/b"]);
+    const placeholder = rows.find((r) => r.head === "agetor/x")!;
+    expect(placeholder.disabledReason).toBe("branch is not pushed yet");
+    const extras = rows.filter((r) => r.head !== "agetor/x");
+    expect(extras.map((r) => [r.title, r.disabledReason, r.checked])).toEqual([
+      ["A", null, false],
+      ["B", null, false],
+    ]);
+    // The gate counts exactly the heads the dialog plans.
+    const gate = proposalHeadsNeedingPr({ taskId: "t1", repos, proposals: collectRunProposals([ev(reply)]), multi: true });
+    expect(gate.map((g) => g.head).sort()).toEqual(["feature/a", "feature/b"]);
+  });
+
+  test("a proposal for the unpushed branch itself replaces the placeholder row instead of duplicating its key", async () => {
+    const reply = ["https://github.com/acme/app/pull/new/agetor/x", block("X", "x body")].join("\n");
+    const rows = await buildPrPlan(
+      input({ repos: [repo({ name: "app", liveHead: null, branch: "agetor/x" })], events: [ev(reply)] }),
+      depsFor({}),
+    );
+    expect(rows).toHaveLength(1);
+    expect(rows[0]).toMatchObject({ head: "agetor/x", title: "X", checked: false });
+    expect(rows[0]!.disabledReason).not.toBeNull();
+  });
+
+  test("the forge branch listing is skipped only for the single chip", async () => {
+    const calls: Array<{ listBranches?: boolean }> = [];
+    const deps = depsFor({}, calls);
+    await buildPrPlan(input({ repos: [repo({ name: "app" })], events: [] }), deps);
+    await buildPrPlan(input({ repos: [repo({ name: "app" })], events: [], liveHeadOnly: true }), deps);
+    expect(calls).toHaveLength(2);
+    expect("listBranches" in calls[0]!).toBe(false);
+    expect(calls[1]!.listBranches).toBe(false);
+  });
+
   test("Closes #N goes only on the issue repository's live-head row", async () => {
     const reply = [
       "https://github.com/acme/app/pull/new/feature/login",

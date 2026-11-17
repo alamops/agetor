@@ -416,9 +416,13 @@ export function planPrRows(input: PrPlanInput, facts: RepoFacts): PrRow[] {
   const rows: PrRow[] = [];
 
   if (!repo.liveHead && !input.liveHeadOnly) {
-    // Nothing pushed to open a PR from yet. Only worth a row when the repository has no PR at all.
-    if (repo.prs.length === 0) {
-      const head = repo.branch ?? "";
+    // Nothing pushed to open a PR from yet. A placeholder row is only worth it
+    // when the repository has no PR at all and no proposal already names the
+    // branch (that proposal gets its own, equally disabled, row below). The
+    // proposals attributed to other branches still plan: they are counted by
+    // `proposalHeadsNeedingPr`, so the dialog must offer them too.
+    const head = repo.branch ?? "";
+    if (repo.prs.length === 0 && !attributed?.has(head)) {
       rows.push({
         key: prRowKey(repo.name, head),
         repoName: repo.name,
@@ -438,7 +442,6 @@ export function planPrRows(input: PrPlanInput, facts: RepoFacts): PrRow[] {
         hasProposal: false,
       });
     }
-    return rows;
   }
 
   const heads = input.liveHeadOnly ? (repo.liveHead ? [repo.liveHead] : []) : headsOf(repo, attributed);
