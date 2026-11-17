@@ -406,8 +406,10 @@ own row, **always disabled for the same reason even when the forge lists a branc
 pushed before**, and its base follows the live-head rules (the stored base unless
 git proved it stale), never the agent's, so a stale listing can't enable a row
 that retargets the base. The planner **still plans every other branch the agent proposed**, so
-the dialog offers exactly the heads `proposalHeadsNeedingPr` counts for the
-button's gate; keep the two in step. A proposal-less row gets the root task's title (the pipeline parent's
+the dialog offers the extra heads `proposalHeadsNeedingPr` counts for the
+button's gate; keep the two in step. The gate skips the unpushed heads
+themselves (their rows are always disabled, so they can't open a PR), and the
+task branch gets no placeholder when a drifted branch already has a row. A proposal-less row gets the root task's title (the pipeline parent's
 for a step), an empty body and a hint. The user edits the base (a native select
 of remote branches) and the title before anything is created.
 

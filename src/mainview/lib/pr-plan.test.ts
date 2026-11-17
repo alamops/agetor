@@ -380,8 +380,19 @@ describe("row states", () => {
     );
     const hotfix = rows.find((r) => r.head === "hotfix/y")!;
     expect(hotfix).toMatchObject({ checked: false, disabledReason: "branch is not pushed yet", base: "develop", baseSource: "task" });
-    // The placeholder for the task branch is still offered, disabled.
-    expect(rows.find((r) => r.head === "agetor/x")!.disabledReason).toBe("branch is not pushed yet");
+    // The drifted branch has its own row, so the task branch gets no placeholder.
+    expect(rows.map((r) => r.head)).toEqual(["hotfix/y"]);
+  });
+
+  test("a drifted branch with no proposal still gets the task branch's placeholder", async () => {
+    const rows = await buildPrPlan(
+      input({
+        repos: [repo({ name: "app", liveHead: null, branch: "agetor/x", pendingHeads: ["hotfix/y"], storedBase: "develop" })],
+        events: [],
+      }),
+      depsFor({}),
+    );
+    expect(rows.map((r) => [r.head, r.disabledReason])).toEqual([["agetor/x", "branch is not pushed yet"]]);
   });
 
   test("an extra head of a repository with a pushed live head is not treated as pending", async () => {
@@ -448,6 +459,41 @@ describe("row states", () => {
 });
 
 describe("proposalHeadsNeedingPr", () => {
+  const unpushed = (over: Partial<PrPlanRepo> = {}) =>
+    repo({ name: "app", liveHead: null, branch: "agetor/x", pendingHeads: ["hotfix/y"], ...over });
+  const proposalFor = (...heads: string[]) =>
+    collectRunProposals([ev(heads.map((h) => `https://github.com/acme/app/pull/new/${h}\n${block(h, "body")}`).join("\n\n"))]);
+
+  test("an unpushed repository's own and drifted branches never light the gate (multi)", () => {
+    const out = proposalHeadsNeedingPr({
+      taskId: "t1",
+      multi: true,
+      proposals: proposalFor("agetor/x", "hotfix/y"),
+      repos: [unpushed()],
+    });
+    expect(out).toEqual([]);
+  });
+
+  test("two pending heads give no gate on a single-repo task", () => {
+    const out = proposalHeadsNeedingPr({
+      taskId: "t1",
+      multi: false,
+      proposals: proposalFor("agetor/x", "hotfix/y"),
+      repos: [unpushed()],
+    });
+    expect(out).toEqual([]);
+  });
+
+  test("an extra head of an unpushed repository still counts", () => {
+    const out = proposalHeadsNeedingPr({
+      taskId: "t1",
+      multi: true,
+      proposals: proposalFor("agetor/x", "feature/docs"),
+      repos: [unpushed()],
+    });
+    expect(out).toEqual([{ repoName: "app", head: "feature/docs" }]);
+  });
+
   test("lists attributed heads without a PR", () => {
     const pr: TaskPr = { url: "https://x/1", head: "feature/login", base: null, number: 1, createdAt: 1 };
     const out = proposalHeadsNeedingPr({

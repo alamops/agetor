@@ -401,8 +401,9 @@ export function headHasPr(
 /**
  * Proposal heads that still need a pull request: every head a proposal is
  * attributed to, minus those that already have one (recorded or opened this
- * session). Backs the Create-all-PRs button's gate; the caller adds the live
- * head's own state.
+ * session), and minus the unpushed heads (`pendingHeadsOf`), whose rows can
+ * only be disabled. Backs the Create-all-PRs button's gate; the caller adds the
+ * live head's own state.
  */
 export function proposalHeadsNeedingPr(
   input: Pick<PrPlanInput, "taskId" | "repos" | "multi"> & { proposals: readonly RunProposal[] },
@@ -410,8 +411,11 @@ export function proposalHeadsNeedingPr(
   const attribution = attributeProposals(input.proposals, input.repos, { multi: input.multi });
   const out: Array<{ repoName: string; head: string }> = [];
   for (const repo of input.repos) {
+    // A pending head's row is always disabled (nothing pushed yet), so it can't
+    // open a PR and must not light the button.
+    const pending = pendingHeadsOf(repo);
     for (const head of attribution.get(repo.name)?.keys() ?? []) {
-      if (!headHasPr(input.taskId, repo, head)) out.push({ repoName: repo.name, head });
+      if (!pending.includes(head) && !headHasPr(input.taskId, repo, head)) out.push({ repoName: repo.name, head });
     }
   }
   return out;
@@ -427,7 +431,7 @@ export function proposalHeadsNeedingPr(
 function pendingHeadsOf(repo: Pick<PrPlanRepo, "liveHead" | "branch" | "pendingHeads">): string[] {
   if (repo.liveHead) return [];
   const out: string[] = [];
-  for (const h of [repo.branch, ...(repo.pendingHeads ?? [])]) if (h && !out.includes(h)) out.push(h);
+  for (const h of [...(repo.pendingHeads ?? []), repo.branch]) if (h && !out.includes(h)) out.push(h);
   return out;
 }
 
@@ -449,12 +453,12 @@ export function planPrRows(input: PrPlanInput, facts: RepoFacts): PrRow[] {
   if (!repo.liveHead && !input.liveHeadOnly) {
     // Nothing pushed to open a PR from yet. A placeholder row is only worth it
     // when the repository has no PR at all and no proposal already names the
-    // branch (that proposal gets its own row below, disabled for the same
+    // branch or the drifted live branch (that proposal gets its own row below, disabled for the same
     // reason, even when the forge lists a branch pushed before). The
     // proposals attributed to other branches still plan: they are counted by
     // `proposalHeadsNeedingPr`, so the dialog must offer them too.
     const head = repo.branch ?? "";
-    if (repo.prs.length === 0 && !attributed?.has(head)) {
+    if (repo.prs.length === 0 && !attributed?.has(head) && !pendingHeads.some((h) => attributed?.has(h))) {
       rows.push({
         key: prRowKey(repo.name, head),
         repoName: repo.name,
