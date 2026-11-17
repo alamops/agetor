@@ -298,7 +298,23 @@ export interface PendingTmuxPrompt {
    *  Chrome startup prompt). Display-only: `choices[].key` is still what the
    *  answer route validates. See `tmuxChoiceLabel`. */
   hideKeys?: boolean;
+  /** What the card asks of the user (absent ≡ `"choice"`): `"enter"` is an
+   *  Enter-only screen (a Continue button), `"code"` the OAuth code prompt (a
+   *  one-line text box). Both carry empty `choices`. */
+  answerKind?: "choice" | "enter" | "code";
+  /** True when the dialog refused the first confirm and the card was
+   *  re-registered: the first click did not take, choose again. */
+  held?: boolean;
 }
+
+/** Body of `POST /tmux-prompts/:id/answer`: exactly one member. `enter` only
+ *  on an `answerKind: "enter"` card, `code` only on an `answerKind: "code"`
+ *  card (one line, at most 512 characters). */
+export type TmuxPromptAnswerBody =
+  | { key: string }
+  | { reject: true }
+  | { enter: true }
+  | { code: string };
 
 /** The ACP tool call an fx permission request is asking about — mirrors
  *  `FxPermissionToolCall` on the server (`src/bun/interactions.ts`). Only
@@ -2239,8 +2255,8 @@ export const api = {
   /** Answer a tmux-pane-scraped REPL prompt. `key` must be one of the
    *  keys advertised on the request — the server validates against the
    *  recorded set before injecting keystrokes via `tmux send-keys`. */
-  answerTmuxPrompt: (id: string, body: { key: string } | { reject: true }) =>
-    j<{ ok: boolean }>(`/tmux-prompts/${id}/answer`, {
+  answerTmuxPrompt: (id: string, body: TmuxPromptAnswerBody) =>
+    j<{ ok: boolean; error?: string }>(`/tmux-prompts/${id}/answer`, {
       method: "POST",
       body: JSON.stringify(body),
     }),

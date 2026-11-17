@@ -1,0 +1,6 @@
+# claude 2.1.326 · live (numbered, no footer at boot)
+ Select login method:
+
+ ❯ 1. Claude account with subscription · Individual, Team, or Enterprise
+   2. Anthropic Console account · API usage billing
+   3. 3rd-party platform · Bedrock, Microsoft Foundry, Google Vertex AI

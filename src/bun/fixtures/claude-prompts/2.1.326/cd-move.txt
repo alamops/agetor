@@ -1,0 +1,16 @@
+# claude 2.1.326 · binary (/cd: 'Moving to a new directory:', 'No, stay put' / 'Yes, move here')
+────────────────────────────────────────────────────────────────────────────────
+ Moving to a new directory:
+ /Users/me/.agetor/worktrees/4c34cf8f-a6fd-4f75-865c-92d7dbafa101/repo-e
+ This directory is part of the repository at
+ /Users/me/Projects/acme/repo-e. Trusting it trusts
+ that whole repository, including its other worktrees and subdirectories.
+ This session hasn't worked here before. Is this a directory you created or one
+ you trust?
+ Claude Code'll be able to read, edit, and execute files here. Its skills,
+ commands, and agents load and can run commands, and so can the git settings of
+ its repository. Your answer holds for this session.
+ Security guide
+ ❯ No, stay put
+   Yes, move here
+ Enter to confirm · Esc to cancel

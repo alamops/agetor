@@ -6,6 +6,7 @@ import { randomUUID } from "node:crypto";
 // top-level use of `tasks` here.
 import { insertCursorAsk, resolveCursorAsk, runs, tasks } from "./db.ts";
 import { questionText } from "../shared/cursor-ask.ts";
+import { redactPaneSecrets } from "./claude-prompt-screens.ts";
 import type { RunEvent } from "../shared/types.ts";
 
 /**
@@ -247,7 +248,25 @@ export interface TmuxPromptRequest {
    *  reaches a keystroke or a fingerprint. Consumed in the webview through
    *  `tmuxChoiceLabel` (src/mainview/lib/tmux-prompt.ts). */
   hideKeys?: boolean;
+  /** What the card asks of the user. Absent ≡ `"choice"` (one button per
+   *  `choices` row, or the unparsable "answer it in the terminal" card).
+   *  `"enter"` is an Enter-only screen (`Login successful. Press Enter to
+   *  continue…`): no choices, one Continue action that sends a single Enter.
+   *  `"code"` is the OAuth `Paste code here if prompted >` screen: no choices,
+   *  one text box whose value is typed into the pane. Neither is ever
+   *  answered automatically. Both carry empty `choices` and are never
+   *  `unparsable` (docs/architecture/harness-claude-code.md). */
+  answerKind?: "choice" | "enter" | "code";
+  /** True on a card re-registered because the dialog refused the first
+   *  confirm and now shows its "held" footer (`To add it, press ↓ to Yes,
+   *  then Enter`): the user's click did not take, choose again. */
+  held?: boolean;
 }
+
+/** Answer sentinels for the two non-choice card kinds. The OAuth code itself
+ *  never enters the registry: the promise resolves with `__code__`. */
+export const TMUX_ENTER_ANSWER = "__enter__";
+export const TMUX_CODE_ANSWER = "__code__";
 
 export interface TmuxPromptAnswer {
   /** Must equal one of the keys advertised on the request. The route
@@ -780,7 +799,21 @@ export function registerTmuxPrompt(args: {
   /** Display-only: hide the synthetic `N. ` prefixes on the card. See
    *  `TmuxPromptRequest.hideKeys`. */
   hideKeys?: boolean;
+  /** See `TmuxPromptRequest.answerKind`. */
+  answerKind?: "choice" | "enter" | "code";
+  /** See `TmuxPromptRequest.held`. */
+  held?: boolean;
 }): { id: string; req: TmuxPromptRequest; answer: Promise<TmuxPromptAnswer> } {
+  // A non-choice card has nothing to pick from and nothing to hand to the
+  // unparsable "answer it in the terminal" branch; mixing them would let the
+  // route's closed allow-list disagree with what the card renders.
+  if (args.answerKind === "enter" || args.answerKind === "code") {
+    if (args.choices.length > 0 || args.unparsable === true) {
+      throw new Error(
+        `registerTmuxPrompt: answerKind '${args.answerKind}' takes no choices and is never unparsable`,
+      );
+    }
+  }
   // Defend the reserved-key namespace — `__external__` / `__cancelled__`
   // must be unambiguously sentinels, not legitimate user keystrokes.
   for (const c of args.choices) {
@@ -809,7 +842,10 @@ export function registerTmuxPrompt(args: {
     taskId: args.taskId,
     runId: args.runId,
     ...pipelineParentFor(args.taskId),
-    paneText: args.paneText,
+    // The ONE point every card's pane text passes through: a code typed into
+    // the OAuth prompt (in the terminal, or echoed back by the pane) must
+    // never be stored, broadcast over SSE or shown on a card.
+    paneText: redactPaneSecrets(args.paneText),
     choices: args.choices,
     cursorIndex: args.cursorIndex,
     nav: args.nav,
@@ -818,6 +854,8 @@ export function registerTmuxPrompt(args: {
     unparsable: args.unparsable,
     confirmKey: args.confirmKey,
     hideKeys: args.hideKeys,
+    ...(args.answerKind && args.answerKind !== "choice" ? { answerKind: args.answerKind } : {}),
+    ...(args.held ? { held: true } : {}),
   };
   const answer = new Promise<TmuxPromptAnswer>((resolve) => {
     tmuxPrompts.set(id, { req, resolve });

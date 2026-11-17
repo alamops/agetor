@@ -12,7 +12,7 @@ import {
   type Locator,
   type Page,
 } from "./fixtures";
-import { gotoApp, getPreferences, openSettingsGeneral, selectProject } from "./helpers";
+import { gotoApp, getPreferences, openSettingsHarnesses, selectProject } from "./helpers";
 // Pure constants/types only (no bun/node runtime imports — see
 // `src/shared/types.ts`'s own "Keep it free of runtime imports" rule), same
 // established pattern as `e2e/fx-models.spec.ts`'s `AGENT_OPTIONS` import —
@@ -899,13 +899,13 @@ test.describe("fx recovery", () => {
     }).toPass({ timeout: 3_000 });
   });
 
-  test("Settings → General: fx auto-resume toggle and delay round-trip through preferences", async ({
+  test("Settings → Harnesses → Behaviour: fx auto-resume toggle and delay round-trip through preferences", async ({
     page,
     request,
     backend,
   }) => {
     await gotoApp(page, backend.bootBase);
-    const dialog = await openSettingsGeneral(page);
+    const dialog = await openSettingsHarnesses(page);
 
     const toggle = dialog.getByTestId("settings-fx-auto-resume");
     await expect(toggle).toBeChecked(); // on by default — no earlier test in this worker wrote either pref key.

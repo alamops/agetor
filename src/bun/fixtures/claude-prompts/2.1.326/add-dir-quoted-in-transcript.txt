@@ -1,0 +1,12 @@
+# claude 2.1.326 · live (hand-built: a transcript quoting the dialog above an idle composer)
+● Claude said the dialog reads:
+  Adding a new directory:
+  /Users/me/.agetor/worktrees/4c34cf8f-a6fd-4f75-865c-92d7dbafa101/repo-e
+  ❯ No, exit
+    Yes, add it
+  Enter to confirm · Esc to cancel
+
+────────────────────────────────────────────────────────────────────────────────
+❯ 
+────────────────────────────────────────────────────────────────────────────────
+  ? for shortcuts
