@@ -22,6 +22,10 @@ export interface FakeCodexModel {
   hidden?: boolean;
   /** Reported as `supportedReasoningEfforts[].reasoningEffort`, in this order. */
   efforts?: string[];
+  /** Reported as `defaultReasoningEffort`: the first listed effort when the
+   *  key is absent (the original stub behavior), the explicit value (`null`
+   *  for "the CLI names no default") when present. */
+  defaultEffort?: string | null;
 }
 
 export interface FakeCodexAppServerOptions {
@@ -45,7 +49,7 @@ function toWire(m: FakeCodexModel): Record<string, unknown> {
     description: "",
     hidden: m.hidden ?? false,
     isDefault: false,
-    defaultReasoningEffort: m.efforts?.[0] ?? null,
+    defaultReasoningEffort: "defaultEffort" in m ? (m.defaultEffort ?? null) : (m.efforts?.[0] ?? null),
     supportedReasoningEfforts: (m.efforts ?? []).map((e) => ({ reasoningEffort: e, description: "" })),
     upgrade: null,
     upgradeInfo: null,
