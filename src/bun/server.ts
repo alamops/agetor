@@ -218,6 +218,7 @@ import {
 } from "./github.ts";
 import { remoteHostsForDirs } from "./git-provider.ts";
 import * as gitHost from "./git-host.ts";
+import { isSafeBranchName, pullTargets } from "./pr-targets.ts";
 import { getDiscoveredEfforts, getDiscoveredModels } from "./agent-discovery.ts";
 import {
   refreshAllModels,
@@ -300,7 +301,7 @@ import type {
   SwitchAccountRefusal,
   SwitchAccountResult,
 } from "../shared/types.ts";
-import { REMOTE_ACCESS_PREF_KEY } from "../shared/types.ts";
+import { REMOTE_ACCESS_PREF_KEY, validateBranchName } from "../shared/types.ts";
 import { armForceQuit, broadcastAppEvent, hasAppEventListeners, requestQuitCompletely, subscribeAppEvents } from "./quit-guard.ts";
 import { BOOT_GATE_EXEMPT_ALWAYS, BOOT_GATE_EXEMPT_HEADLESS, gateRoutesUntilReady } from "./boot-gate.ts";
 import {
@@ -715,6 +716,9 @@ function consumeWsTicket(ticket: string | null, terminalId: string): boolean {
  * run start/settle, terminal open and archive — a PATCH carrying it is
  * silently ignored like every other unlisted field.
  */
+/** `GET /github/pull-targets` takes at most this many `head` parameters. */
+const MAX_PULL_TARGET_HEADS = 20;
+
 const ALLOWED_PATCH_FIELDS = new Set<keyof Task>([
   "title", "prompt", "agent", "workdir", "column", "mode", "model", "effort", "speed", "fast", "maxMode", "taskType",
   "opencodeServer",
@@ -3344,6 +3348,44 @@ export function startApiServer(
           if (!result.ok) {
             return json({ error: result.error }, { status: 400, headers: corsHeaders(req) });
           }
+          return json(result, { headers: corsHeaders(req) });
+        }),
+      },
+
+      // Create-all-PRs facts for one repository: forge identity, remotes, default
+      // branch, remote branch list, whether each `head` (and the task's stored
+      // base) exists there, and whether the stored base is stale. Read-only; the
+      // forge's REST API is the source, never `git ls-remote`.
+      "/github/pull-targets": {
+        GET: authed(async (req) => {
+          const url = new URL(req.url);
+          const dir = url.searchParams.get("path");
+          if (!dir) return json({ error: "path required" }, { status: 400, headers: corsHeaders(req) });
+          const heads = url.searchParams.getAll("head");
+          if (heads.length > MAX_PULL_TARGET_HEADS) {
+            return json(
+              { error: `at most ${MAX_PULL_TARGET_HEADS} head branches per request` },
+              { status: 400, headers: corsHeaders(req) },
+            );
+          }
+          const storedBase = url.searchParams.get("storedBase") || null;
+          const storedBaseSha = url.searchParams.get("storedBaseSha") || null;
+          const liveHead = url.searchParams.get("liveHead") || null;
+          // Every name that can reach a git argv or a forge URL is validated at the boundary.
+          for (const [label, name] of [
+            ...heads.map((h) => ["head", h] as const),
+            ["storedBase", storedBase] as const,
+            ["liveHead", liveHead] as const,
+          ]) {
+            if (name === null) continue;
+            const bad = !isSafeBranchName(name) ? (validateBranchName(name).ok ? "cannot start with '-'" : "not a valid branch name") : null;
+            if (bad) return json({ error: `${label} "${name}": ${bad}` }, { status: 400, headers: corsHeaders(req) });
+          }
+          if (storedBaseSha !== null && !/^[0-9a-f]{7,64}$/i.test(storedBaseSha)) {
+            return json({ error: "storedBaseSha must be a hex commit sha" }, { status: 400, headers: corsHeaders(req) });
+          }
+          const result = await pullTargets({ dir, heads, storedBase, storedBaseSha, liveHead });
+          if (!result.ok) return json({ error: result.error }, { status: 400, headers: corsHeaders(req) });
           return json(result, { headers: corsHeaders(req) });
         }),
       },

@@ -8,7 +8,7 @@ import { readTextNoFollow } from "./no-follow.ts";
 import { readFileBytes } from "./core-file-read.ts";
 import { removeTaskDirWorkspaceIfOnlyScratch, taskDirLexists, taskDirWorkspaceHasOnlyScratch } from "./task-dir-fs.ts";
 import { MAX_DIFF_FILES, parseGitDiff } from "./git-diff.ts";
-import { LEGACY_BRANCH_PREFIX } from "../shared/types.ts";
+import { LEGACY_BRANCH_PREFIX, validateBranchName } from "../shared/types.ts";
 import type { BranchInfo, Task, TaskDiff, TaskRepository, WorktreeTeardownResult } from "../shared/types.ts";
 import { MAX_BLOB_PREVIEW_BYTES } from "../shared/attachments.ts";
 import { isMultiRepoTask } from "../shared/multi-repo.ts";
@@ -643,6 +643,44 @@ export async function resolveRef(dir: string, ref: string): Promise<string | nul
   const res = await git(["rev-parse", "--verify", `${ref}^{commit}`], dir);
   if (!res.ok) return null;
   return /^[0-9a-f]{40}$/.test(res.stdout) ? res.stdout : null;
+}
+
+/**
+ * The branch NAME a requested base ref resolves to at task creation, recorded
+ * as `Task.baseBranch` so Create all PRs can target it later (the pinned sha is
+ * `baseRef`). `develop` and `refs/heads/develop` give `develop`;
+ * `origin/release/1.2` gives `release/1.2`; a tag, a sha, a missing ref, a name
+ * that isn't a valid branch name, or a leading `-` (never passed to git) give
+ * null. `HEAD` gives the checked-out branch, but only when its remote-tracking
+ * ref (the upstream remote, else `origin`) exists locally: a purely local
+ * branch can't be a PR base, and nothing here touches the network. A picked
+ * branch that exists only locally is recorded and reported at PR time.
+ */
+export async function resolveBaseBranchName(dir: string, requestedRef: string): Promise<string | null> {
+  const ref = requestedRef.trim();
+  if (!ref || ref.startsWith("-")) return null;
+  if (ref === "HEAD") {
+    const cur = await git(["symbolic-ref", "--quiet", "--short", "HEAD"], dir);
+    const name = cur.ok ? cur.stdout.trim() : "";
+    if (!name || !validateBranchName(name).ok) return null;
+    const upstream = await git(["config", "--get", `branch.${name}.remote`], dir);
+    const remote = upstream.ok && upstream.stdout.trim() && upstream.stdout.trim() !== "." ? upstream.stdout.trim() : "origin";
+    const has = await git(["rev-parse", "--verify", "--quiet", `refs/remotes/${remote}/${name}^{commit}`], dir);
+    return has.ok ? name : null;
+  }
+  const res = await git(["rev-parse", "--symbolic-full-name", "--verify", "--end-of-options", ref], dir);
+  if (!res.ok) return null;
+  const full = res.stdout.split("\n")[0]?.trim() ?? "";
+  let name: string | null = null;
+  if (full.startsWith("refs/heads/")) name = full.slice("refs/heads/".length);
+  else if (full.startsWith("refs/remotes/")) {
+    // refs/remotes/<remote>/<branch…>: the remote name is one path segment.
+    const rest = full.slice("refs/remotes/".length);
+    const slash = rest.indexOf("/");
+    name = slash > 0 ? rest.slice(slash + 1) : null;
+  }
+  if (!name || name === "HEAD" || !validateBranchName(name).ok) return null;
+  return name;
 }
 
 /**

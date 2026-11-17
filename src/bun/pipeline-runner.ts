@@ -1432,6 +1432,9 @@ async function launchStep(
     worktreePath: parent.worktreePath,
     checkoutBranch: parent.checkoutBranch ?? null,
     baseRef: parent.baseRef,
+    // The step opens its own PRs (`prs` starts empty) but targets the same base.
+    baseBranch: parent.baseBranch ?? null,
+    prs: [],
     // Step rows share the parent's workspace and repository set (D2/M6); the
     // parent owns teardown, so a step never tears a worktree down on its own.
     repositories: parent.repositories ?? [],

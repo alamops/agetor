@@ -11,8 +11,10 @@
 // docs/architecture/multi-repo-tasks.md; the trust boundary (agent text never
 // selects a repository, a remote or a branch name that reaches git unchecked)
 // is docs/architecture/security.md.
-import type { PullTargetsResult, RunEvent, TaskPr } from "../../shared/types.ts";
+import type { PullTargetsResult, RunEvent, Task, TaskPr } from "../../shared/types.ts";
 import { validateBranchName } from "../../shared/types.ts";
+import { isMultiRepoTask, repositoriesForTask } from "../../shared/multi-repo.ts";
+import { prHeadBranch, repositoryPrHead, shouldOfferOpenPr, type TaskGitStatus } from "./commit-push.ts";
 import { parseIssueUrl } from "../../shared/issue-task.ts";
 import { prForHead } from "../../shared/task-prs.ts";
 import { beginPrBatch, endPrBatch, markPrOpened, prOpenedInSession } from "./multi-repo-ui.ts";
@@ -96,6 +98,60 @@ export interface PullTargetsQuery {
 export interface PrPlanDeps {
   providerInfo(path: string): Promise<RepoIdentity | null>;
   pullTargets(query: PullTargetsQuery): Promise<PullTargetsResult>;
+}
+
+// ── Repositories in scope ──────────────────────────────────────────────────
+
+/**
+ * The repositories a PR action is about, with each one's live PR head. A
+ * single-repo task is one entry (head from `prHeadBranch`, gated on pushed and
+ * synced state like the "Create PR" chip); a multi-repo task is one per
+ * repository (head from `repositoryPrHead` against that repository's entry in
+ * the batched git status). `identity` is left unset for the planner to resolve.
+ */
+export function planReposForTask(
+  task: Pick<
+    Task,
+    | "workdir"
+    | "isolation"
+    | "branch"
+    | "branchSource"
+    | "worktreePath"
+    | "baseRef"
+    | "checkoutBranch"
+    | "prUrl"
+    | "prs"
+    | "baseBranch"
+    | "repositories"
+    | "multiRepo"
+    | "issueUrl"
+    | "issueRepoPath"
+  >,
+  gitStatus: TaskGitStatus | null,
+): PrPlanRepo[] {
+  const multi = isMultiRepoTask(task);
+  const entries = repositoriesForTask(task);
+  return entries.map((entry) => {
+    const status = multi
+      ? (gitStatus && "repositories" in gitStatus ? gitStatus.repositories?.find((r) => r.name === entry.name) ?? null : null)
+      : gitStatus;
+    const liveHead = multi
+      ? repositoryPrHead(entry, status)
+      : shouldOfferOpenPr(status)
+        ? prHeadBranch(task.branch ?? null, status, task.branchSource)
+        : null;
+    return {
+      name: entry.name,
+      projectPath: multi ? (entry.worktreePath ?? entry.path) : task.workdir,
+      liveHead,
+      branch: entry.branch,
+      prs: entry.prs ?? [],
+      storedBase: entry.baseBranch ?? null,
+      storedBaseSha: entry.baseRef ?? null,
+      // Only the repository the issue came from may close it.
+      isIssueRepo: multi ? entry.path === task.issueRepoPath : !!task.issueUrl,
+    };
+  });
 }
 
 // ── Issue directive ────────────────────────────────────────────────────────
@@ -304,6 +360,11 @@ function headsOf(repo: PrPlanRepo, byHead: Map<string, AttributedProposal> | und
   return heads;
 }
 
+/** A branch name the core accepts in a pull-targets query (valid, and not an option). */
+function isValidBranchName(name: string): boolean {
+  return name.length > 0 && !name.startsWith("-") && validateBranchName(name).ok;
+}
+
 /** Whether a head already has a PR, recorded or opened this session. */
 function hasPr(taskId: string, repo: PrPlanRepo, head: string): boolean {
   return !!prForHead(repo.prs, head) || prOpenedInSession(taskId, repo.name, head);
@@ -401,7 +462,8 @@ export function planPrRows(input: PrPlanInput, facts: RepoFacts): PrRow[] {
     let disabledReason: string | null = null;
     if (!isLiveHead) {
       const facts = targets?.heads.find((h) => h.name === head);
-      if (facts?.onRemote === false) disabledReason = `branch \`${head}\` isn't on ${remote ?? "origin"}`;
+      if (!isValidBranchName(head)) disabledReason = `\`${head}\` isn't a valid branch name`;
+      else if (facts?.onRemote === false) disabledReason = `branch \`${head}\` isn't on ${remote ?? "origin"}`;
       else if (!facts || facts.onRemote === null) {
         disabledReason = `can't confirm \`${head}\` is on ${remote ?? "origin"}`;
       }
@@ -452,7 +514,8 @@ export async function buildPrPlan(input: PrPlanInput, deps: PrPlanDeps): Promise
     repos.map(async (repo): Promise<RepoFacts> => {
       const attributed = attribution.get(repo.name);
       const heads = input.liveHeadOnly ? (repo.liveHead ? [repo.liveHead] : []) : headsOf(repo, attributed);
-      const candidates = heads.filter((h) => !hasPr(input.taskId, repo, h));
+      // A name the core would refuse (the route 400s on it) never goes into the query.
+      const candidates = heads.filter((h) => !hasPr(input.taskId, repo, h) && isValidBranchName(h));
       if (candidates.length === 0) return { repo, attributed, targets: null, targetsError: null };
       try {
         const targets = await deps.pullTargets({
