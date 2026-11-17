@@ -65,7 +65,7 @@ function card(cfg: ScriptedConfig, over: { withSession?: boolean } = {}) {
     const reg = registerTmuxPrompt({
       taskId, runId: "run-route", paneText: match.paneText, choices: match.choices, cursorIndex: match.cursorIndex,
       nav: match.nav, fingerprint: match.fingerprint, hideKeys: match.hideKeys, answerKind: match.answerKind,
-      identity: __forTest.identityOf(match),
+      confirmKey: match.confirmKey, identity: __forTest.identityOf(match),
     });
     return { taskId, session: session!, req: reg.req, answer: reg.answer };
   }
@@ -189,6 +189,77 @@ describe("drive results and tokens", () => {
     const res = await post("no-such-card", { key: "1" });
     expect(res.status).toBe(200);
     expect(await res.json()).toEqual({ ok: false });
+  });
+
+  test("a card swept while the add-dir drive verifies the dialog left still answers ok (the keys were delivered)", async () => {
+    const { answerTmuxPrompt } = await import("./interactions.ts");
+    const c = card({ dialogs: [REPO_E] });
+    // The boot poller / scraper settles a card whose dialog is gone: land that
+    // inside the drive's post-confirm verify window.
+    const sweep = setTimeout(() => { answerTmuxPrompt(c.req.id, { key: "__external__" }); }, 450);
+    cleanups.push(() => clearTimeout(sweep));
+    const res = await post(c.req.id, { key: "2" });
+    expect(res.status).toBe(200);
+    expect(await res.json()).toEqual({ ok: true });
+    expect(c.session.keys().map((k) => k.k)).toEqual(["Down", "Enter"]);
+  }, 20_000);
+
+  test("two repositories, auto-trust off: answering the first card leaves the second to be carded, and each answer is ok", async () => {
+    const REPO_F = { kind: "add-dir" as const, repo: "repo-f", path: "/Users/me/.agetor/worktrees/4c34cf8f/repo-f" };
+    const c = card({ dialogs: [REPO_E, REPO_F] });
+    const first = await post(c.req.id, { key: "2" });
+    expect(first.status).toBe(200);
+    expect(await first.json()).toEqual({ ok: true });
+    expect(c.session.state().i).toBe(1); // the second dialog is now on screen
+    // The second card is registered from the live pane and answered the same way.
+    const lines = Bun.spawnSync([scripted.bin, "capture-pane", "-p", "-t", sessionNameFor(c.taskId)]).stdout.toString();
+    const match = __forTest.pickScrapeMatch(lines, { paneWorking: false, paneIdle: false, watchdogArmed: false, boot: true })!;
+    const reg = registerTmuxPrompt({
+      taskId: c.taskId, runId: "run-route", paneText: match.paneText, choices: match.choices, cursorIndex: match.cursorIndex,
+      nav: match.nav, fingerprint: match.fingerprint, hideKeys: match.hideKeys, identity: __forTest.identityOf(match),
+    });
+    await new Promise((r) => setTimeout(r, 600)); // the new dialog's 500 ms arm window
+    const second = await post(reg.req.id, { key: "2" });
+    expect(second.status).toBe(200);
+    expect(await second.json()).toEqual({ ok: true });
+    expect(c.session.state().done).toBe(true);
+  }, 30_000);
+
+  // The production drive's two non-add-dir branches (the registered-cursor
+  // `dismissTmuxPrompt` seam no longer covers what the route really runs).
+  test("a y/N prompt: the literal key, then Enter, and nothing else", async () => {
+    const c = card({ dialogs: [{ kind: "raw", text: " Overwrite the existing file? (y/N)\n" }] });
+    expect(c.req.choices.map((x) => x.key)).toEqual(["y", "n"]);
+    const res = await post(c.req.id, { key: "n" });
+    expect(res.status).toBe(200);
+    expect(await res.json()).toEqual({ ok: true });
+    expect(c.session.keys().map((k) => k.k)).toEqual(["n", "Enter"]);
+    expect(findTmuxPromptById(c.req.id)).toBeNull();
+  });
+
+  test("the bare /model picker: arrows from the LIVE cursor, then `s` (session only) in place of Enter", async () => {
+    const picker = [
+      "   Select model",
+      "   Switch between Claude models. Your pick becomes the default for new sessions.",
+      "",
+      "     1. Default (recommended)  Opus 5 with 1M context",
+      "     2. Opus (1M context)      Opus 5 with 1M context",
+      "     3. Fable                  Fable 5",
+      "     4. Sonnet                 Sonnet 5",
+      "     5. Haiku                  Haiku 4.5",
+      "   ❯ 6. Opus 4.8 ✔             Newer version available",
+      "",
+      "   Enter to set as default · s to use this session only · Esc to cancel",
+      "",
+    ].join("\n");
+    const c = card({ dialogs: [{ kind: "raw", text: picker }] });
+    expect(c.req.confirmKey).toBe("s");
+    const res = await post(c.req.id, { key: "4" });
+    expect(res.status).toBe(200);
+    expect(await res.json()).toEqual({ ok: true });
+    // Cursor on row 6, target row 4: two Ups, then the session-only key. A plain
+    // Enter here would rewrite the user's global default model.
+    expect(c.session.keys().map((k) => k.k)).toEqual(["Up", "Up", "s"]);
   });
 
   test("a refused confirm re-cards: the response is ok and a held card replaces the old one", async () => {

@@ -1248,6 +1248,9 @@ describe("logged-out Claude accounts (claude auth status)", () => {
     const result = await fo.prepareTaskHarness(taskId, { manual: true });
     expect(result.ok).toBe(true);
     expect(result.ok && result.moved?.to).toBe(b);
+    // The current account is named too: the walk starts after it, so
+    // `plan.skipped` alone would leave the move unexplained.
+    expect(result.ok && result.warnings).toContain(`skipped ${a}: not logged in`);
     stacks.harnessStacks.delete(stack.id);
   });
 });

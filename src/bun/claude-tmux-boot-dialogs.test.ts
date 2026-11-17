@@ -360,6 +360,40 @@ describe("boot poller — resume consent window", () => {
   }, 50_000);
 });
 
+describe("boot poller — resume window never acts on a quoted dialog", () => {
+  test("a resumed pane whose transcript quotes the trust-folder and bypass dialogs above the idle composer gets no keys", async () => {
+    // The old transcript of a resumed session can contain a pasted/quoted
+    // consent dialog. The bypass / trust-folder matchers are not bottom
+    // anchored, so without `addDirOnly` the tracker would type Down/Enter into
+    // the live composer (Up+Enter can replay the previous prompt).
+    const text = [
+      " > what did the trust prompt say?",
+      " Quick safety check: Is this a project you created or one you trust?",
+      " ❯ No, exit",
+      "   Yes, I trust this folder",
+      " Enter to confirm · Esc to cancel",
+      " WARNING: Claude Code running in Bypass Permissions mode",
+      " ❯ 1. No, exit",
+      "   2. Yes, I accept",
+      "",
+      "────────────────────────────────────────────────────────────────────────────────",
+      "❯ ",
+      "────────────────────────────────────────────────────────────────────────────────",
+      "  ? for shortcuts",
+    ].join("\n");
+    const b = await boot({ dialogs: [{ kind: "raw", text }] }, { resume: true, withRun: true, autoTrustDirectories: DIRS });
+    try {
+      // Several poll periods (350 ms each): the tracker needs two sightings and
+      // 500 ms before it would first press a key.
+      await new Promise((r) => setTimeout(r, 2_500));
+      expect(b.tmux.keys()).toEqual([]);
+      expect(b.statuses().filter((s) => s.startsWith("auto-confirmed"))).toEqual([]);
+    } finally {
+      await b.stop();
+    }
+  }, 30_000);
+});
+
 describe("deferred prompt paste (defect 3)", () => {
   test("never pastes, and never says 'delivering prompt anyway', while a startup dialog is on the pane", async () => {
     setDeferredPromptTimeoutMs(700);

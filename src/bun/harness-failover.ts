@@ -905,11 +905,17 @@ export async function prepareTaskHarness(
   // would no-op on the cleared state, but leaving the handle in the map keeps
   // a dangling timer for up to 24 h; cancel it like the no-move branch does.
   cancelAutoRetry(taskId);
+  // The walk starts AFTER the current account, so `plan.skipped` never lists
+  // it: a logged-out current account is named here, ahead of the others.
+  const skipLines = loggedOutSkipLines([
+    ...(unusable === NOT_LOGGED_IN_REASON ? [{ harnessId: current, reason: unusable }] : []),
+    ...plan.skipped,
+  ]);
   return {
     ok: true,
     moved: { from: current, to },
-    ...(moved.warnings.length > 0 || loggedOutSkipLines(plan.skipped).length > 0
-      ? { warnings: [...loggedOutSkipLines(plan.skipped), ...moved.warnings] }
+    ...(moved.warnings.length > 0 || skipLines.length > 0
+      ? { warnings: [...skipLines, ...moved.warnings] }
       : {}),
   };
 }

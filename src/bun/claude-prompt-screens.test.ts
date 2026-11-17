@@ -207,9 +207,28 @@ describe("matchPasteCodeScreen + redactPaneSecrets", () => {
     expect(redactPaneSecrets("Paste code here if prompted > abc123")).toBe("Paste code here if prompted > ••••");
     const untouched = "line one\n  Paste code here if prompted > \nthe end\n";
     expect(redactPaneSecrets(untouched)).toBe(untouched);
-    const multi = "a\nPaste code here if prompted > secret-1\nb\nPaste code here if prompted >secret-2\nc";
-    expect(redactPaneSecrets(multi)).toBe("a\nPaste code here if prompted > ••••\nb\nPaste code here if prompted > ••••\nc");
+    const multi = "a\nPaste code here if prompted > secret-1\n\nb\nPaste code here if prompted >secret-2\n\nc";
+    expect(redactPaneSecrets(multi)).toBe("a\nPaste code here if prompted > ••••\n\nb\nPaste code here if prompted > ••••\n\nc");
     expect(redactPaneSecrets("nothing to mask here")).toBe("nothing to mask here");
+  });
+
+  test("a code wrapped onto the lines below the prompt is masked too, and the fingerprint is unchanged", () => {
+    const wrapped = [
+      " Paste code here if prompted > wrapped-secret-part-one-abcdefghijklmnop",
+      "qrstuvwxyz-wrapped-secret-part-two#state-value",
+      "",
+      " ❯ ",
+    ].join("\n").replace(" ❯ ", " Esc to cancel");
+    const out = redactPaneSecrets(wrapped);
+    expect(out).not.toContain("wrapped-secret");
+    expect(out).not.toContain("state-value");
+    expect(out).toContain("Paste code here if prompted > ••••");
+    expect(out).toContain("Esc to cancel");
+    const base = matchPasteCodeScreen(" Welcome\n Paste code here if prompted >\n Esc to cancel\n")!;
+    const typed = matchPasteCodeScreen(" Welcome\n Paste code here if prompted > wrapped-secret-part-one-abcdefghijklmnop\nqrstuvwxyz-wrapped-secret-part-two#state-value\n Esc to cancel\n")!;
+    expect(typed.paneText).not.toContain("wrapped-secret");
+    expect(typed.paneText).not.toContain("state-value");
+    expect(typed.fingerprint).toBe(base.fingerprint);
   });
 
   test("redaction is idempotent", () => {

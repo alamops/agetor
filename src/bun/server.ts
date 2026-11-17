@@ -8266,9 +8266,13 @@ export function startApiServer(
           // screen mid-repaint) doesn't register a ghost duplicate. See
           // `markTmuxPromptAnswered` for why this is two-step.
           markTmuxPromptAnswered(pending.taskId, pending.fingerprint);
-          // A refused confirm already replaced this card with a held one.
-          const ok = driven.recarded ? true : answerTmuxPrompt(req.params.id, { key: sentinel });
-          return json({ ok }, { headers: corsHeaders(req) });
+          // A refused confirm already replaced this card with a held one. The
+          // card may also have been settled while the add-dir drive verified the
+          // dialog left (the boot poller / scraper sweeps a card whose dialog is
+          // gone): the keys were delivered, so that is still a success, never
+          // `{ ok: false }` (which the CLI and TUI print as "failed").
+          if (!driven.recarded) answerTmuxPrompt(req.params.id, { key: sentinel });
+          return json({ ok: true }, { headers: corsHeaders(req) });
         }),
       },
 

@@ -300,18 +300,44 @@ export function matchPasteCodeScreen(tail: string): { paneText: string; fingerpr
   if (!region.slice(-6).some((l) => PASTE_CODE_RE.test(l))) return null;
   if (region.some((l) => CURSOR_ROW_RE.test(l))) return null;
   const paneText = redactPaneSecrets(region.join("\n"));
-  const stable = paneText
-    .split("\n")
-    .map((l) => l.trim())
+  // The identity is everything up to and including the prompt line, with what
+  // was typed after the marker removed. Lines below it are not part of it:
+  // redaction drops them once a code is typed (a wrapped code continues there),
+  // so including them would let typing a code change the fingerprint.
+  const lines = paneText.split("\n").map((l) => l.trim());
+  const markerAt = lines.findIndex((l) => PASTE_CODE_RE.test(l));
+  const stable = lines
+    .slice(0, markerAt + 1)
     .join("\n")
     .replace(/(Paste code here if prompted\s*>)\s*•+/i, "$1");
   return { paneText, fingerprint: sha1(`paste-code:${stable}`) };
 }
 
-/** Mask whatever follows `Paste code here if prompted >` on its line. Every
- *  other byte is returned unchanged. */
+/**
+ * Mask a code typed after `Paste code here if prompted >`. The code may be
+ * longer than the pane is wide, so claude wraps it onto the lines below the
+ * prompt: when anything follows the marker, the rest of that line is masked
+ * AND the lines under it (up to the next blank line) are dropped. A prompt with
+ * nothing typed, and every other byte of the pane, is returned unchanged.
+ */
 export function redactPaneSecrets(text: string): string {
-  return text.replace(/(Paste code here if prompted\s*>)[ \t]*(\S[^\n]*)/gi, "$1 ••••");
+  if (!/Paste code here if prompted/i.test(text)) return text;
+  const out: string[] = [];
+  let dropping = false;
+  for (const line of text.split("\n")) {
+    if (dropping) {
+      if (line.trim() === "") dropping = false;
+      else continue;
+    }
+    const m = line.match(/^(.*Paste code here if prompted\s*>)[ \t]*(\S.*)$/i);
+    if (m) {
+      out.push(`${m[1]} ••••`);
+      dropping = true;
+    } else {
+      out.push(line);
+    }
+  }
+  return out.join("\n");
 }
 
 /**

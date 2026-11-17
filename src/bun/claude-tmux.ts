@@ -6634,7 +6634,7 @@ export interface StartupDialogMatch {
  */
 export function matchStartupConsentDialog(
   pane: string,
-  ctx?: { autoTrustDirectories?: AutoTrustDirectory[] },
+  ctx?: { autoTrustDirectories?: AutoTrustDirectory[]; addDirOnly?: boolean },
 ): StartupDialogMatch | null {
   // Claude 2.1.326's `Adding a new directory:` — auto-confirmed only for a
   // directory this spawn itself passed as `--add-dir` (`matchAddDirAutoTrust`
@@ -6656,6 +6656,14 @@ export function matchStartupConsentDialog(
       };
     }
   }
+  // `addDirOnly` is the resume consent window: a resumed pane still shows the
+  // earlier transcript, and the bypass / trust-folder arms below match a marker
+  // ANYWHERE in the pane (they are not bottom-anchored), so a transcript that
+  // quotes one of those dialogs would make the tracker type arrows and Enter
+  // into the live composer. Neither dialog is re-asked on resume (the answer is
+  // persisted), and the add-dir arm above is footer-anchored, so it alone is
+  // safe to run over a pane with history.
+  if (ctx?.addDirOnly) return null;
   const dialog = STARTUP_CONSENT_DIALOGS.find((d) => d.marker.test(pane));
   if (!dialog) return null;
   // Reuse the numbered-modal parser first so the choice list / cursor handling
@@ -9728,7 +9736,9 @@ export async function spawnClaudeViaTmux(opts: ClaudeLaunchOptions): Promise<Spa
     // resume (the answer is per session, never persisted). The poller then
     // keeps one job — the consent dialogs — in a "resume consent window".
     const resumedAtSpawn = existsSync(jsonlPath);
-    const consentCtx = { autoTrustDirectories: opts.autoTrustDirectories ?? [] };
+    // A resumed pane carries the old transcript, so the resume window matches
+    // the footer-anchored add-dir family only (`matchStartupConsentDialog`).
+    const consentCtx = { autoTrustDirectories: opts.autoTrustDirectories ?? [], addDirOnly: resumedAtSpawn };
     let resumeWindowClosed = false;
     const windowOver = (): boolean => (resumedAtSpawn ? resumeWindowClosed : bootSettled);
     void (async () => {
