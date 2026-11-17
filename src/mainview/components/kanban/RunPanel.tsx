@@ -3804,7 +3804,11 @@ function RunPanelBody({
   // A multi task: any repository without a PR on its live head, or a proposal
   // for another branch. A single-repo task has no per-repository gap to fill, so
   // the button only appears once two or more branches could open a PR.
-  const showCreateAllPrs = multiRepo
+  // Hidden until the first git status lands: without it every live head reads
+  // "not pushed yet", and the confirm list would open on that.
+  const showCreateAllPrs = gitStatus === null
+    ? false
+    : multiRepo
     ? liveHeadsNeedingPr.length > 0 || proposalHeads.length > 0
     : new Set([...liveHeadsNeedingPr.map((r) => r.liveHead!), ...proposalHeads.map((h) => h.head)]).size >= 2;
   const onPrsStamped = useCallback(
@@ -3832,6 +3836,24 @@ function RunPanelBody({
       void api.openExternal(url).catch(() => {});
     }
   };
+  // The header PR menu's items are built once per set of PRs: `ContextMenu`
+  // re-places itself and re-focuses its first item whenever `items` changes
+  // identity, so a fresh array every render (SSE flush, board poll) would yank
+  // focus. The select handler reads the latest `viewPr` through a ref.
+  const viewPrRef = useRef(viewPr);
+  viewPrRef.current = viewPr;
+  const scopePrsKey = scopePrs.map((p) => `${p.url}\0${p.head ?? ""}\0${p.base ?? ""}`).join("\n");
+  const prMenuItems = useMemo(
+    () =>
+      scopePrs.map((p, n) => ({
+        id: `pr-${n}`,
+        label: p.head ? `View PR: ${p.head}${p.base ? ` → ${p.base}` : ""}` : "View pull request",
+        icon: GitPullRequest,
+        onSelect: () => viewPrRef.current(p.url),
+      })),
+    // eslint-disable-next-line react-hooks/exhaustive-deps -- `scopePrsKey` stands in for `scopePrs`
+    [scopePrsKey],
+  );
 
   const prHead = multiRepo
     ? (activeRepo ? repositoryPrHead(activeRepo, activeGitStatus) : null)
@@ -5093,9 +5115,9 @@ function RunPanelBody({
                     checked-out branch as long as it isn't the repo default,
                     which would degenerate to base == head. See
                     `prHeadBranch`. Gone once a PR exists (the durable
-                    "View PR" link lives in the panel header). The proposal
-                    parse runs on click, not per event flush — the stream can
-                    be long. */}
+                    "View PR" link lives in the panel header). The click plans the live head
+                    only (`buildPrPlan`): the proposal is read and its base chosen
+                    there, not per event flush — the stream can be long. */}
                 {canSend && !sending && showCreateAllPrs && (
                   <Button
                     size="sm"
@@ -5339,12 +5361,7 @@ function RunPanelBody({
         label="Pull requests"
         testId="run-panel-pr-menu"
         onClose={() => setPrMenu(null)}
-        items={scopePrs.map((p, n) => ({
-          id: `pr-${n}`,
-          label: p.head ? `View PR: ${p.head}${p.base ? ` → ${p.base}` : ""}` : "View pull request",
-          icon: GitPullRequest,
-          onSelect: () => viewPr(p.url),
-        }))}
+        items={prMenuItems}
       />
     </>
   );

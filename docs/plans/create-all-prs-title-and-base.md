@@ -6,9 +6,9 @@
 | Source | Spec `docs/specs/create-all-prs-title-and-base.md` (the pipeline's goal, copied unamended). Investigation `docs/plans/create-all-prs-title-and-base-investigation.md`. Grill record `docs/plans/create-all-prs-title-and-base-grill.md` (34 owner decisions, cited below as G#n). |
 | Flags | none |
 | Gates | grilled + approved by owner (2026-11-17). The owner picked the pinned-sha stale rule (D4, §8 Q1) over G#2's literal wording and approved the §8 calls as written. |
-| Status | planned — approved |
-| Branch | TBD — set when execution starts (the pipeline worktree is on `fix/agetor-create-all-prs-with-wrong-title-a`) |
-| Base SHA | TBD — set when execution starts (HEAD at planning: `32aa7c3a`) |
+| Status | implemented (waves 1-5); full unit suite and e2e green except load-flaky timing tests that pass alone; pending code review |
+| Branch | `fix/agetor-create-all-prs-with-wrong-title-a` |
+| Base SHA | `32aa7c3a` (release v1.2.1); the spec and plan docs were committed first as `4a199a07` and `ffafc975` |
 
 ## 1. Objective & success criteria
 

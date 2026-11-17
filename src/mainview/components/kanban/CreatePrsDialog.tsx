@@ -53,6 +53,11 @@ export interface CreatePrsDialogViewProps {
   onSubmit: () => void;
 }
 
+/** A link target is only ever an http(s) URL (a forge's answer is shown as a link). */
+function safeHref(url: string | null): string | null {
+  return url && /^https?:\/\//i.test(url) ? url : null;
+}
+
 function ResultLine({ result, slug }: { result: PrRowResult; slug: string }) {
   const testId = `create-prs-result-${slug}`;
   switch (result.status) {
@@ -66,19 +71,23 @@ function ResultLine({ result, slug }: { result: PrRowResult; slug: string }) {
       return (
         <p className="flex items-center gap-1 text-xs text-success" data-testid={testId}>
           Created ·{" "}
-          <a className="inline-flex items-center gap-1 underline" href={result.url} target="_blank" rel="noreferrer">
-            View <ExternalLink className="size-3" />
-          </a>
+          {safeHref(result.url) ? (
+            <a className="inline-flex items-center gap-1 underline" href={safeHref(result.url)!} target="_blank" rel="noreferrer">
+              View <ExternalLink className="size-3" />
+            </a>
+          ) : (
+            "done"
+          )}
         </p>
       );
     case "already-open":
       return (
         <p className="text-xs text-info" data-testid={testId}>
           Already open
-          {result.url ? (
+          {safeHref(result.url) ? (
             <>
               {" · "}
-              <a className="underline" href={result.url} target="_blank" rel="noreferrer">
+              <a className="underline" href={safeHref(result.url)!} target="_blank" rel="noreferrer">
                 View
               </a>
             </>

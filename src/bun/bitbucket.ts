@@ -819,7 +819,8 @@ async function findOpenBitbucketPullUrl(
   const links = first && typeof first === "object" ? (first as { links?: unknown }).links : null;
   const html = links && typeof links === "object" ? (links as { html?: unknown }).html : null;
   const href = html && typeof html === "object" ? (html as { href?: unknown }).href : null;
-  return typeof href === "string" && href ? href : null;
+  // The URL is shown as a link: only an http(s) one is passed on.
+  return typeof href === "string" && /^https?:\/\//i.test(href) ? href : null;
 }
 
 /** Branch names a pull-target listing carries (10 pages of 100). */

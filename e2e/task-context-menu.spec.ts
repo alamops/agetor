@@ -259,7 +259,6 @@ test.describe("task context menu", () => {
       "mark-done",
       "archive",
       "unarchive",
-      "view-pr",
       "mark-read",
       "mark-unread",
       "copy-branch",
@@ -267,6 +266,9 @@ test.describe("task context menu", () => {
     ]) {
       await expect(menuItem(page, action)).toHaveCount(0);
     }
+
+    // Every PR entry is `view-pr-<n>` (one per pull request), so match the prefix.
+    await expect(page.locator('[data-testid^="task-context-menu-view-pr"]')).toHaveCount(0);
 
     const items = panel.locator('[role="menuitem"]');
     await expect(items).toHaveCount(5);

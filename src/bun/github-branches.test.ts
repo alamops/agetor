@@ -166,6 +166,27 @@ test("already-exists omits existingUrl when the lookup fails", async () => {
   }
 });
 
+test("already-exists never passes on a non-http(s) existing URL", async () => {
+  const mock = mockGitHubFetch([
+    {
+      method: "POST",
+      match: "/pulls",
+      status: 422,
+      json: { message: "Validation Failed", errors: [{ message: "A pull request already exists for acme:x." }] },
+    },
+    { method: "GET", match: "/pulls?head=", json: [{ html_url: "javascript:alert(1)" }] },
+  ]);
+  try {
+    const res = await create("x");
+    expect(res.ok).toBe(false);
+    if (res.ok) return;
+    expect(res.code).toBe("already-exists");
+    expect("existingUrl" in res).toBe(false);
+  } finally {
+    mock.restore();
+  }
+});
+
 test("another 422 carries errors[].message instead of just 'Validation Failed'", async () => {
   const mock = mockGitHubFetch([
     {

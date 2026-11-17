@@ -1652,7 +1652,8 @@ async function findOpenPullUrl(repo: GitHubRepo, token: string | null, head: str
   const json = await res.json().catch(() => null);
   const first = Array.isArray(json) ? json[0] : null;
   const htmlUrl = first && typeof first === "object" ? (first as { html_url?: unknown }).html_url : null;
-  return typeof htmlUrl === "string" && htmlUrl ? htmlUrl : null;
+  // The URL is shown as a link: only an http(s) one is passed on.
+  return typeof htmlUrl === "string" && /^https?:\/\//i.test(htmlUrl) ? htmlUrl : null;
 }
 
 export async function createGitHubPull(input: CreateGitHubPullInput): Promise<GitHubIssueResponse> {

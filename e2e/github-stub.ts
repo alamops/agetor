@@ -301,3 +301,41 @@ export async function startGitHubStub(port: number, initialRoutes: StubRoute[] =
 
   return stub;
 }
+
+/**
+ * The repository-level routes Create all PRs reads through `GET
+ * /github/pull-targets`: the repository itself (`default_branch`), its branch
+ * listing (one page) and a single-branch lookup (404 "Branch not found" when
+ * absent). `branches` maps a branch name to its tip sha and is read live on
+ * every request, so a spec can add or remove a branch mid-test by mutating it.
+ * The e2e repositories' `origin` is `https://github.com/<owner>/<repo>.git` and
+ * pushes go to a local bare `local` remote, so branch facts have to come from
+ * this REST stub (the stub does not speak git).
+ */
+export function githubRepoRoutes(
+  owner: string,
+  repo: string,
+  opts: { defaultBranch: string; branches: Record<string, string> },
+): StubRoute[] {
+  const base = `/repos/${owner}/${repo}`;
+  const escaped = base.replace(/[.*+?^${}()|[\]\\/]/g, "\\$&");
+  return [
+    { method: "GET", path: base, body: () => ({ default_branch: opts.defaultBranch }) },
+    {
+      method: "GET",
+      path: `${base}/branches`,
+      body: () => Object.entries(opts.branches).map(([name, sha]) => ({ name, commit: { sha } })),
+    },
+    {
+      method: "GET",
+      path: new RegExp(`^${escaped}/branches/.+$`),
+      body: (req: StubRequest) => {
+        const name = decodeURIComponent(req.path.slice(`${base}/branches/`.length));
+        const sha = opts.branches[name];
+        return sha
+          ? { name, commit: { sha } }
+          : { status: 404, body: { message: "Branch not found" } };
+      },
+    },
+  ];
+}

@@ -2574,7 +2574,8 @@ const runTaskMenuAction = useCallback((action: TaskMenuAction, snapshot: Task, r
         items.push({ type: "separator", id: `sep-${entry.group}` });
       }
       const leaf = (e: TaskMenuEntry): ContextMenuLeafItem => ({
-        id: e.id ?? e.action,
+        // Per-repository entries share an action, so the repository joins the id.
+        id: e.id ?? (e.repoName ? `${e.action}-${e.repoName}` : e.action),
         label: e.label,
         danger: e.danger,
         icon: ICON_BY_ACTION[e.action],
