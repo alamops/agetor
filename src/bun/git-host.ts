@@ -1,4 +1,6 @@
 import type {
+  ForgeBranch,
+  ProviderRepoInfo,
   GitHubChecksResult,
   GitHubComment,
   GitHubCommentsResult,
@@ -25,6 +27,9 @@ import {
   createGitHubIssue,
   createGitHubPull,
   createGitHubPullLineComment,
+  getGitHubBranch,
+  getGitHubDefaultBranch,
+  listGitHubBranches,
   getGitHubPullBlob,
   getGitHubPullChecks,
   getGitHubPullDefaults,
@@ -54,6 +59,9 @@ import {
   createGitLabIssue,
   createGitLabPull,
   createGitLabPullLineComment,
+  getGitLabBranch,
+  getGitLabDefaultBranch,
+  listGitLabBranches,
   getGitLabPullBlob,
   getGitLabPullChecks,
   getGitLabIssueThread,
@@ -78,6 +86,9 @@ import {
   createBitbucketIssue,
   createBitbucketPull,
   createBitbucketPullLineComment,
+  getBitbucketBranch,
+  getBitbucketDefaultBranch,
+  listBitbucketBranches,
   getBitbucketPullBlob,
   getBitbucketPullChecks,
   getBitbucketIssueThread,
@@ -131,6 +142,9 @@ const NO_REMOTE_ERROR = "project does not have a supported git remote (GitHub, G
 export interface FacadeError {
   ok: false;
   error: string;
+  /** A pull/merge-request create answer the forge classified (see `createGitHubPull`). */
+  code?: "already-exists";
+  existingUrl?: string;
 }
 
 type ListResponse = ({ ok: true } & GitHubListResult) | FacadeError;
@@ -364,6 +378,48 @@ export async function pullDefaults(input: { dir: string }): Promise<PullDefaults
   const res = repoInfo.provider === "gitlab" ? await getGitLabPullDefaults(repoInfo) : await getBitbucketPullDefaults(repoInfo);
   if (!res.ok) return res;
   return { ...res, head: await currentBranchFor(input.dir) };
+}
+
+// ── Remote branch facts (Create all PRs) ───────────────────────────────────
+//
+// Read from the forge's REST API, never `git ls-remote`: the forge is the system
+// that accepts or rejects the PR, and its API is reachable with the token the PR
+// needs anyway (docs/architecture/multi-repo-tasks.md). `info` lets a caller that
+// already resolved the repository identity skip a second `git remote` walk.
+
+type BranchListResponse =
+  | { ok: true; branches: ForgeBranch[]; truncated: boolean }
+  | FacadeError;
+type BranchInfoResponse = { ok: true; branch: ForgeBranch | null } | FacadeError;
+type DefaultBranchResponse = { ok: true; name: string } | FacadeError;
+
+async function repoInfoFor(input: { dir: string; info?: ProviderRepoInfo }): Promise<ProviderRepoInfo | null> {
+  return input.info ?? (await providerRepoForDir(input.dir));
+}
+
+/** Every branch the forge lists for the project's remote repository (capped). */
+export async function listBranches(input: { dir: string; maxPages?: number; info?: ProviderRepoInfo }): Promise<BranchListResponse> {
+  const repoInfo = await repoInfoFor(input);
+  if (!repoInfo) return { ok: false, error: NO_REMOTE_ERROR };
+  const opts = { maxPages: input.maxPages };
+  if (repoInfo.provider === "github") return listGitHubBranches({ dir: input.dir, ...opts });
+  return repoInfo.provider === "gitlab" ? listGitLabBranches(repoInfo, opts) : listBitbucketBranches(repoInfo, opts);
+}
+
+/** One branch by name (`branch: null` when the forge has no such branch). */
+export async function branchInfo(input: { dir: string; name: string; info?: ProviderRepoInfo }): Promise<BranchInfoResponse> {
+  const repoInfo = await repoInfoFor(input);
+  if (!repoInfo) return { ok: false, error: NO_REMOTE_ERROR };
+  if (repoInfo.provider === "github") return getGitHubBranch({ dir: input.dir, name: input.name });
+  return repoInfo.provider === "gitlab" ? getGitLabBranch(repoInfo, input.name) : getBitbucketBranch(repoInfo, input.name);
+}
+
+/** The forge's own default branch for the repository, with no guessed fallback. */
+export async function remoteDefaultBranch(input: { dir: string; info?: ProviderRepoInfo }): Promise<DefaultBranchResponse> {
+  const repoInfo = await repoInfoFor(input);
+  if (!repoInfo) return { ok: false, error: NO_REMOTE_ERROR };
+  if (repoInfo.provider === "github") return getGitHubDefaultBranch({ dir: input.dir });
+  return repoInfo.provider === "gitlab" ? getGitLabDefaultBranch(repoInfo) : getBitbucketDefaultBranch(repoInfo);
 }
 
 export interface PullCreateInput {

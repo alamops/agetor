@@ -265,6 +265,7 @@ import {
 } from "../shared/types.ts";
 import type {
   AgentKind,
+  TaskPr,
   AgentProfile,
   AppEvent,
   BranchNamingConfig,
@@ -3380,39 +3381,53 @@ export function startApiServer(
             reviewers: Array.isArray(body.reviewers) ? body.reviewers.filter((x): x is string => typeof x === "string") : undefined,
           });
           if (!result.ok) {
-            return json({ error: result.error }, { status: 400, headers: corsHeaders(req) });
+            // `code` ("already-exists") and `existingUrl` ride along so the
+            // webview can show "already open" instead of a failure.
+            return json(
+              {
+                error: result.error,
+                ...(result.code ? { code: result.code } : {}),
+                ...(result.existingUrl ? { existingUrl: result.existingUrl } : {}),
+              },
+              { status: 400, headers: corsHeaders(req) },
+            );
           }
-          // Best-effort: persist the created PR's URL onto the task so the
-          // run panel can show a durable "View PR" link across restarts.
-          // A missing/invalid taskId or an item with no htmlUrl must never
-          // fail an otherwise-successful creation — this is pure bookkeeping
-          // layered on top of a request that already succeeded.
+          // Best-effort: append the created PR to the task's `prs` so the run
+          // panel can show a durable "View PR" link across restarts. A
+          // missing/invalid taskId or an item with no htmlUrl must never fail
+          // an otherwise-successful creation — this is pure bookkeeping layered
+          // on top of a request that already succeeded.
           if (typeof body.taskId === "string" && body.taskId) {
             try {
               const task = tasks.get(body.taskId);
               // Guards: archived tasks are frozen (same contract as PATCH /
-              // backlog), a first PR is never silently overwritten, and the
-              // task must actually belong to the project the PR was created
-              // from — a stale/mistargeted taskId must not stamp an unrelated
-              // task.
+              // backlog), and the task must actually belong to the project the
+              // PR was created from — a stale/mistargeted taskId must not stamp
+              // an unrelated task. Stamps only ever append (a task can open
+              // several PRs: one per branch, one per repository), deduped by URL.
               if (task && task.archivedAt == null && result.item?.htmlUrl) {
+                const entry: TaskPr = {
+                  url: result.item.htmlUrl,
+                  head: body.head,
+                  base: body.base,
+                  number: typeof result.item.number === "number" ? result.item.number : null,
+                  createdAt: Date.now(),
+                };
                 if (isMultiRepoTask(task)) {
                   // Multi-repository (issue #291): stamp only the entry whose
                   // worktree/selected path is the PR's `dir`, matched by
-                  // worktree path before name. First write wins per entry;
-                  // `task.prUrl` stays null (there is no single PR).
-                  const entry = (task.repositories ?? []).find(
+                  // worktree path before name. `task.prs` stays empty (there
+                  // is no single PR).
+                  const repo = (task.repositories ?? []).find(
                     (r) => r.worktreePath === dir || r.path === dir,
                   );
-                  if (entry && !entry.prUrl) {
-                    tasks.setRepositoryPrUrl(task.id, entry.name, result.item.htmlUrl);
-                  }
-                } else if (!task.prUrl && task.workdir === dir) {
-                  tasks.update(task.id, { prUrl: result.item.htmlUrl });
+                  if (repo) tasks.appendRepositoryPr(task.id, repo.name, entry);
+                } else if (task.workdir === dir || task.worktreePath === dir) {
+                  tasks.appendPr(task.id, entry);
                 }
               }
             } catch (err) {
-              console.warn(`[agetor] failed to persist pr_url for task ${body.taskId}:`, err);
+              console.warn(`[agetor] failed to record the pull request for task ${body.taskId}:`, err);
             }
           }
           return json(result, { headers: corsHeaders(req) });

@@ -272,6 +272,28 @@ export function endPrBatch(taskId: string): void {
   if (runningBatches.delete(taskId)) notifyBatches();
 }
 
+const openedHeadsByTask = new Map<string, Set<string>>();
+
+const headKey = (repoName: string, head: string) => `${repoName}\u0000${head}`;
+
+/**
+ * Records that a batch opened a PR from this head of this repository, so a press
+ * before the board poll delivers the stamp can't open it twice (docs/architecture/run-panel.md).
+ */
+export function markPrOpened(taskId: string, repoName: string, head: string): void {
+  let set = openedHeadsByTask.get(taskId);
+  if (!set) {
+    set = new Set();
+    openedHeadsByTask.set(taskId, set);
+  }
+  set.add(headKey(repoName, head));
+}
+
+/** True when a batch this session opened a PR from this (task, repository, head). */
+export function prOpenedInSession(taskId: string, repoName: string, head: string): boolean {
+  return openedHeadsByTask.get(taskId)?.has(headKey(repoName, head)) ?? false;
+}
+
 /** Records that a batch opened a PR for this repository of the task. */
 export function markRepositoryPrOpened(taskId: string, repoName: string): void {
   let set = stampedByBatch.get(taskId);
@@ -299,5 +321,6 @@ export function repositoriesForPrBatch<T extends { name: string; prUrl: string |
 export function resetPrBatchesForTest(): void {
   runningBatches.clear();
   stampedByBatch.clear();
+  openedHeadsByTask.clear();
   notifyBatches();
 }

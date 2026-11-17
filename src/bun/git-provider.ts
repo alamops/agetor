@@ -232,6 +232,17 @@ export function providerForHost(canonicalHost: string): GitProvider | null {
  * has no remotes, or its remotes all resolve to an unsupported host.
  */
 export async function providerRepoForDir(dir: string): Promise<ProviderRepoInfo | null> {
+  return (await providerRemoteForDir(dir))?.info ?? null;
+}
+
+/**
+ * {@link providerRepoForDir} that also names the git remote the identity came
+ * from (`origin`, or the first parseable remote). Create-all-PRs needs it to
+ * read `<remote>/HEAD` and to strip a `<remote>/` prefix from an agent's base.
+ */
+export async function providerRemoteForDir(
+  dir: string,
+): Promise<{ info: ProviderRepoInfo; remote: string } | null> {
   if (!existsSync(dir)) return null;
   const remotes = await run(["git", "remote"], dir);
   if (!remotes.ok) return null;
@@ -245,11 +256,14 @@ export async function providerRepoForDir(dir: string): Promise<ProviderRepoInfo 
     const provider = providerForHost(parsed.host);
     if (!provider) continue;
     return {
-      provider,
-      host: parsed.host,
-      remoteHost: parsed.rawHost,
-      owner: parsed.owner,
-      name: parsed.name,
+      remote: name,
+      info: {
+        provider,
+        host: parsed.host,
+        remoteHost: parsed.rawHost,
+        owner: parsed.owner,
+        name: parsed.name,
+      },
     };
   }
   return null;
