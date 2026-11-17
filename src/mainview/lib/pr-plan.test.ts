@@ -10,6 +10,7 @@ import {
   editPrRow,
   headHasPr,
   normalizeAgentBase,
+  planReposForTask,
   proposalHeadsNeedingPr,
   runPrBatch,
   type PrPlanDeps,
@@ -343,15 +344,55 @@ describe("row states", () => {
     expect(gate.map((g) => g.head).sort()).toEqual(["feature/a", "feature/b"]);
   });
 
-  test("a proposal for the unpushed branch itself replaces the placeholder row instead of duplicating its key", async () => {
+  test("a proposal for the unpushed branch itself replaces the placeholder row, stays disabled even when the forge lists it, and keeps the stored base", async () => {
     const reply = ["https://github.com/acme/app/pull/new/agetor/x", block("X", "x body")].join("\n");
+    const calls: Array<{ liveHead?: string | null }> = [];
     const rows = await buildPrPlan(
-      input({ repos: [repo({ name: "app", liveHead: null, branch: "agetor/x" })], events: [ev(reply)] }),
-      depsFor({}),
+      input({
+        repos: [repo({ name: "app", liveHead: null, branch: "agetor/x", storedBase: "develop" })],
+        events: [ev(reply)],
+      }),
+      // The forge lists agetor/x (pushed before), and develop exists too.
+      depsFor({ "/work/app": { branches: ["main", "develop", "agetor/x"] } }, calls),
     );
     expect(rows).toHaveLength(1);
-    expect(rows[0]).toMatchObject({ head: "agetor/x", title: "X", checked: false });
-    expect(rows[0]!.disabledReason).not.toBeNull();
+    expect(rows[0]).toMatchObject({
+      head: "agetor/x",
+      title: "X",
+      body: "x body",
+      checked: false,
+      disabledReason: "branch is not pushed yet",
+      base: "develop",
+      baseSource: "task",
+    });
+    // The stored base is judged against the unpushed task branch.
+    expect(calls[0]!.liveHead).toBe("agetor/x");
+  });
+
+  test("a drifted live branch that isn't pushed yet is held back and based on the stored base", async () => {
+    const reply = ["https://github.com/acme/app/pull/new/hotfix/y", block("Y", "y body")].join("\n");
+    const rows = await buildPrPlan(
+      input({
+        repos: [repo({ name: "app", liveHead: null, branch: "agetor/x", pendingHeads: ["hotfix/y"], storedBase: "develop" })],
+        events: [ev(reply)],
+      }),
+      depsFor({ "/work/app": { branches: ["main", "develop", "hotfix/y"] } }),
+    );
+    const hotfix = rows.find((r) => r.head === "hotfix/y")!;
+    expect(hotfix).toMatchObject({ checked: false, disabledReason: "branch is not pushed yet", base: "develop", baseSource: "task" });
+    // The placeholder for the task branch is still offered, disabled.
+    expect(rows.find((r) => r.head === "agetor/x")!.disabledReason).toBe("branch is not pushed yet");
+  });
+
+  test("an extra head of a repository with a pushed live head is not treated as pending", async () => {
+    const reply = ["https://github.com/acme/app/pull/new/feature/docs", block("D", "d")].join("\n");
+    const rows = await buildPrPlan(
+      input({ repos: [repo({ name: "app", storedBase: "develop" })], events: [ev(reply)] }),
+      depsFor({}),
+    );
+    const docs = rows.find((r) => r.head === "feature/docs")!;
+    expect(docs.disabledReason).toBeNull();
+    expect(docs.baseSource).not.toBe("task");
   });
 
   test("the forge branch listing is skipped only for the single chip", async () => {
@@ -553,5 +594,41 @@ describe("helpers", () => {
     expect(appendIssueCloseDirective("fixes #7 already", url)).toBe("fixes #7 already");
     expect(appendIssueCloseDirective("mentions #71", url)).toBe("mentions #71\n\nCloses #7");
     expect(appendIssueCloseDirective("body", null)).toBe("body");
+  });
+});
+
+describe("planReposForTask — pending heads", () => {
+  const task = {
+    workdir: "/work/app",
+    isolation: "worktree",
+    branch: "agetor/x",
+    branchSource: "created",
+    worktreePath: null,
+    baseRef: null,
+    checkoutBranch: null,
+    prUrl: null,
+    prs: [],
+    baseBranch: "develop",
+    repositories: undefined,
+    multiRepo: false,
+    issueUrl: null,
+    issueRepoPath: null,
+  } as unknown as Parameters<typeof planReposForTask>[0];
+  const status = (over: Record<string, unknown>) =>
+    ({ branch: "hotfix/y", isDefaultBranch: false, ignored: false, remoteSynced: false, ...over }) as never;
+
+  test("an unsynced checkout that drifted off the task branch reports the drifted branch as pending", () => {
+    const [r] = planReposForTask(task, status({}));
+    expect(r).toMatchObject({ liveHead: null, branch: "agetor/x", pendingHeads: ["hotfix/y"], storedBase: "develop" });
+  });
+
+  test("a synced checkout has a live head and nothing pending", () => {
+    const [r] = planReposForTask(task, status({ remoteSynced: true }));
+    expect(r).toMatchObject({ liveHead: "hotfix/y", pendingHeads: [] });
+  });
+
+  test("no git status yet: nothing pending beyond the task branch", () => {
+    const [r] = planReposForTask(task, null);
+    expect(r).toMatchObject({ liveHead: null, pendingHeads: [] });
   });
 });

@@ -36,6 +36,13 @@ export interface PrPlanRepo {
   liveHead: string | null;
   /** The branch agetor created for this repository, shown when `liveHead` is null. */
   branch: string | null;
+  /**
+   * Branches this repository's checkout is working on that aren't PR-able yet
+   * (the live checkout's branch when it drifted off `branch`, unpushed or
+   * unsynced). Only meaningful while `liveHead` is null; they are treated like
+   * `branch`: never openable, based like a live head.
+   */
+  pendingHeads?: readonly string[];
   /** PRs already recorded for this repository. */
   prs: readonly TaskPr[];
   /** The base branch recorded at task creation, and the sha it was pinned to. */
@@ -142,11 +149,20 @@ export function planReposForTask(
       : shouldOfferOpenPr(status)
         ? prHeadBranch(task.branch ?? null, status, task.branchSource)
         : null;
+    // The head this checkout would open from once pushed and synced: the drifted
+    // live branch included, so a proposal naming it is held back with the rest.
+    const pendingHeads =
+      liveHead || !status
+        ? []
+        : [prHeadBranch(entry.branch, status, entry.branchSource ?? undefined)].filter(
+            (h): h is string => !!h && h !== entry.branch,
+          );
     return {
       name: entry.name,
       projectPath: multi ? (entry.worktreePath ?? entry.path) : task.workdir,
       liveHead,
       branch: entry.branch,
+      pendingHeads,
       prs: entry.prs ?? [],
       storedBase: entry.baseBranch ?? null,
       storedBaseSha: entry.baseRef ?? null,
@@ -401,6 +417,20 @@ export function proposalHeadsNeedingPr(
   return out;
 }
 
+/**
+ * Heads of a repository whose live checkout can't open a PR yet (nothing pushed
+ * or synced): the branch agetor created, and the drifted live branch. A proposal
+ * for one of them is attributed like any other, but its row stays disabled, and
+ * its base is chosen by the live-head rules (stored base first): the agent's
+ * proposal must not retarget the branch the task was created from.
+ */
+function pendingHeadsOf(repo: Pick<PrPlanRepo, "liveHead" | "branch" | "pendingHeads">): string[] {
+  if (repo.liveHead) return [];
+  const out: string[] = [];
+  for (const h of [repo.branch, ...(repo.pendingHeads ?? [])]) if (h && !out.includes(h)) out.push(h);
+  return out;
+}
+
 interface RepoFacts {
   repo: PrPlanRepo;
   attributed: Map<string, AttributedProposal> | undefined;
@@ -414,11 +444,13 @@ export function planPrRows(input: PrPlanInput, facts: RepoFacts): PrRow[] {
   const remote = targets?.remote ?? null;
   const remotes = targets?.remotes?.length ? targets.remotes : ["origin"];
   const rows: PrRow[] = [];
+  const pendingHeads = input.liveHeadOnly ? [] : pendingHeadsOf(repo);
 
   if (!repo.liveHead && !input.liveHeadOnly) {
     // Nothing pushed to open a PR from yet. A placeholder row is only worth it
     // when the repository has no PR at all and no proposal already names the
-    // branch (that proposal gets its own, equally disabled, row below). The
+    // branch (that proposal gets its own row below, disabled for the same
+    // reason, even when the forge lists a branch pushed before). The
     // proposals attributed to other branches still plan: they are counted by
     // `proposalHeadsNeedingPr`, so the dialog must offer them too.
     const head = repo.branch ?? "";
@@ -447,7 +479,10 @@ export function planPrRows(input: PrPlanInput, facts: RepoFacts): PrRow[] {
   const heads = input.liveHeadOnly ? (repo.liveHead ? [repo.liveHead] : []) : headsOf(repo, attributed);
   for (const head of heads) {
     if (headHasPr(input.taskId, repo, head)) continue;
-    const isLiveHead = head === repo.liveHead;
+    const isPendingHead = pendingHeads.includes(head);
+    // A pending head is the task's own branch: the live-head rules apply to it
+    // (stored base, issue directive), only the checkbox is held back.
+    const isLiveHead = head === repo.liveHead || isPendingHead;
     const proposal = attributed?.get(head) ?? null;
     const hints: string[] = [];
 
@@ -475,7 +510,9 @@ export function planPrRows(input: PrPlanInput, facts: RepoFacts): PrRow[] {
     const baseOptions = baseOptionsFor(targets, [base, stored ?? "", agentBase ?? "", targets?.defaultBranch ?? ""]);
 
     let disabledReason: string | null = null;
-    if (!isLiveHead) {
+    if (isPendingHead) {
+      disabledReason = "branch is not pushed yet";
+    } else if (!isLiveHead) {
       const facts = targets?.heads.find((h) => h.name === head);
       if (!isValidBranchName(head)) disabledReason = `\`${head}\` isn't a valid branch name`;
       else if (facts?.onRemote === false) disabledReason = `branch \`${head}\` isn't on ${remote ?? "origin"}`;
@@ -538,7 +575,8 @@ export async function buildPrPlan(input: PrPlanInput, deps: PrPlanDeps): Promise
           heads: candidates,
           storedBase: repo.storedBase,
           storedBaseSha: repo.storedBaseSha,
-          liveHead: repo.liveHead,
+          // The branch whose base the stored one is judged against: the live head, else the unpushed task branch.
+          liveHead: repo.liveHead ?? pendingHeadsOf(repo)[0] ?? null,
           // The single chip needs only its own head and base, which are looked up by name.
           ...(input.liveHeadOnly ? { listBranches: false } : {}),
         });

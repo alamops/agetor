@@ -400,7 +400,12 @@ proposed besides the live checkout) starts unchecked and is disabled unless the
 forge lists it. A head that already has a PR (recorded, or opened this session)
 has no row. A repository whose live checkout isn't pushed (no live head) gets a
 disabled "branch is not pushed yet" placeholder when it has no PR and no proposal
-names that branch, and **still plans every other branch the agent proposed**, so
+names that branch. A proposal that does name an unpushed branch (the task's own
+branch, or the drifted live checkout branch in `PrPlanRepo.pendingHeads`) gets its
+own row, **always disabled for the same reason even when the forge lists a branch
+pushed before**, and its base follows the live-head rules (the stored base unless
+git proved it stale), never the agent's, so a stale listing can't enable a row
+that retargets the base. The planner **still plans every other branch the agent proposed**, so
 the dialog offers exactly the heads `proposalHeadsNeedingPr` counts for the
 button's gate; keep the two in step. A proposal-less row gets the root task's title (the pipeline parent's
 for a step), an empty body and a hint. The user edits the base (a native select
