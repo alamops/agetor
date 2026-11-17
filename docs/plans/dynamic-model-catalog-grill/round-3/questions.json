@@ -1,0 +1,45 @@
+{
+  "version": 1,
+  "id": "dynamic-model-catalog-grill-r3",
+  "title": "Grill — dynamic model & effort catalog per harness",
+  "skill": "grill",
+  "slug": "dynamic-model-catalog",
+  "round": 3,
+  "summary": "**Round 3: two push-backs, then the grill is done.** One contradiction between two of your round-2 answers, and one edge case your Speed note opens.",
+  "sections": [
+    {
+      "id": "pushback",
+      "title": "Push-back",
+      "questions": [
+        {
+          "id": "copilot-acp-blind",
+          "type": "single",
+          "title": "With no copilot on this machine, what happens to the copilot ACP probe?",
+          "impact": "shape",
+          "why": "Your two round-2 answers can't both hold: the guard needs a live spike that stub-only rules out.",
+          "context": "Round 2 you chose **\"Build from docs + stub fixtures only\"** and also confirmed: *\"If the copilot ACP spike shows that opening a session costs a premium request, writes copilot's own config, or doesn't list models with efforts, the probe is not shipped.\"* Without copilot installed, none of those three checks can run. The ACP spec tells us the *shape* a model/effort config option would have, but not whether copilot's server sends one, or what opening a session costs or writes.",
+          "options": [
+            { "id": "ship-off", "label": "Build it from the ACP spec, shipped switched off", "description": "Probe + parser + stub tests land, but copilot keeps `help config` by default. An env var (e.g. `AGETOR_COPILOT_ACP_DISCOVERY=1`) turns it on, and a later live check flips the default.", "consequence": "No unverified probe touches users; the code is ready for the live check." },
+            { "id": "ship-on", "label": "Build it from the spec and ship it on", "description": "Any failure falls back to `help config`.", "consequence": "An unverified side effect (a paid request, a config write) could reach every copilot user." },
+            { "id": "defer", "label": "Move copilot ACP out: a separate spike ticket", "consequence": "Copilot keeps `help config` in this change; nothing copilot-ACP is built." },
+            { "id": "install-copilot", "label": "I'll install and log in to copilot after all", "consequence": "The guard runs live, as confirmed in round 2." }
+          ],
+          "recommendation": { "value": "ship-off", "reason": "Keeps your scope pick and your no-side-effect guard both true." }
+        },
+        {
+          "id": "speed-remember-unsupported",
+          "type": "single",
+          "title": "Remembered Speed is Fast, and the new task's model can't do Fast. What happens to the remembered pick?",
+          "impact": "minor",
+          "why": "Your note: \"disable it if the new task chooses a model/harness that doesn't support fast mode… the same for efforts\". The task falls back to Standard (or the model's default effort). Still open: whether the *remembered* pick survives.",
+          "context": "`lastSpeed:<kind>` already exists (cursor/fx), next to `lastModel`/`lastEffort`, all written when a task is submitted. Example: last task was Opus 5.5 + Fast. The next task picks Sonnet 5.5 (no fast mode), so it gets Standard. Then a third task picks Opus 5.5 again.",
+          "options": [
+            { "id": "keep-memory", "label": "The memory stays Fast; it re-applies on the next Fast-capable model", "description": "Only an explicit pick changes the memory. Efforts work the same way: a remembered `xhigh` falls back to the model's default where unsupported and comes back where supported.", "consequence": "Third task is Fast again. A change from today: `lastSpeed`/`lastEffort` are written on submit, so today the fallback value overwrites the memory." },
+            { "id": "reset-memory", "label": "Falling back overwrites the memory with Standard", "consequence": "Third task is Standard; you re-pick Fast. This is how `lastSpeed:<kind>` / `lastEffort:<kind>` already behave for cursor/fx (written on submit, `NewTaskForm.tsx:689`)." }
+          ],
+          "recommendation": { "value": "keep-memory", "reason": "A fallback isn't a choice you made, so it shouldn't erase the one you did make; it means writing the memory only on an explicit pick." }
+        }
+      ]
+    }
+  ]
+}

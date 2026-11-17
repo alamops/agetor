@@ -1,0 +1,120 @@
+{
+  "version": 1,
+  "formId": "dynamic-model-catalog-grill-r2",
+  "title": "Grill — dynamic model & effort catalog per harness",
+  "round": 2,
+  "mode": "served",
+  "specFile": "questions.json",
+  "specSha256": "ff87c1bf42142b230017b4b34409aa0bd1b895696a47dae06a45ae52c74ba855",
+  "submittedAt": "2026-11-17T18:56:02.659Z",
+  "receivedAt": "2026-11-17T18:56:02.671Z",
+  "answeredBy": null,
+  "summary": {
+    "total": 9,
+    "answered": 9,
+    "skipped": 0,
+    "unanswered": 0,
+    "optionalLeftBlank": 0,
+    "notApplicable": 0,
+    "acceptedRecommendations": 7,
+    "overrodeRecommendations": [
+      "speed-default",
+      "live-verify"
+    ],
+    "oneWayDoorsNotAnswered": [],
+    "withNotes": [
+      "speed-default"
+    ],
+    "needsAnswer": [],
+    "complete": true
+  },
+  "answers": {
+    "speed-default": {
+      "n": 1,
+      "title": "What Speed does a new claude or codex task get by default?",
+      "type": "single",
+      "status": "answered",
+      "impact": "shape",
+      "value": "remember-last",
+      "display": "Remember the last pick per kind",
+      "acceptedRecommendation": false,
+      "recommended": "standard",
+      "note": "make sure we disable it if the new task chooses a model/harness/etc that doesnt support fast mode or ultrafast mode, etc., the same for efforts"
+    },
+    "claude-fast-mechanism": {
+      "n": 2,
+      "title": "If claude can only turn fast mode on through a global setting, what should agetor do?",
+      "type": "single",
+      "status": "answered",
+      "oneWayDoor": true,
+      "impact": "blocking",
+      "value": "per-run-or-drop",
+      "display": "Per-run switch only; otherwise claude Speed is cut",
+      "acceptedRecommendation": true
+    },
+    "speed-midtask": {
+      "n": 3,
+      "title": "When Speed changes on a running claude task, when does it take effect?",
+      "type": "single",
+      "status": "answered",
+      "impact": "minor",
+      "value": "next-run",
+      "display": "Next spawn (new run or resume)",
+      "acceptedRecommendation": true
+    },
+    "speed-notice": {
+      "n": 4,
+      "title": "Cost notice for Fast",
+      "type": "confirm",
+      "status": "answered",
+      "value": "Picking Fast shows the CLI's own description as a hint (codex: \"2x speed, increased usage\"; claude: its fast-mode text), with the same weight as the existing \"Fable bills 2x\" notice. Codex passes the tier through its config flag (exact form verified at build time).",
+      "acceptedRecommendation": true
+    },
+    "pretty-names": {
+      "n": 5,
+      "title": "\"Beautify the names, like opus-5.5 → Opus 5.5\": where should raw model ids stop showing?",
+      "type": "single",
+      "status": "answered",
+      "impact": "shape",
+      "value": "everywhere",
+      "display": "Everywhere a model is shown to a person",
+      "acceptedRecommendation": true
+    },
+    "live-verify": {
+      "n": 6,
+      "title": "Copilot (ACP) and Gemini are in scope, but neither CLI is installed here. How do we verify them?",
+      "type": "single",
+      "status": "answered",
+      "impact": "shape",
+      "value": "stub-only",
+      "display": "Build from docs + stub fixtures only",
+      "acceptedRecommendation": false,
+      "recommended": "install"
+    },
+    "copilot-acp-guard": {
+      "n": 7,
+      "title": "Copilot ACP probe: when it's dropped",
+      "type": "confirm",
+      "status": "answered",
+      "value": "If the copilot ACP spike shows that opening a session costs a premium request, writes copilot's own config, or doesn't list models with efforts, the probe is not shipped; copilot keeps `help config` and the finding goes in the PR body.",
+      "acceptedRecommendation": true
+    },
+    "claude-kind-probe": {
+      "n": 8,
+      "title": "Which claude account the single kind-level probe uses",
+      "type": "confirm",
+      "status": "answered",
+      "value": "The built-in claude harness's config (your default `~/.claude`, or its `CLAUDE_CONFIG_DIR` if set). Its models and efforts apply to every claude harness, stack accounts included. If that harness is logged out, the probe result is distrusted (merge rule 7) and the curated tables apply.",
+      "acceptedRecommendation": true
+    },
+    "bundles-cli": {
+      "n": 9,
+      "title": "Bundles, `agetor add` and the TUI",
+      "type": "confirm",
+      "status": "answered",
+      "value": "Bundle import's \"unknown model\" warning, `agetor add --model/--effort` validation and the TUI use curated ∪ discovered from the core (`GET /agent-models`). Third-party labels and ids printed by the CLI/TUI go through `escapeFreeText` / `escapeControlChars`.",
+      "acceptedRecommendation": true
+    }
+  },
+  "generalNotes": null
+}

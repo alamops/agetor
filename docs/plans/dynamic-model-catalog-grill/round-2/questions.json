@@ -1,0 +1,152 @@
+{
+  "version": 1,
+  "id": "dynamic-model-catalog-grill-r2",
+  "title": "Grill — dynamic model & effort catalog per harness",
+  "skill": "grill",
+  "slug": "dynamic-model-catalog",
+  "round": 2,
+  "summary": "**Round 2.** 18 of 22 round-1 answers accepted the recommendation. This round has **follow-ups to your three overrides and two notes**, plus the one confirm left blank (**Bundles, `agetor add` and the TUI**).\n\nThe heaviest is **Speed, now in scope**: it needs four decisions the build would otherwise make silently.",
+  "proven": [
+    {
+      "text": "**Yes, the refresh icon exists** (your note on Scope). The New Task form's Model label has a `Refresh model list` button (`data-testid=\"refresh-models\"`) that calls `POST /agent-models`, which re-runs every probe. The new claude, gemini, cursor and copilot probes join that same path, so the button refreshes them with no new UI. With the persisted catalog, a refresh also overwrites the stored copy.",
+      "evidence": [
+        {
+          "path": "src/mainview/components/kanban/NewTaskForm.tsx",
+          "line": 1050,
+          "lang": "tsx",
+          "code": "                    <button\n                      type=\"button\"\n                      title=\"Refresh model list\"\n                      aria-label=\"Refresh model list\"\n                      data-testid=\"refresh-models\""
+        }
+      ]
+    },
+    "**Codex reports its speed tier per model.** `gpt-6.1-sol` on codex-cli 0.166.0: `additionalSpeedTiers: [\"fast\"]`, `serviceTiers: [{id: \"priority\", name: \"Fast\", description: \"2x speed, increased usage\"}]`, `defaultServiceTier: null` (spike S3).",
+    "**Claude reports `supportsFastMode: true` on Opus 5.5, Fable 5.2, Opus 5 and Opus 4.8** (spike S1), and nothing on the others. How a single run turns fast mode on is **not verified**; today it's the interactive `/fast` toggle."
+  ],
+  "sections": [
+    {
+      "id": "speed",
+      "title": "Speed, now in scope",
+      "intro": "You moved claude and codex speed tiers into this change (Round 1: **\"In this change\"**). Speed exists today only for cursor and fx (`src/shared/speed.ts`, a per-task Speed picker). These decide how it works for the two new kinds.",
+      "questions": [
+        {
+          "id": "speed-default",
+          "type": "single",
+          "title": "What Speed does a new claude or codex task get by default?",
+          "impact": "shape",
+          "why": "Fast mode is billed higher on both (codex: \"2x speed, increased usage\"), so the default decides what every task costs.",
+          "options": [
+            { "id": "standard", "label": "Standard; Fast is opt-in per task", "consequence": "No cost change for anyone until they pick Fast. Same as cursor/fx today." },
+            { "id": "remember-last", "label": "Remember the last pick per kind", "description": "Like `lastModel:<kind>`.", "consequence": "One click of Fast keeps every following task on the higher bill until changed back." },
+            { "id": "fast", "label": "Fast where the model supports it" }
+          ],
+          "recommendation": { "value": "standard", "reason": "It's an extra-cost tier; opting in per task keeps the bill predictable." }
+        },
+        {
+          "id": "claude-fast-mechanism",
+          "type": "single",
+          "title": "If claude can only turn fast mode on through a global setting, what should agetor do?",
+          "impact": "blocking",
+          "oneWayDoor": true,
+          "why": "Writing your global claude settings would change every claude session you run, not just agetor's: the same kind of side effect the cursor spike had.",
+          "context": "The build will first look for a per-run switch (a CLI flag, or a `--settings` JSON passed only to agetor's spawn, which writes nothing). Two fallbacks are possible if none exists: send `/fast` into the task's tmux session (the way agetor already mirrors `/model`), which may persist to `~/.claude/settings.json`; or write that file. Neither is verified.",
+          "options": [
+            { "id": "per-run-or-drop", "label": "Per-run switch only; otherwise claude Speed is cut", "description": "If no per-run switch exists, claude gets no Speed picker in this change and the finding is reported back.", "consequence": "Never touches your global claude settings; claude Speed may not ship." },
+            { "id": "slash-ok", "label": "Allow `/fast` in the task session, even if claude persists it", "consequence": "Ships claude Speed for sure; your interactive claude default can flip to fast, billed higher." },
+            { "id": "slash-restore", "label": "Allow `/fast`, but restore the previous setting when the run ends", "consequence": "More driver work; a crash mid-run can leave fast mode on." }
+          ],
+          "recommendation": { "value": "per-run-or-drop", "reason": "Same rule you accepted for cursor: discovery and runs must not rewrite the user's own CLI defaults." }
+        },
+        {
+          "id": "speed-midtask",
+          "type": "single",
+          "title": "When Speed changes on a running claude task, when does it take effect?",
+          "impact": "minor",
+          "why": "Claude follow-ups fold into one live session, so a per-spawn switch only applies at the next spawn.",
+          "options": [
+            { "id": "next-run", "label": "Next spawn (new run or resume)", "description": "Shown as \"applies on the next run\" in the task editor.", "consequence": "Simple; matches how a per-spawn flag works." },
+            { "id": "live", "label": "Live, at the next turn", "description": "Restart or reconfigure the session to apply it.", "consequence": "Needs a session restart or `/fast`, which the previous question may rule out." }
+          ],
+          "recommendation": { "value": "next-run", "reason": "It's the only option that works with a per-spawn switch." }
+        },
+        {
+          "id": "speed-notice",
+          "type": "confirm",
+          "title": "Cost notice for Fast",
+          "recommendation": { "value": "Picking Fast shows the CLI's own description as a hint (codex: \"2x speed, increased usage\"; claude: its fast-mode text), with the same weight as the existing \"Fable bills 2x\" notice. Codex passes the tier through its config flag (exact form verified at build time).", "reason": "The cost difference should be visible where it's chosen." }
+        }
+      ]
+    },
+    {
+      "id": "followups",
+      "title": "Follow-ups to your other answers",
+      "questions": [
+        {
+          "id": "pretty-names",
+          "type": "single",
+          "title": "\"Beautify the names, like opus-5.5 → Opus 5.5\": where should raw model ids stop showing?",
+          "impact": "shape",
+          "why": "Decides whether this is just a fallback label or a sweep of every place that prints a model id.",
+          "context": "Your round-1 note on the claude id scheme: *\"Let's also beautify the names, like, opus-5.5 can become Opus 5.5.\"* Picker rows already show labels (\"Opus 5.5\"). Raw ids still show elsewhere, e.g. the task card's model line prints `task.model` verbatim (`opus-5.5 · auto`). The rule would be: the catalog label when one exists, else a prettified id (`opus-5.5` → `Opus 5.5`, `gpt-6.1-sol` → `GPT-6.1 Sol`, `grok-4.7` → `Grok 4.7`). Stored ids don't change.",
+          "evidence": [
+            {
+              "label": "task card prints the raw id",
+              "path": "src/mainview/components/kanban/TaskCard.tsx",
+              "line": 331,
+              "lang": "tsx",
+              "code": "        {(task.model || task.mode) && (\n"
+            }
+          ],
+          "options": [
+            { "id": "everywhere", "label": "Everywhere a model is shown to a person", "description": "Picker rows without a label, unlisted rows, the task card, the run panel, stack badges, and CLI/TUI output (`agetor show`, lists). Inputs still accept ids.", "consequence": "One shared `modelDisplayName(kind, id, catalog)` in `src/shared`, used at every display site." },
+            { "id": "pickers-only", "label": "Only as the fallback label in pickers", "description": "Rows with no label (discovered-only, unlisted).", "consequence": "The task card and CLI keep showing ids." },
+            { "id": "claude-only", "label": "Only for claude ids" }
+          ],
+          "recommendation": { "value": "everywhere", "reason": "One helper, and the task card is where you see ids most." }
+        },
+        {
+          "id": "live-verify",
+          "type": "single",
+          "title": "Copilot (ACP) and Gemini are in scope, but neither CLI is installed here. How do we verify them?",
+          "impact": "shape",
+          "why": "Without the CLIs, their probes ship tested only against stubs written from docs.",
+          "context": "Round 1: you ticked **Copilot: try its ACP server** (over my recommendation) and Gemini. Neither `copilot`, `gemini` nor `agy` is on this machine. The copilot ACP probe is a spike: whether it lists models and efforts, and whether opening a session costs a request or writes copilot's config, is unknown.",
+          "options": [
+            { "id": "install", "label": "You install and log in to copilot and gemini ≥ 0.67 before the build", "description": "The build spikes copilot ACP live and verifies both probes once against the real CLIs.", "consequence": "Real verification; needs your logins on this machine." },
+            { "id": "stub-only", "label": "Build from docs + stub fixtures only", "description": "Every probe failure falls back to today's behavior.", "consequence": "Ships unverified against the real CLIs; the copilot ACP shape is a guess." },
+            { "id": "install-gemini-only", "label": "Install gemini only; copilot ACP moves to a separate spike", "consequence": "Copilot keeps today's `help config` probe in this change." }
+          ],
+          "recommendation": { "value": "install", "reason": "The copilot ACP probe can't be designed without seeing what it returns." }
+        },
+        {
+          "id": "copilot-acp-guard",
+          "type": "confirm",
+          "title": "Copilot ACP probe: when it's dropped",
+          "recommendation": { "value": "If the copilot ACP spike shows that opening a session costs a premium request, writes copilot's own config, or doesn't list models with efforts, the probe is not shipped; copilot keeps `help config` and the finding goes in the PR body.", "reason": "Same no-side-effect bar as cursor and claude." }
+        },
+        {
+          "id": "claude-kind-probe",
+          "type": "confirm",
+          "title": "Which claude account the single kind-level probe uses",
+          "context": "Round 1: you picked **Unscoped, one probe per kind** for claude.",
+          "recommendation": { "value": "The built-in claude harness's config (your default `~/.claude`, or its `CLAUDE_CONFIG_DIR` if set). Its models and efforts apply to every claude harness, stack accounts included. If that harness is logged out, the probe result is distrusted (merge rule 7) and the curated tables apply.", "reason": "Matches \"one probe per kind\" and the existing logged-out rule." }
+        }
+      ]
+    },
+    {
+      "id": "confirm",
+      "title": "Confirm or override",
+      "intro": "Left blank in round 1.",
+      "questions": [
+        {
+          "id": "bundles-cli",
+          "type": "confirm",
+          "title": "Bundles, `agetor add` and the TUI",
+          "recommendation": {
+            "value": "Bundle import's \"unknown model\" warning, `agetor add --model/--effort` validation and the TUI use curated ∪ discovered from the core (`GET /agent-models`). Third-party labels and ids printed by the CLI/TUI go through `escapeFreeText` / `escapeControlChars`.",
+            "reason": "Otherwise a discovered model is selectable in the app but rejected by the CLI."
+          },
+          "context": "> **Round 1: this was left blank.**"
+        }
+      ]
+    }
+  ]
+}
