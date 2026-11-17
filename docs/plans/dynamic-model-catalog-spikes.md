@@ -10,3 +10,11 @@ Run 2026-11-17 on claude 2.1.326, codex-cli 0.166.0, cursor-agent 2026.10.22. ge
 | Cursor (#20) | `cursor-agent --list-models` is read-only; the live check of whether an agetor cursor run edits `~/.cursor/cli-config.json` is T23. |
 
 Fixtures in `src/bun/fixtures/model-discovery/`: `claude-init-2.1.326.json` (the `models[]` array only; the `account` object of the response is never captured), `claude-init-old.json` (synthetic pre-2.1.49 shape), `codex-model-list-0.166.0.json`, `cursor-models-2026.10.22.txt`, `gemini-models.json` (docs field list), `copilot-acp-session-new.json` (ACP spec shape). `grep -ci "@\|email"` over them prints 0.
+
+## T23 — live smoke (2026-11-17, headless core on :4319, `~/.agetor-dev`)
+
+- `GET /agent-models`: **claude-code 13 rows** from the live CLI 2.1.326 (`opus-5.5` `cliDefault`, `fast`, efforts `low…max`; no duplicate labels), **codex 10 rows** with `cliDefault` (`gpt-6.2-sol`), `defaultEffort`, `fast`, `fastTier: "priority"`, **cursor 65 rows** (from 284 flat ids; 7 grouped families with `cursor.effortIds`/`fastEfforts`, no duplicate labels). gemini/copilot: not installed here.
+- Found while smoking: the generic 3 s probe budget timed `cursor-agent --list-models` out under load (it takes 1–3 s), leaving the cursor list empty; `discoverCursor` now has its own 10 s budget.
+- Restart: persisted rows are served at the first request after `/health` (before the boot sweep's probes finish), and a sweep with an unreachable claude binary keeps the claude catalog (`AGETOR_CLAUDE_BIN=/nonexistent/…`).
+- `select key from preferences where key like 'modelCatalog:%'` → `kind:claude-code`, `kind:cursor`, `harness:codex`, `harness:fx`, `harness:opencode`; **0** rows match `@`, `email`, `organization` or `account`.
+- Cursor side-effect check (#20): one minimal agetor cursor run (`composer-2.5`, mode `auto`) against the dev core. The run itself fails with ACP `Invalid params` on this cursor-agent (2026.10.22) — the same failure reproduces on the base commit `32aa7c3a` with mode `ask`, so it is unrelated to this change and out of scope. `~/.cursor/cli-config.json` before/after differs only in `privacyCache.updatedAt` (cursor-agent's own housekeeping); **no model or default changed**. Nothing to ticket from this check beyond the pre-existing `Invalid params` failure.

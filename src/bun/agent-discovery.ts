@@ -179,6 +179,8 @@ function parseCursorModels(stdout: string): DiscoveredModel[] {
   return parseCursorModelList(stdout);
 }
 
+const CURSOR_PROBE_TIMEOUT_MS = 10_000;
+
 async function discoverCursor(): Promise<DiscoveredModel[]> {
   // Resolve against the rehydrated PATH explicitly — see discoverCodex's
   // comment above (and agent-status.ts) for why Bun.spawn's implicit lookup
@@ -188,7 +190,10 @@ async function discoverCursor(): Promise<DiscoveredModel[]> {
   // Best-effort only: cursor-agent may not support --list-models at all, or
   // may not be installed. Either way we fall back to the hardcoded
   // AGENT_OPTIONS list — never throw, never block app boot.
-  const probe = await runProbe([bin, "--list-models"]);
+  // `cursor-agent --list-models` prints ~280 lines and takes 1–3 s cold (more
+  // under load): the generic 3 s budget timed it out and left the picker on the
+  // curated list, so it gets a wider one (still bounded — never blocks boot).
+  const probe = await runProbe([bin, "--list-models"], undefined, CURSOR_PROBE_TIMEOUT_MS);
   if (!probe.ok || !probe.stdout) return [];
   return parseCursorModels(probe.stdout);
 }
