@@ -1,5 +1,12 @@
 import { describe, expect, test } from "bun:test";
-import { latestPrProposal, parsePrProposal } from "./pr-proposal.ts";
+import {
+  cleanBaseValue,
+  collectRunProposals,
+  extractLinkLine,
+  latestPrProposal,
+  parsePrProposal,
+  parsePrProposals,
+} from "./pr-proposal.ts";
 import type { RunEvent } from "../../shared/types.ts";
 
 const LINK = "https://github.com/acme/widgets/pull/new/feature/add-login";
@@ -645,5 +652,163 @@ describe("multi-repository proposals", () => {
       ev({ runId: "new", subagentId: "s1", data: labeled }),
     ];
     expect(latestRepositoryProposals(events).get("frontend")?.title).toBe("Newer");
+  });
+});
+
+// ---------------------------------------------------------------------------
+// parsePrProposals / collectRunProposals (Create all PRs)
+// ---------------------------------------------------------------------------
+
+const block = (title: string, desc: string) =>
+  ["PR title:", "```", title, "```", "", "PR description:", "````", desc, "````"].join("\n");
+
+// The shape of a real multi-PR reply: bold headings, bare pull/new links, no labels.
+function threePrReply(): string {
+  return [
+    "Pushed all branches.",
+    "",
+    "**PR-1: app → `main`**",
+    "https://github.com/acme/app/pull/new/feature/login",
+    "",
+    block("Add login", "Adds login to app."),
+    "",
+    "**PR-2: infra → `main`**",
+    "https://github.com/acme/infra/pull/new/feature/login",
+    "",
+    block("Add login infra", "Infra for login."),
+    "",
+    "**PR-3: app second branch**",
+    "https://github.com/acme/app/pull/new/feature/docs",
+    "",
+    block("Docs for login", "Docs."),
+  ].join("\n");
+}
+
+describe("parsePrProposals", () => {
+  test("a three-PR reply gives three proposals, each with its own link", () => {
+    const ps = parsePrProposals(threePrReply());
+    expect(ps.map((p) => p.title)).toEqual(["Add login", "Add login infra", "Docs for login"]);
+    expect(ps.map((p) => p.link)).toEqual([
+      "https://github.com/acme/app/pull/new/feature/login",
+      "https://github.com/acme/infra/pull/new/feature/login",
+      "https://github.com/acme/app/pull/new/feature/docs",
+    ]);
+    expect(ps[1]!.description).toBe("Infra for login.");
+  });
+
+  test("a proposal without its own link gets null, never a sibling's", () => {
+    const text = [
+      "https://github.com/acme/app/compare/main...a",
+      block("One", "d1"),
+      "",
+      block("Two", "d2"),
+    ].join("\n");
+    const ps = parsePrProposals(text);
+    expect(ps).toHaveLength(2);
+    expect(ps[0]!.link).toBe("https://github.com/acme/app/compare/main...a");
+    expect(ps[1]!.link).toBeNull();
+  });
+
+  test("reads Base: variants (emphasis, backticks, Base branch:, trailing prose)", () => {
+    const mk = (line: string) => parsePrProposals([line, block("T", "D")].join("\n"))[0]!.baseLine;
+    expect(mk("Base: develop")).toBe("develop");
+    expect(mk("**Base:** `develop`")).toBe("develop");
+    expect(mk("**Base**: release/1.2")).toBe("release/1.2");
+    expect(mk("Base branch: `main` (the default).")).toBe("main");
+    expect(mk("- Base: origin/develop")).toBe("origin/develop");
+    expect(mk("Base: <branch>")).toBeNull();
+    expect(mk("no base here")).toBeNull();
+  });
+
+  test("a Base: line belongs to the proposal below it only", () => {
+    const text = ["Base: develop", block("One", "d1"), "", block("Two", "d2")].join("\n");
+    const ps = parsePrProposals(text);
+    expect(ps[0]!.baseLine).toBe("develop");
+    expect(ps[1]!.baseLine).toBeNull();
+  });
+
+  test("the label is the most recent Repository: line above, even above an earlier proposal", () => {
+    const text = [
+      "Repository: app",
+      "https://github.com/acme/app/compare/main...a",
+      block("One", "Repository: not-a-label inside a description"),
+      "",
+      "https://github.com/acme/app/compare/main...b",
+      block("Two", "d2"),
+      "",
+      "Repository: infra",
+      block("Three", "d3"),
+    ].join("\n");
+    const ps = parsePrProposals(text);
+    expect(ps.map((p) => p.repositoryLabel)).toEqual(["app", "app", "infra"]);
+  });
+
+  test("\\r\\n and bare \\r input parse", () => {
+    const text = threePrReply();
+    expect(parsePrProposals(text.replace(/\n/g, "\r\n"))).toHaveLength(3);
+    expect(parsePrProposals(text.replace(/\n/g, "\r"))).toHaveLength(3);
+  });
+
+  test("a four-backtick description holding ``` survives", () => {
+    const desc = "Intro\n```ts\nconst a = 1;\n```\nOutro";
+    const ps = parsePrProposals(block("T", desc));
+    expect(ps[0]!.description).toBe(desc);
+  });
+
+  test("an incomplete trailing proposal is ignored and garbage gives []", () => {
+    expect(parsePrProposals(["PR title:", "```", "Only a title", "```"].join("\n"))).toEqual([]);
+    expect(parsePrProposals("")).toEqual([]);
+    expect(parsePrProposals("nothing\nPR title:")).toEqual([]);
+  });
+});
+
+describe("extractLinkLine", () => {
+  test("bare, angle-bracketed, markdown and labeled forms", () => {
+    const url = "https://github.com/a/b/compare/main...x?quick_pull=1";
+    expect(extractLinkLine(url)).toBe(url);
+    expect(extractLinkLine(`<${url}>`)).toBe(url);
+    expect(extractLinkLine(`[Open PR](${url})`)).toBe(url);
+    expect(extractLinkLine(`PR link: ${url}`)).toBe(url);
+    expect(extractLinkLine(`- **Link:** [open](${url})`)).toBe(url);
+    expect(extractLinkLine(`${url}.`)).toBe(url);
+  });
+  test("prose and non-links are not links", () => {
+    expect(extractLinkLine("Open it at https://x.example/y later")).toBeNull();
+    expect(extractLinkLine("")).toBeNull();
+    expect(extractLinkLine("Base: main")).toBeNull();
+  });
+});
+
+describe("cleanBaseValue", () => {
+  test("keeps underscores and slashes, drops decoration", () => {
+    expect(cleanBaseValue("`feature/a_b`")).toBe("feature/a_b");
+    expect(cleanBaseValue("**main**")).toBe("main");
+    expect(cleanBaseValue("")).toBeNull();
+  });
+});
+
+describe("collectRunProposals", () => {
+  test("ignores subagent and non-assistant events, orders by run then position", () => {
+    const events: RunEvent[] = [
+      ev({ runId: "r1", data: block("Old", "d") }),
+      ev({ runId: "r1", stream: "stdout", data: block("Nope", "d") }),
+      ev({ runId: "r1", subagentId: "sa", data: block("Sub", "d") }),
+      ev({ runId: "r2", data: [block("New A", "d"), "", block("New B", "d")].join("\n") }),
+    ];
+    const ps = collectRunProposals(events);
+    expect(ps.map((p) => [p.runId, p.title])).toEqual([
+      ["r1", "Old"],
+      ["r2", "New A"],
+      ["r2", "New B"],
+    ]);
+    expect(ps.map((p) => p.order)).toEqual([0, 1, 2]);
+  });
+
+  test("joins an assistant reply split across event chunks", () => {
+    const events: RunEvent[] = [
+      ev({ runId: "r1", data: ["PR title:", "```", "Split", "```"].join("\n") }),
+      ev({ runId: "r1", data: ["PR description:", "````", "body", "````"].join("\n") }),
+    ];
+    expect(collectRunProposals(events).map((p) => p.title)).toEqual(["Split"]);
   });
 });

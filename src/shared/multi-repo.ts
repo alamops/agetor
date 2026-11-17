@@ -2,6 +2,7 @@
 // multi-repository tasks (issue #291). Must stay free of runtime imports from
 // either process — see `file-scope.ts`'s header for the same rule.
 import type { Task, TaskRepository } from "./types.ts";
+import { firstPrUrl, taskPrsOf } from "./task-prs.ts";
 
 /** The subset of a task the repository helpers read. */
 export type RepoTaskShape = Pick<
@@ -15,7 +16,7 @@ export type RepoTaskShape = Pick<
   | "checkoutBranch"
   | "prUrl"
   | "repositories"
-> & Pick<Partial<Task>, "multiRepo">;
+> & Pick<Partial<Task>, "multiRepo" | "prs" | "baseBranch">;
 
 /**
  * The subset {@link repositoriesForTask} and the `@`/discovery scope helpers
@@ -74,9 +75,12 @@ export function uniqueRepoSlugs(paths: string[]): string[] {
  * never branch on `undefined`.
  */
 export function repositoriesForTask(
-  task: RepoSetShape & Partial<Pick<Task, "checkoutBranch" | "prUrl">>,
+  task: RepoSetShape & Partial<Pick<Task, "checkoutBranch" | "prUrl" | "prs" | "baseBranch">>,
 ): TaskRepository[] {
   if (task.repositories && task.repositories.length > 0 && isMultiRepoTask(task)) return task.repositories;
+  // `taskPrsOf` falls back to a legacy `prUrl` only when `prs` is absent (an
+  // older core's JSON), so the derived entry never loses a PR across versions.
+  const prs = taskPrsOf(task);
   return [
     {
       path: task.workdir,
@@ -86,7 +90,9 @@ export function repositoriesForTask(
       worktreePath: task.worktreePath ?? null,
       baseRef: task.baseRef ?? null,
       checkoutBranch: task.checkoutBranch ?? null,
-      prUrl: task.prUrl ?? null,
+      prUrl: firstPrUrl(prs),
+      prs,
+      baseBranch: task.baseBranch ?? null,
     },
   ];
 }

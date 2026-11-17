@@ -5,6 +5,7 @@ import {
   moveMenuIndex,
   NATIVE_CONTEXT_MENU_SELECTOR,
   placeContextMenu,
+  placeSubmenu,
   type PlaceContextMenuInput,
 } from "./context-menu.ts";
 
@@ -235,5 +236,35 @@ describe("hasTextSelection", () => {
   test("non-collapsed with real text → true", () => {
     expect(hasTextSelection({ isCollapsed: false, toString: () => "Starting Phase 1" })).toBe(true);
     expect(hasTextSelection({ isCollapsed: false, toString: () => " x " })).toBe(true);
+  });
+});
+
+// --- placeSubmenu ----------------------------------------------------------
+
+describe("placeSubmenu", () => {
+  const anchor = { top: 100, left: 100, right: 200, bottom: 124 };
+  const base = { anchor, width: 150, height: 90, viewportWidth: 1000, viewportHeight: 800 };
+
+  test("opens to the right of the parent item, top-aligned", () => {
+    expect(placeSubmenu(base)).toEqual({ top: 100, left: 200 });
+  });
+
+  test("flips to the left of the parent item when the right side overflows", () => {
+    const r = placeSubmenu({ ...base, anchor: { top: 100, left: 800, right: 900, bottom: 124 } });
+    expect(r.left).toBe(800 - 150);
+  });
+
+  test("clamps into the 8px margin when neither side fits", () => {
+    const r = placeSubmenu({ ...base, viewportWidth: 200, anchor: { top: 100, left: 20, right: 190, bottom: 124 } });
+    expect(r.left).toBe(8);
+  });
+
+  test("clamps vertically so a tall child near the bottom stays on-screen", () => {
+    const r = placeSubmenu({ ...base, anchor: { top: 780, left: 100, right: 200, bottom: 804 } });
+    expect(r.top).toBe(800 - 90 - 8);
+  });
+
+  test("a child taller than the viewport pins to the top margin", () => {
+    expect(placeSubmenu({ ...base, height: 2000 }).top).toBe(8);
   });
 });
