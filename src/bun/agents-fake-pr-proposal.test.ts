@@ -9,7 +9,8 @@ import type { AgentKind, Harness, Task, TaskRepository } from "../shared/types.t
 // agents-fake-md-image.test.ts).
 const DATA_DIR = mkdtempSync(path.join(tmpdir(), "agetor-agents-pr-proposal-db-"));
 process.env.AGETOR_DATA_DIR = DATA_DIR;
-const { spawnAgent, FAKE_CLAUDE_PR_PROPOSAL_PROMPT_MARKER, renderFakePrProposalReply } = await import("./agents.ts");
+const { spawnAgent, FAKE_CLAUDE_PR_PROPOSAL_PROMPT_MARKER, FAKE_CLAUDE_HANDOFF_PROMPT_MARKER, renderFakePrProposalReply } =
+  await import("./agents.ts");
 const { tasks } = await import("./db.ts");
 const { rmTestDataDir } = await import("./test-data-dir.ts");
 
@@ -156,4 +157,21 @@ test("without the marker the generic fake reply is unchanged", async () => {
 test("renderFakePrProposalReply returns null for a template that isn't valid UTF-8 base64url", () => {
   expect(renderFakePrProposalReply("nope", `${FAKE_CLAUDE_PR_PROPOSAL_PROMPT_MARKER}:_w`)).toBeNull();
   expect(renderFakePrProposalReply("nope", "no marker at all")).toBeNull();
+});
+
+test("with a pipeline handoff marker too, the proposal prints before the handoff on turn 1 only", async () => {
+  // A pipeline step's composed prompt carries the goal's markers; the handoff
+  // branch wins the fake driver's dispatch, so it must print the proposal itself.
+  insertTask("pr-prop-5", "feature/step");
+  const prompt = `go ${marker("Base: main\nPR title for {{branch}}")} ${FAKE_CLAUDE_HANDOFF_PROMPT_MARKER}:done`;
+  const first = await run("pr-prop-5", prompt);
+  expect(first.exitCode).toBe(0);
+  const texts = first.chunks.filter((c) => c.stream === "assistant").map((c) => c.data);
+  expect(texts).toHaveLength(2);
+  expect(texts[0]).toBe("Base: main\nPR title for feature/step");
+  expect(texts[1]).toContain("<handoff>");
+  const second = await run("pr-prop-5", prompt);
+  const again = second.chunks.filter((c) => c.stream === "assistant").map((c) => c.data);
+  expect(again.some((t) => t.includes("PR title for"))).toBe(false);
+  expect(again.some((t) => t.includes("<handoff>"))).toBe(true);
 });

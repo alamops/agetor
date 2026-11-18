@@ -1,4 +1,5 @@
 import { execFileSync } from "node:child_process";
+import { randomUUID } from "node:crypto";
 import { mkdir, mkdtemp, rm, writeFile } from "node:fs/promises";
 import { existsSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
@@ -1110,6 +1111,151 @@ test("the single Create PR chip opens the composer on the task's base branch (S6
     await expect(page.getByPlaceholder("Head branch")).toHaveValue(prepared.branch);
   } finally {
     if (prTaskId) await request.delete(`${backend.apiBase}/tasks/${prTaskId}`, { headers: auth }).catch(() => {});
+    await stub.close();
+    if (bareDir) await rm(bareDir, { recursive: true, force: true }).catch(() => {});
+  }
+});
+
+const FAKE_CLAUDE_HANDOFF_PROMPT_MARKER = "__agetor_fake_claude_handoff__";
+
+test("Create all PRs on a pipeline step task: a PR with no proposal takes the root task's title, not the step's (S7)", async ({
+  backend,
+  page,
+  request,
+}) => {
+  // The runner titles a step task `<pipeline> · <step>`. A PR opened from the
+  // step's panel must carry the pipeline's root task title instead
+  // (`resolvePrRootTitle`). The step proposes a PR for an extra branch only, so
+  // the live head's row has no proposal and falls back to the root title.
+  test.setTimeout(120_000);
+  const auth = { authorization: `Bearer ${backend.apiToken}`, "content-type": "application/json" };
+  const rootTitle = "Pipeline root task PR title e2e";
+  const pipelineName = "PR title pipeline e2e";
+  const stepName = "Commit And Push";
+  const extraHead = "e2e-step-extra";
+  const fe: PullRecord[] = [];
+  const stub = await startGitHubStub(
+    backend.githubStubPort,
+    repoStubRoutes("frontend", fe, 71, { main: "a".repeat(40), [extraHead]: "e".repeat(40) }),
+  );
+  let parentId: string | null = null;
+  let pipelineId: string | null = null;
+  let profileId: string | null = null;
+  let bareDir: string | null = null;
+  try {
+    const profile = await request.post(`${backend.apiBase}/agent-profiles`, {
+      headers: auth,
+      data: { name: "PR title step runner e2e", harness: "claude-code", model: "opus-5", instructions: "", skills: [] },
+    });
+    expect(profile.ok()).toBe(true);
+    profileId = ((await profile.json()) as { id: string }).id;
+    const stepId = randomUUID();
+    const pipeline = await request.post(`${backend.apiBase}/pipelines`, {
+      headers: auth,
+      data: {
+        name: pipelineName,
+        description: "",
+        graph: {
+          steps: [
+            {
+              id: stepId,
+              name: stepName,
+              instructions: "",
+              agentProfileId: profileId,
+              position: { x: 0, y: 0 },
+              subagents: { profileIds: [], cap: null },
+              transition: "choose",
+              join: "any",
+            },
+          ],
+          edges: [],
+          startStepId: stepId,
+        },
+        maxSteps: 25,
+      },
+    });
+    expect(pipeline.ok()).toBe(true);
+    pipelineId = ((await pipeline.json()) as { id: string }).id;
+
+    const template = proposalBlock({
+      base: "main",
+      link: `https://github.com/agetor-e2e/frontend/compare/main...${extraHead}?quick_pull=1`,
+      title: "Step extra title",
+      body: "step extra body",
+    });
+    const created = await request.post(`${backend.apiBase}/tasks`, {
+      headers: auth,
+      data: {
+        title: rootTitle,
+        prompt: `${proposalPrompt(template)} ${FAKE_CLAUDE_HANDOFF_PROMPT_MARKER}:done`,
+        agent: "claude-code",
+        workdir: repoA,
+        isolation: "worktree",
+        pipelineId,
+      },
+    });
+    expect(created.ok()).toBe(true);
+    parentId = ((await created.json()) as { id: string }).id;
+    const started = await request.post(`${backend.apiBase}/tasks/${parentId}/start`, { headers: auth });
+    expect(started.ok()).toBe(true);
+
+    type PipelineParentRow = TaskRow & {
+      branch: string | null;
+      pipelineRun: { status: string; history: { stepId: string; taskId: string }[] } | null;
+    };
+    let parent: PipelineParentRow | null = null;
+    await expect(async () => {
+      parent = (await getTaskRow(request, backend, parentId!)) as PipelineParentRow;
+      expect(parent.pipelineRun?.status).toBe("done");
+    }).toPass({ timeout: CONVERGE_TIMEOUT });
+    const root = parent! as PipelineParentRow;
+    const stepTaskId = root.pipelineRun!.history.find((h) => h.stepId === stepId)!.taskId;
+    const step = (await getTaskRow(request, backend, stepTaskId)) as PipelineParentRow;
+    expect(step.title).toBe(`${pipelineName} · ${stepName}`);
+    expect(step.worktreePath).toBe(root.worktreePath);
+    const branch = root.branch!;
+
+    const bare = await mkdtemp(path.join(tmpdir(), "agetor-e2e-bare-step-"));
+    bareDir = bare;
+    git(bare, ["init", "-q", "--bare"]);
+    setLocalRemote(root.worktreePath!, bare);
+    git(root.worktreePath!, ["push", "-q", "-u", "local", branch]);
+    await expect
+      .poll(async () => {
+        const status = await request.get(`${backend.apiBase}/tasks/${stepTaskId}/git-status`, { headers: auth });
+        return ((await status.json()) as { remoteSynced?: boolean }).remoteSynced ?? false;
+      }, { timeout: CONVERGE_TIMEOUT })
+      .toBe(true);
+
+    // Open the step's panel the way a user does: the root card opens the run
+    // view, the step node opens the step task's RunPanel.
+    await gotoApp(page, backend.bootBase);
+    await page.locator(".cursor-grab").filter({ has: page.getByText(rootTitle, { exact: true }) }).click();
+    await expect(page.getByTestId("pipeline-run-view")).toBeVisible();
+    await page.locator(`[data-testid="pipeline-step-node"][data-step-id="${stepId}"]`).click();
+    const panel = page.locator("aside").last();
+    await expect(panel.getByTestId("run-panel-pipeline-strip")).toBeVisible();
+    const button = panel.getByTestId("create-all-prs");
+    await expect(button).toBeEnabled({ timeout: CONVERGE_TIMEOUT });
+    await button.click();
+    const dialog = page.getByTestId("create-prs-dialog");
+    await expect(dialog).toBeVisible();
+    await expect(page.getByTestId("create-prs-loading")).toBeHidden({ timeout: CONVERGE_TIMEOUT });
+
+    const repoName = uniqueRepoSlugs([repoA])[0]!;
+    const liveSlug = rowSlug(repoName, branch);
+    await expect(dialog.locator('[data-testid^="create-prs-row-"]')).toHaveCount(2);
+    await expect(dialog.getByTestId(`create-prs-title-${liveSlug}`)).toHaveValue(rootTitle);
+    await expect(dialog.getByTestId(`create-prs-title-${rowSlug(repoName, extraHead)}`)).toHaveValue("Step extra title");
+    await expect(dialog.getByTestId("create-prs-submit")).toContainText("Create 1 pull request");
+    await dialog.getByTestId("create-prs-submit").click();
+
+    await expect.poll(() => fe.length, { timeout: CONVERGE_TIMEOUT }).toBe(1);
+    expect(fe[0]).toMatchObject({ title: rootTitle, head: branch, base: "main" });
+  } finally {
+    if (parentId) await request.delete(`${backend.apiBase}/tasks/${parentId}`, { headers: auth }).catch(() => {});
+    if (pipelineId) await request.delete(`${backend.apiBase}/pipelines/${pipelineId}`, { headers: auth }).catch(() => {});
+    if (profileId) await request.delete(`${backend.apiBase}/agent-profiles/${profileId}`, { headers: auth }).catch(() => {});
     await stub.close();
     if (bareDir) await rm(bareDir, { recursive: true, force: true }).catch(() => {});
   }

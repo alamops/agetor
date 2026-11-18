@@ -47,6 +47,24 @@ export function createBlocked(rows: readonly PrRow[]): boolean {
   );
 }
 
+/**
+ * The title a PR falls back to when the agent proposed none. A pipeline step
+ * task is titled `<pipeline> · <step>` by the runner, so its PRs carry the
+ * pipeline's root task title instead; the step's own title is the fallback
+ * when the parent can't be read. `getTask` is injectable for tests.
+ */
+export async function resolvePrRootTitle(
+  task: Pick<Task, "title" | "pipelineParentId">,
+  getTask: (id: string) => Promise<Pick<Task, "title">> = (id) => api.getTask(id),
+): Promise<string> {
+  if (!task.pipelineParentId) return task.title;
+  try {
+    return (await getTask(task.pipelineParentId)).title;
+  } catch {
+    return task.title;
+  }
+}
+
 export interface CreatePrsDialogViewProps {
   open: boolean;
   onClose: () => void;
@@ -329,15 +347,7 @@ export function CreatePrsDialog({ open, task, events, gitStatus, onClose, onPrsS
     void (async () => {
       const { task: t, events: ev, gitStatus: gs } = inputsRef.current;
       try {
-        // A step task's PRs carry the pipeline's root title, not the step's.
-        let rootTitle = t.title;
-        if (t.pipelineParentId) {
-          try {
-            rootTitle = (await api.getTask(t.pipelineParentId)).title;
-          } catch {
-            /* the step's own title is the fallback */
-          }
-        }
+        const rootTitle = await resolvePrRootTitle(t);
         const planned = await buildPrPlan(
           {
             taskId: t.id,

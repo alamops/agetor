@@ -2835,7 +2835,12 @@ function makeFakeAgent(
     const subagentSpec = turn <= 1 ? parseFakeSubagentMarker(handoffPromptSource) : null;
     const baseResolveDelayMs = Math.max(20, Number(process.env.AGETOR_FAKE_CLAUDE_RESOLVE_DELAY_MS ?? 30) || 30);
     const resolveDelayMs = subagentSpec ? Math.max(baseResolveDelayMs, subagentSpec.runMs + 60) : baseResolveDelayMs;
+    // A `FAKE_CLAUDE_PR_PROPOSAL_PROMPT_MARKER` in the same source prompt
+    // (turn 1 only) prints its PR proposal ahead of the handoff, so a
+    // pipeline step can propose PRs the way a real Commit & push step does.
+    const prProposalReply = turn <= 1 ? renderFakePrProposalReply(taskId, handoffPromptSource) : null;
     after(5, () => onChunk("status", "fake: working"));
+    if (prProposalReply !== null) after(6, () => onChunk("assistant", prProposalReply));
     if (subagentSpec) {
       // Keyed on the RUN (same reasoning as the Monitor scenario's id):
       // `insertIfAbsent` is INSERT OR IGNORE, so a task-keyed id would

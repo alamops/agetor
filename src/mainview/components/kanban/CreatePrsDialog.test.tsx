@@ -3,7 +3,13 @@
 // walk are covered by pr-plan.test.ts and e2e/multi-repo-task.spec.ts.
 import { describe, expect, test } from "bun:test";
 import { renderToStaticMarkup } from "react-dom/server";
-import { CreatePrsDialogView, createBlocked, creatableRowCount, type CreatePrsDialogViewProps } from "./CreatePrsDialog.tsx";
+import {
+  CreatePrsDialogView,
+  createBlocked,
+  creatableRowCount,
+  resolvePrRootTitle,
+  type CreatePrsDialogViewProps,
+} from "./CreatePrsDialog.tsx";
 import type { PrRow, PrRowResult } from "@/lib/pr-plan";
 
 const row = (over: Partial<PrRow> = {}): PrRow => ({
@@ -141,5 +147,41 @@ describe("CreatePrsDialogView", () => {
     const done = render([row()], { finished: true });
     expect(done).toContain(">Close<");
     expect(done).not.toContain('data-testid="create-prs-submit"');
+  });
+});
+
+describe("resolvePrRootTitle", () => {
+  test("a pipeline step task takes its parent task's title, not its own `<pipeline> · <step>` title", async () => {
+    const asked: string[] = [];
+    const title = await resolvePrRootTitle(
+      { title: "Release pipeline · Commit And Push", pipelineParentId: "parent-1" },
+      async (id) => {
+        asked.push(id);
+        return { title: "Fix the login redirect" };
+      },
+    );
+    expect(title).toBe("Fix the login redirect");
+    expect(asked).toEqual(["parent-1"]);
+  });
+
+  test("a task that isn't a pipeline step keeps its own title and never reads another task", async () => {
+    let calls = 0;
+    const getTask = async () => {
+      calls++;
+      return { title: "should not be used" };
+    };
+    expect(await resolvePrRootTitle({ title: "Plain task", pipelineParentId: null }, getTask)).toBe("Plain task");
+    expect(await resolvePrRootTitle({ title: "Plain task" }, getTask)).toBe("Plain task");
+    expect(calls).toBe(0);
+  });
+
+  test("when the parent can't be read (deleted, network), the step's own title is the fallback", async () => {
+    const title = await resolvePrRootTitle(
+      { title: "Release pipeline · Commit And Push", pipelineParentId: "gone" },
+      async () => {
+        throw new Error("404 task not found");
+      },
+    );
+    expect(title).toBe("Release pipeline · Commit And Push");
   });
 });
