@@ -1083,3 +1083,76 @@ describe("opencodeServer (D-4)", () => {
     }
   });
 });
+
+describe("known model ids for the bundle planner (dynamic model catalog)", () => {
+  test("opencode is per-harness, a discovered claude model is known, and cursor knows its flat variant ids", async () => {
+    const discovery = await import("./agent-discovery.ts");
+    const { localStateFrom } = await import("./bundle.ts");
+    discovery.__testing.resetForTests();
+    discovery.seedDiscoveryCache({ scope: "kind", kind: "claude-code" }, [{ id: "opus-6", label: "Opus 6" }]);
+    discovery.seedDiscoveryCache({ scope: "harness", kind: "opencode", harnessId: "opencode" }, [{ id: "acme/model-1" }]);
+    discovery.seedDiscoveryCache({ scope: "kind", kind: "opencode" }, [{ id: "kind-level/should-not-count" }]);
+    discovery.seedDiscoveryCache(
+      { scope: "kind", kind: "cursor" },
+      [{ id: "gpt-7", efforts: ["high"], cursor: { effortIds: { high: "gpt-7-high" }, fastEfforts: ["high"] } }],
+    );
+    try {
+      const state = localStateFrom(new Map());
+      expect(state.knownModels["claude-code"]).toContain("opus-6");
+      expect(state.knownModels["claude-code"]).toContain("opus-5.5");
+      const oc = state.knownModels["opencode"];
+      expect(oc).toContain("acme/model-1");
+      expect(oc).not.toContain("kind-level/should-not-count");
+      const cursor = state.knownModels["cursor"];
+      for (const id of ["gpt-7", "gpt-7-high", "gpt-7-high-fast", "grok-4.7-high", "grok-4.7-high-fast"]) {
+        expect(cursor, id).toContain(id);
+      }
+    } finally {
+      discovery.__testing.resetForTests();
+    }
+  });
+
+  test("codex and copilot: a model their trusted catalog lacks warns on preview (a start would refuse it); with no catalog it doesn't; copilot's Auto never does", async () => {
+    const discovery = await import("./agent-discovery.ts");
+    const agent = (key: string, name: string, kind: "codex" | "copilot", model: string) => ({
+      key,
+      name,
+      harness: { id: kind, kind, label: kind },
+      model,
+    });
+    const text = JSON.stringify({
+      format: "agetor-bundle",
+      version: 1,
+      agents: [
+        agent("l", "Listed", "codex", "gpt-6.1-sol"),
+        agent("c", "CliOnly", "codex", "gpt-7-e2e"),
+        agent("u", "Unlisted", "codex", "gpt-5.6-sol"),
+        agent("a", "CopilotAuto", "copilot", "auto"),
+        agent("k", "CopilotUnlisted", "copilot", "kimi-k3"),
+      ],
+    });
+    const warningsByName = async (): Promise<(n: string) => string[]> => {
+      const plan = (await (await call("/bundle/import/preview", { text })).json()) as BundleImportPlan;
+      expect(plan.agents).toHaveLength(5);
+      return (n) => plan.agents.find((a) => a.sourceName === n)!.warnings.map((w) => w.code);
+    };
+    discovery.__testing.resetForTests();
+    try {
+      // No catalog: every built-in row is known; an id no list carries is not.
+      let byName = await warningsByName();
+      for (const n of ["Listed", "Unlisted", "CopilotAuto", "CopilotUnlisted"]) expect(byName(n), n).not.toContain("unknown-model");
+      expect(byName("CliOnly")).toContain("unknown-model");
+
+      discovery.seedDiscoveryCache({ scope: "harness", kind: "codex", harnessId: "codex" }, [{ id: "gpt-6.1-sol" }, { id: "gpt-7-e2e" }]);
+      discovery.seedDiscoveryCache({ scope: "kind", kind: "copilot" }, [{ id: "gpt-6.1-sol" }]);
+      byName = await warningsByName();
+      expect(byName("Listed")).not.toContain("unknown-model");
+      expect(byName("CliOnly")).not.toContain("unknown-model");
+      expect(byName("Unlisted")).toContain("unknown-model");
+      expect(byName("CopilotAuto")).not.toContain("unknown-model");
+      expect(byName("CopilotUnlisted")).toContain("unknown-model");
+    } finally {
+      discovery.__testing.resetForTests();
+    }
+  });
+});

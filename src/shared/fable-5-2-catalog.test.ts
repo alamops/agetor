@@ -141,10 +141,10 @@ test("cursor: the Fable 5.1 -thinking sibling is not spec-covered, so it stays a
     scoped: false,
     selected: null,
   });
-  // Every curated row survives in curated order; the discovered-only id is
-  // appended last and is NOT marked unlisted (rule 4).
-  expect(ids(rows).slice(0, AGENT_OPTIONS.cursor.models.length)).toEqual(ids(AGENT_OPTIONS.cursor.models));
-  expect(ids(rows).at(-1)).toBe(thinking);
+  // The CLI's row leads (rule 4: CLI order), every curated row still
+  // follows in curated order, and the discovered-only id is NOT unlisted.
+  expect(ids(rows)[0]).toBe(thinking);
+  expect(ids(rows).slice(1)).toEqual(ids(AGENT_OPTIONS.cursor.models));
   expect(rows.find((r) => r.id === thinking)?.unlisted).toBeUndefined();
 });
 

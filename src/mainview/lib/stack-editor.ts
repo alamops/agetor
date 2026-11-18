@@ -4,6 +4,7 @@
  * the >20-row virtual window can be unit-tested without a DOM.
  * Model and rules: docs/architecture/harness-stacks.md.
  */
+import { modelDisplayName } from "../../shared/model-display.ts";
 import type {
   Harness,
   HarnessLimitState,
@@ -205,10 +206,12 @@ export function cooldownChips(
     .map((s) => {
       const t = memberStateText(s);
       const until = formatUntil(t.until, now);
-      const forModel = t.model ? ` for ${t.model}` : "";
+      // Display only: the raw id stays on `model` (the clear-cooldown key).
+      const shownModel = t.model ? modelDisplayName(null, t.model) : null;
+      const forModel = shownModel ? ` for ${shownModel}` : "";
       return {
         key: `${s.harnessId}:${s.model ?? ""}`,
-        text: `${t.reasonText} · until ${until}${t.model ? ` · for ${t.model}` : ""}`,
+        text: `${t.reasonText} · until ${until}${shownModel ? ` · for ${shownModel}` : ""}`,
         ariaLabel: `Cooling: ${t.reasonText}${forModel}, until ${until}`,
         model: t.model,
         message: t.message,

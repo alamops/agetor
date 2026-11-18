@@ -1,0 +1,6 @@
+[
+  { "modelId": "gemini-3-pro-preview", "id": "gemini-3-pro-preview", "name": "gemini-3-pro-preview", "displayName": "Gemini 3 Pro (preview)", "description": "Most capable model for complex coding and reasoning." },
+  { "modelId": "gemini-3-flash-preview", "id": "gemini-3-flash-preview", "name": "gemini-3-flash-preview", "displayName": "Gemini 3 Flash (preview)", "description": "Fast, balanced model for everyday tasks." },
+  { "modelId": "gemini-2.5-pro", "id": "gemini-2.5-pro", "name": "gemini-2.5-pro", "displayName": "Gemini 2.5 Pro", "description": "Stable pro model." },
+  { "modelId": "gemini-2.5-flash", "id": "gemini-2.5-flash", "name": "gemini-2.5-flash", "displayName": "Gemini 2.5 Flash", "description": "Stable flash model." }
+]

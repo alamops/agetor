@@ -31,13 +31,17 @@
  *    already satisfies rule 1 for `catalogOnly` rows, since a filtered-in
  *    row is by definition in `discovered`), followed by the discovered ids
  *    that had no curated row, in discovered order, labeled `m.label ?? m.id`.
- * 4. `scoped === false` and `discovered` is non-empty → every curated row
- *    (rule 1 still gates `catalogOnly` ones), followed by discovered-only
- *    ids the same way as rule 3. This is the unchanged behavior the
- *    NewTaskForm/RunPanel merge sites had before per-kind scoping existed.
- * 5. The result is always deduped by id, first occurrence wins (curated
- *    rows are considered before discovered ones, so a curated label/hint
- *    always beats a bare discovered id for the same model).
+ * 4. `scoped === false` and `discovered` is non-empty → the CLI's own order
+ *    wins (dynamic-model-catalog #13): every discovered row, in discovered
+ *    order, carrying the curated label/hint when its id has a curated row
+ *    and the (sanitized) CLI label and description otherwise; then the
+ *    curated rows the CLI did not list, in curated order (rule 1 still
+ *    gates `catalogOnly` ones). Pinned rows (rule 9) stay first. Curated
+ *    rows remain the fallback for an old or offline CLI (rule 2) and the
+ *    label/hint overlay for a CLI row.
+ * 5. The result is always deduped by id, first occurrence wins. A curated
+ *    label/hint always beats the CLI's for the same id (rule 4 looks the
+ *    curated row up by id while walking the CLI list).
  * 6. If `selected` is a non-empty string absent from the result, it is
  *    appended last as an `unlisted` row — a `<select>` whose current value
  *    has no matching `<option>` renders blank, so the selected id must
@@ -85,7 +89,11 @@
  *    The same lookup copies the speed flags (`fast` / `ultrafast`, fx
  *    `models --json` ≥0.0.14) onto every row kind above, but only when the
  *    entry reports them `true` — a `false` or absent flag attaches no key.
- *    Pickers pass a row's flags to `supportedSpeeds` (`./speed.ts`).
+ *    Pickers pass a row's flags to `supportedSpeeds` (`./speed.ts`). The
+ *    other discovery-derived fields (`effortLabels`, `defaultEffort`,
+ *    `cliDefault`, `fastHint`, `fastTier`, `defaultFast`, `cursor`) are
+ *    copied the same way, only from a trusted entry and never as an empty
+ *    or `false` value.
  *
  *    One carve-out for `scoped === true`: an entry whose `efforts` is an
  *    explicitly EMPTY array attaches `efforts: []` — "the CLI reported this
@@ -121,21 +129,57 @@ export interface CuratedModel {
   pinned?: boolean;
 }
 
-/** A row from a harness's live CLI-discovered model catalog. */
+/** A cursor variant map for a discovered-only base model: which flat CLI id
+ *  carries each effort, which efforts have a Fast twin, and the id of a
+ *  Fast-only twin. Mirrors the relevant slice of `CursorModelSpec`
+ *  (`./types.ts`) structurally. */
+export interface CursorVariantSpecShape {
+  effortIds?: Readonly<Partial<Record<string, string>>>;
+  fastEfforts?: readonly string[];
+  fastId?: string;
+}
+
+/** A row from a harness's live CLI-discovered model catalog. This is the ONE
+ *  shape: the bun-side discovery module re-exports it and the webview/CLI
+ *  API rows are this type. */
 export interface DiscoveredModel {
+  /** agetor id (claude: derived from the CLI id by rule; cursor: base id). */
   id: string;
+  /** Sanitized CLI display name. */
   label?: string;
+  /** Sanitized CLI description; the hint of a discovered-only row. */
+  description?: string;
   /** Bare reasoning-effort ids the harness's CLI reported for this model
    *  (codex via `codex app-server model/list`; fx ≥0.0.14 via
-   *  `models --json` `models[].efforts`, plus `auto`). Absent when the
-   *  CLI reported none. See rule 8. */
+   *  `models --json` `models[].efforts`, plus `auto`; claude via
+   *  `initialize` `supportedEffortLevels`). Absent when the CLI reported
+   *  none, in CLI order. See rule 8. */
   efforts?: readonly string[];
+  /** CLI-provided display names per effort id (copilot ACP). */
+  effortLabels?: Readonly<Record<string, string>>;
+  /** The CLI's own default effort for this model (codex). */
+  defaultEffort?: string;
+  /** The CLI's own default model (codex `isDefault`; claude `default` row). */
+  cliDefault?: true;
   /** fx only (`models --json` ≥0.0.14 `models[].fast`): the model offers the
-   *  ACP `fast` session option. Copied by rule 8 like `efforts`. */
+   *  ACP `fast` session option. Copied by rule 8 like `efforts`. Also set by
+   *  the codex (service tier) and claude (`supportsFastMode`) probes. */
   fast?: boolean;
   /** fx only (`models[].ultrafast`): the model offers the ACP `ultrafast`
    *  session option. Copied by rule 8 like `efforts`. */
   ultrafast?: boolean;
+  /** The CLI's own description of its Fast tier (codex `serviceTiers[]`). */
+  fastHint?: string;
+  /** Codex: the service-tier id to request for Fast (`priority`). */
+  fastTier?: string;
+  /** Codex: the model's own default service tier is a fast one. */
+  defaultFast?: true;
+  /** Claude: the exact CLI model id (`resolvedModel`). */
+  cliId?: string;
+  /** Claude: the CLI alias the row came from (`opus`). */
+  alias?: string;
+  /** Cursor: the variant map of a discovered-only base. */
+  cursor?: CursorVariantSpecShape;
 }
 
 /** One row in the merged, render-ready model list. */
@@ -150,11 +194,18 @@ export interface ModelOption {
    *  this as the third argument of `supportedEfforts` (`./types.ts`) so the
    *  discovered set wins over the curated `MODEL_EFFORT_SUPPORT` table. */
   efforts?: readonly string[];
+  effortLabels?: Readonly<Record<string, string>>;
+  defaultEffort?: string;
+  cliDefault?: true;
   /** Copied from the discovered entry by rule 8, when `true`. Fed to
    *  `supportedSpeeds` (`./speed.ts`) as the speed option flags. */
   fast?: boolean;
   /** Copied from the discovered entry by rule 8, when `true`. */
   ultrafast?: boolean;
+  fastHint?: string;
+  fastTier?: string;
+  defaultFast?: true;
+  cursor?: CursorVariantSpecShape;
 }
 
 export interface MergeModelOptionsInput {
@@ -196,11 +247,34 @@ function effortsFor(entry: DiscoveredModel | undefined, keepEmpty = false): read
   return undefined;
 }
 
-/** Rule 8, speed flags: copy `fast`/`ultrafast` onto `opt` when the
- *  discovered entry reports them `true` (never attaches a `false` key). */
-function copySpeedFlags(opt: ModelOption, entry: DiscoveredModel | undefined): void {
-  if (entry?.fast === true) opt.fast = true;
-  if (entry?.ultrafast === true) opt.ultrafast = true;
+/** Rule 8, the discovery-derived fields: copy them onto `opt` from a
+ *  trusted discovered entry, never attaching a `false`, empty or absent
+ *  value. `efforts` carries the scoped `[]` carve-out (`keepEmptyEfforts`). */
+function copyDiscoveredFields(
+  opt: ModelOption,
+  entry: DiscoveredModel | undefined,
+  keepEmptyEfforts: boolean,
+): void {
+  if (!entry) return;
+  const efforts = effortsFor(entry, keepEmptyEfforts);
+  if (efforts !== undefined) opt.efforts = efforts;
+  if (entry.fast === true) opt.fast = true;
+  if (entry.ultrafast === true) opt.ultrafast = true;
+  if (entry.effortLabels && Object.keys(entry.effortLabels).length > 0) {
+    opt.effortLabels = { ...entry.effortLabels };
+  }
+  if (entry.defaultEffort) opt.defaultEffort = entry.defaultEffort;
+  if (entry.cliDefault === true) opt.cliDefault = true;
+  if (entry.fastHint) opt.fastHint = entry.fastHint;
+  if (entry.fastTier) opt.fastTier = entry.fastTier;
+  if (entry.defaultFast === true) opt.defaultFast = true;
+  if (entry.cursor && (entry.cursor.effortIds || entry.cursor.fastEfforts || entry.cursor.fastId)) {
+    opt.cursor = {
+      ...(entry.cursor.effortIds ? { effortIds: { ...entry.cursor.effortIds } } : {}),
+      ...(entry.cursor.fastEfforts ? { fastEfforts: [...entry.cursor.fastEfforts] } : {}),
+      ...(entry.cursor.fastId ? { fastId: entry.cursor.fastId } : {}),
+    };
+  }
 }
 
 function toCuratedOption(
@@ -210,18 +284,14 @@ function toCuratedOption(
 ): ModelOption {
   const opt: ModelOption = { id: m.id, label: m.label };
   if (m.hint !== undefined) opt.hint = m.hint;
-  const entry = discoveredById.get(m.id);
-  const efforts = effortsFor(entry, keepEmptyEfforts);
-  if (efforts !== undefined) opt.efforts = efforts;
-  copySpeedFlags(opt, entry);
+  copyDiscoveredFields(opt, discoveredById.get(m.id), keepEmptyEfforts);
   return opt;
 }
 
 function toDiscoveredOnlyOption(m: DiscoveredModel, keepEmptyEfforts: boolean): ModelOption {
   const opt: ModelOption = { id: m.id, label: m.label ?? m.id };
-  const efforts = effortsFor(m, keepEmptyEfforts);
-  if (efforts !== undefined) opt.efforts = efforts;
-  copySpeedFlags(opt, m);
+  if (m.description) opt.hint = m.description;
+  copyDiscoveredFields(opt, m, keepEmptyEfforts);
   return opt;
 }
 
@@ -281,15 +351,21 @@ export function mergeModelOptions(input: MergeModelOptionsInput): ModelOption[] 
       pushDiscoveredOnly(m);
     }
   } else {
-    // Rule 4: all curated rows (rule 1 still gates catalogOnly ones),
-    // then discovered-only ids (discovered order).
-    const discoveredIds = new Set(discovered.map((m) => m.id));
+    // Rule 4: the CLI's order wins. Walk the discovered list; a curated row
+    // for the same id supplies the label/hint, otherwise the CLI's own. Then
+    // the curated rows the CLI did not list (rule 1 gates catalogOnly ones).
+    const curatedById = new Map<string, CuratedModel>();
     for (const m of curated) {
-      if (m.catalogOnly && !discoveredIds.has(m.id)) continue;
-      pushCurated(m);
+      if (!curatedById.has(m.id)) curatedById.set(m.id, m);
     }
     for (const m of discovered) {
-      pushDiscoveredOnly(m);
+      const c = curatedById.get(m.id);
+      if (c) pushCurated(c);
+      else pushDiscoveredOnly(m);
+    }
+    for (const m of curated) {
+      if (m.catalogOnly) continue;
+      pushCurated(m);
     }
   }
 
@@ -309,9 +385,7 @@ export function mergeModelOptions(input: MergeModelOptionsInput): ModelOption[] 
         hint,
         unlisted: true,
       };
-      const efforts = effortsFor(discoveredById.get(selected), scoped);
-      if (efforts !== undefined) unlistedOpt.efforts = efforts;
-      copySpeedFlags(unlistedOpt, discoveredById.get(selected));
+      copyDiscoveredFields(unlistedOpt, discoveredById.get(selected), scoped);
       result.push(unlistedOpt);
     }
   }

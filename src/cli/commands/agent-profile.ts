@@ -1,3 +1,4 @@
+import { asAgentKind, modelDisplayName } from "../../shared/model-display.ts";
 import { readFileSync } from "node:fs";
 import { getClient, type Flags } from "../context.ts";
 import { c, out, printJson, table } from "../output.ts";
@@ -193,6 +194,8 @@ function label(s: string): string {
  *  value can hold an ESC, a C1 control or a bidi override, which would
  *  otherwise drive the terminal or hide what the text says. */
 const safe = (s: string): string => escapeControlChars(s);
+/** The profile's model as a person reads it (`Opus 5.5`), never the raw id. */
+const modelName = (pr: { harness: string; model: string }): string => modelDisplayName(asAgentKind(pr.harness), pr.model);
 
 /** `"N task"` / `"N tasks"` — the singular/plural form both `profile ls`'s
  *  `tasks` column and `profile show`'s `used by:` line render. `taskCount` is
@@ -211,7 +214,7 @@ export function formatAgentProfileListRow(pr: AgentProfile): string[] {
   return [
     c.bold(safe(pr.name)),
     c.gray(safe(pr.harness)),
-    safe(pr.model),
+    safe(modelName(pr)),
     safe(pr.effort ?? "-"),
     safe(pr.mode ?? "-"),
     String(pr.skills.length),
@@ -247,7 +250,7 @@ export function profileHarnessContext(
 export function formatAgentProfileShow(profile: AgentProfile): string[] {
   const lines = [
     `${c.bold(safe(profile.name))}  ${c.dim(profile.id)}`,
-    `  ${label("harness")} ${safe(profile.harness)}   ${label("model")} ${safe(profile.model)}` +
+    `  ${label("harness")} ${safe(profile.harness)}   ${label("model")} ${safe(modelName(profile))}` +
       `   ${label("effort")} ${safe(profile.effort ?? "-")}   ${label("mode")} ${safe(profile.mode ?? "-")}`,
     `  ${label("speed")} ${safe(profile.speed)}   ${label("max mode")} ${profile.maxMode ? "yes" : "no"}`,
     `  ${label("skills")} ${profile.skills.length ? profile.skills.map((s) => `/${safe(s)}`).join(", ") : c.dim("none")}`,

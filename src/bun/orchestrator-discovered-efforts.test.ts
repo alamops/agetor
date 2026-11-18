@@ -166,7 +166,8 @@ test("createTask (codex, discovery empty): no model given → DEFAULT_MODEL.code
 test("createTask (codex, discovered efforts without 'high'): defaults to the strongest offered id, canonical order (medium over low)", async () => {
   discoveryTesting.resetForTests();
   const bin = plantFakeCodexAppServer({
-    pages: [[{ id: "gpt-9-test", efforts: ["low", "medium"] }]],
+    // The CLI names no default effort here, so the strongest offered id wins.
+    pages: [[{ id: "gpt-9-test", efforts: ["low", "medium"], defaultEffort: null }]],
   });
   await withEnvOverride("AGETOR_CODEX_BIN", bin, async () => {
     await refreshKindModels("codex");
@@ -185,6 +186,28 @@ test("createTask (codex, discovered efforts without 'high'): defaults to the str
   // Discovered set {low, medium} filtered into EFFORT_OPTIONS' canonical
   // (highest → lowest) order is [medium, low]; DEFAULT_EFFORT.codex ("high")
   // isn't offered, so the strongest offered id wins.
+  expect(created.task.effort).toBe("medium");
+});
+
+test("createTask (codex, discovered efforts without 'high'): the CLI's own default effort for the model wins over the strongest offered one", async () => {
+  discoveryTesting.resetForTests();
+  const bin = plantFakeCodexAppServer({
+    pages: [[{ id: "gpt-9-test", efforts: ["low", "medium", "xhigh"], defaultEffort: "medium" }]],
+  });
+  await withEnvOverride("AGETOR_CODEX_BIN", bin, async () => {
+    await refreshKindModels("codex");
+  });
+  const created = await createTask({
+    title: "case2-cli-default-effort",
+    prompt: "p",
+    agent: "codex",
+    model: "gpt-9-test",
+    workdir: process.cwd(),
+    isolation: "none",
+    taskType: "task",
+  });
+  if ("error" in created) throw new Error(created.error);
+  // DEFAULT_EFFORT.codex ("high") isn't offered; the CLI says medium.
   expect(created.task.effort).toBe("medium");
 });
 
@@ -238,7 +261,7 @@ test("createTask (codex, discovered efforts present): an explicit input.effort i
 test("PATCH /tasks/:id (codex, discovered efforts): clearing effort (null) is rejected with 400 'cannot be cleared'", async () => {
   discoveryTesting.resetForTests();
   const bin = plantFakeCodexAppServer({
-    pages: [[{ id: "gpt-9-test", efforts: ["low", "medium"] }]],
+    pages: [[{ id: "gpt-9-test", efforts: ["low", "medium"], defaultEffort: null }]],
   });
   await withEnvOverride("AGETOR_CODEX_BIN", bin, async () => {
     await refreshKindModels("codex");
@@ -374,7 +397,7 @@ test("createTask + PATCH guard: a second codex harness's own discovered catalog 
   // `id TEXT PRIMARY KEY` constraint, so every assertion about codex-2 lives
   // in this single test.
   const codex2Home = mkdtempSync(path.join(tmpdir(), "agetor-codex2-home-"));
-  const codex2Bin = plantFakeCodexAppServer({ pages: [[{ id: "m1", efforts: ["low", "medium"] }]] });
+  const codex2Bin = plantFakeCodexAppServer({ pages: [[{ id: "m1", efforts: ["low", "medium"], defaultEffort: null }]] });
   harnesses.insert({
     id: CODEX_2_HARNESS_ID,
     kind: "codex",

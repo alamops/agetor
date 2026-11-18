@@ -109,6 +109,7 @@ import type {
 import { TASK_EVENTS_REPLAY_META_EVENT } from "../../shared/types.ts";
 import { parseReplayMeta } from "../../shared/task-stream-resume.ts";
 import type { NotificationKind } from "../../shared/os-notification.ts";
+import type { DiscoveredModel } from "../../shared/model-options.ts";
 import type {
   BundleExportResponse,
   BundlePickResponse,
@@ -222,14 +223,14 @@ export interface AvailableExtension {
  *  built-in harness only — see `HarnessModelMap` for the per-harness list a
  *  multi-account setup needs. */
 export interface AgentModelMap {
-  "claude-code": { id: string; label?: string; efforts?: string[]; fast?: boolean; ultrafast?: boolean }[];
-  "codex": { id: string; label?: string; efforts?: string[]; fast?: boolean; ultrafast?: boolean }[];
-  "cursor": { id: string; label?: string; efforts?: string[]; fast?: boolean; ultrafast?: boolean }[];
-  "gemini": { id: string; label?: string; efforts?: string[]; fast?: boolean; ultrafast?: boolean }[];
-  "antigravity": { id: string; label?: string; efforts?: string[]; fast?: boolean; ultrafast?: boolean }[];
-  "fx": { id: string; label?: string; efforts?: string[]; fast?: boolean; ultrafast?: boolean }[];
-  "opencode": { id: string; label?: string; efforts?: string[]; fast?: boolean; ultrafast?: boolean }[];
-  "copilot": { id: string; label?: string; efforts?: string[]; fast?: boolean; ultrafast?: boolean }[];
+  "claude-code": DiscoveredModel[];
+  "codex": DiscoveredModel[];
+  "cursor": DiscoveredModel[];
+  "gemini": DiscoveredModel[];
+  "antigravity": DiscoveredModel[];
+  "fx": DiscoveredModel[];
+  "opencode": DiscoveredModel[];
+  "copilot": DiscoveredModel[];
 }
 
 /** Per-harness model id list from `GET /agent-models/harnesses` — one entry
@@ -243,7 +244,7 @@ export interface AgentModelMap {
  *  `fast`/`ultrafast` the fx speed-tier flags (`supportedSpeeds`). */
 export interface HarnessModelMap {
   ready: boolean;
-  byHarness: Record<string, { id: string; label?: string; efforts?: string[]; fast?: boolean; ultrafast?: boolean }[]>;
+  byHarness: Record<string, DiscoveredModel[]>;
 }
 
 /** Pending multi-question card. Claude's scraper cards omit the Cursor

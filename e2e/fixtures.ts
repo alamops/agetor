@@ -179,6 +179,52 @@ function writeFxStubBin(dataDir: string): string {
   return binPath;
 }
 
+/**
+ * Stub `claude` binary, opt-in like the Copilot one: `provisionBackend` points
+ * `AGETOR_CLAUDE_BIN` at it ONLY when the backend's `backendEnv` carries
+ * `AGETOR_E2E_CLAUDE_STUB=1` (e2e/claude-models.spec.ts); every other spec
+ * keeps `/bin/echo`, so nothing else changes. It answers the two calls the
+ * backend makes itself: `--version` (the availability probe) and the
+ * model-discovery probe — `claude -p --input-format stream-json … ` with one
+ * `initialize` control request on stdin — with the file named by
+ * `AGETOR_E2E_CLAUDE_MODELS_JSON` as the response's `models[]` (an absent or
+ * unset file answers an empty list, i.e. an old CLI with no catalog). Turns
+ * never reach it: claude runs through the in-process fake driver. The
+ * response carries a planted account block the backend must never keep.
+ */
+function writeClaudeStubBin(dataDir: string): string {
+  const binDir = path.join(dataDir, "claude-stub-bin");
+  mkdirSync(binDir, { recursive: true });
+  const binPath = path.join(binDir, "claude");
+  writeFileSync(
+    binPath,
+    [
+      "#!/bin/sh",
+      'if [ "$1" = "--version" ]; then',
+      '  echo "2.1.326 (Claude Code)"',
+      "  exit 0",
+      "fi",
+      'case " $* " in',
+      '  *" -p "*)',
+      "    read line",
+      '    if [ -n "$AGETOR_E2E_CLAUDE_MODELS_JSON" ] && [ -f "$AGETOR_E2E_CLAUDE_MODELS_JSON" ]; then',
+      '      models=$(cat "$AGETOR_E2E_CLAUDE_MODELS_JSON")',
+      "    else",
+      '      models="[]"',
+      "    fi",
+      `    printf '{"type":"control_response","response":{"subtype":"success","request_id":"init-1","response":{"models":%s,"account":{"email":"e2e-leak@example.invalid","organization":"E2E Leak Org"}}}}\\n' "$models"`,
+      "    sleep 1",
+      "    exit 0",
+      "    ;;",
+      "esac",
+      "exit 0",
+      "",
+    ].join("\n"),
+  );
+  chmodSync(binPath, 0o755);
+  return binPath;
+}
+
 /** File a spec writes into a project folder to make the OpenCode stub's
  *  `session list` answer for that cwd (see `writeOpencodeStubBin`). */
 export const OPENCODE_STUB_SESSIONS_FILE = ".agetor-e2e-opencode-sessions.json";
@@ -478,6 +524,7 @@ async function provisionBackend(
   const fxStubBinPath = writeFxStubBin(dataDir);
   const opencodeStubBinPath = writeOpencodeStubBin(dataDir);
   const copilotStubBinPath = writeCopilotStubBin(dataDir);
+  const claudeStubBinPath = writeClaudeStubBin(dataDir);
   // Never created: an absolute path that can't resolve pins a seeded-enabled
   // harness to "not installed" independent of the machine's PATH.
   const missingCopilotBinPath = path.join(dataDir, "not-installed", "copilot");
@@ -531,7 +578,7 @@ async function provisionBackend(
       // shell override. Required by quote.spec.ts; inert for the other
       // specs, which never start a run.
       AGETOR_CLAUDE_DRIVER: "fake",
-      AGETOR_CLAUDE_BIN: "/bin/echo",
+      AGETOR_CLAUDE_BIN: extraEnv.AGETOR_E2E_CLAUDE_STUB === "1" ? claudeStubBinPath : "/bin/echo",
       AGETOR_TMUX_BIN: "/bin/echo",
       AGETOR_CLAUDE_ARGS: "",
       // fx routes through the in-process fake driver (spawnAgent's fx

@@ -24,6 +24,7 @@ import {
 } from "./db.ts";
 import { checkHarness } from "./agent-status.ts";
 import { getDiscoveredModels, getHarnessDiscoveredModels } from "./agent-discovery.ts";
+import { knownModelIds } from "../shared/model-catalog.ts";
 import { listAgentCapabilities } from "./commands.ts";
 import { refreshHarnessModels } from "./model-discovery.ts";
 import {
@@ -349,23 +350,24 @@ function probeHarness(h: Harness): Promise<HarnessProbe> {
   return probe;
 }
 
-/** Model ids known for a harness (K14): its discovered catalog plus the
- *  curated rows; `catalogOnly` rows count only while discovery is empty.
- *  A logged-out harness (`loggedIn === false`) distrusts its catalog, as
- *  `mergeModelOptions`' rule 7 does for the pickers — an expired login's
- *  passive discovery reads back a catalog the account can't run — and
- *  knows exactly what its pickers would offer: the non-gated curated rows. */
+/** Model ids known for a harness (K14): exactly what its pickers would
+ *  offer (`knownModelIds`): the discovered catalog plus the curated rows,
+ *  except that for codex and copilot a trusted, non-empty catalog drops the
+ *  curated rows it does not list (`withoutRefusedCuratedRows`), and
+ *  `catalogOnly` rows count only while discovery is empty. A logged-out
+ *  harness (`loggedIn === false`) distrusts its catalog, as `mergeModelOptions`'
+ *  rule 7 does for the pickers — an expired login's passive discovery reads
+ *  back a catalog the account can't run — so only the non-gated curated rows
+ *  count. */
 function knownModelsFor(h: Harness, loggedIn: boolean | null): string[] {
-  const curated = AGENT_OPTIONS[h.kind]?.models ?? [];
-  if (loggedIn === false) return curated.filter((m) => !m.catalogOnly).map((m) => m.id);
   // Same per-harness/per-kind split as `model-discovery.ts`'s
-  // `modelsForHarness`: only fx and codex catalogs vary per harness.
-  const discovered = h.kind === "fx" || h.kind === "codex" ? getHarnessDiscoveredModels(h.id) : getDiscoveredModels(h.kind);
-  const known = new Set(discovered.map((m) => m.id));
-  for (const m of curated) {
-    if (!m.catalogOnly || discovered.length === 0) known.add(m.id);
-  }
-  return [...known];
+  // `modelsForHarness`: fx, codex and opencode catalogs vary per harness.
+  const perHarness = h.kind === "fx" || h.kind === "codex" || h.kind === "opencode";
+  const discovered = perHarness ? getHarnessDiscoveredModels(h.id) : getDiscoveredModels(h.kind);
+  // `knownModelIds` is the pickers' own composition (curated + discovered,
+  // `catalogOnly` rows only while discovery says so, a logged-out catalog
+  // distrusted, cursor's flat variant ids included).
+  return knownModelIds(h.kind, discovered, loggedIn);
 }
 
 /** Harnesses whose status the planner may report on for this file: the ones
@@ -387,7 +389,7 @@ async function probeRelevant(parsed: ParsedBundle): Promise<ProbeMap> {
 
 /** The synchronous half of the local state, read fresh from the database —
  *  run again inside the import transaction. */
-function localStateFrom(probes: ProbeMap): BundleLocalState {
+export function localStateFrom(probes: ProbeMap): BundleLocalState {
   const rows = allLocalHarnesses();
   const local: BundleLocalHarness[] = rows.map((h) => {
     const status = probes.get(h.id)?.status ?? null;

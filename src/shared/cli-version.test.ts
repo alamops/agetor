@@ -3,6 +3,7 @@ import {
   cliVersionSatisfies,
   compareCliVersions,
   formatMinCliVersionError,
+  formatModelNotOfferedError,
   parseCliVersion,
 } from "./cli-version.ts";
 
@@ -193,5 +194,24 @@ describe("formatMinCliVersionError", () => {
       installHint: null,
     });
     expect(message).toBe("Codex 0.155.0-alpha.3 can't run GPT-6 Sol — it needs codex CLI ≥ 0.155.0.");
+  });
+});
+
+describe("formatModelNotOfferedError", () => {
+  test("names the model, harness, parsed version and upgrade hint", () => {
+    expect(
+      formatModelNotOfferedError({
+        harnessLabel: "Codex",
+        installedRaw: "codex-cli 0.166.0",
+        modelLabel: "GPT-9",
+        installHint: "npm i -g @openai/codex",
+      }),
+    ).toBe("GPT-9 isn't in Codex's model list (0.166.0). Pick a model it offers, or update the CLI (npm i -g @openai/codex) if this one is newer.");
+  });
+
+  test("works without a version or an install hint", () => {
+    expect(
+      formatModelNotOfferedError({ harnessLabel: "Copilot", installedRaw: null, modelLabel: "Kimi K9", installHint: null }),
+    ).toBe("Kimi K9 isn't in Copilot's model list. Pick a model it offers, or update the CLI if this one is newer.");
   });
 });

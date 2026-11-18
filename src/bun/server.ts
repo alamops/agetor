@@ -227,6 +227,7 @@ import {
   noteHarnessRemoved,
   getHarnessModelMap,
   noteHarnessStatuses,
+  MODEL_CATALOG_PREF_PREFIX,
 } from "./model-discovery.ts";
 import { getMainWindow } from "./window.ts";
 import {
@@ -4259,13 +4260,31 @@ export function startApiServer(
       // `lastEffort:<agent>`). Values are opaque strings — the meaning
       // lives in whichever caller writes them.
       "/preferences": {
-        GET: authed((req) => json(preferences.list(), { headers: corsHeaders(req) })),
+        GET: authed((req) => {
+          // `modelCatalog:*` rows are the core's own persisted discovery
+          // catalogs (model-discovery.ts): server-managed, never listed.
+          const all = preferences.list();
+          for (const key of Object.keys(all)) {
+            if (key.startsWith(MODEL_CATALOG_PREF_PREFIX)) delete all[key];
+          }
+          return json(all, { headers: corsHeaders(req) });
+        }),
       },
       "/preferences/:key": {
         PUT: authed(async (req) => {
           const body = (await req.json().catch(() => ({}))) as { value?: unknown };
           if (typeof body.value !== "string") {
             return json({ error: "value (string) required" }, { status: 400, headers: corsHeaders(req) });
+          }
+          if (req.params.key.startsWith(MODEL_CATALOG_PREF_PREFIX)) {
+            // The discovered catalogs are written only by the core's own
+            // probes: this route is `app+cli` and the CLI token is readable
+            // by an agent, so letting it plant rows would let it shape the
+            // model pickers (and the effort ids they offer) for every surface.
+            return json(
+              { error: "this preference is managed by the server", code: "server-managed" },
+              { status: 403, headers: corsHeaders(req) },
+            );
           }
           if (req.params.key === ARCHIVED_HISTORY_RETENTION_PREF) {
             // The retention age drives a destructive, one-way trim, so it is

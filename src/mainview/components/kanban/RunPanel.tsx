@@ -111,8 +111,6 @@ import { switchAccountFailureToast, taskPatchFailureToast } from "@/lib/task-pat
 import { iconForRef, refBasename } from "@/lib/file-icons";
 import {
   AGENT_OPTIONS,
-  CATALOG_SCOPED_KINDS,
-  DEFAULT_EFFORT,
   DEFAULT_MODEL,
   defaultModeFor,
   EVENTS_WINDOW_MAX,
@@ -123,11 +121,9 @@ import {
   FX_USAGE_STATUS_PREFIX,
   HARNESS_SWAP_STATUS_PREFIX,
   isInternalStatusSentinel,
-  cursorModelIdCoveredByCatalog,
   cursorModelSupportsMaxMode,
   EFFORT_OPTIONS,
-  retainableEfforts,
-  supportedEfforts,
+  orderEfforts,
   supportedModes,
   type AgentKind,
   type AgentProfile,
@@ -161,8 +157,18 @@ import {
 import { appendReferences } from "../../../shared/refs.ts";
 import { parseSentFilesToolUse } from "../../../shared/sent-files.ts";
 import { stepNameById } from "../../../shared/pipeline.ts";
-import { discoveredEffortsFor, mergeModelOptions } from "../../../shared/model-options.ts";
-import { supportedSpeeds } from "../../../shared/speed.ts";
+import type { DiscoveredModel } from "../../../shared/model-options.ts";
+import {
+  buildModelOptions,
+  effortOptionsFor,
+  resolveDefaultEffort,
+  resolveDefaultModel,
+  retainableEffortsFor,
+  speedNoticeFor,
+  speedOptionsFor,
+  speedTiersKnown,
+} from "../../../shared/model-catalog.ts";
+import { modelDisplayName } from "../../../shared/model-display.ts";
 import { parseIssueUrl } from "../../../shared/issue-task.ts";
 import { draftsEqual, normalizeDraft } from "@/lib/draft";
 import { createEventDeduper } from "@/lib/event-dedup";
@@ -8437,13 +8443,9 @@ function TaskDetails({
   // `harnessModels`/`agentModels` maps — `mergeModelOptions` already applies
   // rule 7 (a logged-out harness's discovered catalog is untrustworthy), and
   // this is the single source that distrust must flow through.
-  const discoveredEffortsForTask = useMemo(
-    () => discoveredEffortsFor(modelOptions, task.model),
-    [modelOptions, task.model],
-  );
   const supportedEffortsForModel = useMemo(
-    () => supportedEfforts(kind, task.model, discoveredEffortsForTask),
-    [kind, task.model, discoveredEffortsForTask],
+    () => effortOptionsFor(kind, task.model, modelOptions),
+    [kind, task.model, modelOptions],
   );
   const allowedEfforts = useMemo(
     () => new Set(supportedEffortsForModel.map((o) => o.id)),
@@ -8452,54 +8454,46 @@ function TaskDetails({
   // `task.effort` rides along so OpenCode keeps a stored variant while its
   // model's variants are still unknown (see `retainableEfforts`).
   const retainable = useMemo(
-    () => retainableEfforts(kind, task.model, discoveredEffortsForTask, task.effort),
-    [kind, task.model, discoveredEffortsForTask, task.effort],
+    () => retainableEffortsFor(kind, task.model, modelOptions, task.effort),
+    [kind, task.model, modelOptions, task.effort],
   );
   // Mirrors `mergeModelOptions` rule 6: a task's current effort can be
   // retained (kept valid by the cascade above) without being one the picker
   // would otherwise offer — e.g. a discovery refresh that omits `none`.
-  // Built in `EFFORT_OPTIONS` order (highest→lowest) rather than appended
-  // last, so a retained `ultra` still sorts above `Low` instead of trailing
-  // the whole list; the "kept as you chose it" hint names the harness the
-  // task is actually running on instead of hardcoding "Codex".
+  // Built from the offered rows (which already include any effort the CLI
+  // reported that agetor has no row for) in display order, with the retained
+  // one slotted in by `orderEfforts` rather than appended last, so a retained
+  // `ultra` still sorts above `Low`; the "kept as you chose it" hint names the
+  // harness the task is actually running on instead of hardcoding "Codex".
   const effortSelectOptions = useMemo(() => {
     const harnessLabel = harnesses.find((h) => h.id === task.agent)?.label ?? kind;
-    const known = EFFORT_OPTIONS.some((o) => o.id === task.effort);
-    const options = EFFORT_OPTIONS
-      .filter((o) => allowedEfforts.has(o.id) || (o.id === task.effort && retainable.has(o.id)))
-      .map((o) => (
-        allowedEfforts.has(o.id)
-          ? o
-          : {
-              ...o,
-              unlisted: true,
-              hint: `Not in ${harnessLabel}'s discovered effort menu — kept as you chose it.`,
-            }
-      ));
-    // `task.effort` may be an id with no `EFFORT_OPTIONS` row at all (an
-    // unknown/future effort id) — the filter above can't represent it, so
-    // fall back to a raw row labelled by the id itself.
-    if (task.effort && !known && retainable.has(task.effort)) {
-      return [
-        ...options,
-        {
-          id: task.effort,
-          label: task.effort,
-          hint: `Not in ${harnessLabel}'s discovered effort menu — kept as you chose it.`,
-          unlisted: true,
-        },
-      ];
-    }
-    return options;
-  }, [allowedEfforts, retainable, task.effort, harnesses, task.agent, kind]);
+    const retained =
+      task.effort && !allowedEfforts.has(task.effort) && retainable.has(task.effort) ? task.effort : null;
+    if (!retained) return supportedEffortsForModel;
+    const retainedRow = {
+      id: retained,
+      label: effortLabelFor(retained),
+      hint: `Not in ${harnessLabel}'s discovered effort menu — kept as you chose it.`,
+      unlisted: true,
+    };
+    const byId = new Map<string, { id: string; label: string; hint?: string; unlisted?: boolean }>(
+      supportedEffortsForModel.map((o) => [o.id, o] as const),
+    );
+    byId.set(retained, retainedRow);
+    const ordered = orderEfforts([...supportedEffortsForModel.map((o) => o.id), retained]);
+    return ordered.map((id) => byId.get(id)!);
+  }, [allowedEfforts, retainable, task.effort, harnesses, task.agent, kind, supportedEffortsForModel]);
   const maxModeAvailable = kind === "cursor" && cursorModelSupportsMaxMode(task.model);
-  // Speed tiers for the task's model: cursor's come from the curated
-  // fast-variant table, fx's only from discovery (the merged row's
-  // `fast`/`ultrafast` flags, rule 8), every other kind offers `off` only.
-  const speedOptions = useMemo(() => {
-    const option = modelOptions.find((o) => o.id === (task.model ?? DEFAULT_MODEL[kind]));
-    return supportedSpeeds(kind, task.model, task.effort, option);
-  }, [kind, task.model, task.effort, modelOptions]);
+  // Speed tiers for the task's model: cursor's come from its variant map,
+  // fx's, codex's and claude's only from discovery (the merged row's flags,
+  // rule 8), every other kind offers `off` only.
+  const speedOptions = useMemo(
+    () => speedOptionsFor(kind, task.model ?? DEFAULT_MODEL[kind], task.effort, modelOptions),
+    [kind, task.model, task.effort, modelOptions],
+  );
+  const speedNotice = speedNoticeFor(kind, task.model ?? DEFAULT_MODEL[kind], task.speed, modelOptions);
+  // Fast is a launch flag: a change to a running task lands on the next spawn.
+  const speedNote = kind === "claude-code" || kind === "codex" ? "Applies on the next run." : undefined;
   useEffect(() => {
     // A profile-bound task's effort is owned by the profile, not this
     // cascade — mutating it here would PATCH a field the profile lock is
@@ -8512,9 +8506,7 @@ function TaskDetails({
       if (task.effort !== null) void save({ effort: null });
       return;
     }
-    const fallback = allowedEfforts.has(DEFAULT_EFFORT[kind])
-      ? DEFAULT_EFFORT[kind]
-      : supportedEffortsForModel[0]!.id;
+    const fallback = resolveDefaultEffort(kind, task.model, modelOptions) ?? supportedEffortsForModel[0]!.id;
     if (task.effort !== fallback) void save({ effort: fallback });
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [allowedEfforts, retainable, task.effort, supportedEffortsForModel, task.agentProfileId, harnessKnown]);
@@ -8582,35 +8574,30 @@ function TaskDetails({
   const kindDefaultsFor = (nextId: string) => {
     const nextKind = harnessKindOf(nextId, harnesses);
     const nextMode = defaultModeFor(nextKind);
-    const nextModel = DEFAULT_MODEL[nextKind];
     // Same merged-rows source `modelOptions` reads from (rule 7's
     // logged-out distrust), but for the harness being switched TO rather
     // than the task's current one.
     const nextLoggedIn = agents.find((a) => a.harnessId === nextId)?.loggedIn ?? null;
+    const nextDiscovered = harnessModels[nextId] ?? agentModels[nextKind] ?? [];
+    const nextModel = resolveDefaultModel(nextKind, nextDiscovered, nextLoggedIn);
     const nextModelRows = mergedModels(nextKind, nextId, agentModels, harnessModels, nextModel, nextLoggedIn);
-    const nextEfforts = supportedEfforts(
-      nextKind,
-      nextModel,
-      discoveredEffortsFor(nextModelRows, nextModel),
-    );
-    const nextEffort = nextEfforts.length === 0
-      ? null
-      : nextEfforts.some((e) => e.id === DEFAULT_EFFORT[nextKind])
-        ? DEFAULT_EFFORT[nextKind]
-        : nextEfforts[0]!.id;
+    const nextEffort = resolveDefaultEffort(nextKind, nextModel, nextModelRows);
     return { mode: nextMode, model: nextModel, effort: nextEffort, speed: "off" as const, maxMode: false };
   };
 
   const onModelChange = (model: string) => {
-    // fx speed reset rule (plan §3.1): drop a stored tier to `off` only on a
+    // Speed reset rule (plan §3.1): drop a stored tier to `off` only on a
     // user model change, and only when the new model's tiers are actually
     // known — the model is in this harness's discovered catalog and that
     // catalog is trusted (rule 7: not a logged-out harness) — and exclude
     // it. Cursor's own clear runs in the effect above.
-    if (kind === "fx" && task.speed !== "off" && selectedStatus?.loggedIn !== false) {
+    if (task.speed !== "off") {
       const discovered = harnessModels[task.agent] ?? agentModels[kind] ?? [];
-      const option = modelOptions.find((o) => o.id === model);
-      if (discovered.some((m) => m.id === model) && !supportedSpeeds(kind, model, task.effort, option).includes(task.speed)) {
+      if (
+        speedTiersKnown(kind, discovered, selectedStatus?.loggedIn ?? null)
+        && discovered.some((m) => m.id === model)
+        && !speedOptionsFor(kind, model, task.effort, modelOptions).includes(task.speed)
+      ) {
         void save({ model, speed: "off" });
         return;
       }
@@ -8820,7 +8807,7 @@ function TaskDetails({
                   onChange={onModelChange}
                 />
               ) : (
-                <span>{task.model ?? "—"}</span>
+                <span>{task.model ? modelDisplayName(kind, task.model, modelOptions) : "—"}</span>
               )}
             </dd>
 
@@ -8867,6 +8854,8 @@ function TaskDetails({
                     value={task.speed}
                     onChange={(speed) => void save({ speed })}
                     disabled={!editable}
+                    {...speedNotice}
+                    {...(speedNote ? { note: speedNote } : {})}
                   />
                 </dd>
               </>
@@ -9068,9 +9057,9 @@ function TaskDetails({
   );
 }
 
-/** Merge curated AGENT_OPTIONS models with this harness's CLI-discovered
- *  catalog via the shared `mergeModelOptions` helper (same rules NewTaskForm
- *  uses — plan `fx-model-catalog-refresh.md` §3 D3) so the inline editor
+/** The picker rows for a harness's kind: curated models merged with its
+ *  CLI-discovered catalog by the shared `buildModelOptions` (the same
+ *  composition NewTaskForm and `agetor add` use), so the inline editor
  *  surfaces every model the user can pick. Prefers the per-harness catalog
  *  (keyed by `harnessId`, e.g. `task.agent`) over the kind-level map, which
  *  only exists as a fallback for an older daemon predating
@@ -9079,19 +9068,24 @@ function mergedModels(
   kind: AgentKind,
   harnessId: string,
   agentModels: AgentModelMap,
-  harnessModels: Record<string, { id: string; label?: string }[]>,
+  harnessModels: Record<string, DiscoveredModel[]>,
   selected: string | null,
   loggedIn: boolean | null,
 ) {
-  const discovered = (harnessModels[harnessId] ?? agentModels[kind] ?? [])
-    .filter((m) => kind !== "cursor" || !cursorModelIdCoveredByCatalog(m.id));
-  return mergeModelOptions({
-    curated: AGENT_OPTIONS[kind].models,
-    discovered,
+  return buildModelOptions(kind, {
+    discovered: harnessModels[harnessId] ?? agentModels[kind] ?? [],
     selected,
-    scoped: CATALOG_SCOPED_KINDS.has(kind),
     loggedIn,
   });
+}
+
+const EFFORT_LABELS: ReadonlyMap<string, string> = new Map(EFFORT_OPTIONS.map((o) => [o.id, o.label] as const));
+
+/** Label for an effort id with no `EFFORT_OPTIONS` row: its id, title-cased. */
+function effortLabelFor(id: string): string {
+  const known = EFFORT_LABELS.get(id);
+  if (known) return known;
+  return id.split(/[-_]+/).filter(Boolean).map((w) => w.charAt(0).toUpperCase() + w.slice(1)).join(" ") || id;
 }
 
 function CompactSelect({

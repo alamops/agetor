@@ -22,6 +22,10 @@ export interface FakeCodexModel {
   hidden?: boolean;
   /** Reported as `supportedReasoningEfforts[].reasoningEffort`, in this order. */
   efforts?: string[];
+  /** Reported as `defaultReasoningEffort`: the first listed effort when the
+   *  key is absent (the original stub behavior), the explicit value (`null`
+   *  for "the CLI names no default") when present. */
+  defaultEffort?: string | null;
 }
 
 export interface FakeCodexAppServerOptions {
@@ -35,6 +39,15 @@ export interface FakeCodexAppServerOptions {
   error?: boolean;
   /** Directory to write into (a fresh mkdtemp dir by default). */
   dir?: string;
+  /** Answer `--version` with this line (e.g. `codex-cli 0.166.0`), so the
+   *  stub also passes `checkHarness` and a harness on it reads as installed.
+   *  Without it `--version` is an unsupported argument like any other. */
+  version?: string;
+  /** Serve `model/list` from this file instead of `pages`, read on every
+   *  request: it holds one page's JSON (`writeFakeCodexCatalog`), and an
+   *  absent file is an empty catalog. Lets a test change what the CLI reports
+   *  while a backend keeps running. */
+  catalogFile?: string;
 }
 
 function toWire(m: FakeCodexModel): Record<string, unknown> {
@@ -45,13 +58,19 @@ function toWire(m: FakeCodexModel): Record<string, unknown> {
     description: "",
     hidden: m.hidden ?? false,
     isDefault: false,
-    defaultReasoningEffort: m.efforts?.[0] ?? null,
+    defaultReasoningEffort: "defaultEffort" in m ? (m.defaultEffort ?? null) : (m.efforts?.[0] ?? null),
     supportedReasoningEfforts: (m.efforts ?? []).map((e) => ({ reasoningEffort: e, description: "" })),
     upgrade: null,
     upgradeInfo: null,
     availabilityNux: null,
     inputModalities: ["text"],
   };
+}
+
+/** Write the one-page catalog a `catalogFile` stub serves (replacing any
+ *  earlier one). The stub reads it on its next `model/list` request. */
+export function writeFakeCodexCatalog(file: string, models: FakeCodexModel[]): void {
+  writeFileSync(file, `${JSON.stringify({ data: models.map(toWire), nextCursor: null })}\n`);
 }
 
 /**
@@ -75,9 +94,21 @@ export function plantFakeCodexAppServer(opts: FakeCodexAppServerOptions): string
     .map((json, i) => `    if [ "$n" -eq ${i + 1} ]; then printf '{"id":%s,"result":%s}\\n' "$id" '${json}'; fi`)
     .join("\n");
   const lastJson = pageJson[pageJson.length - 1]!;
+  for (const [name, value] of [["version", opts.version], ["catalogFile", opts.catalogFile]] as const) {
+    if (value?.includes("'")) throw new Error(`plantFakeCodexAppServer: single quotes are not supported in ${name}`);
+  }
+  const version = opts.version === undefined ? "" : `if [ "$1" = "--version" ]; then echo '${opts.version}'; exit 0; fi\n`;
+  const fromFile = opts.catalogFile === undefined
+    ? null
+    : `      if [ -f '${opts.catalogFile}' ]; then body=$(cat '${opts.catalogFile}'); else body='{"data":[],"nextCursor":null}'; fi
+      printf '{"id":%s,"result":%s}\\n' "$id" "$body"`;
+  const listAnswer = opts.error
+    ? `      printf '{"id":%s,"error":{"code":-32600,"message":"fake: model/list failed"}}\\n' "$id"`
+    : fromFile ?? `${cases}
+      if [ "$n" -gt ${pageJson.length} ]; then printf '{"id":%s,"result":%s}\\n' "$id" '${lastJson}'; fi`;
   const script = `#!/bin/sh
 # fake codex app-server (test stub) — see src/bun/test-codex-app-server.ts
-if [ "$1" != "app-server" ]; then echo "fake codex: unsupported args: $*" >&2; exit 2; fi
+${version}if [ "$1" != "app-server" ]; then echo "fake codex: unsupported args: $*" >&2; exit 2; fi
 n=0
 while IFS= read -r line; do
   id=$(printf '%s' "$line" | sed -n 's/.*"id":\\([0-9][0-9]*\\).*/\\1/p')
@@ -85,8 +116,7 @@ while IFS= read -r line; do
     *'"method":"initialize"'*) printf '{"id":%s,"result":{"userAgent":"fake-codex"}}\\n' "$id" ;;
     *'"method":"model/list"'*)
       n=$((n+1))
-${opts.error ? `      printf '{"id":%s,"error":{"code":-32600,"message":"fake: model/list failed"}}\\n' "$id"` : `${cases}
-      if [ "$n" -gt ${pageJson.length} ]; then printf '{"id":%s,"result":%s}\\n' "$id" '${lastJson}'; fi`}
+${listAnswer}
       ;;
   esac
 done

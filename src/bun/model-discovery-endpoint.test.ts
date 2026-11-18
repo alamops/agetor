@@ -78,6 +78,7 @@ const url = (p: string) => `http://127.0.0.1:4576${p}`;
 
 let priorFxEnabled = false;
 let prevFxBinEnv: string | undefined;
+let prevClaudeBinEnv: string | undefined;
 let unsubscribe: (() => void) | null = null;
 const events: AppEvent[] = [];
 
@@ -93,6 +94,9 @@ beforeAll(async () => {
   // the same process.
   prevFxBinEnv = process.env.AGETOR_FX_BIN;
   process.env.AGETOR_FX_BIN = fxBin;
+  // The sweep also runs the claude `initialize` probe: keep it off a real `claude`.
+  prevClaudeBinEnv = process.env.AGETOR_CLAUDE_BIN;
+  process.env.AGETOR_CLAUDE_BIN = "/nonexistent/agetor-test-claude";
 
   server = startApiServer() as unknown as { stop: () => void };
   token = API_TOKEN;
@@ -113,11 +117,16 @@ beforeAll(async () => {
   unsubscribe = subscribeAppEvents((e) => events.push(e));
 });
 
-afterAll(() => {
+afterAll(async () => {
   unsubscribe?.();
+  // `bun test` shares one process: leave no catalog or settle hook behind.
+  scheduler?.__testing.resetForTests();
+  (await import("./agent-discovery.ts")).__testing.resetForTests();
   harnesses.setEnabled("fx", priorFxEnabled);
   if (prevFxBinEnv === undefined) delete process.env.AGETOR_FX_BIN;
   else process.env.AGETOR_FX_BIN = prevFxBinEnv;
+  if (prevClaudeBinEnv === undefined) delete process.env.AGETOR_CLAUDE_BIN;
+  else process.env.AGETOR_CLAUDE_BIN = prevClaudeBinEnv;
   server?.stop?.();
   rmSync(fxDir, { recursive: true, force: true });
 });

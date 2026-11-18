@@ -337,10 +337,12 @@ describe("supportedEfforts with discovered efforts", () => {
     expect(ids).toEqual(["high", "low"]);
   });
 
-  test("discovered ids unknown to agetor fall back to the curated table", () => {
-    const withUnknownDiscovery = supportedEfforts("codex", "gpt-6-astra", ["turbo"]).map((o) => o.id);
-    const curated = supportedEfforts("codex", "gpt-6-astra").map((o) => o.id);
-    expect(withUnknownDiscovery).toEqual(curated);
+  test("discovered ids unknown to agetor are synthesized on kinds that validate them; kinds that don't fall back to the curated table", () => {
+    // codex validates efforts at spawn (`effortPassesSpawnCheck`), so the id is offered.
+    expect(supportedEfforts("codex", "gpt-6-astra", ["turbo"]).map((o) => o.id)).toEqual(["turbo"]);
+    // fx keeps today's behavior: unknown ids are dropped, so nothing is left and the curated table answers.
+    const fxCurated = supportedEfforts("fx", "e2e/m").map((o) => o.id);
+    expect(supportedEfforts("fx", "e2e/m", ["turbo"]).map((o) => o.id)).toEqual(fxCurated);
   });
 
   test("null / undefined / empty discovered efforts behave exactly like the two-arg call", () => {
@@ -375,12 +377,16 @@ describe("supportedEfforts with discovered efforts", () => {
     expect(ids).toEqual(["medium", "low"]);
   });
 
-  test("cursor unknown-id guard runs before the discovered branch — a discovered list can't re-open efforts for an unknown cursor id", () => {
+  test("cursor unknown-id guard: an unknown id with no discovered efforts has none (a discovered-only base brings its own)", () => {
     // cursor encodes effort in the model id itself (cursorModelArg); an
     // unknown id has no way to receive an effort no matter what a harness
     // "discovered" for it. If the discovered short-circuit ran first, this
     // would incorrectly return ["high", "low"].
-    expect(supportedEfforts("cursor", "cursor-unknown-9", ["low", "high"])).toEqual([]);
+    // Update (dynamic-model-catalog): a discovered-only base carries its efforts
+    // together with a variant map, so discovered efforts are honoured; an
+    // unknown id with none stays empty.
+    expect(supportedEfforts("cursor", "cursor-unknown-9", null)).toEqual([]);
+    expect(supportedEfforts("cursor", "cursor-unknown-9", []).map((o) => o.id)).toEqual([]);
   });
 
   test("cursor unknown-id guard only affects unknown ids — a known cursor id still honours a discovered list", () => {
@@ -856,4 +862,79 @@ test("cursor supportedModes returns auto/plan/ask (no per-model mode carve-outs)
   const ids = supportedModes("cursor", null).map((o) => o.id);
   expect(ids).toEqual(["auto", "plan", "ask"]);
   expect(supportedModes("cursor", "grok-4.7").map((o) => o.id)).toEqual(["auto", "plan", "ask"]);
+});
+
+// --- dynamic model catalog: Opus 4.6, synthesized efforts, cursor discovered spec ---
+
+describe("dynamic effort catalog", () => {
+  const ids = (rows: readonly AgentOption[]) => rows.map((r) => r.id);
+
+  test("curated Opus 4.6 no longer offers xhigh, but a stored xhigh is retained", () => {
+    expect(ids(supportedEfforts("claude-code", "opus-4.6"))).toEqual(["max", "high", "medium", "low"]);
+    expect(retainableEfforts("claude-code", "opus-4.6", ["low", "high"], "xhigh").has("high")).toBe(true);
+    // The CLI's own set excludes xhigh; the curated set no longer lists it
+    // either, so a stored xhigh cascades to a fallback like any unsupported id.
+    expect(retainableEfforts("claude-code", "opus-4.6", ["low", "medium", "high", "max"]).has("xhigh")).toBe(false);
+  });
+
+  test("an effort the CLI reports but agetor lacks is synthesized, ordered between its CLI neighbours", () => {
+    const rows = supportedEfforts("codex", "gpt-7", ["low", "turbo", "high"]);
+    expect(ids(rows)).toEqual(["high", "turbo", "low"]);
+    expect(rows.find((r) => r.id === "turbo")?.label).toBe("Turbo");
+  });
+
+  test("CLI labels win over title-casing for synthesized rows", () => {
+    const rows = supportedEfforts("copilot", "gpt-7", ["low", "turbo-think"], { labels: { "turbo-think": "Turbo Think!" } });
+    expect(rows.find((r) => r.id === "turbo-think")?.label).toBe("Turbo Think!");
+    const plain = supportedEfforts("copilot", "gpt-7", ["low", "turbo-think"]);
+    expect(plain.find((r) => r.id === "turbo-think")?.label).toBe("Turbo Think");
+  });
+
+  test("an id failing the spawn charset is dropped, auto stays gated, fx still drops unknown ids", () => {
+    expect(ids(supportedEfforts("claude-code", "opus-6", ["low", "x y", "a;b", "z".repeat(33), "high"]))).toEqual(["high", "low"]);
+    expect(ids(supportedEfforts("codex", "gpt-7", ["auto", "high"]))).toEqual(["high"]);
+    expect(ids(supportedEfforts("fx", "e2e/m", ["high", "mystery"]))).toEqual(["high"]);
+  });
+
+  test("an unknown id on an ascending CLI list goes above the top known one; a descending list puts it below", () => {
+    expect(ids(supportedEfforts("claude-code", "opus-6", ["low", "medium", "high", "turbo"]))).toEqual(["turbo", "high", "medium", "low"]);
+    expect(ids(supportedEfforts("claude-code", "opus-6", ["high", "medium", "low", "slow"]))).toEqual(["high", "medium", "low", "slow"]);
+    // One known id is no direction: unknown ids go last, in CLI order.
+    expect(ids(supportedEfforts("claude-code", "opus-6", ["turbo", "high"]))).toEqual(["high", "turbo"]);
+  });
+
+  test("empty discovery keeps the curated table; an unknown model falls back to the default model's ladder", () => {
+    expect(ids(supportedEfforts("claude-code", "opus-5.5", []))).toEqual(["max", "xhigh", "high", "medium", "low"]);
+    expect(ids(supportedEfforts("claude-code", "opus-99"))).toEqual(ids(supportedEfforts("claude-code", null)));
+  });
+
+  test("cursor: an unknown base has no efforts unless discovery attached some", () => {
+    expect(supportedEfforts("cursor", "gpt-7", null)).toEqual([]);
+    expect(ids(supportedEfforts("cursor", "gpt-7", ["low", "high"]))).toEqual(["high", "low"]);
+  });
+
+  test("cursorModelArg: a discovered variant map composes the flat id, a curated spec wins over it", () => {
+    const discovered = { effortIds: { high: "gpt-7-high" }, fastEfforts: ["high"] };
+    expect(cursorModelArg("gpt-7", "high", true, false, discovered)).toBe("gpt-7-high-fast");
+    expect(cursorModelArg("gpt-7", "high", false, false, discovered)).toBe("gpt-7-high");
+    expect(cursorModelArg("gpt-7", "high", true)).toBe("gpt-7");
+    expect(cursorModelSupportsFast("gpt-7", "high", discovered)).toBe(true);
+    expect(cursorModelSupportsFast("gpt-7", "low", discovered)).toBe(false);
+    const curatedKey = "grok-4.7";
+    const bogus = { effortIds: { high: "bogus-high" } };
+    expect(cursorModelArg(curatedKey, "high", false, false, bogus)).toBe("grok-4.7-high");
+    expect(cursorModelSupportsFast("gpt-8", null, { fastId: "gpt-8-fast" })).toBe(true);
+    expect(cursorModelArg("gpt-8", null, true, false, { fastId: "gpt-8-fast" })).toBe("gpt-8-fast");
+  });
+
+  test("the copilot Auto row is pinned so the CLI-order rule keeps it first", () => {
+    const auto = AGENT_OPTIONS.copilot.models.find((m) => m.id === "auto");
+    expect(auto?.pinned).toBe(true);
+  });
+
+  test("MODEL_MIN_CLI_VERSION is documented as a frozen fallback", () => {
+    // Guard against new rows sneaking in: the table content is pinned elsewhere;
+    // this just keeps the export shape.
+    expect(Object.keys(MODEL_MIN_CLI_VERSION).sort()).toEqual(["codex", "copilot"]);
+  });
 });

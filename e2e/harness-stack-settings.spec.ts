@@ -277,7 +277,7 @@ test.describe("settings → harnesses → stacks", () => {
     // The provider's message is the chip's tooltip and plain text beside it.
     await expect(chips.nth(0)).toHaveAttribute("title", "Weekly limit reached");
     await expect(row.getByText("Weekly limit reached").first()).toBeVisible();
-    await expect(chips.nth(1)).toContainText("for sonnet-4.6");
+    await expect(chips.nth(1)).toContainText("for Sonnet 4.6");
 
     await row.getByRole("button", { name: `Clear cooldown on ${A}`, exact: true }).click();
     const accountWide = confirmDialog(page, `Clear the account-wide cooldown on ${A}?`);
@@ -287,8 +287,8 @@ test.describe("settings → harnesses → stacks", () => {
     expect(limitStateCount(backend, A, "")).toBe(0);
     expect(limitStateCount(backend, A, "sonnet-4.6")).toBe(1);
 
-    await row.getByRole("button", { name: `Clear cooldown on ${A} for sonnet-4.6` }).click();
-    const perModel = confirmDialog(page, `Clear the sonnet-4.6 cooldown on ${A}?`);
+    await row.getByRole("button", { name: `Clear cooldown on ${A} for Sonnet 4.6` }).click();
+    const perModel = confirmDialog(page, `Clear the Sonnet 4.6 cooldown on ${A}?`);
     await expect(perModel).toBeVisible();
     await perModel.getByRole("button", { name: "Clear", exact: true }).click();
     await expect(chips).toHaveCount(0);

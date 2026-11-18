@@ -57,6 +57,7 @@ import {
   type SettingsSectionId,
   type SettingsView,
 } from "@/lib/settings-dialog-view";
+import { modelDisplayName } from "../../../shared/model-display.ts";
 import {
   FONT_SIZE_DEFAULT,
   FONT_SIZE_MAX,
@@ -530,7 +531,7 @@ export function SettingsDialog({ open, onClose, stickyUserMessages, onStickyUser
   const onClearCooldown = async (h: Harness, model: string | null) => {
     const ok = await confirm({
       title: model
-        ? `Clear the ${model} cooldown on ${h.label}?`
+        ? `Clear the ${modelDisplayName(null, model)} cooldown on ${h.label}?`
         : `Clear the account-wide cooldown on ${h.label}?`,
       description: "The provider may still refuse until its own reset.",
       confirmLabel: "Clear",

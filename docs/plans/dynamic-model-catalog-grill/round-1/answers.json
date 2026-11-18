@@ -1,0 +1,255 @@
+{
+  "version": 1,
+  "formId": "dynamic-model-catalog-grill-r1",
+  "title": "Grill — dynamic model & effort catalog per harness",
+  "round": 1,
+  "mode": "served",
+  "specFile": "questions.json",
+  "specSha256": "356d4d3068248f79e51d786d8ca54eca32295e74a0daa734b3c5b6b401dc8d1a",
+  "submittedAt": "2026-11-17T18:52:30.026Z",
+  "receivedAt": "2026-11-17T18:52:30.036Z",
+  "answeredBy": null,
+  "summary": {
+    "total": 22,
+    "answered": 21,
+    "skipped": 0,
+    "unanswered": 1,
+    "optionalLeftBlank": 0,
+    "notApplicable": 0,
+    "acceptedRecommendations": 18,
+    "overrodeRecommendations": [
+      "harness-scope",
+      "claude-scoping",
+      "speed-tiers"
+    ],
+    "oneWayDoorsNotAnswered": [],
+    "withNotes": [
+      "harness-scope",
+      "claude-id-scheme"
+    ],
+    "needsAnswer": [
+      "bundles-cli"
+    ],
+    "complete": false
+  },
+  "answers": {
+    "harness-scope": {
+      "n": 1,
+      "title": "Which harnesses get new or extended discovery in this change?",
+      "type": "multi",
+      "status": "answered",
+      "impact": "blocking",
+      "value": [
+        "claude",
+        "cursor",
+        "gemini",
+        "codex-extend",
+        "copilot-acp",
+        "antigravity"
+      ],
+      "display": "Claude Code: new `initialize` probe; Cursor: structured base + effort + fast discovery; Gemini: `gemini models -o json` on ≥ 0.67; Codex: also read `isDefault` / `defaultReasoningEffort`; Copilot: try its ACP server for models + efforts; Antigravity: no new source",
+      "acceptedRecommendation": false,
+      "recommended": [
+        "claude",
+        "cursor",
+        "gemini",
+        "codex-extend",
+        "antigravity"
+      ],
+      "note": "We have a refresh icon button already, right? to refetch the options"
+    },
+    "curated-fate": {
+      "n": 2,
+      "title": "What happens to the hand-curated model tables (`AGENT_OPTIONS`, `MODEL_EFFORT_SUPPORT`, `CLAUDE_MODEL_FLAG`, `CURSOR_MODEL_SPECS`…)?",
+      "type": "single",
+      "status": "answered",
+      "impact": "blocking",
+      "value": "frozen-overlay",
+      "display": "Keep them, frozen: fallback + optional label/hint overlay",
+      "acceptedRecommendation": true
+    },
+    "claude-id-scheme": {
+      "n": 3,
+      "title": "How do claude's CLI ids map onto agetor's model ids?",
+      "type": "single",
+      "status": "answered",
+      "oneWayDoor": true,
+      "impact": "blocking",
+      "value": "map-friendly",
+      "display": "Keep friendly ids; derive them from CLI ids by rule",
+      "acceptedRecommendation": true,
+      "note": "Let's also beautify the names, like, opus-5.5 can become Opus 5.5."
+    },
+    "claude-alias-rows": {
+      "n": 4,
+      "title": "Should the picker also offer auto-tracking \"latest\" rows (e.g. **Opus (latest)**) that follow each family's newest release?",
+      "type": "single",
+      "status": "answered",
+      "impact": "shape",
+      "value": "none",
+      "display": "No alias rows",
+      "acceptedRecommendation": true
+    },
+    "claude-scoping": {
+      "n": 5,
+      "title": "Claude's list has no Mythos rows. Should curated rows the CLI doesn't list be hidden?",
+      "type": "single",
+      "status": "answered",
+      "impact": "shape",
+      "value": "unscoped-kind",
+      "display": "Unscoped, one probe per kind",
+      "acceptedRecommendation": false,
+      "recommended": "unscoped-per-harness"
+    },
+    "defaults": {
+      "n": 6,
+      "title": "Default model and default effort: who picks them once discovery exists?",
+      "type": "single",
+      "status": "answered",
+      "impact": "shape",
+      "value": "owner-with-cli-fallback",
+      "display": "Owner pick stays; the CLI's default is the fallback",
+      "acceptedRecommendation": true
+    },
+    "unknown-efforts": {
+      "n": 7,
+      "title": "A CLI reports an effort level agetor doesn't know (e.g. cursor `extra-high`, a future codex tier). What happens?",
+      "type": "single",
+      "status": "answered",
+      "impact": "shape",
+      "value": "synthesize",
+      "display": "Synthesize a row and pass it through",
+      "acceptedRecommendation": true
+    },
+    "order-labels": {
+      "n": 8,
+      "title": "Where do discovered models land in the picker, and whose label do they show?",
+      "type": "single",
+      "status": "answered",
+      "impact": "shape",
+      "value": "cli-order",
+      "display": "CLI order wins; curated-only rows follow",
+      "acceptedRecommendation": true
+    },
+    "cursor-strategy": {
+      "n": 9,
+      "title": "Cursor: where do its model families, effort levels and fast variants come from?",
+      "type": "single",
+      "status": "answered",
+      "impact": "blocking",
+      "value": "flat-heuristic",
+      "display": "Parse the flat list into base + effort + fast",
+      "acceptedRecommendation": true
+    },
+    "speed-tiers": {
+      "n": 10,
+      "title": "Claude (`supportsFastMode`) and codex (`fast` service tier) report speed tiers. Do they belong in this change?",
+      "type": "single",
+      "status": "answered",
+      "impact": "shape",
+      "value": "in",
+      "display": "In this change",
+      "acceptedRecommendation": false,
+      "recommended": "out"
+    },
+    "min-cli-floor": {
+      "n": 11,
+      "title": "Retire the per-model minimum-CLI-version table (`MODEL_MIN_CLI_VERSION`) where discovery is authoritative?",
+      "type": "single",
+      "status": "answered",
+      "impact": "shape",
+      "value": "discovery-first",
+      "display": "Discovery check first; the table becomes a frozen fallback",
+      "acceptedRecommendation": true
+    },
+    "persist-catalog": {
+      "n": 12,
+      "title": "Should the last discovered catalog survive a restart?",
+      "type": "single",
+      "status": "answered",
+      "impact": "shape",
+      "value": "preferences",
+      "display": "Persist in the `preferences` table, no migration",
+      "acceptedRecommendation": true
+    },
+    "opus-46-xhigh": {
+      "n": 13,
+      "title": "Pre-existing bug: curated Opus 4.6 offers `xhigh`, which claude says it doesn't support",
+      "type": "confirm",
+      "status": "answered",
+      "value": "Fix the curated row in this change (drop `xhigh` from `opus-4.6`), so old CLIs without discovery stop offering it too. A stored `xhigh` on existing tasks is kept (`retainableEfforts`), never PATCHed away.",
+      "acceptedRecommendation": true
+    },
+    "claude-probe-isolation": {
+      "n": 14,
+      "title": "Claude probe isolation and privacy",
+      "type": "confirm",
+      "status": "answered",
+      "value": "Spawn through `coreSpawn` with `--strict-mcp-config` (no MCP servers), `disableAllHooks`, `--no-session-persistence`, an empty cwd under the data dir, the harness's `CLAUDE_CONFIG_DIR`, a 10 s timeout. Parse only `models[]`; never log or store the raw response (it carries the account email and org). If build-time checks show MCP servers or hooks still start, claude stays curated and that's reported back.",
+      "acceptedRecommendation": true
+    },
+    "probe-cadence": {
+      "n": 15,
+      "title": "When the new probes run",
+      "type": "confirm",
+      "status": "answered",
+      "value": "Same scheduler and triggers as today's probes: boot, harness status change, harness CRUD, manual refresh, and the 15-minute sweep. No new route or SSE stream; reuse `agent_models_changed`.",
+      "acceptedRecommendation": true
+    },
+    "no-effort-fallback": {
+      "n": 16,
+      "title": "A discovered model with no reported efforts and no curated row",
+      "type": "confirm",
+      "status": "answered",
+      "value": "Today's fallback stays: the default model's ladder for claude (< 2.1.49) and copilot, no effort picker for gemini, antigravity and unparsed cursor rows. Haiku 4.5's curated \"no effort\" stays authoritative.",
+      "acceptedRecommendation": true
+    },
+    "cursor-param-driver": {
+      "n": 17,
+      "title": "Cursor driver keeps flat variant ids",
+      "type": "confirm",
+      "status": "answered",
+      "value": "The cursor driver keeps passing flat variant ids (`grok-4.7-high-fast`), not the bracket form `base[effort=…,fast=…]`.",
+      "acceptedRecommendation": true
+    },
+    "cursor-config-side-effect": {
+      "n": 18,
+      "title": "Pre-existing: agetor's cursor runs may change your interactive cursor default",
+      "type": "confirm",
+      "status": "answered",
+      "value": "Check once during the build (compare `~/.cursor/cli-config.json` before and after a run). If agetor runs do change it, record that as a separate ticket; this change only makes sure the new discovery never writes it.",
+      "acceptedRecommendation": true
+    },
+    "copilot-unchanged": {
+      "n": 19,
+      "title": "Copilot and antigravity keep their current probes",
+      "type": "confirm",
+      "status": "answered",
+      "value": "Copilot keeps `help config` (ids) with curated efforts, and antigravity keeps `agy models`. The curated-table policy above applies to both. A copilot ACP probe becomes its own spike, unless you ticked it under Scope.",
+      "acceptedRecommendation": true
+    },
+    "bundles-cli": {
+      "n": 20,
+      "title": "Bundles, `agetor add` and the TUI",
+      "type": "confirm",
+      "status": "unanswered"
+    },
+    "tests-acceptance": {
+      "n": 21,
+      "title": "Acceptance bar and tests",
+      "type": "confirm",
+      "status": "answered",
+      "value": "Done means: a stub claude reporting a new `claude-opus-6` with its own effort ladder makes **Opus 6** appear in the New Task picker, the task editor and `agetor add`, with that ladder and no agetor change; an old/failed probe gives today's curated picker. Tests: a parser unit test per probe with redacted spike fixtures; a cross-kind invariant that no merged picker has two rows for the same CLI model or the same label (the S2 bug); `supportedEfforts` with unknown levels; one Playwright e2e on the stub claude, extending the fx stub-bin seam.",
+      "acceptedRecommendation": true
+    },
+    "docs": {
+      "n": 22,
+      "title": "Docs",
+      "type": "confirm",
+      "status": "answered",
+      "value": "Update `harnesses.md` (the add-a-model / add-a-kind checklist: a new model needs no PR unless it wants a label/hint override), each touched `harness-<kind>.md`, and CLAUDE.md's \"Agent kinds at a glance\" probe column. Copy the goal into `docs/plans/dynamic-model-catalog.md` with the plan.",
+      "acceptedRecommendation": true
+    }
+  },
+  "generalNotes": null
+}

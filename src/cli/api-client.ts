@@ -41,6 +41,7 @@ import type {
   RemoteAccessStatus,
 } from "../shared/types.ts";
 import type { NotificationKind } from "../shared/os-notification.ts";
+import type { DiscoveredModel } from "../shared/model-options.ts";
 import type { BundleExportResponse } from "../shared/bundle.ts";
 import type { BundleImportOptions, BundleImportPlan, BundleImportResponse } from "../shared/bundle-import.ts";
 import type { AnyRequest, AskQuestionsAnswer } from "../bun/interactions.ts";
@@ -1014,13 +1015,7 @@ export class AgetorClient {
 
 /** One row of a discovered model catalog (`GET /agent-models`, `GET
  *  /agent-models/harnesses`) — the server's `DiscoveredModel` shape. */
-export interface DiscoveredModelRow {
-  id: string;
-  label?: string;
-  efforts?: string[];
-  fast?: boolean;
-  ultrafast?: boolean;
-}
+export type DiscoveredModelRow = DiscoveredModel;
 
 /** Body for POST /tasks (mirrors the server's accepted fields). */
 export interface CreateTaskInput {

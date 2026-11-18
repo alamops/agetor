@@ -298,11 +298,11 @@ test("formatAgentProfileListRow: undefined taskCount (older server payload) rend
   expect(row[6]).toBe("0");
 });
 
-test("formatAgentProfileListRow: name/harness/model/effort/mode come through verbatim", () => {
+test("formatAgentProfileListRow: name/harness/effort/mode come through verbatim, the model as its display name", () => {
   const row = formatAgentProfileListRow(fakeProfile({ taskCount: 0 }));
   expect(row[0]).toBe("Reviewer");
   expect(row[1]).toBe("codex");
-  expect(row[2]).toBe("gpt-6-astra");
+  expect(row[2]).toBe("GPT-6 Astra");
   expect(row[3]).toBe("high");
   expect(row[4]).toBe("auto");
 });
@@ -379,7 +379,7 @@ test("formatAgentProfileShow: off and ultrafast print as their tier", () => {
 test("formatAgentProfileShow: header, fields, used-by and instructions lines", () => {
   const lines = formatAgentProfileShow(fakeProfile({ taskCount: 2, instructions: "Line one.\nLine two.\n" }));
   expect(lines[0]).toBe("Reviewer  p1");
-  expect(lines[1]).toBe("  harness: codex   model: gpt-6-astra   effort: high   mode: auto");
+  expect(lines[1]).toBe("  harness: codex   model: GPT-6 Astra   effort: high   mode: auto");
   expect(lines).toContain("  skills: /code-review, /security-review");
   expect(lines).toContain("  used by: 2 tasks");
   expect(lines.slice(-3)).toEqual(["  instructions:", "    Line one.", "    Line two."]);

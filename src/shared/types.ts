@@ -3591,6 +3591,11 @@ export const DEFAULT_EFFORT: Record<AgentKind, string> = {
  * assumed to be gated the same way, and `AGETOR_SKIP_CLI_VERSION_FLOOR=1` is
  * the override when one isn't.
  * See docs/plans/add-gpt-6-sol-and-luna.md §3 D4.
+ *
+ * FROZEN FALLBACK — add no new rows. A kind whose CLI reports its own catalog
+ * (codex, copilot) is checked against that catalog first
+ * (`modelCatalogVerdict`, `src/shared/model-catalog.ts`); these floors apply
+ * only when discovery has nothing to say (offline, logged out, old CLI).
  */
 export const MODEL_MIN_CLI_VERSION: Partial<Record<AgentKind, Record<string, string>>> = {
   codex: {
@@ -4071,8 +4076,29 @@ export const CURSOR_MODEL_SPECS: Record<string, CursorModelSpec> = {
   },
 };
 
-export function cursorModelSupportsFast(model: string | null, effort: string | null): boolean {
-  const spec = CURSOR_MODEL_SPECS[model ?? DEFAULT_MODEL.cursor];
+/**
+ * The variant map of a cursor base the CLI reported but `CURSOR_MODEL_SPECS`
+ * does not cover (`DiscoveredModel.cursor`, built by `parseCursorModelList`).
+ * A curated spec for the same id always wins over it.
+ */
+export type CursorVariantSpec = Pick<CursorModelSpec, "effortIds" | "fastEfforts" | "fastId">;
+
+/** What the cursor helpers accept as a discovered variant map: structurally
+ *  `CursorVariantSpec`, tolerant of the readonly arrays the shared
+ *  `DiscoveredModel.cursor` shape carries. */
+export type CursorVariantSpecInput = {
+  effortIds?: Readonly<Partial<Record<string, string>>>;
+  fastEfforts?: readonly string[];
+  fastId?: string;
+};
+
+export function cursorModelSupportsFast(
+  model: string | null,
+  effort: string | null,
+  discovered?: CursorVariantSpecInput,
+): boolean {
+  const key = model ?? DEFAULT_MODEL.cursor;
+  const spec: CursorVariantSpecInput | undefined = CURSOR_MODEL_SPECS[key] ?? discovered;
   if (!spec) return false;
   if (spec.fastId && !spec.effortIds) return true;
   if (!effort) return false;
@@ -4091,8 +4117,15 @@ export function cursorModelIdCoveredByCatalog(id: string): boolean {
   });
 }
 
-export function cursorModelArg(model: string, effort: string | null, fast: boolean, maxMode = false): string {
-  const spec = CURSOR_MODEL_SPECS[model];
+export function cursorModelArg(
+  model: string,
+  effort: string | null,
+  fast: boolean,
+  maxMode = false,
+  discovered?: CursorVariantSpecInput,
+): string {
+  const curated = CURSOR_MODEL_SPECS[model];
+  const spec: (CursorVariantSpecInput & { supportsMaxMode?: boolean }) | undefined = curated ?? discovered;
   if (!spec) return model;
   if (!spec.effortIds) {
     const baseId = fast && spec.fastId ? spec.fastId : model;
@@ -4108,7 +4141,7 @@ export function cursorModelArg(model: string, effort: string | null, fast: boole
   const baseId = spec.effortIds[desiredEffort] ?? model;
   if (maxMode && spec.supportsMaxMode) {
     const params = [`context=1m`, `effort=${desiredEffort}`];
-    if (cursorModelSupportsFast(model, desiredEffort)) params.push(`fast=${fast ? "true" : "false"}`);
+    if (cursorModelSupportsFast(model, desiredEffort, discovered)) params.push(`fast=${fast ? "true" : "false"}`);
     return `${model}[${params.join(",")}]`;
   }
   return fast && spec.fastEfforts?.includes(desiredEffort) ? `${baseId}-fast` : baseId;
@@ -4269,7 +4302,10 @@ export const MODEL_EFFORT_SUPPORT: Record<AgentKind, Record<string, string[]>> =
     "opus-5": ["max", "xhigh", "high", "medium", "low"],
     "opus-4.8": ["max", "xhigh", "high", "medium", "low"],
     "opus-4.7": ["max", "xhigh", "high", "medium", "low"],
-    "opus-4.6": ["max", "xhigh", "high", "medium", "low"],
+    // Opus 4.6 has no `xhigh`: the CLI's own `initialize` catalog (2.1.326)
+    // reports low/medium/high/max for it. A stored `xhigh` on an existing
+    // task is still retained (`retainableEfforts`).
+    "opus-4.6": ["max", "high", "medium", "low"],
     // Sonnet 5.5's docs: like Opus 5.5, thinking can't be disabled
     // ({type:"disabled"} 400s — the API's between_tools off switch is nothing
     // agetor ever sends, since effort rides CLAUDE_CODE_EFFORT_LEVEL), so
@@ -4621,24 +4657,21 @@ export function supportedEfforts(
   agent: AgentKind,
   model: string | null,
   discoveredEfforts?: readonly string[] | null,
+  opts?: { labels?: Readonly<Record<string, string>> },
 ): AgentOption[] {
+  const hasDiscovered = Boolean(discoveredEfforts && discoveredEfforts.length > 0);
   // Cursor encodes effort in the model id itself (`cursorModelArg`), so an
   // unknown cursor id has no way to receive an effort at all — this guard
   // must run BEFORE the discovered-effort short-circuit below, or a
   // non-empty `discoveredEfforts` for an unknown cursor id would defeat it
-  // and offer effort choices that would silently never reach the CLI.
-  if (agent === "cursor" && model !== null && !(model in MODEL_EFFORT_SUPPORT.cursor)) return [];
+  // and offer effort choices that would silently never reach the CLI. The
+  // one carve-out is a discovered-only base: the cursor probe attaches its
+  // variant map (`DiscoveredModel.cursor`) and efforts together, and
+  // `cursorModelArg` resolves them through that map.
+  if (agent === "cursor" && model !== null && !(model in MODEL_EFFORT_SUPPORT.cursor) && !hasDiscovered) return [];
   if (agent === "opencode") return opencodeEfforts(model, discoveredEfforts);
-  if (discoveredEfforts && discoveredEfforts.length > 0) {
-    const discoveredAllowed = new Set(discoveredEfforts);
-    // `auto` belongs only to `MODEL_DEFAULT_EFFORT_KINDS` (fx, copilot, opencode — see
-    // the EFFORT_OPTIONS row comment): any other harness that happens to
-    // discover an "auto" id (e.g. codex's `model/list supportedReasoningEfforts`)
-    // must not surface a "Model default" row or pass `auto` through to a flag
-    // that doesn't understand it, so it's dropped from the discovered set
-    // before filtering for every other kind.
-    const fromDiscovery = EFFORT_OPTIONS.filter((o) =>
-      discoveredAllowed.has(o.id) && (MODEL_DEFAULT_EFFORT_KINDS.has(agent) || o.id !== "auto"));
+  if (hasDiscovered && discoveredEfforts) {
+    const fromDiscovery = discoveredEffortOptions(agent, discoveredEfforts, opts?.labels);
     if (fromDiscovery.length > 0) return fromDiscovery;
   }
   const key = model ?? DEFAULT_MODEL[agent];
@@ -4648,6 +4681,126 @@ export function supportedEfforts(
     ?? [];
   const allowed = new Set(ids);
   return EFFORT_OPTIONS.filter((o) => allowed.has(o.id));
+}
+
+/**
+ * Effort ids a CLI reports that agetor has no `EFFORT_OPTIONS` row for are
+ * offered as synthesized rows on these kinds — the ones whose spawn path
+ * validates the id before it reaches argv/env (`effortPassesSpawnCheck`,
+ * `src/shared/effort-check.ts`). Other kinds keep dropping them.
+ */
+const SYNTHESIZED_EFFORT_KINDS: ReadonlySet<AgentKind> = new Set<AgentKind>(["claude-code", "codex", "copilot", "cursor"]);
+
+/** A CLI-reported effort id that is safe to put in argv/env or an effort
+ *  value: lowercase letters, digits, `_` and `-`, 1–32 characters. */
+export const EFFORT_ID_RE = /^[a-z0-9_-]{1,32}$/;
+
+const EFFORT_RANK = new Map(EFFORT_OPTIONS.map((o, i) => [o.id, i] as const));
+
+function titleCaseEffort(id: string): string {
+  return id
+    .split(/[-_]+/)
+    .filter(Boolean)
+    .map((w) => w.charAt(0).toUpperCase() + w.slice(1))
+    .join(" ");
+}
+
+/**
+ * Order a CLI-reported effort list for display: ids agetor knows follow the
+ * canonical `EFFORT_OPTIONS` order (highest first); an id it does not know is
+ * placed between its nearest known neighbours in the CLI's own list, on the
+ * side the CLI's direction implies, and last when the list has too few known
+ * ids to tell a direction. Duplicates collapse (first wins).
+ */
+export function orderEfforts(ids: readonly string[]): string[] {
+  const list: string[] = [];
+  const seen = new Set<string>();
+  for (const raw of ids) {
+    if (typeof raw !== "string" || seen.has(raw)) continue;
+    seen.add(raw);
+    list.push(raw);
+  }
+  const known = list.filter((id) => EFFORT_RANK.has(id));
+  const unknown = list.filter((id) => !EFFORT_RANK.has(id));
+  const sortedKnown = [...known].sort((a, b) => (EFFORT_RANK.get(a) ?? 0) - (EFFORT_RANK.get(b) ?? 0));
+  if (unknown.length === 0) return sortedKnown;
+  const rankOf = (id: string) => EFFORT_RANK.get(id) ?? 0;
+  // The CLI's direction: ascending when its first known id ranks lower
+  // (a larger rank number) than its last known one.
+  const first = known[0];
+  const last = known[known.length - 1];
+  const direction =
+    known.length >= 2 && first !== undefined && last !== undefined && rankOf(first) !== rankOf(last)
+      ? (rankOf(first) > rankOf(last) ? "ascending" : "descending")
+      : null;
+  if (direction === null) return [...sortedKnown, ...unknown];
+  const before = new Map<string, string[]>();
+  const after = new Map<string, string[]>();
+  const push = (m: Map<string, string[]>, k: string, v: string) => {
+    const arr = m.get(k);
+    if (arr) arr.push(v);
+    else m.set(k, [v]);
+  };
+  const top = sortedKnown[0] as string;
+  const bottom = sortedKnown[sortedKnown.length - 1] as string;
+  list.forEach((id, i) => {
+    if (EFFORT_RANK.has(id)) return;
+    let prev: string | undefined;
+    for (let j = i - 1; j >= 0; j--) {
+      const c = list[j] as string;
+      if (EFFORT_RANK.has(c)) { prev = c; break; }
+    }
+    let next: string | undefined;
+    for (let j = i + 1; j < list.length; j++) {
+      const c = list[j] as string;
+      if (EFFORT_RANK.has(c)) { next = c; break; }
+    }
+    if (prev !== undefined && next !== undefined) {
+      // Between two known ids: sit just below the higher-level one.
+      push(after, rankOf(prev) < rankOf(next) ? prev : next, id);
+    } else if (prev !== undefined) {
+      // After the last known id: above it when the CLI ascends, else below.
+      if (direction === "ascending") push(before, top, id);
+      else push(after, bottom, id);
+    } else if (next !== undefined) {
+      // Before the first known id: below it when the CLI ascends, else above.
+      if (direction === "ascending") push(after, bottom, id);
+      else push(before, top, id);
+    }
+  });
+  const slot = (m: Map<string, string[]>, k: string): string[] => {
+    const arr = m.get(k) ?? [];
+    return direction === "ascending" ? [...arr].reverse() : arr;
+  };
+  const out: string[] = [];
+  for (const id of sortedKnown) {
+    out.push(...slot(before, id), id, ...slot(after, id));
+  }
+  return out;
+}
+
+/** The discovered-wins branch of {@link supportedEfforts}: known ids keep
+ *  their curated row, unknown ids that pass the spawn charset become
+ *  synthesized rows on the kinds that validate them, `auto` is dropped
+ *  outside `MODEL_DEFAULT_EFFORT_KINDS`. */
+function discoveredEffortOptions(
+  agent: AgentKind,
+  discoveredEfforts: readonly string[],
+  labels: Readonly<Record<string, string>> | undefined,
+): AgentOption[] {
+  const known = new Map(EFFORT_OPTIONS.map((o) => [o.id, o] as const));
+  const synthesize = SYNTHESIZED_EFFORT_KINDS.has(agent);
+  const accepted = discoveredEfforts.filter((raw) => {
+    if (typeof raw !== "string") return false;
+    if (known.has(raw)) return raw !== "auto" || MODEL_DEFAULT_EFFORT_KINDS.has(agent);
+    return synthesize && EFFORT_ID_RE.test(raw);
+  });
+  return orderEfforts(accepted).map((id) => {
+    const row = known.get(id);
+    if (row) return row;
+    const label = labels?.[id];
+    return { id, label: label && label.trim() ? label.trim() : titleCaseEffort(id) };
+  });
 }
 
 const AUTO_EFFORT_OPTION: AgentOption = EFFORT_OPTIONS.find((o) => o.id === "auto") ?? {
@@ -5127,7 +5280,7 @@ export const AGENT_OPTIONS: Record<AgentKind, AgentOptions> = {
   },
   copilot: {
     models: [
-      { id: "auto", label: "Auto", hint: "Default — Copilot's own model router. Available on every plan, a 10% credit discount, and it never picks a model your organisation has disabled. A status line names the model Copilot actually used." },
+      { id: "auto", label: "Auto", pinned: true, hint: "Default — Copilot's own model router. Available on every plan, a 10% credit discount, and it never picks a model your organisation has disabled. A status line names the model Copilot actually used." },
       { id: "claude-opus-5.5", label: "Claude Opus 5.5", hint: "Anthropic's Opus 5.5 through Copilot. Needs Copilot CLI 1.0.89 or newer." },
       { id: "claude-sonnet-5.5", label: "Claude Sonnet 5.5", hint: "Faster, lower-cost complement to Opus 5.5." },
       { id: "claude-haiku-5.5", label: "Claude Haiku 5.5", hint: "Cheapest, fastest Claude. Needs Copilot CLI 1.0.94 or newer." },
