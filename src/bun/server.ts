@@ -319,8 +319,10 @@ import {
   binaryPreviewKind,
   contentTypeForPreviewPath,
   isImagePath,
+  isScreenshotUploadablePath,
   MAX_FILE_PREVIEW_BYTES,
 } from "../shared/attachments.ts";
+import { previewTwinPath, writePreviewTwinsForRefs } from "./preview-twins.ts";
 import { AGENT_PROFILE_LIMITS, normalizeSkillName } from "../shared/agent-profile.ts";
 import { LONE_SURROGATE_RE, PIPELINE_CONTROL_CHAR_RE, validatePipelineGraph } from "../shared/pipeline.ts";
 import { BUNDLE_MAX_BYTES, findInvisibleChar } from "../shared/bundle.ts";
@@ -7574,17 +7576,19 @@ export function startApiServer(
             if (mode === "folder") {
               return json({ refs: refsFromPaths([fakeDir]) }, { headers: corsHeaders(req) });
             }
+            let fakeRefs: TaskReference[];
             try {
               const entries = readdirSync(fakeDir, { withFileTypes: true })
                 .filter((e) => e.isFile())
                 .sort((a, b) => a.name.localeCompare(b.name));
-              return json(
-                { refs: refsFromPaths(entries.map((e) => path.join(fakeDir, e.name))) },
-                { headers: corsHeaders(req) },
-              );
+              fakeRefs = refsFromPaths(entries.map((e) => path.join(fakeDir, e.name)));
             } catch {
               return json({ refs: [] }, { headers: corsHeaders(req) }); // gone / unreadable — cancelled pick
             }
+            // The seam stands in for the panel, so it writes the same preview
+            // twins the native branch does.
+            await writePreviewTwinsForRefs(dataDir, fakeRefs);
+            return json({ refs: fakeRefs }, { headers: corsHeaders(req) });
           }
           if (!native) return notAvailableHeadless(req);
           const paths = await openFileDialogLabelled(native, {
@@ -7596,7 +7600,15 @@ export function startApiServer(
           // Electrobun splits the panel's answer on ",", so a path with a
           // comma arrives in pieces — put them back together; nothing at all
           // means the user cancelled.
-          return json({ refs: refsFromPaths(pickedPaths(paths)) }, { headers: corsHeaders(req) });
+          const picked = refsFromPaths(pickedPaths(paths));
+          // The panel just ran in this process, so the user's pick carries the
+          // intent grant for exactly these files: copy each image into the
+          // preview-twin cache NOW, while this process may read it, so its
+          // thumbnail survives macOS's privacy block on the folder later
+          // (preview-twins.ts; docs/architecture/security.md, "Preview twins").
+          // Folder mode has no files to twin.
+          if (mode === "files") await writePreviewTwinsForRefs(dataDir, picked);
+          return json({ refs: picked }, { headers: corsHeaders(req) });
         }),
       },
 
@@ -7606,9 +7618,18 @@ export function startApiServer(
       // than trusting the webview's view of directory-ness.
       "/refs/resolve": {
         POST: authed(async (req) => {
-          const body = (await req.json().catch(() => ({}))) as { paths?: unknown };
+          const body = (await req.json().catch(() => ({}))) as { paths?: unknown; previewTwins?: unknown };
           const raw = Array.isArray(body.paths) ? body.paths : [];
-          return json({ refs: await refsFromPathsForCaller(raw, callerOf(req)) }, { headers: corsHeaders(req) });
+          const caller = callerOf(req);
+          const refs = await refsFromPathsForCaller(raw, caller);
+          // `previewTwins: true` marks the user's own drop or paste
+          // (`api.resolveCapturedRefs`, sent by `capture-refs` only). The other
+          // callers of this route (`SentFilesCard`, handoff artifact chips, `@`
+          // scope) stat paths an AGENT chose, with the app token and no user
+          // action, so they never send it, and the core never reads those in
+          // its own process. The CLI token never gets a twin either way.
+          if (caller === "app" && body.previewTwins === true) await writePreviewTwinsForRefs(dataDir, refs);
+          return json({ refs }, { headers: corsHeaders(req) });
         }),
       },
 
@@ -7618,8 +7639,28 @@ export function startApiServer(
       // drag pasteboard directly instead — it always reflects the drag that
       // just ended, since a drop event fires the instant that drag ends.
       "/refs/drag": {
-        POST: authed((req) => {
-          return json({ refs: refsFromPaths(readDragPasteboardPaths()) }, { headers: corsHeaders(req) });
+        POST: authed(async (req) => {
+          const body = (await req.json().catch(() => ({}))) as { names?: unknown };
+          // Basenames of the `File`s the drop actually carried. The drag
+          // pasteboard is shared state an agent could rewrite mid-drag, so a
+          // preview twin is written only for a pasteboard path one of these
+          // names vouches for.
+          const names = new Set(
+            Array.isArray(body.names)
+              ? body.names.filter((n): n is string => typeof n === "string").slice(0, 256)
+              : [],
+          );
+          const refs = refsFromPaths(readDragPasteboardPaths());
+          // Images `POST /screenshots` can take are uploaded by the webview
+          // (their bytes are copied to a file Agetor owns), so only the other
+          // image types (heic, svg, bmp, ico, avif), which attach by their
+          // original path, need a twin.
+          await writePreviewTwinsForRefs(
+            dataDir,
+            refs,
+            (ref) => !isScreenshotUploadablePath(ref.path) && names.has(path.basename(ref.path)),
+          );
+          return json({ refs }, { headers: corsHeaders(req) });
         }),
       },
 
@@ -7806,11 +7847,29 @@ export function startApiServer(
           // in the core's own process under Agetor's TCC identity (D26(j)).
           // Only regular files (a FIFO named `*.png` would hang the stream).
           // `maxBytes` bounds the memory `settleFileBytes` holds below.
-          const opened = await openFileBytes(raw, {
+          let opened = await openFileBytes(raw, {
             followSymlinks: true,
             ifNoneMatch: req.headers.get("if-none-match"),
             maxBytes: MAX_FILE_PREVIEW_BYTES,
           });
+          // Only when the original is DENIED (on macOS, a TCC-protected
+          // folder the disclaimed reader may not enter) fall back to the
+          // preview twin written when the user picked, dropped or pasted this
+          // path (preview-twins.ts). A readable original always wins, and a
+          // missing, too-large or errored one never falls back. The twin read
+          // is the same disclaimed reader and never follows a symlink, so a
+          // twin an agent planted can only show a regular, non-protected file.
+          if (opened.kind === "denied") {
+            const twin = previewTwinPath(dataDir, raw);
+            if (twin !== null) {
+              const viaTwin = await openFileBytes(twin, {
+                followSymlinks: false,
+                ifNoneMatch: req.headers.get("if-none-match"),
+                maxBytes: MAX_FILE_PREVIEW_BYTES,
+              });
+              if (viaTwin.kind === "ok" || viaTwin.kind === "not-modified") opened = viaTwin;
+            }
+          }
           if (opened.kind === "missing") {
             return json({ error: `not found: ${raw}` }, { status: 404, headers: corsHeaders(req) });
           }
