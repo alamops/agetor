@@ -130,23 +130,22 @@ function parseCodexModelList(result: unknown): DiscoveredModel[] {
     if (typeof e.defaultReasoningEffort === "string" && e.defaultReasoningEffort.length > 0) {
       model.defaultEffort = e.defaultReasoningEffort;
     }
-    // Speed: a `fast` additional tier or any service tier means the model has
-    // a faster lane. The tier to request is the first service tier's id
-    // (`priority`), described by its own text; a non-null `defaultServiceTier`
-    // means the model already runs on one by default.
+    // Speed: the Fast lane is requested by the id of the model's first
+    // service tier (`priority`), described by its own text, so a model is
+    // offered Fast only when it names one — a `fast` additional-speed entry
+    // alone (no tier id) would offer a Speed control that passes nothing at
+    // spawn. A non-null `defaultServiceTier` means the model already runs on
+    // a fast tier by default.
     const tiers = Array.isArray(e.serviceTiers)
       ? e.serviceTiers.filter((t): t is Record<string, unknown> => !!t && typeof t === "object")
       : [];
-    const fastTiers = Array.isArray(e.additionalSpeedTiers) && e.additionalSpeedTiers.includes("fast");
-    if (fastTiers || tiers.length > 0) {
+    const tier = tiers.find((t) => typeof t.id === "string" && t.id.length > 0);
+    if (tier && typeof tier.id === "string") {
       model.fast = true;
-      const tier = tiers.find((t) => typeof t.id === "string" && t.id.length > 0);
-      if (tier && typeof tier.id === "string") {
-        model.fastTier = tier.id;
-        if (typeof tier.description === "string") {
-          const hint = sanitizeCliDescription(tier.description);
-          if (hint) model.fastHint = hint;
-        }
+      model.fastTier = tier.id;
+      if (typeof tier.description === "string") {
+        const hint = sanitizeCliDescription(tier.description);
+        if (hint) model.fastHint = hint;
       }
     }
     if (typeof e.defaultServiceTier === "string" && e.defaultServiceTier.length > 0) model.defaultFast = true;
@@ -478,7 +477,8 @@ async function discoverCodex(env?: Record<string, string>, bin?: string): Promis
  * Where and how a kind-level probe runs: the harness's own env and binary, an
  * empty working directory for probes that start a session-like context
  * (claude, copilot ACP), and `skip` for "do not probe at all" (a logged-out
- * account). Built by `model-discovery.ts` from the built-in harness row —
+ * claude account; a copilot catalog a sweep has no reason to re-open a session
+ * for). Built by `model-discovery.ts` from the built-in harness row —
  * this module never reads the database.
  */
 export interface KindProbeTarget {
@@ -1341,6 +1341,15 @@ export function getDiscoveredModels(agent: AgentKind): DiscoveredModel[] {
 }
 
 /**
+ * The CLI catalog a harness's pre-flight and failover judge a model by: a
+ * codex harness's own account-scoped list (never another account's, so one
+ * with no list yet judges nothing), the kind-level list for every other kind.
+ */
+export function getPreflightCatalog(harness: { id: string; kind: AgentKind }): DiscoveredModel[] {
+  return harness.kind === "codex" ? getHarnessDiscoveredModels(harness.id) : getDiscoveredModels(harness.kind);
+}
+
+/**
  * Discovered models for one harness, keyed by harness id rather than kind.
  * `[]` for a harness that hasn't been probed yet — this includes every
  * non-fx/non-codex harness, since this cache only ever gets entries for the
@@ -1466,14 +1475,21 @@ const COPILOT_PROBE_TIMEOUT_MS = 4_000;
  * static per CLI version — it tracks the binary, NOT the account's
  * entitlements or org policy — so it is a kind-level catalog and copilot is
  * deliberately not in `CATALOG_SCOPED_KINDS`: discovered ids are appended
- * after the curated rows and the curated rows are never hidden.
+ * after the curated rows. (It is in `CLI_AUTHORITATIVE_CATALOG_KINDS`, so a
+ * trusted catalog hides the curated rows it lacks: `withoutRefusedCuratedRows`.)
  * `COPILOT_OFFLINE=true` keeps the probe from reaching for the network.
  * The refresh paths call it with no arguments — a per-harness env could not
  * change a list that depends only on the binary — so `env` (merged under
  * `COPILOT_OFFLINE`) and `bin` are test seams.
  * Never throws; an unresolvable binary, non-zero exit or empty output is `[]`.
  */
-async function discoverCopilot(env?: Record<string, string>, bin?: string, cwd?: string): Promise<DiscoveredModel[]> {
+async function discoverCopilot(
+  env?: Record<string, string>,
+  bin?: string,
+  cwd?: string,
+  skip?: boolean,
+): Promise<DiscoveredModel[]> {
+  if (skip) return [];
   try {
     const resolved = bin ?? defaultCopilotBin();
     const resolvable = isAbsolute(resolved)
@@ -1549,7 +1565,7 @@ async function runRefresh(opts?: { fxHarnesses?: FxHarnessTargetsOption; kindTar
       discoverFx(),
       discoverAntigravity(),
       discoverOpencode(),
-      discoverCopilot(kindTargets.copilot?.env, kindTargets.copilot?.bin, kindTargets.copilot?.cwd),
+      discoverCopilot(kindTargets.copilot?.env, kindTargets.copilot?.bin, kindTargets.copilot?.cwd, kindTargets.copilot?.skip),
     ]);
     // Index-aligned with the discoverer list above — append to both together.
     const kinds: AgentKind[] = ["codex", "claude-code", "cursor", "gemini", "fx", "antigravity", "opencode", "copilot"];
@@ -1707,7 +1723,7 @@ async function runRefreshKind(kind: AgentKind, target?: KindProbeTarget): Promis
         models = await discoverOpencode();
         break;
       case "copilot":
-        models = await discoverCopilot(target?.env, target?.bin, target?.cwd);
+        models = await discoverCopilot(target?.env, target?.bin, target?.cwd, target?.skip);
         break;
     }
   } catch {

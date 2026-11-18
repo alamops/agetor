@@ -41,6 +41,8 @@ import {
 export const CLI_AUTHORITATIVE_CATALOG_KINDS: ReadonlySet<AgentKind> = new Set<AgentKind>(["codex", "copilot"]);
 
 const CURSOR_VARIANT_HINT = "Saved as a specific variant — pick the base model to change its effort";
+/** The hint on a stored model id the installed CLI's own list no longer carries. */
+const NOT_IN_CLI_LIST_HINT = "Not in this CLI's model list — pick another model, or update the CLI if it is newer";
 
 /** A discovered catalog is trusted unless the harness is known logged out. */
 function trusted(discovered: readonly DiscoveredModel[], loggedIn: boolean | null | undefined): boolean {
@@ -54,6 +56,37 @@ function withoutSpecCoveredVariants(discovered: readonly DiscoveredModel[]): Dis
     const key = cursorSpecKeyFor(m.id);
     return key === null || key === m.id;
   });
+}
+
+/**
+ * For a kind whose CLI catalog is authoritative (codex, copilot) and a trusted,
+ * non-empty catalog, drop every row the catalog lacks: the merge appends the
+ * curated rows the CLI did not list (rule 4), but pre-flight and failover
+ * refuse exactly those models (`modelCatalogVerdict`), so offering them would
+ * list rows guaranteed to fail. A pinned row stays, and so does the `selected`
+ * id (a stored task's model), as an unlisted row with an honest hint. Every
+ * other kind and every untrusted catalog passes through unchanged.
+ * Invariant (pinned by a test): no non-unlisted row of such a kind has verdict
+ * `missing`.
+ */
+function withoutRefusedCuratedRows(
+  kind: AgentKind,
+  rows: ModelOption[],
+  discovered: readonly DiscoveredModel[],
+  loggedIn: boolean | null | undefined,
+  selected: string | null,
+): ModelOption[] {
+  if (!CLI_AUTHORITATIVE_CATALOG_KINDS.has(kind) || !trusted(discovered, loggedIn)) return rows;
+  const pinned = new Set(AGENT_OPTIONS[kind].models.filter((m) => m.pinned).map((m) => m.id));
+  const out: ModelOption[] = [];
+  for (const row of rows) {
+    if (row.unlisted || pinned.has(row.id) || modelCatalogVerdict(kind, row.id, discovered, loggedIn) !== "missing") {
+      out.push(row);
+    } else if (row.id === selected) {
+      out.push({ id: row.id, label: row.label, hint: NOT_IN_CLI_LIST_HINT, unlisted: true });
+    }
+  }
+  return out;
 }
 
 /**
@@ -73,13 +106,14 @@ export function buildModelOptions(
   },
 ): ModelOption[] {
   const discovered = kind === "cursor" ? withoutSpecCoveredVariants(input.discovered) : input.discovered;
-  const rows = mergeModelOptions({
+  const merged = mergeModelOptions({
     curated: AGENT_OPTIONS[kind].models,
     discovered,
     scoped: CATALOG_SCOPED_KINDS.has(kind),
     selected: input.selected ?? null,
     ...(input.loggedIn !== undefined ? { loggedIn: input.loggedIn } : {}),
   });
+  const rows = withoutRefusedCuratedRows(kind, merged, discovered, input.loggedIn, input.selected ?? null);
   if (kind !== "cursor" || !input.selected) return rows;
   const idx = rows.findIndex((r) => r.id === input.selected && r.unlisted);
   if (idx < 0) return rows;
@@ -213,8 +247,41 @@ export function resolveSeedModel(
   rows: readonly ModelOption[],
 ): string | null {
   if (!stored) return null;
-  if (AGENT_OPTIONS[kind].models.some((m) => m.id === stored)) return stored;
+  // For a CLI-authoritative kind the loaded rows alone decide: a curated row
+  // the CLI's catalog lacks is dropped from them, and must not seed.
+  if (!CLI_AUTHORITATIVE_CATALOG_KINDS.has(kind) && AGENT_OPTIONS[kind].models.some((m) => m.id === stored)) return stored;
   return rows.some((r) => r.id === stored && !r.unlisted) ? stored : null;
+}
+
+/** What a form does with a remembered model it has not applied yet. */
+export type SeedModelStep =
+  /** Nothing decisive yet (no catalog, or a logged-out harness): keep waiting. */
+  | { action: "wait" }
+  /** Start on `model`. `confirmed` is false while only the frozen curated rows
+   *  vouch for it (a CLI-authoritative kind before its trusted catalog lands):
+   *  the caller applies it now but keeps the seed until the catalog confirms. */
+  | { action: "apply"; model: string; confirmed: boolean }
+  /** A trusted catalog is loaded and lacks it (a retired or too-new id): start
+   *  on the default model instead of one that cannot run. */
+  | { action: "default" };
+
+/**
+ * Decide what to do with a remembered `lastModel:<kind>` as the catalog
+ * loads. For a CLI-authoritative kind (codex, copilot) a curated row proves
+ * nothing until a trusted catalog lists the model, so the seed is applied
+ * early but stays `confirmed: false`, and is re-judged when the catalog lands.
+ */
+export function seedModelStep(
+  kind: AgentKind,
+  stored: string,
+  rows: readonly ModelOption[],
+  discovered: readonly DiscoveredModel[],
+  loggedIn: boolean | null | undefined,
+): SeedModelStep {
+  const catalogTrusted = trusted(discovered, loggedIn);
+  const ok = resolveSeedModel(kind, stored, rows);
+  if (ok) return { action: "apply", model: ok, confirmed: !CLI_AUTHORITATIVE_CATALOG_KINDS.has(kind) || catalogTrusted };
+  return catalogTrusted ? { action: "default" } : { action: "wait" };
 }
 
 /** Every model id a bundle, import or pre-check should treat as real for the

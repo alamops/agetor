@@ -657,10 +657,12 @@ function baseInput(
 }
 
 /** Seed for the interactive model picker: the stored `lastModel:<kind>` pref
- *  when it is still offerable — a curated row for the kind, or an id the
- *  harness's discovered catalog actually lists (a model only the CLI knows,
- *  an fx account's discovered-only id) — else the default (the owner's pick,
- *  or the CLI's own default model when a trusted catalog lacks it). Mirrors
+ *  when it is still offerable — a curated row for the kind (for codex and
+ *  copilot only while no trusted catalog is loaded, since one that lacks the
+ *  model drops its row), or an id the harness's discovered catalog actually
+ *  lists (a model only the CLI knows, an fx account's discovered-only id) —
+ *  else the default (the owner's pick, or the CLI's own default model when a
+ *  trusted catalog lacks it). Mirrors
  *  the webview pickers' validation (`resolveSeedModel`) so a retired id (e.g.
  *  gemini-3-pro-preview, shut down 2026-03-09 and cleared by migration 049)
  *  can't be re-offered as the pre-selected default via mergeModelOptions'

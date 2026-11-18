@@ -206,12 +206,12 @@ describe("formatModelNotOfferedError", () => {
         modelLabel: "GPT-9",
         installHint: "npm i -g @openai/codex",
       }),
-    ).toBe("GPT-9 isn't in Codex's model list (0.166.0). Upgrade the CLI (npm i -g @openai/codex) or pick a model it offers.");
+    ).toBe("GPT-9 isn't in Codex's model list (0.166.0). Pick a model it offers, or update the CLI (npm i -g @openai/codex) if this one is newer.");
   });
 
   test("works without a version or an install hint", () => {
     expect(
       formatModelNotOfferedError({ harnessLabel: "Copilot", installedRaw: null, modelLabel: "Kimi K9", installHint: null }),
-    ).toBe("Kimi K9 isn't in Copilot's model list. Upgrade the CLI or pick a model it offers.");
+    ).toBe("Kimi K9 isn't in Copilot's model list. Pick a model it offers, or update the CLI if this one is newer.");
   });
 });

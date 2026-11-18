@@ -27,8 +27,9 @@ import {
 } from "../shared/types.ts";
 import { pickNextMember, type NextMemberPlan } from "../shared/harness-stack.ts";
 import { HARNESS_QUOTA_STALE_MS, harnessQuotaLooksExhausted, harnessQuotaResetAt } from "../shared/harness-limits.ts";
-import { getDiscoveredModels, getHarnessDiscoveredModels } from "./agent-discovery.ts";
-import { modelCatalogVerdict } from "../shared/model-catalog.ts";
+import { getHarnessDiscoveredModels } from "./agent-discovery.ts";
+import { preflightCatalogFor } from "./model-discovery.ts";
+import { CLI_AUTHORITATIVE_CATALOG_KINDS, modelCatalogVerdict } from "../shared/model-catalog.ts";
 import { peekCachedCliVersion } from "./agent-status.ts";
 import { cliVersionSatisfies } from "../shared/cli-version.ts";
 import { harnesses, harnessUsage, runs, tasks, type SessionIdColumn } from "./db.ts";
@@ -247,9 +248,15 @@ export function memberUnusableReason(member: { harnessId: string; enabled: boole
   // exactly like `startTask` does, so a backup that cannot serve the default
   // model is skipped too.
   const model = task.model ?? DEFAULT_MODEL[harness.kind] ?? null;
-  const catalog = getHarnessDiscoveredModels(harness.id);
-  if (catalog.length > 0 && model && !catalog.some((m) => m.id === model)) {
-    return `model ${model} not offered`;
+  // The raw per-harness list judges only the kinds without a CLI-authoritative
+  // catalog (fx, opencode, …); codex and copilot go through the version-guarded
+  // verdict below, so a list stored before a CLI upgrade never refuses a model
+  // the upgraded CLI (and the member's own pre-flight) accepts.
+  if (!CLI_AUTHORITATIVE_CATALOG_KINDS.has(harness.kind)) {
+    const catalog = getHarnessDiscoveredModels(harness.id);
+    if (catalog.length > 0 && model && !catalog.some((m) => m.id === model)) {
+      return `model ${model} not offered`;
+    }
   }
   // Discovery first for the kinds whose CLI catalog is authoritative (codex,
   // copilot): a model the CLI lists is usable whatever the frozen version
@@ -257,8 +264,16 @@ export function memberUnusableReason(member: { harnessId: string; enabled: boole
   // (nothing to judge by) falls through to the table below.
   let verdict: "offered" | "missing" | "unknown" = "unknown";
   if (model) {
-    const kindCatalog = catalog.length > 0 ? catalog : getDiscoveredModels(harness.kind);
-    verdict = modelCatalogVerdict(harness.kind, model, kindCatalog, loginEvidence(harness));
+    // Judged by the same catalog and the same version guard the member's own
+    // pre-flight uses (`preflightCatalogFor`), so a backup is never skipped for
+    // a model its own launch would accept (a codex account judged by another
+    // account's list, or by a list from before a CLI upgrade).
+    verdict = modelCatalogVerdict(
+      harness.kind,
+      model,
+      preflightCatalogFor(harness, peekCachedCliVersion(harness)),
+      loginEvidence(harness),
+    );
     if (verdict === "missing") return `model ${model} not offered`;
   }
   const floor = verdict === "unknown" ? MODEL_MIN_CLI_VERSION[harness.kind]?.[model ?? ""] : undefined;

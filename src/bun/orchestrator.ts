@@ -38,7 +38,8 @@ import {
   type SpawnedAgent,
 } from "./agents.ts";
 import { cachedCliVersion, checkHarness, peekCachedCliVersion, upgradeHintFor } from "./agent-status.ts";
-import { getDiscoveredEfforts, getDiscoveredModels, getHarnessDiscoveredModels, type DiscoveredModel } from "./agent-discovery.ts";
+import { getDiscoveredEfforts, getDiscoveredModels, getHarnessDiscoveredModels, getPreflightCatalog } from "./agent-discovery.ts";
+import { preflightCatalogFor } from "./model-discovery.ts";
 import { OPENCODE_DEFAULT_MODEL, formatOpencodeTurnBreadcrumb, opencodeMajor, type OpencodeTransport } from "../shared/opencode.ts";
 import { importedSessionOf } from "../shared/imported-session.ts";
 import { resolveClaudePlan, upsertClaudePlanFromExitPlanMode, upsertDetectedPlan } from "./task-plans.ts";
@@ -8896,11 +8897,6 @@ async function sendCodexTurn(
 /** Env escape hatch for `minCliVersionError` — see its doc. */
 const SKIP_CLI_VERSION_FLOOR_ENV = "AGETOR_SKIP_CLI_VERSION_FLOOR";
 
-/** The CLI catalog a harness's pre-flight judges a model by: a codex harness's
- *  own account-scoped list (never another account's), copilot's kind-level one. */
-function catalogForPreflight(harness: Harness): DiscoveredModel[] {
-  return harness.kind === "codex" ? getHarnessDiscoveredModels(harness.id) : getDiscoveredModels(harness.kind);
-}
 
 /**
  * Pre-flight 1b — per-model minimum CLI version (`MODEL_MIN_CLI_VERSION` in
@@ -8959,13 +8955,16 @@ export async function minCliVersionError(
     // Discovery first (dynamic-model-catalog #14): for the kinds whose CLI
     // catalog is authoritative (codex, copilot), a model the installed CLI
     // lists is allowed whatever the frozen table says, and one a non-empty,
-    // trusted catalog lacks is refused with an "upgrade the CLI" message. Only
+    // trusted catalog lacks is refused with a "pick another model or update the
+    // CLI" message (`formatModelNotOfferedError`). Only
     // when discovery has nothing to say does the version table below decide.
     let probedForCatalog: HarnessStatus | undefined = status;
     if (CLI_AUTHORITATIVE_CATALOG_KINDS.has(harness.kind)) {
-      const catalog = catalogForPreflight(harness);
-      if (catalog.length > 0) {
+      if (getPreflightCatalog(harness).length > 0) {
         probedForCatalog = status ?? await checkHarness(harness);
+        // Judged only when the catalog was probed under the CLI version that is
+        // installed now; after an upgrade it says nothing until the refresh lands.
+        const catalog = preflightCatalogFor(harness, probedForCatalog.version ?? null);
         const verdict = modelCatalogVerdict(harness.kind, modelId, catalog, probedForCatalog.loggedIn);
         if (verdict === "offered") return null;
         if (verdict === "missing") {
@@ -12764,7 +12763,7 @@ export async function createTask(
   const kind = harness.kind;
   const model = defaultsProfile
     ? defaultsProfile.model
-    : (input.model ?? resolveDefaultModel(kind, catalogForPreflight(harness), null));
+    : (input.model ?? resolveDefaultModel(kind, getPreflightCatalog(harness), null));
   // Discovered efforts (e.g. Codex's own app-server catalog) win when the
   // harness reported a non-empty list for this model; the curated
   // MODEL_EFFORT_SUPPORT table is only the fallback (see

@@ -10,10 +10,11 @@ import {
 import { api, type AgentModelMap } from "@/lib/api";
 import {
   buildModelOptions,
+  CLI_AUTHORITATIVE_CATALOG_KINDS,
   effortOptionsFor,
   resolveDefaultEffort,
   resolveDefaultModel,
-  resolveSeedModel,
+  seedModelStep,
   speedNoticeFor,
   speedOptionsFor,
   speedTiersKnown,
@@ -332,8 +333,13 @@ export function NewTaskForm({ onSubmit, agents, harnesses, stacks = [], profiles
   // A remembered `lastModel:<kind>` the curated list does not carry (a model
   // only the CLI's catalog lists), held until discovery shows it is real, and
   // the kinds whose model the user has already chosen by hand this session.
-  const pendingSeed = useRef<Partial<Record<AgentKind, { model: string; effort: string | null }>>>({});
+  const pendingSeed = useRef<Partial<Record<AgentKind, { model: string; effort: string | null; applied?: boolean }>>>({});
   const modelTouched = useRef<Partial<Record<AgentKind, boolean>>>({});
+  // True once the remembered picks above have been read (or failed to read):
+  // the seed effect below re-runs on it, because the catalog rows can land
+  // BEFORE the preferences do, and a remembered model only the catalog knows
+  // would then never be applied.
+  const [prefsLoaded, setPrefsLoaded] = useState(false);
   const agentCache = useRef<Record<AgentKind, { mode: string; model: string; effort: string | null; speed: Speed; maxMode: boolean }>>({
     "claude-code": { mode: initialMode("claude-code"), model: DEFAULT_MODEL["claude-code"], effort: DEFAULT_EFFORT["claude-code"], speed: "off", maxMode: false },
     "codex": { mode: initialMode("codex"), model: DEFAULT_MODEL["codex"], effort: DEFAULT_EFFORT["codex"], speed: "off", maxMode: false },
@@ -370,7 +376,7 @@ export function NewTaskForm({ onSubmit, agents, harnesses, stacks = [], profiles
         if (md && AGENT_OPTIONS[a].modes.some((x) => x.id === md)) {
           agentCache.current[a].mode = md;
         }
-        if (m && AGENT_OPTIONS[a].models.some((x) => x.id === m)) {
+        if (m && !CLI_AUTHORITATIVE_CATALOG_KINDS.has(a) && AGENT_OPTIONS[a].models.some((x) => x.id === m)) {
           agentCache.current[a].model = m;
         } else if (m) {
           // A remembered model the curated list does not carry (one the
@@ -417,7 +423,11 @@ export function NewTaskForm({ onSubmit, agents, harnesses, stacks = [], profiles
       setEffort(active.effort);
       setSpeed(active.speed);
       setMaxMode(active.maxMode);
-    }).catch(() => { /* preferences failure is non-fatal — defaults stay */ });
+      setPrefsLoaded(true);
+    }).catch(() => {
+      /* preferences failure is non-fatal — defaults stay */
+      if (!cancelled) setPrefsLoaded(true);
+    });
     return () => { cancelled = true; };
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, []);
@@ -444,7 +454,6 @@ export function NewTaskForm({ onSubmit, agents, harnesses, stacks = [], profiles
   // backup the core moves to: the launch pickers say so instead of showing a
   // red "not installed" box next to an enabled Create button.
   const stackFallback = stackBackupCanServe(agent, stacks, harnesses, agents);
-  const { models: staticModels } = AGENT_OPTIONS[kind];
   // `auto` is only valid on models that support real `--permission-mode auto`
   // (all current claude models); other models would error at spawn. supportedModes
   // filters the dropdown so the user can't pick an incompatible combo.
@@ -503,25 +512,35 @@ export function NewTaskForm({ onSubmit, agents, harnesses, stacks = [], profiles
   // default) once the loaded rows show it is real — unless the user has
   // already chosen one. Never fights a later manual pick.
   useEffect(() => {
-    if (modelTouched.current[kind]) return;
+    if (!prefsLoaded || modelTouched.current[kind]) return;
     const pending = pendingSeed.current[kind];
-    if (pending) {
-      const ok = resolveSeedModel(kind, pending.model, models);
-      if (!ok) return;
-      delete pendingSeed.current[kind];
-      agentCache.current[kind].model = ok;
-      setModel(ok);
-      const offered = effortOptionsFor(kind, ok, models);
-      if (pending.effort && offered.some((o) => o.id === pending.effort)) setEffort(pending.effort);
+    const step = pending
+      ? seedModelStep(kind, pending.model, models, discoveredForAgent, selectedStatus?.loggedIn ?? null)
+      : null;
+    // Not carried yet: wait while discovery has nothing trustworthy for this harness.
+    if (step?.action === "wait") return;
+    if (pending && step?.action === "apply") {
+      if (!pending.applied) {
+        pending.applied = true;
+        agentCache.current[kind].model = step.model;
+        setModel(step.model);
+        const offered = effortOptionsFor(kind, step.model, models);
+        if (pending.effort && offered.some((o) => o.id === pending.effort)) setEffort(pending.effort);
+      }
+      // A codex/copilot model only the frozen curated rows vouch for stays
+      // pending: a trusted catalog that then lacks it sends the form back to the
+      // default below, instead of leaving it on a model the CLI refuses.
+      if (step.confirmed) delete pendingSeed.current[kind];
       return;
     }
-    // No remembered pick: start on the owner's default model, or the CLI's own
-    // when its trusted catalog lacks that one.
-    if (model !== DEFAULT_MODEL[kind]) return;
+    // No remembered pick (or a trusted catalog lacking it): start on the owner's
+    // default model, or the CLI's own when its trusted catalog lacks that one.
+    if (step?.action !== "default" && model !== DEFAULT_MODEL[kind]) return;
     const preferred = resolveDefaultModel(kind, discoveredForAgent, selectedStatus?.loggedIn ?? null);
+    agentCache.current[kind].model = preferred;
     if (preferred !== model) setModel(preferred);
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [kind, modelsKey]);
+  }, [kind, modelsKey, prefsLoaded]);
   useEffect(() => {
     if (efforts.length === 0) {
       if (effort !== null) setEffort(null);

@@ -1502,6 +1502,13 @@ test("parseCodexModelList: a model with no tiers has no fast fields; labels are 
   expect(rows).toEqual([{ id: "m", label: "M One" }]);
 });
 
+test("parseCodexModelList: a `fast` additional tier with no service-tier id offers no Fast (nothing to pass at spawn)", () => {
+  const rows = __testing.parseCodexModelList({
+    data: [{ id: "m", additionalSpeedTiers: ["fast"], serviceTiers: [{ description: "no id" }], defaultServiceTier: null }],
+  });
+  expect(rows).toEqual([{ id: "m" }]);
+});
+
 test("parseCursorModels: the fixture is grouped into base rows, not 280 flat ids", () => {
   const rows = __testing.parseCursorModels(fixtureText("cursor-models-2026.10.22.txt"));
   expect(rows.length).toBeLessThan(100);

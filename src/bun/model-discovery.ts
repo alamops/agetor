@@ -2,7 +2,7 @@ import { mkdirSync } from "node:fs";
 import path from "node:path";
 import { dataDir, harnesses, preferences } from "./db.ts";
 import { harnessEnv, resolveBin } from "./agents.ts";
-import { checkHarness, peekCachedCliVersion } from "./agent-status.ts";
+import { cachedCliVersion, checkHarness, peekCachedCliVersion } from "./agent-status.ts";
 import { copilotHome } from "./copilot-home.ts";
 import {
   refreshDiscoveredModels,
@@ -11,6 +11,7 @@ import {
   pruneHarnessDiscovery,
   getDiscoveredModels,
   getHarnessDiscoveredModels,
+  getPreflightCatalog,
   isDiscoveryReady,
   seedDiscoveryCache,
   setDiscoverySettleHook,
@@ -315,6 +316,23 @@ function dropPersisted(prefKey: string): void {
 }
 
 /**
+ * The CLI catalog a pre-flight or failover judges `harness`'s model by, or
+ * `[]` ("nothing to judge by") when that catalog was probed under a different
+ * CLI version than `probedVersion`: a model the old catalog lacks may be one
+ * the upgraded CLI now runs, and the refresh that follows the upgrade has not
+ * landed yet. A catalog or a probe with no version is trusted as it is.
+ */
+export function preflightCatalogFor(harness: Harness, probedVersion: string | null): DiscoveredModel[] {
+  const catalog = getPreflightCatalog(harness);
+  if (catalog.length === 0 || !probedVersion) return catalog;
+  const prefKey = storageKey(harness.kind === "codex"
+    ? { scope: "harness", kind: harness.kind, harnessId: harness.id }
+    : { scope: "kind", kind: harness.kind });
+  const stored = prefKey ? persisted.get(prefKey)?.cliVersion : null;
+  return stored && stored !== probedVersion ? [] : catalog;
+}
+
+/**
  * The settle hook (`agent-discovery.ts`): decides what lands in the cache for
  * a fresh probe and persists it. A non-empty probe replaces the catalog. An
  * empty one keeps the previous catalog (a transient failure, an offline
@@ -403,7 +421,7 @@ function probeCwd(): string | undefined {
  * Resolved inside the enqueued sweep so it reflects the harness rows at run
  * time.
  */
-async function kindTargets(): Promise<Partial<Record<AgentKind, KindProbeTarget>>> {
+async function kindTargets(opts: { sweep?: boolean } = {}): Promise<Partial<Record<AgentKind, KindProbeTarget>>> {
   const out: Partial<Record<AgentKind, KindProbeTarget>> = {};
   const cwd = probeCwd();
   const claude = harnesses.get("claude-code");
@@ -419,10 +437,32 @@ async function kindTargets(): Promise<Partial<Record<AgentKind, KindProbeTarget>
   }
   const copilot = harnesses.get("copilot");
   if (copilot && copilot.enabled !== false) {
+    // A boot or periodic sweep never re-opens an ACP session for a catalog
+    // it already holds: `session/new` can leave a record under the user's
+    // COPILOT_HOME, and the list only changes with the CLI build. The one
+    // exception is a catalog stored under no CLI version, or another one,
+    // while the installed version is known: it may predate an upgrade made
+    // while the app was closed (or a first `--version` too slow to stamp it),
+    // and no status transition would ever re-probe it. An unknown installed
+    // version is no evidence of a change, so the held catalog stays.
+    // Without the skip a sweep would also overwrite the ACP catalog with the
+    // thinner `help config` one.
+    let skip = false;
+    if (opts.sweep && getDiscoveredModels("copilot").length > 0) {
+      let installed: string | null = null;
+      try {
+        installed = await cachedCliVersion(copilot);
+      } catch {
+        installed = null;
+      }
+      const stored = persisted.get(`${MODEL_CATALOG_PREF_PREFIX}kind:copilot`)?.cliVersion ?? null;
+      skip = installed === null || installed === stored;
+    }
     out.copilot = {
       env: { ...harnessEnv(copilot), COPILOT_HOME: copilotHome({ harnessHome: copilot.home, harnessEnv: copilot.env }) },
       bin: resolveBin(copilot),
       ...(cwd ? { cwd } : {}),
+      ...(skip ? { skip: true } : {}),
     };
   }
   return out;
@@ -456,7 +496,7 @@ export async function refreshAllModels(): Promise<void> {
     // Synchronous, before the first await: the persisted catalog is served
     // from the moment the sweep starts, not after its probes finish.
     hydrateFromStore();
-    await refreshDiscoveredModels({ fxHarnesses: discoveryTargets, kindTargets });
+    await refreshDiscoveredModels({ fxHarnesses: discoveryTargets, kindTargets: () => kindTargets({ sweep: true }) });
     publishIfChanged();
   } catch (err) {
     console.error("[agetor] model discovery failed:", err);
@@ -521,6 +561,7 @@ export function noteHarnessRemoved(harnessId: string): void {
     dropPersisted(`${MODEL_CATALOG_PREF_PREFIX}harness:${harnessId}`);
     knownStatus.delete(harnessId);
     lastStatusKey.delete(harnessId);
+    lastKnownVersion.delete(harnessId);
     const timer = pendingDebounce.get(harnessId);
     if (timer) {
       clearTimeout(timer);
@@ -551,6 +592,12 @@ export function getHarnessModelMap(): { ready: boolean; byHarness: Record<string
 
 /** Last-seen transition key per harness id, `${available}|${path}|${version}|${loggedIn}`. */
 const lastStatusKey = new Map<string, string>();
+/** Last non-null CLI version seen per harness id. A `--version` probe that
+ *  times out under load reports `null` for a CLI that is still there; that
+ *  poll keeps this version, so the flap is no transition (each one would
+ *  otherwise re-run the kind-level probes: a `claude` start, a copilot ACP
+ *  `session/new`). */
+const lastKnownVersion = new Map<string, string>();
 /** Pending debounce timers per harness id — a second transition for the same
  *  harness inside the debounce window resets the timer rather than queuing
  *  a second refresh. */
@@ -616,8 +663,11 @@ export function noteHarnessStatuses(statuses: HarnessStatus[]): void {
     const seen = new Set<string>();
     for (const s of statuses) {
       seen.add(s.harnessId);
-      knownStatus.set(s.harnessId, { available: s.available, version: s.version ?? null, loggedIn: s.loggedIn });
-      const key = statusKey(s);
+      if (s.version) lastKnownVersion.set(s.harnessId, s.version);
+      else if (!s.available) lastKnownVersion.delete(s.harnessId);
+      const version = s.version ?? (s.available ? lastKnownVersion.get(s.harnessId) ?? null : null);
+      knownStatus.set(s.harnessId, { available: s.available, version, loggedIn: s.loggedIn });
+      const key = statusKey({ ...s, version });
       const prev = lastStatusKey.get(s.harnessId);
       lastStatusKey.set(s.harnessId, key);
       if (prev === undefined) {
@@ -633,6 +683,7 @@ export function noteHarnessStatuses(statuses: HarnessStatus[]): void {
     for (const harnessId of [...lastStatusKey.keys()]) {
       if (seen.has(harnessId)) continue;
       lastStatusKey.delete(harnessId);
+      lastKnownVersion.delete(harnessId);
       const timer = pendingDebounce.get(harnessId);
       if (timer) {
         clearTimeout(timer);
@@ -680,6 +731,7 @@ function resetForTests(): void {
   setDiscoverySettleHook(null);
   previousSnapshot = null;
   lastStatusKey.clear();
+  lastKnownVersion.clear();
   for (const timer of pendingDebounce.values()) clearTimeout(timer);
   pendingDebounce.clear();
   stopPeriodicDiscovery();

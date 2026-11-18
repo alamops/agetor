@@ -17,7 +17,7 @@ export function sanitizeCliLabel(s: string): string {
   if (typeof s !== "string") return "";
   return s
     // eslint-disable-next-line no-control-regex
-    .replace(/[​-‍⁠﻿\u0000-\u0008\u000B\u000C\u000E-\u001F\u007F-\u009F]/g, "")
+    .replace(/[\u200b-\u200d\u2060\ufeff\u0000-\u0008\u000B\u000C\u000E-\u001F\u007F-\u009F]/g, "")
     .replace(/\s+/g, " ")
     .trim()
     .slice(0, 80);

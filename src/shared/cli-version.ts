@@ -147,8 +147,10 @@ export interface ModelNotOfferedErrorInput {
 /**
  * The user-facing error for a model that the CLI's own (non-empty, trusted)
  * catalog does not list: "<model> isn't in <harness>'s model list (<cli>
- * <version>). Upgrade the CLI (<hint>) or pick a model it offers." The
- * discovery-first sibling of `formatMinCliVersionError`.
+ * <version>). Pick a model it offers, or update the CLI (<hint>) if this one
+ * is newer." The model may be too new for the installed CLI or retired by it,
+ * so the message names both ways out. The discovery-first sibling of
+ * `formatMinCliVersionError`.
  */
 export function formatModelNotOfferedError(input: ModelNotOfferedErrorInput): string {
   const parsed = parseCliVersion(input.installedRaw);
@@ -156,6 +158,6 @@ export function formatModelNotOfferedError(input: ModelNotOfferedErrorInput): st
     ? `${parsed.major}.${parsed.minor}.${parsed.patch}` + (parsed.prerelease !== undefined ? `-${parsed.prerelease}` : "")
     : input.installedRaw;
   const where = version ? ` (${version})` : "";
-  const upgrade = input.installHint ? `Upgrade the CLI (${input.installHint})` : "Upgrade the CLI";
-  return `${input.modelLabel} isn't in ${input.harnessLabel}'s model list${where}. ${upgrade} or pick a model it offers.`;
+  const update = input.installHint ? `update the CLI (${input.installHint})` : "update the CLI";
+  return `${input.modelLabel} isn't in ${input.harnessLabel}'s model list${where}. Pick a model it offers, or ${update} if this one is newer.`;
 }

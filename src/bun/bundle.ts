@@ -350,12 +350,15 @@ function probeHarness(h: Harness): Promise<HarnessProbe> {
   return probe;
 }
 
-/** Model ids known for a harness (K14): its discovered catalog plus the
- *  curated rows; `catalogOnly` rows count only while discovery is empty.
- *  A logged-out harness (`loggedIn === false`) distrusts its catalog, as
- *  `mergeModelOptions`' rule 7 does for the pickers — an expired login's
- *  passive discovery reads back a catalog the account can't run — and
- *  knows exactly what its pickers would offer: the non-gated curated rows. */
+/** Model ids known for a harness (K14): exactly what its pickers would
+ *  offer (`knownModelIds`): the discovered catalog plus the curated rows,
+ *  except that for codex and copilot a trusted, non-empty catalog drops the
+ *  curated rows it does not list (`withoutRefusedCuratedRows`), and
+ *  `catalogOnly` rows count only while discovery is empty. A logged-out
+ *  harness (`loggedIn === false`) distrusts its catalog, as `mergeModelOptions`'
+ *  rule 7 does for the pickers — an expired login's passive discovery reads
+ *  back a catalog the account can't run — so only the non-gated curated rows
+ *  count. */
 function knownModelsFor(h: Harness, loggedIn: boolean | null): string[] {
   // Same per-harness/per-kind split as `model-discovery.ts`'s
   // `modelsForHarness`: fx, codex and opencode catalogs vary per harness.

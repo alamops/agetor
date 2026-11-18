@@ -1,5 +1,5 @@
 import { test, expect, beforeAll, afterAll, afterEach } from "bun:test";
-import { mkdtempSync, writeFileSync } from "node:fs";
+import { existsSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import path from "node:path";
 import type { AppEvent, HarnessStatus } from "../shared/types.ts";
@@ -206,6 +206,19 @@ test("noteHarnessStatuses: available false -> true schedules a debounced refresh
   scheduler.noteHarnessStatuses([makeStatus("avail-flip", { available: false, path: null, version: null, loggedIn: null })]);
   expect(scheduler.__testing.pendingRefreshCount()).toBe(0);
   scheduler.noteHarnessStatuses([makeStatus("avail-flip", { available: true })]);
+  expect(scheduler.__testing.pendingRefreshCount()).toBe(1);
+});
+
+test("noteHarnessStatuses: a --version probe that times out (version null on an available CLI) is no transition; a real version change still is", () => {
+  resetAll();
+  scheduler.noteHarnessStatuses([makeStatus("version-flap", { version: "0.0.6" })]);
+  // Under load `--version` times out: same CLI, no version this poll.
+  scheduler.noteHarnessStatuses([makeStatus("version-flap", { version: null })]);
+  expect(scheduler.__testing.pendingRefreshCount()).toBe(0);
+  scheduler.noteHarnessStatuses([makeStatus("version-flap", { version: "0.0.6" })]);
+  expect(scheduler.__testing.pendingRefreshCount()).toBe(0);
+  scheduler.noteHarnessStatuses([makeStatus("version-flap", { version: null })]);
+  scheduler.noteHarnessStatuses([makeStatus("version-flap", { version: "0.0.7" })]);
   expect(scheduler.__testing.pendingRefreshCount()).toBe(1);
 });
 
@@ -969,6 +982,184 @@ test("a per-harness catalog is persisted under its harness key and hydrated back
   } finally {
     harnesses.setEnabled("codex", wasEnabled);
     preferences.delete("modelCatalog:harness:codex");
+  }
+});
+
+test("kindTargets: a sweep skips the copilot ACP probe while a copilot catalog is held; a manual refresh and a first catalog do not", async () => {
+  resetAll();
+  const copilot = harnesses.get("copilot");
+  expect(copilot).not.toBeNull();
+  const wasEnabled = copilot?.enabled ?? false;
+  harnesses.setEnabled("copilot", true);
+  try {
+    // No catalog yet: even a sweep probes (a first catalog is wanted).
+    expect((await scheduler.__testing.kindTargets({ sweep: true })).copilot?.skip).toBeUndefined();
+    discovery.seedDiscoveryCache({ scope: "kind", kind: "copilot" }, [{ id: "gpt-6.1-sol" }]);
+    // Held: a sweep never re-opens an ACP session for it...
+    expect((await scheduler.__testing.kindTargets({ sweep: true })).copilot?.skip).toBe(true);
+    // ...but a manual refresh / status change / version change does.
+    expect((await scheduler.__testing.kindTargets()).copilot?.skip).toBeUndefined();
+  } finally {
+    harnesses.setEnabled("copilot", wasEnabled);
+    resetAll();
+  }
+});
+
+test("refreshAllModels: a held copilot catalog stored under no CLI version, or under another one, is re-probed by the sweep and re-stamped; the same version is not", async () => {
+  resetAll();
+  const statusTesting = (await import("./agent-status.ts")).__testing;
+  statusTesting.clearStatusCache();
+  const copilot = harnesses.get("copilot");
+  expect(copilot).not.toBeNull();
+  const wasEnabled = copilot?.enabled ?? false;
+  harnesses.setEnabled("copilot", true);
+  // A stub copilot that reports a version, answers `help config` with one
+  // model, and logs every invocation but `--version`.
+  const dir = mkdtempSync(path.join("/tmp", "agetor-md-copilot-ver-"));
+  const log = path.join(dir, "calls.log");
+  const bin = path.join(dir, "copilot");
+  const version = "GitHub Copilot CLI 1.0.200";
+  writeFileSync(
+    bin,
+    `#!/bin/sh\nif [ "$1" = "--version" ]; then echo '${version}'; exit 0; fi\necho "$*" >> '${log}'\n` +
+      `if [ "$1" = "help" ]; then printf 'model:\\n  - "gpt-6.2-sol"\\n'; fi\nexit 0\n`,
+    { mode: 0o755 },
+  );
+  const probes = (): string[] => (existsSync(log) ? readFileSync(log, "utf8").split("\n").filter(Boolean) : []);
+  const store = (cliVersion: string | null): void => {
+    preferences.set(
+      "modelCatalog:kind:copilot",
+      JSON.stringify({ v: 1, cliVersion, savedAt: Date.now(), models: [{ id: "gpt-6.1-sol" }] }),
+    );
+  };
+  const storedVersion = (): unknown => JSON.parse(preferences.get("modelCatalog:kind:copilot") ?? "{}").cliVersion;
+  const fresh = (): void => {
+    resetAll();
+    statusTesting.clearStatusCache();
+    rmSync(log, { force: true });
+  };
+  const prevBin = process.env.AGETOR_COPILOT_BIN;
+  const prevProbe = process.env.AGETOR_COPILOT_ACP_PROBE;
+  process.env.AGETOR_COPILOT_BIN = bin;
+  // `help config` only, so the test needs no ACP stub.
+  process.env.AGETOR_COPILOT_ACP_PROBE = "0";
+  try {
+    // Saved before the CLI version was known (a slow first `--version`):
+    // re-probed, replaced, and stamped with the installed version...
+    store(null);
+    scheduler.__testing.hydrateFromStore();
+    expect(discovery.getDiscoveredModels("copilot").map((m) => m.id)).toEqual(["gpt-6.1-sol"]);
+    await scheduler.refreshAllModels();
+    expect(probes().length).toBeGreaterThan(0);
+    expect(discovery.getDiscoveredModels("copilot").map((m) => m.id)).toEqual(["gpt-6.2-sol"]);
+    expect(storedVersion()).toBe(version);
+    // ...so the next sweep leaves it alone.
+    rmSync(log, { force: true });
+    await scheduler.refreshAllModels();
+    expect(probes()).toEqual([]);
+
+    // Saved under the installed version: the sweep leaves it alone.
+    fresh();
+    store(version);
+    scheduler.__testing.hydrateFromStore();
+    await scheduler.refreshAllModels();
+    expect(probes()).toEqual([]);
+    expect(discovery.getDiscoveredModels("copilot").map((m) => m.id)).toEqual(["gpt-6.1-sol"]);
+
+    // Saved under an older build (upgraded while the app was closed).
+    fresh();
+    store("GitHub Copilot CLI 1.0.100");
+    scheduler.__testing.hydrateFromStore();
+    await scheduler.refreshAllModels();
+    expect(probes().length).toBeGreaterThan(0);
+    expect(discovery.getDiscoveredModels("copilot").map((m) => m.id)).toEqual(["gpt-6.2-sol"]);
+    expect(storedVersion()).toBe(version);
+  } finally {
+    if (prevBin === undefined) delete process.env.AGETOR_COPILOT_BIN;
+    else process.env.AGETOR_COPILOT_BIN = prevBin;
+    if (prevProbe === undefined) delete process.env.AGETOR_COPILOT_ACP_PROBE;
+    else process.env.AGETOR_COPILOT_ACP_PROBE = prevProbe;
+    harnesses.setEnabled("copilot", wasEnabled);
+    preferences.delete("modelCatalog:kind:copilot");
+    statusTesting.clearStatusCache();
+    resetAll();
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test("refreshAllModels: a sweep probes copilot for a first catalog, never re-probes one it holds (and keeps it), while refreshHarnessModels does probe", async () => {
+  resetAll();
+  preferences.delete("modelCatalog:kind:copilot");
+  const copilot = harnesses.get("copilot");
+  expect(copilot).not.toBeNull();
+  const wasEnabled = copilot?.enabled ?? false;
+  harnesses.setEnabled("copilot", true);
+  // A stub copilot that records every invocation and answers nothing.
+  const dir = mkdtempSync(path.join("/tmp", "agetor-md-copilot-"));
+  const log = path.join(dir, "calls.log");
+  const bin = path.join(dir, "copilot");
+  writeFileSync(bin, `#!/bin/sh\necho "$*" >> '${log}'\nexit 0\n`, { mode: 0o755 });
+  const calls = (): string[] => (existsSync(log) ? readFileSync(log, "utf8").split("\n").filter(Boolean) : []);
+  // Only a catalog probe counts: a `--version` status probe is not one.
+  const probes = (): string[] => calls().filter((line) => line !== "--version");
+  const prevBin = process.env.AGETOR_COPILOT_BIN;
+  process.env.AGETOR_COPILOT_BIN = bin;
+  try {
+    // A held catalog (seeded before any probe settles the slot): the sweep
+    // spawns no probe at all, and the catalog survives it.
+    discovery.seedDiscoveryCache({ scope: "kind", kind: "copilot" }, [{ id: "gpt-6.1-sol", label: "GPT-6.1 Sol" }]);
+    await scheduler.refreshAllModels();
+    expect(probes()).toEqual([]);
+    expect(discovery.getDiscoveredModels("copilot").map((m) => m.id)).toEqual(["gpt-6.1-sol"]);
+
+    // A manual refresh (or a status / version change) re-probes; its empty
+    // answer is transient, so the held catalog is kept.
+    await scheduler.refreshHarnessModels("copilot");
+    expect(probes().length).toBeGreaterThan(0);
+    expect(discovery.getDiscoveredModels("copilot").map((m) => m.id)).toEqual(["gpt-6.1-sol"]);
+
+    // No catalog: the sweep probes for a first one.
+    resetAll();
+    rmSync(log, { force: true });
+    await scheduler.refreshAllModels();
+    expect(probes().length).toBeGreaterThan(0);
+  } finally {
+    if (prevBin === undefined) delete process.env.AGETOR_COPILOT_BIN;
+    else process.env.AGETOR_COPILOT_BIN = prevBin;
+    harnesses.setEnabled("copilot", wasEnabled);
+    preferences.delete("modelCatalog:kind:copilot");
+    resetAll();
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test("preflightCatalogFor: a catalog probed under another CLI version judges nothing; the same or an unknown version does", async () => {
+  resetAll();
+  preferences.delete("modelCatalog:harness:codex");
+  const codexHarness = harnesses.get("codex");
+  expect(codexHarness).not.toBeNull();
+  if (!codexHarness) return;
+  const row = { id: "m1", label: "M One" };
+  try {
+    preferences.set(
+      "modelCatalog:harness:codex",
+      JSON.stringify({ v: 1, cliVersion: "codex-cli 0.166.0", savedAt: 1, models: [row] }),
+    );
+    discovery.seedDiscoveryCache({ scope: "harness", kind: "codex", harnessId: "codex" }, [row]);
+    const wasEnabled = codexHarness.enabled;
+    harnesses.setEnabled("codex", true);
+    scheduler.__testing.resetForTests();
+    scheduler.__testing.hydrateFromStore();
+    try {
+      expect(scheduler.preflightCatalogFor(codexHarness, "codex-cli 0.166.0").map((m) => m.id)).toEqual(["m1"]);
+      expect(scheduler.preflightCatalogFor(codexHarness, null).map((m) => m.id)).toEqual(["m1"]);
+      expect(scheduler.preflightCatalogFor(codexHarness, "codex-cli 0.170.0")).toEqual([]);
+    } finally {
+      harnesses.setEnabled("codex", wasEnabled);
+    }
+  } finally {
+    preferences.delete("modelCatalog:harness:codex");
+    resetAll();
   }
 });
 

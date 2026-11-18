@@ -1111,4 +1111,48 @@ describe("known model ids for the bundle planner (dynamic model catalog)", () =>
       discovery.__testing.resetForTests();
     }
   });
+
+  test("codex and copilot: a model their trusted catalog lacks warns on preview (a start would refuse it); with no catalog it doesn't; copilot's Auto never does", async () => {
+    const discovery = await import("./agent-discovery.ts");
+    const agent = (key: string, name: string, kind: "codex" | "copilot", model: string) => ({
+      key,
+      name,
+      harness: { id: kind, kind, label: kind },
+      model,
+    });
+    const text = JSON.stringify({
+      format: "agetor-bundle",
+      version: 1,
+      agents: [
+        agent("l", "Listed", "codex", "gpt-6.1-sol"),
+        agent("c", "CliOnly", "codex", "gpt-7-e2e"),
+        agent("u", "Unlisted", "codex", "gpt-5.6-sol"),
+        agent("a", "CopilotAuto", "copilot", "auto"),
+        agent("k", "CopilotUnlisted", "copilot", "kimi-k3"),
+      ],
+    });
+    const warningsByName = async (): Promise<(n: string) => string[]> => {
+      const plan = (await (await call("/bundle/import/preview", { text })).json()) as BundleImportPlan;
+      expect(plan.agents).toHaveLength(5);
+      return (n) => plan.agents.find((a) => a.sourceName === n)!.warnings.map((w) => w.code);
+    };
+    discovery.__testing.resetForTests();
+    try {
+      // No catalog: every built-in row is known; an id no list carries is not.
+      let byName = await warningsByName();
+      for (const n of ["Listed", "Unlisted", "CopilotAuto", "CopilotUnlisted"]) expect(byName(n), n).not.toContain("unknown-model");
+      expect(byName("CliOnly")).toContain("unknown-model");
+
+      discovery.seedDiscoveryCache({ scope: "harness", kind: "codex", harnessId: "codex" }, [{ id: "gpt-6.1-sol" }, { id: "gpt-7-e2e" }]);
+      discovery.seedDiscoveryCache({ scope: "kind", kind: "copilot" }, [{ id: "gpt-6.1-sol" }]);
+      byName = await warningsByName();
+      expect(byName("Listed")).not.toContain("unknown-model");
+      expect(byName("CliOnly")).not.toContain("unknown-model");
+      expect(byName("Unlisted")).toContain("unknown-model");
+      expect(byName("CopilotAuto")).not.toContain("unknown-model");
+      expect(byName("CopilotUnlisted")).toContain("unknown-model");
+    } finally {
+      discovery.__testing.resetForTests();
+    }
+  });
 });

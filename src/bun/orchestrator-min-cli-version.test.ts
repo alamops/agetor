@@ -430,7 +430,7 @@ test("a codex model missing from a non-empty trusted catalog is refused with the
     if ("error" in started) {
       expect(started.error).toContain("isn't in Codex's model list");
       expect(started.error).toContain("0.166.0");
-      expect(started.error).toContain("Upgrade the CLI (npm i -g @openai/codex)");
+      expect(started.error).toContain("update the CLI (npm i -g @openai/codex)");
     }
     expect(tasks.get(taskId)!.runId).toBeNull();
     expect(runs.listForTask(taskId).length).toBe(0);
@@ -467,6 +467,44 @@ test("an empty catalog leaves the table behavior untouched, and the skip env win
     });
   } finally {
     delete process.env.AGETOR_SKIP_CLI_VERSION_FLOOR;
+  }
+});
+
+test("a stored catalog judges a start only under the CLI version it was probed with: after an upgrade the old list refuses nothing (review S-B)", async () => {
+  process.env.FAKE_CODEX_VERSION = "codex-cli 0.166.0";
+  const { startTask } = await import("./orchestrator.ts");
+  const { harnesses, preferences, runs } = await import("./db.ts");
+  const discovery = await import("./agent-discovery.ts");
+  const scheduler = await import("./model-discovery.ts");
+  harnesses.setEnabled("codex", true);
+  const prefKey = "modelCatalog:harness:codex";
+  // The catalog persisted by an earlier run, hydrated the way a boot does.
+  const restoreCatalog = (cliVersion: string) => {
+    discovery.__testing.resetForTests();
+    scheduler.__testing.resetForTests();
+    preferences.set(prefKey, JSON.stringify({ v: 1, cliVersion, savedAt: 1, models: [{ id: "gpt-6.2-sol" }] }));
+    scheduler.__testing.hydrateFromStore();
+    expect(discovery.getHarnessDiscoveredModels("codex").map((m) => m.id)).toEqual(["gpt-6.2-sol"]);
+  };
+  try {
+    // Probed under the CLI installed now: it lacks gpt-5.6-sol, which is refused.
+    restoreCatalog("codex-cli 0.166.0");
+    const refused = await startTask(await createCodexTask("gpt-5.6-sol"));
+    expect("error" in refused).toBe(true);
+    if ("error" in refused) expect(refused.error).toContain("isn't in Codex's model list");
+
+    // Probed under the CLI before an upgrade (its refresh hasn't landed): the
+    // same list says nothing, and gpt-5.6-sol (no table floor) starts.
+    restoreCatalog("codex-cli 0.160.0");
+    const taskId = await createCodexTask("gpt-5.6-sol");
+    const started = await startTask(taskId);
+    expect("error" in started).toBe(false);
+    await settledRuns(taskId, 1);
+    expect(runs.listForTask(taskId).length).toBe(1);
+  } finally {
+    preferences.delete(prefKey);
+    scheduler.__testing.resetForTests();
+    discovery.__testing.resetForTests();
   }
 });
 

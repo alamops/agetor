@@ -2,6 +2,7 @@ import { test, expect, beforeAll, afterAll } from "bun:test";
 import { mkdtempSync } from "node:fs";
 import { tmpdir } from "node:os";
 import path from "node:path";
+import { rmTestDataDir } from "./test-data-dir.ts";
 
 // Top-level, before any db.ts/server.ts import (db.ts captures the data dir at
 // first import). Unique port, distinct from every other *.test.ts file's.
@@ -31,6 +32,7 @@ beforeAll(async () => {
 
 afterAll(() => {
   server?.stop?.();
+  rmTestDataDir(DATA_DIR);
 });
 
 test("GET /preferences omits every modelCatalog:* key but lists the others", async () => {

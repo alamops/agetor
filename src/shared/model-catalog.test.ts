@@ -13,6 +13,7 @@ import {
   resolveDefaultEffort,
   resolveDefaultModel,
   resolveSeedModel,
+  seedModelStep,
   retainableEffortsFor,
   speedOptionsFor,
   speedTiersKnown,
@@ -76,6 +77,92 @@ describe("C3: no duplicate rows for any kind's fixture", () => {
       const loggedOut = buildModelOptions(kind, { discovered: CATALOGS.claude?.rows ?? [], loggedIn: false }).map((r) => r.id);
       expect(loggedOut.slice().sort()).toEqual(curated.slice().sort());
     }
+  });
+});
+
+describe("a trusted codex/copilot catalog is authoritative for the picker (review M1)", () => {
+  const authoritative = [
+    ["codex", "codex", codex],
+    ["copilot ACP", "copilot", copilotAcp],
+    ["copilot help config", "copilot", copilotHelp],
+  ] as const;
+
+  for (const [name, kind, rows] of authoritative) {
+    test(`${name}: no listed picker row is one pre-flight refuses`, () => {
+      const merged = buildModelOptions(kind, { discovered: rows });
+      expect(merged.length).toBeGreaterThan(0);
+      for (const row of merged.filter((r) => !r.unlisted)) {
+        expect(modelCatalogVerdict(kind, row.id, rows, null), row.id).not.toBe("missing");
+      }
+      // The curated rows the CLI lacks are gone; the CLI's own rows all stay.
+      const curatedOnly = AGENT_OPTIONS[kind].models.filter((m) => !m.pinned && !rows.some((r) => r.id === m.id));
+      for (const m of curatedOnly) expect(merged.map((r) => r.id), m.id).not.toContain(m.id);
+      for (const r of rows) expect(merged.map((x) => x.id)).toContain(r.id);
+    });
+  }
+
+  test("a stored curated-only model stays representable as an unlisted row with an honest hint", () => {
+    const gone = AGENT_OPTIONS.codex.models.find((m) => !codex.some((r) => r.id === m.id));
+    expect(gone, "the codex fixture lacks a curated model").toBeDefined();
+    const merged = buildModelOptions("codex", { discovered: codex, selected: gone?.id ?? null });
+    const row = merged.find((r) => r.id === gone?.id);
+    expect(row).toMatchObject({ unlisted: true });
+    expect(row?.hint).toContain("model list");
+    expect(merged.filter((r) => r.id === gone?.id)).toHaveLength(1);
+  });
+
+  test("copilot's pinned Auto stays offered", () => {
+    expect(buildModelOptions("copilot", { discovered: copilotAcp }).map((r) => r.id)).toContain("auto");
+  });
+
+  test("an untrusted catalog (logged out, empty) still shows every curated row", () => {
+    const curated = AGENT_OPTIONS.codex.models.filter((m) => !m.catalogOnly).map((m) => m.id).sort();
+    expect(buildModelOptions("codex", { discovered: codex, loggedIn: false }).map((r) => r.id).sort()).toEqual(curated);
+    expect(buildModelOptions("codex", { discovered: [] }).map((r) => r.id).sort()).toEqual(curated);
+  });
+
+  test("a remembered curated-only model is not a usable seed once the catalog lacks it", () => {
+    const gone = AGENT_OPTIONS.codex.models.find((m) => !codex.some((r) => r.id === m.id))?.id ?? "";
+    const rows = buildModelOptions("codex", { discovered: codex, selected: gone });
+    expect(resolveSeedModel("codex", gone, rows)).toBeNull();
+    const listed = codex[0]?.id ?? "";
+    expect(resolveSeedModel("codex", listed, rows)).toBe(listed);
+    // With no catalog the curated row is real again.
+    expect(resolveSeedModel("codex", gone, buildModelOptions("codex", { discovered: [] }))).toBe(gone);
+  });
+
+  // The remembered-model step as the form sees it when preferences resolve
+  // BEFORE the catalog (review S-A): codex/copilot apply the built-in model at
+  // once but stay unconfirmed until a trusted catalog lists it.
+  describe("seedModelStep (preferences before the catalog)", () => {
+    const gone = AGENT_OPTIONS.codex.models.find((m) => !codex.some((r) => r.id === m.id))?.id ?? "";
+    const listed = codex[0]?.id ?? "";
+
+    test("no catalog yet: a built-in codex model applies but is not confirmed", () => {
+      const rows = buildModelOptions("codex", { discovered: [] });
+      expect(seedModelStep("codex", gone, rows, [], null)).toEqual({ action: "apply", model: gone, confirmed: false });
+    });
+
+    test("the trusted catalog then lacks it: the seed falls to the default", () => {
+      const rows = buildModelOptions("codex", { discovered: codex, selected: gone });
+      expect(seedModelStep("codex", gone, rows, codex, null)).toEqual({ action: "default" });
+    });
+
+    test("the trusted catalog lists it: confirmed", () => {
+      const rows = buildModelOptions("codex", { discovered: codex, selected: listed });
+      expect(seedModelStep("codex", listed, rows, codex, null)).toEqual({ action: "apply", model: listed, confirmed: true });
+    });
+
+    test("a logged-out harness keeps waiting on an id the curated rows lack, and never falls to the default", () => {
+      const rows = buildModelOptions("codex", { discovered: codex, loggedIn: false });
+      expect(seedModelStep("codex", "brand-new-model", rows, codex, false)).toEqual({ action: "wait" });
+    });
+
+    test("a kind with a non-authoritative catalog is confirmed by its curated row at once", () => {
+      const curated = AGENT_OPTIONS["claude-code"].models[0]?.id ?? "";
+      const rows = buildModelOptions("claude-code", { discovered: [] });
+      expect(seedModelStep("claude-code", curated, rows, [], null)).toEqual({ action: "apply", model: curated, confirmed: true });
+    });
   });
 });
 

@@ -11,6 +11,16 @@ import type { Subprocess } from "bun";
 import { childEnv, coreSpawn } from "../core-spawn.ts";
 
 /**
+ * The most stdout a probe reads (one unbroken line for a JSON-line session,
+ * the whole output for `runCapture`). Far above any real catalog (a claude
+ * `initialize` reply, a gemini model list), so a CLI or a wrapper earlier on
+ * PATH that streams without end can't grow the core's memory on the shared
+ * main thread until the budget fires: past it the child is killed and the
+ * probe answers nothing.
+ */
+export const PROBE_STDOUT_CAP_BYTES = 4 * 1024 * 1024;
+
+/**
  * Drive a line-oriented JSON child (one JSON object per line each way) to a
  * single answer: spawn `cmd`, let `start` write the opening request(s), hand
  * every parsed stdout line to `onMessage`, and stop on `"done"`, child exit
@@ -85,6 +95,8 @@ export async function runJsonLineSession(opts: {
         buf = buf.slice(nl + 1);
         if (dispatch(line)) { buf = ""; break outer; }
       }
+      // An unbroken line past the cap is no answer.
+      if (buf.length > PROBE_STDOUT_CAP_BYTES) { buf = ""; break; }
     }
     // A reply that never got its trailing newline.
     if (buf.trim()) dispatch(buf);
@@ -119,12 +131,29 @@ export async function runCapture(
       timedOut = true;
       try { proc.kill(); } catch { /* already exited */ }
     }, opts.timeoutMs);
+    const reader = (proc.stdout as ReadableStream<Uint8Array>).getReader();
     try {
-      const stdout = await new Response(proc.stdout).text();
+      const chunks: Uint8Array[] = [];
+      let total = 0;
+      let overflowed = false;
+      for (;;) {
+        const { done, value } = await reader.read();
+        if (done) break;
+        total += value.byteLength;
+        if (total > PROBE_STDOUT_CAP_BYTES) {
+          overflowed = true;
+          try { proc.kill(); } catch { /* already exited */ }
+          break;
+        }
+        chunks.push(value);
+      }
+      const stdout = overflowed ? "" : Buffer.concat(chunks).toString("utf8");
       await proc.exited;
-      return { ok: !timedOut && proc.exitCode === 0, stdout };
+      return { ok: !timedOut && !overflowed && proc.exitCode === 0, stdout };
     } finally {
       clearTimeout(timer);
+      // Release a read that a grandchild's open pipe would never end.
+      try { void reader.cancel(); } catch { /* already released */ }
     }
   } catch {
     return { ok: false, stdout: "" };
