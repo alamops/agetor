@@ -1,0 +1,383 @@
+{
+  "version": 1,
+  "id": "app-bar-redesign-grill-r1",
+  "title": "Grill — App bar redesign (harness status, Harness Stacks, responsive)",
+  "skill": "grill",
+  "slug": "app-bar-redesign",
+  "round": 1,
+  "flags": [],
+  "summary": "The window app bar (`<header>` in `src/mainview/App.tsx:2620-2739`) has **no overflow policy**. With your 7 enabled harnesses, its labels wrap at 1280 px or narrower. At about 1100 px or narrower, Pipelines and Settings go off-screen and the whole window scrolls sideways. At 170% UI zoom it breaks even at 1600 px. It also shows nothing about your Claude Code stack.\n\nThere are **12 real questions**, then a **confirm-or-override list** of defaults I'd bet on (one click each). Start with **Direction**: it decides the plan's shape. Every option carries what it costs. Your progress is saved in the browser.\n\nFull evidence: `docs/plans/app-bar-redesign-investigation.md`.",
+  "proven": [
+    {
+      "text": "**Today's bar breaks three ways with your setup.** A static replica, measured in Playwright WebKit and Chromium with your 7 label lengths: one line at 1440 px or wider; labels wrap to 2–3 lines inside the 40 px bar at 1280 px or narrower; Settings and Pipelines go off-screen at about 1100 px or narrower. The logo cluster takes 165 px and the actions 266 px, so the chips get about *window width − 460 px*. Today's 7 chips need 824 px.",
+      "evidence": [{ "label": "spike results", "path": "docs/plans/app-bar-redesign-investigation.md", "line": 137 }]
+    },
+    "**No server change is needed.** Harnesses, statuses, stacks, cooldowns (`harnessLimitStates`), usage and each task's `harnessState` are already in the webview's state. There is no new route, SSE stream, DB column or `ROUTE_POLICY` entry, unless you want native menu items (Q12).",
+    "**Electrobun 1.18.1 cannot set a minimum window size.** The bar must survive any width, however narrow.",
+    "**A stack has no global \"active account\".** Failover happens per task, so a stack chip can only summarize its members. It cannot say \"currently on X\".",
+    "**Reusable helpers exist.** `groupHarnesses`, `cooldownChips`, `quotaSummary`/`StackQuotaMeter`, `harnessQuotaLooksExhausted`, `stackBackupCanServe`, `ui/context-menu.tsx` (a portaled menu with roving focus) and `ui/tooltip.tsx`. Because the bar would use the failover's own \"out of quota\" test, it can never disagree with the failover.",
+    "**Existing bug, fixed in this change.** `UsagePopover` lacks `data-popover-open`, so pressing Escape in a chip popover also closes an open RunPanel. It also renders in place (not portaled), so any overflow-clipped strip would clip it.",
+    "**Tests would not catch a broken bar.** E2E runs at 1280×720 with one harness. This change adds specs that pin the behavior at narrow widths, with many harnesses and at high zoom.",
+    "**This reverses an earlier decision.** Harness-stacks grill decision 28 (\"topbar keeps one usage chip per account in v1 (no grouping)\") deferred exactly this layout change. The new record will state the reversal."
+  ],
+  "sections": [
+    {
+      "id": "direction",
+      "title": "Direction",
+      "intro": "These decide which components get built.",
+      "questions": [
+        {
+          "id": "direction",
+          "type": "single",
+          "title": "What should the harness area of the bar become?",
+          "impact": "blocking",
+          "why": "Decides whether we build an aggregate button, a measured priority+ strip, both, or a new status bar elsewhere.",
+          "context": "Today the bar has one chip per enabled account: icon, full label, an optional meter and a status dot. Your screenshot shows 7 chips. The two members of your stack sit 6 chips apart because chips follow DB order (built-ins first, then by creation date).",
+          "evidence": [
+            { "label": "chip strip, no overflow rule", "path": "src/mainview/App.tsx", "line": 2632, "lang": "tsx", "code": "<div className=\"electrobun-webkit-app-region-no-drag flex items-center gap-2 text-xs text-muted-foreground\">\n  {visibleTopbarAgents(agents, harnesses).map((a) => {" },
+            { "label": "chip order = DB order", "path": "src/bun/db.ts", "line": 2390 }
+          ],
+          "options": [
+            {
+              "id": "aggregate",
+              "label": "(A) One aggregate \"Harnesses\" button",
+              "description": "Shows the worst status, the worst meter and counts. Click opens a panel listing every account, grouped by stack.",
+              "consequence": "Simplest and scales to any count, but you lose per-account meters at a glance.",
+              "preview": "[A] Agetor   [● Harnesses 7 ▮▮▮▯ 82%]                 ⎇ ⇩ ▤ ⟳ ⚙"
+            },
+            {
+              "id": "priority",
+              "label": "(B) A grouped chip strip with priority+ overflow",
+              "description": "Stacks get one chip. Chips that don't fit go into a `+N` menu.",
+              "consequence": "Keeps per-chip meters. Needs ResizeObserver fit logic. When narrow, most chips sit behind `+N` with no summary.",
+              "preview": "[A] Agetor  [Claude stack ●● ▮▮▯] [Codex ▮▯] [Cursor ●] [+3]   ⎇ ⇩ ▤ ⟳ ⚙"
+            },
+            {
+              "id": "hybrid",
+              "label": "(C) Hybrid: compact grouped chips that collapse into a status button",
+              "description": "Like (B), but chips are compact (icon, short label, meter), and the overflow control is a **status** button: it shows the worst state among the hidden chips. Below a width threshold, the whole strip becomes the (A) button.",
+              "consequence": "Most work (fit logic, compact chips and the aggregate panel), but it reads well at every width.",
+              "preview": "wide:   [A] Agetor  [◆ Claude Code ●● ▮▮▯] [Codex ▮▯] [Cursor ●] [OpenCode ●] [Bravo ▮] [PBSCO ▮]   ⎇ ⇩ ▤ ⟳ ⚙\nmedium: [A]  [◆ Claude Code ●● ▮▮▯] [Codex ▮▯] [● +3 ▾]                       ⟳ ⚙ ⋯\nnarrow: [A]  [● Harnesses 6 ▾]                                                 ⟳ ⚙ ⋯"
+            },
+            {
+              "id": "elsewhere",
+              "label": "(D) Move harness status out of the bar",
+              "description": "Into a bottom status bar or the New Task sidebar. The top bar keeps only the logo and actions.",
+              "consequence": "The top bar becomes trivially responsive, but the harness area needs a new surface that has its own width problems.",
+              "preview": "top:    [A] Agetor                                              ⎇ ⇩ ▤ ⟳ ⚙\nbottom: ◆ Claude Code ●● ▮▮▯ · Codex ▮▯ · Cursor ● · …"
+            }
+          ],
+          "recommendation": { "value": "hybrid", "reason": "It keeps the at-a-glance meters you get today when there is room, and never overflows. It follows the HIG pattern of overflowing the middle of a toolbar." }
+        },
+        {
+          "id": "chip-label",
+          "type": "single",
+          "title": "How much of an account's label should a chip show?",
+          "impact": "shape",
+          "why": "Sets the chip widths, and so how many chips fit before overflow starts.",
+          "context": "Your labels run from 5 to 22 characters (\"Claude Personal Backup\"). Four of your accounts share the Claude icon, so with icons alone they can't be told apart.",
+          "showIf": { "question": "direction", "in": ["priority", "hybrid", "elsewhere"] },
+          "options": [
+            { "id": "full", "label": "Full label, always", "consequence": "Fewest chips fit (today's strip needs about 824 px)." },
+            { "id": "truncate", "label": "Truncated at about 14 characters with an ellipsis; full label in the tooltip and the popover", "consequence": "Chips have a bounded width, and same-icon accounts stay distinguishable." },
+            { "id": "icon", "label": "Icon only, label in the tooltip", "consequence": "Narrowest, but your 4 Claude accounts become indistinguishable at a glance." }
+          ],
+          "recommendation": { "value": "truncate", "reason": "Bounded width while you can still tell the Claude accounts apart." }
+        },
+        {
+          "id": "unstacked-grouping",
+          "type": "single",
+          "title": "How should accounts of the same kind that are in no stack appear?",
+          "impact": "shape",
+          "why": "Decides whether \"group\" means only stacks, or also groups by kind.",
+          "context": "You have 2 unstacked Claude accounts (\"Claude Bravo\" and \"Claude PBSCO\") next to a 2-account Claude stack. A kind group would look like a stack but would not fail over, which could suggest failover that isn't happening.",
+          "showIf": { "question": "direction", "in": ["priority", "hybrid", "elsewhere"] },
+          "options": [
+            { "id": "own-chip", "label": "One compact chip each", "consequence": "Only stacks are grouped. What you see is how failover behaves." },
+            { "id": "kind-group", "label": "Group by kind (\"Claude Code ×2\")", "consequence": "Fewer chips. Needs a visual distinction from a stack chip, and a popover listing them." }
+          ],
+          "recommendation": { "value": "own-chip", "reason": "A group in the bar should mean failover, and only stacks fail over." }
+        }
+      ]
+    },
+    {
+      "id": "stacks",
+      "title": "Harness Stacks in the bar",
+      "intro": "Your one stack: Claude Code (built-in, primary), then \"Claude Personal Backup\" (backup).",
+      "questions": [
+        {
+          "id": "stack-chip",
+          "type": "multi",
+          "title": "What should a stack's chip show?",
+          "impact": "shape",
+          "why": "Decides which summary logic the chip needs.",
+          "context": "A stack has no active account, so the chip has to summarize its members. *Headroom* is the worst blocking meter (5-hour or weekly) of the least-used member that can still serve, i.e. how much the stack can still run. It uses `quotaSummary` and `harnessQuotaLooksExhausted`, the failover's own test.",
+          "evidence": [
+            { "label": "quotaSummary (blocking meters, stale after 20 min)", "path": "src/shared/harness-stack.ts", "line": 450 },
+            { "label": "failover's 'out of quota' test", "path": "src/shared/harness-limits.ts", "line": 457 }
+          ],
+          "options": [
+            { "id": "label", "label": "The stack's kind and a stack marker (e.g. ◆ Claude Code)" },
+            { "id": "dots", "label": "One dot per member: ready, cooling, out of quota, unavailable or disabled", "consequence": "Shows the stack's makeup and which member is hurting." },
+            { "id": "headroom", "label": "A headroom meter", "consequence": "One bar for \"how much the stack can still run\"." },
+            { "id": "primary-meter", "label": "The primary's meter instead of headroom", "consequence": "Simpler, but it says \"full\" while the backup still has room." },
+            { "id": "reset", "label": "The earliest reset time (\"until 14:30\") when every member is out", "consequence": "Visible text, not only in the tooltip." }
+          ],
+          "min": 1,
+          "recommendation": { "value": ["label", "dots", "headroom", "reset"], "reason": "Covers makeup, capacity and \"when can I run again\" without opening anything." }
+        },
+        {
+          "id": "stack-popover",
+          "type": "multi",
+          "title": "What should the stack chip's popover contain?",
+          "impact": "shape",
+          "why": "Every item here is a component and a test; Clear cooldown is also a state-changing action.",
+          "context": "Settings → Harnesses already has stack cards with member meters, cooldown chips, **Clear** (behind a confirmation) and Restore. A deep link exists: `openSettingsHarnesses` (`App.tsx:2012`), and the `stacks` section resolves to Harnesses.",
+          "options": [
+            { "id": "members", "label": "Members in order (Primary / Backup 1…) with each one's quota meter and status" },
+            { "id": "cooldowns", "label": "Cooldown chips (\"usage limit · until 14:30 · for <model>\")" },
+            { "id": "refresh", "label": "Refresh usage" },
+            { "id": "manage", "label": "Manage stack… (opens Settings → Harnesses)" },
+            { "id": "history", "label": "Swap history" },
+            { "id": "clear", "label": "Clear cooldown, behind the same confirmation as Settings", "consequence": "Puts a state-changing action in the bar, and adds an e2e flow." }
+          ],
+          "min": 1,
+          "recommendation": { "value": ["members", "cooldowns", "refresh", "manage", "history"], "reason": "The bar is for reading and navigating. Clearing a cooldown stays in Settings, next to its explanation." }
+        },
+        {
+          "id": "failover-activity",
+          "type": "single",
+          "title": "Should the bar show live failover activity: tasks waiting on an all-exhausted retry, or in the middle of a swap?",
+          "impact": "shape",
+          "why": "Adds a task-derived count (and links to the tasks) to the stack chip.",
+          "context": "Each task already carries `harnessState.allExhausted` (with `nextAttemptAt`) and `pendingSwap`, refreshed by the 2-second task poll. Today this is visible only in RunPanel, on the TaskCard badge and in toasts.",
+          "evidence": [
+            { "label": "TaskHarnessState", "path": "src/shared/types.ts", "line": 627 }
+          ],
+          "options": [
+            { "id": "badge", "label": "A count badge on the stack chip; the popover lists those tasks, and clicking one opens it", "consequence": "One summary helper, a list in the popover and an e2e assertion." },
+            { "id": "popover-only", "label": "Only a line in the popover (\"2 tasks waiting for quota until 14:30\")", "consequence": "Less visible; less work." },
+            { "id": "none", "label": "No; it stays in RunPanel, TaskCard and toasts", "consequence": "No task data in the bar." }
+          ],
+          "recommendation": { "value": "badge", "reason": "\"Why are my tasks stuck?\" should be answerable from the bar. The data is already in the webview." }
+        }
+      ]
+    },
+    {
+      "id": "overflow",
+      "title": "Overflow, priority and actions",
+      "questions": [
+        {
+          "id": "priority",
+          "type": "rank",
+          "title": "When chips don't fit, which should stay visible longest? (top = last to overflow)",
+          "impact": "shape",
+          "why": "This becomes the pure function that picks which chips are hidden.",
+          "context": "The **display order** stays stable: stacks first, then accounts in DB order. That way chips don't jump around as usage changes. This ranking only decides *which* chips move into the overflow first.",
+          "options": [
+            { "id": "stacks", "label": "Stacks" },
+            { "id": "running", "label": "Accounts with a task running right now" },
+            { "id": "problem", "label": "Accounts with a problem: warning or critical usage, cooling down, logged out or unavailable" },
+            { "id": "builtin", "label": "Built-in accounts before custom ones (DB order)" }
+          ],
+          "recommendation": { "value": ["problem", "running", "stacks", "builtin"], "reason": "What needs your attention or is in use right now stays visible, and the overflow button's dot covers the rest." }
+        },
+        {
+          "id": "actions-visible",
+          "type": "multi",
+          "title": "Which trailing actions must stay visible at every width? The others move into a \"⋯ More\" menu when the window is narrow.",
+          "impact": "shape",
+          "why": "Sets the fixed width the chips can never take, and which e2e locators change role from button to menuitem when narrow.",
+          "context": "The trailing cluster is 266 px: the task count, then Git, Import sessions, Worktrees, Pipelines and Settings, each a 36 px icon button. The HIG says the trailing edge stays visible at all window sizes. About 15 e2e specs locate these buttons by name, at the default width of 1280 px, so they stay plain buttons at that width.",
+          "evidence": [
+            { "label": "trailing actions", "path": "src/mainview/App.tsx", "line": 2683 },
+            { "label": "every spec's readiness check", "path": "e2e/helpers.ts", "line": 75 }
+          ],
+          "options": [
+            { "id": "settings", "label": "Settings" },
+            { "id": "pipelines", "label": "Pipelines" },
+            { "id": "git", "label": "Git" },
+            { "id": "worktrees", "label": "Worktrees" },
+            { "id": "import", "label": "Import sessions" }
+          ],
+          "min": 1,
+          "recommendation": { "value": ["settings", "pipelines"], "reason": "Pipelines is a page toggle with an active state; Settings is the way into everything else." }
+        },
+        {
+          "id": "min-width",
+          "type": "number",
+          "title": "What is the narrowest window width at which the bar must look complete (logo, at least one chip or the status button, and every always-visible action)?",
+          "impact": "shape",
+          "why": "Sets the breakpoint where the strip turns into the aggregate button, and the e2e viewport we pin.",
+          "context": "Below this width the bar still must not overflow: it keeps the logo, the aggregate status and the essential actions, and the document never scrolls sideways. For reference: a half-screen split on a 14-inch MacBook Pro is about 756 px, on a 16-inch about 864 px.",
+          "unit": "px",
+          "min": 400,
+          "max": 1600,
+          "step": 10,
+          "recommendation": { "value": 720, "reason": "Covers a half-screen split on every current MacBook." }
+        }
+      ]
+    },
+    {
+      "id": "chrome",
+      "title": "Window chrome",
+      "questions": [
+        {
+          "id": "runpanel-overlap",
+          "type": "single",
+          "title": "What should happen to the bar while RunPanel is open?",
+          "impact": "shape",
+          "why": "Today the open panel covers every action in the bar. The fix changes either RunPanel's position or the bar's fit logic.",
+          "context": "RunPanel is `fixed right-0 top-0 z-40 h-full`, 720 px wide by default (420 px to 90vw), so while it is open Settings, Pipelines and the rest are hidden under it. It publishes `--run-panel-width` on `<html>`.",
+          "evidence": [
+            { "label": "RunPanel aside", "path": "src/mainview/components/kanban/RunPanel.tsx", "line": 630, "lang": "tsx", "code": "<aside\n  style={{ width }}\n  className={cn(\n    \"fixed right-0 top-0 z-40 flex h-full max-w-[90vw] flex-col border-l border-border/60 bg-card shadow-2xl transition-transform duration-300 ease-out\"," }
+          ],
+          "options": [
+            { "id": "below", "label": "Start the panel below the bar (`top: 40px`)", "consequence": "The bar stays fully usable at full width. RunPanel loses 40 px of height, and its header layout gets checked." },
+            { "id": "reserve", "label": "Keep the panel full height; the bar reserves `--run-panel-width` and fits into what's left", "consequence": "The actions stay visible to the left of the panel, but the strip collapses on every panel open and resize." },
+            { "id": "keep", "label": "Keep it as is: the panel owns the top-right corner", "consequence": "No work, but the actions stay hidden while a task is open." }
+          ],
+          "recommendation": { "value": "below", "reason": "Mac apps put inspectors under the toolbar, and the bar stays one consistent surface." }
+        },
+        {
+          "id": "zoom",
+          "type": "single",
+          "title": "Under UI zoom (Cmd+= up to 170%), what should the bar's height and left inset do?",
+          "impact": "shape",
+          "why": "Decides whether the bar keeps lining up with the macOS traffic lights.",
+          "context": "The bar is rem-based, so at 170% it is 68 px tall and its left inset is 136 px, while the native traffic lights stay at (8, 8) px and are no longer centered. The comment in `src/bun/index.ts` says to keep the light offset in sync with the header's `pl-20`.",
+          "evidence": [
+            { "label": "traffic light offset", "path": "src/bun/index.ts", "line": 845, "lang": "ts", "code": "// shifts the lights to vertically center inside that header's 40px (h-10)\n// height — keep `x` here in sync with the header's left padding (`pl-20`" }
+          ],
+          "options": [
+            { "id": "pin", "label": "Pin the height (40 px) and left inset (80 px) in px; text and icons inside still scale", "consequence": "Always aligned with the lights. At 170%, fewer chips fit, and the fit logic re-measures on a font change." },
+            { "id": "scale", "label": "Keep scaling everything with zoom", "consequence": "Simpler, but the lights sit at the top-left of a 68 px bar." }
+          ],
+          "recommendation": { "value": "pin", "reason": "Native chrome doesn't zoom. Pinning keeps the bar looking native at every zoom level." }
+        },
+        {
+          "id": "native-menu",
+          "type": "single",
+          "title": "Add the bar's actions to the native macOS menu bar as well?",
+          "impact": "shape",
+          "why": "Gives Settings (and maybe more) an entry point that can never be hidden or clipped. This is new core → webview plumbing.",
+          "context": "The app menu has About, Remote Access…, Hide and Quit, then Edit and Window. There is no \"Settings… ⌘,\", and no menu entry or keyboard shortcut for Git, Worktrees, Pipelines or Import. Remote Access opens a native box, so no menu item reaches the webview today. A new menu action would travel over the existing app SSE channel, so no new stream. The HIG says every toolbar item should also be a menu-bar command.",
+          "evidence": [
+            { "label": "app menu", "path": "src/bun/index.ts", "line": 118 },
+            { "label": "menu click handler", "path": "src/bun/index.ts", "line": 524 }
+          ],
+          "options": [
+            { "id": "settings", "label": "\"Settings… ⌘,\" only", "consequence": "One menu item, one app event and a webview listener (also handling ⌘, in the webview)." },
+            { "id": "all", "label": "Settings ⌘, plus a View or Go menu with Pipelines, Worktrees, Git and Import sessions", "consequence": "Every action is reachable at any width; a few more menu items and tests." },
+            { "id": "none", "label": "Neither; out of scope", "consequence": "The bar stays the only entry point." }
+          ],
+          "recommendation": { "value": "all", "reason": "Once actions can move into an overflow menu, the menu bar is the HIG's guaranteed path, and the plumbing costs the same for one item or five." }
+        },
+        {
+          "id": "task-count",
+          "type": "single",
+          "title": "Where should the task count (\"12 tasks\" / \"3 of 12 tasks\") go?",
+          "impact": "minor",
+          "why": "It takes about 60 px of the trailing cluster.",
+          "context": "It counts the board's filtered tasks, but it also shows on the Pipelines page, where it means nothing. The filter that drives it lives in `KanbanFilters`.",
+          "options": [
+            { "id": "filters", "label": "Move it into the board's filter bar (`KanbanFilters`)", "consequence": "It sits next to the filter it describes, and only on the board." },
+            { "id": "keep", "label": "Keep it in the bar, hidden first when narrow" },
+            { "id": "drop", "label": "Drop it" }
+          ],
+          "recommendation": { "value": "filters", "reason": "It describes the filter, so it belongs next to it." }
+        },
+        {
+          "id": "wordmark",
+          "type": "single",
+          "title": "Keep the \"Agetor\" wordmark next to the logo?",
+          "impact": "minor",
+          "context": "It takes about 90 px. The HIG advises against titling a window with the app name, but it is your branding.",
+          "options": [
+            { "id": "collapse", "label": "Keep it, but it's the first thing to go when narrow (logo stays)" },
+            { "id": "always", "label": "Always keep it" },
+            { "id": "drop", "label": "Drop it; logo only" }
+          ],
+          "recommendation": { "value": "collapse", "reason": "Branding when there's room; the space goes to status when there isn't." }
+        }
+      ]
+    },
+    {
+      "id": "confirm",
+      "title": "Confirm or override",
+      "intro": "Defaults I'd bet on. Confirm each, or type what you want instead.",
+      "questions": [
+        {
+          "id": "c-stale",
+          "type": "confirm",
+          "title": "Stale usage",
+          "impact": "minor",
+          "recommendation": { "value": "Meters older than 20 minutes (`HARNESS_QUOTA_STALE_MS`) are dimmed in the bar, and the tooltip and popover say \"stale · updated N ago\", as Settings and CodexBar do.", "reason": "A full-looking bar from yesterday is misleading." }
+        },
+        {
+          "id": "c-customize",
+          "type": "confirm",
+          "title": "Pin and hide customization",
+          "impact": "minor",
+          "recommendation": { "value": "No per-harness pin or hide in this change; the automatic priority ranking above decides. Disabling a harness still hides it, as today.", "reason": "It adds a settings surface and localStorage state. Ask for it if you want it, and it becomes part of this change." }
+        },
+        {
+          "id": "c-disabled-members",
+          "type": "confirm",
+          "title": "Disabled harnesses",
+          "impact": "minor",
+          "recommendation": { "value": "A disabled account in no stack stays hidden (#201). A disabled **stack member** shows as a muted \"disabled\" dot on the stack chip and in the popover, so the stack's makeup stays honest.", "reason": "Hiding it would misstate the stack." }
+        },
+        {
+          "id": "c-one-member",
+          "type": "confirm",
+          "title": "One-account stacks",
+          "impact": "minor",
+          "recommendation": { "value": "A stack with fewer than 2 enabled members renders as a plain account chip: no stack marker and no \"fails over\" copy, per the harness-stacks rule \"One-account stacks\".", "reason": "Existing rule (`stackPositionText`)." }
+        },
+        {
+          "id": "c-tooltips",
+          "type": "confirm",
+          "title": "Tooltips and test hooks",
+          "impact": "minor",
+          "recommendation": { "value": "Icon buttons switch from native `title` to the portaled `ui/tooltip.tsx`, as the RunPanel header did. Accessible names (`Git`, `Worktrees`, `Settings`, `Import Claude Code sessions…`) and `data-testid`s stay unchanged, and the e2e `headerSettingsButton` helper moves to the accessible name.", "reason": "Consistent tooltips; minimal e2e churn." }
+        },
+        {
+          "id": "c-a11y",
+          "type": "confirm",
+          "title": "Keyboard and accessibility",
+          "impact": "minor",
+          "recommendation": { "value": "Chips and actions stay plain buttons in tab order. The overflow and More controls are menu buttons (`aria-haspopup`, `aria-expanded`, arrow keys, Escape returns focus). Hidden copies are `inert`. Status is never conveyed by color alone (tooltip or aria-label text). Every popover carries `data-popover-open`, closes on Escape and is portaled.", "reason": "WAI-ARIA menu-button pattern plus the repo's Escape-layering rule." }
+        },
+        {
+          "id": "c-drag",
+          "type": "confirm",
+          "title": "Window dragging",
+          "impact": "minor",
+          "recommendation": { "value": "Empty space in the bar, including the space around the chips, still drags the window, and double-clicking it still zooms. Only the controls themselves are `no-drag`.", "reason": "This preserves today's native title-bar behavior." }
+        },
+        {
+          "id": "c-scope",
+          "type": "confirm",
+          "title": "Platform and dependencies",
+          "impact": "minor",
+          "recommendation": { "value": "macOS only (traffic-light inset). No new npm dependency: the fit logic is hand-rolled (`ResizeObserver` plus `ui/context-menu.tsx`). No change to the CLI or TUI; `agetor harness ls` already shows stack and quota state.", "reason": "Matches the arm64-only release and the hand-rolled primitives in this repo." }
+        },
+        {
+          "id": "c-tests",
+          "type": "confirm",
+          "title": "Acceptance tests",
+          "impact": "minor",
+          "recommendation": { "value": "Unit tests for the pure fit, priority and stack-summary logic. Component tests with `renderToStaticMarkup`. A new e2e spec with 7 harnesses and a 2-member stack at 1440, 1100, 900 and your minimum width, at 100% and 170% zoom, and with RunPanel open: `scrollWidth == clientWidth`, the always-visible actions are clickable, overflow and More open and close with Escape, and the stack popover shows its members and cooldowns. All existing e2e specs stay green.", "reason": "The current tests can't see this bug class." }
+        },
+        {
+          "id": "c-docs",
+          "type": "confirm",
+          "title": "Docs",
+          "impact": "minor",
+          "recommendation": { "value": "A new `docs/architecture/app-bar.md` (layout, overflow policy, drag regions, zoom, RunPanel) added to CLAUDE.md's topic map; the app bar added to `harness-stacks.md` § Surfaces → Webview; `README.md` usage-meter line updated; the Grill-28 reversal recorded in the plan.", "reason": "Repo rule: update the subsystem doc in the same change." }
+        }
+      ]
+    }
+  ]
+}
