@@ -280,8 +280,10 @@ export function ContextMenu({ open, x, y, items, onClose, label = "Context menu"
               "flex w-full items-center gap-2 rounded-sm px-2 py-1.5 text-left outline-none transition-colors",
               "hover:bg-accent hover:text-accent-foreground focus-visible:bg-accent focus-visible:text-accent-foreground",
               isActive && "bg-accent text-accent-foreground",
-              item.danger && "text-destructive hover:text-destructive focus-visible:text-destructive",
-              isActive && item.danger && "text-destructive",
+              // `--danger`, not `--destructive`: the latter is 3.76:1 on the popover in
+              // light mode and 1.77:1 in dark, `--danger` is 4.7:1 / 6.59:1.
+              item.danger && "text-danger hover:text-danger focus-visible:text-danger",
+              isActive && item.danger && "text-danger",
               item.disabled && "pointer-events-none opacity-50",
             )}
           >

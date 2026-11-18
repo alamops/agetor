@@ -68,6 +68,7 @@ export default {
         "success-solid": "hsl(var(--success-solid))",
         "danger-solid": "hsl(var(--danger-solid))",
         "warning-solid": "hsl(var(--warning-solid))",
+        "warning-solid-foreground": "hsl(var(--warning-solid-foreground))",
       },
       borderRadius: {
         lg: "var(--radius)",

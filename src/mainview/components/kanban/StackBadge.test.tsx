@@ -25,6 +25,14 @@ describe("StackBadge", () => {
     expect(markup).toContain("Account 2 of 3 — fails over to the next account at its limit");
   });
 
+  test("is the card's one chip: h-5, fully rounded, with its text in a truncating span", () => {
+    const markup = html({ state: { position: 0, count: 2 } });
+    expect(markup).toContain("h-5");
+    expect(markup).toContain("rounded-full");
+    expect(markup).toContain('<span class="truncate">');
+    expect(markup).not.toContain("shrink-0");
+  });
+
   test("a pending swap shows the switch marker and explanation", () => {
     const markup = html({ state: { position: 0, count: 2, pendingSwap: { to: "b" } } });
     expect(markup).toContain("⇄");

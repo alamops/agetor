@@ -1,0 +1,118 @@
+/**
+ * Plain-text preview of a task prompt for the board card.
+ *
+ * A prompt is often a pasted spec: a heading, a table, a code block, then the
+ * actual ask. Showing the first two raw lines gave `# Spec — X | Field | Value`
+ * on the card. This keeps the first prose paragraph instead, with markdown
+ * syntax stripped. It is a rendering-only transform: the stored prompt stays
+ * raw, and the result is plain text (React escapes it; it never becomes HTML).
+ *
+ * Rules, in order:
+ *  1. Drop front matter (a leading `---` … `---` block).
+ *  2. Drop code fences (``` and ~~~, through the closing fence; an unclosed
+ *     fence drops the rest), HTML comments, headings, horizontal rules and
+ *     tables (`|`-led lines).
+ *  3. Split what is left on blank lines; the first block is the paragraph.
+ *     List items count as prose with their markers stripped.
+ *  4. Strip inline syntax (emphasis, inline code, links → text, images → alt,
+ *     `>` quote markers), collapse whitespace, cap at `maxChars`.
+ *  5. If no prose block exists, fall back to the whole prompt with the same
+ *     syntax stripped; if that is empty too, return `""` (the card omits the
+ *     line).
+ */
+export function promptPreview(prompt: string, maxChars = 280): string {
+  const text = prompt.replace(/\r\n?/g, "\n");
+  if (text.trim() === "") return "";
+
+  const withoutComments = text.replace(/<!--[\s\S]*?-->/g, "\n");
+  const lines = dropFrontMatter(withoutComments.split("\n"));
+
+  const prose = firstProseBlock(lines);
+  if (prose) return cap(stripInline(prose), maxChars);
+
+  // Nothing but headings, tables and fences: show what the prompt does say.
+  const fallback = withoutFences(lines)
+    .filter((l) => !isRule(l))
+    .map(stripLinePrefix)
+    .map((l) => l.replace(/^\s{0,3}#{1,6}\s+/, "").replace(/^\s*\|/, "").replace(/\|\s*$/, "").replace(/\s*\|\s*/g, " "))
+    .join(" ");
+  return cap(stripInline(fallback), maxChars);
+}
+
+function dropFrontMatter(lines: string[]): string[] {
+  if (lines[0]?.trim() !== "---") return lines;
+  for (let i = 1; i < lines.length; i++) {
+    if (lines[i]!.trim() === "---") return lines.slice(i + 1);
+  }
+  return lines;
+}
+
+/** Lines outside code fences; an unclosed fence swallows the rest. */
+function withoutFences(lines: string[]): string[] {
+  const out: string[] = [];
+  let fence: string | null = null;
+  for (const line of lines) {
+    if (fence) {
+      if (line.trim().startsWith(fence)) fence = null;
+      continue;
+    }
+    const open = /^\s{0,3}(```|~~~)/.exec(line);
+    if (open) fence = open[1]!;
+    else out.push(line);
+  }
+  return out;
+}
+
+const isRule = (l: string) => /^\s{0,3}([-*_])(\s*\1){2,}\s*$/.test(l);
+const isHeading = (l: string) => /^\s{0,3}#{1,6}(\s|$)/.test(l);
+const isTableLine = (l: string) => /^\s*\|/.test(l) || /^\s*:?-{3,}:?\s*(\|\s*:?-{3,}:?\s*)+\|?\s*$/.test(l);
+
+function firstProseBlock(lines: string[]): string {
+  let fence: string | null = null;
+  let block: string[] = [];
+  for (const line of lines) {
+    if (fence) {
+      if (line.trim().startsWith(fence)) fence = null;
+      continue;
+    }
+    const open = /^\s{0,3}(```|~~~)/.exec(line);
+    if (open) {
+      if (block.length > 0) break;
+      fence = open[1]!;
+      continue;
+    }
+    if (line.trim() === "") {
+      if (block.length > 0) break;
+      continue;
+    }
+    if (isHeading(line) || isRule(line) || isTableLine(line)) {
+      if (block.length > 0) break;
+      continue;
+    }
+    block.push(stripLinePrefix(line));
+  }
+  return block.join(" ");
+}
+
+/** Quote and list markers belong to a line's start, so strip them per line
+ *  (a hyphen inside a sentence must survive). */
+function stripLinePrefix(line: string): string {
+  return line.replace(/^\s*(?:>\s?)+/, "").replace(/^\s*(?:[-*+]|\d+[.)])\s+/, "");
+}
+
+function stripInline(s: string): string {
+  return s
+    .replace(/!\[([^\]]*)\]\([^)]*\)/g, "$1")
+    .replace(/\[([^\]]*)\]\([^)]*\)/g, "$1")
+    .replace(/`+([^`]*)`+/g, "$1")
+    .replace(/(\*\*|__)(.+?)\1/g, "$2")
+    .replace(/(^|[\s(])([*_])(\S(?:.*?\S)?)\2(?=$|[\s).,;:!?])/g, "$1$3")
+    .replace(/~~(.+?)~~/g, "$1")
+    .replace(/\s+/g, " ")
+    .trim();
+}
+
+function cap(s: string, maxChars: number): string {
+  if (s.length <= maxChars) return s;
+  return `${s.slice(0, Math.max(0, maxChars - 1)).trimEnd()}…`;
+}

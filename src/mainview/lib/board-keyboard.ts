@@ -1,0 +1,91 @@
+import type { Announcements, KeyboardCoordinateGetter } from "@dnd-kit/core";
+
+/**
+ * Keyboard dragging for the kanban board (dnd-kit `KeyboardSensor`).
+ *
+ * Space picks a card up and drops it, ← → jump to the previous / next
+ * column, Escape puts it back. Enter is not a drag key: it opens the task
+ * (the card's own `onKeyDown`). Tab is not an end key either, so focus can
+ * still leave the card without silently dropping it somewhere.
+ */
+export const BOARD_KEYBOARD_CODES = {
+  start: ["Space"],
+  cancel: ["Escape"],
+  end: ["Space"],
+};
+
+export interface BoardColumnRect {
+  id: string;
+  left: number;
+  width: number;
+}
+
+/**
+ * The `left` coordinate that centres a dragged card of `activeWidth` over the
+ * column one step in the arrow's direction, or `null` when there is none (up
+ * and down do nothing: columns have no vertical order, and the first and last
+ * column are the ends). `currentColumnId` null means "none yet": the card is
+ * not over a column, so the first step goes to the nearest end.
+ */
+export function nextColumnX(
+  code: string,
+  columns: BoardColumnRect[],
+  currentColumnId: string | null,
+  activeWidth: number,
+): number | null {
+  if (code !== "ArrowLeft" && code !== "ArrowRight") return null;
+  const ordered = [...columns].sort((a, b) => a.left - b.left);
+  if (ordered.length === 0) return null;
+  const at = currentColumnId == null ? -1 : ordered.findIndex((c) => c.id === currentColumnId);
+  let next: BoardColumnRect | undefined;
+  if (at === -1) next = code === "ArrowRight" ? ordered[0] : ordered[ordered.length - 1];
+  else next = ordered[at + (code === "ArrowRight" ? 1 : -1)];
+  if (!next) return null;
+  return next.left + next.width / 2 - activeWidth / 2;
+}
+
+/** dnd-kit coordinate getter: ← → move the card to the neighbouring column,
+ *  keeping its vertical position. The sensor scrolls the board when the target
+ *  column is off-screen. */
+export const boardKeyboardCoordinates: KeyboardCoordinateGetter = (event, { context, currentCoordinates }) => {
+  if (event.code !== "ArrowLeft" && event.code !== "ArrowRight") {
+    // Up / down would otherwise scroll the page under the held card.
+    if (event.code === "ArrowUp" || event.code === "ArrowDown") event.preventDefault();
+    return;
+  }
+  event.preventDefault();
+  const columns: BoardColumnRect[] = [];
+  for (const container of context.droppableContainers.getEnabled()) {
+    const rect = context.droppableRects.get(container.id);
+    if (rect) columns.push({ id: String(container.id), left: rect.left, width: rect.width });
+  }
+  const activeWidth = context.collisionRect?.width ?? context.draggingNodeRect?.width ?? 0;
+  let current: string | null = context.over ? String(context.over.id) : null;
+  if (current == null && context.collisionRect) {
+    const centre = context.collisionRect.left + context.collisionRect.width / 2;
+    current = columns.find((c) => centre >= c.left && centre <= c.left + c.width)?.id ?? null;
+  }
+  const x = nextColumnX(event.code, columns, current, activeWidth);
+  return x == null ? undefined : { x, y: currentCoordinates.y };
+};
+
+export const BOARD_SCREEN_READER_INSTRUCTIONS =
+  "To pick up a task, press Space. Use the left and right arrow keys to move it between columns, press Space to drop it, or Escape to cancel. Press Enter to open it.";
+
+/** Live-region announcements that name the task and the column. dnd-kit's
+ *  defaults read the draggable's id, which for a task is its UUID. */
+export function makeBoardAnnouncements(
+  titleOf: (id: string) => string,
+  columnLabelOf: (id: string) => string,
+): Announcements {
+  const title = (id: string | number) => titleOf(String(id)) || "task";
+  const column = (id: string | number) => columnLabelOf(String(id)) || "a column";
+  return {
+    onDragStart: ({ active }) => `Picked up ${title(active.id)}.`,
+    onDragOver: ({ active, over }) =>
+      over ? `${title(active.id)} is over ${column(over.id)}.` : `${title(active.id)} is not over a column.`,
+    onDragEnd: ({ active, over }) =>
+      over ? `${title(active.id)} was dropped in ${column(over.id)}.` : `${title(active.id)} was dropped.`,
+    onDragCancel: ({ active }) => `Moving ${title(active.id)} was cancelled.`,
+  };
+}
