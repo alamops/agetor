@@ -2145,8 +2145,9 @@ export const api = {
    *  tag. `url` is typically one of `taskDiffBlobUrl`'s / `pullBlobUrl`'s
    *  token-less outputs; the header is the only credential. Throws an `Error` whose
    *  message distinguishes a missing blob ("missing", 404) from one over
-   *  the server's size cap ("too-large", 413) from any other failure, so
-   *  callers can render a matching empty state. */
+   *  the server's size cap ("too-large", 413) from one the core couldn't read
+   *  ("denied", 403) from any other failure, so callers can render a matching
+   *  empty state. */
   fetchBlobBytes: async (url: string): Promise<ArrayBuffer> => {
     const res = await fetch(url, {
       headers: { "authorization": `Bearer ${API_TOKEN}` },
@@ -2154,6 +2155,7 @@ export const api = {
     if (!res.ok) {
       if (res.status === 404) throw new Error("missing");
       if (res.status === 413) throw new Error("too-large");
+      if (res.status === 403) throw new Error("denied");
       throw new Error(`${res.status} ${res.statusText}`);
     }
     return res.arrayBuffer();

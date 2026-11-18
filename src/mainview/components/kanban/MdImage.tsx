@@ -41,7 +41,12 @@
 // worktree first, then workdir — so a task whose worktree was later torn
 // down still finds the file via the source repo (D5). `MdImage` tries each
 // absolute candidate as an `<img src>` in turn via `onError`, falling back
-// to a warning chip only once every candidate has failed.
+// to a chip only once every candidate has failed. The fallback tells *why*
+// (`data-reason`): amber `not-found` only when every candidate 404'd; a 413
+// (`too-large`), a 403 where the core can't read the file for a preview
+// (`denied` — on macOS, a privacy-protected folder) or any other failure
+// (`unavailable`) draws the neutral chip from `lib/preview-copy.ts`. Every
+// local fallback still opens the file through `/open-path`.
 import { createContext, useContext, useEffect, useMemo, useState } from "react";
 import { createPortal } from "react-dom";
 import type React from "react";
@@ -52,6 +57,7 @@ import { cn } from "@/lib/utils";
 import { api, ApiError } from "@/lib/api";
 import { iconForRef, refBasename } from "@/lib/file-icons";
 import { classifyMdImageSrc } from "@/lib/md-image";
+import { NEUTRAL_CHIP_CLASS, previewFailureTitle } from "@/lib/preview-copy";
 import { AuthedImg } from "@/components/ui/authed-img";
 import { AttachmentNotFoundDialog, AttachmentOpenErrorDialog } from "./AttachmentDialogs";
 import type { MdComponents } from "./md-components";
@@ -112,6 +118,11 @@ export const MdImage: NonNullable<MdComponents["img"]> = ({ src, alt, title, nod
   // exists, so the chip must not say "not found", and a smaller file at a
   // later candidate (an older copy in the workdir) must not stand in for it.
   const [tooLarge, setTooLarge] = useState(false);
+  // Any candidate answered 403 (the core couldn't read it for a preview) or
+  // failed some other way (network, decode, 5xx). Neither says the file is
+  // gone, so the final chip must not claim "not found".
+  const [sawDenied, setSawDenied] = useState(false);
+  const [sawError, setSawError] = useState(false);
   const [notFoundPath, setNotFoundPath] = useState<string | null>(null);
   const [openError, setOpenError] = useState<{ path: string; message: string } | null>(null);
 
@@ -124,6 +135,8 @@ export const MdImage: NonNullable<MdComponents["img"]> = ({ src, alt, title, nod
     setCandidateIndex(0);
     setFailed(false);
     setTooLarge(false);
+    setSawDenied(false);
+    setSawError(false);
   }, [source]);
 
   const openLocalPath = async (path: string) => {
@@ -241,16 +254,33 @@ export const MdImage: NonNullable<MdComponents["img"]> = ({ src, alt, title, nod
     // already caught the !allowLocal case for both "file" and "local").
     if (source.candidates.length === 0 || failed) {
       const path = source.path;
+      // Precedence: a proven size refusal, then a read refusal, then any other
+      // failure; amber "not found" only when every candidate 404'd.
+      const reason = tooLarge
+        ? "too-large"
+        : sawDenied
+          ? "denied"
+          : sawError
+            ? "unavailable"
+            : "not-found";
+      const title =
+        reason === "too-large"
+          ? `Image too large to preview: ${path}`
+          : reason === "denied"
+            ? previewFailureTitle("denied", path)
+            : reason === "unavailable"
+              ? previewFailureTitle("error", path)
+              : previewFailureTitle("missing", path);
       content = (
         <button
           type="button"
           data-testid="md-image-fallback"
-          data-reason={tooLarge ? "too-large" : "not-found"}
-          title={tooLarge ? `Image too large to preview: ${path}` : `Image not found: ${path}`}
+          data-reason={reason}
+          title={title}
           onClick={(e) =>
             stopAnd(e, () => void openLocalPath(source.candidates[0] ?? path))
           }
-          className={FALLBACK_CHIP_CLASS}
+          className={reason === "not-found" ? FALLBACK_CHIP_CLASS : NEUTRAL_CHIP_CLASS}
         >
           <ImageOff className="size-3 shrink-0" aria-hidden />
           <span className="truncate">{refBasename(path)}</span>
@@ -263,9 +293,11 @@ export const MdImage: NonNullable<MdComponents["img"]> = ({ src, alt, title, nod
         <span className="inline-flex max-w-full flex-col items-start gap-0.5 align-middle">
           {/* Fetched with the auth header and shown as a `blob:` URL (D13/P9).
               `key` remounts the image per candidate so each candidate is
-              fetched at most once; any non-ok status (404, network, decode)
-              moves to the next candidate exactly as `onError` did. A 413
-              stops at this candidate: the file exists, it's just too big. */}
+              fetched at most once; any non-ok status (404, 403, network,
+              decode) moves to the next candidate exactly as `onError` did,
+              remembering a 403 / other failure so the final chip stays honest.
+              A 413 stops at this candidate: the file exists, it's just too
+              big. */}
           <AuthedImg
             key={currentPath}
             url={api.filePreviewUrl(currentPath)}
@@ -289,6 +321,8 @@ export const MdImage: NonNullable<MdComponents["img"]> = ({ src, alt, title, nod
                 setFailed(true);
                 return;
               }
+              if (status === "denied") setSawDenied(true);
+              else if (status === "error") setSawError(true);
               const next = candidateIndex + 1;
               if (next < source.candidates.length) setCandidateIndex(next);
               else setFailed(true);
