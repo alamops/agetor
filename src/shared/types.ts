@@ -394,7 +394,8 @@ export interface Harness {
    *  the home-derived block. Power-user surface. */
   env: Record<string, string>;
   /** Soft-delete flag. Disabled harnesses are hidden from the New Task
-   *  picker, the default-harness selector, and the window topbar, but the
+   *  picker, the default-harness selector, and the app bar's Harnesses button
+   *  and panel, but the
    *  row stays in the DB so historical `tasks.agent = <id>` references
    *  keep resolving. The orchestrator refuses to start new runs on a
    *  disabled harness; in-flight runs are unaffected. Built-ins are
@@ -1570,8 +1571,8 @@ export interface QuotaMeter {
 }
 
 /**
- * Normalized per-harness usage/quota snapshot, as surfaced by the topbar
- * usage tracker (`GET /usage`, `harness_usage` AppEvent). Distinct from
+ * Normalized per-harness usage/quota snapshot, as surfaced by the app bar's
+ * Harnesses button and panel (`GET /usage`, `harness_usage` AppEvent). Distinct from
  * `HarnessUsage` above — that type is task-count blast radius for the
  * disable-confirmation dialog and is unrelated to this feature.
  *
@@ -6695,6 +6696,12 @@ export interface RemoteAccessStatus {
  *  Only the native Remote Access… box may turn it on (plan §3.5). */
 export const REMOTE_ACCESS_PREF_KEY = "remoteAccess";
 
+/** The webview targets of the native menu bar (`src/bun/app-menu.ts`): the
+ *  "Settings…" item and the "Go" menu. The menu item ids are
+ *  `webview:<action>`; both sides validate against this list. */
+export const APP_MENU_ACTIONS = ["settings", "pipelines", "worktrees", "git", "import-sessions"] as const;
+export type AppMenuAction = (typeof APP_MENU_ACTIONS)[number];
+
 /**
  * App-level events the webview subscribes to over `GET /app/events`. Used
  * for cross-cutting flows that aren't tied to a single task — currently:
@@ -6710,9 +6717,16 @@ export const REMOTE_ACCESS_PREF_KEY = "remoteAccess";
  *                  §3.6).
  *   open_task    — a native notification deep-link (`agetor://task/<id>`)
  *                  was clicked. Webview opens that task's RunPanel.
+ *   menu_action  — a webview-targeted native menu item was clicked (Settings…
+ *                  or an item of the Go menu, `src/bun/app-menu.ts`). The
+ *                  event carries only the action id (`AppMenuAction`); the
+ *                  webview's `runMenuAction` opens the target. With no
+ *                  client attached the core parks it for 10 s and the next
+ *                  `/app/events` client receives it (`pending-open.ts`).
  *   harness_usage — the background usage poller (or a force-refresh) produced
  *                  a fresh `HarnessQuota` snapshot for one harness. Webview
- *                  updates that harness's topbar chip in place.
+ *                  updates that harness's row in the app bar's Harnesses panel
+ *                  (and the button's meter) in place.
  *   agent_models_changed — the model-discovery scheduler re-probed one or
  *                  more harnesses' CLI model catalogs and at least one list
  *                  changed. Webview refetches `GET /agent-models/harnesses`.
@@ -6747,6 +6761,11 @@ export type AppEvent =
   | {
       type: "open_task";
       taskId: string;
+      ts: number;
+    }
+  | {
+      type: "menu_action";
+      action: AppMenuAction;
       ts: number;
     }
   | {

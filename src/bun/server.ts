@@ -314,7 +314,7 @@ import {
   turnOffBackground,
   turnOnBackground,
 } from "./background.ts";
-import { consumePendingOpenTask } from "./pending-open.ts";
+import { consumePendingMenuAction, consumePendingOpenTask } from "./pending-open.ts";
 import {
   binaryPreviewKind,
   contentTypeForPreviewPath,
@@ -4433,7 +4433,7 @@ export function startApiServer(
           json({ version: pkg.version }, { headers: corsHeaders(req) })),
       },
 
-      // Double-clicking the custom app bar in App.tsx hits this route to
+      // Double-clicking the custom app bar (components/app-bar/AppBar.tsx) hits this route to
       // toggle the macOS "zoom" affordance. Electrobun's drag region only
       // wires startWindowMove/stopWindowMove on mousedown/mouseup, so the
       // native double-click-to-zoom gesture never reaches AppKit — the
@@ -9320,6 +9320,12 @@ export function startApiServer(
             const pendingTaskId = consumePendingOpenTask();
             if (pendingTaskId) {
               send({ type: "open_task", taskId: pendingTaskId, ts: Date.now() });
+            }
+            // Same for a native menu click made with no webview attached
+            // (app-menu.ts parks it for the TTL).
+            const pendingMenuAction = consumePendingMenuAction();
+            if (pendingMenuAction) {
+              send({ type: "menu_action", action: pendingMenuAction, ts: Date.now() });
             }
             // Same for the boot-time "Claude Code sessions found" notice: the
             // launch scan usually finishes before the webview connects.

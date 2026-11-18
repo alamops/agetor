@@ -48,6 +48,7 @@ import {
   broadcastAppEvent,
   consumeForceQuit,
   consumeQuitCompletely,
+  hasAppEventListeners,
   requestQuitCompletely,
 } from "./quit-guard.ts";
 import { liveSupervisor, requestSupervisorStop } from "./login-daemon-state.ts";
@@ -82,7 +83,8 @@ import { resolveNotifierApp } from "./notifier.ts";
 import { parseTaskDeepLink } from "./deep-link.ts";
 import { createTaskNotifier } from "./task-notifier.ts";
 import { installNotificationRemovalHooks } from "./notification-hooks.ts";
-import { setPendingOpenTask } from "./pending-open.ts";
+import { setPendingMenuAction, setPendingOpenTask } from "./pending-open.ts";
+import { buildAppMenu, deliverMenuAction, menuActionFromClick } from "./app-menu.ts";
 import pkg from "../../package.json" with { type: "json" };
 
 /** Drop a pid file in the data dir so out-of-process tools (notably
@@ -115,51 +117,7 @@ try {
  * can discover them.
  */
 function installNativeMenu() {
-  ApplicationMenu.setApplicationMenu([
-    {
-      label: "Agetor",
-      submenu: [
-        { role: "about" },
-        { type: "separator" },
-        { label: "Remote Access…", action: "remote-access" },
-        { type: "separator" },
-        { role: "hide", accelerator: "Cmd+H" },
-        { role: "hideOthers", accelerator: "Cmd+Alt+H" },
-        { role: "showAll" },
-        { type: "separator" },
-        { role: "quit", accelerator: "Cmd+Q" },
-        // Stops the background host too (D6): a plain quit parks the core under
-        // the login item when "run in the background" is on.
-        { label: "Quit Agetor Completely", action: "quit-completely", accelerator: "Cmd+Alt+Q" },
-      ],
-    },
-    {
-      label: "Edit",
-      submenu: [
-        { role: "undo", accelerator: "Cmd+Z" },
-        { role: "redo", accelerator: "Cmd+Shift+Z" },
-        { type: "separator" },
-        { role: "cut", accelerator: "Cmd+X" },
-        { role: "copy", accelerator: "Cmd+C" },
-        { role: "paste", accelerator: "Cmd+V" },
-        { role: "pasteAndMatchStyle", accelerator: "Cmd+Shift+Alt+V" },
-        { role: "delete" },
-        { role: "selectAll", accelerator: "Cmd+A" },
-      ],
-    },
-    {
-      label: "Window",
-      submenu: [
-        { role: "minimize", accelerator: "Cmd+M" },
-        { role: "zoom" },
-        { role: "close", accelerator: "Cmd+W" },
-        { type: "separator" },
-        { role: "toggleFullScreen", accelerator: "Ctrl+Cmd+F" },
-        { type: "separator" },
-        { role: "bringAllToFront" },
-      ],
-    },
-  ]);
+  ApplicationMenu.setApplicationMenu(buildAppMenu());
 }
 
 const VITE_PORT = 5173;
@@ -541,6 +499,21 @@ Electrobun.events.on("application-menu-clicked", (e: { data?: { action?: string 
     // before-quit reads this one-shot; with runs active it still asks first.
     requestQuitCompletely();
     Utils.quit();
+  } else {
+    // "Settings…" and the Go menu open something in the webview.
+    const menuAction = menuActionFromClick(action);
+    if (menuAction) {
+      deliverMenuAction(menuAction, {
+        hasListeners: hasAppEventListeners,
+        broadcast: broadcastAppEvent,
+        setPending: setPendingMenuAction,
+        hasWindow: () => getMainWindow() !== null,
+        focusWindow: () => {
+          focusMainWindow();
+        },
+        createWindow: () => windowLifecycle.createMainWindow(),
+      });
+    }
   }
 });
 
@@ -844,8 +817,8 @@ const windowLifecycle = makeWindowLifecycle({
     // + text but keeps inset traffic lights, letting the React header at the
     // top of App.tsx render full-bleed on the same row. `trafficLightOffset`
     // shifts the lights to vertically center inside that header's 40px (h-10)
-    // height — keep `x` here in sync with the header's left padding (`pl-20`
-    // in App.tsx).
+    // height — keep `x` here in sync with the app bar's `pl-[80px]` and its
+    // `h-[40px]` height (components/app-bar/AppBar.tsx).
     const mainWindow = new BrowserWindow({
       title: "Agetor",
       titleBarStyle: "hiddenInset",
