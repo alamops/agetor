@@ -77,10 +77,11 @@ interface ClackAnswer {
   options?: unknown;
 }
 let clackQueue: ClackAnswer[] = [];
-const clackCalls: Array<Pick<ClackAnswer, "kind" | "message" | "options">> = [];
+// `initialValue` is the option a select pre-selects (the wizard's seed).
+const clackCalls: Array<Pick<ClackAnswer, "kind" | "message" | "options"> & { initialValue?: unknown }> = [];
 
-function takeClack(kind: ClackPromptKind, message: string, options: unknown): unknown {
-  clackCalls.push({ kind, message, options });
+function takeClack(kind: ClackPromptKind, message: string, options: unknown, initialValue?: unknown): unknown {
+  clackCalls.push({ kind, message, options, initialValue });
   const next = clackQueue.shift();
   if (!next || next.kind !== kind) {
     throw new Error(`wizard asked ${kind} (${message}) but the script expected ${next?.kind ?? "nothing"}`);
@@ -96,7 +97,8 @@ mock.module("@clack/prompts", () => ({
   // A text prompt's placeholder is recorded as its `options`, so tests can
   // pin what an empty answer falls back to.
   text: async (opts: { message: string; placeholder?: string }) => takeClack("text", opts.message, opts.placeholder),
-  select: async (opts: { message: string; options: unknown }) => takeClack("select", opts.message, opts.options),
+  select: async (opts: { message: string; options: unknown; initialValue?: unknown }) =>
+    takeClack("select", opts.message, opts.options, opts.initialValue),
   multiselect: async (opts: { message: string; options: unknown }) =>
     takeClack("multiselect", opts.message, opts.options),
   confirm: async (opts: { message: string }) => takeClack("confirm", opts.message, undefined),
@@ -819,6 +821,25 @@ test("resolveInitialModel: but the base cursor id is kept", () => {
   // A covered variant of Argon is not a picker row; the bare id is.
   expect(resolveInitialModel("cursor", "gemini-4-argon-high", [])).toBe(DEFAULT_MODEL.cursor);
   expect(resolveInitialModel("cursor", "gemini-4-argon", [])).toBe("gemini-4-argon");
+});
+
+test("resolveInitialModel: codex/copilot — a built-in id their trusted catalog lacks is not a seed (it would be refused at start); no catalog or a logged-out one keeps it", () => {
+  const codex: DiscoveredModel[] = [{ id: "gpt-6.1-sol" }, { id: "gpt-6.2-sol", cliDefault: true }];
+  expect(resolveInitialModel("codex", "gpt-5.6-sol", codex)).toBe(DEFAULT_MODEL.codex);
+  expect(DEFAULT_MODEL.codex).toBe("gpt-6.1-sol");
+  // The owner's default is missing too: the CLI's own default row.
+  expect(resolveInitialModel("codex", "gpt-5.6-sol", [{ id: "gpt-6.2-sol", cliDefault: true }])).toBe("gpt-6.2-sol");
+  // Nothing trustworthy to judge by: the built-in row still seeds.
+  expect(resolveInitialModel("codex", "gpt-5.6-sol", [])).toBe("gpt-5.6-sol");
+  expect(resolveInitialModel("codex", "gpt-5.6-sol", codex, false)).toBe("gpt-5.6-sol");
+  // A built-in id the catalog lists is kept.
+  expect(resolveInitialModel("codex", "gpt-6.1-sol", codex)).toBe("gpt-6.1-sol");
+
+  const copilot: DiscoveredModel[] = [{ id: "gpt-6.1-sol" }];
+  expect(resolveInitialModel("copilot", "kimi-k3", copilot)).toBe(DEFAULT_MODEL.copilot);
+  expect(resolveInitialModel("copilot", "kimi-k3", [])).toBe("kimi-k3");
+  // Copilot's pinned Auto row is never dropped, so it always seeds.
+  expect(resolveInitialModel("copilot", "auto", copilot)).toBe("auto");
 });
 
 test("resolveInitialModel: a logged-out harness's discovered catalog is not consulted (mirrors mergeModelOptions rule 7) — discovered-only pref falls back, curated pref survives", () => {
@@ -2019,5 +2040,157 @@ describe("add wizard multi-repository (issue #291)", () => {
     const input = await wizard(client, o, "issue prompt", {});
     expect(clackCalls.map((c) => c.kind)).toEqual(["confirm"]);
     expect(input!.workdir).toBe(issueDir);
+  });
+});
+
+// ── dynamic model catalog: the wizard offers what the CLI's catalog lists ──────
+
+describe("add wizard — models, efforts and Speed the CLI's own catalog reports", () => {
+  const catalog: Record<string, DiscoveredModel[]> = {
+    "claude-code": [
+      { id: "opus-6", label: "Opus 6", efforts: ["low", "turbo", "max"], fast: true },
+      { id: "opus-5.5", label: "Opus 5.5", efforts: ["low", "medium", "high", "xhigh", "max"] },
+    ],
+    codex: [{ id: "gpt-6.2-sol", label: "GPT-6.2-Sol", efforts: ["low", "high"], fast: true, fastTier: "priority", cliDefault: true }],
+  };
+
+  function clientWith(models: Record<string, DiscoveredModel[]>) {
+    const { client, createTaskCalls } = makeWizardClient([{ path: "/src/backend", name: "backend" }]);
+    (client as unknown as { agentModels: () => Promise<Record<string, DiscoveredModel[]>> }).agentModels = async () => models;
+    return { client, createTaskCalls };
+  }
+
+  test("a model only the CLI lists leads the Model picker, its own effort ladder (with the unknown level) follows, and Speed is offered", async () => {
+    const { client } = clientWith(catalog);
+    resetWizardScript([
+      { kind: "text", value: "T" },
+      { kind: "text", value: "P" },
+      { kind: "select", value: "opus-6" }, // Model
+      { kind: "select", value: "turbo" }, // Effort
+      { kind: "select", value: "fast" }, // Speed
+      { kind: "multiselect", value: ["/src/backend"] },
+      { kind: "confirm", value: false },
+    ]);
+    const input = await wizard(client, parseAdd(["--agent", "claude-code", "--mode", "auto"]), undefined);
+    const select = (message: string) => clackCalls.find((c) => c.kind === "select" && c.message === message)!;
+    const modelRows = select("Model").options as { value: string; label: string }[];
+    expect(modelRows[0]).toMatchObject({ value: "opus-6", label: "Opus 6" });
+    expect(modelRows.map((r) => r.value)).toContain("mythos-5.2"); // curated-only rows still follow
+    const effortRows = select("Effort").options as { value: string; label: string }[];
+    expect(effortRows.map((r) => r.value)).toEqual(["max", "turbo", "low"]);
+    expect(effortRows.find((r) => r.value === "turbo")?.label).toBe("Turbo");
+    expect((select("Speed").options as { value: string }[]).map((r) => r.value)).toEqual(["off", "fast"]);
+    expect(input).toMatchObject({ model: "opus-6", effort: "turbo", speed: "fast" });
+  });
+
+  test("a hostile CLI label is escaped before it reaches the picker", async () => {
+    const hostile: Record<string, DiscoveredModel[]> = {
+      "claude-code": [{ id: "opus-6", label: "Opus\u001b[31m 6", description: "evil\u001b]0;pwned\u0007", efforts: ["high"] }],
+    };
+    const { client } = clientWith(hostile);
+    resetWizardScript([
+      { kind: "text", value: "T" },
+      { kind: "text", value: "P" },
+      { kind: "select", value: "opus-6" },
+      { kind: "select", value: "high" },
+      { kind: "multiselect", value: ["/src/backend"] },
+      { kind: "confirm", value: false },
+    ]);
+    await wizard(client, parseAdd(["--agent", "claude-code", "--mode", "auto"]), undefined);
+    const rows = clackCalls.find((c) => c.kind === "select" && c.message === "Model")!.options as { label: string; hint?: string }[];
+    const row = rows.find((r) => r.label.includes("Opus"))!;
+    expect(JSON.stringify(row)).not.toContain("\u001b");
+    expect(JSON.stringify(row)).not.toContain("\u0007");
+  });
+
+  test("codex: the Speed step appears from the discovered tier flag, and the CLI's default model is the picker's seed when the owner's pick is missing", async () => {
+    const { client } = clientWith(catalog);
+    (client as unknown as { listHarnesses: () => Promise<unknown> }).listHarnesses = async () => ({
+      harnesses: [{ id: "codex", kind: "codex", label: "Codex", isBuiltin: true, home: null, bin: null, env: {}, enabled: true }],
+      statuses: [],
+    });
+    resetWizardScript([
+      { kind: "text", value: "T" },
+      { kind: "text", value: "P" },
+      { kind: "select", value: "gpt-6.2-sol" },
+      { kind: "select", value: "high" },
+      { kind: "select", value: "fast" },
+      { kind: "multiselect", value: ["/src/backend"] },
+      { kind: "confirm", value: false },
+    ]);
+    const input = await wizard(client, parseAdd(["--agent", "codex", "--mode", "auto"]), undefined);
+    expect(clackCalls.some((c) => c.message === "Speed")).toBe(true);
+    expect(input).toMatchObject({ model: "gpt-6.2-sol", speed: "fast" });
+  });
+
+  /** The built-in codex harness, enabled, with `model` remembered as `lastModel:codex`. */
+  function rememberCodexModel(client: AgetorClient, model: string): void {
+    (client as unknown as { listHarnesses: () => Promise<unknown> }).listHarnesses = async () => ({
+      harnesses: [{ id: "codex", kind: "codex", label: "Codex", isBuiltin: true, home: null, bin: null, env: {}, enabled: true }],
+      statuses: [],
+    });
+    (client as unknown as { getPreferences: () => Promise<Record<string, string>> }).getPreferences = async () => ({
+      "lastModel:codex": model,
+    });
+  }
+
+  test("codex: a remembered built-in model the trusted catalog lacks is not offered, and the Model picker starts on the default", async () => {
+    const { client } = clientWith({
+      codex: [
+        { id: "gpt-6.1-sol", label: "GPT-6.1 Sol", efforts: ["low", "high"] },
+        { id: "gpt-6.2-sol", label: "GPT-6.2 Sol", efforts: ["low", "high"], cliDefault: true },
+      ],
+    });
+    rememberCodexModel(client, "gpt-5.6-sol");
+    resetWizardScript([
+      { kind: "text", value: "T" },
+      { kind: "text", value: "P" },
+      { kind: "select", value: "gpt-6.1-sol" }, // Model
+      { kind: "select", value: "high" }, // Effort
+      { kind: "multiselect", value: ["/src/backend"] },
+      { kind: "confirm", value: false },
+    ]);
+    await wizard(client, parseAdd(["--agent", "codex", "--mode", "auto"]), undefined);
+    const picker = clackCalls.find((c) => c.kind === "select" && c.message === "Model")!;
+    expect(picker.initialValue).toBe("gpt-6.1-sol");
+    const ids = (picker.options as { value: string }[]).map((r) => r.value);
+    expect(ids).toEqual(expect.arrayContaining(["gpt-6.1-sol", "gpt-6.2-sol"]));
+    expect(ids).not.toContain("gpt-5.6-sol");
+  });
+
+  test("codex: with no catalog yet, a remembered built-in model still seeds the Model picker", async () => {
+    const { client } = clientWith({});
+    rememberCodexModel(client, "gpt-5.6-sol");
+    resetWizardScript([
+      { kind: "text", value: "T" },
+      { kind: "text", value: "P" },
+      { kind: "select", value: "gpt-5.6-sol" }, // Model
+      { kind: "select", value: "high" }, // Effort
+      { kind: "multiselect", value: ["/src/backend"] },
+      { kind: "confirm", value: false },
+    ]);
+    const input = await wizard(client, parseAdd(["--agent", "codex", "--mode", "auto"]), undefined);
+    const picker = clackCalls.find((c) => c.kind === "select" && c.message === "Model")!;
+    expect(picker.initialValue).toBe("gpt-5.6-sol");
+    expect((picker.options as { value: string }[]).map((r) => r.value)).toContain("gpt-5.6-sol");
+    expect(input).toMatchObject({ model: "gpt-5.6-sol" });
+  });
+
+  test("non-interactive: --model opus-6 and an unknown --effort are accepted verbatim", async () => {
+    reset();
+    const { client, createTaskCalls } = makePlainClient();
+    currentClient = client;
+    await cmdAdd(["--title", "T", "--prompt", "P", "--agent", "claude-code", "--model", "opus-6", "--effort", "turbo"], flags());
+    expect(createTaskCalls[0]).toMatchObject({ model: "opus-6", effort: "turbo" });
+  });
+
+  test("wizardSpeedChoices: claude and codex offer Fast only for a model whose row says so", () => {
+    const rows = [
+      { id: "a", label: "A", fast: true },
+      { id: "b", label: "B" },
+    ];
+    expect(wizardSpeedChoices("claude-code", "a", "high", rows).map((o) => o.id)).toEqual(["off", "fast"]);
+    expect(wizardSpeedChoices("claude-code", "b", "high", rows)).toEqual([]);
+    expect(wizardSpeedChoices("codex", "a", "high", rows).map((o) => o.id)).toEqual(["off", "fast"]);
   });
 });

@@ -2152,6 +2152,9 @@ export const preferences = {
       [key, value, Date.now()],
     );
   },
+  delete(key: string): void {
+    db.run(`DELETE FROM preferences WHERE key = ?`, [key]);
+  },
 };
 
 /**

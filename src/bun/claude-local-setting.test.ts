@@ -57,8 +57,13 @@ test("claudeModelIdFromArg resolves the Sonnet 5.5 CLAUDE_MODEL_FLAG value back 
   expect(claudeModelIdFromArg("claude-sonnet-5-5")).toBe("sonnet-5.5");
 });
 
-test("claudeModelIdFromArg passes an unrecognized raw claude-* id through verbatim", () => {
-  expect(claudeModelIdFromArg("claude-opus-6")).toBe("claude-opus-6");
+test("claudeModelIdFromArg derives the friendly id of a raw claude-* id the table never listed (the rule), dated ids included", () => {
+  expect(claudeModelIdFromArg("claude-opus-6")).toBe("opus-6");
+  expect(claudeModelIdFromArg("claude-haiku-4-5-20251001")).toBe("haiku-4.5");
+});
+
+test("claudeModelIdFromArg passes a raw claude-* id the rule cannot shape through verbatim", () => {
+  expect(claudeModelIdFromArg("claude-3-5-sonnet-20241022")).toBe("claude-3-5-sonnet-20241022");
 });
 
 test("claudeModelIdFromArg returns null for claude's own aliases and the empty string", () => {
@@ -168,14 +173,57 @@ test("model: a display name absent from AGENT_OPTIONS resolves to 'unrepresentab
   expect(result).toEqual({ kind: "unrepresentable", setting: "model", raw: "Opus 6" });
 });
 
-test("model: a raw claude-<id> stdout display name passes through verbatim", () => {
-  const result = parseClaudeLocalSetting({
+test("model: a raw claude-<id> stdout display name resolves by the id rule, and one the rule cannot shape passes through verbatim", () => {
+  const rule = parseClaudeLocalSetting({
     setting: "model",
     args: "",
     stdout: "Set model to claude-opus-6 and saved as your default for new sessions",
     viaMirror: false,
   });
-  expect(result).toEqual({ kind: "model", id: "claude-opus-6" });
+  expect(rule).toEqual({ kind: "model", id: "opus-6" });
+  const verbatim = parseClaudeLocalSetting({
+    setting: "model",
+    args: "",
+    stdout: "Set model to claude-3-5-sonnet-20241022 and saved as your default for new sessions",
+    viaMirror: false,
+  });
+  expect(verbatim).toEqual({ kind: "model", id: "claude-3-5-sonnet-20241022" });
+});
+
+// --- dynamic model catalog: names and efforts only the CLI knows ---
+
+test("model: a display name the CLI itself reports resolves to its agetor id (longest word-boundary match), curated labels first", async () => {
+  const discovery = await import("./agent-discovery.ts");
+  discovery.__testing.resetForTests();
+  discovery.seedDiscoveryCache({ scope: "kind", kind: "claude-code" }, [
+    { id: "opus-6", label: "Opus 6" },
+    { id: "opus-6.1", label: "Opus 6.1 Preview" },
+  ]);
+  try {
+    const set = (name: string) =>
+      parseClaudeLocalSetting({ setting: "model", args: "", stdout: `Set model to ${name} and saved as your default for new sessions`, viaMirror: false });
+    expect(set("Opus 6")).toEqual({ kind: "model", id: "opus-6" });
+    expect(set("Opus 6.1 Preview (1M context)")).toEqual({ kind: "model", id: "opus-6.1" });
+    expect(set("Opus 5.5")).toEqual({ kind: "model", id: "opus-5.5" });
+    expect(set("Opus 7")).toEqual({ kind: "unrepresentable", setting: "model", raw: "Opus 7" });
+  } finally {
+    discovery.__testing.resetForTests();
+  }
+});
+
+test("effort: a level the CLI lists for some model is accepted when it passes the charset; others stay unrepresentable", async () => {
+  const discovery = await import("./agent-discovery.ts");
+  const effort = (level: string) =>
+    parseClaudeLocalSetting({ setting: "effort", args: "", stdout: `Set effort level to ${level}: something`, viaMirror: false });
+  discovery.__testing.resetForTests();
+  expect(effort("turbo")).toEqual({ kind: "unrepresentable", setting: "effort", raw: "turbo" });
+  discovery.seedDiscoveryCache({ scope: "kind", kind: "claude-code" }, [{ id: "opus-6", efforts: ["low", "turbo"] }]);
+  try {
+    expect(effort("turbo")).toEqual({ kind: "effort", id: "turbo" });
+    expect(effort("ultracode")).toEqual({ kind: "unrepresentable", setting: "effort", raw: "ultracode" });
+  } finally {
+    discovery.__testing.resetForTests();
+  }
 });
 
 // ---------------------------------------------------------------------------

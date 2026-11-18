@@ -1,6 +1,7 @@
 import { Badge } from "@/components/ui/badge";
 import { cn } from "@/lib/utils";
 import { agentProfileSummary } from "../../../shared/agent-profile.ts";
+import { modelDisplayName } from "../../../shared/model-display.ts";
 import type { AgentKind, AgentProfile, AgentProfileSnapshot, Harness } from "../../../shared/types.ts";
 import { AgentIcon } from "./AgentIcon";
 
@@ -58,7 +59,7 @@ export function AgentProfileCard({ profile, harnesses, variant, deleted, classNa
   const { kind, label, disabled: harnessDisabled } = resolveHarnessDisplay(profile, harnesses);
   const summary = agentProfileSummary({
     harnessLabel: label,
-    model: profile.model,
+    model: modelDisplayName(kind, profile.model),
     effort: profile.effort,
     mode: profile.mode,
   });

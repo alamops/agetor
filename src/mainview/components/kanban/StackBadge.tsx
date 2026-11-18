@@ -1,5 +1,6 @@
 import { cn } from "@/lib/utils";
 import { stackPositionFor } from "@/lib/stack-badge";
+import { modelDisplayName } from "../../../shared/model-display.ts";
 import type { HarnessStack } from "../../../shared/types.ts";
 
 /**
@@ -77,7 +78,7 @@ export function StackBadge({
   const cooling = coolingUntilMs != null && coolingUntilMs > Date.now();
   if (single && !pending && !scheduled && ex == null && !cooling) return null;
   const attempt = ex ? `attempt ${Math.min(ex.attempts + 1, ex.max)}/${ex.max}` : "";
-  const forModel = coolingModel ? ` for ${coolingModel}` : "";
+  const forModel = coolingModel ? ` for ${modelDisplayName(null, coolingModel)}` : "";
   const coolingDetail = cooling
     ? single
       ? `Its account is cooling${forModel} until ${new Date(coolingUntilMs).toLocaleString()}`

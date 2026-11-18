@@ -24,8 +24,10 @@ beforeAll(async () => {
   token = API_TOKEN;
 });
 
-afterAll(() => {
+afterAll(async () => {
   server?.stop?.();
+  // `bun test` shares one process: leave no discovered catalog behind.
+  (await import("./agent-discovery.ts")).__testing.resetForTests();
   // `bun test` runs every *.test.ts file in one process (see db.ts's own
   // comment on this), so a harness left behind here would otherwise leak
   // into any sibling test file's own harness-count/discovery assertions in

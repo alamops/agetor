@@ -89,7 +89,7 @@ test("antigravity is not catalog-scoped, so the three Argon rows show even when 
   expect(rows.length).toBe(AGENT_OPTIONS.antigravity.models.length);
 });
 
-test("antigravity: a differently named Argon id from `agy models` is appended after every curated row (the fallback if the curated ids are wrong)", () => {
+test("antigravity: a differently named Argon id from `agy models` is listed in CLI order, and curated rows the CLI did not report follow (the fallback if the curated ids are wrong)", () => {
   const discovered: DiscoveredModel[] = [
     { id: "gemini-4-argon-high" },
     { id: "gemini-4-argon" },
@@ -102,11 +102,13 @@ test("antigravity: a differently named Argon id from `agy models` is appended af
     selected: null,
   });
   const curatedCount = AGENT_OPTIONS.antigravity.models.length;
-  // Curated rows keep their order, including the ones discovery didn't report.
-  expect(ids(rows).slice(0, curatedCount)).toEqual(ids(AGENT_OPTIONS.antigravity.models));
-  // The discovered-only id lands after them, once, labelled with its id.
-  expect(ids(rows).slice(curatedCount)).toEqual(["gemini-4-argon"]);
-  expect(rows[curatedCount]?.label).toBe("gemini-4-argon");
+  // The CLI's order wins: its rows first, the discovered-only id (labelled
+  // with its id) appearing exactly where the CLI listed it.
+  expect(ids(rows).slice(0, 3)).toEqual(["gemini-4-argon-high", "gemini-4-argon", DEFAULT_MODEL.antigravity]);
+  expect(rows[1]?.label).toBe("gemini-4-argon");
+  // Every curated row is still offered, the unreported ones after the CLI's.
+  expect(rows.length).toBe(curatedCount + 1);
+  for (const m of AGENT_OPTIONS.antigravity.models) expect(ids(rows)).toContain(m.id);
   // A curated id that discovery also reported is not listed twice.
   expect(ids(rows).filter((id) => id === "gemini-4-argon-high").length).toBe(1);
 });

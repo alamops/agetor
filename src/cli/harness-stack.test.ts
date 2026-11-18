@@ -389,7 +389,7 @@ test("harness ls: several limit rows, quota with stale marker, escaped id, --jso
   expect(text).not.toContain("\u001b");
   expect(text).toContain("usage limit until");
   expect(text).toContain("rate limit until");
-  expect(text).toContain("for gpt-x");
+  expect(text).toContain("for GPT X"); // display name; the raw id stays in --json
   expect(text).toContain("5-hour 42%");
   expect(text).toContain("Weekly 10%");
   expect(text).toContain("stale");

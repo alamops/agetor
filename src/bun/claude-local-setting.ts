@@ -1,5 +1,7 @@
 import { AGENT_OPTIONS } from "../shared/types.ts";
 import { claudeModelIdFromArg } from "./agents.ts";
+import { getDiscoveredModels } from "./agent-discovery.ts";
+import { EFFORT_ID_RE } from "../shared/effort-check.ts";
 import type { LocalSettingInfo } from "./claude-tmux.ts";
 
 /**
@@ -70,10 +72,16 @@ export function claudeModelIdFromDisplayName(name: string): string | null {
   const stripped = stripModelQualifiers(name);
   if (!stripped) return null;
   const claudeIdToken = /^(claude-\S+)/.exec(stripped);
-  if (claudeIdToken) return claudeIdToken[1]!;
+  if (claudeIdToken) return claudeModelIdFromArg(claudeIdToken[1]!) ?? claudeIdToken[1]!;
   const lower = stripped.toLowerCase();
   let matched: { id: string; label: string } | null = null;
-  for (const opt of AGENT_OPTIONS["claude-code"].models) {
+  // Curated labels first, then the labels the CLI itself reports (a model
+  // agetor has no row for yet), the longest word-boundary match winning.
+  const candidates: { id: string; label: string }[] = [
+    ...AGENT_OPTIONS["claude-code"].models,
+    ...getDiscoveredModels("claude-code").flatMap((m) => (m.label ? [{ id: m.id, label: m.label }] : [])),
+  ];
+  for (const opt of candidates) {
     const l = opt.label.toLowerCase();
     // Word-boundary match (finding #4, §10 re-review) — see this function's
     // doc for why a bare `startsWith` over-matches a longer real name that
@@ -95,6 +103,14 @@ export function claudeModelIdFromDisplayName(name: string): string | null {
  * rather than silently dropped.
  */
 const CLAUDE_EFFORT_IDS = new Set(["max", "xhigh", "high", "medium", "low"]);
+
+/** An effort level the CLI itself lists for some model (`initialize`
+ *  `supportedEffortLevels`) and that is a plain token — a level newer than
+ *  this table, which `/effort` can then echo back. */
+function cliReportsClaudeEffort(candidate: string): boolean {
+  if (!EFFORT_ID_RE.test(candidate)) return false;
+  return getDiscoveredModels("claude-code").some((m) => m.efforts?.includes(candidate) === true);
+}
 
 /**
  * A `/model` outcome that resolved to an agetor model id — either claude
@@ -264,7 +280,7 @@ export function parseClaudeLocalSetting(info: LocalSettingInfo): ClaudeLocalSett
   const match = /^Set effort level to (\w+)/.exec(stdout);
   if (!match) return null;
   const candidate = match[1]!.toLowerCase();
-  return CLAUDE_EFFORT_IDS.has(candidate)
+  return CLAUDE_EFFORT_IDS.has(candidate) || cliReportsClaudeEffort(candidate)
     ? { kind: "effort", id: candidate }
     : { kind: "unrepresentable", setting: "effort", raw: candidate };
 }

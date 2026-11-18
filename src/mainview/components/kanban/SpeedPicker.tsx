@@ -24,6 +24,9 @@ export function showsSpeedPicker(options: readonly Speed[], value: Speed): boole
  * carries `data-value` and each segment `aria-pressed`, which is what tests
  * assert on. No label of its own: consumers render theirs (a `<dt>` in task
  * details, a field label elsewhere), gated on {@link showsSpeedPicker}.
+ *
+ * `fastHint` / `note` are optional lines rendered under the group; without
+ * either the DOM is unchanged.
  */
 export function SpeedPicker({
   options,
@@ -31,17 +34,24 @@ export function SpeedPicker({
   onChange,
   disabled,
   testId,
+  fastHint,
+  note,
 }: {
   options: readonly Speed[];
   value: Speed;
   onChange(s: Speed): void;
   disabled?: boolean;
   testId: string;
+  /** The CLI's own cost text for Fast, shown under the control while Fast is
+   *  selected (`speedNoticeFor`). */
+  fastHint?: string;
+  /** A short note shown under the control (e.g. "applies on the next run"). */
+  note?: string;
 }) {
   if (!showsSpeedPicker(options, value)) return null;
   const offered = options.includes(value);
   const hintFor = (id: Speed) => SPEED_OPTIONS.find((o) => o.id === id)?.hint;
-  return (
+  const group = (
     <div
       data-testid={testId}
       data-value={value}
@@ -82,5 +92,18 @@ export function SpeedPicker({
         </Button>
       )}
     </div>
+  );
+  // No hint and no note: the control's DOM is exactly the segmented group.
+  if (!fastHint && !note) return group;
+  return (
+    <>
+      {group}
+      {fastHint && value === "fast" && (
+        <p data-testid={`${testId}-hint`} className="mt-1 text-[11px] text-muted-foreground">{fastHint}</p>
+      )}
+      {note && (
+        <p data-testid={`${testId}-note`} className="mt-1 text-[11px] text-muted-foreground">{note}</p>
+      )}
+    </>
   );
 }

@@ -49,6 +49,7 @@ import { registerLeaveGuard, type LeaveGuard } from "@/lib/leave-guard";
 import { cn } from "@/lib/utils";
 import { AGENT_PROFILE_LIMITS } from "../../../shared/agent-profile.ts";
 import { PIPELINE_LIMITS } from "../../../shared/types.ts";
+import { modelDisplayName } from "../../../shared/model-display.ts";
 import type {
   BundleImportPlan,
   BundleIssue,
@@ -1195,7 +1196,7 @@ function AgentRow({
       <p className="mt-1.5 flex flex-wrap items-center gap-x-1.5 text-[11px] text-muted-foreground">
         {agent.harnessKind && <AgentIcon kind={agent.harnessKind} className="size-3 shrink-0" />}
         <span>
-          {agent.model}
+          {modelDisplayName(agent.harnessKind ?? null, agent.model)}
           {agent.effort ? ` · ${agent.effort}` : ""}
           {agent.mode ? ` · ${agent.mode}` : ""}
         </span>

@@ -117,7 +117,7 @@ test.describe("task card header layout", () => {
     await expect(harnessBadge(card)).toContainText("claude-code");
 
     // Row 2: `[model, mode].join(" · ")`.
-    await expect(card.getByText("opus · auto", { exact: true })).toBeVisible();
+    await expect(card.getByText("Opus · auto", { exact: true })).toBeVisible();
 
     // Row 3: the full title.
     await expect(card.getByText(title, { exact: true })).toBeVisible();
@@ -137,7 +137,7 @@ test.describe("task card header layout", () => {
 
     const icon = card.locator('[aria-label="Bug"]');
     const badge = harnessBadge(card);
-    const modelMode = card.getByText("opus · auto", { exact: true });
+    const modelMode = card.getByText("Opus · auto", { exact: true });
     const cardTitle = card.getByText(title, { exact: true });
     await expect(icon).toBeVisible();
     await expect(badge).toBeVisible();

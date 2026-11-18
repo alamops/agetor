@@ -14,6 +14,7 @@ import { useCountdown, fxPausedBadgeText, fxPausedBadgeTitle } from "@/lib/fx-au
 import { useConfirm } from "@/components/ui/confirm";
 import { taskTypeMeta, type HarnessLimitState, type HarnessStack, type Task } from "../../../shared/types.ts";
 import { sentFileBasename } from "../../../shared/sent-files.ts";
+import { asAgentKind, modelDisplayName } from "../../../shared/model-display.ts";
 import { isTaskFxPaused } from "../../../shared/fx-recovery.ts";
 import { importedSessionOf } from "../../../shared/imported-session.ts";
 import { isMultiRepoTask } from "../../../shared/multi-repo.ts";
@@ -330,7 +331,7 @@ function TaskCardImpl({ task, homeDir, stacks = [], limitStates = [], onStart, o
         </div>
         {(task.model || task.mode) && (
           <span className="self-end text-[10px] font-mono text-muted-foreground">
-            {[task.model, task.mode].filter(Boolean).join(" · ")}
+            {[task.model ? modelDisplayName(task.agentProfile?.harnessKind ?? asAgentKind(task.agent), task.model) : null, task.mode].filter(Boolean).join(" · ")}
           </span>
         )}
         <CardTitle className="text-sm break-words">{task.title}</CardTitle>

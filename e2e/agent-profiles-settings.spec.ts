@@ -274,9 +274,9 @@ test.describe("agent profiles — Settings surface", () => {
 
     const row = section.locator('[data-testid="agent-profile-row"]').filter({ hasText: WIDGET_BUILDER_NAME });
     await expect(row).toBeVisible();
-    // agentProfileSummary joins raw ids (not labels) for model/effort/mode.
+    // agentProfileSummary joins the model as a person reads it (modelDisplayName) and raw ids for effort/mode.
     await expect(row).toContainText("Claude Code");
-    await expect(row).toContainText("sonnet-5");
+    await expect(row).toContainText("Sonnet 5");
     await expect(row).toContainText("medium");
     await expect(row).toContainText("plan");
     await expect(row).toContainText(WIDGET_BUILDER_INSTRUCTIONS);

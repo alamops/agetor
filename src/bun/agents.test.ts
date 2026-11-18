@@ -32,6 +32,7 @@ const {
   isValidEnvKey,
   toTerminalAppleScript,  claudeModelPickerFamily,
   toClaudeModelArg,
+  claudeModelIdFromArg,
   spawnAgent,
   FAKE_FX_RECOVERY_PROMPT_MARKER,
   FAKE_FX_PERMISSION_PROMPT_MARKER,
@@ -3391,4 +3392,176 @@ test("no extraDirectories leaves every argv byte-identical", () => {
   const a = buildCommand(builtin("claude-code"), "p", { ...claudeDefaults });
   const b = buildCommand(builtin("claude-code"), "p", { ...claudeDefaults, extraDirectories: [] });
   expect(b.cmd).toEqual(a.cmd);
+});
+
+// --- dynamic model catalog: claude ids by rule, discovered efforts, Speed, cursor ---
+
+const { seedDiscoveryCache, __testing: discoveryTesting } = await import("./agent-discovery.ts");
+
+/** Seed the discovery cache the way a completed probe would, and always clean up. */
+function withDiscovered(
+  slot: { scope: "kind"; kind: AgentKind } | { scope: "harness"; kind: AgentKind; harnessId: string },
+  rows: import("../shared/model-options.ts").DiscoveredModel[],
+  run: () => void,
+): void {
+  discoveryTesting.resetForTests();
+  seedDiscoveryCache(slot, rows);
+  try {
+    run();
+  } finally {
+    discoveryTesting.resetForTests();
+  }
+}
+
+const LEGACY_CLAUDE_FLAGS: Record<string, string> = {
+  "mythos-5.2": "claude-mythos-5-2", "mythos-5.1": "claude-mythos-5-1", "fable-5.2": "claude-fable-5-2",
+  "fable-5.1": "claude-fable-5-1", "mythos-5": "claude-mythos-5", "fable-5": "claude-fable-5",
+  "opus-5.5": "claude-opus-5-5", "opus-5": "claude-opus-5", "opus-4.8": "claude-opus-4-8",
+  "opus-4.7": "claude-opus-4-7", "opus-4.6": "claude-opus-4-6", "sonnet-5.5": "claude-sonnet-5-5",
+  "sonnet-5": "claude-sonnet-5", "sonnet-4.6": "claude-sonnet-4-6", "haiku-5.5": "claude-haiku-5-5",
+  "haiku-4.5": "claude-haiku-4-5",
+};
+
+test("toClaudeModelArg: all 16 legacy ids keep today's exact string with no catalog, and a discovered id derives by rule", () => {
+  discoveryTesting.resetForTests();
+  for (const [id, cli] of Object.entries(LEGACY_CLAUDE_FLAGS)) expect(toClaudeModelArg(id), id).toBe(cli);
+  withDiscovered({ scope: "kind", kind: "claude-code" }, [{ id: "opus-6", cliId: "claude-opus-6" }], () => {
+    expect(toClaudeModelArg("opus-6")).toBe("claude-opus-6");
+    expect(toClaudeModelArg("opus-5.5")).toBe("claude-opus-5-5");
+  });
+  expect(toClaudeModelArg("opus-6")).toBe("claude-opus-6"); // the rule alone gets there too
+});
+
+test("claudeModelIdFromArg: the rule, a discovered cliId, and aliases still null", () => {
+  expect(claudeModelIdFromArg("claude-opus-6")).toBe("opus-6");
+  expect(claudeModelIdFromArg("claude-opus-5-5")).toBe("opus-5.5");
+  expect(claudeModelIdFromArg("opus")).toBeNull();
+  withDiscovered({ scope: "kind", kind: "claude-code" }, [{ id: "haiku-4.5", cliId: "claude-haiku-4-5-20251001" }], () => {
+    expect(claudeModelIdFromArg("claude-haiku-4-5-20251001")).toBe("haiku-4.5");
+  });
+});
+
+test("claudeModelPickerFamily: the discovered alias rows own the family rows; no catalog keeps the frozen mapping", () => {
+  discoveryTesting.resetForTests();
+  expect(claudeModelPickerFamily("opus-5.5")).toBe("Opus");
+  withDiscovered(
+    { scope: "kind", kind: "claude-code" },
+    [
+      { id: "opus-6", alias: "opus" },
+      { id: "sonnet-6", alias: "sonnet" },
+      { id: "opus-5.5" },
+      { id: "fable-6", alias: "fable" },
+      { id: "haiku-6", alias: "haiku" },
+    ],
+    () => {
+      expect(claudeModelPickerFamily("opus-6")).toBe("Opus");
+      expect(claudeModelPickerFamily("sonnet-6")).toBe("Sonnet");
+      expect(claudeModelPickerFamily("fable-6")).toBe("Fable");
+      expect(claudeModelPickerFamily("haiku-6")).toBe("Haiku");
+      // No longer the alias target: the picker would land on a different version.
+      expect(claudeModelPickerFamily("opus-5.5")).toBeNull();
+      expect(claudeModelPickerFamily("mythos-5.2")).toBeNull();
+    },
+  );
+});
+
+test("claude effort env: known ids pass, a CLI-listed unknown id passes, an unlisted or malformed one is dropped", () => {
+  discoveryTesting.resetForTests();
+  const envFor = (model: string, effort: string) =>
+    buildCommand(builtin("claude-code"), "p", { ...claudeDefaults, model, effort }).env?.CLAUDE_CODE_EFFORT_LEVEL;
+  expect(envFor("opus-5.5", "xhigh")).toBe("xhigh");
+  expect(envFor("opus-5.5", "turbo")).toBeUndefined();
+  withDiscovered({ scope: "kind", kind: "claude-code" }, [{ id: "opus-6", efforts: ["low", "turbo", "x y"] }], () => {
+    expect(envFor("opus-6", "turbo")).toBe("turbo");
+    expect(envFor("opus-6", "x y")).toBeUndefined();
+    expect(envFor("opus-6", "max")).toBe("max");
+  });
+});
+
+test("claude: a model only the CLI knows that reports no efforts declines effort (no throw), curated models still require one", () => {
+  withDiscovered(
+    { scope: "kind", kind: "claude-code" },
+    [{ id: "opus-6", efforts: ["low", "high"] }, { id: "tiny-1" }],
+    () => {
+      const noEffort = buildCommand(builtin("claude-code"), "p", { mode: "auto", model: "tiny-1", effort: null });
+      expect(noEffort.env?.CLAUDE_CODE_EFFORT_LEVEL).toBeUndefined();
+      expect(() => buildCommand(builtin("claude-code"), "p", { mode: "auto", model: "opus-6", effort: null })).toThrow(/effort is required/);
+    },
+  );
+  expect(() => buildCommand(builtin("claude-code"), "p", { mode: "auto", model: "opus-5.5", effort: null })).toThrow(/effort is required/);
+});
+
+test("codex -c model_reasoning_effort: known ids pass, a model-listed unknown id passes, an injection-shaped one is dropped", () => {
+  const argsFor = (effort: string) =>
+    buildCommand(builtin("codex"), "hi", { ...codexDefaults, model: "gpt-7", effort }).cmd;
+  discoveryTesting.resetForTests();
+  expect(argsFor("ultra")).toContain("model_reasoning_effort=ultra");
+  expect(argsFor("turbo").some((a) => a.startsWith("model_reasoning_effort="))).toBe(false);
+  withDiscovered({ scope: "harness", kind: "codex", harnessId: "codex" }, [{ id: "gpt-7", efforts: ["low", "turbo", "a;b"] }], () => {
+    expect(argsFor("turbo")).toContain("model_reasoning_effort=turbo");
+    expect(argsFor("a;b").some((a) => a.startsWith("model_reasoning_effort="))).toBe(false);
+  });
+});
+
+test("copilot --reasoning-effort goes through the same check; auto passes nothing", () => {
+  const opts = { mode: "auto", model: "gpt-7", runId: "run-1", sessionId: "s-1" } as const;
+  const flag = (effort: string) => {
+    const { cmd } = buildCommand(builtin("copilot"), "p", { ...opts, effort });
+    const i = cmd.indexOf("--reasoning-effort");
+    return i < 0 ? null : cmd[i + 1];
+  };
+  discoveryTesting.resetForTests();
+  expect(flag("high")).toBe("high");
+  expect(flag("turbo")).toBeNull();
+  expect(flag("auto")).toBeNull();
+  withDiscovered({ scope: "kind", kind: "copilot" }, [{ id: "gpt-7", efforts: ["turbo"] }], () => {
+    expect(flag("turbo")).toBe("turbo");
+  });
+});
+
+test("cursor: a discovered-only base composes its flat variant id through the discovered variant map; a curated spec still wins", () => {
+  const cmdModel = (model: string, effort: string, speed: "off" | "fast") => {
+    const { cmd, cursorModel } = buildCommand(builtin("cursor"), "p", { mode: "auto", model, effort, speed }) as { cmd: string[]; cursorModel?: string };
+    return cursorModel ?? cmd.join(" ");
+  };
+  discoveryTesting.resetForTests();
+  expect(cmdModel("gpt-7", "high", "fast")).toContain("gpt-7");
+  withDiscovered(
+    { scope: "kind", kind: "cursor" },
+    [{ id: "gpt-7", efforts: ["low", "high"], cursor: { effortIds: { low: "gpt-7-low", high: "gpt-7-high" }, fastEfforts: ["high"] } }],
+    () => {
+      expect(cmdModel("gpt-7", "high", "fast")).toBe("gpt-7-high-fast");
+      expect(cmdModel("gpt-7", "low", "fast")).toBe("gpt-7-low");
+      expect(cmdModel("grok-4.7", "high", "off")).toBe("grok-4.7-high");
+    },
+  );
+});
+
+test("Speed: claude adds the per-run fast setting only for a discovered fast model; codex adds the discovered tier; nothing else changes", () => {
+  const claude = (model: string, speed: "off" | "fast") =>
+    buildCommand(builtin("claude-code"), "p", { ...claudeDefaults, model, speed }).cmd;
+  const codex = (model: string, speed: "off" | "fast") =>
+    buildCommand(builtin("codex"), "p", { ...codexDefaults, model, speed }).cmd;
+  discoveryTesting.resetForTests();
+  expect(claude("opus-5.5", "fast")).not.toContain("--settings"); // nothing discovered: never
+  expect(codex("gpt-6.1-sol", "fast")).not.toContain('service_tier="priority"');
+  withDiscovered({ scope: "kind", kind: "claude-code" }, [{ id: "opus-5.5", fast: true }, { id: "sonnet-5.5" }], () => {
+    const on = claude("opus-5.5", "fast");
+    expect(on[on.indexOf("--settings") + 1]).toBe('{"fastMode":true}');
+    // The settings flag sits before the `--` prompt terminator.
+    expect(on.indexOf("--settings")).toBeLessThan(on.indexOf("--"));
+    expect(claude("opus-5.5", "off")).not.toContain("--settings");
+    expect(claude("sonnet-5.5", "fast")).not.toContain("--settings");
+  });
+  withDiscovered({ scope: "harness", kind: "codex", harnessId: "codex" }, [{ id: "gpt-6.1-sol", fast: true, fastTier: "priority" }, { id: "plain" }], () => {
+    const on = codex("gpt-6.1-sol", "fast");
+    expect(on).toContain('service_tier="priority"');
+    expect(on[on.indexOf('service_tier="priority"') - 1]).toBe("-c");
+    expect(codex("gpt-6.1-sol", "off")).not.toContain('service_tier="priority"');
+    expect(codex("plain", "fast").some((a) => a.includes("service_tier"))).toBe(false);
+  });
+  // A hostile tier id is never put in argv.
+  withDiscovered({ scope: "harness", kind: "codex", harnessId: "codex" }, [{ id: "gpt-6.1-sol", fast: true, fastTier: 'x"; rm -rf' }], () => {
+    expect(codex("gpt-6.1-sol", "fast").some((a) => a.includes("service_tier"))).toBe(false);
+  });
 });

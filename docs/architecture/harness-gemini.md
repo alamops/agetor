@@ -3,6 +3,7 @@
 > Moved from `CLAUDE.md`, where this was the `gemini` bullet of “Agent command shape”. Index of all subsystem docs: the [Topic map in CLAUDE.md](../../CLAUDE.md#topic-map).
 
 **`gemini`** → driven through `src/bun/gemini-tmux.ts`, architecturally a near-clone of codex's driver (one-shot per turn, hosted in a detached per-task tmux session for restart survival) — but with two real differences from codex, both verified empirically against a live spike (CLI 0.54.0, real API calls), not inferred from docs.
+**Model catalog:** Gemini CLI ≥ 0.67.0 lists its models with `gemini models -o json` (`src/bun/discovery/gemini-probe.ts`; rows carry `modelId`, `id`, `name`, `displayName`, `description`, no thinking levels). The subcommand runs only after `gemini --version` parses to ≥ 0.67.0, because an older CLI has no list and would take `models` as a prompt; an older, unparseable or failing CLI gives `[]` and the curated `AGENT_OPTIONS.gemini` stays in charge. The probe is stub-tested against the documented field list (gemini is not installed on the dev machine).
 Launch argv: `gemini -m <model> --output-format stream-json [--session-id <uuid> | --resume <uuid>] [--yolo | --approval-mode plan] --skip-trust -p <prompt>`.
 
 **(1) Session id is self-issued, not discovered**: agetor mints the uuid itself (mirrors claude's pre-generated-uuid pattern) and passes it via `--session-id` on the first turn / `--resume` on every follow-up — confirmed `--resume <uuid> -p "..."` correctly recalls context established under `--session-id <uuid>` on a prior turn.

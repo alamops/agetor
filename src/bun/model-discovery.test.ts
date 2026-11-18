@@ -1,5 +1,5 @@
 import { test, expect, beforeAll, afterAll, afterEach } from "bun:test";
-import { mkdtempSync, writeFileSync } from "node:fs";
+import { existsSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import path from "node:path";
 import type { AppEvent, HarnessStatus } from "../shared/types.ts";
@@ -15,6 +15,7 @@ import { plantFakeCodexAppServer } from "./test-codex-app-server.ts";
 process.env.AGETOR_DATA_DIR = mkdtempSync(path.join(tmpdir(), "agetor-model-discovery-"));
 
 let harnesses: typeof import("./db.ts").harnesses;
+let preferences: typeof import("./db.ts").preferences;
 let subscribeAppEvents: typeof import("./quit-guard.ts").subscribeAppEvents;
 let discovery: typeof import("./agent-discovery.ts");
 let scheduler: typeof import("./model-discovery.ts");
@@ -23,16 +24,28 @@ let scheduler: typeof import("./model-discovery.ts");
 // a binary that doesn't exist so a sweep here never spawns a real `opencode`.
 // The opencode tests below give each harness row its own stub `bin`.
 let prevOpencodeBin: string | undefined;
+// A full sweep also runs the claude `initialize` probe against the built-in
+// claude harness; point it at a missing binary so a sweep never spawns a real
+// `claude` (the claude tests below plant their own stub per test).
+let prevClaudeBin: string | undefined;
 
 afterAll(() => {
+  // `bun test` shares one process: leave no discovered catalog (or settle
+  // hook) behind for a later file's pre-flight.
+  scheduler.__testing.resetForTests();
+  discovery.__testing.resetForTests();
   if (prevOpencodeBin === undefined) delete process.env.AGETOR_OPENCODE_BIN;
   else process.env.AGETOR_OPENCODE_BIN = prevOpencodeBin;
+  if (prevClaudeBin === undefined) delete process.env.AGETOR_CLAUDE_BIN;
+  else process.env.AGETOR_CLAUDE_BIN = prevClaudeBin;
 });
 
 beforeAll(async () => {
   prevOpencodeBin = process.env.AGETOR_OPENCODE_BIN;
   process.env.AGETOR_OPENCODE_BIN = "/nonexistent/agetor-test-opencode";
-  ({ harnesses } = await import("./db.ts"));
+  prevClaudeBin = process.env.AGETOR_CLAUDE_BIN;
+  process.env.AGETOR_CLAUDE_BIN = "/nonexistent/agetor-test-claude";
+  ({ harnesses, preferences } = await import("./db.ts"));
   ({ subscribeAppEvents } = await import("./quit-guard.ts"));
   discovery = await import("./agent-discovery.ts");
   scheduler = await import("./model-discovery.ts");
@@ -193,6 +206,19 @@ test("noteHarnessStatuses: available false -> true schedules a debounced refresh
   scheduler.noteHarnessStatuses([makeStatus("avail-flip", { available: false, path: null, version: null, loggedIn: null })]);
   expect(scheduler.__testing.pendingRefreshCount()).toBe(0);
   scheduler.noteHarnessStatuses([makeStatus("avail-flip", { available: true })]);
+  expect(scheduler.__testing.pendingRefreshCount()).toBe(1);
+});
+
+test("noteHarnessStatuses: a --version probe that times out (version null on an available CLI) is no transition; a real version change still is", () => {
+  resetAll();
+  scheduler.noteHarnessStatuses([makeStatus("version-flap", { version: "0.0.6" })]);
+  // Under load `--version` times out: same CLI, no version this poll.
+  scheduler.noteHarnessStatuses([makeStatus("version-flap", { version: null })]);
+  expect(scheduler.__testing.pendingRefreshCount()).toBe(0);
+  scheduler.noteHarnessStatuses([makeStatus("version-flap", { version: "0.0.6" })]);
+  expect(scheduler.__testing.pendingRefreshCount()).toBe(0);
+  scheduler.noteHarnessStatuses([makeStatus("version-flap", { version: null })]);
+  scheduler.noteHarnessStatuses([makeStatus("version-flap", { version: "0.0.7" })]);
   expect(scheduler.__testing.pendingRefreshCount()).toBe(1);
 });
 
@@ -391,7 +417,7 @@ test("refreshHarnessModels: an efforts-only catalog change (same ids, different 
     await withCodexBin(plantFakeCodexAppServer({ pages: [[{ id: "m", efforts: ["low", "high"] }]] }), async () => {
       await scheduler.refreshHarnessModels("codex");
     });
-    expect(discovery.getDiscoveredModels("codex")).toEqual([{ id: "m", label: "m", efforts: ["low", "high"] }]);
+    expect(discovery.getDiscoveredModels("codex")).toEqual([{ id: "m", label: "m", efforts: ["low", "high"], defaultEffort: "low" }]);
     let changeEvents = events.filter((e): e is Extract<AppEvent, { type: "agent_models_changed" }> => e.type === "agent_models_changed");
     expect(changeEvents.some((e) => e.harnessIds.includes("codex"))).toBe(true);
     events.length = 0;
@@ -401,7 +427,7 @@ test("refreshHarnessModels: an efforts-only catalog change (same ids, different 
     await withCodexBin(plantFakeCodexAppServer({ pages: [[{ id: "m", efforts: ["low", "high", "ultra"] }]] }), async () => {
       await scheduler.refreshHarnessModels("codex");
     });
-    expect(discovery.getDiscoveredModels("codex")).toEqual([{ id: "m", label: "m", efforts: ["low", "high", "ultra"] }]);
+    expect(discovery.getDiscoveredModels("codex")).toEqual([{ id: "m", label: "m", efforts: ["low", "high", "ultra"], defaultEffort: "low" }]);
     changeEvents = events.filter((e): e is Extract<AppEvent, { type: "agent_models_changed" }> => e.type === "agent_models_changed");
     expect(changeEvents.some((e) => e.harnessIds.includes("codex"))).toBe(true);
     events.length = 0;
@@ -819,3 +845,339 @@ test("refreshAllModels: a disabled opencode harness is not probed", async () => 
   expect(discovery.getHarnessDiscoveredModels(created.id)).toEqual([]);
   expect(scheduler.getHarnessModelMap().byHarness[created.id]).toBeUndefined();
 }, 30_000);
+
+
+/* ── persisted catalog (modelCatalog:* preferences) ─────────────────────────── */
+
+const CLAUDE_KEY = "modelCatalog:kind:claude-code";
+
+/** A stub `claude` that answers `--version` and the `initialize` control request. */
+function plantClaudeStub(models: unknown[], opts: { account?: unknown } = {}): string {
+  const dir = mkdtempSync(path.join("/tmp", "agetor-md-claude-"));
+  const reply = path.join(dir, "reply.json");
+  writeFileSync(reply, `${JSON.stringify({ models, ...(opts.account ? { account: opts.account } : {}) })}\n`);
+  const bin = path.join(dir, "claude");
+  writeFileSync(
+    bin,
+    `#!/bin/sh
+if [ "$1" = "--version" ]; then echo "2.1.326 (Claude Code)"; exit 0; fi
+read line
+printf '{"type":"control_response","response":{"subtype":"success","request_id":"init-1","response":%s}}\\n' "$(cat "${reply}")"
+sleep 2
+`,
+    { mode: 0o755 },
+  );
+  return bin;
+}
+
+async function withClaudeBin(bin: string, run: () => Promise<void>): Promise<void> {
+  const prev = process.env.AGETOR_CLAUDE_BIN;
+  process.env.AGETOR_CLAUDE_BIN = bin;
+  try {
+    await run();
+  } finally {
+    if (prev === undefined) delete process.env.AGETOR_CLAUDE_BIN;
+    else process.env.AGETOR_CLAUDE_BIN = prev;
+  }
+}
+
+const OPUS6 = { value: "claude-opus-6", resolvedModel: "claude-opus-6", displayName: "Opus 6", supportsEffort: true, supportedEffortLevels: ["low", "turbo"] };
+
+test("refreshAllModels: a stub claude's catalog is cached, persisted without any account data, and an identical sweep rewrites nothing", async () => {
+  resetAll();
+  preferences.delete(CLAUDE_KEY);
+  const bin = plantClaudeStub([OPUS6], { account: { email: "leak@example.com", organization: "Leaky Org" } });
+  await withClaudeBin(bin, async () => {
+    await scheduler.refreshAllModels();
+  });
+  expect(discovery.getDiscoveredModels("claude-code").map((m) => m.id)).toEqual(["opus-6"]);
+  const stored = preferences.get(CLAUDE_KEY);
+  expect(stored).not.toBeNull();
+  expect(stored).not.toMatch(/leak@example\.com|Leaky Org|"account"|"email"|"organization"/);
+  const parsed = JSON.parse(stored as string) as { v: number; cliVersion: string | null; models: { id: string; cliId?: string }[] };
+  expect(parsed.v).toBe(1);
+  expect(parsed.models[0]).toMatchObject({ id: "opus-6", cliId: "claude-opus-6" });
+  expect(parsed.cliVersion).toContain("2.1.326");
+  await wait(5);
+  await withClaudeBin(bin, async () => {
+    await scheduler.refreshAllModels();
+  });
+  expect(preferences.get(CLAUDE_KEY)).toBe(stored); // same bytes, same savedAt: no write
+});
+
+test("refreshAllModels: the persisted catalog is served before any probe finishes, and a failed (offline) probe keeps it", async () => {
+  resetAll();
+  preferences.set(CLAUDE_KEY, JSON.stringify({ v: 1, cliVersion: "2.1.326 (Claude Code)", savedAt: 1, models: [{ id: "opus-6", label: "Opus 6", efforts: ["low", "turbo"], bogus: "dropped" }] }));
+  let pending: Promise<void> | null = null;
+  await withClaudeBin("/nonexistent/agetor-offline-claude", async () => {
+    pending = scheduler.refreshAllModels();
+    // Synchronously after the call: hydrated, nothing has been probed yet.
+    expect(discovery.getDiscoveredModels("claude-code")).toEqual([{ id: "opus-6", label: "Opus 6", efforts: ["low", "turbo"] }]);
+    await pending;
+  });
+  // The probe found nothing (binary missing), the catalog is kept and the row survives.
+  expect(discovery.getDiscoveredModels("claude-code").map((m) => m.id)).toEqual(["opus-6"]);
+  expect(preferences.get(CLAUDE_KEY)).not.toBeNull();
+});
+
+test("settle: a new CLI version or an unavailable harness drops the stale catalog; the same version keeps it", () => {
+  resetAll();
+  const rows = [{ id: "opus-6" }];
+  const key = { scope: "kind", kind: "claude-code" } as const;
+  preferences.set(CLAUDE_KEY, JSON.stringify({ v: 1, cliVersion: "1.0.0", savedAt: 1, models: rows }));
+  scheduler.__testing.hydrateFromStore();
+  // Same version, transient empty: kept.
+  scheduler.noteHarnessStatuses([makeStatus("claude-code", { kind: "claude-code", version: "1.0.0" })]);
+  expect(scheduler.__testing.settleCatalog(key, [], rows)).toEqual(rows);
+  expect(preferences.get(CLAUDE_KEY)).not.toBeNull();
+  // The CLI was upgraded: an empty probe drops it, stored row included.
+  scheduler.noteHarnessStatuses([makeStatus("claude-code", { kind: "claude-code", version: "2.0.0" })]);
+  expect(scheduler.__testing.settleCatalog(key, [], rows)).toEqual([]);
+  expect(preferences.get(CLAUDE_KEY)).toBeNull();
+  // Unavailable: dropped too.
+  preferences.set(CLAUDE_KEY, JSON.stringify({ v: 1, cliVersion: "2.0.0", savedAt: 1, models: rows }));
+  resetAll();
+  scheduler.__testing.hydrateFromStore();
+  scheduler.noteHarnessStatuses([makeStatus("claude-code", { kind: "claude-code", version: "2.0.0", available: false })]);
+  expect(scheduler.__testing.settleCatalog(key, [], rows)).toEqual([]);
+  expect(preferences.get(CLAUDE_KEY)).toBeNull();
+});
+
+test("hydrate: malformed rows, unknown kinds, per-harness kinds under a kind key and ghost harnesses are ignored", () => {
+  resetAll();
+  preferences.set("modelCatalog:kind:claude-code", "not json");
+  preferences.set("modelCatalog:kind:bogus", JSON.stringify({ v: 1, cliVersion: null, savedAt: 1, models: [{ id: "x" }] }));
+  preferences.set("modelCatalog:kind:codex", JSON.stringify({ v: 1, cliVersion: null, savedAt: 1, models: [{ id: "x" }] }));
+  preferences.set("modelCatalog:harness:ghost", JSON.stringify({ v: 1, cliVersion: null, savedAt: 1, models: [{ id: "x" }] }));
+  preferences.set("modelCatalog:kind:gemini", JSON.stringify({ v: 2, cliVersion: null, savedAt: 1, models: [{ id: "x" }] }));
+  preferences.set("modelCatalog:kind:antigravity", JSON.stringify({ v: 1, cliVersion: null, savedAt: 1, models: "nope" }));
+  scheduler.__testing.hydrateFromStore();
+  for (const kind of ["claude-code", "codex", "gemini", "antigravity"] as const) {
+    expect(discovery.getDiscoveredModels(kind), kind).toEqual([]);
+  }
+  expect(discovery.getHarnessDiscoveredModels("ghost")).toEqual([]);
+  for (const k of ["claude-code", "bogus", "codex", "gemini", "antigravity"]) preferences.delete(`modelCatalog:kind:${k}`);
+  preferences.delete("modelCatalog:harness:ghost");
+});
+
+test("a per-harness catalog is persisted under its harness key and hydrated back, kind slot included for the built-in", async () => {
+  resetAll();
+  preferences.delete("modelCatalog:harness:codex");
+  const wasEnabled = harnesses.get("codex")?.enabled ?? false;
+  harnesses.setEnabled("codex", true);
+  try {
+    await withCodexBin(plantFakeCodexAppServer({ pages: [[{ id: "m1", displayName: "M One", efforts: ["low", "high"] }]] }), async () => {
+      await scheduler.refreshHarnessModels("codex");
+    });
+    const stored = preferences.get("modelCatalog:harness:codex");
+    expect(stored).not.toBeNull();
+    expect(preferences.get("modelCatalog:kind:codex")).toBeNull();
+    resetAll();
+    scheduler.__testing.hydrateFromStore();
+    expect(discovery.getHarnessDiscoveredModels("codex").map((m) => m.id)).toEqual(["m1"]);
+    expect(discovery.getDiscoveredModels("codex").map((m) => m.id)).toEqual(["m1"]);
+    // Removing a harness drops its stored catalog.
+    scheduler.noteHarnessRemoved("codex");
+    expect(preferences.get("modelCatalog:harness:codex")).toBeNull();
+  } finally {
+    harnesses.setEnabled("codex", wasEnabled);
+    preferences.delete("modelCatalog:harness:codex");
+  }
+});
+
+test("kindTargets: a sweep skips the copilot ACP probe while a copilot catalog is held; a manual refresh and a first catalog do not", async () => {
+  resetAll();
+  const copilot = harnesses.get("copilot");
+  expect(copilot).not.toBeNull();
+  const wasEnabled = copilot?.enabled ?? false;
+  harnesses.setEnabled("copilot", true);
+  try {
+    // No catalog yet: even a sweep probes (a first catalog is wanted).
+    expect((await scheduler.__testing.kindTargets({ sweep: true })).copilot?.skip).toBeUndefined();
+    discovery.seedDiscoveryCache({ scope: "kind", kind: "copilot" }, [{ id: "gpt-6.1-sol" }]);
+    // Held: a sweep never re-opens an ACP session for it...
+    expect((await scheduler.__testing.kindTargets({ sweep: true })).copilot?.skip).toBe(true);
+    // ...but a manual refresh / status change / version change does.
+    expect((await scheduler.__testing.kindTargets()).copilot?.skip).toBeUndefined();
+  } finally {
+    harnesses.setEnabled("copilot", wasEnabled);
+    resetAll();
+  }
+});
+
+test("refreshAllModels: a held copilot catalog stored under no CLI version, or under another one, is re-probed by the sweep and re-stamped; the same version is not", async () => {
+  resetAll();
+  const statusTesting = (await import("./agent-status.ts")).__testing;
+  statusTesting.clearStatusCache();
+  const copilot = harnesses.get("copilot");
+  expect(copilot).not.toBeNull();
+  const wasEnabled = copilot?.enabled ?? false;
+  harnesses.setEnabled("copilot", true);
+  // A stub copilot that reports a version, answers `help config` with one
+  // model, and logs every invocation but `--version`.
+  const dir = mkdtempSync(path.join("/tmp", "agetor-md-copilot-ver-"));
+  const log = path.join(dir, "calls.log");
+  const bin = path.join(dir, "copilot");
+  const version = "GitHub Copilot CLI 1.0.200";
+  writeFileSync(
+    bin,
+    `#!/bin/sh\nif [ "$1" = "--version" ]; then echo '${version}'; exit 0; fi\necho "$*" >> '${log}'\n` +
+      `if [ "$1" = "help" ]; then printf 'model:\\n  - "gpt-6.2-sol"\\n'; fi\nexit 0\n`,
+    { mode: 0o755 },
+  );
+  const probes = (): string[] => (existsSync(log) ? readFileSync(log, "utf8").split("\n").filter(Boolean) : []);
+  const store = (cliVersion: string | null): void => {
+    preferences.set(
+      "modelCatalog:kind:copilot",
+      JSON.stringify({ v: 1, cliVersion, savedAt: Date.now(), models: [{ id: "gpt-6.1-sol" }] }),
+    );
+  };
+  const storedVersion = (): unknown => JSON.parse(preferences.get("modelCatalog:kind:copilot") ?? "{}").cliVersion;
+  const fresh = (): void => {
+    resetAll();
+    statusTesting.clearStatusCache();
+    rmSync(log, { force: true });
+  };
+  const prevBin = process.env.AGETOR_COPILOT_BIN;
+  const prevProbe = process.env.AGETOR_COPILOT_ACP_PROBE;
+  process.env.AGETOR_COPILOT_BIN = bin;
+  // `help config` only, so the test needs no ACP stub.
+  process.env.AGETOR_COPILOT_ACP_PROBE = "0";
+  try {
+    // Saved before the CLI version was known (a slow first `--version`):
+    // re-probed, replaced, and stamped with the installed version...
+    store(null);
+    scheduler.__testing.hydrateFromStore();
+    expect(discovery.getDiscoveredModels("copilot").map((m) => m.id)).toEqual(["gpt-6.1-sol"]);
+    await scheduler.refreshAllModels();
+    expect(probes().length).toBeGreaterThan(0);
+    expect(discovery.getDiscoveredModels("copilot").map((m) => m.id)).toEqual(["gpt-6.2-sol"]);
+    expect(storedVersion()).toBe(version);
+    // ...so the next sweep leaves it alone.
+    rmSync(log, { force: true });
+    await scheduler.refreshAllModels();
+    expect(probes()).toEqual([]);
+
+    // Saved under the installed version: the sweep leaves it alone.
+    fresh();
+    store(version);
+    scheduler.__testing.hydrateFromStore();
+    await scheduler.refreshAllModels();
+    expect(probes()).toEqual([]);
+    expect(discovery.getDiscoveredModels("copilot").map((m) => m.id)).toEqual(["gpt-6.1-sol"]);
+
+    // Saved under an older build (upgraded while the app was closed).
+    fresh();
+    store("GitHub Copilot CLI 1.0.100");
+    scheduler.__testing.hydrateFromStore();
+    await scheduler.refreshAllModels();
+    expect(probes().length).toBeGreaterThan(0);
+    expect(discovery.getDiscoveredModels("copilot").map((m) => m.id)).toEqual(["gpt-6.2-sol"]);
+    expect(storedVersion()).toBe(version);
+  } finally {
+    if (prevBin === undefined) delete process.env.AGETOR_COPILOT_BIN;
+    else process.env.AGETOR_COPILOT_BIN = prevBin;
+    if (prevProbe === undefined) delete process.env.AGETOR_COPILOT_ACP_PROBE;
+    else process.env.AGETOR_COPILOT_ACP_PROBE = prevProbe;
+    harnesses.setEnabled("copilot", wasEnabled);
+    preferences.delete("modelCatalog:kind:copilot");
+    statusTesting.clearStatusCache();
+    resetAll();
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test("refreshAllModels: a sweep probes copilot for a first catalog, never re-probes one it holds (and keeps it), while refreshHarnessModels does probe", async () => {
+  resetAll();
+  preferences.delete("modelCatalog:kind:copilot");
+  const copilot = harnesses.get("copilot");
+  expect(copilot).not.toBeNull();
+  const wasEnabled = copilot?.enabled ?? false;
+  harnesses.setEnabled("copilot", true);
+  // A stub copilot that records every invocation and answers nothing.
+  const dir = mkdtempSync(path.join("/tmp", "agetor-md-copilot-"));
+  const log = path.join(dir, "calls.log");
+  const bin = path.join(dir, "copilot");
+  writeFileSync(bin, `#!/bin/sh\necho "$*" >> '${log}'\nexit 0\n`, { mode: 0o755 });
+  const calls = (): string[] => (existsSync(log) ? readFileSync(log, "utf8").split("\n").filter(Boolean) : []);
+  // Only a catalog probe counts: a `--version` status probe is not one.
+  const probes = (): string[] => calls().filter((line) => line !== "--version");
+  const prevBin = process.env.AGETOR_COPILOT_BIN;
+  process.env.AGETOR_COPILOT_BIN = bin;
+  try {
+    // A held catalog (seeded before any probe settles the slot): the sweep
+    // spawns no probe at all, and the catalog survives it.
+    discovery.seedDiscoveryCache({ scope: "kind", kind: "copilot" }, [{ id: "gpt-6.1-sol", label: "GPT-6.1 Sol" }]);
+    await scheduler.refreshAllModels();
+    expect(probes()).toEqual([]);
+    expect(discovery.getDiscoveredModels("copilot").map((m) => m.id)).toEqual(["gpt-6.1-sol"]);
+
+    // A manual refresh (or a status / version change) re-probes; its empty
+    // answer is transient, so the held catalog is kept.
+    await scheduler.refreshHarnessModels("copilot");
+    expect(probes().length).toBeGreaterThan(0);
+    expect(discovery.getDiscoveredModels("copilot").map((m) => m.id)).toEqual(["gpt-6.1-sol"]);
+
+    // No catalog: the sweep probes for a first one.
+    resetAll();
+    rmSync(log, { force: true });
+    await scheduler.refreshAllModels();
+    expect(probes().length).toBeGreaterThan(0);
+  } finally {
+    if (prevBin === undefined) delete process.env.AGETOR_COPILOT_BIN;
+    else process.env.AGETOR_COPILOT_BIN = prevBin;
+    harnesses.setEnabled("copilot", wasEnabled);
+    preferences.delete("modelCatalog:kind:copilot");
+    resetAll();
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test("preflightCatalogFor: a catalog probed under another CLI version judges nothing; the same or an unknown version does", async () => {
+  resetAll();
+  preferences.delete("modelCatalog:harness:codex");
+  const codexHarness = harnesses.get("codex");
+  expect(codexHarness).not.toBeNull();
+  if (!codexHarness) return;
+  const row = { id: "m1", label: "M One" };
+  try {
+    preferences.set(
+      "modelCatalog:harness:codex",
+      JSON.stringify({ v: 1, cliVersion: "codex-cli 0.166.0", savedAt: 1, models: [row] }),
+    );
+    discovery.seedDiscoveryCache({ scope: "harness", kind: "codex", harnessId: "codex" }, [row]);
+    const wasEnabled = codexHarness.enabled;
+    harnesses.setEnabled("codex", true);
+    scheduler.__testing.resetForTests();
+    scheduler.__testing.hydrateFromStore();
+    try {
+      expect(scheduler.preflightCatalogFor(codexHarness, "codex-cli 0.166.0").map((m) => m.id)).toEqual(["m1"]);
+      expect(scheduler.preflightCatalogFor(codexHarness, null).map((m) => m.id)).toEqual(["m1"]);
+      expect(scheduler.preflightCatalogFor(codexHarness, "codex-cli 0.170.0")).toEqual([]);
+    } finally {
+      harnesses.setEnabled("codex", wasEnabled);
+    }
+  } finally {
+    preferences.delete("modelCatalog:harness:codex");
+    resetAll();
+  }
+});
+
+test("kindTargets: the built-in claude harness gets its own env, bin and an empty probe cwd; a disabled one gets none", async () => {
+  resetAll();
+  await withClaudeBin("/nonexistent/agetor-offline-claude", async () => {
+    const targets = await scheduler.__testing.kindTargets();
+    const claude = targets["claude-code"];
+    expect(claude?.bin).toBe("/nonexistent/agetor-offline-claude");
+    expect(claude?.skip).toBe(true); // not installed -> no spawn
+    expect(claude?.cwd).toMatch(/discovery\/probe-cwd$/);
+    expect(targets.copilot?.env.COPILOT_HOME).toBeTruthy();
+  });
+  const was = harnesses.get("claude-code")?.enabled ?? true;
+  harnesses.setEnabled("claude-code", false);
+  try {
+    expect((await scheduler.__testing.kindTargets())["claude-code"]).toBeUndefined();
+  } finally {
+    harnesses.setEnabled("claude-code", was);
+  }
+});

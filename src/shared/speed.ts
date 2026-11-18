@@ -13,8 +13,11 @@
  *   models carry them is only known from discovery (`models --json` ≥0.0.14
  *   `models[].fast` / `.ultrafast`), so fx offers them only when the
  *   selected model option says so;
+ * - codex and claude offer `fast` when the CLI's own catalog says the
+ *   selected model has a faster tier (`DISCOVERED_SPEED_KINDS`);
  * - every other kind offers `off` only.
  */
+import type { CursorVariantSpecShape } from "./model-options";
 import { cursorModelSupportsFast, SPEEDS, type AgentKind, type AgentOption, type Speed } from "./types";
 
 export function isSpeed(v: unknown): v is Speed {
@@ -50,14 +53,26 @@ export interface SpeedOptionFlags {
   ultrafast?: boolean;
 }
 
+/**
+ * Kinds whose Speed tiers come from the CLI's own per-model catalog flags
+ * (`ModelOption.fast`): fx always; codex (`-c service_tier=…`) and claude
+ * (`--settings '{"fastMode":true}'`) because the wave-0 spikes proved a
+ * per-run switch for each (`docs/plans/dynamic-model-catalog-spikes.md`
+ * G1/G2). Cursor derives Fast from its variant map instead.
+ */
+export const DISCOVERED_SPEED_KINDS: ReadonlySet<AgentKind> = new Set<AgentKind>(["fx", "codex", "claude-code"]);
+
 /** The tiers a kind/model/effort offers, always starting with `"off"`. */
 export function supportedSpeeds(
   kind: AgentKind,
   model: string | null,
   effort: string | null,
-  option?: SpeedOptionFlags,
+  option?: SpeedOptionFlags & { cursor?: CursorVariantSpecShape },
 ): Speed[] {
-  if (kind === "cursor") return cursorModelSupportsFast(model, effort) ? ["off", "fast"] : ["off"];
+  if (kind === "cursor") return cursorModelSupportsFast(model, effort, option?.cursor) ? ["off", "fast"] : ["off"];
+  if (kind === "codex" || kind === "claude-code") {
+    return DISCOVERED_SPEED_KINDS.has(kind) && option?.fast === true ? ["off", "fast"] : ["off"];
+  }
   if (kind === "fx") {
     const out: Speed[] = ["off"];
     if (option?.fast === true) out.push("fast");

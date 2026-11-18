@@ -44,7 +44,7 @@ Coding agents are good enough now that the limiting factor is you: one terminal,
 - **Eight harnesses, many accounts.** Run Claude Code, Codex, Cursor, Gemini CLI, fx, Antigravity, GitHub Copilot and OpenCode side by side. To use a second account, add a harness with its own home directory (`$HOME`, or the CLI's own config-dir variable). For GitHub Copilot that is a separate `COPILOT_HOME`; whether it also keeps the login separate isn't verified yet, see the [GitHub Copilot notes](#github-copilot-notes).
 - **Agents (reusable profiles).** Save a harness, model, effort, mode, speed, instructions and skills as a named **Agent**, then launch tasks from it in one click.
 - **Pipelines.** Chain Agents into a reusable graph on a canvas, such as *Plan → Implement → Review*. Steps hand context to each other, branch, fan out and loop, all from a single board card. See [Pipelines](#pipelines).
-- **Model discovery.** Model and effort pickers start from a curated list. For Codex, Cursor, fx, Antigravity and OpenCode, they also include the models your account actually offers, as reported by the CLI. For OpenCode that includes each model's variants, which show up as its effort choices. For GitHub Copilot, they include the models your installed CLI version knows about (that list doesn't depend on your account). If a model needs a newer CLI than you have installed, Agetor refuses the run with an upgrade hint instead of letting the CLI fail with a confusing error.
+- **Model discovery.** Model and effort pickers start from a curated list, and every harness CLI that can report its own models is asked at runtime, so a new model shows up without an Agetor release: Claude Code reports its models and each one's effort levels (including levels Agetor has never heard of) and whether it has a Fast mode; Codex reports the models your account offers, their default effort and Fast tier; Cursor's flat model list is grouped into one row per model with its effort and Fast choices; Gemini CLI 0.67 or newer lists its models; and fx, Antigravity and OpenCode report what your account offers. The CLI's order comes first and the curated list stays behind it as the fallback for an older CLI, an offline start or a logged-out account. The last list is remembered across restarts. For OpenCode that includes each model's variants, which show up as its effort choices. For GitHub Copilot, they include the models the CLI reports over its ACP server (with the current model's effort levels), falling back to the list your installed CLI version knows about. If the CLI's own list (Codex, Copilot) lacks the model you picked, or a model needs a newer CLI than you have installed, Agetor refuses the run with an upgrade hint instead of letting the CLI fail with a confusing error.
 
 ### Converse
 
@@ -96,7 +96,7 @@ Codex accounts are isolated by `CODEX_HOME`; the newer stack behaviour copies th
 
 Each harness offers the permission modes its CLI actually supports. They range from hands-off modes (*Auto*, *Full access*) to *Ask*, *Plan only* and *Read-only*.
 
-Where the model offers one, pickers also show a **Speed** control: *Off*, *Fast* or *Ultrafast*. Cursor's Fast comes from its fast model variants, and fx's Fast and Ultrafast come from the AI Gateway lanes your account's catalog lists for that model. Ultrafast costs more per token than Fast. On the CLI, use `--speed off|fast|ultrafast` (`--fast` and `--no-fast` still work).
+Where the model offers one, pickers also show a **Speed** control: *Off*, *Fast* or *Ultrafast*. Cursor's Fast comes from its fast model variants, fx's Fast and Ultrafast come from the AI Gateway lanes your account's catalog lists for that model, and Claude Code's and Codex's Fast appear for models whose own CLI says they have one (Codex shows its own cost text; a change applies on the next run). Ultrafast costs more per token than Fast. On the CLI, use `--speed off|fast|ultrafast` (`--fast` and `--no-fast` still work).
 
 ### Codex notes
 
@@ -388,7 +388,8 @@ Most settings live in the app under **Settings**: General, Harnesses, Stacks, Ag
 | `AGETOR_OPENCODE_TRANSPORT` | Set to `run` to make OpenCode 2 use one `opencode run` per turn in `tmux`, as OpenCode 1.x does, instead of Agetor's managed server. | the managed server |
 | `AGETOR_HARNESS_AUTO_ENABLE` | Set to `0` to stop Agetor turning installed built-in harnesses on by itself (see [Supported harnesses](#supported-harnesses)). | on |
 | `AGETOR_TMUX_BIN` | Override the `tmux` binary. | `tmux` on `PATH` |
-| `AGETOR_SKIP_CLI_VERSION_FLOOR` | Set to `1` to skip the per-model minimum CLI version check. | unset |
+| `AGETOR_SKIP_CLI_VERSION_FLOOR` | Set to `1` to skip the per-model minimum CLI version check and the "model not in the CLI's list" check. | unset |
+| `AGETOR_COPILOT_ACP_PROBE` | Set to `0` to stop Agetor from asking GitHub Copilot's ACP server for its models (it then reads `copilot help config`). | on |
 | `AGETOR_DAEMON_IDLE_MS` | Shut a headless core down after this long with no run and no client (`0` disables). Applies to the CLI-spawned daemon; the background core never idle-exits unless you set this. | `300000` (CLI daemon) |
 | `AGETOR_HEADLESS_NOTIFICATIONS` | Set to `0` to stop a headless core posting OS notifications; `1` forces them on. | on (macOS) |
 | `AGETOR_LOGIN_ITEM_HELPER` | Path to the `agetor-login-item` helper the CLI and the core use to read or change the login item. | the installed app's helper |

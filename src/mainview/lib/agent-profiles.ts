@@ -11,6 +11,7 @@ import { useCallback, useEffect, useState } from "react";
 import { api } from "./api";
 import type { AgentKind, AgentProfile, Harness, Task } from "../../shared/types.ts";
 import { agentProfileSummary } from "../../shared/agent-profile.ts";
+import { modelDisplayName } from "../../shared/model-display.ts";
 
 // Module-level store: one fetch serves every mounted `useAgentProfiles()`
 // consumer. `cache` is `null` until the first fetch resolves (successfully
@@ -171,7 +172,7 @@ export function resolveTaskProfileDisplay(
       harnessLabel: snapshot.harnessLabel,
       summary: agentProfileSummary({
         harnessLabel: snapshot.harnessLabel,
-        model: snapshot.model,
+        model: modelDisplayName(snapshot.harnessKind, snapshot.model),
         effort: snapshot.effort,
         mode: snapshot.mode,
       }),

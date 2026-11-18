@@ -406,11 +406,11 @@ describe("cooldownChips (D13, D14)", () => {
     );
     expect(chips.map((c) => c.text)).toEqual([
       "usage limit · until 14:30",
-      "rate limit · until 15:00 · for gpt-5",
+      "rate limit · until 15:00 · for GPT-5",
     ]);
     expect(chips[0]!.message).toBe("You've hit your limit");
     expect(chips[1]!.model).toBe("gpt-5");
-    expect(chips[1]!.ariaLabel).toBe("Cooling: rate limit for gpt-5, until 15:00");
+    expect(chips[1]!.ariaLabel).toBe("Cooling: rate limit for GPT-5, until 15:00");
   });
 
   test("a later day carries the date", () => {

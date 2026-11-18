@@ -1,5 +1,6 @@
 import { describe, expect, test } from "bun:test";
 import {
+  DISCOVERED_SPEED_KINDS,
   SPEED_OPTIONS,
   isSpeed,
   resolveSpeedInput,
@@ -114,7 +115,7 @@ describe("supportedSpeeds", () => {
   });
 
   test("every other kind offers off only, even with flags", () => {
-    const others: AgentKind[] = ["claude-code", "codex", "gemini", "antigravity"];
+    const others: AgentKind[] = ["gemini", "antigravity", "copilot", "opencode"];
     for (const kind of others) {
       expect(supportedSpeeds(kind, null, null)).toEqual(["off"]);
       expect(supportedSpeeds(kind, null, null, { fast: true, ultrafast: true })).toEqual(["off"]);
@@ -144,5 +145,27 @@ describe("SPEED_OPTIONS / speedLabel", () => {
     expect(speedLabel("off")).toBe("Off");
     expect(speedLabel("fast")).toBe("Fast");
     expect(speedLabel("ultrafast")).toBe("Ultrafast");
+  });
+});
+
+describe("discovered Speed tiers (codex, claude)", () => {
+  test("codex and claude offer fast only when the selected model's discovered flag says so", () => {
+    for (const kind of ["codex", "claude-code"] as const) {
+      expect(supportedSpeeds(kind, "m", null, { fast: true })).toEqual(["off", "fast"]);
+      expect(supportedSpeeds(kind, "m", null, { fast: true, ultrafast: true })).toEqual(["off", "fast"]);
+      expect(supportedSpeeds(kind, "m", null)).toEqual(["off"]);
+      expect(supportedSpeeds(kind, "m", null, { ultrafast: true })).toEqual(["off"]);
+    }
+  });
+
+  test("DISCOVERED_SPEED_KINDS lists exactly fx, codex and claude-code", () => {
+    expect([...DISCOVERED_SPEED_KINDS].sort()).toEqual(["claude-code", "codex", "fx"]);
+  });
+
+  test("a discovered-only cursor base offers fast through its variant map", () => {
+    const cursor = { effortIds: { high: "gpt-7-high" }, fastEfforts: ["high"] };
+    expect(supportedSpeeds("cursor", "gpt-7", "high", { cursor })).toEqual(["off", "fast"]);
+    expect(supportedSpeeds("cursor", "gpt-7", "low", { cursor })).toEqual(["off"]);
+    expect(supportedSpeeds("cursor", "gpt-7", "high")).toEqual(["off"]);
   });
 });

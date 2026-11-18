@@ -1,0 +1,54 @@
+{
+  "version": 1,
+  "formId": "dynamic-model-catalog-grill-r3",
+  "title": "Grill — dynamic model & effort catalog per harness",
+  "round": 3,
+  "mode": "served",
+  "specFile": "questions.json",
+  "specSha256": "eba5b0e6989f7f4cb6829ecd01018d484a0670399a1ce1f49fe4f846603af33a",
+  "submittedAt": "2026-11-17T18:57:39.724Z",
+  "receivedAt": "2026-11-17T18:57:39.730Z",
+  "answeredBy": null,
+  "summary": {
+    "total": 2,
+    "answered": 2,
+    "skipped": 0,
+    "unanswered": 0,
+    "optionalLeftBlank": 0,
+    "notApplicable": 0,
+    "acceptedRecommendations": 0,
+    "overrodeRecommendations": [
+      "copilot-acp-blind",
+      "speed-remember-unsupported"
+    ],
+    "oneWayDoorsNotAnswered": [],
+    "withNotes": [],
+    "needsAnswer": [],
+    "complete": true
+  },
+  "answers": {
+    "copilot-acp-blind": {
+      "n": 1,
+      "title": "With no copilot on this machine, what happens to the copilot ACP probe?",
+      "type": "single",
+      "status": "answered",
+      "impact": "shape",
+      "value": "ship-on",
+      "display": "Build it from the spec and ship it on",
+      "acceptedRecommendation": false,
+      "recommended": "ship-off"
+    },
+    "speed-remember-unsupported": {
+      "n": 2,
+      "title": "Remembered Speed is Fast, and the new task's model can't do Fast. What happens to the remembered pick?",
+      "type": "single",
+      "status": "answered",
+      "impact": "minor",
+      "value": "reset-memory",
+      "display": "Falling back overwrites the memory with Standard",
+      "acceptedRecommendation": false,
+      "recommended": "keep-memory"
+    }
+  },
+  "generalNotes": null
+}

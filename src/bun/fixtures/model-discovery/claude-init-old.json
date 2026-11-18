@@ -1,0 +1,29 @@
+{
+ "models": [
+  {
+   "value": "default",
+   "displayName": "Default (recommended)",
+   "description": "Use the default model"
+  },
+  {
+   "value": "opus",
+   "displayName": "Opus",
+   "description": "Opus 4.1 for complex tasks"
+  },
+  {
+   "value": "sonnet",
+   "displayName": "Sonnet",
+   "description": "Sonnet 4 for everyday tasks"
+  },
+  {
+   "value": "claude-opus-4-1",
+   "displayName": "Opus 4.1",
+   "description": "Opus 4.1 for complex tasks"
+  },
+  {
+   "value": "claude-sonnet-4",
+   "displayName": "Sonnet 4",
+   "description": "Sonnet 4 for everyday tasks"
+  }
+ ]
+}
