@@ -48,8 +48,11 @@ export interface E2EBackend {
    *  replants it with the given `{ name: content }` entries, returning
    *  their absolute paths in the same key order. Call this instead of
    *  writing into `fakePickDir` by hand before exercising the
-   *  Files/Folder picker buttons. */
-  plantPicks: (files: Record<string, string>) => Promise<string[]>;
+   *  Files/Folder picker buttons. A value is text, or raw bytes (a real
+   *  image a spec wants a thumbnail of). `/refs/pick` also writes preview
+   *  twins keyed by path, so a spec that picks an image uses a unique name
+   *  per test: the dir is worker-shared and a twin outlives the file. */
+  plantPicks: (files: Record<string, string | Uint8Array>) => Promise<string[]>;
   /** Where `POST /bundle/export/save` with `target: "downloads"` writes in
    *  this backend (`AGETOR_DOWNLOADS_DIR`, docs/plans/agents-pipelines-
    *  import-export.md). Not created up front — the server creates it on the
@@ -761,7 +764,7 @@ async function provisionBackend(
 
   // Backs `E2EBackend.plantPicks` — see its JSDoc on the interface above.
   // Closes over `fakePickDir` so callers never have to pass it themselves.
-  async function plantPicks(files: Record<string, string>): Promise<string[]> {
+  async function plantPicks(files: Record<string, string | Uint8Array>): Promise<string[]> {
     await rm(fakePickDir, { recursive: true, force: true });
     await mkdir(fakePickDir, { recursive: true });
     const paths: string[] = [];

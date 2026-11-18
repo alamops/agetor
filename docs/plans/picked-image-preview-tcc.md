@@ -6,9 +6,9 @@
 | Source | The owner's report in the pipeline task prompt (restated in §1, per grill D19); investigation `docs/plans/picked-image-preview-tcc-investigation.md`; grill record `docs/plans/picked-image-preview-tcc-grill.md` (D1–D20, answers in `docs/plans/picked-image-preview-tcc-grill/round-1/answers.json`); two planning-time owner answers (§8 P1, P2) |
 | Flags | none |
 | Gates | Grilled (20/20 answered); 2 planning-time questions answered by the owner. The twin work (waves 2–3) is gated by the S1 spike (grill D15). |
-| Status | planned |
+| Status | implemented on the branch (waves 0–4 done, e2e and unit green except as listed in §8.2); V1, the live check on a signed build, is owner-assisted and still to do |
 | Branch | `fix/agetor-broken-for-visibility-file` (the agetor task branch). Do **not** cut a new branch in this worktree: agetor re-checks out `task.branch` on the next run. |
-| Base SHA | TBD — set when execution starts (HEAD at planning: `4d7f8bfb`) |
+| Base SHA | `4d7f8bfb` (HEAD when execution started; the planning docs are `0e168acb` on top of it) |
 
 ## 1. Objective & success criteria
 
@@ -459,3 +459,25 @@ bun node_modules/@playwright/test/cli.js test e2e/markdown-images.spec.ts e2e/se
 | A twin of a file changed after the pick shows the pick-time bytes while the original is unreadable | Accepted behavior: a twin is a snapshot, and a re-pick refreshes it; documented in security.md | D1 |
 | `CLAUDE.md` rule line for twins | Not needed: security.md is the subsystem doc that CLAUDE.md's topic map sends `server.ts` route work to | — |
 | New per-task state in `RunPanelBody` | None added (state lives in per-message components) | — |
+
+## 10. Execution record (2026-11-18)
+
+### 10.1 Spike outcomes (G1)
+
+- **S1** (`docs/plans/picked-image-preview-tcc-spike-pick.md`): **pick** and **drag** copy a fresh `~/Desktop` file in-process with no prompt (407 ms and 9 ms, byte-identical; zero `DesktopFolder` requests from the dev app in the TCC log). **Paste**: a Finder ⌘C/⌘V of a png or a heic delivers the *bytes* to WKWebView (no `file://` URL), so it is uploaded, and `/refs/resolve` was never called; a png drop also went through `/refs/drag`. Nothing contradicts the paste twin (same primitive), so per P1 all three gestures ship, with the paste twin behind `previewTwins: true` + the app caller. `tccutil reset` was not run: the dev build shares the installed app's bundle id. The five `~/Desktop/agetor-s1-c07a13*` test files are the owner's to delete.
+- **S2** (`docs/plans/picked-image-preview-tcc-spike-acp.md`): **fx reads** a picked Desktop screenshot (through its shell tool, as a disclaimed child). **cursor cannot be tested**: every cursor task fails with `Invalid params` on `cursor-agent 2026.10.22`, with or without the file, before any read. Ticket draft is in the S2 note (owner-deferred, grill D13).
+
+### 10.2 Deviations from the plan, each with its reason
+
+1. **E4 uses a mocked 403, not `chmod 000`.** `git diff` has to read the working-tree file to list it, so an unreadable file never reaches the Diff dialog; the test fulfills the `side=new` blob route with a 403 through `page.route` and pins what the dialog does with it. The core's own 403 (`taskDiffBlob` `denied`) is covered by the existing server tests.
+2. **`MdImage` keeps `Image too large to preview: <path>` as the `too-large` title**, because `e2e/markdown-images.spec.ts` asserts that exact string and the plan says that spec stays unchanged. The chip is neutral (the plan's rule), only the wording is kept.
+3. **Port 4469, not 4471**, for `preview-twins-endpoint.test.ts` (`daemon-boot.test.ts` already uses 4471). `__forTest` gained `passes()` so the coalescing test can count sweep passes.
+4. **`ImageChip` reports `data-preview-state` `loading` until the thumbnail settles** (the plan's list), and `ok` only once it has.
+5. E1's blocked cases `chmod 000` the planted file *before* the pick (as the plan says) inside a `pickImage` helper; the twin case chmods after it.
+
+### 10.3 Still open
+
+- **V1** (plan §5): the live check on this branch's build (the owner's Desktop screenshot gets its thumbnail; an older message lights up after reopening the task; a `~/Documents` markdown image shows the neutral chip and opens). Needs the owner at the keyboard.
+- Re-check the no-prompt result on the first signed release (the dev build is ad-hoc signed).
+- The cursor `Invalid params` ticket (S2 note).
+
