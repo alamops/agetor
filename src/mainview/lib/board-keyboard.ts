@@ -89,3 +89,23 @@ export function makeBoardAnnouncements(
     onDragCancel: ({ active }) => `Moving ${title(active.id)} was cancelled.`,
   };
 }
+
+/**
+ * The card root's `onKeyDown`: Enter on the card ITSELF opens the task (Enter
+ * on a nested button belongs to that button), and every other key goes on to
+ * dnd-kit's own handler, which starts a drag on Space only when the target is
+ * the card's activator node. Returns true when it opened the task.
+ */
+export function handleCardKeyDown(
+  e: { key: string; target: unknown; currentTarget: unknown; preventDefault: () => void },
+  open: () => void,
+  dragKeyDown?: () => void,
+): boolean {
+  if (e.key === "Enter" && e.target === e.currentTarget) {
+    e.preventDefault();
+    open();
+    return true;
+  }
+  dragKeyDown?.();
+  return false;
+}

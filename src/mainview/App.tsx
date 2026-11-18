@@ -1,6 +1,6 @@
 import { useCallback, useEffect, useLayoutEffect, useMemo, useRef, useState } from "react";
 import { AnimatePresence, motion } from "motion/react";
-import { DndContext, type DragEndEvent, PointerSensor, useSensor, useSensors } from "@dnd-kit/core";
+import { DndContext, type DragEndEvent, KeyboardSensor, PointerSensor, useSensor, useSensors } from "@dnd-kit/core";
 import {
   AlertTriangle,
   Archive,
@@ -64,6 +64,7 @@ import { WelcomeDialog } from "@/components/onboarding/WelcomeDialog";
 import { OnboardingChecklist } from "@/components/onboarding/OnboardingChecklist";
 import type { UpdateSnapshot } from "@/lib/api";
 import { useConfirm } from "@/components/ui/confirm";
+import { BOARD_KEYBOARD_CODES, BOARD_SCREEN_READER_INSTRUCTIONS, boardKeyboardCoordinates, makeBoardAnnouncements } from "@/lib/board-keyboard";
 import { toast } from "sonner";
 import { Toaster } from "@/components/ui/sonner";
 import { dismissPending, dismissTaskToast, hasPendingToast, notifyFilesSent, notifyWaitingInput, toastApiError, toastError, toastFxAutoResumeExhausted, toastFxAutoResumeFired, toastHarnessExhausted, toastHarnessSwap, toastHarnessUnusable, toastPending, toastPipelineReview, toastSendFailed, toastSessionEnded, toastSuccess, toastUnknownCommand, type ToastArgs } from "@/lib/toasts";
@@ -394,7 +395,14 @@ function AppInner() {
   // SettingsDialog so new-harness HOME suggestions point under the current
   // data dir instead of always hard-coding the prod tree.
   const [dataDir, setDataDir] = useState<string>("");
-  const sensors = useSensors(useSensor(PointerSensor, { activationConstraint: { distance: 6 } }));
+  // Pointer drags need a 6 px move, so a click still opens the card. The
+  // keyboard sensor makes the board usable without a mouse: Space picks a card
+  // up, ← → move it between columns, Space drops, Escape cancels
+  // (`lib/board-keyboard.ts`). Both end in the one `onDragEnd` below.
+  const sensors = useSensors(
+    useSensor(PointerSensor, { activationConstraint: { distance: 6 } }),
+    useSensor(KeyboardSensor, { keyboardCodes: BOARD_KEYBOARD_CODES, coordinateGetter: boardKeyboardCoordinates }),
+  );
   const confirm = useConfirm();
 
   // True while the pipeline canvas editor has unsaved changes — set via the
@@ -2091,6 +2099,17 @@ function AppInner() {
     }
   }, [refresh, surfaceError]);
 
+  // Live-region wording for a keyboard drag: task titles and column labels,
+  // never dnd-kit's default of the draggable id (a task UUID). Lookups read
+  // `tasksRef`, so this is built once and `DndContext`'s props stay stable.
+  const boardAccessibility = useMemo(() => ({
+    announcements: makeBoardAnnouncements(
+      (id) => tasksRef.current.find((t) => t.id === id)?.title ?? "",
+      (id) => COLUMNS.find((c) => c.id === id)?.label ?? "",
+    ),
+    screenReaderInstructions: { draggable: BOARD_SCREEN_READER_INSTRUCTIONS },
+  }), []);
+
   // `startTask` materializes the worktree, which can re-pin the branch when a
   // create-time uniqueness race is only detectable once the branch actually
   // exists. Surface the change so the user isn't left believing the name they
@@ -2147,6 +2166,24 @@ function AppInner() {
       surfaceError(e);
     }
   }, [surfaceError, refresh]);
+  // Stop from the board: the card's Stop button and the task menu's Stop both
+  // come through here, so stopping a pipeline PARENT always asks first (its
+  // Stop cancels live steps and dismisses a pending review). Every other
+  // task keeps the one-click Stop. `TaskCard` has no stop logic of its own.
+  const stopFromBoard = useCallback((t: Task) => {
+    if (!t.pipelineId) {
+      void cancel(t);
+      return;
+    }
+    void confirm({
+      title: "Stop this pipeline?",
+      description: "Live steps will be cancelled and the pending review dismissed. History is kept.",
+      confirmLabel: "Stop",
+      variant: "destructive",
+    }).then((ok) => {
+      if (ok) void cancel(t);
+    });
+  }, [cancel, confirm]);
   const markDone = useCallback(async (t: Task) => {
     setTasks((cur) => cur.map((x) => (x.id === t.id ? { ...x, column: "done" } : x)));
     try {
@@ -2461,7 +2498,7 @@ const runTaskMenuAction = useCallback((action: TaskMenuAction, snapshot: Task, r
         void start(t);
         break;
       case "stop":
-        void cancel(t);
+        stopFromBoard(t);
         break;
       case "resume-recovery":
         void api.resumeFxRecovery(t.id).catch((e: unknown) => {
@@ -2552,7 +2589,7 @@ const runTaskMenuAction = useCallback((action: TaskMenuAction, snapshot: Task, r
         return exhaustive;
       }
     }
-  }, [start, cancel, markDone, archive, unarchive, openInFinder, viewPullRequest, viewIssue, markRead, markUnread, copyToClipboard, del, openPipelineRun, reviewPipelineFromBoard]);
+  }, [start, stopFromBoard, markDone, archive, unarchive, openInFinder, viewPullRequest, viewIssue, markRead, markUnread, copyToClipboard, del, openPipelineRun, reviewPipelineFromBoard]);
 
   // Maps `buildTaskContextMenu`'s pure entries onto the primitive's
   // `ContextMenuItem[]`, inserting a separator whenever the group changes
@@ -2858,7 +2895,7 @@ const runTaskMenuAction = useCallback((action: TaskMenuAction, snapshot: Task, r
                     className="kanban-scroll absolute inset-0 overflow-x-scroll"
                     onScroll={(e) => saveBoardScroll(e.currentTarget.scrollLeft, e.currentTarget.scrollTop)}
                   >
-                    <DndContext sensors={sensors} onDragEnd={onDragEnd}>
+                    <DndContext sensors={sensors} onDragEnd={onDragEnd} accessibility={boardAccessibility}>
                       <div className="flex gap-3 p-4">
                         {visibleColumns.map((c) => (
                           <Column
@@ -2870,18 +2907,15 @@ const runTaskMenuAction = useCallback((action: TaskMenuAction, snapshot: Task, r
                             stacks={harnessStacks}
                             limitStates={harnessLimitStates}
                             onStart={start}
-                            onCancel={cancel}
-                            onDelete={del}
+                            onCancel={stopFromBoard}
                             onOpen={openTaskFromBoard}
                             onOpenAttention={openAttention}
                             onReviewPipeline={reviewPipelineFromBoard}
-                            onDiff={setDiffTask}
                             onMarkDone={markDone}
-                            onArchive={archive}
-                            onUnarchive={unarchive}
                             emptyHint={onboardingVisibility.showChecklist ? EMPTY_COLUMN_HINT[c.id] : undefined}
                             selectedTaskId={selected?.id ?? null}
                             onContextMenu={openTaskMenu}
+                            menuTaskId={taskMenu?.task.id ?? null}
                           />
                         ))}
                       </div>

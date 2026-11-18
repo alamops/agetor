@@ -3,6 +3,7 @@ import {
   BOARD_KEYBOARD_CODES,
   BOARD_SCREEN_READER_INSTRUCTIONS,
   boardKeyboardCoordinates,
+  handleCardKeyDown,
   makeBoardAnnouncements,
   nextColumnX,
 } from "./board-keyboard.ts";
@@ -138,5 +139,35 @@ describe("makeBoardAnnouncements", () => {
   test("dropped outside any column", () => {
     expect(ann.onDragEnd({ active, over: null })).toBe("Fix login was dropped.");
     expect(ann.onDragOver({ active, over: null })).toBe("Fix login is not over a column.");
+  });
+});
+
+describe("handleCardKeyDown", () => {
+  const card = {};
+  const button = {};
+  const ev = (key: string, target: object) => {
+    let prevented = false;
+    return { e: { key, target, currentTarget: card, preventDefault: () => { prevented = true; } }, prevented: () => prevented };
+  };
+
+  test("Enter on the card opens it once and never reaches dnd-kit", () => {
+    let opened = 0;
+    let drag = 0;
+    const k = ev("Enter", card);
+    expect(handleCardKeyDown(k.e, () => { opened++; }, () => { drag++; })).toBe(true);
+    expect([opened, drag, k.prevented()]).toEqual([1, 0, true]);
+  });
+
+  test("Enter on a nested button does not open the card", () => {
+    let opened = 0;
+    let drag = 0;
+    expect(handleCardKeyDown(ev("Enter", button).e, () => { opened++; }, () => { drag++; })).toBe(false);
+    expect([opened, drag]).toEqual([0, 1]);
+  });
+
+  test("Space goes to dnd-kit (which only starts a drag from the card itself)", () => {
+    let drag = 0;
+    handleCardKeyDown(ev(" ", button).e, () => {}, () => { drag++; });
+    expect(drag).toBe(1);
   });
 });

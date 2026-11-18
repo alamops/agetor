@@ -91,7 +91,13 @@ export default defineConfig({
     trace: "retain-on-failure",
     screenshot: "only-on-failure",
   },
-  projects: [{ name: "chromium", use: { ...devices["Desktop Chrome"] } }],
+  projects: [
+    { name: "chromium", use: { ...devices["Desktop Chrome"] } },
+    // WKWebView, the app's real target, is WebKit. The board-card bounds spec
+    // is the one layout guardrail that runs in both engines; every other spec
+    // stays Chromium-only. Needs `playwright install webkit` once.
+    { name: "webkit", use: { ...devices["Desktop Safari"] }, testMatch: /task-card-bounds\.spec\.ts/ },
+  ],
   webServer: {
     command: E2E_VITE_PORT === 5173 ? "bun run hmr" : `bunx vite --port ${E2E_VITE_PORT}`,
     url: E2E_BASE_URL,
