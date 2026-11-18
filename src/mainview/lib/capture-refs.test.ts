@@ -6,6 +6,8 @@ import {
   type RefResolver,
   type ScreenshotUploader,
 } from "./capture-refs.ts";
+import { isScreenshotUploadablePath } from "../../shared/attachments.ts";
+import { api } from "./api.ts";
 import type { TaskReference } from "../../shared/types.ts";
 
 /* ────────────────────────────────────────────────────────────────────────── *
@@ -521,4 +523,95 @@ test("dragRefs throwing degrades silently to the rung-3 upload path (no error su
   expect(attachCalls).toBe(1);
   expect(r.items).toHaveLength(1);
   expect(r.skippedFolders).toBe(0);
+});
+
+/* ────────────────────────────────────────────────────────────────────────── *
+ * Preview-twin plumbing (docs/plans/picked-image-preview-tcc.md, U4): the drop
+ * tells the core which files it carried, and only a drop/paste's own file://
+ * paths ask for preview twins.
+ * ────────────────────────────────────────────────────────────────────────── */
+
+test("rung 2 hands dragRefs the carried files' basenames, in order", async () => {
+  const seen: string[][] = [];
+  const dragRefs: DragRefsFetcher = async (names) => {
+    seen.push(names);
+    return [];
+  };
+  const dt = makeTransfer([
+    { kind: "file", file: textFile("b-notes.txt") },
+    { kind: "file", file: new File(["x"], "a-icon.heic", { type: "image/heic" }) },
+    { kind: "file", file: textFile("c.txt") },
+  ]);
+  await captureDroppedOrPastedItems(dt, { dragRefs, attachmentUploader: async (_b, name) => ({ path: `/a/${name}`, basename: name }) });
+  expect(seen).toEqual([["b-notes.txt", "a-icon.heic", "c.txt"]]);
+});
+
+test("rung 2 with no collected File (types carry Files) sends an empty names list", async () => {
+  const seen: string[][] = [];
+  const dragRefs: DragRefsFetcher = async (names) => {
+    seen.push(names);
+    return [];
+  };
+  await captureDroppedOrPastedItems(makeTransfer([], ["Files"]), { dragRefs });
+  expect(seen).toEqual([[]]);
+});
+
+test("a heic from the drag pasteboard is kept (it needs a twin); png/jpg/gif/webp stay on the upload path", async () => {
+  const dragRefs: DragRefsFetcher = async () => [
+    { path: "/Users/x/a.png", isDirectory: false },
+    { path: "/Users/x/b.JPEG", isDirectory: false },
+    { path: "/Users/x/c.gif", isDirectory: false },
+    { path: "/Users/x/d.webp", isDirectory: false },
+    { path: "/Users/x/e.heic", isDirectory: false },
+    { path: "/Users/x/f.svg", isDirectory: false },
+  ];
+  const uploaded: string[] = [];
+  const uploader: ScreenshotUploader = async (blob) => {
+    uploaded.push("u");
+    return { path: `/Users/x/.agetor/screenshots/${uploaded.length}.png`, basename: `${uploaded.length}.png` };
+  };
+  const dt = makeTransfer(
+    ["a.png", "b.JPEG", "c.gif", "d.webp"].map((n) => ({ kind: "file" as const, file: blobImage(n) })).concat([
+      { kind: "file", file: new File(["x"], "e.heic", { type: "image/heic" }) },
+      { kind: "file", file: new File(["<svg/>"], "f.svg", { type: "image/svg+xml" }) },
+    ]),
+  );
+  const r = await captureDroppedOrPastedItems(dt, { dragRefs, uploader });
+  expect(uploaded).toHaveLength(4);
+  const byPath = r.items.map((i) => i.ref.path);
+  expect(byPath).toContain("/Users/x/e.heic");
+  expect(byPath).toContain("/Users/x/f.svg");
+  expect(byPath).not.toContain("/Users/x/a.png");
+});
+
+test("isScreenshotUploadablePath matches exactly png/jpg/jpeg/gif/webp on the basename, never a directory", () => {
+  for (const p of ["/a/b.png", "/a/b.JPG", "/a/b.jpeg", "/a/b.gif", "/a/b.WEBP", "b.png"]) {
+    expect(isScreenshotUploadablePath(p)).toBe(true);
+  }
+  for (const p of ["/a/b.heic", "/a/b.svg", "/a/b.bmp", "/a/b.ico", "/a/b.avif", "/a/b.pdf", "/a/png", "/a/b.png/", "/a.png.d/x"]) {
+    expect(isScreenshotUploadablePath(p)).toBe(false);
+  }
+});
+
+test("rung 1 with no injected resolver uses api.resolveCapturedRefs (twins), never api.resolveRefs", async () => {
+  const realCaptured = api.resolveCapturedRefs;
+  const realPlain = api.resolveRefs;
+  const calls: string[] = [];
+  api.resolveCapturedRefs = async (paths) => {
+    calls.push(`captured:${paths.join(",")}`);
+    return [{ path: paths[0]!, isDirectory: false }];
+  };
+  api.resolveRefs = async () => {
+    calls.push("plain");
+    return [];
+  };
+  try {
+    const dt = makeUriListTransfer({ "text/uri-list": "file:///Users/x/pic.heic" });
+    const r = await captureDroppedOrPastedItems(dt, { dragRefs: noDrag });
+    expect(calls).toEqual(["captured:/Users/x/pic.heic"]);
+    expect(r.items.map((i) => i.ref.path)).toEqual(["/Users/x/pic.heic"]);
+  } finally {
+    api.resolveCapturedRefs = realCaptured;
+    api.resolveRefs = realPlain;
+  }
 });

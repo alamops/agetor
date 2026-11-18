@@ -1023,12 +1023,31 @@ export const api = {
       method: "POST",
       body: JSON.stringify({ paths }),
     }).then((r) => r.refs),
+  /** `resolveRefs` for the `file://` paths of the user's OWN drop or paste
+   *  (`capture-refs` rung 1, and nothing else): the same stat, plus
+   *  `previewTwins: true`, which asks the core to also write a preview twin of
+   *  each image so its thumbnail survives macOS's privacy block on the folder
+   *  (docs/architecture/security.md, "Preview twins"). Every other caller of
+   *  `/refs/resolve` names agent-chosen paths and must keep using
+   *  `resolveRefs`, which never sends the flag. */
+  resolveCapturedRefs: (paths: string[]) =>
+    j<{ refs: TaskReference[] }>("/refs/resolve", {
+      method: "POST",
+      body: JSON.stringify({ paths, previewTwins: true }),
+    }).then((r) => r.refs),
   /** Recover the real paths of the drag/drop that just ended, off the macOS
    *  drag pasteboard — WKWebView exposes no `file://` URLs on a drop, so this
    *  is the fallback for non-image files/folders dragged from Finder. The
-   *  server stats each (directory-ness correct, nonexistent dropped). */
-  dragRefs: () =>
-    j<{ refs: TaskReference[] }>("/refs/drag", { method: "POST" }).then((r) => r.refs),
+   *  server stats each (directory-ness correct, nonexistent dropped).
+   *  `names` are the basenames of the `File`s the drop carried; the core
+   *  writes preview twins only for non-uploadable images those names vouch
+   *  for, so a drag pasteboard an agent rewrote mid-drag can't make it copy a
+   *  file the user never dropped. */
+  dragRefs: (names: string[]) =>
+    j<{ refs: TaskReference[] }>("/refs/drag", {
+      method: "POST",
+      body: JSON.stringify({ names }),
+    }).then((r) => r.refs),
   listBranches: (dir: string) =>
     j<BranchInfo[]>(`/projects/branches?path=${encodeURIComponent(dir)}`),
   /** `git fetch --all --prune` on the project so newly pushed remote branches
