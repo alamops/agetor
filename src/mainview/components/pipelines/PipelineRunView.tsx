@@ -964,7 +964,11 @@ export function PipelineRunView({ taskId, onOpenTask, onBack, onOpenSettingsAgen
         >
           {STATUS_LABEL[run.status]}
         </Badge>
-        {progress && <span className="text-xs text-muted-foreground">{progress.label}</span>}
+        {progress && (
+          <span className="text-xs text-muted-foreground" data-testid="pipeline-run-progress">
+            {[progress.done ? "" : progress.label, progress.runsLabel].filter(Boolean).join(" · ") || progress.label}
+          </span>
+        )}
         <div className="ml-auto flex items-center gap-2">
           {actionError && <span className="text-xs text-danger">{actionError}</span>}
           {showMarkDone && (

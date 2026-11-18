@@ -2246,6 +2246,113 @@ describe("pipelineStepProgress", () => {
     expect(progress.total).toBe(0);
     expect(progress.label).toBe("0/0");
   });
+
+  // Ten steps s1..s10; history mirrors a real looping run (Code Review ×3,
+  // Bug Fix ×2, every other step once).
+  const tenSteps = () => Array.from({ length: 10 }, (_, i) => makeStep({ id: `s${i + 1}`, name: `Step ${i + 1}` }));
+  const tenSnapshot = () => ({ graph: makeGraph({ steps: tenSteps() }), maxSteps: 25, profiles: {}, capturedAt: 0 });
+  const rec = (seq: number, stepId: string, outcome: "succeeded" | "failed" | "returned" | null = "succeeded", taskId: string | null = `t${seq}`) => ({
+    seq, stepId, taskId, startedAt: seq, endedAt: outcome ? seq + 1 : null, outcome, handoff: null, nextStepIds: [] as string[],
+  });
+  const loopHistory = () => {
+    const ids = ["s1", "s2", "s3", "s4", "s5", "s6", "s7", "s8", "s9", "s10", "s3", "s3", "s9"];
+    return ids.map((id, i) => rec(i + 1, id));
+  };
+
+  test("a looping run counts distinct steps, never executions (13/10 regression)", () => {
+    // s9 reruns and s3 reruns, but s10 is never skipped here: 10 distinct.
+    const p = pipelineStepProgress(makeRun({ status: "done", snapshot: tenSnapshot(), history: loopHistory() }));
+    expect(p.completed).toBe(10);
+    expect(p.done).toBe(true);
+    expect(p.countLabel).toBe("✓ Done");
+    expect(p.label).toBe("✓ Done");
+    expect(p.executions).toBe(13);
+    expect(p.reruns).toBe(3);
+    expect(p.runsLabel).toBe("13 step runs · 3 re-runs");
+  });
+
+  test("a done run that skipped a branch reads Done, not 9/10", () => {
+    const history = loopHistory().filter((h) => h.stepId !== "s10");
+    const p = pipelineStepProgress(makeRun({ status: "done", snapshot: tenSnapshot(), history }));
+    expect(p.completed).toBe(9);
+    expect(p.total).toBe(10);
+    expect(p.label).toBe("✓ Done");
+  });
+
+  test("a cancelled or blocked run keeps the numeric count (blocked names the active step)", () => {
+    const history = loopHistory().filter((h) => h.stepId !== "s10");
+    const cancelled = pipelineStepProgress(makeRun({ status: "cancelled", snapshot: tenSnapshot(), history }));
+    expect(cancelled.label.startsWith("9/10")).toBe(true);
+    expect(cancelled.done).toBe(false);
+    const blocked = pipelineStepProgress(makeRun({
+      status: "blocked", snapshot: tenSnapshot(), history, active: [{ stepId: "s10", taskId: "tx", seq: 99 }],
+    }));
+    expect(blocked.label).toBe("9/10 · Step 10");
+  });
+
+  test("a repeated step id while running never double counts and names the active step", () => {
+    const history = [rec(1, "s1"), rec(2, "s2"), rec(3, "s2"), rec(4, "s3", null)];
+    const p = pipelineStepProgress(makeRun({
+      status: "running", snapshot: tenSnapshot(), history, active: [{ stepId: "s3", taskId: "t4", seq: 4 }],
+    }));
+    expect(p.completed).toBe(2);
+    expect(p.label).toBe("2/10 · Step 3");
+    // The live execution is in history already: counted once.
+    expect(p.executions).toBe(4);
+    expect(p.reruns).toBe(1);
+  });
+
+  test("an active entry missing from history still counts as an execution", () => {
+    const p = pipelineStepProgress(makeRun({
+      snapshot: tenSnapshot(), active: [{ stepId: "s1", taskId: "t1", seq: 1 }],
+    }));
+    expect(p.executions).toBe(1);
+    expect(p.runsLabel).toBe("1 step run");
+  });
+
+  test("a fan-out reports how many more steps run beside the first", () => {
+    const p = pipelineStepProgress(makeRun({
+      snapshot: tenSnapshot(),
+      active: [
+        { stepId: "s4", taskId: "a", seq: 1 },
+        { stepId: "s5", taskId: "b", seq: 2 },
+        { stepId: "s6", taskId: "c", seq: 3 },
+      ],
+    }));
+    expect(p.current).toEqual({ kind: "step", stepId: "s4", name: "Step 4", more: 2 });
+  });
+
+  test("a pending gate with nothing active is the current step", () => {
+    const p = pipelineStepProgress(makeRun({
+      snapshot: tenSnapshot(),
+      humanSteps: [{ stepId: "s2", seq: 5, startedAt: 5, arrivals: [] }],
+      history: [rec(1, "s1"), rec(5, "s2", null, null)],
+    }));
+    expect(p.current).toEqual({ kind: "gate", stepId: "s2", name: "Step 2", more: 0 });
+    expect(p.label).toBe("1/10 · Step 2");
+    // A gate record spawns no task, so it is not an execution.
+    expect(p.executions).toBe(1);
+  });
+
+  test("a history step missing from the snapshot, a failed record and a returned gate never count as completed", () => {
+    const p = pipelineStepProgress(makeRun({
+      snapshot: tenSnapshot(),
+      history: [rec(1, "ghost"), rec(2, "s1", "failed"), rec(3, "s2", "returned", null)],
+    }));
+    expect(p.completed).toBe(0);
+    expect(p.executions).toBe(2);
+  });
+
+  test("no snapshot: 0/0 and no runs label", () => {
+    const p = pipelineStepProgress(makeRun());
+    expect(p.runsLabel).toBe("");
+    expect(p.current).toBeNull();
+  });
+
+  test("singular wording", () => {
+    const p = pipelineStepProgress(makeRun({ snapshot: tenSnapshot(), history: [rec(1, "s1"), rec(2, "s1")] }));
+    expect(p.runsLabel).toBe("2 step runs · 1 re-run");
+  });
 });
 
 describe("classifyStepResponse", () => {
