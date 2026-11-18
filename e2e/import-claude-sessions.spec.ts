@@ -76,7 +76,8 @@ test("header import lands the session in Review with history and no Run", async 
   await row.getByRole("button", { name: "Import", exact: true }).click();
   await expect(dialog.getByText("please fix the login")).toHaveCount(0);
   await page.getByRole("button", { name: "Close" }).click();
-  const card = page.getByRole("button", { name: /please fix the login/ });
+  // The card is a labelled group (not a button), so locate it by its task id hook.
+  const card = page.locator("[data-task-id]").filter({ hasText: /please fix the login/ });
   await card.scrollIntoViewIfNeeded();
   await expect(card.getByRole("button", { name: "Run", exact: true })).toHaveCount(0);
   await card.getByRole("button", { name: "Open", exact: true }).click();
