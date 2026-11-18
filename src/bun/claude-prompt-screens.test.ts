@@ -260,6 +260,14 @@ describe("matchPasteCodeScreen + redactPaneSecrets", () => {
     expect(m.fingerprint).toBe(matchPasteCodeScreen(" Welcome\n Paste code here if prompted >\n\n Esc to cancel")!.fingerprint);
   });
 
+  test("a code with characters outside the usual alphabet is masked from the row under a bare marker", () => {
+    const pane = " Paste code here if prompted >\nab!cd&ef?gh:ij*kl@mn$op^q(r)s[t]u{v}w|x<y>z\n\nthe end\n";
+    const out = redactPaneSecrets(pane);
+    expect(out).not.toContain("ab!cd");
+    expect(out).toContain("Paste code here if prompted > ••••");
+    expect(out).toContain("the end");
+  });
+
   test("a full-length code wrapped past six rows still matches, with the same fingerprint", () => {
     const code = "c".repeat(500) + "#xyz";
     const rows = [` Paste code here if prompted > ${code.slice(0, 49)}`];

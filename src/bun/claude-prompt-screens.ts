@@ -267,6 +267,13 @@ const PASTE_CODE_MAX_WRAP_ROWS = Math.ceil(OAUTH_CODE_MAX_LEN / 40) + 1;
 /** A wrapped continuation row of an OAuth code: one token of the code's
  *  characters. Box-drawing chrome, a `>` composer and prose never match. */
 const PASTE_CODE_WRAP_ROW_RE = /^\s*[A-Za-z0-9_\-#.~%+=/]+\s*$/;
+/** A row the redactor treats as part of a typed code: one token of anything
+ *  `validateOAuthCode` accepts (no control character), whitespace being the
+ *  boundary, so prose under an empty prompt is never masked. Wider than
+ *  {@link PASTE_CODE_WRAP_ROW_RE}, which also decides whether a prompt is live
+ *  and so must not count box-drawing chrome as a code. */
+// eslint-disable-next-line no-control-regex
+const PASTE_CODE_REDACT_ROW_RE = /^\s*[^\s\u0000-\u001f\u007f-\u009f]+\s*$/;
 /** Rows of anything else allowed under the prompt (and its wrapped code). */
 const PASTE_CODE_TRAILING_ROWS = 5;
 const VOLATILE_RE = /^\s*(?:[✻✶✳✢·*]\s+\S.*…|.*\(\d+s ·.*\)|.*Tip:.*)$/;
@@ -356,7 +363,7 @@ export function matchPasteCodeScreen(tail: string): { paneText: string; fingerpr
  * prompt: when anything follows the marker, the rest of that line is masked
  * AND the lines under it (up to the next blank line) are dropped. When the
  * marker ends its row, the code can start on the row under it: the rows right
- * under a bare marker that look like a code (one token of a code's characters)
+ * under a bare marker that look like a code (one token, no whitespace or control character)
  * are dropped and the marker's line is masked. Every other byte of the pane,
  * including prose under an empty prompt, is returned unchanged.
  */
@@ -371,7 +378,7 @@ export function redactPaneSecrets(text: string): string {
       if (line.trim() !== "") continue;
       dropping = null;
     } else if (dropping === "bare") {
-      if (line.trim() !== "" && PASTE_CODE_WRAP_ROW_RE.test(line)) {
+      if (line.trim() !== "" && PASTE_CODE_REDACT_ROW_RE.test(line)) {
         out[bare!.at] = bare!.masked;
         continue;
       }

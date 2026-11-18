@@ -853,6 +853,9 @@ async function prepareTaskHarnessPass(
   if (!task) return { ok: false, error: "task not found" };
   const resolved = harnessStacks.resolveForTask(task);
   if (!resolved) return { ok: true };
+  // A turn may have started, or background agents taken hold, while the probe ran.
+  const busy = (): boolean => runs.hasRunning(taskId) || Boolean(hooks?.isTaskHeld?.(taskId));
+  if (busy()) return { ok: true };
   const { stack, current } = resolved;
   // A stack of fewer than two accounts behaves exactly like a lone account:
   // no failover state, and the normal pre-flight error (with its login help)
@@ -932,6 +935,9 @@ async function prepareTaskHarnessPass(
     sessionId: latestSessionForAccount(task, fromHarness.kind, current),
     cwd: task.worktreePath ?? task.workdir,
     history: { trigger: "unavailable", reason },
+    // Re-checked after the mirror and transfer awaits: a task that went live
+    // or got held meanwhile keeps its account (the message queues behind it).
+    beforeCommit: () => !busy(),
     state: () => ({
       stackId: stack.id,
       position: plan.member.position,
@@ -949,6 +955,9 @@ async function prepareTaskHarnessPass(
     // blocks on the same condition.
     return { ok: false, error: `could not move the conversation to ${toHarness.label}: ${moved.message}` };
   }
+  // Declined by `beforeCommit`: nothing was written, so report no move (the
+  // caller must not drop the session of an account the task never left).
+  if (moved.kind === "aborted") return { ok: true };
   // A manual move supersedes any armed all-exhausted retry. The timer callback
   // would no-op on the cleared state, but leaving the handle in the map keeps
   // a dangling timer for up to 24 h; cancel it like the no-move branch does.

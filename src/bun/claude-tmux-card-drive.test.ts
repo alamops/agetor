@@ -159,6 +159,24 @@ describe("answerTmuxPromptInPane — choice cards", () => {
     expect(d.session.state().exited).toBeUndefined();
   }, 20_000);
 
+  test("a held card plans from a fresh read after the arm wait: a cursor moved in the terminal meanwhile is respected", async () => {
+    const d = drive({ dialogs: [REPO_E], refuseEnters: 1 });
+    const card = cardFor(d, { runId: "run-held-moved" });
+    expect(await answerTmuxPromptInPane(card, { kind: "choice", key: "2" })).toEqual({ ok: true, recarded: true });
+    const [held] = activeTmuxPromptsForTask(d.taskId);
+    expect(held!.cursorIndex).toBe(0);
+    const answering = answerTmuxPromptInPane(held!, { kind: "choice", key: "2" });
+    // During the 500 ms arm wait the user moves the cursor to "Yes, add it".
+    await Bun.sleep(150);
+    d.session.patch({ cursor: 1 });
+    expect(await answering).toEqual({ ok: true });
+    // Planned from the live cursor (on Yes): the held safety net, Up, Down, Enter.
+    // The stale cursor would have sent Down, which wraps onto "No, exit".
+    expect(d.session.keys().map((k) => k.k)).toEqual(["Down", "Enter", "Up", "Down", "Enter"]);
+    expect(d.session.state().done).toBe(true);
+    expect(d.session.state().exited).toBeUndefined();
+  }, 20_000);
+
   test("a pick that is not one of the card's choices sends nothing", async () => {
     const d = drive({ dialogs: [REPO_E] });
     const card = cardFor(d);

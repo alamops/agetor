@@ -2546,11 +2546,26 @@ async function driveCard(
   const gap = addDir ? ADD_DIR_KEY_GAP_MS : 30;
   let arrows: string[];
   if (addDir) {
-    // A held dialog accepts keys again only ≥500 ms after the refusal.
-    if (addDir.footer === "held") await Bun.sleep(STARTUP_DIALOG_ARM_MS);
+    let cursorIndex = match.cursorIndex;
+    if (addDir.footer === "held") {
+      // A held dialog accepts keys again only ≥500 ms after the refusal. The
+      // wait is long enough for the user to move the cursor or answer in the
+      // terminal, so plan from a fresh read of the same dialog.
+      await Bun.sleep(STARTUP_DIALOG_ARM_MS);
+      if (!stillCurrent()) return { ok: false, reason: "send-failed" };
+      const again = await io.capture();
+      if (again === null) return { ok: false, reason: "dialog-changed" };
+      const againLines = again.split("\n");
+      const fresh = parseAddDirDialog(againLines.slice(Math.max(0, againLines.length - SCRAPE_TAIL_LINES)).join("\n"));
+      if (!fresh || fresh.identity !== addDir.identity || typeof fresh.cursorIndex !== "number") {
+        return { ok: false, reason: "dialog-changed" };
+      }
+      cursorIndex = fresh.cursorIndex;
+    }
     arrows = planConfirmArrows({
-      cursorIndex: match.cursorIndex,
+      cursorIndex,
       acceptIndex: targetIndex,
+      // The refusal already happened: keep its safety net even if the footer repainted.
       heldAddDir: addDir.footer === "held" && targetIndex === addDir.yesIndex,
     });
   } else {
