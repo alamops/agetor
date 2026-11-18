@@ -449,6 +449,9 @@ export const CLAUDE_LOGIN_HINT =
 type ClaudeAuthResult = { loggedIn: boolean | null; authHelp: string | null };
 const CLAUDE_AUTH_UNKNOWN: ClaudeAuthResult = { loggedIn: null, authHelp: null };
 const claudeAuthCache = new Map<string, { value: ClaudeAuthResult; expiresAt: number }>();
+/** Per-key probe generation: only the latest probe started for a key may write
+ *  its answer back, so a slow older probe can never overwrite a newer one. */
+const claudeAuthProbeGen = new Map<string, number>();
 
 /** Cache key: the resolved binary and the account's config root, so editing an
  *  account's home or env never inherits the old account's answer. */
@@ -537,8 +540,12 @@ async function getCachedClaudeAuth(
     const cached = claudeAuthCache.get(key);
     if (cached && cached.expiresAt > Date.now()) return cached.value;
   }
+  const gen = (claudeAuthProbeGen.get(key) ?? 0) + 1;
+  claudeAuthProbeGen.set(key, gen);
   const value = await probeClaudeAuth(harness, path, env);
-  claudeAuthCache.set(key, { value, expiresAt: Date.now() + STATUS_CACHE_TTL_MS });
+  if (claudeAuthProbeGen.get(key) === gen) {
+    claudeAuthCache.set(key, { value, expiresAt: Date.now() + STATUS_CACHE_TTL_MS });
+  }
   return value;
 }
 
@@ -558,16 +565,21 @@ export function peekClaudeLoggedIn(harness: Harness): boolean | null {
 /**
  * Warm the login cache for every Claude Code account in `harnesses`, in
  * parallel, giving up on stragglers after `budgetMs` (their probes keep their
- * own 5 s cap and still land in the cache). Never throws.
+ * own 5 s cap and still land in the cache). `fresh` re-probes even accounts
+ * with a fresh cached answer. Never throws.
  */
-export async function refreshClaudeAuth(harnesses: Harness[], budgetMs = CLAUDE_AUTH_PROBE_TIMEOUT_MS): Promise<void> {
+export async function refreshClaudeAuth(
+  harnesses: Harness[],
+  budgetMs = CLAUDE_AUTH_PROBE_TIMEOUT_MS,
+  opts?: { fresh?: boolean },
+): Promise<void> {
   const claude = harnesses.filter((h) => h.kind === "claude-code");
   if (claude.length === 0) return;
   const work = Promise.all(
     claude.map(async (h) => {
       const path = resolveBinPath(resolveBin(h));
       if (!path) return;
-      await getCachedClaudeAuth(h, path, probeEnvFor(h), undefined);
+      await getCachedClaudeAuth(h, path, probeEnvFor(h), opts?.fresh ? { freshAuth: true } : undefined);
     }),
   ).then(() => undefined, () => undefined);
   let timer: ReturnType<typeof setTimeout> | undefined;
@@ -1037,6 +1049,7 @@ export const __testing = {
   clearStatusCache: () => {
     statusCache.clear();
     claudeAuthCache.clear();
+    claudeAuthProbeGen.clear();
     versionCache.clear();
     authCache.clear();
   },

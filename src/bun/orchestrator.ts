@@ -7783,10 +7783,25 @@ async function fireHarnessAutoRetryInner(taskId: string): Promise<void> {
     patchTaskState(taskId, { allExhausted: null });
     return;
   }
-  const { stack, current } = resolved;
   await warmStackLogins(task);
+  // The login probe awaited: a Stop, a column move, an archive or a manual
+  // start may have cleared the countdown meanwhile. Plan from the live row, and
+  // never re-arm a retry the user already ended.
+  const live = tasks.get(taskId);
+  if (!live || live.archivedAt != null || live.column !== "blocked" || !live.harnessState?.allExhausted) return;
+  if (runs.hasRunning(taskId) || backgroundAgentsHoldTask(taskId)) {
+    deferAutoRetryNow(taskId);
+    return;
+  }
+  const liveResolved = harnessStacks.resolveForTask(live);
+  if (!liveResolved) {
+    endCleanRetry(taskId);
+    patchTaskState(taskId, { allExhausted: null });
+    return;
+  }
+  const { stack, current } = liveResolved;
   const now = Date.now();
-  const plan = planRetryMember(task, { now });
+  const plan = planRetryMember(live, { now });
   if (plan.kind !== "next") {
     planExhaustedTracked(taskId, plan, now, { startedThisAttempt: false });
     return;
@@ -7825,7 +7840,7 @@ async function fireHarnessAutoRetryInner(taskId: string): Promise<void> {
     from: current,
     to: toHarness.id,
     sessionId,
-    cwd: task.worktreePath ?? task.workdir,
+    cwd: live.worktreePath ?? live.workdir,
     // A pipeline Stop, an archive or a column move during the mirror/transfer
     // awaits clears the exhausted state. Do not resurrect it: no retry may
     // start on a stopped run's behalf. A plain Stop in that window is
@@ -7929,7 +7944,7 @@ async function fireHarnessAutoRetryInner(taskId: string): Promise<void> {
     transferredSessionId,
     hasToolUse: preserveConversation && transferredSessionId !== null,
     notes: moved.warnings,
-    cleanRetryText: retryParts.length > 0 ? retryParts.join("\n\n") : task.prompt,
+    cleanRetryText: retryParts.length > 0 ? retryParts.join("\n\n") : live.prompt,
     cleanRetryParts: retryParts,
     position: position + 1,
     count: stack.members.length,

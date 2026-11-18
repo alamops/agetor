@@ -2122,7 +2122,9 @@ function checkTurnStall(state: SessionState): void {
   state.stallFired = true;
   // Include the last visible pane lines so the run log answers "stuck on
   // WHAT?" without the user having to attach to tmux themselves.
-  const pane = (state.scrapeLastPaneText ?? "").split("\n").slice(-12).join("\n").trim();
+  // Masked before the excerpt is cut: an OAuth code can wrap onto lines whose
+  // prompt line is above the cut.
+  const pane = redactPaneSecrets(state.scrapeLastPaneText ?? "").split("\n").slice(-12).join("\n").trim();
   onChunk?.(
     "status",
     `${TURN_STALLED_STATUS_PREFIX}no transcript activity for ${Math.round(quietMs / 60_000)}m while a turn is in flight — `
@@ -2493,6 +2495,8 @@ async function driveCard(
 ): Promise<PromptDriveResult> {
   const live = await io.capture();
   if (live === null) return { ok: false, reason: "dialog-changed" };
+  // The capture awaited: the session may have been disposed or superseded.
+  if (!stillCurrent()) return { ok: false, reason: "send-failed" };
   const lines = live.split("\n");
   const tail = lines.slice(Math.max(0, lines.length - SCRAPE_TAIL_LINES)).join("\n");
 
@@ -5961,7 +5965,16 @@ function matchSliderModal(tail: string): ScrapeMatch | null {
   const choices: TmuxPromptChoice[] = labels.map((l, i) => ({ key: String(i + 1), label: l.label }));
   const paneText = lines.slice(-12).join("\n").trimEnd();
   const fingerprint = sha1(`slider:${labels.map((l) => l.label).join("/")}|@${cursorIndex}`);
-  return { paneText, choices, cursorIndex, fingerprint, highConfidence: true, nav: "horizontal" };
+  // The track row carries the ▲ cursor, so the identity is the window without it.
+  const context = lines
+    .map((l, i) => ({ l, i }))
+    .slice(-12)
+    .filter(({ i }) => i !== trackIdx)
+    .map(({ l }) => l.trim())
+    .filter((l) => l.length > 0)
+    .join("\n");
+  const identity = sha1(`slider-id:${labels.map((l) => l.label).join("/")}|${context}`);
+  return { paneText, choices, cursorIndex, fingerprint, highConfidence: true, nav: "horizontal", identity };
 }
 
 /** Upper bound on the contiguous choice rows `matchUnnumberedModal` will
@@ -6166,15 +6179,23 @@ function needsStrictStability(m: ScrapeMatch): boolean {
 }
 
 /** The cursor-free identity a card is registered with (`TmuxPromptRequest.
- *  identity`): the matcher's own when it set one (the add-dir family), else for
- *  a choice card the labels, for every other card its fingerprint (which has no
+ *  identity`): the matcher's own when it set one (the add-dir family, the
+ *  slider), else for a choice card the labels plus the card's text with the
+ *  cursor glyph removed, for every other card its fingerprint (which has no
  *  cursor in it). Applied at the two registration sites, not inside
  *  `pickScrapeMatch`, which stays the plain union of the matchers. */
 function identityOf(m: ScrapeMatch): string {
   if (m.identity) return m.identity;
-  return m.unparsable || m.choices.length === 0
-    ? m.fingerprint
-    : sha1(`choices:${m.choices.map((c) => c.label).join("\u0001")}`);
+  if (m.unparsable || m.choices.length === 0) return m.fingerprint;
+  // The labels alone can't tell two Yes/No dialogs apart (allow THIS command vs
+  // THAT edit), so the dialog's own text is part of it: every line of the card
+  // with the cursor glyph removed, which is all the cursor changes on a menu.
+  const text = m.paneText
+    .split("\n")
+    .map((l) => l.replace(/^\s*[❯›]\s?/, "").trim())
+    .filter((l) => l.length > 0)
+    .join("\n");
+  return sha1(`choices:${m.choices.map((c) => c.label).join("\u0001")}|${text}`);
 }
 
 /**
@@ -9552,8 +9573,12 @@ export async function spawnClaudeViaTmux(opts: ClaudeLaunchOptions): Promise<Spa
   // was never added (or twice) is a no-op.
   const bootToken = {};
   let bootWaitDone = false;
+  // The startup-dialog poller can still owe the pane a confirm after the boot
+  // wait ends (a `--resume` launch's consent window outlives it), so it holds
+  // the token too, until it exits.
+  let consentPollerDone = false;
   const releaseBootToken = (): void => {
-    if (bootWaitDone && deferredPasteSettled) bootsInFlight.delete(bootToken);
+    if (bootWaitDone && deferredPasteSettled && consentPollerDone) bootsInFlight.delete(bootToken);
   };
   if (opts.deferredPrompt) {
     const deferredPrompt = opts.deferredPrompt;
@@ -9955,6 +9980,11 @@ export async function spawnClaudeViaTmux(opts: ClaudeLaunchOptions): Promise<Spa
         const closing = bootFoundJsonl ? startupConfirm.flushConfirmed() : startupConfirm.flushAbsent();
         for (const line of closing) opts.onChunk("status", line);
       } catch { /* never let the boot poller crash the spawn */ }
+      finally {
+        // Every exit (window closed, session gone or superseded, a throw).
+        consentPollerDone = true;
+        releaseBootToken();
+      }
     })();
 
     // Wait for the JSONL, re-arming for another full window whenever a startup

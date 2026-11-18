@@ -223,4 +223,26 @@ describe("Start pre-flight on a harness stack", () => {
       stacks.harnessStacks.delete(stack.id);
     }
   }, 20_000);
+
+  test("after an all-logged-out refusal, logging in and pressing Start again at once goes through", async () => {
+    const a = account("out");
+    const b = account("out");
+    const stack = stacks.harnessStacks.create({ label: "login-retry", kind: "claude-code", members: [a.id, b.id] });
+    try {
+      const task = makeTask(a.id);
+      const refused = await orch.startTask(task.id);
+      expect("error" in refused).toBe(true);
+      // The refusal cached "logged out" for both accounts. The user logs in to
+      // the task's account and clicks Start within the cache's 15 s.
+      expect(status.peekClaudeLoggedIn(db.harnesses.get(a.id)!)).toBe(false);
+      a.set("in");
+      const started = await orch.startTask(task.id);
+      expect(started).toHaveProperty("runId");
+      await settled(task.id);
+      expect(db.tasks.get(task.id)!.agent).toBe(a.id);
+      expect(db.runs.listForTask(task.id)[0]!.agent).toBe(a.id);
+    } finally {
+      stacks.harnessStacks.delete(stack.id);
+    }
+  }, 20_000);
 });

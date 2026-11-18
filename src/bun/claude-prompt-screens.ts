@@ -15,6 +15,7 @@
  * live|binary` header so a new capture slots in next to the old one.
  */
 import { createHash } from "node:crypto";
+import { OAUTH_CODE_MAX_LEN } from "../shared/oauth-code.ts";
 
 function sha1(s: string): string {
   return createHash("sha1").update(s).digest("hex");
@@ -260,6 +261,14 @@ const PASTE_CODE_RE = /Paste code here if prompted\s*>/i;
 /** Non-blank lines read for the OAuth-code screen, and the fixed window (ending at the prompt line) its card and fingerprint use. */
 const PASTE_CODE_SCAN_LINES = 40;
 const PASTE_CODE_WINDOW_LINES = 12;
+/** Rows a typed code can wrap onto below the prompt: a code of
+ *  `OAUTH_CODE_MAX_LEN` characters on a pane 40 columns wide, plus one. */
+const PASTE_CODE_MAX_WRAP_ROWS = Math.ceil(OAUTH_CODE_MAX_LEN / 40) + 1;
+/** A wrapped continuation row of an OAuth code: one token of the code's
+ *  characters. Box-drawing chrome, a `>` composer and prose never match. */
+const PASTE_CODE_WRAP_ROW_RE = /^\s*[A-Za-z0-9_\-#.~%+=/]+\s*$/;
+/** Rows of anything else allowed under the prompt (and its wrapped code). */
+const PASTE_CODE_TRAILING_ROWS = 5;
 const VOLATILE_RE = /^\s*(?:[✻✶✳✢·*]\s+\S.*…|.*\(\d+s ·.*\)|.*Tip:.*)$/;
 
 function tailNonBlank(tail: string, n: number): string[] {
@@ -304,7 +313,26 @@ export function matchPasteCodeScreen(tail: string): { paneText: string; fingerpr
   // So read a deeper tail, redact it, and cut a fixed window that ENDS at the
   // prompt line instead.
   const all = tailNonBlank(tail, PASTE_CODE_SCAN_LINES);
-  if (!all.slice(-6).some((l) => PASTE_CODE_RE.test(l))) return null;
+  let rawMarkerAt = -1;
+  for (let i = all.length - 1; i >= 0; i--) {
+    if (PASTE_CODE_RE.test(all[i]!)) { rawMarkerAt = i; break; }
+  }
+  if (rawMarkerAt < 0) return null;
+  // Under the prompt: the rows a long code wraps onto (bounded by the code's
+  // maximum length), then at most a few other rows. More than that means the
+  // prompt is old output with something else drawn under it.
+  let below = rawMarkerAt + 1;
+  let wrapChars = 0;
+  while (
+    below < all.length
+    && below - rawMarkerAt <= PASTE_CODE_MAX_WRAP_ROWS
+    && PASTE_CODE_WRAP_ROW_RE.test(all[below]!)
+    && wrapChars + all[below]!.trim().length <= OAUTH_CODE_MAX_LEN
+  ) {
+    wrapChars += all[below]!.trim().length;
+    below++;
+  }
+  if (all.length - below > PASTE_CODE_TRAILING_ROWS) return null;
   if (all.slice(-12).some((l) => CURSOR_ROW_RE.test(l))) return null;
   const lines = redactPaneSecrets(all.join("\n")).split("\n");
   let markerAt = -1;
@@ -326,24 +354,41 @@ export function matchPasteCodeScreen(tail: string): { paneText: string; fingerpr
  * Mask a code typed after `Paste code here if prompted >`. The code may be
  * longer than the pane is wide, so claude wraps it onto the lines below the
  * prompt: when anything follows the marker, the rest of that line is masked
- * AND the lines under it (up to the next blank line) are dropped. A prompt with
- * nothing typed, and every other byte of the pane, is returned unchanged.
+ * AND the lines under it (up to the next blank line) are dropped. When the
+ * marker ends its row, the code can start on the row under it: the rows right
+ * under a bare marker that look like a code (one token of a code's characters)
+ * are dropped and the marker's line is masked. Every other byte of the pane,
+ * including prose under an empty prompt, is returned unchanged.
  */
 export function redactPaneSecrets(text: string): string {
   if (!/Paste code here if prompted/i.test(text)) return text;
   const out: string[] = [];
-  let dropping = false;
+  // "typed": drop every row up to the next blank; "bare": drop code-shaped rows.
+  let dropping: "typed" | "bare" | null = null;
+  let bare: { at: number; masked: string } | null = null;
   for (const line of text.split("\n")) {
-    if (dropping) {
-      if (line.trim() === "") dropping = false;
-      else continue;
+    if (dropping === "typed") {
+      if (line.trim() !== "") continue;
+      dropping = null;
+    } else if (dropping === "bare") {
+      if (line.trim() !== "" && PASTE_CODE_WRAP_ROW_RE.test(line)) {
+        out[bare!.at] = bare!.masked;
+        continue;
+      }
+      dropping = null;
+      bare = null;
     }
-    const m = line.match(/^(.*Paste code here if prompted\s*>)[ \t]*(\S.*)$/i);
-    if (m) {
-      out.push(`${m[1]} ••••`);
-      dropping = true;
-    } else {
-      out.push(line);
+    const typed = line.match(/^(.*Paste code here if prompted\s*>)[ \t]*(\S.*)$/i);
+    if (typed) {
+      out.push(`${typed[1]} ••••`);
+      dropping = "typed";
+      continue;
+    }
+    out.push(line);
+    const empty = line.match(/^(.*Paste code here if prompted\s*>)\s*$/i);
+    if (empty) {
+      dropping = "bare";
+      bare = { at: out.length - 1, masked: `${empty[1]} ••••` };
     }
   }
   return out.join("\n");

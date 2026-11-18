@@ -255,9 +255,10 @@ export function AnswerOverlay({
         }
         if (key.backspace || key.delete) return setCodeText((t) => t.slice(0, -1));
         if (input && !key.ctrl && !key.meta) {
-          const chunk = input.length > 1 ? sanitizeDrop(input) : input;
+          // Appended as typed: a code is not a dropped path, and trimming and
+          // validation belong to the shared OAuth-code path on submit.
           setHint("");
-          return setCodeText((t) => t + chunk);
+          return setCodeText((t) => t + input);
         }
         return;
       }

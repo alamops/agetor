@@ -241,13 +241,16 @@ export const NOT_LOGGED_IN_REASON = "not logged in";
  * account without blocking: the probes run in parallel, capped at 5 s in all,
  * and fail open. A task outside a stack is a no-op. Call it before planning.
  */
-export async function warmStackLogins(task: Pick<Task, "id" | "agent" | "harnessState">): Promise<void> {
+export async function warmStackLogins(
+  task: Pick<Task, "id" | "agent" | "harnessState">,
+  opts?: { fresh?: boolean },
+): Promise<void> {
   const resolved = harnessStacks.resolveForTask(task);
   if (!resolved) return;
   const members = resolved.stack.members
     .map((m) => harnesses.getByIdOrKind(m.harnessId))
     .filter((h): h is NonNullable<typeof h> => h != null);
-  await refreshClaudeAuth(members);
+  await refreshClaudeAuth(members, undefined, opts);
 }
 
 /** The "skipped <account>: not logged in" status lines for a plan's skipped
@@ -801,13 +804,30 @@ export async function prepareTaskHarness(
   taskId: string,
   opts: { manual: boolean; forceOffCurrent?: boolean; forceReason?: string } = { manual: true },
 ): Promise<PrepareResult> {
+  return prepareTaskHarnessPass(taskId, opts, false);
+}
+
+/** One pass of {@link prepareTaskHarness}. `freshAuth` re-probes every
+ *  account's login instead of reading the 15 s cache: a manual start that the
+ *  cache says is logged out everywhere gets one fresh pass before it is
+ *  refused, so logging in and pressing Start again works at once. */
+async function prepareTaskHarnessPass(
+  taskId: string,
+  opts: { manual: boolean; forceOffCurrent?: boolean; forceReason?: string },
+  freshAuth: boolean,
+): Promise<PrepareResult> {
+  const before = tasks.get(taskId);
+  if (!before) return { ok: false, error: "task not found" };
+  if (!harnessStacks.resolveForTask(before)) return { ok: true };
+  if (runs.hasRunning(taskId) || hooks?.isTaskHeld?.(taskId)) return { ok: true };
+  await warmStackLogins(before, { fresh: freshAuth });
+  // The probe awaited: plan from the task and stack as they are NOW (an
+  // account switch, a stack edit or a member change may have landed meanwhile).
   const task = tasks.get(taskId);
   if (!task) return { ok: false, error: "task not found" };
   const resolved = harnessStacks.resolveForTask(task);
   if (!resolved) return { ok: true };
-  if (runs.hasRunning(taskId) || hooks?.isTaskHeld?.(taskId)) return { ok: true };
   const { stack, current } = resolved;
-  await warmStackLogins(task);
   // A stack of fewer than two accounts behaves exactly like a lone account:
   // no failover state, and the normal pre-flight error (with its login help)
   // is what the user sees.
@@ -864,6 +884,8 @@ export async function prepareTaskHarness(
   if (plan.kind !== "next") {
     // Every account refused for the same reason: the login. Say how to fix it.
     if (plan.kind === "none-usable" && plan.reasons.length > 0 && plan.reasons.every((r) => r.reason === NOT_LOGGED_IN_REASON)) {
+      // The cache may predate a login the user just did: ask again before refusing.
+      if (opts.manual && !freshAuth) return prepareTaskHarnessPass(taskId, opts, true);
       return { ok: false, error: `every account in this stack is ${NOT_LOGGED_IN_REASON} — ${CLAUDE_LOGIN_HINT}` };
     }
     return { ok: false, error: "no usable account in this stack — enable, install or log in to one" };

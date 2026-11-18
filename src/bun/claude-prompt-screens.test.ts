@@ -60,14 +60,17 @@ describe("parseAddDirDialog", () => {
     expect(d.path).toBe(REPO_E);
   });
 
-  test("cut-off dialog: title scrolled off, path from the Adding: trailer", () => {
-    const d = parseAddDirDialog(pane("add-dir-startup-cutoff"))!;
+  test("cut-off dialog: title scrolled off, a ~450-char path reassembled from a six-row Adding: trailer", () => {
+    const raw = pane("add-dir-startup-cutoff");
+    const trailerAt = raw.split("\n").findIndex((l) => l.startsWith(" Adding:"));
+    const trailerRows = raw.split("\n").slice(trailerAt).filter((l) => l.trim().length > 0);
+    expect(trailerRows.length).toBe(6);
+    const d = parseAddDirDialog(raw)!;
     expect(d.footer).toBe("cutoff");
     expect(d.title).toBeNull();
-    expect(d.path).toBe(
-      "/Users/me/.agetor/worktrees/long/ws/dddddddddddddddddddddddddddddddddd"
-        + "dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd/repo-long",
-    );
+    const expected = `/Users/me/.agetor/worktrees/long/ws/${"d".repeat(404)}/repo-long`;
+    expect(expected.length).toBe(450);
+    expect(d.path).toBe(expected);
     expect(d.cursorIndex).toBe(0);
   });
 
@@ -240,6 +243,39 @@ describe("matchPasteCodeScreen + redactPaneSecrets", () => {
     expect(typed.fingerprint).toBe(base.fingerprint);
     expect(typed.paneText).not.toContain("wrapped-secret");
     expect(typed.paneText).not.toContain("state-value");
+  });
+
+  test("a code that starts on the row under a bare marker is masked, prose under an empty prompt is not", () => {
+    const code = `${"a".repeat(80)}${"b".repeat(80)}#state-value`;
+    const pane = ` Welcome\n Paste code here if prompted >\n${code.slice(0, 80)}\n${code.slice(80)}\n\n Esc to cancel`;
+    const out = redactPaneSecrets(pane);
+    expect(out).not.toContain("aaaa");
+    expect(out).not.toContain("bbbb");
+    expect(out).not.toContain("state-value");
+    expect(out).toContain("Paste code here if prompted > ••••");
+    expect(out).toContain("Esc to cancel");
+    expect(redactPaneSecrets(out)).toBe(out);
+    const m = matchPasteCodeScreen(pane)!;
+    expect(m.paneText).not.toContain("aaaa");
+    expect(m.fingerprint).toBe(matchPasteCodeScreen(" Welcome\n Paste code here if prompted >\n\n Esc to cancel")!.fingerprint);
+  });
+
+  test("a full-length code wrapped past six rows still matches, with the same fingerprint", () => {
+    const code = "c".repeat(500) + "#xyz";
+    const rows = [` Paste code here if prompted > ${code.slice(0, 49)}`];
+    for (let i = 49; i < code.length; i += 80) rows.push(code.slice(i, i + 80));
+    expect(rows.length).toBeGreaterThan(6);
+    const typed = matchPasteCodeScreen(` Welcome\n${rows.join("\n")}\n Esc to cancel\n`);
+    expect(typed).not.toBeNull();
+    expect(typed!.paneText).not.toContain("cccc");
+    expect(typed!.fingerprint).toBe(matchPasteCodeScreen(" Welcome\n Paste code here if prompted >\n Esc to cancel\n")!.fingerprint);
+  });
+
+  test("an old prompt with unrelated output under it is not a paste-code screen", () => {
+    const below = Array.from({ length: 6 }, (_, i) => ` some later output line ${i + 1}`).join("\n");
+    expect(matchPasteCodeScreen(` Paste code here if prompted >\n${below}\n`)).toBeNull();
+    const tokens = Array.from({ length: 20 }, () => "x".repeat(40)).join("\n");
+    expect(matchPasteCodeScreen(` Paste code here if prompted > abc\n${tokens}\n${below}\n`)).toBeNull();
   });
 
   test("redaction is idempotent", () => {

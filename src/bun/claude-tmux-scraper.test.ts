@@ -3838,6 +3838,16 @@ describe("claude 2.1.326 Enter-to-confirm family through the real chain", () => 
     expect(identityOf(moved)).toBe(identityOf(numbered));
     expect(identityOf(pickScrapeMatch(fixture("login-successful"), quiet)!)).toBeTruthy();
   });
+
+  test("two Yes/No dialogs with different questions have different identities", () => {
+    const { identityOf } = __forTest;
+    const bash = pickScrapeMatch(" Bash command\n   rm -rf build\n Do you want to proceed?\n ❯ 1. Yes\n   2. No\n", quiet)!;
+    const edit = pickScrapeMatch(" Edit file\n   src/app.ts\n Do you want to proceed?\n ❯ 1. Yes\n   2. No\n", quiet)!;
+    expect(bash.choices.map((c) => c.label)).toEqual(edit.choices.map((c) => c.label));
+    expect(identityOf(bash)).not.toBe(identityOf(edit));
+    const bashMoved = pickScrapeMatch(" Bash command\n   rm -rf build\n Do you want to proceed?\n   1. Yes\n ❯ 2. No\n", quiet)!;
+    expect(identityOf(bashMoved)).toBe(identityOf(bash));
+  });
 });
 
 describe("createStartupConfirmTracker — add-dir dialogs", () => {

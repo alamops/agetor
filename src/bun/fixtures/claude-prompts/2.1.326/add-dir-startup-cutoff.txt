@@ -4,5 +4,9 @@
  ❯ No, exit
    Yes, add it
  Enter to confirm · Esc to cancel
- Adding: /Users/me/.agetor/worktrees/long/ws/dddddddddddddddddddddddddddddddddd
-dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd/repo-long
+ Adding: /Users/me/.agetor/worktrees/long/ws/ddddddddddddddddddddddddddddddddddd
+dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd
+dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd
+dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd
+dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd
+ddddddddddddddddddddddddddddddddddddddddddddddddd/repo-long

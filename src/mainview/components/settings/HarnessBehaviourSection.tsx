@@ -12,22 +12,45 @@ import {
 } from "../../../shared/types.ts";
 
 /**
+ * One chain per preference key, shared by every mounted copy of the page: a
+ * load waits for the writes queued before it, and writes land in the order
+ * they were made, so an older write can never land after a newer one.
+ */
+const preferenceQueues = new Map<string, Promise<void>>();
+
+function enqueuePreferenceOp(key: string, op: () => Promise<void>): void {
+  const next = (preferenceQueues.get(key) ?? Promise.resolve()).then(op).catch(() => { /* each op handles its own failure */ });
+  preferenceQueues.set(key, next);
+}
+
+/**
  * A boolean preference the page reads once on mount and writes through a
  * last-write-wins queue: writes run one at a time, and a toggle that lands
  * while an older request is queued skips that request, so the stored value is
- * always the last switch. A failed write puts the switch back.
+ * always the last switch. A failed write puts the switch back to the last
+ * value the server confirmed. A load never overwrites a switch made after it
+ * began.
  */
 function useBooleanPreference(key: string, parse: (stored: string | undefined) => boolean, write: (on: boolean) => string) {
   const [value, setValue] = useState(() => parse(undefined));
   const touchedRef = useRef(false);
   const desiredRef = useRef<boolean | null>(null);
-  const queueRef = useRef(Promise.resolve());
+  // The last value the server is known to hold (loaded, or written successfully).
+  const confirmedRef = useRef<boolean>(parse(undefined));
   useEffect(() => {
     let cancelled = false;
-    void api.listPreferences().then((prefs) => {
-      if (cancelled || touchedRef.current) return;
-      setValue(parse(prefs[key]));
-    }).catch(() => { /* the default stays */ });
+    enqueuePreferenceOp(key, async () => {
+      try {
+        const prefs = await api.listPreferences();
+        if (cancelled) return;
+        const stored = parse(prefs[key]);
+        // The queue ran every earlier write first, so this is what the server
+        // holds now, even when the switch was moved after the load began.
+        confirmedRef.current = stored;
+        if (touchedRef.current) return;
+        setValue(stored);
+      } catch { /* the default stays */ }
+    });
     return () => { cancelled = true; };
     // `parse` is a module-level function at every call site.
     // eslint-disable-next-line react-hooks/exhaustive-deps
@@ -36,14 +59,15 @@ function useBooleanPreference(key: string, parse: (stored: string | undefined) =
     touchedRef.current = true;
     desiredRef.current = on;
     setValue(on);
-    queueRef.current = queueRef.current.then(async () => {
+    enqueuePreferenceOp(key, async () => {
       if (desiredRef.current !== on) return;
       try {
         await api.setPreference(key, write(on));
+        confirmedRef.current = on;
       } catch {
         if (desiredRef.current !== on) return;
-        desiredRef.current = !on;
-        setValue(!on);
+        desiredRef.current = confirmedRef.current;
+        setValue(confirmedRef.current);
       }
     });
   };
