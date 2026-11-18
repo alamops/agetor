@@ -226,13 +226,15 @@ function taskCard(page: Page, title: string): Locator {
   return page.locator('[class*="cursor-grab"]').filter({ hasText: title });
 }
 
-/** Click a task card's "View changes (git diff)" icon button (present on
- *  every card, independent of column/run state — TaskCard.tsx:198) and wait
- *  for the resulting dialog to render. */
+/** Open a task card's "View changes" dialog. The card has no Diff button any
+ *  more: it lives in the card's `⋯` menu (present on every card, independent
+ *  of column/run state), so open the menu and pick the entry. Then wait for
+ *  the dialog to render. */
 async function openDiffDialog(page: Page, title: string): Promise<Locator> {
   const card = taskCard(page, title);
   await expect(card).toBeVisible();
-  await card.getByTitle("View changes (git diff)").click();
+  await card.getByTestId("task-card-more").click();
+  await page.getByTestId("task-context-menu").getByRole("menuitem", { name: "View changes" }).click();
   const dialog = page.getByRole("dialog");
   await expect(dialog).toBeVisible();
   await expect(dialog.getByText("Changes")).toBeVisible();

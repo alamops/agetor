@@ -1,3 +1,5 @@
+> **Superseded by [task-card-ui-overhaul.md](task-card-ui-overhaul.md) (2026-11-18).** The 3-row header below was replaced by layout C1; the contract is [docs/architecture/task-card.md](../architecture/task-card.md).
+
 # Plan — TaskCard header: 3-row layout
 
 | Field | Value |
