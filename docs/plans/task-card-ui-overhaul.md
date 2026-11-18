@@ -6,9 +6,9 @@
 | Source | Owner goal: "Improve the Card UI following the best UI/UX practices. Currently it's broken like in the attached screenshot." The screenshot is transcribed in [`task-card-ui-overhaul-investigation.md`](task-card-ui-overhaul-investigation.md) §0. Decisions: [`task-card-ui-overhaul-grill.md`](task-card-ui-overhaul-grill.md), 23 decisions in 2 rounds. Design gate (this step): the measured mockup in [`task-card-ui-overhaul-mockup/`](task-card-ui-overhaul-mockup/README.md); the owner picked **C1**. |
 | Flags | none |
 | Gates | grilled + design sign-off by owner (C over A/B, then C1 over C2, Stop on `--danger`) + plan approved as written by owner, including the four planning calls in §8 (2026-11-18) |
-| Status | planned |
-| Branch | `fix/agetor-card-ui-improvement` (agetor worktree; set when execution starts) |
-| Base SHA | TBD — set when execution starts (branch head was `4d7f8bfb` at planning) |
+| Status | implemented (T1–T12, branch commits `wave 1`–`wave 3`); T13 owner eyeball check + PR pending |
+| Branch | `fix/agetor-card-ui-improvement` (agetor worktree) |
+| Base SHA | `4d7f8bfb93320076aa86292d614d84d4b883ba7d` (the planning docs are commit `54a486ec`) |
 
 ## 1. Objective & success criteria
 
@@ -337,3 +337,14 @@ The `webServer` in `playwright.config.ts` starts Vite (`bun run hmr`). Backends 
 | Agent-written prompt summary | Out of scope | A server feature; the preview stays a client transform (grill brief §3) |
 | Shared `Button` `destructive` variant contrast app-wide | Out of scope | App-wide colour change outside the card; grill #20 keeps shared button variants untouched. The card works around it locally (T7) |
 | Data backfill | None needed | Rendering only; progress recomputes from existing `history` |
+
+## 10. Deviations during implementation
+
+Small, two-way, recorded here so review sees them (owner has not separately ratified these):
+
+1. **`executions` counts history records, not history plus `run.active.length`.** A live execution is already in `history` with `outcome: null` (`pipeline-runner.ts` pushes both), so the plan's formula double-counted it. `pipelineStepProgress` counts `taskId !== null` history records and adds only an active entry missing from history.
+2. **The WebKit run is a Playwright project, not a `test.describe` with `test.use({ browserName })`.** Playwright refuses `browserName` inside a describe group. `playwright.config.ts` gains a `webkit` project with `testMatch: task-card-bounds.spec.ts`; every other spec stays Chromium-only.
+3. **`onDelete`, `onDiff`, `onArchive` and `onUnarchive` are removed from `TaskCard`, `Column` and the `<Column>` call in `App.tsx`.** The card no longer has those buttons, so the props would be dead; the menu keeps using the same handlers through `runTaskMenuAction`.
+4. **Identity line.** The identity text is `name · model · mode` in one truncating span, as §2.2 says; the plan's mockup variant omitted the mode.
+5. **Blocked hat line** names the step the block is on (`run.blocked[].stepId`), falling back to the live step, then to the bare word `Blocked`.
+6. **Bounds spec.** The worst-case pipeline state uses a 70-character pipeline name: with the plan's 26-character name a deliberately broken hat (`truncate`) still passed, so the check could not fail. With the longer name it fails as required.
