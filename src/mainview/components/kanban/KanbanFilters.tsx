@@ -108,8 +108,10 @@ export function KanbanFilters({
     || typeFilter.length > 0;
 
   return (
-    // `flex-wrap` + `min-w-0`: at narrow widths the controls wrap onto a
-    // second line instead of widening the document (docs/architecture/app-bar.md).
+    // `flex-wrap` + `min-w-0`, and every control `max-w-full`: at narrow widths
+    // (or a large UI zoom, which scales the fixed rem widths) the controls wrap
+    // onto further lines and shrink to the row, instead of widening the
+    // document (docs/architecture/app-bar.md).
     <div className="flex min-w-0 shrink-0 flex-wrap items-center gap-x-2 gap-y-2 border-b border-border/60 px-4 py-2">
       <MultiSearchSelect
         values={harnessFilter}
@@ -118,9 +120,9 @@ export function KanbanFilters({
         emptyLabel="All harnesses"
         placeholder="Search harnesses…"
         leadingIcon={<Cpu className="size-3.5" />}
-        className="w-48"
+        className="w-48 max-w-full"
       />
-      <div className="relative min-w-40 max-w-md flex-1">
+      <div className="relative min-w-[min(10rem,100%)] max-w-md flex-1">
         <Search className="pointer-events-none absolute left-2.5 top-1/2 size-3.5 -translate-y-1/2 text-muted-foreground" aria-hidden />
         <Input
           {...IDENTIFIER_INPUT_PROPS}
@@ -158,7 +160,7 @@ export function KanbanFilters({
         emptyLabel="All repos"
         placeholder="Search projects…"
         leadingIcon={<Folder className="size-3.5" />}
-        className="w-56"
+        className="w-56 max-w-full"
       />
       <MultiSearchSelect
         values={statusFilter}
@@ -167,7 +169,7 @@ export function KanbanFilters({
         emptyLabel="All statuses"
         placeholder="Search statuses…"
         leadingIcon={<Tag className="size-3.5" />}
-        className="w-48"
+        className="w-48 max-w-full"
       />
       <MultiSearchSelect
         values={typeFilter}
@@ -176,18 +178,22 @@ export function KanbanFilters({
         emptyLabel="All types"
         placeholder="Search types…"
         leadingIcon={<Shapes className="size-3.5" />}
-        className="w-44"
+        className="w-44 max-w-full"
       />
-      <Select
-        value={archivedView}
-        onChange={(e) => onArchivedViewChange(e.target.value as ArchivedView)}
-        className="w-36"
-        title="Filter by archive state"
-      >
-        <option value="active">Active only</option>
-        <option value="all">All</option>
-        <option value="archived">Archived only</option>
-      </Select>
+      {/* The width lives on this wrapper, not on the <select>: `Select` wraps
+          it in its own `relative` div, so a `max-w-full` on the <select> would
+          resolve against a box that has no definite width. */}
+      <div className="w-36 max-w-full">
+        <Select
+          value={archivedView}
+          onChange={(e) => onArchivedViewChange(e.target.value as ArchivedView)}
+          title="Filter by archive state"
+        >
+          <option value="active">Active only</option>
+          <option value="all">All</option>
+          <option value="archived">Archived only</option>
+        </Select>
+      </div>
       {anyActive && (
         <Button
           variant="ghost"

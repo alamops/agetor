@@ -58,4 +58,11 @@ describe("KanbanFilters layout", () => {
     expect(markup).toContain("flex-wrap");
     expect(markup).toContain("min-w-0");
   });
+
+  test("every fixed-width control can shrink to the row (a large UI zoom scales the rem widths)", () => {
+    const markup = html();
+    for (const w of ["w-48", "w-56", "w-44"]) expect(markup).toContain(`${w} max-w-full`);
+    // The archive Select keeps its width on a wrapper (its own wrapper div has no definite width).
+    expect(markup).toContain('<div class="w-36 max-w-full"><div class="relative"><select');
+  });
 });
