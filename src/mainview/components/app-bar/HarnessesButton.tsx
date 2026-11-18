@@ -109,7 +109,7 @@ export function HarnessesButton({ button, hide, open, panelId, onToggle, buttonR
     return <span className={cn(BASE_CLASS, "whitespace-nowrap")}>{content}</span>;
   }
   return (
-    <Tooltip label={button.summaryText}>
+    <Tooltip label={button.summaryText} className="min-w-0">
       <button
         ref={buttonRef}
         type="button"

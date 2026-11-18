@@ -19,11 +19,14 @@ function partWidth(ghost: HTMLElement, name: PartName): number {
 }
 
 function measureParts(ghost: HTMLElement): AppBarPartWidths {
+  // The ghost always carries a More replica (it is a step-2 part), but step 0
+  // does not show it, so it is not part of the full width.
+  const more = partWidth(ghost, "more");
   return {
-    full: ghost.scrollWidth,
+    full: ghost.scrollWidth - more,
     wordmark: partWidth(ghost, "wordmark"),
     importAction: partWidth(ghost, "import"),
-    more: partWidth(ghost, "more"),
+    more,
     harnessText: partWidth(ghost, "harness-text"),
     until: partWidth(ghost, "until"),
   };

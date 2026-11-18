@@ -75,12 +75,13 @@ export async function gotoApp(page: Page, url: string, options: GotoAppOptions =
   await expect(headerSettingsButton(page)).toBeVisible();
 }
 
-/** The app bar's Settings button, by its `title` (exact). A role-name lookup
- *  ("Settings") is ambiguous — strict-mode violation — whenever a toast with
- *  its own "Settings" action button (e.g. the harness auto-enable toast) is
- *  also on screen; only the header button carries this title. */
+/** The app bar's Settings button: scoped to the banner landmark (the app bar's
+ *  `<header>`). A page-wide role-name lookup ("Settings") is ambiguous —
+ *  strict-mode violation — whenever a toast with its own "Settings" action
+ *  button (e.g. the harness auto-enable toast) is also on screen; only the
+ *  app bar's button lives in the banner. */
 export function headerSettingsButton(page: Page): Locator {
-  return page.getByTitle("Settings", { exact: true });
+  return page.getByRole("banner").getByRole("button", { name: "Settings", exact: true });
 }
 
 /** Opens Settings → General (the default section on open — no tab click

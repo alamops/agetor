@@ -649,7 +649,7 @@ export const api = {
   defaults: () => j<AppDefaults>("/defaults"),
   info: () => j<{ version: string }>("/info"),
   /** Toggle the window's macOS "zoom" state. Wired up to double-click on
-   *  the app bar in App.tsx because Electrobun's drag region doesn't
+   *  the app bar (components/app-bar/AppBar.tsx) because Electrobun's drag region doesn't
    *  implement the native title-bar double-click gesture. */
   toggleWindowZoom: () =>
     j<{ ok: boolean; skipped?: string }>("/window/toggle-zoom", { method: "POST" }),
