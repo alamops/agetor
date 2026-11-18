@@ -28,7 +28,7 @@ export function ModeControl({
   "aria-labelledby"?: string;
 }) {
   return (
-    <div data-testid="launch-mode" data-value={primary}>
+    <div data-testid="launch-mode" data-value={primary} data-mode={mode} data-kind={kind}>
       <SegmentedControl
         aria-labelledby={labelledBy}
         aria-label={labelledBy ? undefined : "Mode"}

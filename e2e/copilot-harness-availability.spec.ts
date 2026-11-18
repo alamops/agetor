@@ -4,6 +4,7 @@ import { tmpdir } from "node:os";
 import path from "node:path";
 import { test, expect, type APIRequestContext, type E2EBackend, type Locator, type Page } from "./fixtures";
 import { gotoApp, selectProject } from "./helpers";
+import { backlogButton, fillNewTask, harnessPicker, newTaskPanel, pickHarness, runTaskButton } from "./launch-helpers";
 
 /**
  * E2E failure states of the GitHub Copilot harness's availability probe
@@ -108,9 +109,10 @@ async function expectSettingsRowUnavailable(
 
 /**
  * New Task: picking GitHub Copilot shows the inline unavailable box (reason +
- * cask hint). "Run task" then creates the card but the start is refused with
- * the same reason and hint: the error toast shows it, the task never gets a
- * run, and it stays out of `running`.
+ * cask hint) and gates **Run task** with the same reason as visible text;
+ * **Add to backlog** stays available and creates the card. Starting that card
+ * from the API is still refused by the server's own pre-flight, with the same
+ * reason and hint, and never creates a run.
  */
 async function expectRunRefused(
   page: Page,
@@ -119,39 +121,34 @@ async function expectRunRefused(
   projectName: string,
   reason: RegExp | string,
 ): Promise<void> {
-  const form = page.locator("aside").first();
-  const copilotButton = form.getByRole("button", { name: "GitHub Copilot", exact: true });
-  await expect(copilotButton).toBeVisible({ timeout: 20_000 });
-  // The harness button's own status dot is red too.
-  await expect(copilotButton.locator("span.bg-danger-solid")).toBeVisible({ timeout: 15_000 });
-  await copilotButton.click();
+  const form = newTaskPanel(page);
+  await pickHarness(form, "GitHub Copilot");
+  // The selected harness's own status dot is red too.
+  await expect(harnessPicker(form).getByTestId("launch-harness-status")).toHaveAttribute("data-tone", "error", {
+    timeout: 15_000,
+  });
   await selectProject(page, form, projectName);
 
-  const unavailable = form.locator("div.border-destructive\\/40").filter({ hasText: CASK_HINT });
+  const unavailable = form.getByTestId("launch-agent-unavailable-hint").filter({ hasText: CASK_HINT });
   await expect(unavailable).toBeVisible({ timeout: 15_000 });
   await expect(unavailable).toContainText(reason);
 
   const title = `copilot-unavailable ${randomUUID().slice(0, 8)}`;
-  await form.getByPlaceholder("Short description").fill(title);
-  const prompt = form.getByTestId("prompt-textarea");
-  await prompt.click();
-  await prompt.fill("this should never reach an agent");
-  // An unavailable harness doesn't disable the button: the start pre-flight
-  // is what refuses it.
-  const runButton = form.getByRole("button", { name: "Run task", exact: true });
-  await expect(runButton).toBeEnabled({ timeout: 15_000 });
-  await runButton.click();
+  await fillNewTask(page, { title, prompt: "this should never reach an agent" });
 
-  const toast = page.getByText(/GitHub Copilot is not available/).first();
-  await expect(toast).toBeVisible({ timeout: 15_000 });
-  await expect(toast).toContainText(`Install it with: ${CASK_HINT}`);
+  // An unavailable harness blocks Run (the reason is visible text, since a
+  // disabled button shows no tooltip) but never the backlog.
+  await expect(runTaskButton(form)).toBeDisabled();
+  await expect(form.getByTestId("launch-run-blocked-reason")).toContainText("GitHub Copilot can't start");
+  await expect(backlogButton(form)).toBeEnabled();
+  await backlogButton(form).click();
 
   await expect
     .poll(async () => (await listTasks(request, backend)).find((t) => t.title === title)?.id ?? null, { timeout: 15_000 })
     .not.toBeNull();
   const task = (await listTasks(request, backend)).find((t) => t.title === title)!;
   expect(task.agent).toBe("copilot");
-  expect(task.column).not.toBe("running");
+  expect(task.column).toBe("backlog");
   expect(task.runId).toBeNull();
   expect(await listRuns(request, backend, task.id)).toEqual([]);
 

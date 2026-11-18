@@ -397,7 +397,7 @@ export function SelectProjectsDialog({ open, onClose, value, onSave, lockedPath,
         ) : null}
 
         {conflicts.length > 0 ? (
-          <p className="flex items-start gap-1.5 text-xs text-destructive" role="alert" data-testid="select-projects-save-error">
+          <p className="flex items-start gap-1.5 text-xs text-danger" role="alert" data-testid="select-projects-save-error">
             <TriangleAlert className="mt-0.5 h-3.5 w-3.5 shrink-0" />
             {conflicts.map(describeRootConflict).join(" ")}
           </p>

@@ -20,6 +20,7 @@ import { gotoApp, getPreferences, openSettingsGeneral, selectProject } from "./h
 // (see the marker-literal comments below for why THOSE stay copied).
 import { FX_AUTO_RESUME_DELAY_PREF, FX_AUTO_RESUME_MAX, FX_AUTO_RESUME_PREF } from "../src/shared/types.ts";
 import { FX_RESUME_UNSUPPORTED_TEXT } from "../src/shared/fx-recovery.ts";
+import { openMore, pickHarness } from "./launch-helpers";
 
 // Wait budget for a fake-driver turn to surface in the panel (the paused
 // notice, the recovered line, a follow-up echo). The fake storm itself is
@@ -408,9 +409,7 @@ function newTaskFormPanel(page: Page): Locator {
  *  harness is enabled. Mirrors `e2e/fx-interactions.spec.ts`'s identical
  *  helper. */
 async function selectHarness(page: Page, label: string): Promise<void> {
-  const button = newTaskFormPanel(page).getByRole("button", { name: label, exact: true });
-  await expect(button).toBeVisible({ timeout: 20_000 });
-  await button.click();
+  await pickHarness(newTaskFormPanel(page), label);
 }
 
 /** Registers a fresh directory under `backend.dataDir` as a project under a
@@ -999,9 +998,9 @@ test.describe("fx recovery", () => {
     // `yolo` / "Full access" row) is what a fresh fx selection lands on.
     // Locator mirrors `e2e/fx-interactions.spec.ts`'s identical "Mode" row
     // xpath (no dedicated testid exists on the trigger).
-    const modeLabel = form.getByText("Mode", { exact: true });
-    const modeTrigger = modeLabel.locator("xpath=following-sibling::div[2]//button").first();
-    await expect(modeTrigger).toHaveText("Full access");
+    await openMore(form);
+    const modeTrigger = form.getByTestId("launch-mode-variant-picker-trigger");
+    await expect(modeTrigger).toContainText("Full access");
 
     await selectProject(page, form, projectName);
 

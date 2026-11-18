@@ -186,9 +186,10 @@ export function Picker({
     if (!open) return;
     queueMicrotask(() => {
       if (placement === "inline") panelRef.current?.scrollIntoView({ block: "nearest" });
-      const opts = { preventScroll: placement === "inline" };
-      if (searchable) searchRef.current?.focus(opts);
-      else listRef.current?.focus(opts);
+      // Never let focusing the panel scroll the page: a scroll would close it
+      // (the outside-scroll rule below) the moment it opened.
+      if (searchable) searchRef.current?.focus({ preventScroll: true });
+      else listRef.current?.focus({ preventScroll: true });
     });
   }, [open, searchable, placement]);
 
@@ -200,9 +201,16 @@ export function Picker({
     const onDown = (e: MouseEvent) => {
       if (!inside(e.target)) close(false);
     };
+    const openedAt = Date.now();
     const onScroll = (e: Event) => {
       if (placement !== "popover") return;
-      if (!inside(e.target)) close(false);
+      // Only a scroll of something that CONTAINS the trigger moves the trigger
+      // out from under a fixed popover; ignore scrolls inside the popover, and
+      // the settling scrolls of the first instants after opening.
+      if (Date.now() - openedAt < 150) return;
+      const t = e.target;
+      const scrolledAncestor = t === document || (t instanceof Node && t.contains(triggerRef.current));
+      if (scrolledAncestor && !inside(t)) close(false);
     };
     const onResize = () => {
       if (placement === "popover") close(false);
@@ -429,7 +437,7 @@ export function Picker({
         onKeyDown={onTriggerKeyDown}
         className={cn(
           "flex h-9 w-full items-center gap-2 rounded-md border bg-background px-3 py-1 text-left text-sm shadow-sm transition-colors hover:bg-accent/40 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring disabled:cursor-not-allowed disabled:opacity-50",
-          tone === "danger" || invalid ? "border-destructive/60" : "border-input",
+          tone === "danger" || invalid ? "border-danger/60" : "border-input",
           triggerClassName,
         )}
       >

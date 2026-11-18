@@ -4,6 +4,7 @@ import { tmpdir } from "node:os";
 import path from "node:path";
 import { test, expect, type APIRequestContext, type E2EBackend, type Locator, type Page } from "./fixtures";
 import { gotoApp, selectProject } from "./helpers";
+import { effortField, modeField, modelField, newTaskPanel, openMore, pickHarness, setPrimaryMode, type PickerHandle } from "./launch-helpers";
 
 /**
  * E2E coverage for docs/plans/github-copilot-harness.md TT7: the GitHub
@@ -152,13 +153,13 @@ function harnessRow(control: Locator): Locator {
 /** The New Task form's Model `<select>` (see e2e/fx-models.spec.ts for the
  *  structural-locator rationale: the refresh button sits in a row that is the
  *  previous sibling of the `<select>`, both inside one wrapper). */
-function newTaskModelSelect(page: Page): Locator {
-  return page.getByTestId("refresh-models").locator("xpath=../..").locator("select");
+function newTaskModelSelect(page: Page): PickerHandle {
+  return modelField(newTaskPanel(page));
 }
 
 /** The New Task form's Effort `<select>` (same wrapper shape as Model's). */
-function newTaskEffortSelect(form: Locator): Locator {
-  return form.getByText("Effort", { exact: true }).locator("xpath=..").locator("select");
+function newTaskEffortSelect(form: Locator): PickerHandle {
+  return effortField(form);
 }
 
 test.describe("GitHub Copilot harness", () => {
@@ -210,48 +211,46 @@ test.describe("GitHub Copilot harness", () => {
 
     await gotoApp(page, freshBackend.bootBase);
     const form = newTaskFormPanel(page);
-    const copilotButton = form.getByRole("button", { name: "GitHub Copilot", exact: true });
-    await expect(copilotButton).toBeVisible({ timeout: 20_000 });
-    await copilotButton.click();
+    await pickHarness(form, "GitHub Copilot");
     await selectProject(page, form, projectName);
 
     // Model: Auto is the default and first row; the discovered catalog adds
     // `gpt-5.4-mini`, which has no curated row, as a bare-id option.
     const modelSelect = newTaskModelSelect(page);
-    await expect(modelSelect).toHaveValue("auto");
+    await modelSelect.expectValue("auto");
     await expect
-      .poll(async () => modelSelect.locator("option").allTextContents(), {
+      .poll(async () => modelSelect.optionLabels(), {
         timeout: 15_000,
         message: "copilot model picker never listed the discovered-only gpt-5.4-mini",
       })
       .toContain("gpt-5.4-mini");
-    const modelLabels = await modelSelect.locator("option").allTextContents();
+    const modelLabels = await modelSelect.optionLabels();
     expect(modelLabels[0]).toBe("Auto");
     expect(modelLabels).toContain("Claude Opus 5.5");
 
     // Effort: "Model default" (`auto`) is the default.
     const effortSelect = newTaskEffortSelect(form);
-    await expect(effortSelect).toHaveValue("auto");
-    await expect(effortSelect.locator("option:checked")).toHaveText("Model default");
+    await effortSelect.expectValue("auto");
+    await expect(effortSelect.trigger).toContainText("Model default");
 
     // No Speed control for Copilot (only cursor/fx render one).
     await expect(form.getByText("Speed", { exact: true })).toHaveCount(0);
-    await expect(form.getByTestId("new-task-speed")).toHaveCount(0);
+    await expect(form.getByTestId("launch-speed")).toHaveCount(0);
 
     // Modes: Auto (default), Plan, Read-only.
-    const modeLabel = form.getByText("Mode", { exact: true });
-    const modeTrigger = modeLabel.locator("xpath=following-sibling::div[2]//button").first();
-    await expect(modeTrigger).toHaveText("Auto");
-    await modeTrigger.click();
-    const popover = form.locator("[data-popover-open]");
-    await expect(popover).toBeVisible();
-    await expect(popover.locator("span.block.truncate")).toHaveText(["Auto", "Plan", "Read-only"]);
-    await popover.getByRole("button", { name: /^Plan/ }).click();
-    await expect(modeTrigger).toHaveText("Plan");
-    // The Code/Plan pill routes to Copilot's own `--mode plan`.
-    await expect(
-      modeLabel.locator("xpath=following-sibling::div[1]").getByRole("button", { name: "Plan", exact: true }),
-    ).toHaveAttribute("title", /--mode plan/);
+    // Code | Plan is the primary choice; the exact code variants (Auto,
+    // Read-only) sit in the Approvals picker under More options.
+    await modeField(form).expectValue("auto");
+    await openMore(form);
+    await expect(form.getByTestId("launch-mode-variant-picker-trigger")).toContainText("Auto");
+    await form.getByTestId("launch-mode-variant-picker-trigger").click();
+    const popover = page.getByTestId("launch-mode-variant-picker-popover");
+    await expect(popover.getByRole("option")).toHaveText(["Auto", "Read-only"]);
+    await page.keyboard.press("Escape");
+    await setPrimaryMode(form, "plan");
+    await modeField(form).expectValue("plan");
+    // The Plan radio routes to Copilot's own `--mode plan`.
+    await expect(form.getByTestId("launch-mode-plan")).toHaveAttribute("title", /--mode plan/);
   });
 
   test("stream marker: thinking, tool card, auto-picked line, usage chip and a live subagent tab with its nested tool call", async ({

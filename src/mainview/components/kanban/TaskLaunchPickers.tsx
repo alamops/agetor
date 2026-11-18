@@ -138,7 +138,7 @@ export function TaskLaunchPickers({
         {pipelinesLoading && pipelines.length === 0 ? (
           <p data-testid="launch-pipelines-loading" className="text-2xs text-muted-foreground">Loading pipelines…</p>
         ) : pipelinesUnavailable ? (
-          <p data-testid="launch-pipelines-error" className="text-2xs text-destructive">
+          <p data-testid="launch-pipelines-error" className="text-2xs text-danger">
             Couldn't load pipelines {pipelinesError ? `— ${pipelinesError}` : ""}
           </p>
         ) : pipelines.length === 0 && pipelineId === null ? (

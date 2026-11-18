@@ -164,7 +164,7 @@ export function AgentProfileForm({
       {loaded ? (
         <div
           data-testid="agent-profile-form-error"
-          className="rounded-md border border-destructive/40 bg-destructive/10 px-3 py-2 text-xs text-destructive-foreground"
+          className="rounded-md border border-danger/40 bg-danger/10 px-3 py-2 text-xs text-foreground"
         >
           This agent no longer exists — it may have been deleted elsewhere.
         </div>

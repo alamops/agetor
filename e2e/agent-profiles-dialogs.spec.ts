@@ -426,8 +426,8 @@ test.describe("agent profile picker in the shared launch dialogs", () => {
     const picker = issueTaskDialog.getByTestId("agent-profile-picker");
     await expect(picker).toBeVisible();
     await picker.getByTestId("agent-profile-picker-trigger").click();
-    await expect(picker.getByTestId("agent-profile-picker-popover")).toBeVisible();
-    const row = picker.locator(`[data-testid="agent-profile-picker-row"][data-profile-id="${dialogProfileId}"]`);
+    await expect(page.getByTestId("agent-profile-picker-popover")).toBeVisible();
+    const row = page.locator(`[data-testid="agent-profile-picker-row"][data-profile-id="${dialogProfileId}"]`);
     await expect(row).toBeVisible();
     await row.click();
 
@@ -514,7 +514,7 @@ test.describe("agent profile picker in the shared launch dialogs", () => {
 
     const picker = issueTaskDialog.getByTestId("agent-profile-picker");
     await picker.getByTestId("agent-profile-picker-trigger").click();
-    const row = picker.locator(`[data-testid="agent-profile-picker-row"][data-profile-id="${cursorProfileId}"]`);
+    const row = page.locator(`[data-testid="agent-profile-picker-row"][data-profile-id="${cursorProfileId}"]`);
     await expect(row).toBeVisible({ timeout: CONVERGE_TIMEOUT });
     await row.click();
 
@@ -552,8 +552,8 @@ test.describe("agent profile picker in the shared launch dialogs", () => {
     const picker = dlg.getByTestId("agent-profile-picker");
     await expect(picker).toBeVisible();
     await picker.getByTestId("agent-profile-picker-trigger").click();
-    await expect(picker.getByTestId("agent-profile-picker-popover")).toBeVisible();
-    const row = picker.locator(`[data-testid="agent-profile-picker-row"][data-profile-id="${dialogProfileId}"]`);
+    await expect(page.getByTestId("agent-profile-picker-popover")).toBeVisible();
+    const row = page.locator(`[data-testid="agent-profile-picker-row"][data-profile-id="${dialogProfileId}"]`);
     await expect(row).toBeVisible();
     await row.click();
 
@@ -599,7 +599,7 @@ test.describe("agent profile picker in the shared launch dialogs", () => {
 
     const picker = issueTaskDialog.getByTestId("agent-profile-picker");
     await picker.getByTestId("agent-profile-picker-trigger").click();
-    const popover = picker.getByTestId("agent-profile-picker-popover");
+    const popover = page.getByTestId("agent-profile-picker-popover");
     await expect(popover).toBeVisible();
     await expect(popover).toHaveAttribute("data-popover-open", "");
 

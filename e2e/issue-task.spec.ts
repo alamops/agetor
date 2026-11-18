@@ -7,6 +7,7 @@ import { fileURLToPath } from "node:url";
 import { test, expect, type APIRequestContext, type E2EBackend, type Locator, type Page } from "./fixtures";
 import { dialogBranchPicker, gotoApp, openSelectProjects, selectBaseBranch } from "./helpers";
 import { startGitHubStub, type GitHubStub, type StubRoute } from "./github-stub";
+import { pickHarness } from "./launch-helpers";
 
 /**
  * E2E coverage for "task from a Git issue + its comment thread" via the
@@ -606,7 +607,7 @@ async function createPipelineRest(
 async function pickPipeline(dialog: Locator, pipelineId: string): Promise<void> {
   const picker = dialog.getByTestId("launch-pipeline-picker").getByTestId("pipeline-picker");
   await picker.getByTestId("pipeline-picker-trigger").click();
-  const popover = picker.getByTestId("pipeline-picker-popover");
+  const popover = picker.page().getByTestId("pipeline-picker-popover");
   await expect(popover).toBeVisible({ timeout: CONVERGE_TIMEOUT });
   await popover.locator(`[data-testid="pipeline-picker-row"][data-pipeline-id="${pipelineId}"]`).click();
   await expect(popover).toBeHidden();
@@ -617,9 +618,9 @@ async function pickPipeline(dialog: Locator, pipelineId: string): Promise<void> 
 async function openPipelineManageRow(dialog: Locator): Promise<Locator> {
   const picker = dialog.getByTestId("launch-pipeline-picker").getByTestId("pipeline-picker");
   await picker.getByTestId("pipeline-picker-trigger").click();
-  const popover = picker.getByTestId("pipeline-picker-popover");
+  const popover = picker.page().getByTestId("pipeline-picker-popover");
   await expect(popover).toBeVisible({ timeout: CONVERGE_TIMEOUT });
-  const manage = popover.getByTestId("pipeline-picker-manage");
+  const manage = picker.page().getByTestId("pipeline-picker-manage");
   await expect(manage).toBeVisible();
   return manage;
 }
@@ -995,18 +996,16 @@ test.describe("task from a Git issue", () => {
     const issueTaskDialog = await openIssueTaskDialog(page);
 
     const typePicker = issueTaskDialog.getByTestId("task-type-picker");
-    const taskButton = typePicker.getByRole("button", { name: "Task", exact: true });
-    const bugButton = typePicker.getByRole("button", { name: "Bug", exact: true });
-    const spikeButton = typePicker.getByRole("button", { name: "Spike", exact: true });
+    const taskButton = typePicker.getByRole("radio", { name: "Task", exact: true });
+    const bugButton = typePicker.getByRole("radio", { name: "Bug", exact: true });
+    const spikeButton = typePicker.getByRole("radio", { name: "Spike", exact: true });
 
     // Seeded from the fixture issue's "bug" label (inferTaskTypeFromLabels,
     // src/shared/issue-task.ts) once the thread loads — Bug renders with the
-    // `default` Button variant (`bg-primary` in its class list, per
-    // TaskTypePicker.tsx), Task/Spike stay on the `outline` variant, which
-    // never emits `bg-primary`.
-    await expect(bugButton).toHaveClass(/bg-primary/, { timeout: CONVERGE_TIMEOUT });
-    await expect(taskButton).not.toHaveClass(/bg-primary/);
-    await expect(spikeButton).not.toHaveClass(/bg-primary/);
+    // checked radio of the Type radiogroup (TaskTypePicker.tsx).
+    await expect(bugButton).toBeChecked({ timeout: CONVERGE_TIMEOUT });
+    await expect(taskButton).not.toBeChecked();
+    await expect(spikeButton).not.toBeChecked();
 
     const worktreeOptions = issueTaskDialog.getByTestId("worktree-options");
     const branchNameInput = worktreeOptions.getByTestId("branch-name-input");
@@ -1018,16 +1017,16 @@ test.describe("task from a Git issue", () => {
     // Picking Spike swaps both the selected button and the derived prefix
     // (DEFAULT_BRANCH_CONFIG.rules.spike.prefix === "spike/").
     await spikeButton.click();
-    await expect(spikeButton).toHaveClass(/bg-primary/);
-    await expect(bugButton).not.toHaveClass(/bg-primary/);
+    await expect(spikeButton).toBeChecked();
+    await expect(bugButton).not.toBeChecked();
     await expect(async () => {
       expect(await branchNameInput.inputValue()).toMatch(/^spike\//);
     }).toPass({ timeout: CONVERGE_TIMEOUT });
 
     // Picking Bug back swaps them again (fix/ per DEFAULT_BRANCH_CONFIG).
     await bugButton.click();
-    await expect(bugButton).toHaveClass(/bg-primary/);
-    await expect(spikeButton).not.toHaveClass(/bg-primary/);
+    await expect(bugButton).toBeChecked();
+    await expect(spikeButton).not.toBeChecked();
     await expect(async () => {
       expect(await branchNameInput.inputValue()).toMatch(/^fix\//);
     }).toPass({ timeout: CONVERGE_TIMEOUT });
@@ -1153,7 +1152,7 @@ test.describe("task from a Git issue", () => {
     const issueTaskDialog = await openIssueTaskDialog(page);
 
     // Baseline: the Agent picker is visible and there's no pipeline summary.
-    await expect(issueTaskDialog.getByText("Agent", { exact: true })).toBeVisible();
+    await expect(issueTaskDialog.getByTestId("agent-profile-picker")).toBeVisible();
     await expect(issueTaskDialog.getByTestId("launch-pipeline-summary")).toHaveCount(0);
     await expect(issueTaskDialog.getByTestId("launch-pipeline-picker")).toBeVisible();
 
@@ -1161,7 +1160,7 @@ test.describe("task from a Git issue", () => {
     // profile card (the Agent block disappears entirely behind the summary).
     const agentPicker = issueTaskDialog.getByTestId("agent-profile-picker");
     await agentPicker.getByTestId("agent-profile-picker-trigger").click();
-    await agentPicker.locator(`[data-testid="agent-profile-picker-row"][data-profile-id="${profileId}"]`).click();
+    await page.locator(`[data-testid="agent-profile-picker-row"][data-profile-id="${profileId}"]`).click();
     // The picker's own trigger renders a chip with the same test id, so the
     // selected card is the last one.
     await expect(issueTaskDialog.getByTestId("agent-profile-card").last()).toBeVisible();
@@ -1174,13 +1173,13 @@ test.describe("task from a Git issue", () => {
     await expect(summary).toContainText("1 step");
     await expect(summary).toContainText("starts with");
     await expect(issueTaskDialog.getByTestId("agent-profile-card")).toHaveCount(0);
-    await expect(issueTaskDialog.getByText("Agent", { exact: true })).toHaveCount(0);
+    await expect(issueTaskDialog.getByTestId("agent-profile-picker")).toHaveCount(0);
     await expect(issueTaskDialog.getByTestId("launch-pipeline-problem")).toHaveCount(0);
 
     // Change clears the selection and restores the Agent block.
     await summary.getByTestId("launch-pipeline-change").click();
     await expect(issueTaskDialog.getByTestId("launch-pipeline-summary")).toHaveCount(0);
-    await expect(issueTaskDialog.getByText("Agent", { exact: true })).toBeVisible();
+    await expect(issueTaskDialog.getByTestId("agent-profile-picker")).toBeVisible();
     // The profile picked before the pipeline stays cleared — Change restores
     // the manual block, not the profile it replaced (New Task parity).
     await expect(issueTaskDialog.getByTestId("agent-profile-card")).toHaveCount(0);
@@ -1226,7 +1225,7 @@ test.describe("task from a Git issue", () => {
     createdTaskIds.splice(createdTaskIds.indexOf(task.id), 1);
   });
 
-  test("pipeline picker: an unrunnable pipeline is listed but blocks Create & start", async ({ page, backend }) => {
+  test("pipeline picker: an unrunnable pipeline is listed but blocks Run task", async ({ page, backend }) => {
     test.setTimeout(90_000);
     const suffix = Date.now();
     const pipelineName = `E2E unrunnable pipeline ${suffix}`;
@@ -1311,7 +1310,7 @@ test.describe("task from a Git issue", () => {
 
     // Manually pick the deterministically unavailable harness: a plain
     // single-agent launch must be blocked by it.
-    await issueTaskDialog.getByRole("button", { name: manualHarnessLabel }).click();
+    await pickHarness(issueTaskDialog, manualHarnessLabel);
     const hint = issueTaskDialog.getByTestId("launch-agent-unavailable-hint");
     await expect(hint).toBeVisible({ timeout: CONVERGE_TIMEOUT });
     await expect(hint).toContainText("not found on PATH");

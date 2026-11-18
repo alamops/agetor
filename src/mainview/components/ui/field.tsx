@@ -81,7 +81,7 @@ export function FieldDescription({ className, ...props }: React.HTMLAttributes<H
 
 export function FieldError({ className, ...props }: React.HTMLAttributes<HTMLParagraphElement>) {
   const ctx = React.useContext(FieldContext);
-  return <p id={ctx?.errorId} role="alert" className={cn("text-2xs text-destructive", className)} {...props} />;
+  return <p id={ctx?.errorId} role="alert" className={cn("text-2xs text-danger", className)} {...props} />;
 }
 
 /** A labelled group of related controls (a radiogroup's wrapper, a set of toggles). */

@@ -6,6 +6,7 @@ import path from "node:path";
 import { randomUUID } from "node:crypto";
 import { test, expect, type APIRequestContext, type E2EBackend, type Locator, type Page } from "./fixtures";
 import { gotoApp, openSelectProjects } from "./helpers";
+import { modelField } from "./launch-helpers";
 
 /**
  * E2e coverage for docs/plans/clone-repository-launch-pickers.md §5 TT3: the
@@ -104,21 +105,11 @@ async function waitForLaunchReady(dialog: Locator): Promise<void> {
   await expect(dialog.getByTestId("agent-profile-picker")).toBeVisible({ timeout: CONVERGE_TIMEOUT });
 }
 
-/** Mirrors `e2e/agent-profiles-settings.spec.ts`'s `launchSelect`: the
- *  `TaskLaunchPickers` manual-block markup has no `htmlFor`/`aria-labelledby`
- *  wiring, so each `<label>` + `<Select>` pair is located structurally —
- *  the label's next sibling wraps the actual `<select>`. */
-function launchSelect(container: Locator, label: string): Locator {
-  return container
-    .locator("label", { hasText: new RegExp(`^${label}$`) })
-    .locator("xpath=following-sibling::*[1]//select");
-}
-
 async function selectProfileInDialog(dialog: Locator, profileId: string): Promise<void> {
   const picker = dialog.getByTestId("agent-profile-picker");
   await picker.getByTestId("agent-profile-picker-trigger").click();
-  await expect(picker.getByTestId("agent-profile-picker-popover")).toBeVisible();
-  await picker.locator(`[data-testid="agent-profile-picker-row"][data-profile-id="${profileId}"]`).click();
+  await expect(picker.page().getByTestId("agent-profile-picker-popover")).toBeVisible();
+  await picker.page().locator(`[data-testid="agent-profile-picker-row"][data-profile-id="${profileId}"]`).click();
 }
 
 interface TaskRow {
@@ -226,7 +217,7 @@ test.describe("Clone repository dialog", () => {
     // includes "sonnet-5" unconditionally (not catalog-scoped) — is what the
     // manual Model select renders.
     await expect(launch.getByText("Harness", { exact: true })).toBeVisible();
-    await launchSelect(launch, "Model").selectOption("sonnet-5");
+    await modelField(launch).selectOption("sonnet-5");
 
     const submit = dialog.getByTestId("clone-submit");
     await expect(submit).toBeEnabled({ timeout: CONVERGE_TIMEOUT });

@@ -5,6 +5,7 @@ import path from "node:path";
 import { test, expect, type APIRequestContext, type E2EBackend, type Locator, type Page } from "./fixtures";
 import { gotoApp } from "./helpers";
 import { AGENT_OPTIONS } from "../src/shared/types.ts";
+import { modelField, newTaskPanel, pickHarness, type PickerHandle } from "./launch-helpers";
 
 /**
  * E2E coverage for `docs/plans/fx-model-catalog-refresh.md` TT1: the fx model
@@ -193,9 +194,7 @@ async function openTask(page: Page, title: string): Promise<Locator> {
  *  that the harness is actually enabled and the (fresh-per-navigation)
  *  harness list fetch has already picked that up. */
 async function selectHarness(page: Page, label: string): Promise<void> {
-  const button = newTaskFormPanel(page).getByRole("button", { name: label, exact: true });
-  await expect(button).toBeVisible({ timeout: 20_000 });
-  await button.click();
+  await pickHarness(newTaskFormPanel(page), label);
 }
 
 /**
@@ -208,8 +207,8 @@ async function selectHarness(page: Page, label: string): Promise<void> {
  * children of one shared `space-y-1` wrapper. Two levels up from the button
  * lands on that wrapper; `select` inside it is the Model dropdown.
  */
-function newTaskModelSelect(page: Page): Locator {
-  return page.getByTestId("refresh-models").locator("xpath=../..").locator("select");
+function newTaskModelSelect(page: Page): PickerHandle {
+  return modelField(newTaskPanel(page));
 }
 
 /**
@@ -247,12 +246,12 @@ function detailsModelSelect(panel: Locator): Locator {
  * — never synchronously with whatever action triggered the probe.
  */
 async function expectConvergedFxOptions(
-  select: Locator,
+  select: PickerHandle | Locator,
   expected: string[] = EXPECTED_FX_OPTION_LABELS,
   timeout = 15_000,
 ): Promise<void> {
   await expect
-    .poll(async () => select.locator("option").allTextContents(), {
+    .poll(async () => ("optionLabels" in select ? select.optionLabels() : select.locator("option").allTextContents()), {
       timeout,
       message: "fx model picker never converged to curated ∩ discovered + discovered-only",
     })
@@ -328,7 +327,7 @@ test.describe("fx model catalog picker", () => {
     // live (SSE push or ready-retry), never via a fresh page load.
     await expectConvergedFxOptions(modelSelect);
 
-    const texts = await modelSelect.locator("option").allTextContents();
+    const texts = await modelSelect.optionLabels();
     for (const label of EXPECTED_FX_OPTION_LABELS) {
       expect(texts).toContain(label);
     }
@@ -337,7 +336,7 @@ test.describe("fx model catalog picker", () => {
     }
 
     // --- Default selection ---------------------------------------------
-    await expect(modelSelect).toHaveValue(FX_DEFAULT_MODEL_ID);
+    await modelSelect.expectValue(FX_DEFAULT_MODEL_ID);
   });
 
   test("New Task form: refresh-models button re-probes and keeps the converged catalog", async ({
@@ -354,7 +353,7 @@ test.describe("fx model catalog picker", () => {
     const modelSelect = newTaskModelSelect(page);
     await expectConvergedFxOptions(modelSelect);
 
-    const refreshButton = page.getByTestId("refresh-models");
+    const refreshButton = page.getByTestId("launch-refresh-models");
     await expect(refreshButton).toBeVisible();
     await expect(refreshButton).toBeEnabled();
     await refreshButton.click();
@@ -392,14 +391,14 @@ test.describe("fx model catalog picker", () => {
     // intersect claude's ids against fx's Gateway ids and produce an empty
     // (or unrecognizable) list, failing this exact-equality check.
     await expect
-      .poll(async () => modelSelect.locator("option").allTextContents(), { timeout: 10_000 })
+      .poll(async () => modelSelect.optionLabels(), { timeout: 10_000 })
       .toEqual(claudeCuratedLabels);
 
     // Named explicitly per this task's ask: the curated first option
     // (Mythos 5.2 — the top row since Fable 5.2's release, 2026-11-09) must be
     // present, not just the list length.
     expect(claudeCuratedLabels[0]).toBeTruthy();
-    const texts = await modelSelect.locator("option").allTextContents();
+    const texts = await modelSelect.optionLabels();
     expect(texts).toContain(claudeCuratedLabels[0]);
   });
 

@@ -157,8 +157,8 @@ function detailsRow(panel: Locator, label: string): Locator {
 async function selectProfileInForm(form: Locator, profileId: string): Promise<void> {
   const picker = form.getByTestId("agent-profile-picker");
   await picker.getByTestId("agent-profile-picker-trigger").click();
-  await expect(picker.getByTestId("agent-profile-picker-popover")).toBeVisible();
-  await picker.locator(`[data-testid="agent-profile-picker-row"][data-profile-id="${profileId}"]`).click();
+  await expect(picker.page().getByTestId("agent-profile-picker-popover")).toBeVisible();
+  await picker.page().locator(`[data-testid="agent-profile-picker-row"][data-profile-id="${profileId}"]`).click();
 }
 
 // ---- REST helpers ----
@@ -285,7 +285,7 @@ test.describe("agent profiles: launch surfaces", () => {
       "No agent — pick harness manually",
     );
     await picker.getByTestId("agent-profile-picker-trigger").click();
-    const popover = picker.getByTestId("agent-profile-picker-popover");
+    const popover = page.getByTestId("agent-profile-picker-popover");
     await expect(popover).toBeVisible();
     const preSeedRowCount = await popover.locator('[data-testid="agent-profile-picker-row"]').count();
     if (preSeedRowCount === 0) {
@@ -338,7 +338,7 @@ test.describe("agent profiles: launch surfaces", () => {
     const form2 = newTaskForm(page);
     const picker2 = form2.getByTestId("agent-profile-picker");
     await picker2.getByTestId("agent-profile-picker-trigger").click();
-    const popover2 = picker2.getByTestId("agent-profile-picker-popover");
+    const popover2 = page.getByTestId("agent-profile-picker-popover");
     await expect(popover2).toBeVisible();
     // Scoped to this scenario's own three profile ids rather than the
     // popover's total row count — another spec file sharing this worker's
@@ -357,7 +357,7 @@ test.describe("agent profiles: launch surfaces", () => {
     await expect(alphaRow).toContainText(ALPHA_INSTRUCTIONS);
     await expect(alphaRow.locator("svg")).toHaveCount(1);
 
-    const search = popover2.getByTestId("agent-profile-picker-search");
+    const search = page.getByTestId("agent-profile-picker-search");
 
     // ---- Search by name ----
     await search.fill("gamma");
@@ -399,7 +399,7 @@ test.describe("agent profiles: launch surfaces", () => {
     await expect(form2.getByText("Harness", { exact: true })).toHaveCount(0);
     await picker2.getByTestId("agent-profile-picker-trigger").click();
     await expect(popover2).toBeVisible();
-    await popover2.getByTestId("agent-profile-picker-none").click();
+    await page.getByTestId("agent-profile-picker-none").click();
     await expect(popover2).toBeHidden();
     await expect(form2.getByText("Harness", { exact: true })).toBeVisible();
     await expect(form2.locator('[data-testid="agent-profile-card"]')).toHaveCount(0);
@@ -418,8 +418,8 @@ test.describe("agent profiles: launch surfaces", () => {
     const picker = form.getByTestId("agent-profile-picker");
 
     await picker.getByTestId("agent-profile-picker-trigger").click();
-    await expect(picker.getByTestId("agent-profile-picker-popover")).toBeVisible();
-    await picker.getByTestId("agent-profile-picker-manage").click();
+    await expect(page.getByTestId("agent-profile-picker-popover")).toBeVisible();
+    await page.getByTestId("agent-profile-picker-manage").click();
 
     const dialog = page.getByRole("dialog");
     await expect(dialog.getByRole("heading", { name: "Settings" })).toBeVisible();
@@ -459,9 +459,9 @@ test.describe("agent profiles: launch surfaces", () => {
     // App.tsx's onClose calls `refreshProfiles()` — the already-mounted New
     // Task form's picker should see "Echo" without a page reload.
     await picker.getByTestId("agent-profile-picker-trigger").click();
-    await expect(picker.getByTestId("agent-profile-picker-popover")).toBeVisible();
+    await expect(page.getByTestId("agent-profile-picker-popover")).toBeVisible();
     await expect(
-      picker.locator('[data-testid="agent-profile-picker-row"]').filter({ hasText: "Echo" }),
+      page.locator('[data-testid="agent-profile-picker-row"]').filter({ hasText: "Echo" }),
     ).toBeVisible({ timeout: CONVERGE_TIMEOUT });
   });
 
@@ -533,7 +533,7 @@ test.describe("agent profiles: launch surfaces", () => {
     const form = newTaskForm(page);
     await selectProfileInForm(form, deltaId);
 
-    const hint = form.getByTestId("agent-profile-harness-unavailable");
+    const hint = form.getByTestId("launch-agent-unavailable-hint");
     await expect(hint).toBeVisible();
     if (aliasStatus!.reason) {
       await expect(hint).toContainText(aliasStatus!.reason);

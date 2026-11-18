@@ -14,6 +14,15 @@ import type { HarnessQuota } from "../src/shared/types.ts";
 
 export interface GotoAppOptions {
   /**
+   * Defaults to `true`: before the page loads, opens every launch section's
+   * "More options" disclosure (`agetor:launch:<surface>:<section>:more`, see
+   * src/mainview/lib/panel-collapse.ts), so a spec reaches the rarely-changed
+   * fields (Branch name, Speed, the agent profile picker, the Mode variant,
+   * Max Mode) without clicking through. e2e/launch-layout.spec.ts opts out
+   * (`{ launchMoreOpen: false }`) to test the real default and its persistence.
+   */
+  launchMoreOpen?: boolean;
+  /**
    * Defaults to `true`: before navigating, seeds `onboardingDismissed="true"`
    * directly against the backend this `url` points at, so the first-run
    * welcome dialog / "Getting started" checklist (docs/plans/onboarding-
@@ -56,7 +65,22 @@ function backendFromBootUrl(url: string): { apiBase: string; token: string } | n
  *  hash params, e.g. font-size.spec's `&fontSize=`). See `GotoAppOptions`
  *  for the default onboarding-dismissal seeding. */
 export async function gotoApp(page: Page, url: string, options: GotoAppOptions = {}): Promise<void> {
-  const { seedOnboardingDismissed = true } = options;
+  const { seedOnboardingDismissed = true, launchMoreOpen = true } = options;
+  if (launchMoreOpen) {
+    await page.addInitScript(() => {
+      try {
+        for (const surface of ["panel", "dialog"]) {
+          for (const section of ["workspace", "agent"]) {
+            if (localStorage.getItem(`agetor:launch:${surface}:${section}:more`) === null) {
+              localStorage.setItem(`agetor:launch:${surface}:${section}:more`, "1");
+            }
+          }
+        }
+      } catch {
+        /* storage unavailable — the specs then open More options themselves */
+      }
+    });
+  }
   if (seedOnboardingDismissed) {
     const backend = backendFromBootUrl(url);
     if (backend) {

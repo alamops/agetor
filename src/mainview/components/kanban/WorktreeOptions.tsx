@@ -394,7 +394,7 @@ function LiveWorktreeOptions({
           placeholder="feature/my-task"
           className={cn(
             "pr-10 font-mono text-xs",
-            !branchValidation.ok && "border-destructive focus-visible:ring-destructive",
+            !branchValidation.ok && "border-danger focus-visible:ring-danger",
           )}
           title="Git branch the worktree will use. Live-resolved from this project's nomenclature (title, type, project name); edit to override, or use the settings button to change the pattern."
         />
@@ -412,7 +412,7 @@ function LiveWorktreeOptions({
         </Button>
       </div>
       {!branchValidation.ok ? (
-        <p id="launch-branch-name-error" role="alert" className="text-2xs text-destructive">{branchValidation.reason}</p>
+        <p id="launch-branch-name-error" role="alert" className="text-2xs text-danger">{branchValidation.reason}</p>
       ) : branchDirty && hasBranchTemplateTags(branchOverride) ? (
         <p className="truncate font-mono text-2xs text-muted-foreground" title={branchField.resolved}>
           → {branchField.resolved}

@@ -103,7 +103,7 @@ export function LaunchSection({ id, surface, title, summary, tone = "default", c
           <span
             data-testid={`launch-section-${id}-summary`}
             data-tone={tone}
-            className={cn("min-w-0 flex-1 truncate text-right text-2xs", tone === "danger" ? "text-destructive" : "text-muted-foreground")}
+            className={cn("min-w-0 flex-1 truncate text-right text-2xs", tone === "danger" ? "text-danger" : "text-muted-foreground")}
           >
             {summary}
           </span>

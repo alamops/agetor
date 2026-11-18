@@ -6,6 +6,7 @@ import path from "node:path";
 import { test, expect, type APIRequestContext, type E2EBackend, type Locator, type Page } from "./fixtures";
 import { gotoApp } from "./helpers";
 import { startGitHubStub, type GitHubStub, type StubRoute } from "./github-stub";
+import { pickHarness } from "./launch-helpers";
 
 /**
  * E2E coverage for the "Resolve with Agetor" dialog
@@ -372,7 +373,7 @@ async function createPipelineRest(
 async function pickPipeline(dialog: Locator, pipelineId: string): Promise<void> {
   const picker = dialog.getByTestId("launch-pipeline-picker").getByTestId("pipeline-picker");
   await picker.getByTestId("pipeline-picker-trigger").click();
-  const popover = picker.getByTestId("pipeline-picker-popover");
+  const popover = picker.page().getByTestId("pipeline-picker-popover");
   await expect(popover).toBeVisible({ timeout: CONVERGE_TIMEOUT });
   await popover.locator(`[data-testid="pipeline-picker-row"][data-pipeline-id="${pipelineId}"]`).click();
   await expect(popover).toBeHidden();
@@ -381,9 +382,9 @@ async function pickPipeline(dialog: Locator, pipelineId: string): Promise<void> 
 async function openPipelineManageRow(dialog: Locator): Promise<Locator> {
   const picker = dialog.getByTestId("launch-pipeline-picker").getByTestId("pipeline-picker");
   await picker.getByTestId("pipeline-picker-trigger").click();
-  const popover = picker.getByTestId("pipeline-picker-popover");
+  const popover = picker.page().getByTestId("pipeline-picker-popover");
   await expect(popover).toBeVisible({ timeout: CONVERGE_TIMEOUT });
-  const manage = popover.getByTestId("pipeline-picker-manage");
+  const manage = picker.page().getByTestId("pipeline-picker-manage");
   await expect(manage).toBeVisible();
   return manage;
 }
@@ -574,13 +575,13 @@ test.describe("Resolve with Agetor dialog", () => {
     await gotoApp(page, backend.bootBase);
     const dlg = await openResolveConflictsDialog(page);
 
-    await expect(dlg.getByText("Agent", { exact: true })).toBeVisible();
+    await expect(dlg.getByTestId("agent-profile-picker")).toBeVisible();
     await expect(dlg.getByTestId("launch-pipeline-summary")).toHaveCount(0);
 
     // One-selection: a profile pick, then a pipeline pick, drops the card.
     const agentPicker = dlg.getByTestId("agent-profile-picker");
     await agentPicker.getByTestId("agent-profile-picker-trigger").click();
-    await agentPicker.locator(`[data-testid="agent-profile-picker-row"][data-profile-id="${profileId}"]`).click();
+    await page.locator(`[data-testid="agent-profile-picker-row"][data-profile-id="${profileId}"]`).click();
     // The picker's own trigger renders a chip with the same test id, so the
     // selected card is the last one.
     await expect(dlg.getByTestId("agent-profile-card").last()).toBeVisible();
@@ -592,12 +593,12 @@ test.describe("Resolve with Agetor dialog", () => {
     await expect(summary).toContainText("1 step");
     await expect(summary).toContainText("starts with");
     await expect(dlg.getByTestId("agent-profile-card")).toHaveCount(0);
-    await expect(dlg.getByText("Agent", { exact: true })).toHaveCount(0);
+    await expect(dlg.getByTestId("agent-profile-picker")).toHaveCount(0);
     await expect(dlg.getByTestId("launch-pipeline-problem")).toHaveCount(0);
 
     await summary.getByTestId("launch-pipeline-change").click();
     await expect(dlg.getByTestId("launch-pipeline-summary")).toHaveCount(0);
-    await expect(dlg.getByText("Agent", { exact: true })).toBeVisible();
+    await expect(dlg.getByTestId("agent-profile-picker")).toBeVisible();
     // The profile picked before the pipeline stays cleared — Change restores
     // the manual block, not the profile it replaced (New Task parity).
     await expect(dlg.getByTestId("agent-profile-card")).toHaveCount(0);
@@ -635,7 +636,7 @@ test.describe("Resolve with Agetor dialog", () => {
     createdTaskIds.splice(createdTaskIds.indexOf(task.id), 1);
   });
 
-  test("pipeline picker: an unrunnable pipeline is listed but blocks Create & start", async ({ page, backend }) => {
+  test("pipeline picker: an unrunnable pipeline is listed but blocks Run task", async ({ page, backend }) => {
     test.setTimeout(90_000);
     const suffix = Date.now();
     const pipelineName = `E2E PR unrunnable pipeline ${suffix}`;
@@ -709,7 +710,7 @@ test.describe("Resolve with Agetor dialog", () => {
     const dlg = await openResolveConflictsDialog(page);
 
     // A plain single-agent launch on the unavailable harness is blocked.
-    await dlg.getByRole("button", { name: manualHarnessLabel }).click();
+    await pickHarness(dlg, manualHarnessLabel);
     const hint = dlg.getByTestId("launch-agent-unavailable-hint");
     await expect(hint).toBeVisible({ timeout: CONVERGE_TIMEOUT });
     await expect(hint).toContainText("not found on PATH");

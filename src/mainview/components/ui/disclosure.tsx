@@ -47,7 +47,7 @@ export function Disclosure({
             data-tone={noteTone}
             className={cn(
               "min-w-0 flex-1 truncate text-right text-2xs font-normal",
-              noteTone === "danger" ? "text-destructive" : "text-muted-foreground",
+              noteTone === "danger" ? "text-danger" : "text-muted-foreground",
             )}
           >
             {note}

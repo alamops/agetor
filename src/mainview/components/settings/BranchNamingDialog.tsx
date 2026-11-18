@@ -158,7 +158,7 @@ export function BranchNamingDialog({ open, onClose, projectPath, projectName, ac
                   <p
                     className={cn(
                       "text-3xs",
-                      legal ? "text-muted-foreground" : "text-destructive",
+                      legal ? "text-muted-foreground" : "text-danger",
                     )}
                   >
                     e.g. <span className="font-mono">{example}</span>
@@ -193,7 +193,7 @@ export function BranchNamingDialog({ open, onClose, projectPath, projectName, ac
         </p>
 
         {!validation.ok && (
-          <p className="text-xs text-destructive">{validation.reason}</p>
+          <p className="text-xs text-danger">{validation.reason}</p>
         )}
 
       </DialogBody>

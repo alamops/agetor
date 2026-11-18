@@ -51,7 +51,7 @@ export function LaunchFooter({
         </p>
       ) : null}
       {error ? (
-        <p role="alert" data-testid="launch-error" className="rounded-md border border-destructive/40 bg-destructive/10 px-2.5 py-1.5 text-xs text-destructive">
+        <p role="alert" data-testid="launch-error" className="rounded-md border border-danger/40 bg-danger/10 px-2.5 py-1.5 text-xs text-danger">
           {error}
         </p>
       ) : null}

@@ -434,7 +434,7 @@ export function CloneProjectDialog({ open, onClose, onCloned }: Props) {
             <p
               role="alert"
               data-testid="clone-error"
-              className="rounded-md border border-destructive/40 bg-destructive/10 px-3 py-2 text-xs text-destructive"
+              className="rounded-md border border-danger/40 bg-danger/10 px-3 py-2 text-xs text-danger"
             >
               {error}
             </p>
