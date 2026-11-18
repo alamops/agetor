@@ -13,8 +13,9 @@ const DOT_CLASS: Record<StatusDotTone, string> = {
 
 interface Props {
   tone: StatusDotTone;
-  /** Spoken name of the state: the dot is never the only carrier of it. */
-  label: string;
+  /** Spoken name of the state: the dot is never the only carrier of it.
+   *  Omitted → purely decorative (`aria-hidden`), as in the measurement ghost. */
+  label?: string;
   className?: string;
   "data-testid"?: string;
 }
@@ -23,8 +24,7 @@ interface Props {
 export function StatusDot({ tone, label, className, "data-testid": testId }: Props) {
   return (
     <span
-      role="img"
-      aria-label={label}
+      {...(label === undefined ? { "aria-hidden": true } : { role: "img", "aria-label": label })}
       data-testid={testId}
       data-tone={tone}
       className={cn("inline-block size-2 shrink-0 rounded-full", DOT_CLASS[tone], className)}
