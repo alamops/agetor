@@ -239,3 +239,74 @@ export function Dialog({
     </div>
   );
 }
+
+// ---------------------------------------------------------------------------
+// Composition parts. Additive: `Dialog`'s own props, classes and keyboard
+// behavior are unchanged. A dialog that wants a sticky footer and its own
+// scroll region passes `className="flex max-h-[calc(100vh-2rem)] flex-col p-0"`
+// and composes `DialogHeader` / `DialogBody` / `DialogFooter`
+// (docs/architecture/task-launch-ui.md).
+// ---------------------------------------------------------------------------
+
+/** The dialog's title row: title, optional description, optional close button. */
+export function DialogHeader({ className, ...props }: React.HTMLAttributes<HTMLDivElement>) {
+  return (
+    <div
+      className={cn("flex shrink-0 items-start justify-between gap-3 border-b border-border px-5 py-3", className)}
+      {...props}
+    />
+  );
+}
+
+/** The dialog title. Pass the same `id` as `Dialog`'s `labelledBy`. */
+export function DialogTitle({ className, ...props }: React.HTMLAttributes<HTMLHeadingElement>) {
+  return <h2 className={cn("text-base font-semibold leading-tight", className)} {...props} />;
+}
+
+/** The dialog's description. Pass the same `id` as `Dialog`'s `describedBy`. */
+export function DialogDescription({ className, ...props }: React.HTMLAttributes<HTMLParagraphElement>) {
+  return <p className={cn("mt-0.5 text-xs text-muted-foreground", className)} {...props} />;
+}
+
+/** The dialog's scroll region. Inside a `max-h` flex panel it is the only
+ *  thing that scrolls, which keeps the header and the footer in view. */
+export function DialogBody({ className, ...props }: React.HTMLAttributes<HTMLDivElement>) {
+  return <div className={cn("min-h-0 flex-1 overflow-y-auto px-5 py-4", className)} {...props} />;
+}
+
+/** The dialog's action row, outside the scroll region so it is always visible. */
+export function DialogFooter({ className, ...props }: React.HTMLAttributes<HTMLDivElement>) {
+  return (
+    <div
+      className={cn(
+        "flex shrink-0 flex-wrap items-center justify-end gap-2 border-t border-border px-5 py-3",
+        className,
+      )}
+      {...props}
+    />
+  );
+}
+
+/** A ghost icon button that closes the dialog (`aria-label="Close"`). */
+export function DialogClose({
+  className,
+  onClick,
+  ...props
+}: React.ButtonHTMLAttributes<HTMLButtonElement>) {
+  return (
+    <button
+      type="button"
+      aria-label="Close"
+      onClick={onClick}
+      className={cn(
+        "inline-flex size-8 shrink-0 items-center justify-center rounded-md text-muted-foreground transition-colors hover:bg-accent hover:text-accent-foreground focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring",
+        className,
+      )}
+      {...props}
+    >
+      <svg aria-hidden viewBox="0 0 24 24" className="size-4" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round">
+        <path d="M18 6 6 18M6 6l12 12" />
+      </svg>
+    </button>
+  );
+}

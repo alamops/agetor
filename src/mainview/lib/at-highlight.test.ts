@@ -1,5 +1,5 @@
 import { describe, expect, test } from "bun:test";
-import { computeAtHighlights, isListedPath, type HighlightSegment, unresolvedAtTokens, isSafeClientRelPath } from "./at-highlight.ts";
+import { computeAtHighlights, isListedPath, type HighlightSegment, unresolvedAtTokens, isSafeClientRelPath, isHandleLikeAtToken } from "./at-highlight.ts";
 
 /** Every test's segments must reconstruct the original text exactly — this
  *  invariant is checked alongside the segment shape in most cases below. */
@@ -165,4 +165,25 @@ test("isSafeClientRelPath mirrors the server-side guard", () => {
   expect(isSafeClientRelPath("/abs/x")).toBe(false);
   expect(isSafeClientRelPath("../x")).toBe(false);
   expect(isSafeClientRelPath("a/../x")).toBe(false);
+});
+
+describe("isHandleLikeAtToken (B2)", () => {
+  test("a bare handle is not a file path", () => {
+    expect(isHandleLikeAtToken("octocat")).toBe(true);
+    expect(isHandleLikeAtToken("some-user")).toBe(true);
+    expect(isHandleLikeAtToken("A1")).toBe(true);
+  });
+  test("anything with a slash or a dot, or an invalid handle, still counts as a path", () => {
+    expect(isHandleLikeAtToken("missing/file.ts")).toBe(false);
+    expect(isHandleLikeAtToken("notes.md")).toBe(false);
+    expect(isHandleLikeAtToken("src/")).toBe(false);
+    expect(isHandleLikeAtToken("-lead")).toBe(false);
+    expect(isHandleLikeAtToken("a".repeat(40))).toBe(false);
+    expect(isHandleLikeAtToken("")).toBe(false);
+  });
+  test("a handle token is filtered from the warning list while a path token stays", () => {
+    const tokens = unresolvedAtTokens("thanks @octocat see @missing/file.ts", new Set<string>());
+    const kept = tokens.filter((t) => !isHandleLikeAtToken(t.path)).map((t) => t.path);
+    expect(kept).toEqual(["missing/file.ts"]);
+  });
 });

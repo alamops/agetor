@@ -68,7 +68,7 @@ const disabled = (tag: string): boolean => /\sdisabled(=""|\s|>)/.test(tag);
 const repo = (path: string): RepoSelection => ({ path, root: path });
 
 describe("WorktreeOptions — live", () => {
-  test("the Select Projects button sits above the Isolate checkbox (SC1)", () => {
+  test("the Select Projects button sits above the Isolate switch (SC1)", () => {
     const markup = live([repo("/repos/api")]);
     const projects = markup.indexOf('data-testid="select-projects-button"');
     const isolate = markup.indexOf('data-testid="isolate-toggle"');
@@ -84,7 +84,7 @@ describe("WorktreeOptions — live", () => {
     // With nothing selected there is no branch row, but the historical
     // default (isolate on) still shows the branch-name field.
     expect(disabled(openingTag(markup, "isolate-toggle"))).toBe(false);
-    expect(openingTag(markup, "isolate-toggle")).toContain("checked");
+    expect(openingTag(markup, "isolate-toggle")).toContain('aria-checked="true"');
     expect(markup).toContain('data-testid="branch-name-input"');
   });
 
@@ -93,7 +93,7 @@ describe("WorktreeOptions — live", () => {
     expect(markup).toContain('data-testid="branch-row-api"');
     expect(markup).toContain("Branch · api");
     expect(markup).not.toContain("projects selected");
-    expect(openingTag(markup, "isolate-toggle")).toContain("checked");
+    expect(openingTag(markup, "isolate-toggle")).toContain('aria-checked="true"');
     expect(disabled(openingTag(markup, "isolate-toggle"))).toBe(false);
     expect(markup).not.toContain("Always on when more than one project is selected.");
     expect(markup).toContain('data-testid="branch-name-input"');
@@ -109,7 +109,7 @@ describe("WorktreeOptions — live", () => {
     expect(markup).toContain("Branch · api");
     expect(markup).toContain("Branch · web");
     const isolate = openingTag(markup, "isolate-toggle");
-    expect(isolate).toContain("checked");
+    expect(isolate).toContain('aria-checked="true"');
     expect(disabled(isolate)).toBe(true);
     expect(markup).toContain("Always on when more than one project is selected.");
     // The shared branch name is used in every repository, with the server's
@@ -120,7 +120,7 @@ describe("WorktreeOptions — live", () => {
   test("isolate off hides the branch-name field but keeps every project's line", () => {
     const markup = live([repo("/repos/api")], { isolate: false, effectiveIsolate: false });
     expect(markup).toContain('data-testid="branch-row-api"');
-    expect(openingTag(markup, "isolate-toggle")).not.toContain("checked");
+    expect(openingTag(markup, "isolate-toggle")).toContain('aria-checked="false"');
     expect(markup).not.toContain('data-testid="branch-name-input"');
   });
 
@@ -187,7 +187,7 @@ describe("WorktreeOptions — locked (PR-conflict dialog)", () => {
     expect(branch).toContain("readOnly");
     expect(branch).toContain('value="fix/pr-head"');
     const isolate = openingTag(markup, "isolate-toggle");
-    expect(isolate).toContain("checked");
+    expect(isolate).toContain('aria-checked="true"');
     expect(disabled(isolate)).toBe(true);
     // A locked PR task never edits the shared branch name.
     expect(markup).not.toContain('data-testid="branch-name-input"');
@@ -196,5 +196,45 @@ describe("WorktreeOptions — locked (PR-conflict dialog)", () => {
   test("falls back to the generic Project label when no path is carried", () => {
     const markup = renderToStaticMarkup(<WorktreeOptions locked={{ branch: "main" }} />);
     expect(markup).toContain(">Project<");
+  });
+});
+
+const ONE_REPO = { path: "/work/agetor", root: "/work/agetor", baseRef: null } as unknown as RepoSelection;
+
+describe("WorktreeOptions — launch UI contract", () => {
+  test("Isolate is a labelled switch, not a native checkbox", () => {
+    const markup = renderToStaticMarkup(
+      <WorktreeOptions state={state()} repos={[ONE_REPO]} onReposChange={() => {}} />,
+    );
+    expect(markup).not.toContain('type="checkbox"');
+    const tag = openingTag(markup, "isolate-toggle");
+    expect(tag).toContain('role="switch"');
+    expect(tag).toContain('id="launch-isolate"');
+    expect(markup).toContain('for="launch-isolate"');
+  });
+  test("Projects and Branch name have associated labels", () => {
+    const markup = renderToStaticMarkup(
+      <WorktreeOptions state={state()} repos={[ONE_REPO]} onReposChange={() => {}} />,
+    );
+    expect(markup).toContain('for="launch-projects-control"');
+    expect(markup).toContain('id="launch-projects-control"');
+    expect(markup).toContain('for="launch-branch-name"');
+    expect(markup).toContain('id="launch-branch-name"');
+  });
+  test("renderBranchName can wrap or hide the Branch name field", () => {
+    const wrapped = renderToStaticMarkup(
+      <WorktreeOptions
+        state={state()}
+        repos={[ONE_REPO]}
+        onReposChange={() => {}}
+        renderBranchName={(node) => <div data-testid="more-wrap">{node}</div>}
+      />,
+    );
+    expect(wrapped).toContain('data-testid="more-wrap"');
+    expect(wrapped).toContain('data-testid="branch-name-input"');
+    const hidden = renderToStaticMarkup(
+      <WorktreeOptions state={state()} repos={[ONE_REPO]} onReposChange={() => {}} renderBranchName={() => null} />,
+    );
+    expect(hidden).not.toContain('data-testid="branch-name-input"');
   });
 });

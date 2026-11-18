@@ -2602,6 +2602,14 @@ const runTaskMenuAction = useCallback((action: TaskMenuAction, snapshot: Task, r
     openPipelinesPage();
   }, [closeGithubDialog, openPipelinesPage]);
 
+  /** The launch dialogs' "Manage agents…" row: the inner issue/PR dialog has
+   *  already closed itself, so this closes the Git dialog beneath and only THEN
+   *  opens Settings → Agents (same ordering as `openPipelinesFromGit`). */
+  const openSettingsAgentsFromGit = useCallback(() => {
+    closeGithubDialog();
+    openSettingsAgents();
+  }, [closeGithubDialog, openSettingsAgents]);
+
   return (
     <div className="flex h-screen w-screen flex-col bg-background text-foreground">
       {/* Top app bar sits on the same row as the macOS traffic lights (see
@@ -2742,10 +2750,7 @@ const runTaskMenuAction = useCallback((action: TaskMenuAction, snapshot: Task, r
         stacks={harnessStacks}
           agents={agents}
           harnesses={harnesses}
-          profiles={profiles}
           onOpenSettingsAgents={openSettingsAgents}
-          pipelines={pipelines}
-          pipelinesLoaded={pipelinesLoaded}
           onOpenPipelines={openPipelinesPage}
           agentModels={agentModels}
           harnessModels={harnessModels}
@@ -2757,7 +2762,7 @@ const runTaskMenuAction = useCallback((action: TaskMenuAction, snapshot: Task, r
               // "Run task" creates the row in `ready` (so it's briefly visible in
               // that column even when the agent starts immediately afterward),
               // then asks the orchestrator to start it — which moves the card to
-              // `running`. "To backlog" just queues with no auto-start.
+              // `running`. "Add to backlog" just queues with no auto-start.
               const created = await api.createTask({
                 ...input,
                 column: start ? "ready" : "backlog",
@@ -3062,6 +3067,7 @@ const runTaskMenuAction = useCallback((action: TaskMenuAction, snapshot: Task, r
           setSettingsOpen(true);
         }}
         onOpenPipelines={openPipelinesFromGit}
+        onOpenSettingsAgents={openSettingsAgentsFromGit}
       />
       <QuitConfirmDialog request={quitRequest} onClose={() => setQuitRequest(null)} />
       <ImportSessionsDialog

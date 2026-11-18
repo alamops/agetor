@@ -3,7 +3,7 @@ import ReactMarkdown from "react-markdown";
 import remarkGfm from "remark-gfm";
 import { toast } from "sonner";
 import {
-  AlertTriangle, Archive, ArchiveRestore, ArrowDown, ArrowUp, BookmarkPlus, Bot, Check, ChevronDown, ChevronRight, ChevronUp, CircleDot, ClipboardList, CornerDownRight, Eye, FolderOpen, FileText, FilePenLine, FilePlus, Folder,  GitCommit, GitCompare, GitMerge, GitPullRequest, Globe, HelpCircle, ListTodo, Paperclip, Plug, Radar, RefreshCw, Search, Send, ShieldAlert, Slash, SquareSlash,
+  AlertTriangle, Archive, ArchiveRestore, ArrowDown, ArrowUp, BookmarkPlus, Bot, Check, ChevronDown, ChevronRight, ChevronUp, CircleDot, ClipboardList, CornerDownRight, Eye, FolderOpen, FileText, FilePenLine, FilePlus, Folder,  GitCommit, GitCompare, GitMerge, GitPullRequest, Globe, HelpCircle, Info, ListTodo, Paperclip, Plug, Radar, RefreshCw, Search, Send, ShieldAlert, Slash, SquareSlash,
   Play, Sparkles, Square, Terminal, Trash2, Workflow, Wrench, X,
 } from "lucide-react";
 import { api, ApiError, commitPushPrompt, type AgentModelMap, type PendingInteraction } from "@/lib/api";
@@ -90,6 +90,7 @@ import { QuoteSelectionButton } from "./QuoteSelectionButton";
 import type { GitHubPullPrefill } from "./GitHubDialog";
 import { Button, buttonVariants } from "@/components/ui/button";
 import { Tooltip } from "@/components/ui/tooltip";
+import { Notice } from "@/components/ui/notice";
 import { Badge, badgeVariants } from "@/components/ui/badge";
 import { Input } from "@/components/ui/input";
 import { Select } from "@/components/ui/select";
@@ -4948,29 +4949,32 @@ function RunPanelBody({
           docs/plans/pipelines.md), so there's nothing for a composer to
           talk to regardless of column/archived state. */}
       {task.pipelineId ? (
-        <div className="shrink-0 border-t border-border/60 p-3 text-[11px] text-muted-foreground">
-          This is a pipeline task — open the pipeline view to talk to its steps.
+        <div className="shrink-0 border-t border-border/60 p-2">
+          <Notice tone="muted" icon={<Info className="size-3.5" />}>
+            This is a pipeline task — open the pipeline view to talk to its steps.
+          </Notice>
         </div>
       ) : archived && !canSend ? (
-        <div className="shrink-0 border-t border-border/60 p-3 text-[11px] text-muted-foreground">
-          This task is archived. Unarchive it to interact.
+        <div className="shrink-0 border-t border-border/60 p-2">
+          <Notice tone="muted" icon={<Info className="size-3.5" />}>
+            This task is archived. Unarchive it to interact.
+          </Notice>
         </div>
       ) : activeStream !== "main" ? (
         // Background-agent streams are read-only — you can watch them but not
         // talk to them. Switch back to Main to send a message.
-        <div className="flex shrink-0 items-center gap-2 border-t border-border/60 p-3 text-[11px] text-muted-foreground">
-          <Eye className="size-3 shrink-0" />
-          <span>
-            Viewing a background agent — read-only.{" "}
-            <button
-              type="button"
-              onClick={() => setActiveStream("main")}
-              className="text-foreground underline underline-offset-2 hover:no-underline"
-            >
-              Back to Main
-            </button>{" "}
-            to send a message.
-          </span>
+        <div className="shrink-0 border-t border-border/60 p-2">
+          <Notice
+            tone="muted"
+            icon={<Eye className="size-3.5" />}
+            action={
+              <Button type="button" variant="secondary" size="sm" onClick={() => setActiveStream("main")}>
+                Back to Main
+              </Button>
+            }
+          >
+            Viewing a background agent — read-only. Switch back to Main to send a message.
+          </Notice>
         </div>
       ) : (
         <div
@@ -5021,12 +5025,9 @@ function RunPanelBody({
             innerClassName="space-y-1.5"
             placement="above"
             label={null}
-            // Shown once the task is sendable, OR as soon as there's
-            // something to stash — that's what lets "Save for later" work
-            // pre-run. Also shown whenever Resolve Conflicts is offerable
-            // (even disabled), so an offerable-but-not-yet-sendable task
-            // doesn't have the button pop in and out as the draft is typed.
-            toolbar={Boolean(canSend || input.trim() || sendRefs.length > 0 || showResolveConflicts)}
+            // The toolbar row (Extensions picker, the actions, and Send at its
+            // end) is always rendered: Send moved into it, and "Save for
+            // later" / Resolve Conflicts keep appearing in it as before.
             actions={
               <>
                 {/* Backlog mutations are frozen server-side while archived
@@ -5040,7 +5041,7 @@ function RunPanelBody({
                     disabled={sending || backlogBusy}
                     title="Save this message to the backlog to send later — without sending it now."
                   >
-                    <BookmarkPlus className="mr-1 size-3" /> Save for later
+                    <BookmarkPlus className="mr-1 size-3.5" aria-hidden /> Save for later
                   </Button>
                 )}
                 {/* Commit & push keys on live git state (uncommitted changes or
@@ -5058,7 +5059,7 @@ function RunPanelBody({
                     onClick={() => void sendCommitPush()}
                     title="Ask the agent to commit the working-tree changes, push the current branch to origin, and reply with the link to open a PR plus a PR title and description in copyable code blocks."
                   >
-                    <GitCommit className="mr-1 size-3" /> Commit &amp; push
+                    <GitCommit className="mr-1 size-3.5" aria-hidden /> Commit &amp; push
                   </Button>
                 )}
                 {/* Offered once the branch is pushed and synced with its
@@ -5081,7 +5082,7 @@ function RunPanelBody({
                     title="Open one pull request per repository that doesn't have one yet, prefilled from the agent's labeled proposals"
                     data-testid="create-all-prs"
                   >
-                    <GitPullRequest className="mr-1 size-3" /> {allPrsBusy ? "Creating PRs…" : "Create all PRs"}
+                    <GitPullRequest className="mr-1 size-3.5" aria-hidden /> {allPrsBusy ? "Creating PRs…" : "Create all PRs"}
                   </Button>
                 )}
                 {!headerPrUrl && prHead != null && shouldOfferOpenPr(activeGitStatus) && !sending && (
@@ -5113,7 +5114,7 @@ function RunPanelBody({
                     }}
                     title="Create a pull request for this task's branch — prefilled from the agent's summary when available"
                   >
-                    <GitPullRequest className="mr-1 size-3" /> Create PR
+                    <GitPullRequest className="mr-1 size-3.5" aria-hidden /> Create PR
                   </Button>
                 )}
                 {/* Post-PR counterpart to "Open PR" above: offered once the
@@ -5145,7 +5146,7 @@ function RunPanelBody({
                               : "Ask the agent to merge the base branch and resolve the reported conflicts"
                     }
                   >
-                    <GitMerge className="mr-1 size-3" /> {resolveConflictsSent ? "Sent to agent" : "Resolve Conflicts"}
+                    <GitMerge className="mr-1 size-3.5" aria-hidden /> {resolveConflictsSent ? "Sent to agent" : "Resolve Conflicts"}
                   </Button>
                 )}
               </>
@@ -5156,7 +5157,7 @@ function RunPanelBody({
             // task doesn't have, so call it out inline rather than silently.
             notice={
               archived && (
-                <p className="text-[10px] text-muted-foreground">
+                <p className="text-3xs text-muted-foreground">
                   Sending will unarchive this task and restore its worktree.
                 </p>
               )
@@ -5193,7 +5194,11 @@ function RunPanelBody({
                 className="absolute right-1.5 top-1.5 z-10"
               />
             }
-            trailing={
+            // The Send button lives at the END of the toolbar row, beside the
+            // actions (it used to be a tall side button). The toolbar row is
+            // therefore always rendered. Enter, Shift+Enter and Cmd/Ctrl+Enter
+            // keep their meaning: see `onKeyDown` below, which is unchanged.
+            toolbarEnd={
               // Distinguish "live session exists" from "needs resume" — not
               // "turn in flight". `liveRunId` (task.runId) stays set while the
               // tmux session is alive (including between turns) and is only
@@ -5204,21 +5209,22 @@ function RunPanelBody({
                 align="end"
                 side="top"
                 className="shrink-0"
-                label={liveRunId ? "Send to the live agent" : "Resume the conversation with this message"}
+                label={`${liveRunId ? "Send to the live agent" : "Resume the conversation with this message"} — Enter · Shift+Enter for a new line`}
               >
                 <Button
-                  size="icon"
                   onClick={() => void send()}
                   disabled={!canSend || sending || backlogBusy || modalPending || (!input.trim() && sendRefs.length === 0)}
                   aria-label="Send"
-                  className="h-16 w-12 shrink-0"
+                  className="shrink-0 gap-1.5 px-3"
                 >
-                  <Send className="size-4" />
+                  <Send className="size-4" aria-hidden />
+                  <span>Send</span>
                 </Button>
               </Tooltip>
             }
+            textareaAriaLabel="Message"
             rows={2}
-            textareaClassName="h-16 min-h-0 w-full resize-none text-xs pr-8"
+            textareaClassName="h-16 min-h-0 w-full resize-none pr-8 text-sm"
             textareaTestId="send-textarea"
             placeholder={
               modalPending

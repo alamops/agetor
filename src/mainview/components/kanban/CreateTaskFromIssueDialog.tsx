@@ -1,7 +1,7 @@
-import { useEffect, useMemo, useState } from "react";
-import { AlertCircle, AlertTriangle, Bot, Loader2, X } from "lucide-react";
-import { Dialog } from "@/components/ui/dialog";
-import { Button } from "@/components/ui/button";
+import { useEffect, useMemo, useRef, useState } from "react";
+import { AlertCircle, AlertTriangle, Bot, Info, Loader2 } from "lucide-react";
+import { Dialog, DialogBody, DialogClose, DialogDescription, DialogFooter, DialogHeader, DialogTitle } from "@/components/ui/dialog";
+import { Notice } from "@/components/ui/notice";
 import { useConfirm } from "@/components/ui/confirm";
 import { api } from "@/lib/api";
 import { DEFAULT_TASK_TYPE, type GitHubIssueThreadResult, type TaskReference, type TaskType } from "../../../shared/types.ts";
@@ -15,7 +15,11 @@ import {
 import { composeLaunchPrompt } from "../../../shared/agent-profile.ts";
 import { promptByteOverage } from "../../../shared/prompt-limits.ts";
 import { createAndStartTask, TaskLaunchPickers, useTaskLaunch } from "./TaskLaunchPickers";
-import { useWorktreeOptions, WorktreeOptions } from "./WorktreeOptions";
+import { useWorktreeOptions } from "./WorktreeOptions";
+import { WorkspaceSection } from "./WorkspaceSection";
+import { LaunchFooter } from "./LaunchFooter";
+import { launchGate, submitPicks } from "@/lib/launch-state";
+import { useSubmitShortcut } from "@/lib/use-submit-shortcut";
 import { useProjectSelection } from "./ProjectSelection";
 import { repositoryFileScopes } from "@/lib/repo-selection";
 import { selectionPayload } from "@/lib/worktree-payload";
@@ -39,6 +43,9 @@ interface Props {
   /** Closes this dialog (after any draft confirmation) and navigates to the
    *  Pipelines page. Optional so other mounts render no manage row. */
   onManagePipelines?: () => void;
+  /** Closes this dialog (after any draft confirmation) and opens Settings →
+   *  Agents. Optional so other mounts render no manage row. */
+  onManageAgents?: () => void;
 }
 
 /**
@@ -57,7 +64,7 @@ interface Props {
  * embedded (inline in the prompt, and in full as a referenced snapshot
  * file).
  */
-export function CreateTaskFromIssueDialog({ open, onClose, context, onCreated, onManagePipelines }: Props) {
+export function CreateTaskFromIssueDialog({ open, onClose, context, onCreated, onManagePipelines, onManageAgents }: Props) {
   const launch = useTaskLaunch(open, { withPipelines: true });
   const confirm = useConfirm();
 
@@ -197,16 +204,26 @@ export function CreateTaskFromIssueDialog({ open, onClose, context, onCreated, o
         launch.pipelineId ? prompt : composeLaunchPrompt(launch.selectedProfile, prompt),
       );
 
-  const canSubmit =
-    !!context &&
-    !!thread &&
-    prompt.trim().length > 0 &&
-    repos.length > 0 &&
-    launch.effectiveLaunchable &&
-    launch.pipelineReady &&
-    !submitting &&
-    overage == null &&
-    wt.valid;
+  // The single Run rule (`launchGate`) — the issue's title is derived, so none
+  // is required — plus this dialog's own conditions: the thread has loaded and
+  // no submit is in flight.
+  const gate = launchGate({
+    title: "",
+    prompt,
+    requireTitle: false,
+    reposCount: repos.length,
+    worktreeValid: wt.valid,
+    overage: overage != null,
+    effectiveLaunchable: launch.effectiveLaunchable,
+    effectiveHarnessLabel: launch.harnesses.find((h) => h.id === launch.effectiveAgent)?.label ?? launch.effectiveAgent,
+    effectiveReason: launch.effectiveStatus?.reason ?? null,
+    statusKnown: launch.effectiveStatus !== undefined,
+    pipelineSelected: launch.selectedPipeline !== null,
+    pipelineReady: launch.pipelineReady,
+    pipelineState: launch.pipelineState,
+    pipelineProblem: launch.pipelineProblem,
+  });
+  const canSubmit = !!context && !!thread && !submitting && gate.canRun;
 
   // Anything the user changed since the dialog opened: the prompt, attached
   // references, the Type picker, a worktree option, a base ref picked in the
@@ -223,15 +240,15 @@ export function CreateTaskFromIssueDialog({ open, onClose, context, onCreated, o
     repos.length > 1 ||
     launch.pipelineId !== null;
 
-  /** "Manage pipelines…": confirm before discarding a dirty draft, then close
-   *  this dialog (the inner one) so the Git dialog beneath can be closed by
-   *  the App callback without leaving a stacked overlay above the Pipelines
-   *  page. Cancel keeps everything open. */
-  const managePipelines = async () => {
+  /** "Manage pipelines…" / "Manage agents…": confirm before discarding a dirty
+   *  draft, then close this dialog (the inner one) so the Git dialog beneath can
+   *  be closed by the App callback without leaving a stacked overlay above the
+   *  destination page. Cancel keeps everything open. */
+  const leaveForPage = async (destination: string, navigate: (() => void) | undefined) => {
     if (submitting) return;
     if (draftDirty) {
       const ok = await confirm({
-        title: "Discard this task draft and open Pipelines?",
+        title: `Discard this task draft and open ${destination}?`,
         description: "Your prompt edits, references and selections will be lost.",
         confirmLabel: "Discard draft",
         variant: "destructive",
@@ -239,7 +256,7 @@ export function CreateTaskFromIssueDialog({ open, onClose, context, onCreated, o
       if (!ok) return;
     }
     onClose();
-    onManagePipelines?.();
+    navigate?.();
   };
 
   const submit = async () => {
@@ -262,11 +279,14 @@ export function CreateTaskFromIssueDialog({ open, onClose, context, onCreated, o
           isolate: wt.effectiveIsolate,
           branchSubmitValue: wt.branchField.submitValue,
         }),
-        mode: launch.mode,
-        model: launch.model,
-        effort: launch.effort,
-        speed: launch.speed,
-        maxMode: launch.maxMode,
+        // The same one mapping New Task uses (`submitPicks`): Fast is submitted
+        // for every kind, and a selected profile's own values replace the manual
+        // picks (the server re-resolves from the profile either way).
+        ...submitPicks({
+          kind: launch.kind,
+          picks: { mode: launch.mode, model: launch.model, effort: launch.effort, speed: launch.speed, maxMode: launch.maxMode },
+          profile: launch.selectedProfile,
+        }),
         // Omit entirely when no profile/pipeline is selected (finding F2-1) —
         // see NewTaskForm.submit's matching comment. The two are mutually
         // exclusive by construction (each setter clears the other), so the
@@ -289,46 +309,40 @@ export function CreateTaskFromIssueDialog({ open, onClose, context, onCreated, o
     }
   };
 
+  // Cmd/Ctrl+Enter runs the task from anywhere inside the dialog.
+  const contentRef = useRef<HTMLDivElement>(null);
+  useSubmitShortcut(contentRef, () => void submit(), canSubmit);
+
   return (
     <Dialog
       open={open}
       onClose={onClose}
       labelledBy="create-task-from-issue-dialog-title"
-      className="flex max-h-[85vh] w-full max-w-lg flex-col p-0"
+      className="flex max-h-[calc(100vh-2rem)] w-full max-w-4xl flex-col p-0 md:h-[min(46rem,calc(100vh-2rem))]"
     >
-      {/* `display: contents` keeps this test-id wrapper out of the flex
-       *  layout below — header/body/footer still act as direct flex items
-       *  of the Dialog panel (which needs that for its max-h/overflow
-       *  scroll region to work), while still giving e2e a stable node to
-       *  find the whole dialog by. Dialog's own props don't forward
+      {/* `display: contents` keeps this test-id wrapper out of the flex layout
+       *  below — header/body/footer still act as direct flex items of the Dialog
+       *  panel (which needs that for its max-h/overflow scroll region to work),
+       *  while still giving e2e a stable node to find the whole dialog by and the
+       *  shortcut a scope to listen on. Dialog's own props don't forward
        *  arbitrary data-* attributes onto the panel. */}
-      <div data-testid="issue-task-dialog" className="contents">
-        <header className="flex items-start justify-between gap-3 border-b border-border/60 p-3">
+      <div ref={contentRef} data-testid="issue-task-dialog" className="contents">
+        <DialogHeader>
           <div className="min-w-0">
-            <div id="create-task-from-issue-dialog-title" className="flex items-center gap-2 text-sm font-semibold">
-              <Bot className="size-4 shrink-0 text-muted-foreground" />
+            <DialogTitle id="create-task-from-issue-dialog-title" className="flex items-center gap-2">
+              <Bot className="size-4 shrink-0 text-muted-foreground" aria-hidden />
               Work on this with Agetor
-            </div>
+            </DialogTitle>
             {context && (
-              <div className="mt-0.5 truncate text-xs text-muted-foreground">
+              <DialogDescription className="truncate">
                 #{context.number} — {context.title}
-              </div>
+              </DialogDescription>
             )}
           </div>
-          <Button
-            variant="ghost"
-            size="icon"
-            className="shrink-0"
-            title="Close"
-            aria-label="Close"
-            disabled={submitting}
-            onClick={onClose}
-          >
-            <X className="size-4" />
-          </Button>
-        </header>
+          <DialogClose disabled={submitting} onClick={onClose} title="Close" />
+        </DialogHeader>
 
-        <div className="min-h-0 flex-1 overflow-y-auto p-3 text-xs">
+        <DialogBody className="p-0 md:overflow-hidden">
           {loading && (
             <div className="flex items-center justify-center gap-2 py-8 text-sm text-muted-foreground">
               <Loader2 className="size-4 animate-spin" /> Loading…
@@ -348,108 +362,103 @@ export function CreateTaskFromIssueDialog({ open, onClose, context, onCreated, o
           )}
 
           {!loading && !error && !!context && !!thread && (
-            <div className="space-y-3">
-              <div className="rounded-md border border-border/60 bg-muted/40 px-3 py-2 text-[11px] text-muted-foreground">
-                {wt.effectiveIsolate
-                  ? "Creates a task on a fresh branch in its own worktree."
-                  : "Runs the agent directly in the project checkout — it commits onto your current branch, in your working tree."}{" "}
-                {thread.commentsError ? (
-                  "The issue is embedded in the prompt (comments couldn't be fetched) and saved as a referenced snapshot file."
-                ) : (
-                  <>
-                    The issue and its {thread.comments.length} comment
-                    {thread.comments.length === 1 ? "" : "s"}{" "}
-                    {thread.comments.length === 1 ? "is" : "are"} embedded in the prompt and saved as a
-                    referenced snapshot file.
-                  </>
-                )}
-                {wt.effectiveIsolate && " The agent commits locally; it never pushes."}
-                {thread.truncated && " Thread truncated at the fetch cap."}
-                {thread.refetchCommand && (
-                  <div className="mt-1">
-                    Re-fetch: <code className="font-mono">{thread.refetchCommand}</code>
-                  </div>
-                )}
-              </div>
+            // Two columns from the `md` breakpoint (768 px), each scrolling on its
+            // own; one column with one scroll below it. The footer sits outside.
+            <div className="md:grid md:h-full md:min-h-0 md:grid-cols-[minmax(0,1fr)_22rem]">
+              <div className="space-y-4 px-5 py-4 md:min-h-0 md:overflow-y-auto">
+                <Notice tone="info" icon={<Info className="size-3.5" />}>
+                  <p>
+                    {wt.effectiveIsolate
+                      ? "Creates a task on a fresh branch in its own worktree."
+                      : "Runs the agent directly in the project checkout — it commits onto your current branch, in your working tree."}{" "}
+                    {thread.commentsError ? (
+                      "The issue is embedded in the prompt (comments couldn't be fetched) and saved as a referenced snapshot file."
+                    ) : (
+                      <>
+                        The issue and its {thread.comments.length} comment
+                        {thread.comments.length === 1 ? "" : "s"}{" "}
+                        {thread.comments.length === 1 ? "is" : "are"} embedded in the prompt and saved as a
+                        referenced snapshot file.
+                      </>
+                    )}
+                    {wt.effectiveIsolate && " The agent commits locally; it never pushes."}
+                    {thread.truncated && " Thread truncated at the fetch cap."}
+                  </p>
+                  {thread.refetchCommand && (
+                    <p>
+                      Re-fetch: <code className="font-mono">{thread.refetchCommand}</code>
+                    </p>
+                  )}
+                </Notice>
 
-              {thread.commentsError && (
-                <div className="flex items-start gap-2 rounded-md border border-warning/40 bg-warning/10 p-2 text-[11px] text-warning">
-                  <AlertTriangle className="mt-0.5 size-3.5 shrink-0" />
-                  <div>
+                {thread.commentsError && (
+                  <Notice tone="warning" icon={<AlertTriangle className="size-3.5" />}>
                     <div>Comments weren't fetched — {thread.commentsError}</div>
                     {thread.refetchCommand && (
-                      <div className="mt-1">
-                        The agent can fetch them itself with the re-fetch command in the prompt.
-                      </div>
+                      <div>The agent can fetch them itself with the re-fetch command in the prompt.</div>
                     )}
-                  </div>
-                </div>
-              )}
-
-              <TaskTypePicker
-                value={taskType}
-                onChange={(t) => { setTaskType(t); setTypeDirty(true); }}
-              />
-
-              <PromptComposer
-                value={prompt}
-                onChange={(v) => { setPrompt(v); setPromptDirty(true); }}
-                agent={launch.effectiveAgent}
-                references={references}
-                onReferencesChange={setReferences}
-                setReferences={setReferences}
-                fileScope={fileScope}
-                fileScopes={fileScopes}
-                startingFolder={context.path}
-                rows={12}
-                footer={overage && (
-                  <div className="rounded-md border border-warning/40 bg-warning/10 p-2 text-[11px] text-warning">
-                    This prompt is {Math.ceil(overage.bytes / 1024)} KB — {launch.overageLabel}'s one-shot
-                    launch caps prompts at {Math.floor(overage.limit / 1024)} KB. Pick another harness or
-                    trim the prompt.
-                  </div>
+                  </Notice>
                 )}
-              />
 
-              <WorktreeOptions
-                state={wt}
-                repos={repos}
-                onReposChange={setRepos}
-                lockedPath={context.path}
-              />
+                <TaskTypePicker
+                  value={taskType}
+                  onChange={(t) => { setTaskType(t); setTypeDirty(true); }}
+                />
 
-              <TaskLaunchPickers
-                launch={launch}
-                // `onManagePipelines` is optional (see the prop comment): a
-                // mount without it must render no manage row, not one that
-                // closes this dialog and goes nowhere.
-                onManagePipelines={onManagePipelines ? () => { void managePipelines(); } : undefined}
-                disabled={submitting}
-              />
+                <PromptComposer
+                  value={prompt}
+                  onChange={(v) => { setPrompt(v); setPromptDirty(true); }}
+                  agent={launch.effectiveAgent}
+                  references={references}
+                  onReferencesChange={setReferences}
+                  setReferences={setReferences}
+                  fileScope={fileScope}
+                  fileScopes={fileScopes}
+                  startingFolder={context.path}
+                  rows={12}
+                  footer={overage && (
+                    <Notice tone="warning">
+                      This prompt is {Math.ceil(overage.bytes / 1024)} KB — {launch.overageLabel}'s one-shot
+                      launch caps prompts at {Math.floor(overage.limit / 1024)} KB. Pick another harness or
+                      trim the prompt.
+                    </Notice>
+                  )}
+                />
+              </div>
 
-              {submitError && (
-                <div className="rounded-md border border-destructive/40 bg-destructive/10 p-2 text-[11px] text-destructive-foreground">
-                  {submitError}
-                </div>
-              )}
+              <div className="space-y-3 border-t border-border bg-muted/20 px-5 py-4 md:min-h-0 md:overflow-y-auto md:border-l md:border-t-0">
+                <WorkspaceSection
+                  surface="dialog"
+                  state={wt}
+                  repos={repos}
+                  onReposChange={setRepos}
+                  lockedPath={context.path}
+                />
+
+                <TaskLaunchPickers
+                  launch={launch}
+                  layout="sections"
+                  surface="dialog"
+                  // The manage rows are optional (see the prop comments): a mount
+                  // without them must render no row, not one that closes this
+                  // dialog and goes nowhere.
+                  onManagePipelines={onManagePipelines ? () => { void leaveForPage("Pipelines", onManagePipelines); } : undefined}
+                  onManageProfiles={onManageAgents ? () => { void leaveForPage("Settings → Agents", onManageAgents); } : undefined}
+                  disabled={submitting}
+                />
+              </div>
             </div>
           )}
-        </div>
+        </DialogBody>
 
-        <div className="flex shrink-0 justify-end gap-2 border-t border-border/60 p-3">
-          <Button variant="outline" onClick={onClose} disabled={submitting}>
-            Cancel
-          </Button>
-          <Button data-testid="issue-task-submit" onClick={() => void submit()} disabled={!canSubmit}>
-            {submitting ? (
-              <>
-                <Loader2 className="mr-1 size-3.5 animate-spin" /> Creating…
-              </>
-            ) : (
-              "Create & start"
-            )}
-          </Button>
-        </div>
+        <DialogFooter className="block">
+          <LaunchFooter
+            reason={gate.runBlockedReason}
+            error={submitError}
+            cancel={{ label: "Cancel", onClick: onClose, disabled: submitting, testId: "launch-cancel" }}
+            primary={{ label: "Run task", onClick: () => void submit(), disabled: !canSubmit, testId: "issue-task-submit", busy: submitting }}
+          />
+        </DialogFooter>
       </div>
     </Dialog>
   );

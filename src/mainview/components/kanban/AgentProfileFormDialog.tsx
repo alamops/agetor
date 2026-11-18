@@ -1,7 +1,8 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
-import { X } from "lucide-react";
 import { toast } from "sonner";
-import { Dialog } from "@/components/ui/dialog";
+import { Dialog, DialogBody, DialogClose, DialogHeader, DialogTitle } from "@/components/ui/dialog";
+import { Field, FieldLabel } from "@/components/ui/field";
+import { Notice } from "@/components/ui/notice";
 import { useConfirm } from "@/components/ui/confirm";
 import { Button } from "@/components/ui/button";
 import { Input } from "@/components/ui/input";
@@ -322,10 +323,11 @@ function AgentProfileFormBody({
           without a confirm. `TaskLaunchPickers` has no `disabled` prop — the
           fieldset reaches its selects/buttons/switches natively. */}
       <fieldset disabled={saving} className="m-0 min-w-0 space-y-3 border-0 p-0">
-      <div className="space-y-1">
-        <label className="text-xs text-muted-foreground">Name</label>
+      <Field controlId="agent-profile-name-input">
+        <FieldLabel>Name</FieldLabel>
         <Input
           {...IDENTIFIER_INPUT_PROPS}
+          id="agent-profile-name-input"
           data-testid="agent-profile-name"
           value={form.name}
           maxLength={AGENT_PROFILE_LIMITS.name}
@@ -333,13 +335,14 @@ function AgentProfileFormBody({
           placeholder="Bug fixer"
           autoFocus={autoFocus}
         />
-      </div>
+      </Field>
 
-      <TaskLaunchPickers launch={trackedLaunch} hideProfilePicker />
+      <TaskLaunchPickers launch={trackedLaunch} layout="flat" hideProfilePicker />
 
-      <div className="space-y-1">
-        <label className="text-xs text-muted-foreground">Instructions</label>
+      <Field controlId="agent-profile-instructions-input">
+        <FieldLabel>Instructions</FieldLabel>
         <Textarea
+          id="agent-profile-instructions-input"
           data-testid="agent-profile-instructions"
           value={form.instructions}
           maxLength={AGENT_PROFILE_LIMITS.instructions}
@@ -347,10 +350,10 @@ function AgentProfileFormBody({
           rows={5}
           placeholder="General instructions this agent should always follow…"
         />
-      </div>
+      </Field>
 
-      <div className="space-y-1">
-        <label className="text-xs text-muted-foreground">Skills</label>
+      <div className="space-y-1.5">
+        <span className="block text-xs font-medium text-muted-foreground">Skills</span>
         <SkillsPicker
           value={form.skills}
           onChange={(skills) => setForm({ ...form, skills })}
@@ -364,13 +367,13 @@ function AgentProfileFormBody({
           <input
             type="checkbox"
             data-testid="agent-profile-copy-tasks"
-            className="mt-0.5"
+            className="mt-0.5 size-4 accent-primary"
             checked={copyTasks}
             onChange={(e) => setCopyTasks(e.target.checked)}
           />
           <span className="space-y-0.5">
-            <span className="block text-xs">Also copy tasks that use this agent</span>
-            <span className="block text-xs text-muted-foreground">
+            <span className="block text-sm">Also copy tasks that use this agent</span>
+            <span className="block text-2xs text-muted-foreground">
               New backlog cards. Runs, pipeline steps, and tasks on an existing branch stay on the original.
             </span>
           </span>
@@ -379,19 +382,15 @@ function AgentProfileFormBody({
       </fieldset>
 
       {saveError && (
-        <div
-          data-testid="agent-profile-form-error"
-          className="rounded-md border border-destructive/40 bg-destructive/10 px-3 py-2 text-xs text-destructive-foreground"
-        >
+        <Notice tone="danger" data-testid="agent-profile-form-error">
           {saveError}
-        </div>
+        </Notice>
       )}
 
       <div className={cn("flex justify-end gap-2", variant === "page" && PAGE_FOOTER_CLASS)}>
         {variant === "page" && typeof profileId === "string" && profileId !== "" && (
           <Button
             variant="outline"
-            size="sm"
             data-testid="agent-profile-form-duplicate"
             onClick={() => onDuplicate?.()}
             disabled={saving}
@@ -399,10 +398,10 @@ function AgentProfileFormBody({
             Duplicate
           </Button>
         )}
-        <Button variant="outline" size="sm" data-testid="agent-profile-cancel" onClick={onCancel} disabled={saving}>
+        <Button variant="outline" data-testid="agent-profile-cancel" onClick={onCancel} disabled={saving}>
           Cancel
         </Button>
-        <Button size="sm" data-testid="agent-profile-save" onClick={() => void save()} disabled={disabled}>
+        <Button data-testid="agent-profile-save" onClick={() => void save()} disabled={disabled}>
           {saving ? "Saving…" : "Save"}
         </Button>
       </div>
@@ -460,19 +459,15 @@ export function AgentProfileFormDialog({ open, profileId, onClose, onSaved }: Ag
       open={open}
       onClose={() => void requestClose()}
       labelledBy="agent-profile-form-dialog-title"
-      className="flex max-h-[85vh] w-full max-w-lg flex-col p-0"
+      className="flex max-h-[calc(100vh-2rem)] w-full max-w-lg flex-col p-0"
     >
       <div data-testid="agent-profile-form-dialog" className="contents">
-        <header className="flex items-start justify-between gap-3 border-b border-border/60 p-3">
-          <div id="agent-profile-form-dialog-title" className="text-sm font-semibold">
-            {title}
-          </div>
-          <Button variant="ghost" size="icon" className="shrink-0" title="Close" aria-label="Close" onClick={() => void requestClose()}>
-            <X className="size-4" />
-          </Button>
-        </header>
+        <DialogHeader className="items-center">
+          <DialogTitle id="agent-profile-form-dialog-title">{title}</DialogTitle>
+          <DialogClose title="Close" onClick={() => void requestClose()} />
+        </DialogHeader>
 
-        <div className="min-h-0 flex-1 overflow-y-auto p-3 text-xs">
+        <DialogBody>
           <AgentProfileForm
             profileId={profileId}
             onSaved={(p) => {
@@ -483,7 +478,7 @@ export function AgentProfileFormDialog({ open, profileId, onClose, onSaved }: Ag
             autoFocus
             onDirtyChange={handleDirtyChange}
           />
-        </div>
+        </DialogBody>
       </div>
     </Dialog>
   );

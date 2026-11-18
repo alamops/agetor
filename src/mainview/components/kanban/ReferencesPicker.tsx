@@ -175,10 +175,10 @@ export function ReferencesPicker({
         size="sm"
         disabled={picking}
         data-testid="refs-pick-files"
-        className="h-6 gap-1 px-2 text-[11px]"
+        className="h-8 gap-1 px-2.5 text-xs"
         onClick={(e) => { e.stopPropagation(); void pick("files"); }}
       >
-        <FilePlus className="size-3" /> Files
+        <FilePlus className="size-3.5" aria-hidden /> Files
       </Button>
       <Button
         type="button"
@@ -186,10 +186,10 @@ export function ReferencesPicker({
         size="sm"
         disabled={picking}
         data-testid="refs-pick-folder"
-        className="h-6 gap-1 px-2 text-[11px]"
+        className="h-8 gap-1 px-2.5 text-xs"
         onClick={(e) => { e.stopPropagation(); void pick("folder"); }}
       >
-        <FolderPlus className="size-3" /> Folder
+        <FolderPlus className="size-3.5" aria-hidden /> Folder
       </Button>
     </div>
   );
@@ -225,7 +225,7 @@ export function ReferencesPicker({
         ) : (
           <div className="flex items-center justify-end">{buttons}</div>
         )}
-        {hint && <p className="mt-1 text-[10px] text-muted-foreground">{hint}</p>}
+        {hint && <p className="mt-1 text-3xs text-muted-foreground">{hint}</p>}
         {dropOverlay}
       </div>
     );
@@ -237,7 +237,7 @@ export function ReferencesPicker({
       onToggle={(e) => setOpen((e.target as HTMLDetailsElement).open)}
       data-testid="refs-dropzone-expandable"
       className={cn(
-        "relative rounded-md border border-border/60 bg-card/40 px-2 py-1.5",
+        "relative rounded-md border border-input bg-background/40 px-2.5 py-1.5",
         dragging && "border-primary/60 bg-primary/5",
         className,
       )}
@@ -247,7 +247,7 @@ export function ReferencesPicker({
     >
       <summary
         data-testid="refs-summary"
-        className="flex cursor-pointer items-center justify-between gap-2 text-[11px] text-muted-foreground"
+        className="flex min-h-8 cursor-pointer items-center justify-between gap-2 text-xs font-medium text-muted-foreground"
       >
         <span className="inline-flex items-center gap-1">
           {label}{" "}
@@ -263,8 +263,8 @@ export function ReferencesPicker({
       <div className="mt-1.5 space-y-1">
         {refs.length > 0
           ? chips
-          : <p className="text-[10px] text-muted-foreground">No files attached yet.</p>}
-        {hint && <p className="text-[10px] text-muted-foreground">{hint}</p>}
+          : <p className="text-3xs text-muted-foreground">No files attached yet.</p>}
+        {hint && <p className="text-3xs text-muted-foreground">{hint}</p>}
       </div>
       {dropOverlay}
     </details>

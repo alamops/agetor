@@ -8,6 +8,14 @@ import {
   clampPanelWidth,
   readPanelWidth,
   writePanelWidth,
+  NEW_TASK_PANEL_DEFAULT_WIDTH,
+  NEW_TASK_PANEL_MAX_WIDTH,
+  NEW_TASK_PANEL_MIN_WIDTH,
+  NEW_TASK_PANEL_WIDTH_KEY,
+  clampNewTaskPanelWidth,
+  clampWidth,
+  readNewTaskPanelWidth,
+  writeNewTaskPanelWidth,
 } from "./panel-width.ts";
 
 /** In-memory stand-in for `window.localStorage`. */
@@ -109,4 +117,39 @@ test("a resized panel round-trips through storage (restart survival)", () => {
 
 test("the storage key is namespaced so it can't collide with other apps", () => {
   expect(KEY).toBe("agetor:runPanelWidth");
+});
+
+// --- New Task panel width -------------------------------------------------
+
+test("clampWidth bounds by min/max and viewport, and the lower bound wins", () => {
+  const o = { min: 100, max: 300, fallback: 200 };
+  expect(clampWidth(50, o)).toBe(100);
+  expect(clampWidth(999, o)).toBe(300);
+  expect(clampWidth(Number.NaN, o)).toBe(200);
+  expect(clampWidth(280, { ...o, viewportWidth: 500, minRemaining: 300 })).toBe(200);
+  expect(clampWidth(280, { ...o, viewportWidth: 200, minRemaining: 300 })).toBe(100);
+});
+
+test("the New Task panel width defaults to 384 and clamps to 320..560", () => {
+  expect(NEW_TASK_PANEL_DEFAULT_WIDTH).toBe(384);
+  expect(readNewTaskPanelWidth(1600, fakeStorage())).toBe(384);
+  expect(clampNewTaskPanelWidth(10, 1600)).toBe(NEW_TASK_PANEL_MIN_WIDTH);
+  expect(clampNewTaskPanelWidth(9999, 1600)).toBe(NEW_TASK_PANEL_MAX_WIDTH);
+});
+
+test("the New Task panel leaves the board at least 480px, never going under 320", () => {
+  expect(clampNewTaskPanelWidth(560, 900)).toBe(420);
+  expect(clampNewTaskPanelWidth(560, 600)).toBe(NEW_TASK_PANEL_MIN_WIDTH);
+});
+
+test("the New Task panel width round-trips and survives bad storage", () => {
+  const s = fakeStorage();
+  writeNewTaskPanelWidth(500.4, s);
+  expect(s.map.get(NEW_TASK_PANEL_WIDTH_KEY)).toBe("500");
+  expect(readNewTaskPanelWidth(1600, s)).toBe(500);
+  expect(readNewTaskPanelWidth(1600, fakeStorage({ [NEW_TASK_PANEL_WIDTH_KEY]: "junk" }))).toBe(384);
+  expect(readNewTaskPanelWidth(1600, throwingStorage)).toBe(384);
+  expect(readNewTaskPanelWidth(1600, null)).toBe(384);
+  expect(() => writeNewTaskPanelWidth(500, throwingStorage)).not.toThrow();
+  expect(NEW_TASK_PANEL_WIDTH_KEY).toBe("agetor:newTaskPanelWidth");
 });

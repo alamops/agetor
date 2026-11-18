@@ -1,0 +1,59 @@
+{
+  "version": 1,
+  "formId": "new-task-ui-ux-grill-r2",
+  "title": "Grill round 2: New Task redesign, push-back",
+  "round": 2,
+  "mode": "served",
+  "specFile": "questions.json",
+  "specSha256": "ded74cec9d3e364681bd6dc53a7476d96fe3d0bb267db036659fb28e12cf608f",
+  "submittedAt": "2026-11-18T21:29:36.466Z",
+  "receivedAt": "2026-11-18T21:29:36.468Z",
+  "answeredBy": null,
+  "summary": {
+    "total": 3,
+    "answered": 3,
+    "skipped": 0,
+    "unanswered": 0,
+    "optionalLeftBlank": 0,
+    "notApplicable": 0,
+    "acceptedRecommendations": 3,
+    "overrodeRecommendations": [],
+    "oneWayDoorsNotAnswered": [],
+    "withNotes": [],
+    "needsAnswer": [],
+    "complete": true
+  },
+  "answers": {
+    "runpanel-scope": {
+      "n": 1,
+      "title": "You chose both 'shared changes only' and 'full redesign' for the RunPanel send box. What should this change do to it?",
+      "type": "single",
+      "status": "answered",
+      "impact": "blocking",
+      "value": "full-in",
+      "display": "Full redesign in this change: the dock, its toolbar actions and the background-agent bar adopt the new pattern",
+      "acceptedRecommendation": true
+    },
+    "collapse-model": {
+      "n": 2,
+      "title": "Your frequent fields cover most of Workspace and Agent. What should collapse?",
+      "type": "single",
+      "status": "answered",
+      "impact": "blocking",
+      "value": "both",
+      "display": "Both: each section can collapse to its summary line, and inside an open section the rare fields sit behind More options",
+      "acceptedRecommendation": true
+    },
+    "mode-placement": {
+      "n": 3,
+      "title": "Where does the Code | Plan control sit, given that Mode isn't in your frequent list?",
+      "type": "single",
+      "status": "answered",
+      "impact": "shape",
+      "value": "visible",
+      "display": "Always visible in Agent, under Harness (one row); only the variant picker goes into More options",
+      "acceptedRecommendation": true
+    }
+  },
+  "generalNotes": null
+}

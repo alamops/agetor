@@ -1,9 +1,8 @@
 import { useEffect, useMemo, useRef, useState } from "react";
-import { X } from "lucide-react";
 import { toast } from "sonner";
 import { api, type BranchNamingConfig } from "@/lib/api";
 import { Button } from "@/components/ui/button";
-import { Dialog } from "@/components/ui/dialog";
+import { Dialog, DialogBody, DialogClose, DialogDescription, DialogFooter, DialogHeader, DialogTitle } from "@/components/ui/dialog";
 import { Input } from "@/components/ui/input";
 import { Switch } from "@/components/ui/switch";
 import { cn } from "@/lib/utils";
@@ -95,25 +94,23 @@ export function BranchNamingDialog({ open, onClose, projectPath, projectName, ac
     <Dialog
       open={open}
       onClose={onClose}
-      className="max-w-lg"
+      className="flex max-h-[calc(100vh-2rem)] max-w-lg flex-col p-0"
       labelledBy="branch-naming-title"
       initialFocusRef={firstFieldRef}
     >
-      <div className="flex items-center justify-between border-b border-border/60 pb-3">
+      <DialogHeader>
         <div className="min-w-0">
-          <h2 id="branch-naming-title" className="text-base font-semibold">
-            Branch naming
-          </h2>
-          <p className="truncate text-xs text-muted-foreground" title={projectPath}>
-            {projectName || projectPath || "No project selected"}
-          </p>
+          <DialogTitle id="branch-naming-title">Branch naming</DialogTitle>
+          <DialogDescription>
+            <span className="block truncate" title={projectPath}>
+              {projectName || projectPath || "No project selected"}
+            </span>
+          </DialogDescription>
         </div>
-        <Button variant="ghost" size="icon" onClick={onClose} aria-label="Close">
-          <X className="size-4" />
-        </Button>
-      </div>
+        <DialogClose onClick={onClose} />
+      </DialogHeader>
 
-      <div className="space-y-4 pt-4 text-sm">
+      <DialogBody className="space-y-4 text-sm">
         <p className="text-xs text-muted-foreground">
           When a task runs isolated, agetor creates a git branch named from these
           rules. The prefix is chosen by the task&apos;s type.
@@ -150,9 +147,9 @@ export function BranchNamingDialog({ open, onClose, projectPath, projectName, ac
                     value={prefix}
                     onChange={(e) => setPrefix(t.id, e.target.value)}
                     placeholder="feature/"
-                    className="h-8 font-mono text-xs"
+                    className="font-mono text-xs"
                   />
-                  <p className="text-[10px] text-muted-foreground">
+                  <p className="text-3xs text-muted-foreground">
                     pattern{" "}
                     <span className="font-mono text-foreground/70">
                       {pattern}
@@ -160,7 +157,7 @@ export function BranchNamingDialog({ open, onClose, projectPath, projectName, ac
                   </p>
                   <p
                     className={cn(
-                      "text-[10px]",
+                      "text-3xs",
                       legal ? "text-muted-foreground" : "text-destructive",
                     )}
                   >
@@ -175,7 +172,7 @@ export function BranchNamingDialog({ open, onClose, projectPath, projectName, ac
         <label className="flex items-center justify-between gap-3">
           <span className="min-w-0">
             <span className="text-xs">Include card name in the branch</span>
-            <span className="block text-[10px] text-muted-foreground">
+            <span className="block text-3xs text-muted-foreground">
               Off &rarr; branch body is a short unique id instead of the title slug.
             </span>
           </span>
@@ -185,7 +182,7 @@ export function BranchNamingDialog({ open, onClose, projectPath, projectName, ac
           />
         </label>
 
-        <p className="text-[10px] text-muted-foreground">
+        <p className="text-3xs text-muted-foreground">
           Tags are replaced when the task is created:{" "}
           {BRANCH_TEMPLATE_TAGS.map(({ tag, description }, i) => (
             <span key={tag}>
@@ -199,13 +196,14 @@ export function BranchNamingDialog({ open, onClose, projectPath, projectName, ac
           <p className="text-xs text-destructive">{validation.reason}</p>
         )}
 
-        <div className="flex items-center justify-end gap-2 border-t border-border/60 pt-3">
-          <Button variant="ghost" size="sm" onClick={onClose}>Cancel</Button>
-          <Button size="sm" onClick={() => void save()} disabled={loading || saving || !validation.ok}>
-            {saving ? "Saving…" : "Save"}
-          </Button>
-        </div>
-      </div>
+      </DialogBody>
+
+      <DialogFooter>
+        <Button variant="ghost" onClick={onClose}>Cancel</Button>
+        <Button onClick={() => void save()} disabled={loading || saving || !validation.ok}>
+          {saving ? "Saving…" : "Save"}
+        </Button>
+      </DialogFooter>
     </Dialog>
   );
 }

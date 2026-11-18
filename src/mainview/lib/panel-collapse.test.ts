@@ -1,6 +1,8 @@
 import { expect, test } from "bun:test";
 import {
   NEW_TASK_PANEL_COLLAPSED_KEY,
+  launchMoreKey,
+  launchSectionKey,
   readCollapsed,
   writeCollapsed,
   type PanelStorage,
@@ -89,4 +91,26 @@ test("a collapsed panel round-trips through storage (restart survival)", () => {
 
 test("the storage key is namespaced so it can't collide with other apps", () => {
   expect(KEY).toBe("agetor:newTaskPanelCollapsed");
+});
+
+test("launch section keys are namespaced per surface and section", () => {
+  expect(launchSectionKey("panel", "workspace")).toBe("agetor:launch:panel:workspace:collapsed");
+  expect(launchSectionKey("dialog", "agent")).toBe("agetor:launch:dialog:agent:collapsed");
+  expect(launchMoreKey("panel", "agent")).toBe("agetor:launch:panel:agent:more");
+  const keys = new Set([
+    launchSectionKey("panel", "workspace"), launchSectionKey("panel", "agent"),
+    launchSectionKey("dialog", "workspace"), launchSectionKey("dialog", "agent"),
+    launchMoreKey("panel", "workspace"), launchMoreKey("panel", "agent"),
+    launchMoreKey("dialog", "workspace"), launchMoreKey("dialog", "agent"),
+  ]);
+  expect(keys.size).toBe(8);
+});
+
+test("a launch section's flag round-trips and defaults when storage throws", () => {
+  const s = fakeStorage();
+  const key = launchSectionKey("panel", "agent");
+  expect(readCollapsed(key, s)).toBe(false);
+  writeCollapsed(key, true, s);
+  expect(readCollapsed(key, s)).toBe(true);
+  expect(readCollapsed(key, throwingStorage)).toBe(false);
 });
