@@ -374,8 +374,10 @@ test.describe("OpenCode v2 server driver (fake opencode serve)", () => {
       const steer = `also mention pineapple ${suffix}`;
       await sendFollowUp(panel, steer);
 
-      // The steer is a user bubble in the running transcript...
-      await expect(panel.getByText(steer, { exact: true })).toBeVisible({ timeout: CONVERGE_TIMEOUT });
+      // The steer is a user bubble in the running transcript... (scoped to the
+      // transcript: until the input POST answers, the send box and its
+      // highlight mirror still hold the same text)
+      await expect(panel.getByTestId("transcript-log").getByText(steer, { exact: true })).toBeVisible({ timeout: CONVERGE_TIMEOUT });
       // ...and the model's final reply carries it (the fake appends delivered
       // steers as `[steer: <text>]`).
       await expect(panel.getByText(new RegExp(`^Done\\. \\[steer: .*${steer}.*\\]$`))).toBeVisible({

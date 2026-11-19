@@ -416,6 +416,36 @@ test.describe("@ file references", () => {
     await expect(highlightMarks(form)).toHaveCount(1, { timeout: CONVERGE_TIMEOUT });
   });
 
+  test("an @ token typed before the project's files are known opens the popover once they are, with no further key", async ({ page, backend }) => {
+    // The picker mounts only once the prompt has a file scope (the selected project). Hold the
+    // project list so the form has none while "@my" is typed, then let it through: the popover
+    // must open on the text already in the field. A slow boot used to leave it closed until the
+    // next keystroke, because the picker only read the caret on keyup / click / focus.
+    let release!: () => void;
+    const gate = new Promise<void>((r) => (release = r));
+    const projectsUrl = (url: URL) => url.pathname === "/projects";
+    await page.route(projectsUrl, async (route) => {
+      if (route.request().method() === "GET") await gate;
+      await route.continue();
+    });
+    const form = newTaskForm(page);
+    const textarea = promptTextarea(form);
+    try {
+      await gotoApp(page, backend.bootBase);
+      await textarea.click();
+      await page.keyboard.type("@my");
+      await expect(textarea).toHaveValue("@my");
+      await expect(atPopover(form)).toHaveCount(0);
+    } finally {
+      release();
+    }
+    // Waits for the released handlers to finish before removing the route.
+    await page.unrouteAll({ behavior: "wait" });
+
+    await expect(atRow(form, "docs/my notes.md")).toBeVisible({ timeout: CONVERGE_TIMEOUT });
+    await expect(textarea).toBeFocused();
+  });
+
   test("Highlighting: only @ tokens that resolve to a real file get a mark", async ({ page, backend }) => {
     await gotoApp(page, backend.bootBase);
     const form = newTaskForm(page);
@@ -617,27 +647,47 @@ test.describe("@ file references", () => {
     test.setTimeout(60_000);
     expect(startedTaskId, "the prior 'Start' scenario must have run first").toBeTruthy();
 
+    // The previous scenario sent a follow-up; wait until that run has settled
+    // BEFORE loading the app. A column transition refreshes the listing, so a
+    // settle landing between the write and "@fres" would surface the new file
+    // and make the "popover must not know it yet" assertion racy. Waiting on
+    // the API alone after the page loaded was not enough: the webview learns
+    // the new column on its next 2 s /tasks poll, which under a loaded suite
+    // landed after the write. Loading the page after the settle means its
+    // first /tasks already carries the settled column.
+    await expect(async () => {
+      const t = await getTaskById(request, backend, startedTaskId!);
+      expect(t?.column, "the prior follow-up run has settled").not.toBe("running");
+    }).toPass({ timeout: CONVERGE_TIMEOUT });
+
+    // Count the send box's listing requests for the task's worktree, so the
+    // file is written only once none is in flight: the focus refetch below
+    // answers after the README row is already showing (that row comes from
+    // the mount listing), and a refetch still running when the file lands
+    // lists it too.
+    let listingStarted = 0;
+    let listingDone = 0;
+    const isWorktreeListing = (url: string) =>
+      url.includes("/files/index") && decodeURIComponent(url).includes(`/worktrees/${startedTaskId}`);
+    page.on("request", (r) => { if (isWorktreeListing(r.url())) listingStarted++; });
+    const onDone = (r: { url(): string }) => { if (isWorktreeListing(r.url())) listingDone++; };
+    page.on("requestfinished", onDone);
+    page.on("requestfailed", onDone);
+
     await gotoApp(page, backend.bootBase);
     await taskCard(page, startedTaskTitle).click();
     const panel = runPanel(page);
     const textarea = panel.getByTestId("send-textarea");
     await expect(textarea).toBeVisible({ timeout: CONVERGE_TIMEOUT });
 
-    // The previous scenario sent a follow-up; wait until that run has settled
-    // before writing the file. A column transition refreshes the listing, so
-    // a settle landing between the write and "@fres" would surface the new
-    // file and make the "popover must not know it yet" assertion racy (it
-    // failed that way under a fully loaded suite, not in isolation).
-    await expect(async () => {
-      const t = await getTaskById(request, backend, startedTaskId!);
-      expect(t?.column, "the prior follow-up run has settled").not.toBe("running");
-    }).toPass({ timeout: CONVERGE_TIMEOUT });
-
     // Load the listing (focus-refetch) and prove it's live BEFORE the new
     // file exists.
     await textarea.click();
     await page.keyboard.type("@REA");
     await expect(atRow(panel, "README.md")).toBeVisible({ timeout: CONVERGE_TIMEOUT });
+    await expect
+      .poll(() => listingStarted > 0 && listingDone === listingStarted, { timeout: CONVERGE_TIMEOUT })
+      .toBe(true);
     await textarea.fill("");
 
     // "The agent creates a file mid-session" — the fake driver writes no

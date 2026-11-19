@@ -3,13 +3,13 @@ import { mkdirSync, mkdtempSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import path from "node:path";
 import { test, expect, type E2EBackend } from "./fixtures";
-import { gotoApp, selectProject } from "./helpers";
-import { fillNewTask, modelPicker, newTaskPanel, runTaskButton } from "./launch-helpers";
+import { gotoApp, registerGitProject, selectProject } from "./helpers";
+import { backlogButton, expandLaunch, fillNewTask, modelPicker, newTaskPanel, runTaskButton } from "./launch-helpers";
 
 /**
  * The keyboard contract of the launch surfaces (docs/architecture/task-launch-ui.md):
- * Cmd/Ctrl+Enter runs the task from the panel and is inert while a popover is open or Run is
- * disabled; arrow keys and Enter drive a picker; Escape closes a picker first; Tab moves through
+ * Cmd/Ctrl+Enter runs the task from the panel and is inert while a picker is open, inside any open
+ * popover, or while Run is disabled (an escape-only popover elsewhere, like the @ notice, doesn't block it); arrow keys and Enter drive a picker; Escape closes a picker first; Tab moves through
  * the panel in visual order; and the RunPanel send box keeps Enter / Shift+Enter / Cmd+Enter.
  */
 
@@ -40,8 +40,21 @@ async function registerProject(backend: E2EBackend, name: string): Promise<void>
 }
 
 async function taskTitles(backend: E2EBackend): Promise<string[]> {
+  return (await taskRows(backend)).map((t) => t.title);
+}
+
+interface TaskRow {
+  title: string;
+  prompt: string;
+  column: string;
+  mode: string | null;
+  taskType: string;
+}
+
+async function taskRows(backend: E2EBackend): Promise<TaskRow[]> {
   const res = await fetch(`${backend.apiBase}/tasks`, { headers: auth(backend) });
-  return ((await res.json()) as Array<{ title: string }>).map((t) => t.title);
+  if (!res.ok) throw new Error(`GET /tasks -> ${res.status}: ${await res.text()}`);
+  return (await res.json()) as TaskRow[];
 }
 
 test.describe("launch keyboard", () => {
@@ -90,10 +103,20 @@ test.describe("launch keyboard", () => {
     await modelPicker(panel).click();
     await expect(page.getByTestId("launch-model-picker-popover")).toBeVisible();
     await page.keyboard.press("ControlOrMeta+Enter");
-    await page.waitForTimeout(1_500);
-    expect(await taskTitles(freshBackend)).not.toContain(title);
     await page.keyboard.press("Escape");
     await expect(page.getByTestId("launch-model-picker-popover")).toHaveCount(0);
+
+    // With the picker closed the same chord runs the form under a second title. Had an earlier
+    // chord fired, its submit would have cleared the title and prompt, the second chord would be
+    // inert on the emptied form, and the poll below would time out. The fresh backend holds no
+    // other task, so exactly one task proves neither the Run-disabled nor the picker chord fired.
+    const second = `kbd after ${randomUUID().slice(0, 8)}`;
+    const titleField = panel.getByPlaceholder("Short description");
+    await titleField.fill(second);
+    await titleField.focus();
+    await page.keyboard.press("ControlOrMeta+Enter");
+    await expect.poll(() => taskTitles(freshBackend), { timeout: 20_000 }).toContain(second);
+    expect(await taskTitles(freshBackend)).toEqual([second]);
   });
 
   test("a picker is driven by arrow keys and Enter, and Escape closes it first", async ({ page, freshBackend }) => {
@@ -142,6 +165,142 @@ test.describe("launch keyboard", () => {
     expect(projects).toBeGreaterThan(seen.indexOf("prompt-textarea"));
     expect(harness === -1 || harness > projects).toBe(true);
     expect(new Set(seen).size).toBeGreaterThan(6);
+  });
+
+  test("a radio group is driven by arrow keys: they wrap, move focus with the check, and the picks they land on are submitted", async ({ page, freshBackend }) => {
+    const projectName = `kbd-radio-${randomUUID().slice(0, 8)}`;
+    await registerProject(freshBackend, projectName);
+    await gotoApp(page, freshBackend.bootBase);
+    const panel = newTaskPanel(page);
+    await selectProject(page, panel, projectName);
+    await expandLaunch(panel);
+    const title = `kbd radio ${randomUUID().slice(0, 8)}`;
+    await fillNewTask(page, { title, prompt: "p" });
+
+    // Type: Task ← wraps to Spike, → wraps back to Task, ↓ moves on to Bug.
+    const type = panel.getByTestId("task-type-picker");
+    const taskRadio = type.getByTestId("task-type-task");
+    const bugRadio = type.getByTestId("task-type-bug");
+    const spikeRadio = type.getByTestId("task-type-spike");
+    await expect(taskRadio).toBeChecked();
+    await taskRadio.focus();
+    await page.keyboard.press("ArrowLeft");
+    await expect(spikeRadio).toBeChecked();
+    await expect(spikeRadio).toBeFocused();
+    await page.keyboard.press("ArrowRight");
+    await expect(taskRadio).toBeChecked();
+    await expect(taskRadio).toBeFocused();
+    await page.keyboard.press("ArrowDown");
+    await expect(bugRadio).toBeChecked();
+    await expect(bugRadio).toBeFocused();
+    // Roving tabindex: only the checked radio is a Tab stop.
+    await expect(bugRadio).toHaveAttribute("tabindex", "0");
+    await expect(taskRadio).toHaveAttribute("tabindex", "-1");
+    await expect(spikeRadio).toHaveAttribute("tabindex", "-1");
+
+    // Mode: Code → Plan with the right arrow, back with the up arrow, then forward again.
+    const code = panel.getByTestId("launch-mode-code");
+    const plan = panel.getByTestId("launch-mode-plan");
+    await expect(code).toBeChecked();
+    await code.focus();
+    await page.keyboard.press("ArrowRight");
+    await expect(plan).toBeChecked();
+    await expect(plan).toBeFocused();
+    await page.keyboard.press("ArrowUp");
+    await expect(code).toBeChecked();
+    await page.keyboard.press("ArrowRight");
+    await expect(plan).toBeChecked();
+
+    // What the keys picked is what the task is stored with.
+    await backlogButton(panel).click();
+    await expect.poll(async () => (await taskRows(freshBackend)).some((t) => t.title === title), { timeout: 20_000 }).toBe(true);
+    const row = (await taskRows(freshBackend)).find((t) => t.title === title)!;
+    expect(row.column).toBe("backlog");
+    expect(row.taskType).toBe("bug");
+    expect(row.mode).toBe("plan");
+  });
+
+  test("Cmd/Ctrl+Enter while the @ suggestions are open picks the suggestion instead of running the task", async ({ page, freshBackend }) => {
+    const projectName = `kbd-at-${randomUUID().slice(0, 8)}`;
+    await registerGitProject(freshBackend, projectName);
+    await gotoApp(page, freshBackend.bootBase);
+    const panel = newTaskPanel(page);
+    await selectProject(page, panel, projectName);
+    const title = `kbd at ${randomUUID().slice(0, 8)}`;
+    await panel.getByPlaceholder("Short description").fill(title);
+    const prompt = panel.getByTestId("prompt-textarea");
+    await prompt.click();
+    await page.keyboard.type("see @REA");
+    const suggestions = panel.getByTestId("at-file-autocomplete");
+    await expect(suggestions.locator('[data-testid="at-file-autocomplete-row"][data-path="README.md"]')).toBeVisible({ timeout: 20_000 });
+    await expect(runTaskButton(panel)).toBeEnabled({ timeout: 20_000 });
+
+    // The chord completes the token and closes the list.
+    await page.keyboard.press("ControlOrMeta+Enter");
+    await expect(prompt).toHaveValue("see @README.md ");
+    await expect(suggestions).toHaveCount(0);
+
+    // With nothing open, the same chord runs the task. Its stored prompt carries the completed
+    // token, so the first chord did not also submit the half-typed "@REA".
+    await page.keyboard.press("ControlOrMeta+Enter");
+    await expect.poll(async () => (await taskRows(freshBackend)).filter((t) => t.title === title).length, { timeout: 20_000 }).toBe(1);
+    const row = (await taskRows(freshBackend)).find((t) => t.title === title)!;
+    expect(row.prompt.trim()).toBe("see @README.md");
+    expect(row.column).not.toBe("backlog");
+  });
+
+  test("Cmd/Ctrl+Enter still runs the task while the @ notice says the project's files can't be listed", async ({ page, freshBackend }) => {
+    // A plain directory can't be listed, so typing "@" shows a passive notice with nothing to
+    // pick. AtFileAutocomplete's contract for that notice is "everything but Escape behaves as if
+    // no popover were up", and it marks itself `data-popover-keys="escape-only"`
+    // (docs/architecture/prompt-composer.md): the run chord must not be swallowed by it.
+    const projectName = `kbd-at-error-${randomUUID().slice(0, 8)}`;
+    await registerProject(freshBackend, projectName);
+    await gotoApp(page, freshBackend.bootBase);
+    const panel = newTaskPanel(page);
+    await selectProject(page, panel, projectName);
+    const title = `kbd at error ${randomUUID().slice(0, 8)}`;
+    await panel.getByPlaceholder("Short description").fill(title);
+    const prompt = panel.getByTestId("prompt-textarea");
+    await prompt.click();
+    await page.keyboard.type("look at @x");
+    await expect(panel.getByTestId("at-file-error")).toBeVisible({ timeout: 20_000 });
+    await expect(runTaskButton(panel)).toBeEnabled({ timeout: 20_000 });
+
+    await page.keyboard.press("ControlOrMeta+Enter");
+    await expect.poll(() => taskTitles(freshBackend), { timeout: 20_000 }).toContain(title);
+  });
+
+  test("Cmd/Ctrl+Enter typed inside the Extensions popover's search does not run the task", async ({ page, freshBackend }) => {
+    // The Extensions popover is escape-only too, so it no longer blocks the chord from elsewhere,
+    // but a key typed inside it belongs to it: its search box handles Enter in a React handler
+    // that runs after the form's listener, so the form must hold the chord back itself.
+    const projectName = `kbd-ext-${randomUUID().slice(0, 8)}`;
+    await registerProject(freshBackend, projectName);
+    await gotoApp(page, freshBackend.bootBase);
+    const panel = newTaskPanel(page);
+    await selectProject(page, panel, projectName);
+    const title = `kbd ext ${randomUUID().slice(0, 8)}`;
+    await fillNewTask(page, { title, prompt: "p" });
+    await expect(runTaskButton(panel)).toBeEnabled({ timeout: 20_000 });
+
+    await panel.getByTestId("extension-picker-trigger").click();
+    const search = panel.getByTestId("extension-picker-search");
+    await search.focus();
+    await page.keyboard.press("ControlOrMeta+Enter");
+    await page.keyboard.press("Escape");
+    await expect(panel.getByTestId("extension-picker-popover")).toHaveCount(0);
+
+    // With the popover closed the chord runs the form under a second title. Had the first chord
+    // fired, its submit would have cleared the form and the poll below would time out; exactly one
+    // task on the fresh backend proves it didn't.
+    const second = `kbd ext after ${randomUUID().slice(0, 8)}`;
+    const titleField = panel.getByPlaceholder("Short description");
+    await titleField.fill(second);
+    await titleField.focus();
+    await page.keyboard.press("ControlOrMeta+Enter");
+    await expect.poll(() => taskTitles(freshBackend), { timeout: 20_000 }).toContain(second);
+    expect(await taskTitles(freshBackend)).toEqual([second]);
   });
 
   test("the send box keeps its keys: Enter sends, Shift+Enter inserts a new line, Cmd/Ctrl+Enter sends", async ({ page, request, freshBackend }) => {

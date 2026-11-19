@@ -6,7 +6,7 @@
 | Source | Pipeline task text and the owner's screenshot (outside the repo, transcribed in the investigation §1); `docs/plans/new-task-ui-ux-investigation.md`; `docs/plans/new-task-ui-ux-grill.md` (the contract) with `docs/plans/new-task-ui-ux-grill/round-{1,2}/answers.json` |
 | Flags | none |
 | Gates | grilled (2 rounds, complete, no one-way doors); approved by owner as written on 2026-11-18, with the §8 assumptions as defaults |
-| Status | implemented on the branch; code-review rounds 1–5 fixed (see "Execution notes — review round 1", "— review round 2", "Review round 3", "Review round 4" and "Review round 5"). The full e2e suite (532 tests) has not been run green on the final head yet: round 1 had one real failure, fixed and followed only by a partial re-run, and rounds 2–5 re-ran only the affected specs (listed in their notes); the Test Writer step runs the full suite. Deviations are listed under "Execution notes" at the end. |
+| Status | implemented on the branch; code-review rounds 1–6 fixed (see "Execution notes — review round 1", "— review round 2", "Review round 3" to "Review round 6"); round 7 approved. The Test Writer step added the tests listed under "Test Writer" below; the one it left red (TW-D1) and two more defects the Test Loop found are fixed (see "Test Loop"). Typecheck is clean, `bun test src/mainview src/shared` is green, and every one of the 552 e2e tests passed on the final code, across three runs because the Node under Vite aborted twice (see "Test Loop"). Deviations are listed under "Execution notes" at the end. |
 | Branch | `fix/agetor-new-task-ui-improvement` |
 | Base SHA | `4d7f8bfb93320076aa86292d614d84d4b883ba7d` |
 
@@ -896,7 +896,7 @@ Added by this plan. Each is a reversible default, and the owner can flip any of 
 | "Manage agents…" in Clone | out of scope | A7: unwinding nested overlays is a navigation change; a different ticket. The owner can flip it at approval. |
 | e2e locator migration (~25 specs) and retired ids | in this run | T6a/T6b (helpers), T19a/T19b (switch) |
 | New e2e: Speed submit, Cmd/Ctrl+Enter, collapse/More options persistence, resize, dialog layout, parity, send-key parity | in this run | T9, T20 |
-| Docs describing the old UI (11 files) | in this run | T21 |
+| Docs describing the old UI (11 files) | in this run | T21; review round 6 brought the last three in line (README quick start, the CLAUDE.md layout-chrome bullet, `harnesses.md`) |
 | Style spec, CLAUDE.md Topic map row and UI-conventions bullets | in this run | T21 |
 | A11y bar: labels, keyboard, visible focus, AA contrast in both themes | in this run | T2, T10–T18, T20, T22 |
 | Before/after screenshots, both themes, every surface | in this run | T0, T22 |
@@ -983,3 +983,53 @@ The round-2 review at `70dca452` sent the branch back with R-M1, R-S1–R-S3 and
 - **R5-S1 fixed.** `ResolveConflictsDialog` shows its footer reason only once the form is on screen (harnesses loaded, no load error, a resolve context), as the issue dialog does. While the harnesses load the footer says "Loading harnesses…"; after a failed fetch, or once the PR's state changed, it shows nothing. New `resolve-conflicts.spec.ts` case fails `GET /harnesses` with a 500 and expects the error and no `launch-run-blocked-reason`.
 - **R5-N1 fixed.** `issue-task.spec.ts` holds the thread route's predicate in one const, so `page.unroute` removes the route it registered (Playwright compares function matchers by reference).
 - **R5-N2 fixed.** The Status line says the full e2e suite has not been run green on the final head; the Test Writer step runs it.
+
+### Review round 6 — Bug Fix
+
+- **R6-S1, R6-N1, R6-N2 fixed** (`d47e9a89`): README, the CLAUDE.md layout-chrome bullet and `harnesses.md` describe the new panel; the resize handle's max uses `NEW_TASK_PANEL_MIN_BOARD_WIDTH`; `DialogClose` has disabled styles and the issue, PR and Clone dialogs pass `disabled`. Round 7 re-reviewed it and approved.
+
+### Test Writer (step 18)
+
+Tests added for paths no earlier test drove. Each was run once and shown red against a broken copy of the code it guards (the change reverted afterwards).
+
+- `e2e/launch-keyboard.spec.ts`: a radio group (Type, Code | Plan) is driven by the arrow keys, wraps, moves focus with the check and keeps one Tab stop, and the picks are stored on the task; Cmd/Ctrl+Enter while the `@` suggestions are open completes the token instead of running (the stored prompt carries the completed token); Cmd/Ctrl+Enter while the `@` "couldn't list this project's files" notice shows still runs the task (**red, TW-D1**). The "does nothing while a picker is open" case waits for a positive signal (a second run under a new title) instead of sleeping 1.5 s.
+- `e2e/launch-layout.spec.ts`: the panel collapses to the 44 px rail (no form, no resize handle) and back without losing the title, prompt, project, Type, model or mode, at the default width; collapsed survives a reload.
+- `e2e/launch-branch-naming.spec.ts` (new): the Branch naming dialog opens for the selected project focused on the first rule, saves it, and the panel's branch name follows (and switches rule with Type); an invalid prefix can't be saved and Escape, Cancel and × store nothing; an edited branch name is announced on the closed More options row, Reset to pattern undoes it, and Run task creates the task on the saved rule's branch.
+- `e2e/resolve-conflicts.spec.ts`: the PR dialog's Manage agents row from a clean draft closes both dialogs and opens Settings → Agents with no confirm (the `PullActions` wiring); while Run task is in flight the header Close and Cancel are disabled and dimmed (R6-N2) and the pickers locked, and the created task closes the dialog.
+- `e2e/issue-task.spec.ts`: the same in-flight case for the issue dialog. `e2e/clone-providers.spec.ts`: the header Close is disabled and dimmed while a clone runs.
+- `src/mainview/components/ui/primitives.test.tsx`: `DialogClose` (a `type="button"` named Close that forwards `disabled` and `title`, icon hidden) and `DialogDescription`.
+
+**TW-D1 (product defect, fixed in the Test Loop step; see "Test Loop" below).** In a project whose files can't be listed (a plain folder), typing `@x` in the panel's prompt shows the "Couldn't list this project's files" notice, and Cmd/Ctrl+Enter then does nothing although Run task is enabled. `useSubmitShortcut` stays inert on any `[data-popover-open]` in its scope, and the notice carries that marker with `data-popover-keys="escape-only"`; `AtFileAutocomplete` documents that in this mode everything but Escape behaves as if no popover were up, and `prompt-composer.md` says escape-only carriers don't swallow other shortcuts. Checked: honoring `:not([data-popover-keys="escape-only"])` in the hook's query turns the test green and keeps the suggestions case green (the open list consumes Enter through `defaultPrevented`). Whether an open Extensions popover (also escape-only) should then let the chord through is the fixer's call.
+
+Verification: `bun run typecheck` clean; `bun test src/mainview src/shared` 4479 pass, 0 fail. E2e on private ports (`AGETOR_E2E_VITE_PORT=5287 AGETOR_E2E_PORT_OFFSET=2700`), the six touched spec files: 62 passed, 1 failed (TW-D1).
+
+### Test Loop (step 19) and final verification (step 20)
+
+Run on head `d47e9a89` plus the uncommitted Test Loop work, on private ports (`CI=1 AGETOR_E2E_VITE_PORT=5291 AGETOR_E2E_PORT_OFFSET=3000`), one Playwright run at a time, at machine load 20–47.
+
+Product fixes, each with an e2e shown red before the fix and green after:
+
+- **TW-D1 fixed.** Cmd/Ctrl+Enter in a launch form is blocked only by a popover that owns the keyboard (`KEYBOARD_OWNING_POPOVERS` in `lib/find-shortcut.ts`, reused as `SUBMIT_BLOCKING_POPOVERS` in `lib/submit-shortcut.ts`) or by a key typed inside any open popover (`keyFromInsidePopover`). The `@` "couldn't list this project's files" notice no longer swallows the chord. The Extensions decision: Cmd/Ctrl+Enter typed in the Extensions search box still does not run the task, because the key comes from inside the popover; a new `launch-keyboard.spec.ts` case pins it. Intended change, documented in `task-launch-ui.md`: a `/` menu left open while focus moved to another field no longer blocks the chord.
+- **`AtFileAutocomplete` reads the caret on mount** when the textarea is focused. An `@token` typed before the project's file scope arrived opened no popover (the at-file-autocomplete load flake). New e2e holds `GET /projects`.
+- **`ui/picker.tsx` grows when rows arrive after it opened.** It re-measured its own capped `scrollHeight` and stayed clipped at its first height (the fx-recovery "mode defaults to Full access" timeout). Fixed with `naturalPopoverHeight()` in `lib/popover-position.ts` plus unit tests. New `launch-layout.spec.ts` case holds `GET /harnesses`.
+
+Test-race fixes: the at-file "Run-settle refresh" waits until no worktree listing request is in flight before writing the file (120/120 under stress at load 47); the OpenCode steer test is scoped to `transcript-log`, because the send box and its highlight mirror hold the same text until the input POST answers; `launch-layout` uses `reducedMotion`, because a CSS width transition stalled mid-way under load while the inline width was already right.
+
+Code review of this step's diff: no blocker or must-fix; S2 and every nit applied (exact task-count asserts, `try/finally` release on held routes, `registerGitProject` moved to `e2e/helpers.ts`, comment fixes, a catalog wait before a negative model check).
+
+Results: `bun run typecheck` clean. Full `bun test`: 13710 pass, 32 skip, 6 fail; five are `github-network.test.ts`, which also fail on `main` at `4d7f8bfb`, and the sixth (`orchestrator-hold-scope-claim`) timed out a hook under load and passes alone. After the last product change, `bun test src/mainview src/shared`: 4483 pass, 0 fail.
+
+Full Playwright runs:
+
+| Run | Tests | Passed | Failed | Did not run | Notes |
+| --- | --- | --- | --- | --- | --- |
+| #1 | 550 | 537 | 1 | 12 (serial) | at-file-autocomplete; product fix above |
+| #2 | 551 | 548 | 3 | 0 | launch-layout transition, opencode steer locator, markdown-readability (a 5 s textarea wait at load ~37; passed on rerun, no race found) |
+| #3 | 551 | 545 | 1 | 5 | fx-recovery picker; product fix above |
+| #4 (final code) | 552 | 357 | 101 | 94 | Inconclusive: the Vite dev server stopped answering around test 366 (curl to :5291 timed out with the port still listening), so nearly every later test timed out in `page.goto` and serial siblings did not run |
+| Rerun of #4's 34 spec files | 233 | 208 | 14 | 11 | The same abort at test ~210; every test before it passed, including `fx-models` "picker shows curated ∩ discovered catalog", run #4's one failure before the abort |
+| The five files left, Vite on Node v24.22.3 | 60 | 60 | 0 | 0 | `pipelines-run`, `select-projects`, `task-switch-during-restore`, `theme`, `usage-tracker` |
+
+**Cause of the breakdowns.** The Node under the Vite dev server aborted: `abort: Lazy deopt after a fast API call with return value is unsupported`, in `Buffer.byteLength` while Vite's transform middleware sent a 4 MB module, and the process then spun at 99% CPU with the port still listening. Playwright starts Vite with `bunx vite`, whose `#!/usr/bin/env node` picks the first `node` on `PATH`; on this machine that is Homebrew's v26.13.1. It is a runtime fault, not a test or product failure. Run e2e with an LTS Node first on `PATH` (for example `export PATH="$HOME/.nvm/versions/node/v24.22.3/bin:$PATH"`).
+
+**Final e2e state.** Every one of the 552 tests passed on the final code, across three runs: 319 in run #4 (the spec files with no failures), 208 in the 34-file rerun before the abort, and 60 in the last run. No product or test change was needed after the picker fix.

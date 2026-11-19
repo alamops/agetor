@@ -6,12 +6,19 @@ import { test, expect, type E2EBackend } from "./fixtures";
 import { gotoApp, selectProject } from "./helpers";
 import {
   backlogButton,
+  expectModel,
+  modelOptionIds,
+  expectPrimaryMode,
+  expectTaskType,
   fillNewTask,
+  harnessPicker,
   newTaskPanel,
   openMore,
   pickModel,
   pickSpeed,
+  pickTaskType,
   runTaskButton,
+  setPrimaryMode,
 } from "./launch-helpers";
 
 /**
@@ -47,6 +54,12 @@ async function registerProject(backend: E2EBackend, name: string): Promise<void>
 test.describe("New Task panel layout", () => {
   test.describe.configure({ timeout: 120_000 });
   test.use({ backendEnv: { AGETOR_E2E_CLAUDE_STUB: "1", AGETOR_E2E_CLAUDE_MODELS_JSON: CATALOG } });
+  // These tests measure the panel's rendered width. Its width change is a 200 ms CSS transition,
+  // and under a loaded machine headless Chromium can stop producing the frames that advance it, so
+  // the box sat mid-transition (441 px of a 420 -> 500 px change) for the whole poll while the
+  // inline width was already right. Reduced motion turns the transition off
+  // (`motion-reduce:transition-none`), so the geometry asserted is the settled one.
+  test.use({ contextOptions: { reducedMotion: "reduce" } });
 
   test("the frequent fields are visible with More options closed, and every field has an associated label", async ({ page, freshBackend }) => {
     const projectName = `layout-${randomUUID().slice(0, 8)}`;
@@ -249,5 +262,96 @@ test.describe("New Task panel layout", () => {
     await expect(handle).toHaveAttribute("aria-valuemax", "320");
     await page.setViewportSize(full);
     await expect(handle).toHaveAttribute("aria-valuenow", "384");
+  });
+
+  test("the panel collapses to the rail and back without losing the draft, and stays collapsed after a reload", async ({ page, freshBackend }) => {
+    await page.setViewportSize({ width: 1280, height: 900 });
+    const projectName = `layout-rail-${randomUUID().slice(0, 8)}`;
+    await registerProject(freshBackend, projectName);
+    const projectFolder = createHash("sha1").update(projectName).digest("hex").slice(0, 12);
+    await gotoApp(page, freshBackend.bootBase, { launchMoreOpen: false });
+    const panel = newTaskPanel(page);
+    await selectProject(page, panel, projectName);
+    const projects = panel.getByTestId("select-projects-button");
+    await expect(projects).toContainText(projectFolder);
+
+    // A draft spread over every part of the form: the text fields, the Task section's Type, and
+    // the Agent section's picks (which live in useTaskLaunch, not in the unmounted children).
+    const title = `rail ${randomUUID().slice(0, 8)}`;
+    await fillNewTask(page, { title, prompt: "keep this prompt" });
+    // Every pick below differs from its default, so getting it back can't be a reset.
+    await expectTaskType(panel, "Task");
+    await expectPrimaryMode(panel, "code");
+    // Wait for the CLI catalog first: before it lands the trigger shows a fallback, and a
+    // negative check would pass on that alone.
+    await expect.poll(() => modelOptionIds(panel), { timeout: 20_000 }).toContain("opus-6");
+    await expect(panel.getByTestId("launch-model-picker-trigger")).not.toHaveAttribute("data-value", "opus-6");
+    await pickTaskType(panel, "Bug");
+    await pickModel(panel, "opus-6");
+    await setPrimaryMode(panel, "plan");
+
+    const toggle = panel.getByRole("button", { name: "Collapse new task panel", exact: true });
+    await toggle.click();
+    // The rail: 44 px, no form fields and no resize handle (nothing to drop into or drag).
+    const expandToggle = panel.getByRole("button", { name: "Expand new task panel", exact: true });
+    await expect(expandToggle).toHaveAttribute("aria-expanded", "false");
+    await expect(panel.getByPlaceholder("Short description")).toHaveCount(0);
+    await expect(panel.getByTestId("new-task-panel-resize")).toHaveCount(0);
+    await expect.poll(async () => Math.round((await panel.boundingBox())!.width)).toBe(44);
+
+    // The rail's own "New task" button brings the whole draft back at the default width.
+    await panel.getByRole("button", { name: "New task", exact: true }).click();
+    await expect(panel.getByRole("button", { name: "Collapse new task panel", exact: true })).toHaveAttribute("aria-expanded", "true");
+    await expect(panel.getByPlaceholder("Short description")).toHaveValue(title);
+    await expect(panel.getByTestId("prompt-textarea")).toHaveValue("keep this prompt");
+    await expect(projects).toContainText(projectFolder);
+    await expectTaskType(panel, "Bug");
+    await expectModel(panel, "opus-6");
+    await expectPrimaryMode(panel, "plan");
+    await expect(panel.getByTestId("new-task-panel-resize")).toHaveAttribute("aria-valuenow", "384");
+    await expect.poll(async () => Math.round((await panel.boundingBox())!.width)).toBe(384);
+
+    // Collapsed is remembered across a reload; the header toggle expands it again.
+    await panel.getByRole("button", { name: "Collapse new task panel", exact: true }).click();
+    await expect(expandToggle).toHaveAttribute("aria-expanded", "false");
+    await page.reload();
+    await expect(expandToggle).toHaveAttribute("aria-expanded", "false", { timeout: 20_000 });
+    await expect(panel.getByPlaceholder("Short description")).toHaveCount(0);
+    await expandToggle.click();
+    await expect(panel.getByPlaceholder("Short description")).toBeVisible();
+  });
+
+  test("a picker opened before its rows load grows to show them when they arrive", async ({ page, freshBackend }) => {
+    // The Harness picker can be opened while /harnesses is still loading (a slow boot). The
+    // rows that arrive afterwards must fit inside the open popover, not be clipped to the
+    // height it measured with one row (the picker re-measured its own capped height).
+    let release!: () => void;
+    const gate = new Promise<void>((r) => (release = r));
+    await page.route((url) => url.pathname === "/harnesses", async (route) => {
+      if (route.request().method() === "GET") await gate;
+      await route.continue();
+    });
+    const panel = newTaskPanel(page);
+    const pop = page.getByTestId("launch-harness-picker-popover");
+    try {
+      await gotoApp(page, freshBackend.bootBase, { launchMoreOpen: false });
+      await harnessPicker(panel).click();
+      await expect(pop).toBeVisible();
+      // Opened small: the rows haven't arrived (an empty state, or a fallback row).
+      expect(await pop.getByRole("option").count()).toBeLessThan(2);
+    } finally {
+      release();
+    }
+    await page.unrouteAll({ behavior: "wait" });
+
+    await expect.poll(() => pop.getByRole("option").count(), { timeout: 20_000 }).toBeGreaterThan(1);
+    // Every row lies inside the popover's box: nothing is cut off by a stale max-height.
+    await expect
+      .poll(async () => {
+        const box = (await pop.boundingBox())!;
+        const rows = await pop.getByRole("option").evaluateAll((els) => els.map((e) => e.getBoundingClientRect().bottom));
+        return rows.every((bottom) => bottom <= box.y + box.height + 0.5);
+      }, { timeout: 5_000 })
+      .toBe(true);
   });
 });

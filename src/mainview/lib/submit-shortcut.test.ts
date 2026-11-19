@@ -1,5 +1,5 @@
 import { describe, expect, test } from "bun:test";
-import { isSubmitShortcut, shouldFireSubmit } from "./submit-shortcut.ts";
+import { isSubmitShortcut, shouldFireSubmit, SUBMIT_BLOCKING_POPOVERS } from "./submit-shortcut.ts";
 
 const key = (o: Partial<Parameters<typeof isSubmitShortcut>[0]>) => ({
   key: "Enter", metaKey: false, ctrlKey: false, altKey: false, shiftKey: false, ...o,
@@ -22,10 +22,18 @@ describe("isSubmitShortcut", () => {
 });
 
 describe("shouldFireSubmit", () => {
-  test("inert when consumed, while a popover is open, or when Run is off", () => {
-    expect(shouldFireSubmit({ defaultPrevented: false, scopeHasOpenPopover: false, canRun: true })).toBe(true);
-    expect(shouldFireSubmit({ defaultPrevented: true, scopeHasOpenPopover: false, canRun: true })).toBe(false);
-    expect(shouldFireSubmit({ defaultPrevented: false, scopeHasOpenPopover: true, canRun: true })).toBe(false);
-    expect(shouldFireSubmit({ defaultPrevented: false, scopeHasOpenPopover: false, canRun: false })).toBe(false);
+  const base = { defaultPrevented: false, scopeHasBlockingPopover: false, keyFromInsidePopover: false, canRun: true };
+  test("fires only when nothing consumed or holds the key and Run is on", () => {
+    expect(shouldFireSubmit(base)).toBe(true);
+    expect(shouldFireSubmit({ ...base, defaultPrevented: true })).toBe(false);
+    expect(shouldFireSubmit({ ...base, scopeHasBlockingPopover: true })).toBe(false);
+    expect(shouldFireSubmit({ ...base, keyFromInsidePopover: true })).toBe(false);
+    expect(shouldFireSubmit({ ...base, canRun: false })).toBe(false);
+  });
+});
+
+describe("SUBMIT_BLOCKING_POPOVERS", () => {
+  test("pins the selector: an open popover blocks the chord unless it is escape-only", () => {
+    expect(SUBMIT_BLOCKING_POPOVERS).toBe('[data-popover-open]:not([data-popover-keys="escape-only"])');
   });
 });

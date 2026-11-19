@@ -11,7 +11,7 @@ import { Notice } from "./notice.tsx";
 import { Disclosure } from "./disclosure.tsx";
 import { ResizeHandle } from "./resize-handle.tsx";
 import { Kbd } from "./kbd.tsx";
-import { Dialog, DialogBody, DialogFooter, DialogHeader, DialogTitle } from "./dialog.tsx";
+import { Dialog, DialogBody, DialogClose, DialogDescription, DialogFooter, DialogHeader, DialogTitle } from "./dialog.tsx";
 
 describe("Field", () => {
   test("the label's htmlFor equals the control's id, and the description carries the id the control names", () => {
@@ -135,5 +135,21 @@ describe("Dialog parts", () => {
     expect(html).toContain('id="t"');
     expect(html).toContain("shrink-0");
     expect(renderToStaticMarkup(<Dialog open={false} onClose={() => {}}>x</Dialog>)).toBe("");
+  });
+
+  test("DialogClose is a plain button named Close that forwards disabled and title; its icon is hidden", () => {
+    const html = renderToStaticMarkup(<DialogClose disabled title="Close" onClick={() => {}} />);
+    expect(html).toMatch(/^<button type="button" aria-label="Close"/);
+    expect(html).toContain('disabled=""');
+    expect(html).toContain('title="Close"');
+    expect(html).toContain('<svg aria-hidden="true"');
+    // Enabled unless told otherwise.
+    expect(renderToStaticMarkup(<DialogClose onClick={() => {}} />)).not.toContain("disabled=");
+  });
+
+  test("DialogDescription renders the paragraph a dialog's describedBy points at", () => {
+    const html = renderToStaticMarkup(<DialogDescription id="d">PR #42 — title</DialogDescription>);
+    expect(html).toMatch(/^<p [^>]*id="d"/);
+    expect(html).toContain("PR #42 — title");
   });
 });

@@ -4,7 +4,7 @@ import { Check, ChevronDown, Search } from "lucide-react";
 import { cn } from "@/lib/utils";
 import { IDENTIFIER_INPUT_PROPS } from "@/lib/identifier-input";
 import { isTypeAheadKey, navigate, typeAhead } from "@/lib/listbox-nav";
-import { placePopover, type PopoverPlacement } from "@/lib/popover-position";
+import { naturalPopoverHeight, placePopover, type PopoverPlacement } from "@/lib/popover-position";
 
 export interface PickerItem {
   value: string;
@@ -175,10 +175,21 @@ export function Picker({
     const panel = panelRef.current;
     if (!trig || !panel) return;
     const r = trig.getBoundingClientRect();
+    const list = listRef.current;
+    // Rows that arrive while the panel is open (a harness or model list still
+    // loading) must grow it: measure past the max-height the last placement set.
+    const popoverHeight = list
+      ? naturalPopoverHeight({
+          panelScrollHeight: panel.scrollHeight,
+          listClientHeight: list.clientHeight,
+          listScrollHeight: list.scrollHeight,
+          maxListHeight: MAX_LIST_HEIGHT,
+        })
+      : panel.scrollHeight;
     setPlace(
       placePopover({
         trigger: { top: r.top, left: r.left, width: r.width, height: r.height },
-        popoverHeight: panel.scrollHeight,
+        popoverHeight,
         viewportWidth: window.innerWidth,
         viewportHeight: window.innerHeight,
         prefer,

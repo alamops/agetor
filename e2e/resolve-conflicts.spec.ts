@@ -809,6 +809,82 @@ test.describe("Resolve with Agetor dialog", () => {
     await page.unroute(harnessesUrl);
   });
 
+  test("manage agents: from a clean draft the row closes both dialogs and opens Settings → Agents", async ({ page, backend }) => {
+    test.setTimeout(90_000);
+    await gotoApp(page, backend.bootBase);
+    const dlg = await openResolveConflictsDialog(page);
+
+    // The PR dialog's own wiring (PullActions → App's openSettingsAgentsFromGit), not the issue one.
+    await dlg.getByTestId("agent-profile-picker-trigger").click();
+    const manage = page.getByTestId("agent-profile-picker-manage");
+    await expect(manage).toBeVisible({ timeout: CONVERGE_TIMEOUT });
+    await manage.click();
+
+    const settings = page.getByRole("dialog").filter({ has: page.locator("#settings-dialog-title") });
+    await expect(settings).toBeVisible({ timeout: CONVERGE_TIMEOUT });
+    await expect(settings.getByRole("button", { name: "Agents", exact: true })).toHaveAttribute("aria-current", "page");
+    // Nothing was typed, so no discard confirm was asked, and no launch or Git dialog is left
+    // stacked under Settings.
+    await expect(page.getByText("Discard this task draft and open Settings → Agents?")).toHaveCount(0);
+    await expect(dlg).toHaveCount(0);
+    await expect(page.getByRole("dialog")).toHaveCount(1);
+  });
+
+  test("while Run task is in flight, the header Close and Cancel are disabled and dimmed; the created task closes the dialog", async ({
+    page,
+    request,
+    backend,
+  }) => {
+    test.setTimeout(90_000);
+    const auth = { authorization: `Bearer ${backend.apiToken}` };
+    const before = new Set(
+      ((await (await request.get(`${backend.apiBase}/tasks`, { headers: auth })).json()) as TaskRow[]).map((t) => t.id),
+    );
+    await gotoApp(page, backend.bootBase);
+    const dlg = await openResolveConflictsDialog(page);
+
+    // Hold the create request so the dialog stays in its busy state until the gate opens.
+    let release!: () => void;
+    const gate = new Promise<void>((r) => (release = r));
+    let held = 0;
+    const tasksUrl = (url: URL) => url.pathname === "/tasks";
+    await page.route(tasksUrl, async (route) => {
+      if (route.request().method() !== "POST") return route.continue();
+      held++;
+      await gate;
+      await route.continue();
+    });
+
+    const submit = dlg.getByTestId("resolve-conflicts-submit");
+    await expect(submit).toBeEnabled({ timeout: CONVERGE_TIMEOUT });
+    await submit.click();
+    // Release the held create even when an assertion below fails, so the route never hangs.
+    try {
+      await expect.poll(() => held, { timeout: CONVERGE_TIMEOUT }).toBe(1);
+
+      const close = dlg.getByRole("button", { name: "Close", exact: true });
+      await expect(close).toBeDisabled();
+      await expect(close).toHaveCSS("opacity", "0.5");
+      await expect(dlg.getByTestId("launch-cancel")).toBeDisabled();
+      await expect(submit).toBeDisabled();
+      await expect(submit).toContainText("Running");
+      await expect(dlg.getByTestId("launch-harness-picker-trigger")).toBeDisabled();
+    } finally {
+      release();
+    }
+    await expect(dlg).toBeHidden({ timeout: CONVERGE_TIMEOUT });
+    await page.unroute(tasksUrl);
+    const cardTitle = `Resolve conflicts: PR #${PR_NUMBER} — ${PR_TITLE}`;
+    let created: TaskRow | undefined;
+    await expect(async () => {
+      const rows = (await (await request.get(`${backend.apiBase}/tasks`, { headers: auth })).json()) as TaskRow[];
+      created = rows.find((t) => t.title === cardTitle && !before.has(t.id));
+      expect(created).toBeTruthy();
+    }).toPass({ timeout: CONVERGE_TIMEOUT });
+    createdTaskIds.push(created!.id);
+    expect(held).toBe(1);
+  });
+
   test("pipeline picker: Manage pipelines closes both dialogs, confirming a dirty draft first", async ({ page, backend }) => {
     test.setTimeout(90_000);
     await gotoApp(page, backend.bootBase);

@@ -69,3 +69,22 @@ export function placePopover(opts: {
   const top = side === "below" ? trigger.top + trigger.height + GAP : trigger.top - GAP - maxHeight;
   return { side, top: Math.max(VIEWPORT_MARGIN, top), left, width, maxHeight };
 }
+
+/**
+ * The height a popover panel needs for all of its content, measured while it
+ * may already be clamped. The panel's list is the part that scrolls, so a
+ * panel capped by an earlier `maxHeight` reports that cap as its own
+ * `scrollHeight`; re-measuring it after rows arrive would keep it at the old
+ * size forever. Adding back what the list hides (its content past its current
+ * box, itself limited to `maxListHeight`) gives the uncapped height. With
+ * nothing clipped this is exactly `panelScrollHeight`.
+ */
+export function naturalPopoverHeight(m: {
+  panelScrollHeight: number;
+  listClientHeight: number;
+  listScrollHeight: number;
+  maxListHeight: number;
+}): number {
+  const listNatural = Math.min(m.listScrollHeight, m.maxListHeight);
+  return m.panelScrollHeight + Math.max(0, listNatural - m.listClientHeight);
+}

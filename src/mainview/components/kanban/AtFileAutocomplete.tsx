@@ -115,6 +115,11 @@ export function AtFileAutocomplete({ entries, truncated, value, onChange, textar
     const el = textareaRef.current;
     if (!el) return;
     const sync = () => setCaret(el.selectionStart ?? 0);
+    // This picker mounts only once the prompt has a file scope, which can be
+    // after the user already typed an `@token` (a slow boot, or a project
+    // picked mid-draft). Read the caret now, or the popover would wait for the
+    // next key. Only for a focused field: a blurred one shows no popover.
+    if (el.ownerDocument.activeElement === el) sync();
     el.addEventListener("keyup", sync);
     el.addEventListener("click", sync);
     el.addEventListener("focus", sync);

@@ -1453,6 +1453,64 @@ test.describe("task from a Git issue", () => {
     await expect(settings.getByRole("button", { name: "Agents", exact: true })).toHaveAttribute("aria-current", "page");
   });
 
+  test("while Run task is in flight, the header Close and Cancel are disabled and dimmed; the created task closes the dialog", async ({
+    page,
+    request,
+    backend,
+  }) => {
+    test.setTimeout(90_000);
+    // Earlier tests in this serial file may still hold a task under the same card title.
+    const listTasks = async () =>
+      (await (
+        await request.get(`${backend.apiBase}/tasks`, { headers: { authorization: `Bearer ${backend.apiToken}` } })
+      ).json()) as Array<{ id: string; title: string; isolation: string }>;
+    const before = new Set((await listTasks()).map((t) => t.id));
+    await gotoApp(page, backend.bootBase);
+    const dlg = await openIssueTaskDialog(page);
+    // In place: no worktree to materialize, the busy state is all this test is about.
+    await dlg.getByTestId("worktree-options").getByTestId("isolate-toggle").uncheck();
+
+    // Hold the create request so the dialog stays in its busy state until the gate opens.
+    let release!: () => void;
+    const gate = new Promise<void>((r) => (release = r));
+    let held = 0;
+    const tasksUrl = (url: URL) => url.pathname === "/tasks";
+    await page.route(tasksUrl, async (route) => {
+      if (route.request().method() !== "POST") return route.continue();
+      held++;
+      await gate;
+      await route.continue();
+    });
+
+    const submit = dlg.getByTestId("issue-task-submit");
+    await expect(submit).toBeEnabled({ timeout: CONVERGE_TIMEOUT });
+    await submit.click();
+    // Release the held create even when an assertion below fails, so the route never hangs.
+    try {
+      await expect.poll(() => held, { timeout: CONVERGE_TIMEOUT }).toBe(1);
+
+      const close = dlg.getByRole("button", { name: "Close", exact: true });
+      await expect(close).toBeDisabled();
+      await expect(close).toHaveCSS("opacity", "0.5");
+      await expect(dlg.getByTestId("launch-cancel")).toBeDisabled();
+      await expect(submit).toBeDisabled();
+      await expect(submit).toContainText("Running");
+      await expect(dlg.getByTestId("launch-harness-picker-trigger")).toBeDisabled();
+    } finally {
+      release();
+    }
+    await expect(dlg).toBeHidden({ timeout: CONVERGE_TIMEOUT });
+    await page.unroute(tasksUrl);
+    let task: { id: string; isolation: string } | undefined;
+    await expect(async () => {
+      task = (await listTasks()).find((t) => t.title === CARD_TITLE && !before.has(t.id));
+      expect(task).toBeTruthy();
+    }).toPass({ timeout: CONVERGE_TIMEOUT });
+    expect(task!.isolation).toBe("none");
+    expect(held).toBe(1);
+    await deleteTask(request, backend, task!.id);
+  });
+
   test("the footer never asks for a prompt while the thread loads, and says so when the fetch fails", async ({ page, backend }) => {
     test.setTimeout(90_000);
     await gotoApp(page, backend.bootBase);
