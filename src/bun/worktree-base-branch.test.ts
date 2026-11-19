@@ -140,3 +140,18 @@ test("resolveBaseRefAndBranch: a named branch records it; a tag or sha keeps a n
   expect(await resolveBaseRefAndBranch(dir, tip)).toEqual({ sha: tip, baseBranch: null });
   expect(await resolveBaseRefAndBranch(dir, "does-not-exist")).toEqual({ sha: null, baseBranch: null });
 });
+
+test("resolveBaseRefAndBranch: HEAD on a branch that shares its name with a tag pins the branch, not the tag", async () => {
+  const dir = await makeRepo();
+  await git(["tag", "topic"], dir); // the tag stays on c1
+  await git(["checkout", "-q", "-b", "topic"], dir);
+  writeFileSync(path.join(dir, "f"), "2\n");
+  await git(["commit", "-q", "-am", "c2"], dir);
+  await git(["update-ref", "refs/remotes/origin/topic", "HEAD"], dir);
+  const branchTip = await git(["rev-parse", "refs/heads/topic"], dir);
+  expect(branchTip).not.toBe(await git(["rev-parse", "refs/tags/topic"], dir));
+  // `symbolic-ref --short` would answer `heads/topic` here.
+  expect(await git(["symbolic-ref", "--short", "HEAD"], dir)).toBe("heads/topic");
+  expect(await resolveBaseRefAndBranch(dir, "HEAD")).toEqual({ sha: branchTip, baseBranch: "topic" });
+  expect(await resolveBaseBranchName(dir, "HEAD")).toBe("topic");
+});

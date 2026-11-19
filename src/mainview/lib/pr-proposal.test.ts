@@ -600,6 +600,24 @@ describe("parsePrProposals", () => {
     ]);
   });
 
+  test("a proposal never inherits the link or base of a dropped proposal above it; its own link still wins", () => {
+    const orphan = [
+      "Base: develop",
+      "https://github.com/acme/app/compare/develop...a",
+      "PR title:",
+      "```",
+      "Orphan title",
+      "```",
+      "",
+    ];
+    const linkless = parsePrProposals([...orphan, block("Second", "second description")].join("\n"));
+    expect(linkless.map((p) => [p.title, p.link, p.baseLine])).toEqual([["Second", null, null]]);
+    const own = parsePrProposals(
+      [...orphan, "Base: main", "https://github.com/acme/app/compare/main...b", block("Second", "d")].join("\n"),
+    );
+    expect(own.map((p) => [p.title, p.link, p.baseLine])).toEqual([["Second", "https://github.com/acme/app/compare/main...b", "main"]]);
+  });
+
   test("a three-PR reply gives three proposals, each with its own link", () => {
     const ps = parsePrProposals(threePrReply());
     expect(ps.map((p) => p.title)).toEqual(["Add login", "Add login infra", "Docs for login"]);

@@ -206,8 +206,12 @@ function readTitleAndDescription(lines: string[], titleLabelIdx: number): RawPro
 function parsePrProposalsUnsafe(text: string): PrProposal[] {
   const lines = text.replace(/\r\n?/g, "\n").split("\n");
   const raws: RawProposal[] = [];
+  // Every `PR title:` label the walk reaches, kept or dropped: a dropped one
+  // still owns the link and base above it.
+  const titleIdxs: number[] = [];
   for (let i = 0; i < lines.length; i++) {
     if (!TITLE_LABEL_RE.test(lines[i] ?? "")) continue;
+    titleIdxs.push(i);
     const raw = readTitleAndDescription(lines, i);
     if (!raw) continue;
     raws.push(raw);
@@ -217,7 +221,10 @@ function parsePrProposalsUnsafe(text: string): PrProposal[] {
   const out: PrProposal[] = [];
   raws.forEach((raw, n) => {
     const prev = raws[n - 1];
-    const windowStart = prev ? prev.endIdx + 1 : 0;
+    const prevTitle = titleIdxs.filter((t) => t < raw.titleLabelIdx).at(-1);
+    // Back to the end of the previous kept proposal, and never past the
+    // previous title of any kind: a dropped proposal's link is not this one's.
+    const windowStart = Math.max(prev ? prev.endIdx + 1 : 0, prevTitle !== undefined ? prevTitle + 1 : 0);
     let link: string | null = null;
     let baseLine: string | null = null;
     for (let i = raw.titleLabelIdx - 1; i >= windowStart; i--) {

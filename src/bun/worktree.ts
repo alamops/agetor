@@ -656,10 +656,17 @@ export async function resolveRef(dir: string, ref: string): Promise<string | nul
  * branch can't be a PR base, and nothing here touches the network. A picked
  * branch that exists only locally is recorded and reported at PR time.
  */
-/** The branch HEAD points at (`symbolic-ref`), or null when detached or not a valid branch name. */
+/**
+ * The branch HEAD points at, or null when detached or not a valid branch name.
+ * Reads the FULL symbolic ref and strips exactly `refs/heads/`: `--short`
+ * answers `heads/<name>` when a tag shares the branch's name, which names no
+ * branch.
+ */
 async function checkedOutBranch(dir: string): Promise<string | null> {
-  const cur = await git(["symbolic-ref", "--quiet", "--short", "HEAD"], dir);
-  const name = cur.ok ? cur.stdout.trim() : "";
+  const cur = await git(["symbolic-ref", "--quiet", "HEAD"], dir);
+  const full = cur.ok ? cur.stdout.trim() : "";
+  if (!full.startsWith("refs/heads/")) return null;
+  const name = full.slice("refs/heads/".length);
   return name && validateBranchName(name).ok ? name : null;
 }
 

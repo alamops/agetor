@@ -166,7 +166,8 @@ export function ContextMenu({ open, x, y, items, onClose, label = "Context menu"
     // linger at the previous anchor. Compared by value, not array identity,
     // so an ordinary re-render of the same menu keeps its open child.
     const rootKey = `${x},${y}|${items.map((it) => (it.type === "separator" ? "-" : it.id)).join(",")}`;
-    if (rootKeyRef.current !== null && rootKeyRef.current !== rootKey) {
+    const replaced = rootKeyRef.current !== null && rootKeyRef.current !== rootKey;
+    if (replaced) {
       setSub(null);
       setSubPos(null);
       setSubIndex(-1);
@@ -190,7 +191,12 @@ export function ContextMenu({ open, x, y, items, onClose, label = "Context menu"
     // queued to the next microtask so it runs after this paint commits.
     queueMicrotask(() => {
       const first = moveMenuIndex(-1, 1, enabled);
-      if (first !== -1) setActiveIndex(first);
+      if (first === -1) return;
+      setActiveIndex(first);
+      // A replacement may leave `activeIndex` unchanged (the old menu's
+      // first item was active too), so the effect below won't re-run; focus
+      // directly, or focus stays on the removed child panel.
+      if (replaced) panelRef.current?.querySelector<HTMLElement>(`[data-menu-index="${first}"]`)?.focus();
     });
     // `items` is frozen for the lifetime of one open (App hands a stable
     // array identity that only changes when the menu (re)opens), so this

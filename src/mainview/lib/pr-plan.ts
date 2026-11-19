@@ -209,8 +209,13 @@ const sameName = (a: string, b: string) => a.toLowerCase() === b.toLowerCase();
  */
 function soleLinkMatch<R extends { identity?: RepoIdentity | null }>(matches: R[], link: PrLink): R | undefined {
   if (matches.length <= 1) return matches[0];
-  const exact = matches.filter((r) => r.identity?.remoteHost?.toLowerCase() === link.host);
+  const exact = hostMatches(matches, link);
   return exact.length === 1 ? exact[0] : undefined;
+}
+
+/** The repositories whose own remote host is the link's host. */
+function hostMatches<R extends { identity?: RepoIdentity | null }>(repos: R[], link: PrLink): R[] {
+  return repos.filter((r) => r.identity?.remoteHost?.toLowerCase() === link.host);
 }
 
 /**
@@ -242,14 +247,22 @@ export function attributeProposals(
 
     if (link) {
       const matches = repos.filter((r) => r.identity && linkMatchesRepo(link, r.identity));
-      repo = matches.find((r) => p.repositoryLabel && sameName(r.name, p.repositoryLabel)) ?? soleLinkMatch(matches, link);
+      // The link's own host naming exactly one of them beats a label naming
+      // another; the label only breaks a tie the link leaves open.
+      const byHost = matches.length > 1 ? hostMatches(matches, link) : [];
+      repo = byHost.length === 1
+        ? byHost[0]
+        : matches.find((r) => p.repositoryLabel && sameName(r.name, p.repositoryLabel)) ?? soleLinkMatch(matches, link);
       if (repo) head = link.head;
     }
     if (!repo && p.repositoryLabel) {
       const labeled = repos.find((r) => sameName(r.name, p.repositoryLabel!));
       // A link that names another repository (a known identity that doesn't match) disqualifies the label.
       const namesAnother = labeled && link && labeled.identity && !linkMatchesRepo(link, labeled.identity);
-      if (labeled && !namesAnother) {
+      // So does a link that isn't a PR-opening link at all (a PR page, a typo):
+      // only a proposal with no link takes the label's live head.
+      const unreadableLink = !!p.link && !link;
+      if (labeled && !namesAnother && !unreadableLink) {
         repo = labeled;
         // A parsed link decides the head, even when it names none (a fork's
         // `owner:branch`): only a proposal with no PR link takes the live head.

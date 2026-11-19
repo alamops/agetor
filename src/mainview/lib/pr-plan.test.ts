@@ -287,8 +287,23 @@ describe("attribution", () => {
     expect(attributeProposals(proposals(mr("gitlab.c.example")), [a, b], { multi: true }).size).toBe(0);
     const bare = (r: typeof a) => ({ ...r, identity: { host: r.identity.host, owner: r.identity.owner, name: r.identity.name } });
     expect(attributeProposals(proposals(mr("gitlab.b.example")), [bare(a), bare(b)], { multi: true }).size).toBe(0);
+    // The link's own host beats a label naming the other instance's repository;
+    // with no host to tell them apart, the label breaks the tie.
+    const labeledA = ["Repository: app", `https://gitlab.b.example/acme/app/-/merge_requests/new?merge_request[source_branch]=f`, block("T", "D")].join("\n");
+    const att = attributeProposals(proposals(labeledA), [a, b], { multi: true });
+    expect(att.get("app-2")?.get("f")?.title).toBe("T");
+    expect(att.get("app")).toBeUndefined();
+    const labeledC = ["Repository: app", `https://gitlab.c.example/acme/app/-/merge_requests/new?merge_request[source_branch]=f`, block("T", "D")].join("\n");
+    expect(attributeProposals(proposals(labeledC), [a, b], { multi: true }).get("app")?.get("f")?.title).toBe("T");
     // One repository with that identity still matches canonically (self-hosted or aliased).
     expect(attributeProposals(proposals(mr("gitlab.c.example")), [a], { multi: false }).get("app")?.get("f")?.title).toBe("T");
+  });
+
+  test("a labeled proposal whose link isn't a PR-opening link is never sent to the live head", () => {
+    const text = ["Repository: infra", "https://github.com/acme/infra/pull/12", block("T", "D")].join("\n");
+    expect(attributeProposals(proposals(text), [app, infra], { multi: true }).size).toBe(0);
+    const unknownInfra = { ...infra, identity: null };
+    expect(attributeProposals(proposals(text), [app, unknownInfra], { multi: true }).size).toBe(0);
   });
 
   test("a label with no link attributes to the live head", () => {
