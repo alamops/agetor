@@ -115,6 +115,7 @@ import type {
   Run,
   Task,
   TaskReference,
+  TaskRepository,
 } from "../shared/types.ts";
 import { CONTINUATION_STATUS_TEXT, PIPELINE_LIMITS } from "../shared/types.ts";
 
@@ -1049,6 +1050,11 @@ function noteParentWorktreeWarning(parentId: string, warning: string): void {
   else console.warn(`[agetor] pipeline task ${parentId}: ${warning}`);
 }
 
+/** A parent's repository entries for a step row: same metadata, no PR history. */
+function withoutPrs(repos: readonly TaskRepository[]): TaskRepository[] {
+  return repos.map((r) => ({ ...r, prs: [], prUrl: null }));
+}
+
 /** Copy the parent's current `branch`/`worktreePath`/`checkoutBranch` onto every step row
  *  still `active` in `run`, so each step's own `startTask` → `prepareWorkdir`
  *  reuse-check sees the up-to-date path instead of whatever it was inserted
@@ -1064,7 +1070,9 @@ function propagateWorktreeToActiveSteps(parent: Task, run: PipelineRunState): vo
     if (step && isMultiRepoTask(parent) && parent.repositories && parent.repositories.length > 0) {
       const stepNames = (step.repositories ?? []).map((r) => `${r.name}:${r.worktreePath}:${r.branch}`).join("|");
       const parentNames = parent.repositories.map((r) => `${r.name}:${r.worktreePath}:${r.branch}`).join("|");
-      if (stepNames !== parentNames) tasks.setRepositories(a.taskId, parent.repositories);
+      // Without the parent's PRs: `setRepositories` falls back to the incoming
+      // `prs` when the step has none yet, and the step's history is its own.
+      if (stepNames !== parentNames) tasks.setRepositories(a.taskId, withoutPrs(parent.repositories));
       // The step shares the parent's checkouts; mirror the parent's last-seen
       // values too (setRepositories alone keeps the step's older stored value).
       recordPreparedRepositoryCheckouts(a.taskId, parent.repositories);
@@ -1437,7 +1445,8 @@ async function launchStep(
     prs: [],
     // Step rows share the parent's workspace and repository set (D2/M6); the
     // parent owns teardown, so a step never tears a worktree down on its own.
-    repositories: parent.repositories ?? [],
+    // Like the scalar `prs`, each entry's PR history starts empty.
+    repositories: withoutPrs(parent.repositories ?? []),
     // A one-repository multi parent's step stays multi (it stores the entry).
     multiRepo: isMultiRepoTask(parent),
     issueRepoPath: parent.issueRepoPath ?? null,

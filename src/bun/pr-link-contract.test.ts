@@ -134,6 +134,10 @@ describe("the prompt's link templates read back through the parser", () => {
   test("an ssh-alias remote: the prompt asks for the web host, and a link built with it still attributes", () => {
     for (const prompt of Object.values(PROMPTS)) {
       expect(prompt).toContain("use the HostName that alias points to");
+      // An SSH-over-443 HostName is a transport endpoint, never the link's host.
+      expect(prompt).toContain("ssh.github.com means github.com");
+      expect(prompt).toContain("altssh.gitlab.com means gitlab.com");
+      expect(prompt).toContain("altssh.bitbucket.org means bitbucket.org");
     }
     // `ssh -G github-work.com` would report HostName github.com: the canonical host.
     const id = identityOf("git@github-work.com:acme/app.git");

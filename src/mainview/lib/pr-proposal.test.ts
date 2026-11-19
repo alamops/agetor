@@ -583,6 +583,23 @@ function threePrReply(): string {
 }
 
 describe("parsePrProposals", () => {
+  test("a title with no description of its own never takes the next proposal's; the next one stays whole", () => {
+    const text = [
+      "https://github.com/acme/app/compare/main...a",
+      "PR title:",
+      "```",
+      "Orphan title",
+      "```",
+      "",
+      "https://github.com/acme/app/compare/main...b",
+      block("Second", "second description"),
+    ].join("\n");
+    const ps = parsePrProposals(text);
+    expect(ps.map((p) => [p.title, p.description, p.link])).toEqual([
+      ["Second", "second description", "https://github.com/acme/app/compare/main...b"],
+    ]);
+  });
+
   test("a three-PR reply gives three proposals, each with its own link", () => {
     const ps = parsePrProposals(threePrReply());
     expect(ps.map((p) => p.title)).toEqual(["Add login", "Add login infra", "Docs for login"]);
@@ -682,6 +699,15 @@ describe("cleanBaseValue", () => {
     expect(cleanBaseValue("`feature/a_b`")).toBe("feature/a_b");
     expect(cleanBaseValue("**main**")).toBe("main");
     expect(cleanBaseValue("")).toBeNull();
+  });
+  test("a backtick-quoted name is read whole: an apostrophe inside is kept, prose after the closing backtick ignored", () => {
+    expect(cleanBaseValue("`fix/it's-done`")).toBe("fix/it's-done");
+    expect(cleanBaseValue("`release/1.2` (the branch it was cut from).")).toBe("release/1.2");
+    expect(cleanBaseValue("**`develop`** — not main")).toBe("develop");
+    expect(cleanBaseValue("`<branch>`")).toBeNull();
+    expect(cleanBaseValue("``")).toBeNull();
+    // Unquoted values keep the token rules.
+    expect(cleanBaseValue("main (the default).")).toBe("main");
   });
 });
 

@@ -3457,8 +3457,9 @@ export function startApiServer(
               if (task && task.archivedAt == null && result.item?.htmlUrl) {
                 const entry: TaskPr = {
                   url: result.item.htmlUrl,
-                  head: body.head,
-                  base: body.base,
+                  // The names the forge was sent (`create*Pull` trims them).
+                  head: body.head.trim(),
+                  base: body.base.trim(),
                   number: typeof result.item.number === "number" ? result.item.number : null,
                   createdAt: Date.now(),
                 };

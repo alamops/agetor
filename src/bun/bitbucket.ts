@@ -782,7 +782,7 @@ export async function createBitbucketPull(
   if (!res.ok) {
     const message = errorFrom(res, json, repo, !!creds);
     if (res.status === 400 && BITBUCKET_ALREADY_OPEN_RE.test(apiErrorMessage(json, res.status, res.statusText))) {
-      const existingUrl = await findOpenBitbucketPullUrl(repo, creds, head);
+      const existingUrl = await findOpenBitbucketPullUrl(repo, creds, head, base);
       return { ok: false, error: message, code: "already-exists", ...(existingUrl ? { existingUrl } : {}) };
     }
     return { ok: false, error: message };
@@ -800,13 +800,23 @@ export async function createBitbucketPull(
  */
 const BITBUCKET_ALREADY_OPEN_RE = /already (?:an )?open|only one pull request may be open|already exists/i;
 
-/** The open pull request whose source is `head`, by BBQL. Best effort. */
+/**
+ * The open pull request from this repository's `head` into `base`, by BBQL.
+ * Best effort. One head may have open PRs into several bases (or a fork's
+ * same-named branch may), so the query pins all three.
+ */
 async function findOpenBitbucketPullUrl(
   repo: ProviderRepoInfo,
   creds: BitbucketCreds | null,
   head: string,
+  base: string,
 ): Promise<string | null> {
-  const q = `source.branch.name="${escapeBBQLString(head)}" AND state="OPEN"`;
+  const q = [
+    `source.repository.full_name="${escapeBBQLString(`${repo.owner}/${repo.name}`)}"`,
+    `source.branch.name="${escapeBBQLString(head)}"`,
+    `destination.branch.name="${escapeBBQLString(base)}"`,
+    `state="OPEN"`,
+  ].join(" AND ");
   const res = await fetchBitbucket(
     `${repoBasePath(repo)}/pullrequests?pagelen=1&q=${encodeURIComponent(q)}`,
     creds,
@@ -857,11 +867,19 @@ export async function listBitbucketBranches(
       const b = normalizeBitbucketBranch(v);
       if (b) branches.push(b);
     }
-    next = sanitizeNextUrl((json as { next?: unknown } | null)?.next);
-    if (!next) return { ok: true, branches, truncated: false };
+    const rawNext = (json as { next?: unknown } | null)?.next;
+    next = sanitizeNextUrl(rawNext);
+    // A `next` link that is present but rejected (off-origin, malformed) means
+    // more branches exist that this walk won't fetch: the listing is
+    // incomplete, so report it truncated and let callers ask per name.
+    if (!next) return { ok: true, branches, truncated: rawNext != null && rawNext !== "" };
   }
   return { ok: true, branches, truncated: next !== null };
 }
+
+/** A 404 that is about the branch itself ("Branch zz not found", "No such
+ *  branch"), not a repository or access failure that merely mentions a branch. */
+const BITBUCKET_BRANCH_NOT_FOUND_RE = /^\s*branch\b.*\bnot found\b|\bno such branch\b/i;
 
 /**
  * `GET …/refs/branches/:name` (encoded per path segment). A 404 whose message
@@ -882,7 +900,7 @@ export async function getBitbucketBranch(
   if (!("status" in res)) return res;
   const json = await res.json().catch(() => null);
   if (res.ok) return { ok: true, branch: normalizeBitbucketBranch(json) };
-  if (res.status === 404 && /branch/i.test(apiErrorMessage(json, res.status, res.statusText))) {
+  if (res.status === 404 && BITBUCKET_BRANCH_NOT_FOUND_RE.test(apiErrorMessage(json, res.status, res.statusText))) {
     return { ok: true, branch: null };
   }
   return { ok: false, error: errorFrom(res, json, repo, !!creds) };

@@ -8,7 +8,7 @@ import { rmTestDataDir } from "./test-data-dir.ts";
 
 const DATA_DIR = mkdtempSync(path.join(tmpdir(), "agetor-base-branch-data-"));
 process.env.AGETOR_DATA_DIR = DATA_DIR;
-const { resolveBaseBranchName } = await import("./worktree.ts");
+const { resolveBaseBranchName, resolveBaseRefAndBranch } = await import("./worktree.ts");
 
 const dirs: string[] = [];
 afterAll(() => {
@@ -107,4 +107,36 @@ test("a non-git directory gives null", async () => {
   dirs.push(dir);
   expect(await resolveBaseBranchName(dir, "main")).toBeNull();
   expect(await resolveBaseBranchName(dir, "HEAD")).toBeNull();
+});
+
+// `resolveBaseRefAndBranch`: the pinned sha and the recorded name come from one
+// identity, so a checkout that changes mid-create can't mix them.
+test("resolveBaseRefAndBranch: HEAD on a pushed branch pins that branch's tip and records its name", async () => {
+  const dir = await makeRepo();
+  await git(["checkout", "-q", "-b", "topic"], dir);
+  writeFileSync(path.join(dir, "f"), "2\n");
+  await git(["commit", "-q", "-am", "c2"], dir);
+  await git(["update-ref", "refs/remotes/origin/topic", "HEAD"], dir);
+  const tip = await git(["rev-parse", "refs/heads/topic"], dir);
+  expect(await resolveBaseRefAndBranch(dir, "HEAD")).toEqual({ sha: tip, baseBranch: "topic" });
+});
+
+test("resolveBaseRefAndBranch: HEAD on a local-only branch or detached pins the commit with no name", async () => {
+  const dir = await makeRepo();
+  const tip = await git(["rev-parse", "HEAD"], dir);
+  expect(await resolveBaseRefAndBranch(dir, "HEAD")).toEqual({ sha: tip, baseBranch: null });
+  await git(["update-ref", "refs/remotes/origin/main", "HEAD"], dir);
+  await git(["checkout", "-q", "--detach"], dir);
+  expect(await resolveBaseRefAndBranch(dir, " HEAD ")).toEqual({ sha: tip, baseBranch: null });
+});
+
+test("resolveBaseRefAndBranch: a named branch records it; a tag or sha keeps a null name; a missing ref gives nulls", async () => {
+  const dir = await makeRepo();
+  const tip = await git(["rev-parse", "HEAD"], dir);
+  await git(["branch", "release/1.2"], dir);
+  await git(["tag", "v1"], dir);
+  expect(await resolveBaseRefAndBranch(dir, "release/1.2")).toEqual({ sha: tip, baseBranch: "release/1.2" });
+  expect(await resolveBaseRefAndBranch(dir, "v1")).toEqual({ sha: tip, baseBranch: null });
+  expect(await resolveBaseRefAndBranch(dir, tip)).toEqual({ sha: tip, baseBranch: null });
+  expect(await resolveBaseRefAndBranch(dir, "does-not-exist")).toEqual({ sha: null, baseBranch: null });
 });

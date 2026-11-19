@@ -202,12 +202,27 @@ export type Attribution = Map<string, Map<string, AttributedProposal>>;
 const sameName = (a: string, b: string) => a.toLowerCase() === b.toLowerCase();
 
 /**
+ * The repository a link names among its canonical matches. One match is it.
+ * Several (the same `owner/name` on two instances of one forge, which
+ * `canonicalGitHost` folds together) narrow to the one whose own remote host
+ * is the link's; still ambiguous gives none, never a guess.
+ */
+function soleLinkMatch<R extends { identity?: RepoIdentity | null }>(matches: R[], link: PrLink): R | undefined {
+  if (matches.length <= 1) return matches[0];
+  const exact = matches.filter((r) => r.identity?.remoteHost?.toLowerCase() === link.host);
+  return exact.length === 1 ? exact[0] : undefined;
+}
+
+/**
  * Assign each proposal to the (repository, head) it is for. A proposal belongs
  * to repository R and head H when either holds:
  *  - its link's host and full `owner/name` path equal R's forge identity and the
- *    link names head H (a fork head is never attributed); or
+ *    link names head H (a fork head is never attributed); when several
+ *    repositories share that identity, R is the one whose own remote host is
+ *    the link's, or none; or
  *  - its `Repository:` label equals R's workspace name and its link, if any,
- *    doesn't name another repository. H is then the link's head, else R's live head.
+ *    doesn't name another repository. H is then the parsed link's head (none
+ *    for a fork head), or R's live head when there is no PR link.
  * On a single-repository task an unlabeled proposal with no PR link at all goes
  * to the live head, as the single chip always did. Anything else is left
  * unattributed: agent text never picks a repository on a guess. The newest
@@ -227,7 +242,7 @@ export function attributeProposals(
 
     if (link) {
       const matches = repos.filter((r) => r.identity && linkMatchesRepo(link, r.identity));
-      repo = matches.find((r) => p.repositoryLabel && sameName(r.name, p.repositoryLabel)) ?? matches[0];
+      repo = matches.find((r) => p.repositoryLabel && sameName(r.name, p.repositoryLabel)) ?? soleLinkMatch(matches, link);
       if (repo) head = link.head;
     }
     if (!repo && p.repositoryLabel) {
@@ -236,10 +251,14 @@ export function attributeProposals(
       const namesAnother = labeled && link && labeled.identity && !linkMatchesRepo(link, labeled.identity);
       if (labeled && !namesAnother) {
         repo = labeled;
-        head = link?.head ?? labeled.liveHead;
+        // A parsed link decides the head, even when it names none (a fork's
+        // `owner:branch`): only a proposal with no PR link takes the live head.
+        head = link ? link.head : labeled.liveHead;
       }
     }
-    if (!repo && !opts.multi && repos.length === 1 && !p.repositoryLabel && !link) {
+    // "No PR link at all": a link that didn't parse (a PR page, a typo) is
+    // still a link naming something else, so it never falls back here.
+    if (!repo && !opts.multi && repos.length === 1 && !p.repositoryLabel && !p.link) {
       repo = repos[0];
       head = repo!.liveHead;
     }

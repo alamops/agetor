@@ -406,7 +406,7 @@ test("pull-create stamps only the matching multi-repository entry, appending eac
   expect(reread.prUrl).toBeNull();
 });
 
-test("pull-create stamps a single-repo task when the PR is opened from its worktree, and a repeated URL is recorded once", async () => {
+test("pull-create stamps a single-repo task when the PR is opened from its worktree with trimmed head/base, and a repeated URL is recorded once", async () => {
   const { tasks } = await import("./db.ts");
   const sourceDir = await makeGitHubRepo("o", "wt-src");
   const worktreeDir = await makeGitHubRepo("o", "wt-src");
@@ -420,7 +420,9 @@ test("pull-create stamps a single-repo task when the PR is opened from its workt
       const res = await realFetch(url("/github/pull-create"), {
         method: "POST",
         headers: { authorization: `Bearer ${token}`, "content-type": "application/json" },
-        body: JSON.stringify({ path: worktreeDir, title: "From worktree", head: "feature/wt", base: "develop", taskId: task.id }),
+        // Padded names: the record stores what the forge was sent (trimmed),
+        // so the live head `feature/wt` matches it.
+        body: JSON.stringify({ path: worktreeDir, title: "From worktree", head: " feature/wt ", base: "develop\n", taskId: task.id }),
       });
       expect(res.status).toBe(200);
     } finally {

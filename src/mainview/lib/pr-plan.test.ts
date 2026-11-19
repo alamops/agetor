@@ -258,6 +258,39 @@ describe("attribution", () => {
     expect(attributeProposals(proposals(other), [app], { multi: false }).size).toBe(0);
   });
 
+  test("a labeled proposal whose link names a fork head stays unattributed, never the live head", () => {
+    const text = ["Repository: app", "https://github.com/acme/app/compare/main...someone:feature", block("T", "D")].join("\n");
+    expect(attributeProposals(proposals(text), [app, infra], { multi: true }).size).toBe(0);
+    // The label path (identity not resolved, so the link can't match by host):
+    // a parsed link with no head still never falls back to the live head.
+    const unknown = { ...app, identity: null };
+    expect(attributeProposals(proposals(text), [unknown, infra], { multi: true }).size).toBe(0);
+    // With no link at all, the label does take the live head.
+    const linkless = ["Repository: app", block("T", "D")].join("\n");
+    expect(attributeProposals(proposals(linkless), [unknown, infra], { multi: true }).get("app")?.get("feature/login")?.title).toBe("T");
+  });
+
+  test("a single-repo proposal whose link doesn't parse as a PR link never falls back to the live head", () => {
+    const text = ["https://github.com/acme/app/pull/12", block("T", "D")].join("\n");
+    expect(attributeProposals(proposals(text), [app], { multi: false }).size).toBe(0);
+  });
+
+  test("the same owner/name on two instances of one forge: the link's own host picks the repository, else none", () => {
+    const a = { name: "app", liveHead: "f", identity: { host: "gitlab.com", owner: "acme", name: "app", remoteHost: "gitlab.a.example" } };
+    const b = { name: "app-2", liveHead: "f", identity: { host: "gitlab.com", owner: "acme", name: "app", remoteHost: "gitlab.b.example" } };
+    const mr = (host: string) =>
+      [`https://${host}/acme/app/-/merge_requests/new?merge_request[source_branch]=f`, block("T", "D")].join("\n");
+    const toB = attributeProposals(proposals(mr("gitlab.b.example")), [a, b], { multi: true });
+    expect(toB.get("app-2")?.get("f")?.title).toBe("T");
+    expect(toB.get("app")).toBeUndefined();
+    // A third instance, or identities with no remote host, is ambiguous: no guess.
+    expect(attributeProposals(proposals(mr("gitlab.c.example")), [a, b], { multi: true }).size).toBe(0);
+    const bare = (r: typeof a) => ({ ...r, identity: { host: r.identity.host, owner: r.identity.owner, name: r.identity.name } });
+    expect(attributeProposals(proposals(mr("gitlab.b.example")), [bare(a), bare(b)], { multi: true }).size).toBe(0);
+    // One repository with that identity still matches canonically (self-hosted or aliased).
+    expect(attributeProposals(proposals(mr("gitlab.c.example")), [a], { multi: false }).get("app")?.get("f")?.title).toBe("T");
+  });
+
   test("a label with no link attributes to the live head", () => {
     const text = ["Repository: infra", block("T", "D")].join("\n");
     const att = attributeProposals(proposals(text), [app, infra], { multi: true });

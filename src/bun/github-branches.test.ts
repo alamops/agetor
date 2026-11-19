@@ -128,7 +128,7 @@ test("createGitHubPull maps a duplicate-PR 422 to already-exists with the existi
     },
     {
       method: "GET",
-      match: "/repos/acme/widgets/pulls?head=acme%3Afeature%2Fa&state=open&per_page=1",
+      match: "/repos/acme/widgets/pulls?head=acme%3Afeature%2Fa&base=main&state=open&per_page=1",
       json: [{ html_url: "https://github.com/acme/widgets/pull/9" }],
     },
   ]);

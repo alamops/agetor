@@ -1116,6 +1116,100 @@ test("the single Create PR chip opens the composer on the task's base branch (S6
   }
 });
 
+test("Create all PRs: a batch still pending for one task never locks or finishes the plan opened for another (S8)", async ({
+  backend,
+  page,
+  request,
+}) => {
+  // RunPanel is one long-lived instance; the dialog inside it is keyed per task
+  // (`create-prs-dialog-<id>`), so a batch that outlives a task switch writes
+  // only to its own, unmounted instance. Task A's POST is held open, the
+  // dialog is opened on task B, and B's plan must stay editable and
+  // submittable and must not turn "finished" when A's batch ends. (Without the
+  // key, B's rows open locked.) The same task can't reopen mid-batch: its
+  // button is disabled while `isPrBatchRunning`.
+  test.setTimeout(150_000);
+  const auth = { authorization: `Bearer ${backend.apiToken}`, "content-type": "application/json" };
+  const titleA = "Pending batch task A e2e";
+  const titleB = "Reopened plan task B e2e";
+  const extraA = "e2e-gen-extra-a";
+  const extraB = "e2e-gen-extra-b";
+  const posted: PullRecord[] = [];
+  let releaseA: () => void = () => {};
+  const gateA = new Promise<void>((resolve) => {
+    releaseA = resolve;
+  });
+  let headA = "";
+  const routes = repoStubRoutes("frontend", posted, 81, { main: "a".repeat(40), [extraA]: "c".repeat(40), [extraB]: "d".repeat(40) });
+  const pullsPost = routes.find((r) => r.method === "POST")!;
+  const record = pullsPost.body as (req: StubRequest) => unknown;
+  // Task A's create waits for the gate; anything else answers at once.
+  pullsPost.body = async (req: StubRequest) => {
+    if ((req.body as PullRecord).head === headA) await gateA;
+    return record(req);
+  };
+  const stub = await startGitHubStub(backend.githubStubPort, routes);
+  const ids: string[] = [];
+  const bares: string[] = [];
+  try {
+    const link = (head: string) => `https://github.com/agetor-e2e/frontend/compare/main...${head}?quick_pull=1`;
+    const prompt = (extra: string, who: string) =>
+      proposalPrompt(
+        proposalBlock({ base: "main", link: link("{{branch}}"), title: `${who} live title`, body: `${who} body` }) +
+          proposalBlock({ base: "main", link: link(extra), title: `${who} extra title`, body: `${who} extra body` }),
+      );
+    const a = await createPushedSingleTask(request, backend, { title: titleA, prompt: prompt(extraA, "A") });
+    ids.push(a.taskId);
+    bares.push(a.bareDir);
+    headA = a.branch;
+    const b = await createPushedSingleTask(request, backend, { title: titleB, prompt: prompt(extraB, "B") });
+    ids.push(b.taskId);
+    bares.push(b.bareDir);
+    const repoName = uniqueRepoSlugs([repoA])[0]!;
+
+    // Start A's batch and leave its POST pending.
+    const dialogA = await openCreatePrsDialog(page, backend, titleA);
+    await expect(dialogA.getByTestId("create-prs-submit")).toContainText("Create 1 pull request");
+    await dialogA.getByTestId("create-prs-submit").click();
+    await expect(dialogA.getByTestId("create-prs-submit")).toContainText("Creating…");
+    await page.getByTestId("create-prs-close").click();
+    await expect(page.getByTestId("create-prs-dialog")).toBeHidden();
+
+    // Switch to B without closing the panel (see the repo-tab reset test) and open its plan.
+    await page.getByText(titleB, { exact: true }).first().dispatchEvent("click");
+    const buttonB = page.getByTestId("create-all-prs");
+    await expect(buttonB).toBeEnabled({ timeout: CONVERGE_TIMEOUT });
+    await buttonB.click();
+    const dialogB = page.getByTestId("create-prs-dialog");
+    await expect(page.getByTestId("create-prs-loading")).toBeHidden({ timeout: CONVERGE_TIMEOUT });
+    const liveB = rowSlug(repoName, b.branch);
+    await expect(dialogB.getByTestId(`create-prs-title-${liveB}`)).toHaveValue("B live title");
+    await expect(dialogB.getByTestId(`create-prs-title-${liveB}`)).toBeEnabled();
+    await expect(dialogB.getByTestId(`create-prs-check-${liveB}`)).toBeEnabled();
+    await expect(dialogB.getByTestId("create-prs-submit")).toBeEnabled();
+    await expect(dialogB.getByTestId("create-prs-submit")).toContainText("Create 1 pull request");
+
+    // A's batch ends while B's plan is open: B stays a fresh, submittable plan.
+    releaseA();
+    await expect.poll(() => posted.filter((p) => p.head === a.branch).length, { timeout: CONVERGE_TIMEOUT }).toBe(1);
+    await expect.poll(async () => (await getTaskRow(request, backend, a.taskId)).prs?.length ?? 0, { timeout: CONVERGE_TIMEOUT }).toBe(1);
+    await expect(dialogB.getByTestId("create-prs-submit")).toBeVisible();
+    await expect(dialogB.getByTestId("create-prs-submit")).toBeEnabled();
+    await expect(dialogB.getByTestId("create-prs-close")).toHaveText("Cancel");
+    await expect(dialogB.getByTestId(`create-prs-result-${liveB}`)).toHaveCount(0);
+
+    await dialogB.getByTestId("create-prs-submit").click();
+    await expect.poll(() => posted.filter((p) => p.head === b.branch).length, { timeout: CONVERGE_TIMEOUT }).toBe(1);
+    expect(posted.find((p) => p.head === b.branch)).toMatchObject({ title: "B live title", base: "main" });
+    await expect(dialogB.getByTestId("create-prs-close")).toHaveText("Close", { timeout: CONVERGE_TIMEOUT });
+  } finally {
+    releaseA();
+    for (const id of ids) await request.delete(`${backend.apiBase}/tasks/${id}`, { headers: auth }).catch(() => {});
+    await stub.close();
+    for (const dir of bares) await rm(dir, { recursive: true, force: true }).catch(() => {});
+  }
+});
+
 const FAKE_CLAUDE_HANDOFF_PROMPT_MARKER = "__agetor_fake_claude_handoff__";
 
 test("Create all PRs on a pipeline step task: a PR with no proposal takes the root task's title, not the step's (S7)", async ({

@@ -26,6 +26,17 @@ describe("parsePrLink — GitHub", () => {
     expect(l?.head).toBeNull();
     expect(l?.base).toBe("main");
   });
+  test("a compare whose branch name has a merge_requests segment stays a GitHub link", () => {
+    expect(parsePrLink("https://github.com/acme/app/compare/main...fix/merge_requests?quick_pull=1")).toMatchObject({
+      forge: "github", head: "fix/merge_requests", base: "main",
+    });
+    expect(parsePrLink("https://github.com/acme/app/compare/main...fix/merge_requests/new")).toMatchObject({
+      forge: "github", owner: "acme", repo: "app", head: "fix/merge_requests/new", base: "main",
+    });
+    expect(parsePrLink("https://github-work.com/acme/app/compare/merge_requests...feature")).toMatchObject({
+      forge: "github", head: "feature", base: "merge_requests",
+    });
+  });
   test("a PR page, a repo page and garbage are not PR links", () => {
     expect(parsePrLink("https://github.com/acme/app/pull/12")).toBeNull();
     expect(parsePrLink("https://github.com/acme/app")).toBeNull();

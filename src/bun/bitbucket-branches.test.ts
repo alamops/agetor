@@ -57,7 +57,7 @@ test("listBitbucketBranches follows the body's next link with pagelen=100", asyn
   }
 });
 
-test("listBitbucketBranches stops at maxPages and marks truncated; ignores an off-origin next", async () => {
+test("listBitbucketBranches stops at maxPages and marks truncated; never follows an off-origin next but reports the listing truncated", async () => {
   const next = "https://api.bitbucket.org/2.0/repositories/acme/app/refs/branches?pagelen=100&page=2";
   let mock = mockGitHubFetch([{ match: "refs/branches", json: { values: values(1, 2), next } }]);
   try {
@@ -71,7 +71,8 @@ test("listBitbucketBranches stops at maxPages and marks truncated; ignores an of
   ]);
   try {
     const res = await listBitbucketBranches(REPO);
-    expect(res.ok && res.truncated).toBe(false);
+    // Incomplete, not complete: pullTargets must fall back to a per-name lookup.
+    expect(res.ok && res.truncated).toBe(true);
     expect(mock.calls).toHaveLength(1);
   } finally {
     mock.restore();
@@ -103,6 +104,27 @@ test("getBitbucketBranch finds a branch, maps a branch 404 to null, errors on a 
   ]);
   try {
     expect((await getBitbucketBranch(REPO, "zz")).ok).toBe(false);
+  } finally {
+    mock.restore();
+  }
+  // A repository/access 404 that merely mentions a branch is still an error.
+  mock = mockGitHubFetch([
+    {
+      match: "refs/branches/zz",
+      status: 404,
+      json: { type: "error", error: { message: "You may not have access to this repository or its branches" } },
+    },
+  ]);
+  try {
+    expect((await getBitbucketBranch(REPO, "zz")).ok).toBe(false);
+  } finally {
+    mock.restore();
+  }
+  mock = mockGitHubFetch([
+    { match: "refs/branches/zz", status: 404, json: { type: "error", error: { message: "No such branch: zz" } } },
+  ]);
+  try {
+    expect(await getBitbucketBranch(REPO, "zz")).toEqual({ ok: true, branch: null });
   } finally {
     mock.restore();
   }
@@ -143,6 +165,14 @@ test("createBitbucketPull maps a duplicate-PR 400 to already-exists with the ope
     if (res.ok) return;
     expect(res.code).toBe("already-exists");
     expect(res.existingUrl).toBe("https://bitbucket.org/acme/app/pull-requests/4");
+    // The lookup pins this repository, the head and the base: one head may have
+    // open PRs into several bases.
+    const lookup = mock.calls.find((c) => c.method === "GET")!;
+    const q = new URL(lookup.url).searchParams.get("q");
+    expect(q).toContain(`source.repository.full_name="${REPO.owner}/${REPO.name}"`);
+    expect(q).toContain('source.branch.name="f"');
+    expect(q).toContain('destination.branch.name="main"');
+    expect(q).toContain('state="OPEN"');
   } finally {
     mock.restore();
   }

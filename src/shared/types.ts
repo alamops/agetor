@@ -6852,14 +6852,19 @@ function shellQuoteInner(s: string): string {
  * legacy `pull/new/<head>`. Names are URL-encoded; `<base>...<head>` is split on
  * the three dots (git forbids `..` in a ref name). The host may be an ssh alias
  * or its real web host: `linkMatchesRepo` canonicalizes both sides, so either
- * attributes, but only the web host opens when clicked in the transcript.
+ * attributes, but only the web host opens when clicked in the transcript. The
+ * forges' documented SSH-over-443 endpoints (`ssh.github.com`,
+ * `altssh.gitlab.com`, `altssh.bitbucket.org`) are named so the agent maps
+ * them to the web host instead of copying them from a HostName line.
  */
 const PR_LINK_FORMS =
   `For GitHub use https://<host>/<owner>/<repo>/compare/<base>...<head>?quick_pull=1; ` +
   `for GitLab use https://<host>/<namespace>/<project>/-/merge_requests/new?merge_request[source_branch]=<head>&merge_request[target_branch]=<base>; ` +
   `for Bitbucket use https://<host>/<workspace>/<repo>/pull-requests/new?source=<head>&dest=<base>. ` +
   `<host> is the forge's web host: when the remote uses an ssh host alias from ~/.ssh/config, ` +
-  `use the HostName that alias points to, so the link opens in a browser.`;
+  `use the HostName that alias points to, so the link opens in a browser. ` +
+  `A forge's SSH-only endpoint is not its web host: ssh.github.com means github.com, ` +
+  `altssh.gitlab.com means gitlab.com, and altssh.bitbucket.org means bitbucket.org.`;
 
 /**
  * A working directory the user has registered as a "project". Surfaced in the

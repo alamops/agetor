@@ -104,7 +104,14 @@ export function loadProviderIdentity(path: string): Promise<RepoIdentity | null>
 
 function sameIdentity(a: RepoIdentity | null, b: RepoIdentity | null): boolean {
   if (a === b) return true;
-  return a !== null && b !== null && a.host === b.host && a.owner === b.owner && a.name === b.name;
+  return (
+    a !== null &&
+    b !== null &&
+    a.host === b.host &&
+    a.owner === b.owner &&
+    a.name === b.name &&
+    a.remoteHost === b.remoteHost
+  );
 }
 
 /** Test seam: forget every entry and request. */

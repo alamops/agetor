@@ -81,6 +81,8 @@ export function ContextMenu({ open, x, y, items, onClose, label = "Context menu"
   const [subPos, setSubPos] = useState<{ top: number; left: number } | null>(null);
   const [subIndex, setSubIndex] = useState(-1);
   const subPanelRef = useRef<HTMLDivElement>(null);
+  /** The anchor + item ids the open root menu was laid out for (null while closed). */
+  const rootKeyRef = useRef<string | null>(null);
   const onCloseRef = useRef(onClose);
   onCloseRef.current = onClose;
 
@@ -154,7 +156,22 @@ export function ContextMenu({ open, x, y, items, onClose, label = "Context menu"
   }, [open]);
 
   useLayoutEffect(() => {
-    if (!open) return;
+    if (!open) {
+      rootKeyRef.current = null;
+      return;
+    }
+    // A new anchor or item set while the menu stays open (a right-click on
+    // another card closes and reopens it in one React batch, so `open` never
+    // goes false) replaces the root menu: drop the old child so it can't
+    // linger at the previous anchor. Compared by value, not array identity,
+    // so an ordinary re-render of the same menu keeps its open child.
+    const rootKey = `${x},${y}|${items.map((it) => (it.type === "separator" ? "-" : it.id)).join(",")}`;
+    if (rootKeyRef.current !== null && rootKeyRef.current !== rootKey) {
+      setSub(null);
+      setSubPos(null);
+      setSubIndex(-1);
+    }
+    rootKeyRef.current = rootKey;
     const panel = panelRef.current;
     if (!panel) return;
     const width = panel.offsetWidth;
@@ -360,7 +377,10 @@ export function ContextMenu({ open, x, y, items, onClose, label = "Context menu"
         // marker those handlers check, this is the belt-and-suspenders.
         e.preventDefault();
         e.stopPropagation();
-        onCloseRef.current();
+        // One level at a time: a child opened by hover leaves focus on its
+        // parent item, so this Escape closes that child first.
+        if (sub) closeSubmenu(true);
+        else onCloseRef.current();
         break;
       }
       case "Tab": {

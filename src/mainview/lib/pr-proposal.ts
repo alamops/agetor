@@ -140,6 +140,16 @@ export function cleanBaseValue(raw: string): string | null {
   let v = raw.trim();
   if (/^<[^>]*>$/.test(v)) return null;
   if (v.startsWith("__") && v.endsWith("__") && v.length > 4) v = v.slice(2, -2).trim();
+  // A backtick-quoted value is read whole first: everything between the
+  // matching backticks is the name (an apostrophe included), and prose after
+  // the closing one is ignored.
+  const quoted = /^(?:\*\*|__|\*|_)?\s*`([^`]*)`/.exec(v);
+  if (quoted) {
+    const inner = quoted[1]!.trim();
+    if (!inner || /^<[^>]*>$/.test(inner)) return null;
+    // A branch name has no whitespace: `main (the default)` inside the quotes still gives `main`.
+    return inner.split(/\s+/)[0]!;
+  }
   v = v.replace(/^[*`"'<\s]+/, "");
   const token = /^[^\s`*"'<>,;()]+/.exec(v)?.[0] ?? "";
   const cleaned = token.replace(/[.,;:]+$/, "");
@@ -181,6 +191,11 @@ function readTitleAndDescription(lines: string[], titleLabelIdx: number): RawPro
   if (!title) return null;
   const descLabelIdx = lines.findIndex((l, i) => i > titleFence.endIdx && DESC_LABEL_RE.test(l));
   if (descLabelIdx === -1) return null;
+  // A description belongs to the nearest title above it: when another
+  // `PR title:` comes first, this proposal has none and is dropped, leaving the
+  // next one (which the caller resumes at) whole.
+  const nextTitleIdx = lines.findIndex((l, i) => i > titleFence.endIdx && TITLE_LABEL_RE.test(l));
+  if (nextTitleIdx !== -1 && nextTitleIdx < descLabelIdx) return null;
   const descFence = findFenceAfter(lines, descLabelIdx + 1);
   if (!descFence) return null;
   const description = descFence.content.trim();

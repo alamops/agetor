@@ -289,7 +289,7 @@ import {
   detachWorktree,
   repoRoot,
   resolveRef,
-  resolveBaseBranchName,
+  resolveBaseRefAndBranch,
   branchName,
   ensureUniqueBranch,
   fetchBranch,
@@ -12574,7 +12574,7 @@ export async function createTask(
     const errors: string[] = [];
     for (const entry of keptRepositories) {
       const requested = requestedByPath.get(entry.path)?.trim() || defaultBaseRef || "HEAD";
-      const sha = await resolveRef(entry.path, requested);
+      const { sha, baseBranch: entryBaseBranch } = await resolveBaseRefAndBranch(entry.path, requested);
       if (!sha && requested !== "HEAD") {
         errors.push(`base ref "${requested}" not found in ${entry.name} (${entry.path})`);
         continue;
@@ -12582,7 +12582,7 @@ export async function createTask(
       repositories.push({
         ...entry,
         baseRef: sha ?? null,
-        baseBranch: sha ? await resolveBaseBranchName(entry.path, requested) : null,
+        baseBranch: entryBaseBranch,
         prs: [],
       });
     }
@@ -12634,14 +12634,14 @@ export async function createTask(
     plannedBranch = existingBranch;
     branchSource = "existing";
   } else if (workdirRoot) {
-    const sha = await resolveRef(workdir, requestedRef);
-    if (!sha) {
+    const resolved = await resolveBaseRefAndBranch(workdir, requestedRef);
+    if (!resolved.sha) {
       if (requestedRef !== "HEAD") {
         return { error: `base ref "${requestedRef}" not found in ${workdir}` };
       }
     } else {
-      baseRef = sha;
-      baseBranch = await resolveBaseBranchName(workdir, requestedRef);
+      baseRef = resolved.sha;
+      baseBranch = resolved.baseBranch;
     }
   }
 

@@ -1634,10 +1634,14 @@ function createErrorMessage(body: unknown, status: number, statusText: string): 
   return detail.length > 0 ? `${base}: ${detail.join("; ")}` : base;
 }
 
-/** The URL of the open pull request whose head is `head`, if GitHub says there is one. Best effort. */
-async function findOpenPullUrl(repo: GitHubRepo, token: string | null, head: string): Promise<string | null> {
+/**
+ * The URL of the open pull request from `head` into `base`, if GitHub says
+ * there is one. Best effort. `base` matters: one head may have open PRs into
+ * several bases, and the duplicate is the one this create targeted.
+ */
+async function findOpenPullUrl(repo: GitHubRepo, token: string | null, head: string, base: string): Promise<string | null> {
   const qualified = head.includes(":") ? head : `${repo.owner}:${head}`;
-  const url = `${GITHUB_API_BASE}/repos/${repo.owner}/${repo.name}/pulls?head=${encodeURIComponent(qualified)}&state=open&per_page=1`;
+  const url = `${GITHUB_API_BASE}/repos/${repo.owner}/${repo.name}/pulls?head=${encodeURIComponent(qualified)}&base=${encodeURIComponent(base)}&state=open&per_page=1`;
   const res = await fetchGitHub(url, token, "application/vnd.github+json");
   if (!("status" in res) || !res.ok) return null;
   const json = await res.json().catch(() => null);
@@ -1679,7 +1683,7 @@ export async function createGitHubPull(input: CreateGitHubPullInput): Promise<Gi
   const json = await res.json().catch(() => null);
   if (!res.ok) {
     if (res.status === 422 && validationMessages(json).some((m) => ALREADY_EXISTS_RE.test(m))) {
-      const existingUrl = await findOpenPullUrl(repo, token, head);
+      const existingUrl = await findOpenPullUrl(repo, token, head, base);
       return {
         ok: false,
         error: createErrorMessage(json, res.status, res.statusText),

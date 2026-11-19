@@ -53,8 +53,8 @@ function stripGit(name: string): string {
 
 function parseGitLab(host: string, segs: string[], params: URLSearchParams): PrLink | null {
   // `/<namespace…>/<project>/-/merge_requests/new` (the `-/` is absent on old instances).
-  const mrIdx = segs.indexOf("merge_requests");
-  if (mrIdx < 2 || segs[mrIdx + 1] !== "new" || segs.length !== mrIdx + 2) return null;
+  const mrIdx = segs.length - 2;
+  if (mrIdx < 2 || segs[mrIdx] !== "merge_requests" || segs[mrIdx + 1] !== "new") return null;
   const projectSegs = segs.slice(0, segs[mrIdx - 1] === "-" ? mrIdx - 1 : mrIdx);
   if (projectSegs.length < 2) return null;
   const repo = stripGit(projectSegs[projectSegs.length - 1]!);
@@ -122,7 +122,17 @@ export function parsePrLink(url: string): PrLink | null {
     const host = u.hostname.toLowerCase();
     const segs = splitPath(u.pathname);
     if (!segs) return null;
-    if (segs.includes("merge_requests")) return parseGitLab(host, segs, u.searchParams);
+    // GitLab only by its terminal `merge_requests/new` route, never on a GitHub
+    // host: a GitHub compare whose branch name has a `merge_requests` segment
+    // stays a GitHub link.
+    if (
+      canonicalGitHost(host) !== "github.com" &&
+      segs.length >= 4 &&
+      segs[segs.length - 2] === "merge_requests" &&
+      segs[segs.length - 1] === "new"
+    ) {
+      return parseGitLab(host, segs, u.searchParams);
+    }
     if (segs[2] === "pull-requests") return parseBitbucket(host, segs, u.searchParams);
     return parseGitHub(host, segs);
   } catch {
@@ -132,9 +142,14 @@ export function parsePrLink(url: string): PrLink | null {
 
 /** The provider identity of a repository, as `providerRepoForDir` reports it. */
 export interface RepoIdentity {
+  /** Canonical host (`gitlab.com` for any GitLab instance). */
   host: string;
   owner: string;
   name: string;
+  /** The remote's own host before canonicalization (`gitlab.a.example`, or an
+   *  ssh alias). Tells apart repositories on two instances of one forge, which
+   *  the canonical host folds together. */
+  remoteHost?: string;
 }
 
 function fullPath(owner: string, name: string): string {

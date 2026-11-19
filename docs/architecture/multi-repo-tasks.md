@@ -313,7 +313,14 @@ workspace root **and** every repository checkout to exist.
   ([run-panel.md](run-panel.md) has the in-flight rules); `Closes #N` goes only
   on the `issueRepoPath` repository's live-head PR. A forge's "already exists"
   answer reaches the webview as `{ error, code: "already-exists", existingUrl? }`
-  and shows as "already open" (it is not stamped onto the task).
+  and shows as "already open" (it is not stamped onto the task). `existingUrl`
+  is looked up for the same head **and base** (GitHub `?head=&base=`, Bitbucket
+  BBQL on source repository, source branch and destination branch; GitLab reads
+  the MR id from its own error), since one head may have open PRs into several
+  bases. The stored `head`/`base` are the trimmed names the forge was sent.
+  A step row starts with no PRs of its own, per repository too (each copied
+  entry's `prs` is emptied), and a later sync of the parent's entries never
+  copies the parent's PRs in.
 - A PR opened from a pipeline step's panel is stamped on the **step** row only
   (single and multi alike; `body.taskId` names the step). The parent card does
   not show it, and the parent's "Create all PRs" still counts that repository
@@ -351,7 +358,11 @@ the one git prints on push always targets the default branch:
 The prompt asks for the forge's web host: when the remote uses an ssh host alias
 from `~/.ssh/config`, the agent uses the HostName it points to, so the link opens
 from the transcript. Either host attributes, since `linkMatchesRepo` canonicalizes
-both sides with `canonicalGitHost` (`src/shared/git-host.ts`).
+both sides with `canonicalGitHost` (`src/shared/git-host.ts`). The prompt also
+names the forges' SSH-over-443 endpoints (`ssh.github.com`, `altssh.gitlab.com`,
+`altssh.bitbucket.org`) as transport hosts that map to the web host. A GitLab
+link is recognized only by its terminal `merge_requests/new` path on a
+non-GitHub host, so a GitHub branch named `…/merge_requests` stays a GitHub link.
 
 The parser also reads GitHub's `compare/<head>` and the legacy `pull/new/<head>`.
 Names are percent-decoded; a fork head (`owner:branch`) is never attributed. The
@@ -361,21 +372,30 @@ escape clause "unless you moved the work onto a different base".
 **Parsing** (`parsePrProposals`): every complete proposal in a reply, each with
 the link and `Base:` line nearest above its own title (searched back only to the
 end of the previous proposal, so one never inherits a sibling's) and the most
-recent `Repository:` label above it. `collectRunProposals` orders them across
-runs.
+recent `Repository:` label above it. A title whose description label comes only
+after the next `PR title:` has no description: it is dropped and the next
+proposal parses whole. A backtick-quoted `Base:` value is read whole between
+its backticks (an apostrophe included; prose after it ignored).
+`collectRunProposals` orders them across runs.
 
 **Attribution** (`attributeProposals`): a proposal belongs to repository R and
 head H when its link's host and full `owner/name` path equal R's forge identity
 (`providerRemoteForDir`; GitLab nested groups compare as one slash-joined path, and both hosts go through `canonicalGitHost` from `src/shared/git-host.ts`, since provider-info reports the canonical host while a self-hosted or ssh-aliased link carries the real one)
 and the link names H, or its `Repository:` label equals R's workspace name and
-its link, if any, doesn't name another repository (H is then the link's head,
-else R's live head). On a single-repo task an unlabeled proposal with no PR link
-goes to the live head. Anything else is unattributed: there is no blind
+its link, if any, doesn't name another repository (H is then the parsed link's
+head, none for a fork head, or R's live head when there is no PR link). When
+several repositories share one canonical identity (the same `owner/name` on two
+instances of a forge), the one whose own remote host (`RepoIdentity.remoteHost`,
+from provider-info) is the link's host wins; still ambiguous, the proposal is
+unattributed. On a single-repo task an unlabeled proposal with no PR link at all
+(not even one that fails to parse) goes to the live head. Anything else is unattributed: there is no blind
 "one proposal, one target" fallback. The newest proposal per (R, H) wins.
 
 **Base** (`chooseBase`, the only place it is decided): a live-head PR targets
 the base stored at task creation (`Task.baseBranch` / `repositories[].baseBranch`,
-resolved by `resolveBaseBranchName` beside the pinned `baseRef` sha) unless git
+resolved with the pinned `baseRef` sha by `resolveBaseRefAndBranch`, which reads
+a `HEAD` base's checked-out branch once and takes both the sha and the name from
+it) unless git
 proves it stale, then the agent's `Base:` line (else its link's base), then the
 remote default (`<remote>/HEAD`, else the forge's default branch, never a guessed
 `main`). An extra head never uses the stored base. A base missing on the remote

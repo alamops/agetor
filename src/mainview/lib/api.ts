@@ -2488,5 +2488,5 @@ export const api = {
 // a module cache (`provider-info-cache.ts`); this is its one network source.
 setProviderInfoFetcher(async (path) => {
   const info = await api.getProviderInfo(path);
-  return { host: info.host, owner: info.owner, name: info.name };
+  return { host: info.host, owner: info.owner, name: info.name, remoteHost: info.remoteHost };
 });
