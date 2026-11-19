@@ -340,6 +340,12 @@ export function useTaskLaunch(
   // pending-seed effect re-runs on it, because the catalog can land BEFORE the
   // preferences do.
   const [prefsLoaded, setPrefsLoaded] = useState(false);
+  // Bumped every time a self-fetching dialog re-seeds the per-kind cache from the
+  // remembered picks (i.e. on EVERY open). `prefsLoaded` stays true across opens and
+  // the catalog ids rarely change, so without it the pending-seed effect below would
+  // not re-run on a second open and the remembered model/effort would be replaced
+  // by the kind's default (and then overwritten by `rememberPicks` on Run).
+  const [seedGeneration, setSeedGeneration] = useState(0);
   const prefsRef = useRef<Record<string, string | undefined>>({});
   const defaultHarnessApplied = useRef(false);
 
@@ -523,6 +529,7 @@ export function useTaskLaunch(
         setAgent(nextAgent);
         applyPicks(seeded.cache[nextKind]);
         setPrefsLoaded(true);
+        setSeedGeneration((g) => g + 1);
       })
       .catch((e) => {
         if (!cancelled) setLoadError(e instanceof Error ? e.message : String(e));
@@ -587,7 +594,7 @@ export function useTaskLaunch(
     pickCache.current[kind] = { ...pickCache.current[kind], model: out.model };
     if (out.model !== model) setModel(out.model);
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [kind, modelsKey, prefsLoaded]);
+  }, [kind, modelsKey, prefsLoaded, seedGeneration]);
 
   useEffect(() => {
     if (efforts.length === 0) {

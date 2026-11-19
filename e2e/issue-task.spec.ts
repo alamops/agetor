@@ -1,13 +1,14 @@
 import { execFileSync } from "node:child_process";
-import { existsSync } from "node:fs";
+import { existsSync, mkdirSync } from "node:fs";
 import { mkdir, mkdtemp, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
 import { test, expect, type APIRequestContext, type E2EBackend, type Locator, type Page } from "./fixtures";
-import { dialogBranchPicker, gotoApp, openSelectProjects, selectBaseBranch } from "./helpers";
+import { dialogBranchPicker, gotoApp, openSelectProjects, putPreference, selectBaseBranch } from "./helpers";
 import { startGitHubStub, type GitHubStub, type StubRoute } from "./github-stub";
-import { pickHarness } from "./launch-helpers";
+import { expectEffort, expectHarness, expectModel, pickHarness } from "./launch-helpers";
+import { plantFakeCodexAppServer, writeFakeCodexCatalog, type FakeCodexModel } from "../src/bun/test-codex-app-server.ts";
 
 /**
  * E2E coverage for "task from a Git issue + its comment thread" via the
@@ -1476,5 +1477,75 @@ test.describe("task from a Git issue", () => {
     await expect(dialog).toBeHidden({ timeout: CONVERGE_TIMEOUT });
     const task = await awaitCreatedTask(request, backend, CARD_TITLE);
     expect(task.column).not.toBe("backlog");
+  });
+});
+
+// ---- Remembered picks survive a dialog re-open (self-fetch seeding) ------------------------------
+//
+// `useTaskLaunch` in self-fetch mode (the issue / PR / Clone dialogs are mounted while closed)
+// re-seeds the per-kind pick cache from the remembered preferences on EVERY open. A codex
+// remembered model is a *pending* seed (the catalog must vouch for it), applied by an effect that
+// must therefore re-run per open: with `prefsLoaded` already true and the catalog ids unchanged,
+// a second open used to fall back to the kind's default model and effort.
+
+const CODEX_CATALOG_DEFAULT = "gpt-6.1-sol";
+const CODEX_CLI_ONLY = "gpt-7-e2e";
+const CODEX_CATALOG: FakeCodexModel[] = [
+  { id: CODEX_CLI_ONLY, displayName: "GPT-7 E2E", efforts: ["low", "high"], defaultEffort: "low" },
+  { id: CODEX_CATALOG_DEFAULT, displayName: "GPT-6.1 Sol", efforts: ["low", "medium", "high"], defaultEffort: "medium" },
+];
+const CODEX_STUB_DIR = path.join("/tmp", `agetor-e2e-issue-codex-${process.pid}`);
+const CODEX_STUB_BIN = (() => {
+  mkdirSync(CODEX_STUB_DIR, { recursive: true });
+  const catalogFile = path.join(CODEX_STUB_DIR, "model-list.json");
+  writeFakeCodexCatalog(catalogFile, CODEX_CATALOG);
+  return plantFakeCodexAppServer({ pages: [], dir: CODEX_STUB_DIR, version: "codex-cli 0.166.0", catalogFile });
+})();
+
+test.describe("task from a Git issue: remembered picks across re-opens", () => {
+  test.use({ backendEnv: { AGETOR_CODEX_BIN: CODEX_STUB_BIN } });
+
+  test("a second open of the issue dialog keeps the remembered codex model and effort", async ({ page, request, freshBackend }) => {
+    test.setTimeout(120_000);
+    const headers = { authorization: `Bearer ${freshBackend.apiToken}`, "content-type": "application/json" };
+    const freshStub = await startGitHubStub(freshBackend.githubStubPort, issueRoutes());
+    try {
+      await registerProject(freshBackend.apiBase, freshBackend.apiToken, projectDir);
+      const enabled = await request.patch(`${freshBackend.apiBase}/harnesses/codex`, { headers, data: { enabled: true } });
+      expect(enabled.ok(), await enabled.text()).toBeTruthy();
+      await expect
+        .poll(
+          async () => {
+            const res = await request.get(`${freshBackend.apiBase}/agent-models/harnesses`, { headers });
+            const body = (await res.json()) as { byHarness: Record<string, { id: string }[]> };
+            return (body.byHarness.codex ?? []).map((m) => m.id);
+          },
+          { timeout: 20_000, message: "the core never loaded the codex stub's model list" },
+        )
+        .toContain(CODEX_CLI_ONLY);
+      await putPreference(request, freshBackend, "defaultHarness", "codex");
+      await putPreference(request, freshBackend, "lastModel:codex", CODEX_CLI_ONLY);
+      await putPreference(request, freshBackend, "lastEffort:codex", "high");
+
+      await gotoApp(page, freshBackend.bootBase);
+      const dialog = await openIssueTaskDialog(page);
+      await expectHarness(dialog, "Codex");
+      await expectModel(dialog, CODEX_CLI_ONLY);
+      await expectEffort(dialog, "high");
+
+      // Close the launch dialog only (the Git dialog and its issue detail stay), then open it again
+      // WITHOUT reloading: the picks are re-seeded from the remembered preferences.
+      await page.keyboard.press("Escape");
+      await expect(dialog).toBeHidden();
+      await page.getByTestId("issue-work-with-agetor").click();
+      const reopened = page.getByTestId("issue-task-dialog");
+      await expect(reopened).toBeVisible({ timeout: CONVERGE_TIMEOUT });
+      await expect(reopened.getByTestId("prompt-textarea")).toBeVisible({ timeout: CONVERGE_TIMEOUT });
+      await expectHarness(reopened, "Codex");
+      await expectModel(reopened, CODEX_CLI_ONLY);
+      await expectEffort(reopened, "high");
+    } finally {
+      await freshStub.close();
+    }
   });
 });
