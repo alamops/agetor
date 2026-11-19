@@ -1,4 +1,5 @@
 import type {
+  ForgeBranch,
   GitHubCheckRun,
   GitHubChecksResult,
   GitHubComment,
@@ -88,6 +89,10 @@ function gitlabApiBase(repo: ProviderRepoInfo): string {
 export interface GitLabError {
   ok: false;
   error: string;
+  /** Set by the merge-request create call when GitLab says one is already open. */
+  code?: "already-exists";
+  /** The open merge request's URL, built from the iid GitLab names. */
+  existingUrl?: string;
 }
 
 type GitLabListResponse = ({ ok: true } & GitHubListResult) | GitLabError;
@@ -666,10 +671,100 @@ export async function createGitLabPull(repo: ProviderRepoInfo, input: CreateGitL
   });
   if (!("status" in res)) return res;
   const json = await res.json().catch(() => null);
-  if (!res.ok) return { ok: false, error: errorFrom(res, json, repo, !!token) };
+  if (!res.ok) {
+    const message = errorFrom(res, json, repo, !!token);
+    if (res.status === 409 && /already exists/i.test(message)) {
+      // "Another open merge request already exists for this source branch: !12"
+      const iid = /!(\d+)/.exec(message)?.[1];
+      return {
+        ok: false,
+        error: message,
+        code: "already-exists",
+        ...(iid ? { existingUrl: `https://${gitlabHost(repo)}/${repo.owner}/${repo.name}/-/merge_requests/${iid}` } : {}),
+      };
+    }
+    return { ok: false, error: message };
+  }
   const item = normalizeItem("pulls", json);
   if (!item) return { ok: false, error: "GitLab returned an unexpected merge request response" };
   return { ok: true, item, message: "Merge request created." };
+}
+
+/** Branch names a pull-target listing carries (10 pages of 100). */
+const GITLAB_BRANCH_LIST_MAX_PAGES = 10;
+
+function normalizeGitLabBranch(raw: unknown): ForgeBranch | null {
+  if (!raw || typeof raw !== "object") return null;
+  const o = raw as { name?: unknown; commit?: unknown };
+  if (typeof o.name !== "string" || !o.name) return null;
+  const sha = o.commit && typeof o.commit === "object" ? (o.commit as { id?: unknown }).id : null;
+  return { name: o.name, sha: typeof sha === "string" && sha ? sha : null };
+}
+
+/** `GET /projects/:id/repository/branches` (`per_page=100&page=N`), capped at `maxPages`. */
+export async function listGitLabBranches(
+  repo: ProviderRepoInfo,
+  opts: { maxPages?: number } = {},
+): Promise<{ ok: true; branches: ForgeBranch[]; truncated: boolean } | GitLabError> {
+  const token = await gitlabToken(repo.remoteHost);
+  const projectId = encodeProjectId(repo.owner, repo.name);
+  const maxPages = Math.max(1, Math.min(opts.maxPages ?? GITLAB_BRANCH_LIST_MAX_PAGES, 20));
+  const branches: ForgeBranch[] = [];
+  for (let page = 1; page <= maxPages; page++) {
+    const res = await fetchGitLab(
+      `${gitlabApiBase(repo)}/projects/${projectId}/repository/branches?per_page=100&page=${page}`,
+      token,
+    );
+    if (!("status" in res)) return res;
+    const json = await res.json().catch(() => null);
+    if (!res.ok) return { ok: false, error: errorFrom(res, json, repo, !!token) };
+    const rows = Array.isArray(json) ? json : [];
+    for (const r of rows) {
+      const b = normalizeGitLabBranch(r);
+      if (b) branches.push(b);
+    }
+    if (rows.length < 100) return { ok: true, branches, truncated: false };
+  }
+  return { ok: true, branches, truncated: true };
+}
+
+/**
+ * `GET /projects/:id/repository/branches/:name` with the whole name URL-encoded
+ * (`release%2F1.2`). A 404 whose message says "Branch Not Found" is a missing
+ * branch (`branch: null`); a plain "404 Project Not Found" stays an error.
+ */
+export async function getGitLabBranch(
+  repo: ProviderRepoInfo,
+  name: string,
+): Promise<{ ok: true; branch: ForgeBranch | null } | GitLabError> {
+  const trimmed = name.trim();
+  if (!trimmed) return { ok: false, error: "branch name required" };
+  const token = await gitlabToken(repo.remoteHost);
+  const projectId = encodeProjectId(repo.owner, repo.name);
+  const res = await fetchGitLab(
+    `${gitlabApiBase(repo)}/projects/${projectId}/repository/branches/${encodeURIComponent(trimmed)}`,
+    token,
+  );
+  if (!("status" in res)) return res;
+  const json = await res.json().catch(() => null);
+  if (res.ok) return { ok: true, branch: normalizeGitLabBranch(json) };
+  const message = apiError(json, res.status, res.statusText);
+  if (res.status === 404 && /branch/i.test(message)) return { ok: true, branch: null };
+  return { ok: false, error: authHint(res.status, message, repo, !!token) };
+}
+
+/** `GET /projects/:id` → `default_branch`, with no guessed fallback. */
+export async function getGitLabDefaultBranch(
+  repo: ProviderRepoInfo,
+): Promise<{ ok: true; name: string } | GitLabError> {
+  const token = await gitlabToken(repo.remoteHost);
+  const res = await fetchGitLab(`${gitlabApiBase(repo)}/projects/${encodeProjectId(repo.owner, repo.name)}`, token);
+  if (!("status" in res)) return res;
+  const json = await res.json().catch(() => null);
+  if (!res.ok) return { ok: false, error: errorFrom(res, json, repo, !!token) };
+  const name = json && typeof json === "object" ? (json as { default_branch?: unknown }).default_branch : null;
+  if (typeof name !== "string" || !name) return { ok: false, error: "GitLab did not report a default branch" };
+  return { ok: true, name };
 }
 
 /** Matches `getGitHubPullDiff`'s `GitHubDiffResponse` shape, including the 8MB

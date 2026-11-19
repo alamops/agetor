@@ -76,6 +76,8 @@ export async function resolveRepositorySet(
     baseRef: null,
     checkoutBranch: null,
     prUrl: null,
+    prs: [],
+    baseBranch: null,
   }));
   if (errors.length > 0) return { ok: false, errors, repositories };
   return {

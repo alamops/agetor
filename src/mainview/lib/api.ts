@@ -50,6 +50,7 @@ import type {
   GitHubPullCommit,
   GitHubPullCommitsResult,
   GitHubPullDefaultsResult,
+  PullTargetsResult,
   GitHubPullLineComment,
   GitHubPullMergeability,
   GitHubPullMergeMethod,
@@ -121,6 +122,7 @@ import { ApiTransitError, fetchWithRecovery } from "./net-retry.ts";
 import { configureCoreBusy, suspendCoreBusy, trackRequest } from "./core-busy.ts";
 import { opencodeSkipBody } from "./opencode-interactions.ts";
 import { openEventStream } from "./sse-fetch.ts";
+import { setProviderInfoFetcher } from "./provider-info-cache.ts";
 
 export interface UpdateSnapshot {
   status: UpdateStatus;
@@ -1203,6 +1205,26 @@ export const api = {
     const q = new URLSearchParams({ path: input.path });
     return j<GitHubPullDefaultsResult>(`/github/pull-defaults?${q.toString()}`);
   },
+  // Create-all-PRs facts for one repository: its forge identity, remotes,
+  // default branch, remote branch list, whether each `heads` entry exists on
+  // the remote, and whether the task's stored base is stale (docs/architecture/multi-repo-tasks.md).
+  getPullTargets: (input: {
+    path: string;
+    heads: string[];
+    storedBase?: string | null;
+    storedBaseSha?: string | null;
+    liveHead?: string | null;
+    /** `false` skips the forge branch listing (existence is then looked up by name). */
+    listBranches?: boolean;
+  }) => {
+    const q = new URLSearchParams({ path: input.path });
+    for (const head of input.heads) q.append("head", head);
+    if (input.listBranches === false) q.set("branches", "none");
+    if (input.storedBase) q.set("storedBase", input.storedBase);
+    if (input.storedBaseSha) q.set("storedBaseSha", input.storedBaseSha);
+    if (input.liveHead) q.set("liveHead", input.liveHead);
+    return j<PullTargetsResult & { ok: true }>(`/github/pull-targets?${q.toString()}`);
+  },
   // `kind` ("pulls"|"issues") lets GitLab/Bitbucket route to the right
   // notes/comments endpoint (their APIs split MR/PR comments from issue
   // comments, unlike GitHub's single endpoint) — see git-host.ts's
@@ -1431,14 +1453,18 @@ export const api = {
     body?: string;
     draft?: boolean;
     reviewers?: string[];
-    /** When set, the server persists the created PR's URL onto this task
-     *  (`tasks.pr_url`) atomically with creation — see `Task.prUrl`. */
+    /** When set, the server appends the created PR to this task's `prs`
+     *  atomically with creation — see `Task.prs`. */
     taskId?: string;
   }) =>
+    // `retry: false`: creating a PR is not idempotent, so a dropped response
+    // must never re-send it. A forge's "already exists" answer arrives as an
+    // `ApiError` whose `body` carries `code: "already-exists"` and, when the
+    // forge's own lookup found it, `existingUrl` (read by `alreadyOpenOf`).
     j<{ ok: true; message?: string; item: GitHubListResult["items"][number] }>("/github/pull-create", {
       method: "POST",
       body: JSON.stringify(input),
-    }),
+    }, { retry: false }),
   createGitHubIssue: (input: {
     path: string;
     title: string;
@@ -2458,3 +2484,10 @@ export const api = {
     );
   },
 };
+
+// The Create-all-PRs button gate reads each repository's forge identity through
+// a module cache (`provider-info-cache.ts`); this is its one network source.
+setProviderInfoFetcher(async (path) => {
+  const info = await api.getProviderInfo(path);
+  return { host: info.host, owner: info.owner, name: info.name, remoteHost: info.remoteHost };
+});

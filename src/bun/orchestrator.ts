@@ -292,6 +292,7 @@ import {
   detachWorktree,
   repoRoot,
   resolveRef,
+  resolveBaseRefAndBranch,
   branchName,
   ensureUniqueBranch,
   fetchBranch,
@@ -12594,6 +12595,10 @@ export async function createTask(
   const workdirRoot = isolation === "worktree" ? await repoRoot(branchScopeDir) : null;
 
   let baseRef: string | null = null;
+  // The branch NAME `baseRef` was resolved from (`Task.baseBranch`), so Create
+  // all PRs can target it. Null for a tag/sha pick, isolation `none`,
+  // `existingBranch`, or a non-git directory.
+  let baseBranch: string | null = null;
   let plannedBranch: string | null = null;
   let branchSource: Task["branchSource"] = "created";
   let repositories: TaskRepository[] = [];
@@ -12611,12 +12616,17 @@ export async function createTask(
     const errors: string[] = [];
     for (const entry of keptRepositories) {
       const requested = requestedByPath.get(entry.path)?.trim() || defaultBaseRef || "HEAD";
-      const sha = await resolveRef(entry.path, requested);
+      const { sha, baseBranch: entryBaseBranch } = await resolveBaseRefAndBranch(entry.path, requested);
       if (!sha && requested !== "HEAD") {
         errors.push(`base ref "${requested}" not found in ${entry.name} (${entry.path})`);
         continue;
       }
-      repositories.push({ ...entry, baseRef: sha ?? null });
+      repositories.push({
+        ...entry,
+        baseRef: sha ?? null,
+        baseBranch: entryBaseBranch,
+        prs: [],
+      });
     }
     if (errors.length > 0) return { error: errors.join("\n") };
   } else if (existingBranch) {
@@ -12666,13 +12676,14 @@ export async function createTask(
     plannedBranch = existingBranch;
     branchSource = "existing";
   } else if (workdirRoot) {
-    const sha = await resolveRef(workdir, requestedRef);
-    if (!sha) {
+    const resolved = await resolveBaseRefAndBranch(workdir, requestedRef);
+    if (!resolved.sha) {
       if (requestedRef !== "HEAD") {
         return { error: `base ref "${requestedRef}" not found in ${workdir}` };
       }
     } else {
-      baseRef = sha;
+      baseRef = resolved.sha;
+      baseBranch = resolved.baseBranch;
     }
   }
 
@@ -12981,8 +12992,10 @@ export async function createTask(
     branchSource: multiRepo ? "created" : branchSource,
     worktreePath: null,
     baseRef: multiRepo ? null : baseRef,
-    // No PR exists for a brand-new task; set server-side by pull-create.
+    baseBranch: multiRepo ? null : baseBranch,
+    // No PR exists for a brand-new task; `prs` is appended server-side by pull-create.
     prUrl: null,
+    prs: [],
     issueUrl: validatedIssueUrl,
     issueRepoPath: multiRepo ? issueRepoPath : null,
     repositories: multiRepo ? repositories : [],

@@ -13,7 +13,8 @@ import { normalizeDeliveredUserText, type CleanRetryRow } from "../shared/user-m
 import { isSpeed, speedFromFast } from "../shared/speed.ts";
 import { OPENCODE_SERVER_INPUT_ERROR } from "../shared/opencode.ts";
 import { isMultiRepoTask, repositoriesForTask } from "../shared/multi-repo.ts";
-import type { TaskRepository } from "../shared/types.ts";
+import { appendTaskPr, firstPrUrl, legacyTaskPrs, parseTaskPrs } from "../shared/task-prs.ts";
+import type { TaskPr, TaskRepository } from "../shared/types.ts";
 import { AGENT_PROFILE_LIMITS, normalizeSkillName } from "../shared/agent-profile.ts";
 import { PIPELINE_CONTROL_CHAR_RE, validatePipelineGraph } from "../shared/pipeline.ts";
 import { decideForwardResume, type ForwardResumeSnapshotReason } from "./event-resume.ts";
@@ -91,7 +92,15 @@ type TaskRow = {
   task_type: string;
   branch: string | null; worktree_path: string | null; base_ref: string | null;
   branch_source: string;
+  // Retired by migration 092: still read by the migration's backfill and kept
+  // for a downgrade, but no longer written or read by agetor (`prs` replaced it).
   pr_url: string | null;
+  // Migration 092: the branch NAME `base_ref` was resolved from at create time
+  // (written only by `tasks.insert`), and the PRs opened for the task's branch
+  // as `TaskPr[]` JSON (written only by `tasks.appendPr`). Both are skipped by
+  // the generic `update` SET clause and never bump `updated_at`.
+  base_branch: string | null;
+  prs: string;
   issue_url: string | null;
   mode: string | null; model: string | null; effort: string | null;
   // Speed tier (migration 072, which dropped the old cursor-only `fast`
@@ -1033,19 +1042,44 @@ const parseTaskRepositories = (raw: unknown): TaskRepository[] => {
     const o = entry as Record<string, unknown>;
     if (typeof o.path !== "string" || o.path.length === 0) continue;
     if (typeof o.name !== "string" || o.name.length === 0) continue;
+    const branch = typeof o.branch === "string" ? o.branch : null;
+    const checkoutBranch = typeof o.checkoutBranch === "string" ? o.checkoutBranch : null;
+    // An entry written before migration 092 carries a single `prUrl`: convert
+    // it on read (the head is the last-seen checkout, else the branch; the base
+    // and number were never recorded). A stored `prs` always wins.
+    const prs = Array.isArray(o.prs)
+      ? parseTaskPrs(o.prs)
+      : legacyTaskPrs(typeof o.prUrl === "string" ? o.prUrl : null, checkoutBranch ?? branch);
     out.push({
       path: o.path,
       name: o.name,
-      branch: typeof o.branch === "string" ? o.branch : null,
+      branch,
       branchSource: o.branchSource === "existing" ? "existing" : "created",
       worktreePath: typeof o.worktreePath === "string" ? o.worktreePath : null,
       baseRef: typeof o.baseRef === "string" ? o.baseRef : null,
-      checkoutBranch: typeof o.checkoutBranch === "string" ? o.checkoutBranch : null,
-      prUrl: typeof o.prUrl === "string" ? o.prUrl : null,
+      checkoutBranch,
+      prUrl: firstPrUrl(prs),
+      prs,
+      baseBranch: typeof o.baseBranch === "string" ? o.baseBranch : null,
     });
   }
   return out;
 };
+
+/**
+ * The JSON a `tasks.repositories` write stores. The deprecated derived `prUrl`
+ * is dropped (it is recomputed from `prs` on every read), so the column holds
+ * one source of truth per entry.
+ */
+const serializeRepositories = (repos: readonly TaskRepository[]): string =>
+  JSON.stringify(
+    repos.map(({ prUrl, ...rest }) => ({
+      ...rest,
+      // A caller still holding the older shape (a `prUrl` and no `prs`) keeps
+      // its PR: it is converted here, exactly as the read path would.
+      prs: rest.prs ?? legacyTaskPrs(prUrl, rest.checkoutBranch ?? rest.branch),
+    })),
+  );
 
 /**
  * The one-entry repository array a single-repository row derives, through the
@@ -1062,7 +1096,8 @@ const derivedRepositories = (r: TaskRow): TaskRepository[] =>
     worktreePath: r.worktree_path,
     baseRef: r.base_ref,
     checkoutBranch: r.checkout_branch ?? null,
-    prUrl: r.pr_url,
+    prs: parseTaskPrs(r.prs),
+    baseBranch: r.base_branch ?? null,
     repositories: [],
   });
 
@@ -1090,11 +1125,12 @@ function writeRepositoryCheckout(
     changed = true;
     return { ...r, checkoutBranch: value };
   });
-  if (changed) db.run(`UPDATE tasks SET repositories = ? WHERE id = ?`, [JSON.stringify(next), taskId]);
+  if (changed) db.run(`UPDATE tasks SET repositories = ? WHERE id = ?`, [serializeRepositories(next), taskId]);
 }
 
 const toTask = (r: TaskRow, counts?: TaskCounts): Task => {
   const storedRepositories = parseTaskRepositories(r.repositories);
+  const prs = parseTaskPrs(r.prs);
   return {
   id: r.id,
   title: r.title,
@@ -1108,7 +1144,12 @@ const toTask = (r: TaskRow, counts?: TaskCounts): Task => {
   branchSource: r.branch_source as Task["branchSource"],
   worktreePath: r.worktree_path,
   baseRef: r.base_ref,
-  prUrl: r.pr_url,
+  // Deprecated and derived from `prs` (the older single field), so older
+  // clients keep working. Null for a multi-repository task, whose PRs live on
+  // `repositories[].prs` and whose task-level list stays empty.
+  prUrl: firstPrUrl(prs),
+  prs,
+  baseBranch: r.base_branch ?? null,
   issueUrl: r.issue_url,
   mode: r.mode,
   model: r.model,
@@ -1315,18 +1356,23 @@ export const tasks = {
     db.run(
       `INSERT INTO tasks
          (id, title, prompt, "column", agent, workdir, isolation, task_type,
-          branch, branch_source, worktree_path, base_ref, pr_url, issue_url, mode, model, effort, speed, max_mode, opencode_server, refs, backlog, draft, plans, todo_progress,
+          branch, branch_source, worktree_path, base_ref, base_branch, prs, issue_url, mode, model, effort, speed, max_mode, opencode_server, refs, backlog, draft, plans, todo_progress,
           agent_profile_id, agent_profile,
           pipeline_id, pipeline_run, pipeline_parent_id, pipeline_step_id,
           checkout_branch,
           repositories, issue_repo_path,
           last_assistant_event_id, last_seen_event_id,
           run_id, created_at, updated_at, archived_at)
-       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
       [
         t.id, t.title, t.prompt, t.column, t.agent, t.workdir, t.isolation,
         t.taskType,
-        t.branch, t.branchSource, t.worktreePath, t.baseRef, t.prUrl ?? null, t.issueUrl ?? null, t.mode, t.model, t.effort, t.speed, t.maxMode ? 1 : 0,
+        t.branch, t.branchSource, t.worktreePath, t.baseRef,
+        // `pr_url` is retired (migration 092) and stays NULL on new rows.
+        t.baseBranch ?? null,
+        // A caller still on the older shape (a `prUrl`, no `prs`) keeps its PR.
+        JSON.stringify(t.prs ?? legacyTaskPrs(t.prUrl, t.checkoutBranch ?? t.branch, t.updatedAt)),
+        t.issueUrl ?? null, t.mode, t.model, t.effort, t.speed, t.maxMode ? 1 : 0,
         readOpencodeServer(t.opencodeServer),
         JSON.stringify(t.references ?? []),
         JSON.stringify(t.backlog ?? []),
@@ -1344,7 +1390,7 @@ export const tasks = {
         // `toTask` derives the one entry from the scalar columns above. A
         // pipeline step copying a one-repository multi parent passes
         // `multiRepo: true`, so it stores its one entry and stays multi.
-        JSON.stringify(isMultiRepoTask(t) && t.repositories && t.repositories.length > 0 ? t.repositories : []),
+        isMultiRepoTask(t) && t.repositories && t.repositories.length > 0 ? serializeRepositories(t.repositories) : "[]",
         t.issueRepoPath ?? null,
         // A brand-new task has never had an assistant event or a mark-seen
         // — both start NULL, which `toTask` reads as `unread: false`.
@@ -1416,6 +1462,12 @@ export const tasks = {
     // join the same skip list on the same rationale: both are written only
     // by `tasks.setImportedOpencode` below. `opencode_server` (also 078) is
     // NOT skipped — it is an ordinary patchable launch field like `speed`.
+    // `base_branch` and `prs` (migration 092) join the same skip list: the
+    // first is written only by `tasks.insert` and never changes, the second
+    // only by `tasks.appendPr`'s targeted UPDATE. `pr_url` is retired: the
+    // column stays for a downgrade but nothing writes it any more. A generic
+    // PATCH must never drop a recorded PR, and none of these writes bump
+    // `updated_at`.
     // `harness_state` (migration 084) joins the same skip list: it is written
     // only by `tasks.setHarnessState` below (and the failover engine through
     // it). A generic PATCH must never clobber a pending swap, the retry
@@ -1424,13 +1476,13 @@ export const tasks = {
     db.run(
       `UPDATE tasks SET
          title=?, prompt=?, "column"=?, agent=?, workdir=?, isolation=?, task_type=?,
-         branch=?, branch_source=?, worktree_path=?, base_ref=?, pr_url=?, issue_url=?, mode=?, model=?, effort=?, speed=?, max_mode=?, opencode_server=?, refs=?, backlog=?, draft=?, plans=?, todo_progress=?,
+         branch=?, branch_source=?, worktree_path=?, base_ref=?, issue_url=?, mode=?, model=?, effort=?, speed=?, max_mode=?, opencode_server=?, refs=?, backlog=?, draft=?, plans=?, todo_progress=?,
          run_id=?, updated_at=?, archived_at=?
        WHERE id=?`,
       [
         next.title, next.prompt, next.column, next.agent, next.workdir, next.isolation,
         next.taskType,
-        next.branch, next.branchSource, next.worktreePath, next.baseRef, next.prUrl ?? null, next.issueUrl ?? null, next.mode, next.model, next.effort, next.speed, next.maxMode ? 1 : 0,
+        next.branch, next.branchSource, next.worktreePath, next.baseRef, next.issueUrl ?? null, next.mode, next.model, next.effort, next.speed, next.maxMode ? 1 : 0,
         readOpencodeServer(next.opencodeServer),
         JSON.stringify(next.references ?? []),
         JSON.stringify(next.backlog ?? []),
@@ -1781,11 +1833,12 @@ export const tasks = {
    *
    * The caller's array is a *snapshot* taken before one or more awaits
    * (`prepareTaskWorkdir` can take seconds), so it must not clobber fields
-   * another writer stamped meanwhile. `prUrl` (first-write-wins, stamped by
-   * `setRepositoryPrUrl`) and `checkoutBranch` (last-seen drift, written by
-   * the dedicated `setRepositoryCheckout` compare-then-write at every refresh
-   * point) are therefore merged from the CURRENT row: a stored value wins, and
-   * the incoming value is only used when nothing is stored yet (first
+   * another writer stamped meanwhile. `prs` (append-only, stamped by
+   * `appendRepositoryPr`), `baseBranch` (written at creation) and
+   * `checkoutBranch` (last-seen drift, written by the dedicated
+   * `setRepositoryCheckout` compare-then-write at every refresh point) are
+   * therefore merged from the CURRENT row: a stored value wins, and the
+   * incoming value is only used when nothing is stored yet (first
    * materialization). Callers that genuinely observed a new checkout record it
    * through `setRepositoryCheckout` after this call.
    */
@@ -1802,36 +1855,55 @@ export const tasks = {
     const merged = stored.map((r) => {
       const prev = byName.get(r.name);
       if (!prev) return r;
+      const prs = prev.prs && prev.prs.length > 0 ? prev.prs : (r.prs ?? []);
       return {
         ...r,
-        prUrl: prev.prUrl ?? r.prUrl,
+        prs,
+        prUrl: firstPrUrl(prs),
+        baseBranch: prev.baseBranch ?? r.baseBranch ?? null,
         checkoutBranch: prev.checkoutBranch ?? r.checkoutBranch,
       };
     });
-    db.run(`UPDATE tasks SET repositories = ? WHERE id = ?`, [JSON.stringify(merged), taskId]);
+    db.run(`UPDATE tasks SET repositories = ? WHERE id = ?`, [serializeRepositories(merged), taskId]);
     return this.get(taskId);
   },
   /**
-   * Stamp one multi-repository task's entry with the PR URL opened for it.
-   * First write wins: an entry that already has a `prUrl` is never
-   * overwritten, so a second "Create PR" click can't lose the durable link.
-   * `selector` matches by workspace name, selected path or worktree path.
-   * No-op (returns the current row) for a single-repository task — its
-   * `prUrl` scalar is written by the ordinary path. Never bumps `updated_at`.
+   * Append one pull request to a single-repository task's `prs`, deduped by URL
+   * (a repeated stamp is a no-op). No-op (returns the current row) for a
+   * multi-repository task, whose PRs live on `repositories[].prs`
+   * (`appendRepositoryPr`). The read-modify-write has no await between the get
+   * and the UPDATE, so two concurrent stamps serialize on the JS turn. Never
+   * bumps `updated_at`: server-managed (docs/architecture/persistence.md).
    */
-  setRepositoryPrUrl(taskId: string, selector: string, prUrl: string): Task | null {
+  appendPr(taskId: string, entry: TaskPr): Task | null {
+    const cur = this.get(taskId);
+    if (!cur) return null;
+    if (cur.multiRepo) return cur;
+    const prs = appendTaskPr(cur.prs ?? [], entry);
+    if (prs.length === (cur.prs ?? []).length) return cur;
+    db.run(`UPDATE tasks SET prs = ? WHERE id = ?`, [JSON.stringify(prs), taskId]);
+    return this.get(taskId) ?? cur;
+  },
+  /**
+   * Append one pull request to a multi-repository task's entry, deduped by URL.
+   * `selector` matches by workspace name, selected path or worktree path.
+   * No-op (returns the current row) for a single-repository task or an unknown
+   * selector. Never bumps `updated_at`.
+   */
+  appendRepositoryPr(taskId: string, selector: string, entry: TaskPr): Task | null {
     const cur = this.get(taskId);
     if (!cur) return null;
     if (!cur.multiRepo) return cur;
-    const repos = cur.repositories ?? [];
     let changed = false;
-    const next = repos.map((r) => {
+    const next = (cur.repositories ?? []).map((r) => {
       const matches = r.name === selector || r.path === selector || r.worktreePath === selector;
-      if (!matches || r.prUrl) return r;
+      if (!matches) return r;
+      const prs = appendTaskPr(r.prs ?? [], entry);
+      if (prs.length === (r.prs ?? []).length) return r;
       changed = true;
-      return { ...r, prUrl };
+      return { ...r, prs, prUrl: firstPrUrl(prs) };
     });
-    if (changed) db.run(`UPDATE tasks SET repositories = ? WHERE id = ?`, [JSON.stringify(next), taskId]);
+    if (changed) db.run(`UPDATE tasks SET repositories = ? WHERE id = ?`, [serializeRepositories(next), taskId]);
     return this.get(taskId) ?? cur;
   },
   /**

@@ -2437,6 +2437,44 @@ function emitFakeFxToolMetaTurn(
 export const FAKE_CLAUDE_MD_IMAGE_PROMPT_MARKER = "__agetor_fake_claude_md_image__";
 
 /**
+ * Test hook for Create all PRs (`docs/architecture/run-panel.md`): makes the
+ * fake claude driver print ONE assistant reply that proposes pull requests, so
+ * the e2e suite can assert the title, body and base each POST carries. Used as
+ * `__agetor_fake_claude_pr_proposal__:<base64url template>` in the task prompt.
+ * The template is the reply text with two placeholders resolved from the task
+ * row at spawn time (the branch names are minted per task, so a spec can't know
+ * them up front): `{{branch}}` is the task's branch and `{{branch:<repo>}}` the
+ * branch of the multi-repo entry named `<repo>`. A placeholder with no match is
+ * left verbatim. Malformed base64 (or an empty template) emits a `status` line,
+ * `fake pr proposal: bad template`, then completes. Turn 1 only, like every
+ * canned scenario here. Same prompt-marker trick as
+ * {@link FAKE_CLAUDE_MD_IMAGE_PROMPT_MARKER}: the e2e backend is worker-shared,
+ * so a per-test env var isn't possible. `e2e/multi-repo-task.spec.ts` can't
+ * import from `src/bun/*` and keeps a **literal copy** of this string.
+ */
+export const FAKE_CLAUDE_PR_PROPOSAL_PROMPT_MARKER = "__agetor_fake_claude_pr_proposal__";
+
+/**
+ * The reply text a {@link FAKE_CLAUDE_PR_PROPOSAL_PROMPT_MARKER} prompt asks
+ * for, with its branch placeholders resolved from the task row, or `null` when
+ * the template is missing or isn't valid base64url UTF-8. Exported for tests.
+ */
+export function renderFakePrProposalReply(taskId: string, prompt: string): string | null {
+  const m = new RegExp(`${FAKE_CLAUDE_PR_PROPOSAL_PROMPT_MARKER}:([A-Za-z0-9_-]+)`).exec(prompt);
+  if (!m) return null;
+  const encoded = m[1]!;
+  const template = Buffer.from(encoded, "base64url").toString("utf8");
+  // Buffer's base64url decoder is lenient; a lossless round trip proves it was valid.
+  if (!template || Buffer.from(template, "utf8").toString("base64url") !== encoded.replace(/=+$/, "")) return null;
+  const task = tasks.get(taskId);
+  return template.replace(/\{\{branch(?::([^}]+))?\}\}/g, (whole, repo: string | undefined) => {
+    if (repo === undefined) return task?.branch ?? whole;
+    const entry = task?.repositories?.find((r) => r.name === repo);
+    return entry?.branch ?? whole;
+  });
+}
+
+/**
  * Test hook for the Claude Code context-compaction rendering work
  * (`docs/plans/claude-code-placeholder.md`): makes the fake claude driver emit
  * the sequence the real JSONL mapper produces for a compaction — a `status`
@@ -2836,7 +2874,12 @@ function makeFakeAgent(
     const subagentSpec = turn <= 1 ? parseFakeSubagentMarker(handoffPromptSource) : null;
     const baseResolveDelayMs = Math.max(20, Number(process.env.AGETOR_FAKE_CLAUDE_RESOLVE_DELAY_MS ?? 30) || 30);
     const resolveDelayMs = subagentSpec ? Math.max(baseResolveDelayMs, subagentSpec.runMs + 60) : baseResolveDelayMs;
+    // A `FAKE_CLAUDE_PR_PROPOSAL_PROMPT_MARKER` in the same source prompt
+    // (turn 1 only) prints its PR proposal ahead of the handoff, so a
+    // pipeline step can propose PRs the way a real Commit & push step does.
+    const prProposalReply = turn <= 1 ? renderFakePrProposalReply(taskId, handoffPromptSource) : null;
     after(5, () => onChunk("status", "fake: working"));
+    if (prProposalReply !== null) after(6, () => onChunk("assistant", prProposalReply));
     if (subagentSpec) {
       // Keyed on the RUN (same reasoning as the Monitor scenario's id):
       // `insertIfAbsent` is INSERT OR IGNORE, so a task-keyed id would
@@ -3364,6 +3407,19 @@ function makeFakeAgent(
         "assistant",
         `Here are the screenshots.\n\n![Absolute shot](${mdImageDir}/shot.png)\n\n![Relative shot](agetor-md-images/shot.png)\n\n![Missing shot](${mdImageDir}/missing.png)\n\n![The report](${mdImageDir}/report.pdf)`,
       );
+    });
+    after(10, () => {
+      onChunk("status", "turn complete");
+      resolveDone(0);
+    });
+  } else if (prompt.includes(FAKE_CLAUDE_PR_PROPOSAL_PROMPT_MARKER)) {
+    // Test hook: see FAKE_CLAUDE_PR_PROPOSAL_PROMPT_MARKER's doc comment. The
+    // reply goes out as one `assistant` chunk: proposals are read from the
+    // assistant stream only, and the generic fake turn prints on stdout.
+    const reply = renderFakePrProposalReply(taskId, prompt);
+    after(5, () => {
+      if (reply === null) onChunk("status", "fake pr proposal: bad template");
+      else onChunk("assistant", reply);
     });
     after(10, () => {
       onChunk("status", "turn complete");

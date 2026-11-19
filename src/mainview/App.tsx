@@ -34,7 +34,7 @@ import { clampFontSizePercent, COLUMNS, USAGE_SUPPORTED_KINDS, type AgentStatus,
 import { parseIssueUrl } from "../shared/issue-task.ts";
 import { AgentIcon } from "@/components/kanban/AgentIcon";
 import { Column } from "@/components/kanban/Column";
-import { ContextMenu, type ContextMenuItem } from "@/components/ui/context-menu";
+import { ContextMenu, type ContextMenuItem, type ContextMenuLeafItem } from "@/components/ui/context-menu";
 import { DiffDialog } from "@/components/kanban/DiffDialog";
 import { GitHubDialog, type GitHubItemDetailPrefill, type GitHubPullPrefill } from "@/components/kanban/GitHubDialog";
 import { UsageMeter } from "@/components/usage/UsageMeter";
@@ -79,10 +79,11 @@ import { publishPipelineGlobalEvent } from "@/lib/pipeline-events";
 import { parseThemePreference } from "@/lib/theme";
 import { parsePullNumber } from "@/lib/pr-url";
 import { hasTextSelection, keepsNativeContextMenu } from "@/lib/context-menu";
-import { buildTaskContextMenu, type TaskMenuAction, type TaskMenuGroup } from "@/lib/task-context-menu";
+import { buildTaskContextMenu, type TaskMenuAction, type TaskMenuEntry, type TaskMenuGroup } from "@/lib/task-context-menu";
 import { issueProjectPath, taskProjectPath } from "@/lib/repo-selection";
 import { multiRepoDeleteFallback, openFolderUnavailableReason, taskSearchText } from "@/lib/multi-repo-ui";
 import { isMultiRepoTask } from "../shared/multi-repo.ts";
+import { taskPrsOf } from "../shared/task-prs.ts";
 import { cn } from "@/lib/utils";
 import { autoEnabledToastText, opencodeSessionsFoundText } from "@/lib/import-sessions";
 import { ONBOARDING_DISMISSED_PREF, deriveOnboardingSteps, resolveOnboardingVisibility } from "@/lib/onboarding";
@@ -2444,7 +2445,7 @@ function AppInner() {
   // (`view-pr` / `copy-*`) read the field from the SNAPSHOT the entry was
   // gated on, falling back to the live task — the live value can't be
   // trusted to still be set, and a `!` would only hide that.
-const runTaskMenuAction = useCallback((action: TaskMenuAction, snapshot: Task, repoName?: string) => {
+const runTaskMenuAction = useCallback((action: TaskMenuAction, snapshot: Task, repoName?: string, entryPrUrl?: string) => {
     const t = tasksRef.current.find((x) => x.id === snapshot.id) ?? snapshot;
     switch (action) {
       case "open":
@@ -2494,7 +2495,9 @@ const runTaskMenuAction = useCallback((action: TaskMenuAction, snapshot: Task, r
         // Field-derived entries were gated on the SNAPSHOT (the menu the
         // user saw), so read the field from there and only fall back to the
         // live task — the live value can't be trusted to still be set.
-        const prUrl = snapshot.prUrl ?? t.prUrl;
+        // The entry names the PR it opens (a task can have several); the
+        // snapshot's first PR is only the fallback for an older entry shape.
+        const prUrl = entryPrUrl ?? taskPrsOf(snapshot)[0]?.url ?? taskPrsOf(t)[0]?.url;
         if (prUrl) viewPullRequest({ projectPath: t.workdir, prUrl });
         break;
       }
@@ -2506,7 +2509,8 @@ const runTaskMenuAction = useCallback((action: TaskMenuAction, snapshot: Task, r
         // non-git workspace root).
         const repo = (snapshot.repositories ?? []).find((r) => r.name === repoName)
           ?? (t.repositories ?? []).find((r) => r.name === repoName);
-        if (repo?.prUrl) viewPullRequest({ projectPath: repo.worktreePath ?? repo.path, prUrl: repo.prUrl });
+        const prUrl = entryPrUrl ?? (repo ? taskPrsOf(repo)[0]?.url : undefined);
+        if (repo && prUrl) viewPullRequest({ projectPath: repo.worktreePath ?? repo.path, prUrl });
         break;
       }
       case "view-issue": {
@@ -2569,13 +2573,25 @@ const runTaskMenuAction = useCallback((action: TaskMenuAction, snapshot: Task, r
       if (prevGroup !== null && entry.group !== prevGroup) {
         items.push({ type: "separator", id: `sep-${entry.group}` });
       }
-      items.push({
-        id: entry.action,
-        label: entry.label,
-        danger: entry.danger,
-        icon: ICON_BY_ACTION[entry.action],
-        onSelect: () => runTaskMenuAction(entry.action, taskMenu.task, entry.repoName),
+      const leaf = (e: TaskMenuEntry): ContextMenuLeafItem => ({
+        // Per-repository entries share an action, so the repository joins the id.
+        id: e.id ?? (e.repoName ? `${e.action}-${e.repoName}` : e.action),
+        label: e.label,
+        danger: e.danger,
+        icon: ICON_BY_ACTION[e.action],
+        onSelect: () => runTaskMenuAction(e.action, taskMenu.task, e.repoName, e.prUrl),
       });
+      if (entry.children) {
+        items.push({
+          type: "submenu",
+          id: entry.id ?? entry.action,
+          label: entry.label,
+          icon: ICON_BY_ACTION[entry.action],
+          items: entry.children.map(leaf),
+        });
+      } else {
+        items.push(leaf(entry));
+      }
       prevGroup = entry.group;
     }
     return items;
