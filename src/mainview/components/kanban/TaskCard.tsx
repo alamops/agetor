@@ -7,7 +7,7 @@ import { AWAITING_RING_CLASS } from "@/lib/awaiting";
 import { AwaitingGlow } from "@/components/ui/awaiting-glow";
 import { taskTypeIcon } from "@/lib/task-type-icon";
 import { promptPreview } from "@/lib/prompt-preview";
-import { cancelBoardDrag, handleCardKeyDown, isOutsideCard } from "@/lib/board-keyboard";
+import { cancelBoardDrag, cancelBoardDragIfGone, handleCardKeyDown, isOutsideCard } from "@/lib/board-keyboard";
 import { taskActionFlags } from "@/lib/task-card-actions";
 import { PipelineHat } from "@/components/pipelines/PipelineHat";
 import { taskTypeMeta, type HarnessLimitState, type HarnessStack, type Task } from "../../../shared/types.ts";
@@ -120,6 +120,21 @@ function TaskCardImpl({ task, homeDir, stacks = [], limitStates = [], onStart, o
       document.removeEventListener("focusout", leave, true);
     };
   }, [isDragging]);
+  // Those listeners leave with the card. If the held task disappears from the
+  // board (deleted or archived elsewhere), nothing else would end the drag,
+  // and dnd-kit would keep taking Space and the arrows document-wide. A card
+  // that only changed columns remounts under the same id and keeps the drag.
+  const heldRef = useRef(false);
+  useEffect(() => {
+    heldRef.current = isDragging;
+  }, [isDragging]);
+  useEffect(() => {
+    const id = task.id;
+    return () => {
+      if (!heldRef.current) return;
+      queueMicrotask(() => cancelBoardDragIfGone(id));
+    };
+  }, [task.id]);
   const style = transform ? { transform: CSS.Translate.toString(transform) } : undefined;
   const type = taskTypeMeta(task.taskType);
   const TypeIcon = taskTypeIcon(type.icon);
@@ -136,10 +151,12 @@ function TaskCardImpl({ task, homeDir, stacks = [], limitStates = [], onStart, o
       // Lets the board find this card when it reveals the card the user
       // left from (`lib/board-scroll.ts`), and e2e specs locate it.
       data-task-id={task.id}
-      aria-label={task.title}
       className={cn(
         "relative cursor-grab select-none border-border/60 border-l-4 hover:border-border transition-colors",
-        "focus-visible:outline focus-visible:outline-2 focus-visible:outline-offset-2 focus-visible:outline-ring",
+        // `[outline-style:solid]`, not Tailwind v3's `outline`: `cn`'s
+        // tailwind-merge 3 reads `outline` as a width and drops it beside
+        // `outline-2`, which left the browser's own focus ring in place.
+        "focus-visible:[outline-style:solid] focus-visible:outline-2 focus-visible:outline-offset-2 focus-visible:outline-ring",
         type.borderClass,
         isDragging && "opacity-50",
         awaiting && AWAITING_RING_CLASS,
@@ -171,10 +188,22 @@ function TaskCardImpl({ task, homeDir, stacks = [], limitStates = [], onStart, o
       }}
       {...listeners}
       {...attributes}
+      // After the spread: dnd-kit stamps `aria-disabled` from `disabled:
+      // archived`, which on a group would mark the archived card's Open and
+      // `⋯` buttons disabled too. An archived card can't be dragged, so it
+      // drops the drag description and says it is archived in its name.
+      aria-disabled={undefined}
+      aria-roledescription={archived ? undefined : attributes["aria-roledescription"]}
+      aria-describedby={archived ? undefined : attributes["aria-describedby"]}
+      aria-label={archived ? `${task.title} (archived)` : task.title}
       // After the spreads, so it composes dnd-kit's key handler instead of
       // replacing it. Enter on the card itself (never on a nested button)
-      // opens the task, unless the card is held in a keyboard drag.
-      onKeyDown={(e) => handleCardKeyDown(e, () => onOpen(task), () => listeners?.onKeyDown?.(e), isDragging)}
+      // opens the task, unless the card is held in a keyboard drag. Space on
+      // an archived card (no drag listeners) would scroll the board instead.
+      onKeyDown={(e) => {
+        if (archived && e.key === " " && e.target === e.currentTarget) e.preventDefault();
+        handleCardKeyDown(e, () => onOpen(task), () => listeners?.onKeyDown?.(e), isDragging);
+      }}
     >
       {task.unread && !isOpen && (
         // Static dot for "has assistant messages you haven't read yet" —

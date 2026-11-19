@@ -180,5 +180,9 @@ function stripInline(s: string): string {
 
 function cap(s: string, maxChars: number): string {
   if (s.length <= maxChars) return s;
-  return `${s.slice(0, Math.max(0, maxChars - 1)).trimEnd()}…`;
+  let end = Math.max(0, maxChars - 1);
+  // Never split a surrogate pair: half an emoji renders as U+FFFD.
+  const last = s.charCodeAt(end - 1);
+  if (last >= 0xd800 && last <= 0xdbff) end -= 1;
+  return `${s.slice(0, end).trimEnd()}…`;
 }

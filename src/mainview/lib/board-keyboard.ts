@@ -31,6 +31,16 @@ export function cancelBoardDrag(doc: Document = document): void {
   doc.dispatchEvent(new view.KeyboardEvent("keydown", { code: BOARD_CANCEL_CODE, key: BOARD_CANCEL_CODE, bubbles: true }));
 }
 
+/** Cancels the drag when the held task's card is gone from the board: its
+ *  unmount took the card's cancel listeners with it. A card that only moved
+ *  columns is back under the same `data-task-id`, and its drag goes on. */
+export function cancelBoardDragIfGone(taskId: string, doc: Document = document): boolean {
+  const cards = doc.querySelectorAll("[data-task-id]");
+  for (const card of cards) if (card.getAttribute("data-task-id") === taskId) return false;
+  cancelBoardDrag(doc);
+  return true;
+}
+
 /** True when a pointer press or a focus change landed outside the held card,
  *  which is when the drag must end. `target` null (focus left the document)
  *  counts as outside. */

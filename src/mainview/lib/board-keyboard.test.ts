@@ -5,6 +5,7 @@ import {
   BOARD_CANCEL_CODE,
   boardKeyboardCoordinates,
   cancelBoardDrag,
+  cancelBoardDragIfGone,
   handleCardKeyDown,
   isOutsideCard,
   BOARD_DRAG_SELECTOR,
@@ -217,6 +218,24 @@ describe("leaving a held card", () => {
     expect(seen[0]!.init.code).toBe(BOARD_CANCEL_CODE);
     // A document with no window (detached) is a no-op, not a throw.
     cancelBoardDrag({ defaultView: null } as unknown as Document);
+  });
+
+  test("cancelBoardDragIfGone cancels only when no card carries the held task's id", () => {
+    let cancels = 0;
+    class FakeKeyboardEvent {
+      constructor(public type: string, public init: Record<string, unknown>) {}
+    }
+    const docWith = (ids: string[]) => ({
+      defaultView: { KeyboardEvent: FakeKeyboardEvent },
+      dispatchEvent: () => { cancels++; return true; },
+      querySelectorAll: () => ids.map((id) => ({ getAttribute: () => id })),
+    }) as unknown as Document;
+    // The card moved columns: it is back under the same id, the drag goes on.
+    expect(cancelBoardDragIfGone("t1", docWith(["t0", "t1"]))).toBe(false);
+    expect(cancels).toBe(0);
+    // The held task left the board: nothing else would end the drag.
+    expect(cancelBoardDragIfGone("t1", docWith(["t0"]))).toBe(true);
+    expect(cancels).toBe(1);
   });
 
   test("setBoardDragging marks and unmarks the body", () => {

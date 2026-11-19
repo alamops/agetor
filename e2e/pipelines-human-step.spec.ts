@@ -63,7 +63,6 @@ test("pause + accept: card Review/no Done, panel contents, Accept carries the co
   await expect(card.getByTestId("task-card-pipeline-review")).toBeVisible();
   // Stop is not a card button at a gate (Review is the one primary action,
   // Open browses); it lives in the `⋯` menu, where it still asks to confirm.
-  await expect(card.getByTestId("task-card-pipeline-stop")).toHaveCount(0);
   await expect(card.locator('button[title="Stop"]')).toHaveCount(0);
   await expect(card.getByRole("button", { name: "Stop" })).toHaveCount(0);
   await expect(card.getByRole("button", { name: "Done" })).toHaveCount(0);

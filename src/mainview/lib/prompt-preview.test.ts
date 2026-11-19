@@ -52,6 +52,15 @@ describe("promptPreview", () => {
     expect(out.endsWith("…")).toBe(true);
   });
 
+  test("the cap never splits an emoji's surrogate pair", () => {
+    // 278 ASCII characters put the emoji's high surrogate at index 278, the
+    // last code unit a 279-unit cut keeps.
+    const out = promptPreview(`${"a".repeat(278)}😀 more words after the emoji`);
+    expect(out.endsWith("…")).toBe(true);
+    expect(out).not.toMatch(/[\uD800-\uDBFF](?![\uDC00-\uDFFF])/);
+    expect(out.length).toBeLessThanOrEqual(280);
+  });
+
   test("a huge unbroken paragraph stays fast and still previews its start", () => {
     for (const unit of ["word ", "*a ", "_b ", "[x](y "]) {
       const start = performance.now();

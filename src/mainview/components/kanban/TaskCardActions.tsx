@@ -1,4 +1,5 @@
 import { ArrowRight, CheckCircle2, Ellipsis, FolderOpen, MessageCircleQuestion, Play, Square, UserCheck } from "lucide-react";
+import { useRef } from "react";
 import { Button } from "@/components/ui/button";
 import { awaitingLabel } from "@/lib/awaiting";
 import { cardActions, taskActionFlags, type CardAction } from "@/lib/task-card-actions";
@@ -33,6 +34,7 @@ const BTN = "h-7 gap-1.5 px-2.5 text-xs";
  */
 export function TaskCardActions({ task, menuOpen, onStart, onCancel, onOpen, onOpenAttention, onReviewPipeline, onMarkDone, onMore }: Props) {
   const { pendingCount } = taskActionFlags(task);
+  const closedByPress = useRef(false);
   const actions = cardActions(task);
   // Answer (N) next to Done and `⋯` (an awaiting task in Review) needs the
   // 20 px of its trailing arrow: without it the row is 8 px too wide in WebKit.
@@ -101,7 +103,17 @@ export function TaskCardActions({ task, menuOpen, onStart, onCancel, onOpen, onO
           aria-expanded={menuOpen}
           title="More actions"
           data-testid="task-card-more"
+          // A press on ⋯ while its menu is open closes the menu (the menu's
+          // own outside-press handler, on mousedown), and the click that
+          // follows must not open it again: ⋯ toggles.
+          onPointerDown={() => {
+            closedByPress.current = menuOpen;
+          }}
           onClick={(e) => {
+            // `detail` 0 is a keyboard click, which no press precedes.
+            const skip = closedByPress.current && e.detail > 0;
+            closedByPress.current = false;
+            if (skip) return;
             const r = e.currentTarget.getBoundingClientRect();
             onMore(task, { x: r.left, y: r.bottom + 4 });
           }}
