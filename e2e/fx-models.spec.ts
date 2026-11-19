@@ -201,7 +201,7 @@ async function selectHarness(page: Page, label: string): Promise<void> {
  * The New Task form's Model `<select>`. There is no `htmlFor`/`aria-
  * labelledby` wiring the "Model" `<label>` to the `<select>` (NewTaskForm
  * .tsx), so this locates structurally instead: the "Refresh model list"
- * button (`data-testid="refresh-models"`, unique to this form — the
+ * button (`data-testid="launch-refresh-models"`, unique to this form — the
  * task-details editor's twin carries a different testid) sits in a small
  * flex row that is the immediate previous sibling of the `<Select>`, both
  * children of one shared `space-y-1` wrapper. Two levels up from the button

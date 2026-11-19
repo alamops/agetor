@@ -192,7 +192,7 @@ async function selectHarness(page: Page, label: string): Promise<void> {
  * see that file's `enableFxHarness`/`createFxTask` duplication rationale).
  * There is no `htmlFor`/`aria-labelledby` wiring the "Model" `<label>` to
  * the `<select>` in NewTaskForm.tsx, so this locates structurally instead:
- * the "Refresh model list" button (`data-testid="refresh-models"`) sits in a
+ * the "Refresh model list" button (`data-testid="launch-refresh-models"`) sits in a
  * small flex row that is the immediate previous sibling of the `<Select>`,
  * both children of one shared `space-y-1` wrapper. Two levels up from the
  * button lands on that wrapper; `select` inside it is the Model dropdown.

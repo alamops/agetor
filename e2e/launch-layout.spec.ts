@@ -177,6 +177,8 @@ test.describe("New Task panel layout", () => {
 
     await handle.dblclick();
     await expect(handle).toHaveAttribute("aria-valuenow", "384");
+    // The width animates (200 ms); measure the handle only once the panel has settled.
+    await expect.poll(width).toBe(384);
 
     // Drag: +116 px from the default lands on 500, and survives a reload.
     const box = (await handle.boundingBox())!;

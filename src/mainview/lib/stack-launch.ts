@@ -9,7 +9,7 @@ import type { AgentStatus, Harness, HarnessStack } from "../../shared/types.ts";
  * moves a task off a disabled, removed or logged-out member, and a failed
  * fresh pre-flight gets one forced move to a usable backup
  * (docs/architecture/harness-stacks.md "Manual paths"). So a launch surface
- * must not block Create & start on the current account's own status when this
+ * must not block Run task on the current account's own status when this
  * returns true — the core picks the account. Advisory only: the core stays
  * authoritative, and an unknown login (`loggedIn: null`) counts as usable,
  * the same fail-open rule the core applies.
