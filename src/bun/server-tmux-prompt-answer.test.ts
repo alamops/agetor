@@ -297,6 +297,27 @@ describe("reject, and one answer at a time", () => {
     expect(findTmuxPromptById(c.req.id)).not.toBeNull();
   });
 
+  test("{reject:true} on a pane that moved on → 409, no Escape (it would interrupt claude's turn), the card stays", async () => {
+    const c = card({ dialogs: [{ kind: "enter-only" }, REPO_E] });
+    c.session.patch({ i: 1, cursor: 0 });
+    const res = await post(c.req.id, { reject: true });
+    expect(res.status).toBe(409);
+    expect(c.session.keys()).toEqual([]);
+    expect(findTmuxPromptById(c.req.id)).not.toBeNull();
+  });
+
+  test("a code into a field that already has text → 409 with a fixed sentence, nothing typed, the card stays", async () => {
+    const c = card({ dialogs: [{ kind: "paste-code" }], echoTyped: true });
+    c.session.patch({ typed: "already-there" });
+    const res = await post(c.req.id, { code: "abc" });
+    expect(res.status).toBe(409);
+    const body = await res.json();
+    expect(body.code).toBe("field-not-empty");
+    expect(JSON.stringify(body)).not.toContain("already-there");
+    expect(c.session.keys()).toEqual([]);
+    expect(findTmuxPromptById(c.req.id)).not.toBeNull();
+  });
+
   test("{reject:true} with the session gone → 410 and the card stays", async () => {
     const c = card({ dialogs: [{ kind: "enter-only" }] }, { withSession: false });
     const res = await post(c.req.id, { reject: true });
@@ -310,7 +331,8 @@ describe("reject, and one answer at a time", () => {
     const statuses = [a.status, b.status].sort();
     expect(statuses).toEqual([200, 409]);
     const refused = a.status === 409 ? a : b;
-    expect((await refused.json()).error).toBe("this prompt is already being answered");
+    // `code` lets the CLI and TUI tell this 409 from "the prompt changed".
+    expect(await refused.json()).toEqual({ ok: false, error: "this prompt is already being answered", code: "answer-in-flight" });
     expect(c.session.keys().map((k) => k.k)).toEqual(["Enter"]);
   });
 });

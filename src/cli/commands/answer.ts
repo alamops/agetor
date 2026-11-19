@@ -9,6 +9,7 @@ import type {
   TmuxPromptRequest,
   FxPermissionRequest,
 } from "../../bun/interactions.ts";
+import type { TmuxPromptAnswerBody } from "../../shared/types.ts";
 import {
   answerFlagsError,
   buildAskAnswer,
@@ -329,7 +330,7 @@ async function answerTmux(client: AgetorClient, req: TmuxPromptRequest): Promise
   // through the terminal-text helper like every other stored string.
   out(c.dim(escapeFreeText(req.paneText)));
   if (req.held === true) out(c.yellow(TMUX_HELD_HINT));
-  let body: { key?: string; reject?: boolean; enter?: boolean; code?: string };
+  let body: TmuxPromptAnswerBody;
   if (tmuxCardKind(req) === "code") {
     // A password prompt keeps the code out of the scrollback, and out of the
     // history of anything that records the screen.
@@ -355,11 +356,14 @@ async function answerTmux(client: AgetorClient, req: TmuxPromptRequest): Promise
       out(res.ok ? c.green("✓ answered") : c.red(escapeFreeText(res.error ?? "failed to answer")));
     }
   } catch (e) {
-    // The route's refusal (409 the prompt changed, 410 the session is gone, 400
-    // invalid input) carries a fixed sentence that never quotes a typed code.
+    // The route's refusal (409 the prompt changed or is being answered, 410 the
+    // session is gone, 400 invalid input) carries a fixed sentence that never
+    // quotes a typed code. Nothing was answered: exit nonzero, and stop here
+    // rather than walk on to the next card as if this one went through.
     if (e instanceof ApiError) {
-      out(c.red(escapeFreeText(tmuxAnswerFailure(e.status, e.message))));
-      return true;
+      out(c.red(escapeFreeText(tmuxAnswerFailure(e.status, e.message, e.body))));
+      process.exitCode = 1;
+      return false;
     }
     throw e;
   }

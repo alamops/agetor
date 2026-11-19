@@ -1,3 +1,4 @@
+import { createHash } from "node:crypto";
 import { existsSync, realpathSync } from "node:fs";
 import { isAbsolute, join } from "node:path";
 import { TMUX_MISSING_REASON, type AgentKind, type ClaudeAccount, type Harness, type HarnessStatus } from "../shared/types.ts";
@@ -453,11 +454,30 @@ const claudeAuthCache = new Map<string, { value: ClaudeAuthResult; expiresAt: nu
  *  its answer back, so a slow older probe can never overwrite a newer one. */
 const claudeAuthProbeGen = new Map<string, number>();
 
-/** Cache key: the resolved binary and the account's config root, so editing an
- *  account's home or env never inherits the old account's answer. */
-function claudeAuthKey(harness: Harness, path: string): string {
+/** Env names that decide which credential `claude auth status` reads: an API
+ *  key or OAuth token (`ANTHROPIC_*`, `CLAUDE_*`), a Bedrock or Vertex backend
+ *  and its credentials (`AWS_*`, `GOOGLE_*`, `CLOUD_ML_*`), and `HOME` (the
+ *  macOS keychain the subscription login lives in). Anything else in an
+ *  account's env map leaves the cached answer alone. */
+const CLAUDE_AUTH_ENV_RE = /^(?:ANTHROPIC_|CLAUDE_|AWS_|GOOGLE_|CLOUD_ML_)|^HOME$/;
+
+/** A one-way digest of the auth-relevant env (names and values), so a changed
+ *  key or token re-probes while the secret itself never sits in a map key. */
+function claudeAuthEnvDigest(env: Record<string, string>): string {
+  const relevant = Object.keys(env)
+    .filter((k) => CLAUDE_AUTH_ENV_RE.test(k))
+    .sort()
+    .map((k) => `${k}=${env[k]}`)
+    .join("\n");
+  return relevant === "" ? "-" : createHash("sha256").update(relevant).digest("hex").slice(0, 16);
+}
+
+/** Cache key: the resolved binary, the account's config root and its
+ *  auth-relevant env, so editing an account's home, key or token never
+ *  inherits the old account's answer. */
+function claudeAuthKey(harness: Harness, path: string, env: Record<string, string>): string {
   const root = claudeRootFor(harness);
-  return `${harness.id}:${path}:${root.configDir}:${root.claudeJsonDir}`;
+  return `${harness.id}:${path}:${root.configDir}:${root.claudeJsonDir}:${claudeAuthEnvDigest(env)}`;
 }
 
 /**
@@ -535,7 +555,7 @@ async function getCachedClaudeAuth(
   env: Record<string, string>,
   opts: { freshAuth?: boolean } | undefined,
 ): Promise<ClaudeAuthResult> {
-  const key = claudeAuthKey(harness, path);
+  const key = claudeAuthKey(harness, path, env);
   if (!opts?.freshAuth) {
     const cached = claudeAuthCache.get(key);
     if (cached && cached.expiresAt > Date.now()) return cached.value;
@@ -558,7 +578,7 @@ export function peekClaudeLoggedIn(harness: Harness): boolean | null {
   if (harness.kind !== "claude-code") return null;
   const path = resolveBinPath(resolveBin(harness));
   if (!path) return null;
-  const cached = claudeAuthCache.get(claudeAuthKey(harness, path));
+  const cached = claudeAuthCache.get(claudeAuthKey(harness, path, probeEnvFor(harness)));
   return cached && cached.expiresAt > Date.now() ? cached.value.loggedIn : null;
 }
 

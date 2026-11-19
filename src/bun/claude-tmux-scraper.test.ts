@@ -3819,6 +3819,23 @@ describe("claude 2.1.326 Enter-to-confirm family through the real chain", () => 
     }
   });
 
+  test("an Enter-only screen under a numbered menu left higher up the pane is the Enter card, not the stale menu", () => {
+    // The login-method select scrolled up out of the Enter-only screen's window
+    // (no cursor row in its last twelve lines), and claude now waits on Enter.
+    const filler = Array.from({ length: 14 }, (_, i) => ` Step ${i + 1} of the sign-in finished.`);
+    const pane = [
+      " Select login method:",
+      " ❯ 1. Claude account with subscription",
+      "   2. Anthropic Console account",
+      "   3. 3rd-party platform",
+      ...filler,
+      " Login successful. Press Enter to continue…",
+    ].join("\n");
+    const card = pickScrapeMatch(pane, quiet)!;
+    expect(card.answerKind).toBe("enter");
+    expect(card.choices).toEqual([]);
+  });
+
   test("the OAuth code prompt → a code card, with the typed code masked", () => {
     const card = pickScrapeMatch(fixture("paste-code"), quiet)!;
     expect(card.answerKind).toBe("code");

@@ -125,6 +125,9 @@ const ADD_DIR_TRAILER_RE = /^\s*Adding:\s*(\S.*)$/;
 const ADD_DIR_TRAILER_MAX_LINES = 8;
 /** The line after the path in the dialog body. */
 const ADD_DIR_PATH_END_RE = /^\s*(This directory is part of|This session hasn't worked here|Is this a directory)/i;
+/** Rows a wrapped add-dir path may span under its title: a PATH_MAX (1024)
+ *  path on a 40-column pane, with room to spare. */
+const ADD_DIR_PATH_MAX_ROWS = 32;
 
 /**
  * Parse the add-dir dialog family off the bottom of a pane, or `null`.
@@ -189,13 +192,18 @@ export function parseAddDirDialog(pane: string): AddDirDialog | null {
     const m = lines[t]!.match(ADD_DIR_TITLE_RE);
     if (!m) continue;
     title = `${m[1]}:`;
+    // The path ends at the first description line (or a blank row). A path that
+    // runs into the choice rows, or past the row cap, was not read whole: it is
+    // unknown, never a truncated prefix that could equal a shorter trusted path.
     const parts: string[] = [];
-    for (let p = t + 1; p < rowsTopAt && parts.length < 6; p++) {
+    let complete = false;
+    for (let p = t + 1; p < rowsTopAt; p++) {
       const body = lines[p]!;
-      if (body.trim() === "" || ADD_DIR_PATH_END_RE.test(body)) break;
+      if (body.trim() === "" || ADD_DIR_PATH_END_RE.test(body)) { complete = true; break; }
+      if (parts.length >= ADD_DIR_PATH_MAX_ROWS) break;
       parts.push(body.trim());
     }
-    path = parts.join("");
+    path = complete ? parts.join("") : null;
     break;
   }
   if (title !== null && title !== pair.title) return null;
@@ -330,7 +338,7 @@ export function matchEnterOnlyScreen(tail: string): { paneText: string; fingerpr
  * types straight into the terminal never reaches a card, a log or the
  * fingerprint, and typing it does not make the card look "dismissed".
  */
-export function matchPasteCodeScreen(tail: string): { paneText: string; fingerprint: string } | null {
+export function matchPasteCodeScreen(tail: string): { paneText: string; fingerprint: string; filled: boolean } | null {
   // A wrapped code adds lines BELOW the prompt, which would push the lines above
   // it out of a bottom-anchored window and change the fingerprint mid-typing.
   // So read a deeper tail, redact it, and cut a fixed window that ENDS at the
@@ -357,6 +365,9 @@ export function matchPasteCodeScreen(tail: string): { paneText: string; fingerpr
   }
   if (all.length - below > PASTE_CODE_TRAILING_ROWS) return null;
   if (all.slice(-12).some((l) => CURSOR_ROW_RE.test(l))) return null;
+  // Something is already in the field: text after the marker, or code-shaped
+  // rows under a bare marker (a code that wrapped from the start of a row).
+  const filled = /Paste code here if prompted\s*>[ \t]*\S/i.test(all[rawMarkerAt]!) || below > rawMarkerAt + 1;
   const lines = redactPaneSecrets(all.join("\n")).split("\n");
   let markerAt = -1;
   for (let i = lines.length - 1; i >= 0; i--) {
@@ -370,7 +381,7 @@ export function matchPasteCodeScreen(tail: string): { paneText: string; fingerpr
     .map((l) => l.trim())
     .join("\n")
     .replace(/(Paste code here if prompted\s*>)\s*•+/i, "$1");
-  return { paneText: ctxLines.join("\n"), fingerprint: sha1(`paste-code:${stable}`) };
+  return { paneText: ctxLines.join("\n"), fingerprint: sha1(`paste-code:${stable}`), filled };
 }
 
 /**

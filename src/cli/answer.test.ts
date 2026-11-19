@@ -577,8 +577,37 @@ test("tmux code card: cancelling the prompt posts nothing", async () => {
   expect(cancelCalls.length).toBeGreaterThan(0);
 });
 
+test("tmux card: a refusal exits nonzero and stops before the next card; an in-flight 409 says so", async () => {
+  outputs.length = 0;
+  const savedExit = process.exitCode;
+  let posts = 0;
+  currentClient = {
+    listTasks: async () => [{ id: "t1", title: "T" }],
+    pendingInteractions: async () => [tmuxReq({ id: "p1", answerKind: "enter" }), tmuxReq({ id: "p2", answerKind: "enter" })],
+    answerTmuxPrompt: async () => {
+      posts++;
+      throw new ApiError(
+        409,
+        { ok: false, error: "this prompt is already being answered", code: "answer-in-flight" },
+        "this prompt is already being answered",
+      );
+    },
+  } as unknown as AgetorClient;
+  selectImpl = pickLabel("Continue (press Enter)");
+  try {
+    await cmdAnswer(["t1"], flags);
+    expect(posts).toBe(1); // the second card is never answered after a refusal
+    expect(process.exitCode).toBe(1);
+    expect(outputs.some((l) => l.includes("already being answered elsewhere"))).toBe(true);
+    expect(outputs.some((l) => l.includes("the prompt changed"))).toBe(false);
+  } finally {
+    process.exitCode = savedExit;
+  }
+});
+
 test("tmux card: a 409 says the prompt changed and a 400 on a code never echoes it", async () => {
   outputs.length = 0;
+  const savedExit = process.exitCode;
   const req = tmuxReq({ answerKind: "enter" });
   currentClient = {
     listTasks: async () => [{ id: "t1", title: "T" }],
@@ -604,6 +633,8 @@ test("tmux card: a 409 says the prompt changed and a 400 on a code never echoes 
   await cmdAnswer(["t1"], flags);
   expect(outputs.some((l) => l.includes("the code must be a single line"))).toBe(true);
   expect(outputs.join("\n")).not.toContain("secret-value");
+  expect(process.exitCode).toBe(1);
+  process.exitCode = savedExit;
 });
 
 test("tmux card: pane text is printed through the terminal-text escaper and a held card says so", async () => {

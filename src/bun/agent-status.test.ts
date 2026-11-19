@@ -1373,6 +1373,26 @@ describe("claude-code login probe", () => {
     expect(c.calls()).toBe(2); // the fresh result was written back
   });
 
+  test("a changed key or token in the account env re-probes; an unrelated env change keeps the cached answer", async () => {
+    const { peekClaudeLoggedIn } = await import("./agent-status.ts");
+    const c = plantClaude(`echo '{"loggedIn": false}'; exit 1`);
+    withClaudeJson(c.account);
+    process.env.AGETOR_CLAUDE_BIN = c.bin;
+    const h = account("claude-a", c.account);
+    expect((await checkHarness(h)).loggedIn).toBe(false);
+    expect(c.calls()).toBe(1);
+    await checkHarness({ ...h, env: { ...h.env, SOME_UNRELATED_SETTING: "1" } });
+    expect(c.calls()).toBe(1);
+    // The user adds an API key to the account: the cached "logged out" no longer applies.
+    const keyed: Harness = { ...h, env: { ...h.env, ANTHROPIC_API_KEY: "sk-test-new" } };
+    expect(peekClaudeLoggedIn(keyed)).toBeNull();
+    await checkHarness(keyed);
+    expect(c.calls()).toBe(2);
+    const tokened: Harness = { ...h, env: { ...h.env, CLAUDE_CODE_OAUTH_TOKEN: "tok-test" } };
+    await checkHarness(tokened);
+    expect(c.calls()).toBe(3);
+  });
+
   test("peekClaudeLoggedIn reads the cache and never probes; refreshClaudeAuth warms it in parallel", async () => {
     const { peekClaudeLoggedIn, refreshClaudeAuth } = await import("./agent-status.ts");
     const c = plantClaude(`echo '{"loggedIn": false}'; exit 1`);

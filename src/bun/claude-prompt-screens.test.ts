@@ -158,6 +158,25 @@ describe("matchAddDirAutoTrust", () => {
     expect(matchAddDirAutoTrust(pane("add-dir-startup-armed"), [{ name: "x", paths: [WT] }])).toBeNull();
   });
 
+  test("a wrapped path is read whole: its first rows never stand in for a shorter trusted path", () => {
+    // A path that wraps over eight 40-column rows, under the title as claude draws it.
+    const long = `${WT}/` + "d".repeat(260) + "/repo-long";
+    const rows = long.match(/.{1,40}/g)!;
+    expect(rows.length).toBeGreaterThan(6);
+    const armed = pane("add-dir-startup-armed").replace(` ${REPO_E}\n`, rows.map((r) => ` ${r}\n`).join(""));
+    // The old six-row cap rejoined only the first six rows: a trusted path equal
+    // to them must not match the longer directory on screen.
+    const prefix = rows.slice(0, 6).join("");
+    expect(matchAddDirAutoTrust(armed, [{ name: "x", paths: [prefix] }])).toBeNull();
+    expect(matchAddDirAutoTrust(armed, [{ name: "repo-long", paths: [long] }])?.name).toBe("repo-long");
+  });
+
+  test("a path that runs into the choice rows (no end in sight) is unknown, never a prefix", () => {
+    const lines = [" Adding a new directory:", ` ${REPO_E}`, " ❯ No, exit", "   Yes, add it", " Enter to confirm · Esc to cancel"];
+    expect(parseAddDirDialog(lines.join("\n"))?.path).toBeNull();
+    expect(matchAddDirAutoTrust(lines.join("\n"), DIRS)).toBeNull();
+  });
+
   test("a realpath spelling in paths[] matches", () => {
     const m = matchAddDirAutoTrust(pane("add-dir-startup-armed"), [{ name: "repo-e", paths: ["/elsewhere/repo-e", REPO_E] }]);
     expect(m?.name).toBe("repo-e");
@@ -223,6 +242,13 @@ describe("matchPasteCodeScreen + redactPaneSecrets", () => {
     const m = matchPasteCodeScreen(pane("paste-code-typed"))!;
     expect(m.paneText).not.toContain("abc123");
     expect(m.paneText).toContain("Paste code here if prompted > ••••");
+  });
+
+  test("filled says whether the field already has text: typed after the marker, or wrapped under a bare one", () => {
+    expect(matchPasteCodeScreen(pane("paste-code"))!.filled).toBe(false);
+    expect(matchPasteCodeScreen(pane("paste-code-typed"))!.filled).toBe(true);
+    const bare = pane("paste-code").replace(/Paste code here if prompted >\s*$/m, "Paste code here if prompted >\nabcdefghijklmnop");
+    expect(matchPasteCodeScreen(bare)!.filled).toBe(true);
   });
 
   test("typing a code does not change the fingerprint", () => {

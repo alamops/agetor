@@ -4539,12 +4539,13 @@ const harnessRetriesInFlight = new Set<string>();
  * fires on the no-swap-target passthrough branches), `"after-transfer"` runs
  * after the mirror/transfer awaits and before the spawn decision, and
  * `"before-block"` runs just before the all-exhausted branch writes its
- * blocked column / arms a retry. `"retry-before-commit"` runs inside the
+ * blocked column / arms a retry. `"retry-after-warm"` runs right after the
+ * all-exhausted retry's login warm-up, before it plans. `"retry-before-commit"` runs inside the
  * all-exhausted retry's `beforeCommit`, after its mirror/transfer and before
  * the move is committed. The hook receives the task and old run id,
  * so a test can Stop or archive at exactly that point.
  */
-type HarnessSwapSettlePhase = "settle" | "after-transfer" | "before-block" | "retry-before-commit";
+type HarnessSwapSettlePhase = "settle" | "after-transfer" | "before-block" | "retry-after-warm" | "retry-before-commit";
 let harnessSwapSettleHook:
   | ((taskId: string, runId: string, phase: HarnessSwapSettlePhase) => void | Promise<void>)
   | null = null;
@@ -7787,6 +7788,17 @@ async function fireHarnessAutoRetryInner(taskId: string): Promise<void> {
     return;
   }
   await warmStackLogins(task);
+  await harnessSwapSettleHook?.(taskId, task.runId ?? "", "retry-after-warm");
+  // A plain Stop during the probe is recorded on this retry's window
+  // (`swapCancelRequested`) and nothing else clears the countdown, so planning
+  // on would re-arm it (a wait or none-usable plan). Settle it like the Stop
+  // `beforeCommit` catches: the countdown ends, the card stays blocked.
+  if (swapCancelRequested.delete(taskId)) {
+    cancelHarnessRetryForTask(taskId);
+    const stoppedRun = runs.latestForTask(taskId);
+    if (stoppedRun) saveStatusLineQuietly(stoppedRun.id, taskId, "cancelled by user during the account retry");
+    return;
+  }
   // The login probe awaited: a Stop, a column move, an archive or a manual
   // start may have cleared the countdown meanwhile. Plan from the live row, and
   // never re-arm a retry the user already ended.

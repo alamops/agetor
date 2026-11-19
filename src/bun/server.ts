@@ -119,9 +119,7 @@ import {
   healWindowSize,
   jsonlPathFor,
   rebuildEventsFromJsonl,
-  markTmuxPromptAnswered,
   resolveAskCard,
-  sendModalKeys,
   sessionExists,
   sessionNameFor,
   type PromptAction,
@@ -8191,8 +8189,9 @@ export function startApiServer(
             return json({ error: "exactly one of key, reject, enter or code" }, { status: 400, headers: corsHeaders(req) });
           }
           if (tmuxAnswersInFlight.has(pending.id)) {
+            // `code` tells the clients this 409 apart from "the prompt changed".
             return json(
-              { ok: false, error: "this prompt is already being answered" },
+              { ok: false, error: "this prompt is already being answered", code: "answer-in-flight" },
               { status: 409, headers: corsHeaders(req) },
             );
           }
@@ -8204,24 +8203,19 @@ export function startApiServer(
             // the user sends their redirect as a normal, separate turn — no
             // in-flight Esc-then-send interrupt (which is what corrupts the run
             // accounting). The modal having been Esc'd, the message reaches claude.
+            // The Escape goes through the same live-pane drive as every answer:
+            // only while the pane still shows THIS card (an Escape on a pane that
+            // moved on would interrupt claude's turn), and a failed send leaves
+            // the card up.
+            let action: PromptAction;
+            let sentinel: string;
             if (body.reject !== undefined) {
               if (body.reject !== true) {
                 return json({ error: "reject must be true" }, { status: 400, headers: corsHeaders(req) });
               }
-              if (!(await sessionExists(pending.taskId))) {
-                return json(
-                  { ok: false, error: "tmux session is gone — cancel the run and start a new one" },
-                  { status: 410, headers: corsHeaders(req) },
-                );
-              }
-              await sendModalKeys(pending.taskId, ["Escape"]);
-              markTmuxPromptAnswered(pending.taskId, pending.fingerprint);
-              const ok = answerTmuxPrompt(req.params.id, { key: "__external__" });
-              return json({ ok }, { headers: corsHeaders(req) });
-            }
-            let action: PromptAction;
-            let sentinel: string;
-            if (body.enter !== undefined) {
+              action = { kind: "reject" };
+              sentinel = "__external__";
+            } else if (body.enter !== undefined) {
               if (body.enter !== true || cardKind !== "enter") {
                 return json({ error: "this prompt does not take Enter" }, { status: 400, headers: corsHeaders(req) });
               }
@@ -8290,16 +8284,26 @@ export function startApiServer(
               if (driven.reason === "wrong-kind") {
                 return json({ error: "this prompt does not take that answer" }, { status: 400, headers: corsHeaders(req) });
               }
+              if (driven.reason === "field-not-empty") {
+                // A fixed sentence: whatever is in the field is never quoted.
+                return json(
+                  {
+                    ok: false,
+                    error: "Claude's code field already has text in it — clear it in the terminal, then answer again",
+                    code: "field-not-empty",
+                  },
+                  { status: 409, headers: corsHeaders(req) },
+                );
+              }
               return json(
                 { ok: false, error: "failed to deliver keystroke to tmux" },
                 { status: 500, headers: corsHeaders(req) },
               );
             }
-            // Stamp the fingerprint as just-answered before resolving so
-            // the next scrape tick (which may catch the modal still on
-            // screen mid-repaint) doesn't register a ghost duplicate. See
-            // `markTmuxPromptAnswered` for why this is two-step.
-            markTmuxPromptAnswered(pending.taskId, pending.fingerprint);
+            // The drive already stamped the fingerprint as just-answered on the
+            // session that received the keys, so the next scrape tick (which may
+            // catch the modal still on screen mid-repaint) doesn't register a
+            // ghost duplicate. See `markTmuxPromptAnswered`.
             // A refused confirm already replaced this card with a held one. The
             // card may also have been settled while the add-dir drive verified the
             // dialog left (the boot poller / scraper sweeps a card whose dialog is

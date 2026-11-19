@@ -2350,13 +2350,15 @@ async function walkCursor(
 export type PromptAction =
   | { kind: "choice"; key: string }
   | { kind: "enter" }
-  | { kind: "code"; code: string };
+  | { kind: "code"; code: string }
+  /** Escape, on any card kind, only while the live pane still shows the card. */
+  | { kind: "reject" };
 
 /** `recarded`: the dialog refused the confirm, the old card was settled and a
  *  fresh one (`held: true`) registered in its place. */
 export type PromptDriveResult =
   | { ok: true; recarded?: boolean }
-  | { ok: false; reason: "no-session" | "dialog-changed" | "wrong-kind" | "send-failed" };
+  | { ok: false; reason: "no-session" | "dialog-changed" | "wrong-kind" | "send-failed" | "field-not-empty" };
 
 /** The pane the drive reads and types into: tmux, or the e2e fake pane. */
 interface CardPaneIo {
@@ -2456,8 +2458,16 @@ function fakePaneIo(pane: FakePromptPane): CardPaneIo {
  * - `enter`: exactly one Enter, only when the live pane is the same Enter-only
  *   screen. Never sent automatically.
  * - `code`: only on an `answerKind: "code"` card whose live pane still shows
- *   the OAuth prompt; the text goes in with `send-keys -l -- …` and then Enter.
- *   The code is never in a thrown message, a log line, a chunk or the result.
+ *   the OAuth prompt with an EMPTY field (`field-not-empty` otherwise: typing
+ *   would append to what is there, a retry after a failed Enter included); the
+ *   text goes in with `send-keys -l -- …`, the pane is read again, and Enter
+ *   goes only if the same prompt is still there. The code is never in a thrown
+ *   message, a log line, a chunk or the result.
+ * - `reject`: Escape, on any card kind, only while the live pane still shows
+ *   the card (an Escape on a changed pane would interrupt claude's turn).
+ *
+ * On success the "just answered" stamp goes on the session that received the
+ * keys, never on whatever session the task has by the time the route resumes.
  */
 export async function answerTmuxPromptInPane(
   pending: TmuxPromptRequest,
@@ -2466,7 +2476,7 @@ export async function answerTmuxPromptInPane(
   const fake = process.env.AGETOR_CLAUDE_DRIVER === "fake" ? fakePromptPanes.get(pending.taskId) : undefined;
   const state = sessions.get(pending.taskId);
   if (!fake && !state) return { ok: false, reason: "no-session" };
-  if (action.kind !== (pending.answerKind ?? "choice")) return { ok: false, reason: "wrong-kind" };
+  if (action.kind !== "reject" && action.kind !== (pending.answerKind ?? "choice")) return { ok: false, reason: "wrong-kind" };
   let result: PromptDriveResult = { ok: false, reason: "send-failed" };
   if (fake) {
     try {
@@ -2474,6 +2484,7 @@ export async function answerTmuxPromptInPane(
     } catch {
       result = { ok: false, reason: "send-failed" };
     }
+    if (result.ok && state) stampAnswered(state, pending.fingerprint);
     return result;
   }
   await queueTmuxOp(pending.taskId, async (stillCurrent) => {
@@ -2484,7 +2495,35 @@ export async function answerTmuxPromptInPane(
       result = { ok: false, reason: "send-failed" };
     }
   }, state);
+  // The session that received the keys, even if the task has respawned since.
+  if (result.ok) stampAnswered(state!, pending.fingerprint);
   return result;
+}
+
+/**
+ * Whether the live pane (redacted tail) still shows the dialog `pending` was
+ * registered for: the same fingerprint for the footer-less shapes (Enter-only,
+ * OAuth code, unparsable), the same cursor-free identity for a parsed menu.
+ */
+function liveShowsPendingCard(pending: TmuxPromptRequest, tail: string): boolean {
+  const kind = pending.answerKind ?? "choice";
+  if (kind === "enter") return matchEnterOnlyScreen(tail)?.fingerprint === pending.fingerprint;
+  if (kind === "code") return matchPasteCodeScreen(tail)?.fingerprint === pending.fingerprint;
+  if (pending.choices.length === 0) {
+    // An unparsable card: its own matcher, either arm (the watchdog arm carded
+    // a stuck turn's pane, which still shows working chrome).
+    return matchUnparsableModal(tail, true)?.fingerprint === pending.fingerprint;
+  }
+  const match = pickScrapeMatch(tail, {
+    paneWorking: paneShowsClaudeWorking(tail),
+    paneIdle: paneShowsIdleInputBox(tail),
+    watchdogArmed: false,
+    boot: true,
+  });
+  if (!match || match.answerKind === "enter" || match.answerKind === "code" || match.unparsable) return false;
+  return pending.identity
+    ? identityOf(match) === pending.identity
+    : match.choices.map((c) => c.label).join("\u0001") === pending.choices.map((c) => c.label).join("\u0001");
 }
 
 async function driveCard(
@@ -2501,6 +2540,12 @@ async function driveCard(
   // Masked exactly as at registration, so the card's fingerprint compares.
   const tail = redactPaneSecrets(lines.slice(Math.max(0, lines.length - SCRAPE_TAIL_LINES)).join("\n"));
 
+  if (action.kind === "reject") {
+    if (!liveShowsPendingCard(pending, tail)) return { ok: false, reason: "dialog-changed" };
+    if (!stillCurrent()) return { ok: false, reason: "send-failed" };
+    return (await io.key("Escape")) ? { ok: true } : { ok: false, reason: "send-failed" };
+  }
+
   if (action.kind === "enter") {
     const screen = matchEnterOnlyScreen(tail);
     if (!screen || screen.fingerprint !== pending.fingerprint) return { ok: false, reason: "dialog-changed" };
@@ -2510,9 +2555,20 @@ async function driveCard(
   if (action.kind === "code") {
     const screen = matchPasteCodeScreen(tail);
     if (!screen || screen.fingerprint !== pending.fingerprint) return { ok: false, reason: "dialog-changed" };
+    // Typing appends: never add a code to whatever is already in the field (a
+    // code typed in the terminal, or this card's own earlier attempt whose
+    // Enter failed). The user clears it in the terminal and answers again.
+    if (screen.filled) return { ok: false, reason: "field-not-empty" };
     if (!(await io.literal(escapeTypedTrailingSemicolon(action.code)))) return { ok: false, reason: "send-failed" };
     await Bun.sleep(STARTUP_CONFIRM_KEY_GAP_MS);
     if (!stillCurrent()) return { ok: false, reason: "send-failed" };
+    // Enter only into the same prompt (now filled, which the masked
+    // fingerprint ignores): the pane may have moved on while the code went in.
+    const typed = await io.capture();
+    if (typed === null || !stillCurrent()) return { ok: false, reason: "send-failed" };
+    const typedLines = typed.split("\n");
+    const again = matchPasteCodeScreen(redactPaneSecrets(typedLines.slice(Math.max(0, typedLines.length - SCRAPE_TAIL_LINES)).join("\n")));
+    if (!again || again.fingerprint !== pending.fingerprint) return { ok: false, reason: "send-failed" };
     return (await io.key("Enter")) ? { ok: true } : { ok: false, reason: "send-failed" };
   }
 
@@ -2560,7 +2616,7 @@ async function driveCard(
       if (again === null) return { ok: false, reason: "dialog-changed" };
       const againLines = again.split("\n");
       const fresh = parseAddDirDialog(againLines.slice(Math.max(0, againLines.length - SCRAPE_TAIL_LINES)).join("\n"));
-      if (!fresh || fresh.identity !== addDir.identity || typeof fresh.cursorIndex !== "number") {
+      if (!fresh || fresh.identity !== addDir.identity || typeof fresh.cursorIndex !== "number" || fresh.footer === "locked") {
         return { ok: false, reason: "dialog-changed" };
       }
       cursorIndex = fresh.cursorIndex;
@@ -6384,8 +6440,9 @@ function matchUnparsableModal(tail: string, watchdogArmed: boolean): ScrapeMatch
  * boot poller's generic-modal branch — factored out (docs/plans/model-
  * effort-local-command-turns.md §10 review finding #9) so the two can't
  * silently drift apart, and so the precedence itself
- * (numbered > yes-no > slider > unnumbered > unparsable, gated on
- * `paneWorking`/`paneIdle`) is unit-testable without a live tmux pane.
+ * (Enter-only/code > numbered > yes-no > slider > theme picker > unnumbered >
+ * unparsable, gated on `paneWorking`/`paneIdle`) is unit-testable without a
+ * live tmux pane.
  *
  * The unnumbered arm sits AFTER the slider deliberately: the slider's own
  * footer also contains `Enter to confirm`, so its indented track/label rows
@@ -6418,12 +6475,17 @@ function pickScrapeMatch(
   opts: { paneWorking: boolean; paneIdle: boolean; watchdogArmed: boolean; boot?: boolean },
 ): ScrapeMatch | null {
   const quiet = !opts.paneWorking && !opts.paneIdle;
-  // The Enter-only / OAuth-code screens and the theme picker sit before the
-  // unnumbered arm and are disjoint from it: none of them draws a `❯` row
-  // with an Enter-to-confirm footer. The theme picker is a boot-only shape (a
-  // never-onboarded or logged-out config) and has no footer at all.
-  return matchNumberedModal(tail) ?? matchYesNoModal(tail) ?? matchSliderModal(tail)
-    ?? (quiet ? matchPromptScreen(tail) : null)
+  // The Enter-only / OAuth-code screens come FIRST: they are bottom-anchored
+  // (the press-Enter line in the last three rows, the code prompt near the
+  // bottom) and refuse any `❯` row in their window, so they never claim a live
+  // menu, while `matchNumberedModal` is not bottom-anchored and would card a
+  // numbered select left higher up the pane (a login-method menu above "Login
+  // successful. Press Enter to continue…") instead of the screen waiting on
+  // Enter. The theme picker sits before the unnumbered arm and is disjoint from
+  // it (no Enter-to-confirm footer); it is a boot-only shape (a never-onboarded
+  // or logged-out config).
+  return (quiet ? matchPromptScreen(tail) : null)
+    ?? matchNumberedModal(tail) ?? matchYesNoModal(tail) ?? matchSliderModal(tail)
     ?? (quiet && opts.boot ? matchThemePickerCard(tail) : null)
     ?? (quiet ? matchUnnumberedModal(tail) : null)
     ?? (quiet ? matchUnparsableModal(tail, opts.watchdogArmed) : null);
@@ -6846,6 +6908,8 @@ async function confirmStartupDialog(
   sessionName: string,
   m: StartupDialogMatch,
   live: {
+    /** The boot's own session: the confirm runs on its `queueTmuxOp` chain. */
+    state: SessionState;
     /** False once the session this boot belongs to was replaced or torn down
      *  (a respawn reuses the tmux name): no key may be sent after that. */
     stillCurrent: () => boolean;
@@ -6864,30 +6928,41 @@ async function confirmStartupDialog(
   const armWait = STARTUP_DIALOG_ARM_MS - (Date.now() - live.firstSeenAt);
   if (armWait > 0) await Bun.sleep(armWait);
   if (!live.stillCurrent()) return false;
-  // Every keystroke is computed from a LIVE read of the same dialog, never from
-  // the match that scheduled the attempt: the cursor may have moved since, or
-  // the dialog may be gone, and the two-row select WRAPS — a Down from "Yes"
-  // lands on "No, exit", where an accepted Enter exits claude.
-  const cap = await tmux(["capture-pane", "-p", "-t", sessionName]);
-  if (!cap.ok || !live.stillCurrent()) return false;
-  const fresh = live.rematch(cap.stdout);
-  if (!fresh || startupDialogIdentity(fresh) !== startupDialogIdentity(m)) return false;
-  // No readable cursor: no direction is safe. Send nothing; the tracker retries.
-  if (fresh.cursorIndex === null) return false;
-  const keys = planConfirmArrows({
-    cursorIndex: fresh.cursorIndex,
-    acceptIndex: fresh.acceptIndex,
-    heldAddDir: fresh.addDir?.footer === "held",
-  });
-  for (const arrow of keys) {
-    if (!live.stillCurrent()) return false;
+  // The read and the keys run on the task's tmux-op chain, the one a card
+  // answer and a paste use, so neither can interleave keys with this confirm.
+  let sent = false;
+  await queueTmuxOp(taskId, async (opCurrent) => {
+    const current = (): boolean => opCurrent() && live.stillCurrent();
+    // Every keystroke is computed from a LIVE read of the same dialog, never
+    // from the match that scheduled the attempt: the cursor may have moved
+    // since, or the dialog may be gone, and the two-row select WRAPS — a Down
+    // from "Yes" lands on "No, exit", where an accepted Enter exits claude.
+    const cap = await tmux(["capture-pane", "-p", "-t", sessionName]);
+    if (!cap.ok || !current()) return;
+    const fresh = live.rematch(cap.stdout);
+    if (!fresh || startupDialogIdentity(fresh) !== startupDialogIdentity(m)) return;
+    // No readable cursor: no direction is safe. Send nothing; the tracker retries.
+    if (fresh.cursorIndex === null) return;
+    // A card already owns this dialog (the user is answering it): leave it to the card.
+    const capLines = cap.stdout.split("\n");
+    const capTail = redactPaneSecrets(capLines.slice(Math.max(0, capLines.length - SCRAPE_TAIL_LINES)).join("\n"));
+    if (activeTmuxPromptsForTask(taskId).some((p) => liveShowsPendingCard(p, capTail))) return;
+    const keys = planConfirmArrows({
+      cursorIndex: fresh.cursorIndex,
+      acceptIndex: fresh.acceptIndex,
+      heldAddDir: fresh.addDir?.footer === "held",
+    });
+    for (const arrow of keys) {
+      if (!current()) return;
+      bumpIfLive();
+      if (!(await tmux(["send-keys", "-t", sessionName, arrow])).ok) return;
+      await Bun.sleep(STARTUP_CONFIRM_KEY_GAP_MS);
+    }
+    if (!current()) return;
     bumpIfLive();
-    if (!(await tmux(["send-keys", "-t", sessionName, arrow])).ok) return false;
-    await Bun.sleep(STARTUP_CONFIRM_KEY_GAP_MS);
-  }
-  if (!live.stillCurrent()) return false;
-  bumpIfLive();
-  return (await tmux(["send-keys", "-t", sessionName, "Enter"])).ok;
+    sent = (await tmux(["send-keys", "-t", sessionName, "Enter"])).ok;
+  }, live.state);
+  return sent;
 }
 
 /**
@@ -8444,6 +8519,12 @@ async function scrapeOnce(state: SessionState): Promise<void> {
 export function markTmuxPromptAnswered(taskId: string, fingerprint: string): void {
   const state = sessions.get(taskId);
   if (!state) return;
+  stampAnswered(state, fingerprint);
+}
+
+/** {@link markTmuxPromptAnswered} on a given session: the card drive stamps the
+ *  session that received the keys, not the task's current one. */
+function stampAnswered(state: SessionState, fingerprint: string): void {
   state.recentlyAnsweredFingerprints.set(fingerprint, Date.now());
   // Clear the stability cursor so the next match has to re-stabilise
   // before it can register again — this defends against the case where
@@ -9371,6 +9452,25 @@ export function formatSlowLaunchStatus(stages: {
  * observability — it never alters what gets spawned or when.
  */
 export async function spawnClaudeViaTmux(opts: ClaudeLaunchOptions): Promise<SpawnedAgent> {
+  claudeSpawnsInFlight.set(opts.taskId, (claudeSpawnsInFlight.get(opts.taskId) ?? 0) + 1);
+  try {
+    return await spawnClaudeViaTmuxInner(opts);
+  } finally {
+    const left = (claudeSpawnsInFlight.get(opts.taskId) ?? 1) - 1;
+    if (left > 0) claudeSpawnsInFlight.set(opts.taskId, left);
+    else claudeSpawnsInFlight.delete(opts.taskId);
+  }
+}
+
+/**
+ * Spawns of a task between their pre-kill of the tmux name and `sessions.set`.
+ * In that window the OLD boot's state is still `sessions.get(taskId)`, yet the
+ * tmux name may already belong to the new spawn's session, so a timed-out boot
+ * must not kill by that name or delete the entry while one is counted here.
+ */
+const claudeSpawnsInFlight = new Map<string, number>();
+
+async function spawnClaudeViaTmuxInner(opts: ClaudeLaunchOptions): Promise<SpawnedAgent> {
   const sessionName = sessionNameFor(opts.taskId);
 
   // Defensively clear any stale same-named session before (re)creating it, so
@@ -9627,6 +9727,7 @@ export async function spawnClaudeViaTmux(opts: ClaudeLaunchOptions): Promise<Spa
         // re-arm, and immediately before the final paste attempt.
         const slotLive = () => state.turnQueue.includes(initialSlot);
         let ready = false;
+        let liveOnlyBlockedSince: number | null = null;
         windows: for (;;) {
           const deadline = Date.now() + (deferredPromptTimeoutOverrideMs ?? DEFERRED_PROMPT_TIMEOUT_MS);
           while (Date.now() < deadline) {
@@ -9641,9 +9742,19 @@ export async function spawnClaudeViaTmux(opts: ClaudeLaunchOptions): Promise<Spa
           // still something to wait for: a pending card, or a startup dialog
           // the boot poller saw on the pane within its sighting grace (an
           // auto-confirm in flight, a dialog it is about to card, or one it
-          // is waiting out a refusal on). The paste only gives up when the
-          // boot itself does.
-          if (activeTmuxPromptsForTask(opts.taskId).length === 0 && !startupDialogOnPane(state)) break;
+          // is waiting out a refusal on), or one the paste's own modal guard
+          // sees on the live pane right now (a dialog the poller has not
+          // sighted, on which that guard would refuse the paste and fail the
+          // initial turn). The paste only gives up when the boot itself does,
+          // or when a pane only the guard sees as blocking (nothing carded or
+          // sighted it) has stayed that way for a full boot timeout.
+          if (activeTmuxPromptsForTask(opts.taskId).length > 0 || startupDialogOnPane(state)) {
+            liveOnlyBlockedSince = null;
+          } else {
+            if (!paneShowsBlockingPrompt(redactPaneSecrets(await capturePastePane(state)))) break;
+            liveOnlyBlockedSince ??= Date.now();
+            if (Date.now() - liveOnlyBlockedSince > (bootTimeoutOverrideMs ?? CLAUDE_BOOT_TIMEOUT_MS)) break;
+          }
           if (!(await tmux(["has-session", "-t", "=" + sessionName])).ok) return;
           if (sessions.get(opts.taskId) !== state) return;
           if (!slotLive()) return;
@@ -9780,6 +9891,8 @@ export async function spawnClaudeViaTmux(opts: ClaudeLaunchOptions): Promise<Spa
     const startupConfirm = createStartupConfirmTracker();
     let lastGenericFingerprint: string | null = null;
     let genericStreak = 0;
+    /** Consecutive boot polls with no modal on the pane (the no-match sweep's stability bar). */
+    let noGenericStreak = 0;
     // Set by the poller whenever a startup question is on the pane during the
     // current boot-wait window; read (and reset) by the wait loop so a window
     // in which the user was being asked something never counts toward the
@@ -9874,10 +9987,12 @@ export async function spawnClaudeViaTmux(opts: ClaudeLaunchOptions): Promise<Spa
           const step = startupConfirm.observe(m, now);
           for (const line of step.statuses) opts.onChunk("status", line);
           if (m) {
+            noGenericStreak = 0;
             state.startupDialogSeenAt = now;
             lastDialogAt = now;
             if (step.attempt) {
               await confirmStartupDialog(opts.taskId, sessionName, step.attempt, {
+                state,
                 stillCurrent: () => sessions.get(opts.taskId) === state,
                 firstSeenAt: dialogFirstSeenAt,
                 rematch: (p) => matchStartupConsentDialog(p, consentCtx),
@@ -9955,7 +10070,23 @@ export async function spawnClaudeViaTmux(opts: ClaudeLaunchOptions): Promise<Spa
             watchdogArmed: false,
             boot: true,
           });
-          if (!generic) { lastGenericFingerprint = null; genericStreak = 0; continue; }
+          if (!generic) {
+            lastGenericFingerprint = null;
+            genericStreak = 0;
+            // External dismissal with nothing in its place (the user answered
+            // the dialog in the terminal and claude moved on): settle the cards
+            // whose own dialog is gone, once the pane has shown no modal on two
+            // consecutive polls (one blank repaint frame must not drop a live
+            // card). A card whose dialog is still there stays.
+            noGenericStreak++;
+            if (noGenericStreak >= 2) {
+              for (const pending of activeTmuxPromptsForTask(opts.taskId)) {
+                if (!liveShowsPendingCard(pending, tail)) answerTmuxPrompt(pending.id, { key: "__external__" });
+              }
+            }
+            continue;
+          }
+          noGenericStreak = 0;
           // Something modal is on the pane: the deferred paste must not type into it.
           state.startupDialogSeenAt = now;
           // External dismissal: a previously surfaced startup prompt whose
@@ -10056,13 +10187,23 @@ export async function spawnClaudeViaTmux(opts: ClaudeLaunchOptions): Promise<Spa
       break;
     }
     bootSettled = true;
-    if (sessions.get(opts.taskId) !== state) {
-      // Superseded (a respawn or teardown replaced this session): the tmux name
-      // now belongs to the new one, so kill nothing and record nothing. Settle
-      // this boot's own queued turns so their promises don't hang.
+    // Superseded (a respawn or teardown replaced this session, or a respawn is
+    // between its pre-kill and taking the entry over): the tmux name belongs to
+    // the new one, so kill nothing and record nothing. Settle this boot's own
+    // queued turns so their promises don't hang.
+    const superseded = (): boolean =>
+      sessions.get(opts.taskId) !== state || claudeSpawnsInFlight.has(opts.taskId);
+    const settleSuperseded = (): void => {
       const err = new Error("jsonl-discovery-timeout");
       state.pendingEndTurn = null;
       for (const slot of state.turnQueue.splice(0)) slot.reject?.(err);
+    };
+    if (!found && superseded()) {
+      settleSuperseded();
+      return;
+    }
+    if (found && sessions.get(opts.taskId) !== state) {
+      settleSuperseded();
       return;
     }
     if (!found) {
@@ -10086,8 +10227,14 @@ export async function spawnClaudeViaTmux(opts: ClaudeLaunchOptions): Promise<Spa
       opts.onChunk("stderr", `expected at: ${jsonlPath}`);
       // A code typed into claude's OAuth prompt can be on the pane: mask it.
       opts.onChunk("stderr", `--- tmux pane ---\n${redactPaneSecrets(pane)}\n--- end pane ---`);
+      // The captures above awaited: a respawn may have taken the name since.
+      // Re-checked with no await before the kill, which is sent at once.
+      if (superseded()) {
+        settleSuperseded();
+        return;
+      }
       await killTaskSession(opts.taskId);
-      sessions.delete(opts.taskId);
+      if (sessions.get(opts.taskId) === state) sessions.delete(opts.taskId);
       // Reject every queued turn so all dependent promises settle. Drop any
       // staged end_turn — without claude's JSONL we can't confirm it, and
       // letting it fire later would emit a "turn complete" for a turn that
@@ -11659,6 +11806,19 @@ let beforeSendTurnFlushHook: ((taskId: string) => void) | null = null;
 // dispatch logic against a real temp JSONL file without going through
 // tmux. Not part of the public surface.
 export const __forTest = {
+  /** Count a spawn of `taskId` as in flight (between its pre-kill and taking
+   *  the session entry over) until the returned release runs. */
+  holdSpawnInFlight(taskId: string): () => void {
+    claudeSpawnsInFlight.set(taskId, (claudeSpawnsInFlight.get(taskId) ?? 0) + 1);
+    let released = false;
+    return () => {
+      if (released) return;
+      released = true;
+      const left = (claudeSpawnsInFlight.get(taskId) ?? 1) - 1;
+      if (left > 0) claudeSpawnsInFlight.set(taskId, left);
+      else claudeSpawnsInFlight.delete(taskId);
+    };
+  },
   /** Register a synthetic session keyed on taskId, returning the queue
    *  + offset surface for assertions. */
   installSession(taskId: string, jsonlPath: string): SessionState {

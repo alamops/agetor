@@ -16,8 +16,9 @@ import { makeScriptedClaudeTmux, type ScriptedConfig, type ScriptedSession } fro
  * ────────────────────────────────────────────────────────────────────────── */
 
 const testDataDir = mkdtempSync(path.join(tmpdir(), "agetor-claude-session-fresh-"));
-process.env.AGETOR_DATA_DIR = testDataDir;
 // `bun test` runs every file in one process: restored in afterAll.
+const savedDataDir = process.env.AGETOR_DATA_DIR;
+process.env.AGETOR_DATA_DIR = testDataDir;
 const savedClaudeBin = process.env.AGETOR_CLAUDE_BIN;
 process.env.AGETOR_CLAUDE_BIN = "claude";
 
@@ -41,6 +42,8 @@ afterAll(() => {
   else process.env.AGETOR_CLAUDE_BIN = savedClaudeBin;
   scripted.cleanup();
   rmTestDataDir(testDataDir);
+  if (savedDataDir === undefined) delete process.env.AGETOR_DATA_DIR;
+  else process.env.AGETOR_DATA_DIR = savedDataDir;
 });
 afterEach(() => setBootTimeoutMs(null));
 
@@ -54,6 +57,7 @@ interface Launch {
   stamped: Array<{ id: string; jsonlExistedThen: boolean }>;
   jsonl: (id: string) => string;
   cwd: string;
+  configDir: string;
   stop: () => Promise<void>;
   done: Promise<number>;
 }
@@ -62,13 +66,20 @@ interface Launch {
  *  every later file in this process (`launch-settle.test.ts`). */
 const DEFAULT_TEST_BOOT_TIMEOUT_MS = 2_000;
 
-async function launch(o: { resumeSessionId?: string | null; writeJsonlFor?: string; dialogs: ScriptedConfig["dialogs"]; autoTrustDirectories?: Array<{ name: string; paths: string[] }> }): Promise<Launch> {
-  const taskId = randomUUID();
+async function launch(o: {
+  resumeSessionId?: string | null;
+  writeJsonlFor?: string;
+  dialogs: ScriptedConfig["dialogs"];
+  autoTrustDirectories?: Array<{ name: string; paths: string[] }>;
+  /** Relaunch an earlier launch's task (same task id, working directory and config dir). */
+  retryOf?: Launch;
+}): Promise<Launch> {
+  const taskId = o.retryOf?.taskId ?? randomUUID();
   const bootsBefore = claudeBootsInFlight();
   const timeoutOverride = setBootTimeoutMs(null);
   setBootTimeoutMs(timeoutOverride ?? DEFAULT_TEST_BOOT_TIMEOUT_MS);
-  const cwd = mkdtempSync(path.join(tmpdir(), "agetor-claude-session-cwd-"));
-  const configDir = mkdtempSync(path.join(tmpdir(), "agetor-claude-session-cfg-"));
+  const cwd = o.retryOf?.cwd ?? mkdtempSync(path.join(tmpdir(), "agetor-claude-session-cwd-"));
+  const configDir = o.retryOf?.configDir ?? mkdtempSync(path.join(tmpdir(), "agetor-claude-session-cfg-"));
   const jsonl = (id: string) => jsonlPathFor(cwd, id, configDir);
   if (o.writeJsonlFor) {
     mkdirSync(path.dirname(jsonl(o.writeJsonlFor)), { recursive: true });
@@ -100,7 +111,8 @@ async function launch(o: { resumeSessionId?: string | null; writeJsonlFor?: stri
     taskId,
     session,
     get argv() {
-      const call = session.calls().find((c) => c.argv[0] === "new-session");
+      // The latest launch under this tmux name (a retry of the same task reuses it).
+      const call = session.calls().filter((c) => c.argv[0] === "new-session").at(-1);
       const raw = call?.argv ?? [];
       const dash = raw.indexOf("--");
       return dash >= 0 ? raw.slice(dash + 1) : raw;
@@ -109,6 +121,7 @@ async function launch(o: { resumeSessionId?: string | null; writeJsonlFor?: stri
     stamped,
     jsonl,
     cwd,
+    configDir,
     stop: async () => {
       await dropSession(taskId);
       const deadline = Date.now() + 15_000;
@@ -157,11 +170,16 @@ describe("spawnAgent claude branch — session id timing and the resume check", 
       // The first launch used `--session-id <fresh uuid>`, never `--resume`.
       expect(flag(l.argv, "--session-id")).toMatch(/^[0-9a-f-]{36}$/);
       expect(l.argv).not.toContain("--resume");
-      // …and with no id recorded, the next turn has nothing to resume: fresh again, a NEW id.
-      const next = await launch({ dialogs: [] });
+      // …and with no id recorded, the retry of the SAME task has nothing to
+      // resume (the orchestrator passes the last id a run recorded, here none):
+      // fresh again, under a NEW id, and the failed boot left no session file.
+      const failedId = flag(l.argv, "--session-id")!;
+      expect(existsSync(l.jsonl(failedId))).toBe(false);
+      const next = await launch({ dialogs: [], retryOf: l, resumeSessionId: l.stamped.at(-1)?.id ?? null });
       try {
+        expect(next.taskId).toBe(l.taskId);
         expect(next.argv).not.toContain("--resume");
-        expect(flag(next.argv, "--session-id")).not.toBe(flag(l.argv, "--session-id"));
+        expect(flag(next.argv, "--session-id")).not.toBe(failedId);
       } finally {
         await next.stop();
       }

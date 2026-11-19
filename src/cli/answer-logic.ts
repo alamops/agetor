@@ -240,8 +240,12 @@ export function tmuxCodeProblem(raw: string): string | null {
 /** The hint line for a card that was re-registered after a refused confirm. */
 export const TMUX_HELD_HINT = "Claude didn't take the first keypress — choose again.";
 
-/** The sentence for an answer the route refused (never echoes a typed code). */
-export function tmuxAnswerFailure(status: number, message: string | undefined): string {
+/** The sentence for an answer the route refused (never echoes a typed code).
+ *  `body` is the refusal's JSON body: its `code` tells the 409s apart. */
+export function tmuxAnswerFailure(status: number, message: string | undefined, body?: unknown): string {
+  const code = typeof body === "object" && body !== null ? (body as { code?: unknown }).code : undefined;
+  if (status === 409 && code === "answer-in-flight") return "this prompt is already being answered elsewhere — nothing was sent";
+  if (status === 409 && code === "field-not-empty") return message || "Claude's code field already has text in it";
   if (status === 409) return "the prompt changed — run `agetor answer` again";
   if (status === 410) return "the session is gone — start the task again";
   return message || "failed to answer";

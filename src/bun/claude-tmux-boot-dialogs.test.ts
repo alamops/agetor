@@ -15,6 +15,8 @@ import { makeScriptedClaudeTmux, type ScriptedConfig, type ScriptedSession } fro
  * ────────────────────────────────────────────────────────────────────────── */
 
 const testDataDir = mkdtempSync(path.join(tmpdir(), "agetor-boot-dialogs-data-"));
+// `bun test` runs every file in one process: restored in afterAll.
+const savedDataDir = process.env.AGETOR_DATA_DIR;
 process.env.AGETOR_DATA_DIR = testDataDir;
 
 const {
@@ -27,6 +29,7 @@ const {
   sessionNameFor,
   claudeBootsInFlight,
   answerTmuxPromptInPane,
+  __forTest,
 } = await import("./claude-tmux.ts");
 const { activeTmuxPromptsForTask, answerTmuxPrompt, findTmuxPromptById } = await import("./interactions.ts");
 const { tasks, runs } = await import("./db.ts");
@@ -43,6 +46,8 @@ afterAll(() => {
   else process.env.AGETOR_TMUX_BIN = savedTmuxBin;
   scripted.cleanup();
   rmTestDataDir(testDataDir);
+  if (savedDataDir === undefined) delete process.env.AGETOR_DATA_DIR;
+  else process.env.AGETOR_DATA_DIR = savedDataDir;
 });
 
 interface Chunk { stream: string; data: string }
@@ -130,7 +135,13 @@ async function boot(
   const fileReady: string[] = [];
   const agent = await spawnClaudeViaTmux({
     taskId,
-    argv: o.deferredPrompt ? ["claude", "--session-id", sessionId] : ["claude", "--session-id", sessionId, "hello"],
+    // As `buildClaudeArgv` builds it: `--resume` reopens the session file,
+    // `--session-id` starts one; a deferred prompt is pasted, never in argv.
+    argv: [
+      "claude",
+      ...(o.resume ? ["--resume", sessionId] : ["--session-id", sessionId]),
+      ...(o.deferredPrompt ? [] : ["hello"]),
+    ],
     env: {},
     cwd,
     onChunk: (stream, data) => { chunks.push({ stream, data }); },
@@ -453,7 +464,10 @@ describe("deferred prompt paste during an auto-confirm (no card ever exists)", (
     try {
       await until(() => b.tmux.state().done, 30_000, "the dialog auto-confirmed");
       expect(activeTmuxPromptsForTask(b.taskId)).toHaveLength(0);
-      const confirmedAt = b.tmux.keys().filter((k) => k.k === "Enter" && !k.literal).at(-1)!.t;
+      // The consent confirm is the THIRD bare Enter (after the two refused
+      // ones), not the last: the deferred paste's own submit Enter may already
+      // have landed by the time this samples the log.
+      const confirmedAt = b.tmux.keys().filter((k) => k.k === "Enter" && !k.literal)[2]!.t;
       await until(() => pastes().length === 1, 15_000, "the deferred paste");
       expect(pastes()[0]!.t).toBeGreaterThan(confirmedAt);
       expect(b.statuses().some((s) => s.includes("delivering prompt anyway"))).toBe(false);
@@ -546,3 +560,62 @@ describe("boot poller — auto-confirm gives up and hands the dialog to a card",
 
 // Silence "unused" for helpers kept for readability in failures.
 void findTmuxPromptById;
+
+describe("boot poller — a card whose dialog went away with nothing in its place", () => {
+  test("is settled once the pane has shown no modal on two polls; a card whose dialog is still there stays", async () => {
+    setBootTimeoutMs(15_000);
+    const b = await boot({ dialogs: [{ kind: "enter-only" }] }, { autoTrustDirectories: [], withRun: true });
+    try {
+      await until(() => activeTmuxPromptsForTask(b.taskId).length === 1, 15_000, "card");
+      // Still on screen: the card stays across many polls.
+      await new Promise((r) => setTimeout(r, 1_200));
+      expect(activeTmuxPromptsForTask(b.taskId)).toHaveLength(1);
+      // Answered in the terminal: claude moves on to a plain (non-modal) frame,
+      // and has not written its session file yet.
+      b.tmux.patch({ cfg: { dialogs: [{ kind: "raw", text: " Starting up…\n" }] } });
+      await until(() => activeTmuxPromptsForTask(b.taskId).length === 0, 5_000, "the stale card settled");
+    } finally {
+      await b.stop();
+    }
+  }, 40_000);
+});
+
+describe("deferred prompt paste — a blocking dialog nothing carded or sighted", () => {
+  test("the paste keeps waiting while the live pane shows it, then lands once it is gone", async () => {
+    // A resumed boot: its consent window ignores a non-consent dialog, and with
+    // no run the scraper cards nothing, so only the live guard sees it.
+    setDeferredPromptTimeoutMs(300);
+    setBootTimeoutMs(15_000);
+    const modal = " Do you want to proceed?\n ❯ 1. Yes\n   2. No\n";
+    const b = await boot({ dialogs: [{ kind: "raw", text: modal }] }, { deferredPrompt: "a very large prompt", resume: true });
+    const pastes = () => b.tmux.calls().filter((c) => c.argv[0] === "paste-buffer");
+    try {
+      // Several readiness windows elapse with the dialog up.
+      await new Promise((r) => setTimeout(r, 2_000));
+      expect(b.statuses().some((s) => s.includes("delivering prompt anyway"))).toBe(false);
+      expect(b.stderr()).not.toContain("paste failed");
+      expect(pastes()).toHaveLength(0);
+      b.tmux.patch({ i: 1, done: true }); // the dialog is answered: claude's composer is up
+      await until(() => pastes().length === 1, 15_000, "the deferred paste");
+    } finally {
+      await b.stop();
+    }
+  }, 40_000);
+});
+
+describe("boot timeout while a respawn is between its pre-kill and taking the session over", () => {
+  test("the expired boot kills nothing by the shared tmux name and leaves the entry alone", async () => {
+    setBootTimeoutMs(800);
+    const b = await boot({ dialogs: [{ kind: "raw", text: " Starting up…\n" }] });
+    const release = __forTest.holdSpawnInFlight(b.taskId);
+    try {
+      const spawnedAt = b.tmux.calls().find((c) => c.argv[0] === "new-session")!.t;
+      await expect(b.done).rejects.toThrow("jsonl-discovery-timeout");
+      expect(b.tmux.calls().filter((c) => c.argv[0] === "kill-session" && c.t >= spawnedAt)).toEqual([]);
+      expect(b.stderr()).not.toContain("JSONL never appeared");
+    } finally {
+      release();
+      await b.stop();
+    }
+  }, 30_000);
+});

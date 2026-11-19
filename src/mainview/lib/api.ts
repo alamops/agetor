@@ -101,6 +101,7 @@ import type {
   TaskReference,
   TaskType,
   TerminalTab,
+  TmuxPromptAnswerBody,
   UpdateStatus,
   WorktreeGitStatus,
   WorktreeInfo,
@@ -308,14 +309,8 @@ export interface PendingTmuxPrompt {
   held?: boolean;
 }
 
-/** Body of `POST /tmux-prompts/:id/answer`: exactly one member. `enter` only
- *  on an `answerKind: "enter"` card, `code` only on an `answerKind: "code"`
- *  card (one line, at most 512 characters). */
-export type TmuxPromptAnswerBody =
-  | { key: string }
-  | { reject: true }
-  | { enter: true }
-  | { code: string };
+/** Body of `POST /tmux-prompts/:id/answer` (the shared exact-one type). */
+export type { TmuxPromptAnswerBody };
 
 /** The ACP tool call an fx permission request is asking about — mirrors
  *  `FxPermissionToolCall` on the server (`src/bun/interactions.ts`). Only

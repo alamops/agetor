@@ -504,5 +504,5 @@ function optionLabels(req: AnyRequest | null, qIndex: number): string[] {
 /** The line for a refused tmux answer: the route's fixed sentence (it never
  *  quotes a typed code), or the error's own message. */
 function tmuxFailureText(e: unknown): string {
-  return e instanceof ApiError ? tmuxAnswerFailure(e.status, e.message) : (e as Error).message;
+  return e instanceof ApiError ? tmuxAnswerFailure(e.status, e.message, e.body) : (e as Error).message;
 }
