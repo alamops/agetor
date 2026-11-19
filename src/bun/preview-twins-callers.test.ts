@@ -39,7 +39,7 @@ describe("who may write a preview twin", () => {
 
   test("the /refs/resolve call is guarded by the app caller and the previewTwins flag", () => {
     const server = readFileSync(path.join(SRC, "bun/server.ts"), "utf8");
-    expect(server).toMatch(/caller === "app" && body\.previewTwins === true\) await writePreviewTwinsForRefs\(/);
+    expect(server).toMatch(/caller === "app" && body\.previewTwins === true\) \{[^}]*await writePreviewTwinsForRefs\(dataDir, refs, \(ref\) => names\.has\(/);
   });
 });
 
@@ -54,7 +54,7 @@ describe("who may ask /refs/resolve for twins", () => {
   test("api.resolveRefs never sends the flag; resolveCapturedRefs does", () => {
     const api = readFileSync(path.join(SRC, "mainview/lib/api.ts"), "utf8");
     expect(api).toContain("body: JSON.stringify({ paths }),");
-    expect(countMatches(api, /body: JSON\.stringify\(\{ paths, previewTwins: true \}\)/g)).toBe(1);
+    expect(countMatches(api, /body: JSON\.stringify\(\{ paths, names, previewTwins: true \}\)/g)).toBe(1);
   });
 
   test("resolveCapturedRefs is referenced only by api.ts and capture-refs.ts", () => {

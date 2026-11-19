@@ -152,9 +152,11 @@ export type ScreenshotUploader = (blob: Blob) => Promise<{ path: string; basenam
 /** Resolve the absolute paths a drop/paste carried as `file://` URLs into
  *  references (server stats each). Injectable for tests; production callers
  *  pick up `api.resolveCapturedRefs`, which also asks the core to write a
- *  preview twin of each image: these paths came from a user's own drop/paste,
- *  unlike the agent-chosen paths `api.resolveRefs` serves elsewhere. */
-export type RefResolver = (paths: string[]) => Promise<TaskReference[]>;
+ *  preview twin of each image a carried `File` vouches for. `names` are the
+ *  basenames of the `File`s the same drop/paste carried: a `file://` line in
+ *  plain text (an agent's output dragged out of the transcript) carries no
+ *  `File`, so it gets a stat and a reference but never a twin. */
+export type RefResolver = (paths: string[], names: string[]) => Promise<TaskReference[]>;
 
 /** Recover the current drag's real paths off the macOS drag pasteboard
  *  (drop only — see `captureDroppedOrPastedItems`). `names` are the basenames
@@ -285,7 +287,7 @@ export async function captureDroppedOrPastedItems(
 
   if (filePaths.length) {
     try {
-      const refs = await resolver(filePaths);
+      const refs = await resolver(filePaths, collected.map((c) => c.file.name));
       const items = refs.map((ref) => ({ ref, basename: refBasename(ref.path) }));
       return { items, skipped: Math.max(0, filePaths.length - refs.length), skippedFolders: 0 };
     } catch (e) {

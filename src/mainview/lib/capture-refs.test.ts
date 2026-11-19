@@ -264,6 +264,34 @@ test("a dragged image file uses its path (URL), not an upload", async () => {
   expect(r.items[0]!.ref.path).toBe("/Users/x/photo.png");
 });
 
+test("rung 1 sends the carried Files' names to the resolver (the core twins only what they vouch for)", async () => {
+  const seen: Array<{ paths: string[]; names: string[] }> = [];
+  const resolver: RefResolver = async (paths, names) => {
+    seen.push({ paths, names });
+    return paths.map((p) => ({ path: p, isDirectory: false }));
+  };
+  const dt = makeUriListTransfer(
+    { "text/uri-list": "file:///Users/x/photo.heic" },
+    [{ kind: "file", file: blobImage("photo.heic") }],
+  );
+  await captureDroppedOrPastedItems(dt, { resolver, dragRefs: noDrag });
+  expect(seen).toEqual([{ paths: ["/Users/x/photo.heic"], names: ["photo.heic"] }]);
+});
+
+test("a text/plain-only drop of a file:// line (agent output) carries no File names, so no twin can be requested", async () => {
+  const seen: Array<{ paths: string[]; names: string[] }> = [];
+  const resolver: RefResolver = async (paths, names) => {
+    seen.push({ paths, names });
+    return paths.map((p) => ({ path: p, isDirectory: false }));
+  };
+  const dt = makeUriListTransfer({ "text/plain": "file:///Users/x/Desktop/secret.png\nfile:///Users/x/Desktop/x.heic" });
+  const r = await captureDroppedOrPastedItems(dt, { resolver, dragRefs: noDrag });
+  // The reference itself still resolves (a stat), but the names list is empty,
+  // which is what makes the core skip every twin.
+  expect(seen).toEqual([{ paths: ["/Users/x/Desktop/secret.png", "/Users/x/Desktop/x.heic"], names: [] }]);
+  expect(r.items).toHaveLength(2);
+});
+
 test("transient temp-dir URL is ignored; image blob is uploaded instead", async () => {
   // A macOS screenshot-thumbnail drag may carry a file:// URL into a temp
   // dir *and* the image blob. We must not reference the temp path (it can
@@ -597,8 +625,8 @@ test("rung 1 with no injected resolver uses api.resolveCapturedRefs (twins), nev
   const realCaptured = api.resolveCapturedRefs;
   const realPlain = api.resolveRefs;
   const calls: string[] = [];
-  api.resolveCapturedRefs = async (paths) => {
-    calls.push(`captured:${paths.join(",")}`);
+  api.resolveCapturedRefs = async (paths, names) => {
+    calls.push(`captured:${paths.join(",")}|${names.join(",")}`);
     return [{ path: paths[0]!, isDirectory: false }];
   };
   api.resolveRefs = async () => {
@@ -608,7 +636,7 @@ test("rung 1 with no injected resolver uses api.resolveCapturedRefs (twins), nev
   try {
     const dt = makeUriListTransfer({ "text/uri-list": "file:///Users/x/pic.heic" });
     const r = await captureDroppedOrPastedItems(dt, { dragRefs: noDrag });
-    expect(calls).toEqual(["captured:/Users/x/pic.heic"]);
+    expect(calls).toEqual(["captured:/Users/x/pic.heic|"]);
     expect(r.items.map((i) => i.ref.path)).toEqual(["/Users/x/pic.heic"]);
   } finally {
     api.resolveCapturedRefs = realCaptured;

@@ -6,7 +6,7 @@
 | Source | The owner's report in the pipeline task prompt (restated in §1, per grill D19); investigation `docs/plans/picked-image-preview-tcc-investigation.md`; grill record `docs/plans/picked-image-preview-tcc-grill.md` (D1–D20, answers in `docs/plans/picked-image-preview-tcc-grill/round-1/answers.json`); two planning-time owner answers (§8 P1, P2) |
 | Flags | none |
 | Gates | Grilled (20/20 answered); 2 planning-time questions answered by the owner. The twin work (waves 2–3) is gated by the S1 spike (grill D15). |
-| Status | implemented on the branch (waves 0–4 done, e2e and unit green except as listed in §8.2); V1, the live check on a signed build, is owner-assisted and still to do |
+| Status | implemented on the branch (waves 0–4 done, e2e and unit green except as listed in §10.3; the §10.2 deviations apply); V1, the live check on a signed build, is owner-assisted and still to do |
 | Branch | `fix/agetor-broken-for-visibility-file` (the agetor task branch). Do **not** cut a new branch in this worktree: agetor re-checks out `task.branch` on the next run. |
 | Base SHA | `4d7f8bfb` (HEAD when execution started; the planning docs are `0e168acb` on top of it) |
 
@@ -393,7 +393,7 @@ bun node_modules/@playwright/test/cli.js test e2e/markdown-images.spec.ts e2e/se
 **Blast radius.**
 - `statusForHttp(403)` changes for every `AuthedImg` and `useAuthedObjectUrl` consumer. All four are covered (T2–T5), and `GitHubDialog`'s PR panes keep generic copy, though now in a neutral pane.
 - `/refs/drag` and `/refs/resolve` bodies grow an optional field each, and older webviews keep working (no field → no twins).
-- `capture-refs` rung 1 now posts `previewTwins: true`.
+- `capture-refs` rung 1 now posts `previewTwins: true` and `names` (the basenames of the carried `File`s; see §10.2 item 6).
 - `previews/` is new under `dataDir`. Nothing deletes it on task delete, by design (path-keyed, shared by tasks, capped).
 - Rollback is a revert. A leftover `~/.agetor/previews/` is inert and can be deleted by hand.
 
@@ -474,6 +474,7 @@ bun node_modules/@playwright/test/cli.js test e2e/markdown-images.spec.ts e2e/se
 3. **Port 4469, not 4471**, for `preview-twins-endpoint.test.ts` (`daemon-boot.test.ts` already uses 4471). `__forTest` gained `passes()` so the coalescing test can count sweep passes.
 4. **`ImageChip` reports `data-preview-state` `loading` until the thumbnail settles** (the plan's list), and `ok` only once it has.
 5. E1's blocked cases `chmod 000` the planted file *before* the pick (as the plan says) inside a `pickImage` helper; the twin case chmods after it.
+6. **`/refs/resolve` also takes `names`, and twins only a path a name vouches for** (code review M1, 2026-11-18). Rung 1 collects `file://` lines from `text/plain` too, and the composer's drop wrappers capture any drop that bubbles up from the textarea, so dragging agent output that names a protected path would otherwise have made the core copy that file in-process (a silent read or a prompt in Agetor's name, and a copy under `previews/` the agent can read). `capture-refs` now sends the basenames of the `File`s the same drop/paste carried, and the handler applies the same check as `/refs/drag`. A text-only drop carries no `File`, so it still gets its reference (a stat) but never a twin. The `previewTwins: true` flag and the app-caller guard stay. Pinned by `preview-twins-endpoint.test.ts`, `capture-refs.test.ts` and `preview-twins-callers.test.ts`.
 
 ### 10.3 Still open
 

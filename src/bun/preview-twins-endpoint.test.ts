@@ -171,21 +171,40 @@ describe("/refs/resolve twins only for the app caller that asks for it", () => {
 
   test("the app token with previewTwins: true: a twin", async () => {
     const png = file("resolve-flag.png");
-    const res = await post("/refs/resolve", { paths: [png], previewTwins: true });
+    const res = await post("/refs/resolve", { paths: [png], names: [path.basename(png)], previewTwins: true });
     expect(((await res.json()) as { refs: unknown[] }).refs).toHaveLength(1);
     expect(hasTwin(png)).toBe(true);
   });
 
+  test("previewTwins without a vouching name: the stat answers, no twin (text drop of a file:// line)", async () => {
+    const png = file("resolve-noname.png");
+    const other = file("resolve-othername.png");
+    for (const names of [undefined, [], ["unrelated.png"], [42, null], path.basename(png)]) {
+      const res = await post("/refs/resolve", { paths: [png, other], names, previewTwins: true });
+      expect(((await res.json()) as { refs: unknown[] }).refs).toHaveLength(2);
+    }
+    expect(hasTwin(png)).toBe(false);
+    expect(hasTwin(other)).toBe(false);
+  });
+
+  test("only the path a name vouches for is twinned", async () => {
+    const vouched = file("resolve-vouched.png");
+    const stranger = file("resolve-stranger.png");
+    await post("/refs/resolve", { paths: [vouched, stranger], names: [path.basename(vouched)], previewTwins: true });
+    expect(hasTwin(vouched)).toBe(true);
+    expect(hasTwin(stranger)).toBe(false);
+  });
+
   test("only a literal true counts", async () => {
     const png = file("resolve-truthy.png");
-    await post("/refs/resolve", { paths: [png], previewTwins: "true" });
-    await post("/refs/resolve", { paths: [png], previewTwins: 1 });
+    await post("/refs/resolve", { paths: [png], names: [path.basename(png)], previewTwins: "true" });
+    await post("/refs/resolve", { paths: [png], names: [path.basename(png)], previewTwins: 1 });
     expect(hasTwin(png)).toBe(false);
   });
 
   test("the CLI token with the flag still gets no twin (D17)", async () => {
     const png = file("resolve-cli.png");
-    const res = await post("/refs/resolve", { paths: [png], previewTwins: true }, cliToken);
+    const res = await post("/refs/resolve", { paths: [png], names: [path.basename(png)], previewTwins: true }, cliToken);
     expect(res.status).toBe(200);
     expect(((await res.json()) as { refs: unknown[] }).refs).toHaveLength(1);
     expect(hasTwin(png)).toBe(false);

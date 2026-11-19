@@ -1027,13 +1027,16 @@ export const api = {
    *  (`capture-refs` rung 1, and nothing else): the same stat, plus
    *  `previewTwins: true`, which asks the core to also write a preview twin of
    *  each image so its thumbnail survives macOS's privacy block on the folder
-   *  (docs/architecture/security.md, "Preview twins"). Every other caller of
+   *  (docs/architecture/security.md, "Preview twins"). `names` are the basenames
+   *  of the `File`s the same drop/paste carried; the core twins only a path one
+   *  of them vouches for, so a `file://` line in dragged text (agent output)
+   *  can't make it copy a file the user never dropped. Every other caller of
    *  `/refs/resolve` names agent-chosen paths and must keep using
    *  `resolveRefs`, which never sends the flag. */
-  resolveCapturedRefs: (paths: string[]) =>
+  resolveCapturedRefs: (paths: string[], names: string[]) =>
     j<{ refs: TaskReference[] }>("/refs/resolve", {
       method: "POST",
-      body: JSON.stringify({ paths, previewTwins: true }),
+      body: JSON.stringify({ paths, names, previewTwins: true }),
     }).then((r) => r.refs),
   /** Recover the real paths of the drag/drop that just ended, off the macOS
    *  drag pasteboard — WKWebView exposes no `file://` URLs on a drop, so this

@@ -449,6 +449,13 @@ async function taskGitStatusForDir(
   };
 }
 
+/** The basenames of the `File`s a drop or paste carried, as the webview sent
+ *  them (`names`): strings only, at most 256. A preview twin is written only
+ *  for a path one of these vouches for. */
+function fileNameSet(raw: unknown): Set<string> {
+  return new Set(Array.isArray(raw) ? raw.filter((n): n is string => typeof n === "string").slice(0, 256) : []);
+}
+
 function refsFromPaths(rawPaths: unknown[]): TaskReference[] {
   const refs: TaskReference[] = [];
   const seen = new Set<string>();
@@ -7618,7 +7625,11 @@ export function startApiServer(
       // than trusting the webview's view of directory-ness.
       "/refs/resolve": {
         POST: authed(async (req) => {
-          const body = (await req.json().catch(() => ({}))) as { paths?: unknown; previewTwins?: unknown };
+          const body = (await req.json().catch(() => ({}))) as {
+            paths?: unknown;
+            names?: unknown;
+            previewTwins?: unknown;
+          };
           const raw = Array.isArray(body.paths) ? body.paths : [];
           const caller = callerOf(req);
           const refs = await refsFromPathsForCaller(raw, caller);
@@ -7628,7 +7639,15 @@ export function startApiServer(
           // scope) stat paths an AGENT chose, with the app token and no user
           // action, so they never send it, and the core never reads those in
           // its own process. The CLI token never gets a twin either way.
-          if (caller === "app" && body.previewTwins === true) await writePreviewTwinsForRefs(dataDir, refs);
+          // Even then a twin is written only for a path whose basename one of
+          // the dropped/pasted `File`s (`names`) vouches for: a `file://` line
+          // in plain text dragged out of the transcript carries no `File`, so
+          // an agent's text can't make the core copy a file the user never
+          // dropped (same check as `/refs/drag`).
+          if (caller === "app" && body.previewTwins === true) {
+            const names = fileNameSet(body.names);
+            await writePreviewTwinsForRefs(dataDir, refs, (ref) => names.has(path.basename(ref.path)));
+          }
           return json({ refs }, { headers: corsHeaders(req) });
         }),
       },
@@ -7645,11 +7664,7 @@ export function startApiServer(
           // pasteboard is shared state an agent could rewrite mid-drag, so a
           // preview twin is written only for a pasteboard path one of these
           // names vouches for.
-          const names = new Set(
-            Array.isArray(body.names)
-              ? body.names.filter((n): n is string => typeof n === "string").slice(0, 256)
-              : [],
-          );
+          const names = fileNameSet(body.names);
           const refs = refsFromPaths(readDragPasteboardPaths());
           // Images `POST /screenshots` can take are uploaded by the webview
           // (their bytes are copied to a file Agetor owns), so only the other
