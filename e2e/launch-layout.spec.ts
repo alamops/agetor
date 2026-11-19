@@ -216,4 +216,38 @@ test.describe("New Task panel layout", () => {
     await expect.poll(width).toBe(500);
     await expect(panel.getByTestId("new-task-panel-resize")).toHaveAttribute("aria-valuenow", "500");
   });
+
+  test("a click or a key press that changes nothing, and a reset, never overwrite the saved width in a narrow window", async ({ page, freshBackend }) => {
+    await gotoApp(page, freshBackend.bootBase, { launchMoreOpen: false });
+    const full = page.viewportSize()!;
+    await page.evaluate(() => localStorage.setItem("agetor:newTaskPanelWidth", "500"));
+    await page.setViewportSize({ width: 900, height: full.height });
+    await page.reload();
+    const panel = newTaskPanel(page);
+    const handle = panel.getByTestId("new-task-panel-resize");
+    const saved = () => page.evaluate(() => localStorage.getItem("agetor:newTaskPanelWidth"));
+    // The window limits what is shown (900 - 480 board = 420), and the handle's range with it.
+    await expect(handle).toHaveAttribute("aria-valuenow", "420");
+    await expect(handle).toHaveAttribute("aria-valuemax", "420");
+
+    // A click without movement is not a resize.
+    const box = (await handle.boundingBox())!;
+    await page.mouse.click(box.x + box.width / 2, box.y + box.height / 2);
+    // Neither is a key that is already at the limit.
+    await handle.focus();
+    await page.keyboard.press("End");
+    await page.keyboard.press("ArrowRight");
+    expect(await saved()).toBe("500");
+    await page.setViewportSize(full);
+    await expect(handle).toHaveAttribute("aria-valuenow", "500");
+
+    // The reset is limited to the window too: never wider than the handle's own maximum.
+    await page.setViewportSize({ width: 700, height: full.height });
+    await expect(handle).toHaveAttribute("aria-valuenow", "320");
+    await handle.dblclick();
+    await expect(handle).toHaveAttribute("aria-valuenow", "320");
+    await expect(handle).toHaveAttribute("aria-valuemax", "320");
+    await page.setViewportSize(full);
+    await expect(handle).toHaveAttribute("aria-valuenow", "384");
+  });
 });

@@ -6,7 +6,7 @@
 | Source | Pipeline task text and the owner's screenshot (outside the repo, transcribed in the investigation §1); `docs/plans/new-task-ui-ux-investigation.md`; `docs/plans/new-task-ui-ux-grill.md` (the contract) with `docs/plans/new-task-ui-ux-grill/round-{1,2}/answers.json` |
 | Flags | none |
 | Gates | grilled (2 rounds, complete, no one-way doors); approved by owner as written on 2026-11-18, with the §8 assumptions as defaults |
-| Status | implemented on the branch; code-review rounds 1 and 2 fixed (see "Execution notes — review round 1" and "— review round 2"). The full e2e suite (532 tests) was green at round 1; round 2 re-ran only the affected specs (listed in its notes). Deviations are listed under "Execution notes" at the end. |
+| Status | implemented on the branch; code-review rounds 1–4 fixed (see "Execution notes — review round 1", "— review round 2", "Review round 3" and "Review round 4"). The full e2e suite (532 tests) was green at round 1; round 2 re-ran only the affected specs (listed in its notes). Deviations are listed under "Execution notes" at the end. |
 | Branch | `fix/agetor-new-task-ui-improvement` |
 | Base SHA | `4d7f8bfb93320076aa86292d614d84d4b883ba7d` |
 
@@ -198,7 +198,7 @@ Sources: `CLAUDE.md`, and memory where noted.
    - **A non-default value or an error behind a closed control is announced on the control's row.** Examples: "More options · Speed: Fast"; a danger-toned summary "Branch name is invalid".
    - A selected agent profile's card stays visible even while the profile picker sits behind a closed More options.
 8. **Gate.** *(A2, A3)*
-   - `launchGate()` returns `{ canRun, canBacklog, runBlockedReason, backlogBlockedReason }`. Run requires `effectiveLaunchable && pipelineReady`; neither condition applies to Add to backlog (S5).
+   - `launchGate()` returns `{ canRun, canBacklog, runBlockedReason }`. Run requires `effectiveLaunchable && pipelineReady`; neither condition applies to Add to backlog (S5).
    - The reason renders in the footer (`launch-run-blocked-reason`), linked from Run with `aria-describedby`.
    - A harness whose status isn't known yet gets a muted "Checking status…" dot, and Run waits for the status. That is the dialogs' existing `effectiveLaunchable` semantics.
 9. **Mode.** `ModeControl` is a Code | Plan SegmentedControl that calls `launch.setMode(CODE_PLAN_MODE[kind].code|plan)`. Clicking Code while a code variant is active does nothing, as today. The per-harness Plan tooltips move to `lib/launch-copy.ts`. The variant picker (Auto / Accept edits / Ask… with hints) appears only when the kind has more than one code variant, and sits behind Agent → More options (S7, L4).
@@ -245,7 +245,7 @@ export function launchGate(i: {
   title: string; prompt: string; requireTitle: boolean; reposCount: number; worktreeValid: boolean;
   overage: boolean; effectiveLaunchable: boolean; effectiveHarnessLabel: string;
   pipelineSelected: boolean; pipelineReady: boolean; pipelineState: PipelineLaunchState; pipelineProblem: string | null;
-}): { canRun: boolean; canBacklog: boolean; runBlockedReason: string | null; backlogBlockedReason: string | null };
+}): { canRun: boolean; canBacklog: boolean; runBlockedReason: string | null };
 ```
 **`lib/launch-copy.ts`** (W1-T3): `planModeTooltip(kind)` (the `:1073-1088` table), `CODE_MODE_TOOLTIP`, `harnessTooltip(status, harnessId)` (`:1027-1039` order: email, today's tokens, reason, auth help, path, version), `usageNote(kind, modelId, modelLabel)` (Fable/Mythos, `:1204-1220`), `effortTooltip(kind, hasEfforts)` (`:1154-1160`).
 **`lib/launch-summary.ts`** (W1-T3): `workspaceSummary({ projectLabels, baseRefs, isolate, branch })` → `"agetor · current branch · isolated · fix/7c5261"`; `agentSummary({ pipelineName, profileName, harnessLabel, modelLabel, effortLabel, primary })` → `"Claude Code · Opus 5.5 · High · Code"`; `moreOptionsNotes(...)` → the list of non-default rare values (`"Speed: Fast"`, `"Max Mode"`, `"Mode: Accept edits"`, `"Branch name edited"`).
@@ -380,7 +380,7 @@ Implement the §3 signatures by moving the decision rules out of `NewTaskForm.ts
    - available → `ok`;
    - status `undefined` → `unknown`.
 7. `launchGate`:
-   - Missing title (when required), prompt or project → both actions blocked, with the reason "Add a title, a prompt and a project".
+   - Missing title (when required), prompt or project → both actions blocked, with a reason naming only what is missing ("Add a title, a prompt and a project" when all three are).
    - Invalid worktree or overage → both actions blocked.
    - Harness not launchable → **only Run** blocked, with the reason "<Harness> can't start: <reason>. Add it to the backlog or pick another harness".
    - Pipeline `checking` or `blocked` → only Run blocked, with that state's text.
@@ -966,3 +966,14 @@ The round-2 review at `70dca452` sent the branch back with R-M1, R-S1–R-S3 and
 - **N2 fixed.** P8 asserts `launch-more-agent` has `aria-expanded="true"` before the negative Speed check, so it cannot pass on a closed section.
 - **Left as is (owner decisions).** `KanbanFilters.tsx` stays untouched (the app-bar branch owns the search-box fix); plan A3 stays as written.
 - **Verification.** `bun run typecheck` clean; `bun test src/mainview src/shared` 4476 pass, 0 fail; e2e on private ports (`launch-layout`, `launch-behaviors`, `issue-task`, `resolve-conflicts`): 42 passed, 0 failed. The full 532-test suite still runs on the final head before the PR.
+
+### Review round 4 — Bug Fix
+
+- **S1 fixed.** `CreateTaskFromIssueDialog` shows its footer reason only once the form is on screen (thread loaded, no error, a context). While the thread loads the footer says "Loading the issue…"; after a failed fetch, or with no context, it shows nothing, because the empty prompt is not the user's omission. New `issue-task.spec.ts` case holds `/github/issue-thread` (footer reads "Loading the issue…", never "Add a prompt"), then fails it with a 500 (error shown, no reason). Red on the previous head, green now.
+- **N1 fixed.** The double-click reset shows `clampNewTaskPanelWidth(default, window.innerWidth)` and stores the plain default, so `aria-valuenow` never exceeds `aria-valuemax` in a narrow window.
+- **N2 fixed.** `ResizeHandle` commits a pointer release only when the pointer moved, and a key press only when the width changes. A click on the handle or an `End`/`ArrowRight` at the limit no longer replaces the saved width with the window-limited one. New `launch-layout.spec.ts` case: saved 500, 900 px window, click and keys, widen, still 500; a reset in a 700 px window stays within the range. Red on the previous head, green now.
+- **N3 fixed.** `launchGate`'s missing-fields reason names only what is missing ("Add a title", "Add a prompt and a project", …); unit-pinned.
+- **N4 fixed.** `LaunchGate.backlogBlockedReason` had no reader, so it is removed (the type, the gate and the plan's §3 signature).
+- **N5 fixed.** The Status line names rounds 1–4.
+- **Left as is (owner decisions).** Plan A3 (Add to backlog stays enabled for a pipeline the server's `createTask` refuses) and the merge order with `fix/agetor-app-bar-ui-improvement`'s `KanbanFilters` change.
+- **Verification.** `bun run typecheck` clean; `bun test src/mainview src/shared` 4477 pass, 0 fail. E2e on private ports (`launch-layout`, `new-task-submit`, `launch-behaviors`, `issue-task`, `resolve-conflicts`): 49 passed, 0 failed. The full 532-test suite still runs on the final head before the PR.

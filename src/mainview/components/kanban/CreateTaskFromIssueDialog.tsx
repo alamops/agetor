@@ -224,6 +224,11 @@ export function CreateTaskFromIssueDialog({ open, onClose, context, onCreated, o
     pipelineProblem: launch.pipelineProblem,
   });
   const canSubmit = !!context && !!thread && !submitting && gate.canRun;
+  // The gate's reason is about the form, which is only on screen once the thread has loaded:
+  // while it loads (the prompt is still empty) or after a failed fetch the footer must not ask
+  // for a prompt the user cannot type yet.
+  const formShown = !loading && !error && !!context && !!thread;
+  const footerReason = formShown ? gate.runBlockedReason : loading ? "Loading the issue…" : null;
 
   // Anything the user changed since the dialog opened: the prompt, attached
   // references, the Type picker, a worktree option, a base ref picked in the
@@ -453,7 +458,7 @@ export function CreateTaskFromIssueDialog({ open, onClose, context, onCreated, o
 
         <DialogFooter className="block">
           <LaunchFooter
-            reason={gate.runBlockedReason}
+            reason={footerReason}
             error={submitError}
             cancel={{ label: "Cancel", onClick: onClose, disabled: submitting, testId: "launch-cancel" }}
             primary={{ label: "Run task", onClick: () => void submit(), disabled: !canSubmit, testId: "issue-task-submit", busy: submitting }}

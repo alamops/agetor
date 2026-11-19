@@ -1453,6 +1453,46 @@ test.describe("task from a Git issue", () => {
     await expect(settings.getByRole("button", { name: "Agents", exact: true })).toHaveAttribute("aria-current", "page");
   });
 
+  test("the footer never asks for a prompt while the thread loads, and says so when the fetch fails", async ({ page, backend }) => {
+    test.setTimeout(90_000);
+    await gotoApp(page, backend.bootBase);
+
+    // Hold the thread: the prompt is still empty, which is not the user's omission.
+    let release!: () => void;
+    const gate = new Promise<void>((r) => (release = r));
+    await page.route(
+      (url) => url.pathname === "/github/issue-thread",
+      async (route) => {
+        await gate;
+        await route.continue();
+      },
+    );
+    const opened = openIssueTaskDialog(page);
+    const dialog = page.getByTestId("issue-task-dialog");
+    const reason = dialog.getByTestId("launch-run-blocked-reason");
+    await expect(reason).toHaveText(/Loading the issue/, { timeout: CONVERGE_TIMEOUT });
+    await expect(reason).not.toContainText("Add a prompt");
+    await expect(dialog.getByTestId("issue-task-submit")).toBeDisabled();
+    release();
+    await opened;
+    await expect(reason).toHaveCount(0);
+    await expect(dialog.getByTestId("issue-task-submit")).toBeEnabled({ timeout: CONVERGE_TIMEOUT });
+
+    // A failed fetch shows the error, not a request for a prompt there is no field for.
+    await page.unroute((url) => url.pathname === "/github/issue-thread");
+    await dialog.getByTestId("launch-cancel").click();
+    await expect(dialog).toBeHidden();
+    await page.route(
+      (url) => url.pathname === "/github/issue-thread",
+      (route) => route.fulfill({ status: 500, contentType: "application/json", body: JSON.stringify({ error: "thread unavailable" }) }),
+    );
+    await page.getByTestId("issue-work-with-agetor").click();
+    await expect(dialog).toBeVisible({ timeout: CONVERGE_TIMEOUT });
+    await expect(dialog.getByText("thread unavailable")).toBeVisible({ timeout: CONVERGE_TIMEOUT });
+    await expect(dialog.getByTestId("launch-run-blocked-reason")).toHaveCount(0);
+    await expect(dialog.getByTestId("issue-task-submit")).toBeDisabled();
+  });
+
   test("launch layout: two columns from md with a sticky footer, one column below it", async ({ page, backend }) => {
     test.setTimeout(90_000);
     await page.setViewportSize({ width: 1280, height: 900 });

@@ -247,7 +247,6 @@ export interface LaunchGate {
   canRun: boolean;
   canBacklog: boolean;
   runBlockedReason: string | null;
-  backlogBlockedReason: string | null;
 }
 
 /**
@@ -265,30 +264,33 @@ export function launchGate(i: LaunchGateInput): LaunchGate {
   const missing =
     (i.requireTitle && !i.title.trim()) || !i.prompt.trim() || i.reposCount === 0;
   if (missing) {
-    const reason = i.requireTitle ? "Add a title, a prompt and a project" : "Add a prompt and a project";
-    return { canRun: false, canBacklog: false, runBlockedReason: reason, backlogBlockedReason: reason };
+    const needs: string[] = [];
+    if (i.requireTitle && !i.title.trim()) needs.push("a title");
+    if (!i.prompt.trim()) needs.push("a prompt");
+    if (i.reposCount === 0) needs.push("a project");
+    const reason = `Add ${needs.length > 1 ? `${needs.slice(0, -1).join(", ")} and ${needs[needs.length - 1]}` : needs[0]}`;
+    return { canRun: false, canBacklog: false, runBlockedReason: reason };
   }
   if (!i.worktreeValid) {
     const reason = "Fix the branch name first";
-    return { canRun: false, canBacklog: false, runBlockedReason: reason, backlogBlockedReason: reason };
+    return { canRun: false, canBacklog: false, runBlockedReason: reason };
   }
   if (i.overage) {
     const reason = "The prompt is too long for this harness";
-    return { canRun: false, canBacklog: false, runBlockedReason: reason, backlogBlockedReason: reason };
+    return { canRun: false, canBacklog: false, runBlockedReason: reason };
   }
   if (i.pipelineSelected && !i.pipelineReady) {
     const reason =
       i.pipelineState === "checking"
         ? "Checking the pipeline's start step…"
         : (i.pipelineProblem ?? "The pipeline can't start yet");
-    return { canRun: false, canBacklog: true, runBlockedReason: reason, backlogBlockedReason: null };
+    return { canRun: false, canBacklog: true, runBlockedReason: reason };
   }
   if (!i.effectiveLaunchable && i.statusKnown === false) {
     return {
       canRun: false,
       canBacklog: true,
       runBlockedReason: `Checking ${i.effectiveHarnessLabel} availability…`,
-      backlogBlockedReason: null,
     };
   }
   if (!i.effectiveLaunchable) {
@@ -297,10 +299,9 @@ export function launchGate(i: LaunchGateInput): LaunchGate {
       canRun: false,
       canBacklog: true,
       runBlockedReason: `${i.effectiveHarnessLabel} can't start${why}. Add it to the backlog or pick another harness`,
-      backlogBlockedReason: null,
     };
   }
-  return { canRun: true, canBacklog: true, runBlockedReason: null, backlogBlockedReason: null };
+  return { canRun: true, canBacklog: true, runBlockedReason: null };
 }
 
 export type SeedOutcome =

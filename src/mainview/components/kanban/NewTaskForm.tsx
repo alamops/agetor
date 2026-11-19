@@ -346,7 +346,8 @@ export function NewTaskForm({ onSubmit, agents, harnesses, stacks = [], onOpenSe
   }, []);
   const onResizeReset = useCallback(() => {
     preferredWidth.current = NEW_TASK_PANEL_DEFAULT_WIDTH;
-    setWidth(NEW_TASK_PANEL_DEFAULT_WIDTH);
+    // Shown within the window like every other width; the saved one is the plain default.
+    setWidth(clampNewTaskPanelWidth(NEW_TASK_PANEL_DEFAULT_WIDTH, window.innerWidth));
     writeNewTaskPanelWidth(NEW_TASK_PANEL_DEFAULT_WIDTH);
   }, []);
 

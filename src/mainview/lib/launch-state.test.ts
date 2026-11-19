@@ -189,19 +189,26 @@ describe("launchGate", () => {
     pipelineState: "no-pipeline", pipelineProblem: null,
   };
   test("everything valid → both allowed, no reason", () => {
-    expect(launchGate(ok)).toEqual({ canRun: true, canBacklog: true, runBlockedReason: null, backlogBlockedReason: null });
+    expect(launchGate(ok)).toEqual({ canRun: true, canBacklog: true, runBlockedReason: null });
   });
   test("a missing title, prompt or project blocks both actions", () => {
     for (const bad of [{ title: " " }, { prompt: "" }, { reposCount: 0 }]) {
       const g = launchGate({ ...ok, ...bad });
       expect(g.canRun).toBe(false);
       expect(g.canBacklog).toBe(false);
-      expect(g.runBlockedReason).toBe("Add a title, a prompt and a project");
     }
+  });
+  test("the reason names only what is missing", () => {
+    expect(launchGate({ ...ok, title: " " }).runBlockedReason).toBe("Add a title");
+    expect(launchGate({ ...ok, prompt: "" }).runBlockedReason).toBe("Add a prompt");
+    expect(launchGate({ ...ok, reposCount: 0 }).runBlockedReason).toBe("Add a project");
+    expect(launchGate({ ...ok, title: "", prompt: "" }).runBlockedReason).toBe("Add a title and a prompt");
+    expect(launchGate({ ...ok, title: "", prompt: "", reposCount: 0 }).runBlockedReason).toBe("Add a title, a prompt and a project");
   });
   test("the dialogs don't need a title", () => {
     expect(launchGate({ ...ok, title: "", requireTitle: false }).canRun).toBe(true);
-    expect(launchGate({ ...ok, title: "", requireTitle: false, prompt: "" }).runBlockedReason).toBe("Add a prompt and a project");
+    expect(launchGate({ ...ok, title: "", requireTitle: false, prompt: "" }).runBlockedReason).toBe("Add a prompt");
+    expect(launchGate({ ...ok, title: "", requireTitle: false, prompt: "", reposCount: 0 }).runBlockedReason).toBe("Add a prompt and a project");
   });
   test("an invalid worktree or an oversize prompt blocks both", () => {
     expect(launchGate({ ...ok, worktreeValid: false })).toMatchObject({ canRun: false, canBacklog: false });
@@ -212,7 +219,6 @@ describe("launchGate", () => {
     expect(g.canRun).toBe(false);
     expect(g.canBacklog).toBe(true);
     expect(g.runBlockedReason).toBe("Copilot can't start: copilot not installed. Add it to the backlog or pick another harness");
-    expect(g.backlogBlockedReason).toBeNull();
   });
   test("a harness whose status hasn't arrived yet makes Run wait, not fail", () => {
     const g = launchGate({ ...ok, effectiveLaunchable: false, statusKnown: false, effectiveHarnessLabel: "Codex" });

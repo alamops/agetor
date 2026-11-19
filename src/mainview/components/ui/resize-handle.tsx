@@ -37,7 +37,7 @@ export function ResizeHandle({
   step = 16,
   className,
 }: ResizeHandleProps) {
-  const drag = React.useRef<{ startX: number; startWidth: number; last: number } | null>(null);
+  const drag = React.useRef<{ startX: number; startWidth: number; last: number; moved: boolean } | null>(null);
   const [dragging, setDragging] = React.useState(false);
   // The window listeners below outlive a render: read the latest callbacks through a ref.
   const cbs = React.useRef({ onChange, onCommit, min, max });
@@ -52,7 +52,7 @@ export function ResizeHandle({
   const onPointerDown = (e: React.PointerEvent<HTMLDivElement>) => {
     if (e.button !== 0) return;
     e.preventDefault();
-    const d = { startX: e.clientX, startWidth: value, last: value };
+    const d = { startX: e.clientX, startWidth: value, last: value, moved: false };
     drag.current = d;
     setDragging(true);
     const move = (ev: PointerEvent) => {
@@ -60,6 +60,7 @@ export function ResizeHandle({
       const next = Math.min(hi, Math.max(lo, Math.round(d.startWidth + (ev.clientX - d.startX))));
       if (next !== d.last) {
         d.last = next;
+        d.moved = true;
         cbs.current.onChange(next);
       }
     };
@@ -70,7 +71,10 @@ export function ResizeHandle({
       cleanup.current = null;
       drag.current = null;
       setDragging(false);
-      cbs.current.onCommit(d.last);
+      // A click without movement is not a resize: committing would persist the (possibly
+      // window-limited) shown width over the width the user saved. `moved`, not a changed
+      // width, so a drag that returns to its start still ends the consumer's `resizing`.
+      if (d.moved) cbs.current.onCommit(d.last);
     };
     window.addEventListener("pointermove", move);
     window.addEventListener("pointerup", end);
@@ -91,6 +95,8 @@ export function ResizeHandle({
     else if (e.key === "End") next = max;
     if (next === null) return;
     e.preventDefault();
+    // Already at the limit: nothing changes, so nothing is saved.
+    if (next === value) return;
     onChange(next);
     onCommit(next);
   };
