@@ -107,7 +107,7 @@ import type {
   WorktreeInfo,
   WorktreeTeardownResult,
 } from "../../shared/types.ts";
-import { TASK_EVENTS_REPLAY_META_EVENT } from "../../shared/types.ts";
+import { TASK_EVENTS_REPLAY_META_EVENT, taskListPath, type TaskListOptions } from "../../shared/types.ts";
 import { parseReplayMeta } from "../../shared/task-stream-resume.ts";
 import type { NotificationKind } from "../../shared/os-notification.ts";
 import type { DiscoveredModel } from "../../shared/model-options.ts";
@@ -1779,7 +1779,10 @@ export const api = {
     if (scope.limit != null) params.set("limit", String(scope.limit));
     return j<{ files: string[]; truncated: boolean }>(`/files/index?${params.toString()}`, signal ? { signal } : undefined);
   },
-  listTasks: () => j<Task[]>("/tasks"),
+  /** Every task by default. The board poll passes `{ archived: "exclude",
+   *  keep }` so archived tasks stay server-side unless a view needs them
+   *  (`TaskListArchived`, docs/architecture/core-responsiveness.md). */
+  listTasks: (opts?: TaskListOptions) => j<Task[]>(taskListPath(opts)),
   /** Single task by id, fresh from the server (bypasses the 2s board poll's
    *  staleness). Used to re-check a task's persisted draft right after the
    *  panel seeds from a possibly-stale polled object — see RunPanel's

@@ -14,7 +14,9 @@ export function useTasks(client: AgetorClient, intervalMs = 1500): Task[] {
     let alive = true;
     const poll = async () => {
       try {
-        const t = await client.listTasks();
+        // The dashboard shows only unarchived tasks (`dashboardRows`), so
+        // archived ones stay server-side instead of riding every 1.5 s tick.
+        const t = await client.listTasks({ archived: "exclude" });
         if (alive) setTasks(t);
       } catch {
         /* transient — keep the last good list */
