@@ -54,6 +54,23 @@ interface ActionSpec {
 const ICON_BOX = "h-[32px] w-[32px] shrink-0";
 
 /**
+ * Whether a double-click that reached the header's `onDoubleClick` should
+ * toggle the window zoom. React events bubble through portals, so the Harnesses
+ * panel and the More menu (both portaled to `document.body`) deliver their
+ * double-clicks here even though they are not inside the header in the DOM:
+ * `header.contains(target)` rejects those. A double-click on a control inside
+ * the header (`no-drag`) is rejected too; only empty bar space toggles.
+ */
+export function isBarZoomDoubleClick(
+  header: { contains(node: Node | null): boolean },
+  target: EventTarget | null,
+): boolean {
+  const el = target as (Node & { closest?: (selector: string) => Element | null }) | null;
+  if (!el || !header.contains(el)) return false;
+  return !el.closest?.(".electrobun-webkit-app-region-no-drag");
+}
+
+/**
  * The window app bar.
  *
  * Layout: the traffic lights (`titleBarStyle: "hiddenInset"`, offset in
@@ -174,7 +191,7 @@ export const AppBar = memo(function AppBar(p: AppBarProps) {
       data-fit-step={step}
       className="electrobun-webkit-app-region-drag relative flex h-[40px] shrink-0 items-center justify-between gap-3 overflow-x-clip border-b border-border/60 pl-[80px] pr-4"
       onDoubleClick={(e) => {
-        if ((e.target as Element).closest(".electrobun-webkit-app-region-no-drag")) return;
+        if (!isBarZoomDoubleClick(e.currentTarget, e.target)) return;
         void api.toggleWindowZoom().catch(() => {});
       }}
     >

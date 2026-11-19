@@ -75,3 +75,29 @@ describe("chooseFitStep", () => {
     expect(chooseFitStep(530, noUntil, 0)).toBe(3);
   });
 });
+
+describe("Import and More are the same box (the shipped case)", () => {
+  // Both are one 32 px icon button with the same gap, so swapping one for the
+  // other frees nothing: step 2 needs exactly what step 1 needs and Import only
+  // ever moves together with step 3 (the 'Harnesses' text collapse).
+  const EQ: AppBarPartWidths = { ...W, importAction: 40, more: 40 };
+
+  test("step 2 frees no width", () => {
+    expect(requiredWidth(2, EQ)).toBe(requiredWidth(1, EQ));
+  });
+
+  test("step 2 is never chosen on its own, growing or shrinking, at any width", () => {
+    // `previous` is never 2 here: the fit can only reach 2 from 2.
+    for (const previous of [0, 1, 3, 4] as AppBarStep[]) {
+      for (let available = 400; available <= 800; available++) {
+        expect(chooseFitStep(available, EQ, previous), `${available}px from ${previous}`).not.toBe(2);
+      }
+    }
+  });
+
+  test("the fit goes 1 -> 3, never 2", () => {
+    expect(chooseFitStep(requiredWidth(1, EQ), EQ, 0)).toBe(1);
+    expect(chooseFitStep(requiredWidth(1, EQ) - 1, EQ, 1)).toBe(3);
+  });
+});
+

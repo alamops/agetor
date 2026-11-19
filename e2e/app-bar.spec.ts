@@ -313,6 +313,43 @@ test.describe("app bar", () => {
     }
   });
 
+  test("a double-click inside the portaled Harnesses panel does not toggle the window zoom", async ({
+    page,
+    freshBackend: backend,
+  }) => {
+    test.setTimeout(240_000);
+    const arranged = await arrange(backend);
+    try {
+      const zoomCalls: string[] = [];
+      await page.route("**/window/toggle-zoom", async (route) => {
+        zoomCalls.push(route.request().method());
+        await route.fulfill({ status: 200, contentType: "application/json", body: JSON.stringify({ ok: true }) });
+      });
+      await page.setViewportSize({ width: 1440, height: 900 });
+      await gotoApp(page, backend.bootBase);
+      const button = harnessesButton(page);
+      await expect(button).toBeVisible();
+
+      // Control: a double-click on empty bar space does toggle the zoom.
+      await page.mouse.dblclick(720, 20);
+      await expect.poll(() => zoomCalls.length, { message: "empty bar space toggles the zoom" }).toBe(1);
+
+      // The panel is portaled to <body>, outside the header's DOM, but React
+      // events bubble through the portal to the header's onDoubleClick.
+      await button.click();
+      const panel = page.getByRole("dialog", { name: "Harnesses" });
+      await expect(panel).toBeVisible();
+      await panel.getByRole("heading", { name: "Other accounts" }).dblclick();
+      await panel.dblclick({ position: { x: 4, y: 4 } });
+      // Give a (wrongly) fired request time to land before asserting none did.
+      await page.waitForTimeout(500);
+      expect(zoomCalls, "a double-click in the panel must not toggle the zoom").toHaveLength(1);
+      await expect(panel).toBeVisible();
+    } finally {
+      await cleanup(backend, arranged);
+    }
+  });
+
   test("with RunPanel open the bar stays usable and every menu action opens its target", async ({
     page,
     freshBackend: backend,

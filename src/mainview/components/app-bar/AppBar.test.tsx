@@ -6,7 +6,7 @@
 import { describe, expect, test } from "bun:test";
 import { renderToStaticMarkup } from "react-dom/server";
 import type { AgentStatus, Harness, HarnessStack, Task } from "../../../shared/types.ts";
-import { AppBar, type AppBarProps } from "./AppBar.tsx";
+import { AppBar, isBarZoomDoubleClick, type AppBarProps } from "./AppBar.tsx";
 
 const harness = (id: string): Harness => ({ id, kind: "claude-code", label: id, isBuiltin: false, home: null, bin: null, env: {}, enabled: true });
 const status = (id: string): AgentStatus =>
@@ -130,5 +130,30 @@ describe("AppBar", () => {
     const empty = markup({ agents: [], harnesses: [], stacks: [] });
     expect(empty).toContain('data-testid="harnesses-button"');
     expect(empty).toContain('data-tone="none"');
+  });
+});
+
+describe("isBarZoomDoubleClick", () => {
+  const node = (inside: boolean, noDrag: boolean) => ({
+    inside,
+    closest: (sel: string) => (noDrag && sel.includes("no-drag") ? ({} as Element) : null),
+  });
+  const header = { contains: (n: Node | null) => (n as unknown as { inside: boolean } | null)?.inside === true };
+  const target = (n: ReturnType<typeof node>) => n as unknown as EventTarget;
+
+  test("empty bar space toggles the zoom", () => {
+    expect(isBarZoomDoubleClick(header, target(node(true, false)))).toBe(true);
+  });
+
+  test("a control inside the header does not", () => {
+    expect(isBarZoomDoubleClick(header, target(node(true, true)))).toBe(false);
+  });
+
+  test("an event bubbled through a portal (target outside the header's DOM) does not", () => {
+    expect(isBarZoomDoubleClick(header, target(node(false, false)))).toBe(false);
+  });
+
+  test("a missing target does not", () => {
+    expect(isBarZoomDoubleClick(header, null)).toBe(false);
   });
 });

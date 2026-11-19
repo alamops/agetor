@@ -23,7 +23,7 @@ The bar replaced a per-account chip strip. That **reverses** harness-stacks gril
 
 - The header is **pinned at 40 px with an 80 px left inset** at every UI zoom (`h-[40px] pl-[80px]`). The inset clears the macOS traffic lights; `trafficLightOffset` in `src/bun/index.ts` is tuned to this height, so change them together.
 - UI zoom sets the root font size, so every rem scales. The control **boxes** are px (icon buttons `32px`, the Harnesses button `32px` tall, the logo `28px`); the glyphs and text inside still scale. A rem-sized `size-9` would be 61 px at 170 % and cannot fit a 40 px bar.
-- The header is a **drag region**. Only controls carry `electrobun-webkit-app-region-no-drag` (each button, never a wrapper), so empty bar space moves the window. A double-click on empty space calls `api.toggleWindowZoom()`; a double-click on a control must not (the handler skips targets inside `.electrobun-webkit-app-region-no-drag`).
+- The header is a **drag region**. Only controls carry `electrobun-webkit-app-region-no-drag` (each button, never a wrapper), so empty bar space moves the window. A double-click on empty space calls `api.toggleWindowZoom()`; a double-click on a control must not (the handler skips targets inside `.electrobun-webkit-app-region-no-drag`). React events bubble through portals, so a double-click inside the portaled Harnesses panel or More menu also reaches the header's handler; `isBarZoomDoubleClick` (`AppBar.tsx`) rejects any target that is not inside the header's own DOM (`header.contains(target)`), so only empty bar space toggles the zoom.
 - `overflow-x: clip` on the header is the last resort: the document never scrolls sideways. The Harnesses button is the one item that shrinks (`min-w-0`, truncating).
 - Icon buttons use `ui/tooltip.tsx`. Accessible names and test ids are unchanged (`Git`, `Import Claude Code sessions and OpenCode sessions`, `Worktrees`, `Pipelines`, `Settings`, `pipelines-button`, `import-claude-sessions-open`). The e2e helper `headerSettingsButton` is the Settings button inside the `banner` landmark.
 - **RunPanel** keeps its full-window backdrop while open, so a press on the bar closes it instead of reaching the bar. The native menu is the way to reach the bar's actions then.
@@ -37,11 +37,13 @@ The bar replaced a per-account chip strip. That **reverses** harness-stacks gril
 |---|---|
 | 0 | nothing |
 | 1 | the wordmark |
-| 2 | Import moves into the **⋯ More** menu |
+| 2 | Import moves into the **⋯ More** menu (see the note below: it frees no width on its own) |
 | 3 | "Harnesses", the count and the % |
 | 4 | "until HH:MM" |
 
 The logo, dot, meter, failover badge, Git, Worktrees, Pipelines and Settings never hide. Past step 4 the header clips.
+
+**Step 2 never wins alone.** Import and the More button are the same 32 px box with the same gap, so `requiredWidth(2) == requiredWidth(1)`: if step 1 does not fit, step 2 does not either, and the fit goes 0 → 1 → 3. Import therefore only moves into the More menu together with step 3 (`app-bar-fit.test.ts` pins this with equal Import and More widths). The step stays in the ladder (the owner's order, and it would start to matter if the two widths ever differ); it costs nothing.
 
 The widths come from a **ghost**: an `inert`, `aria-hidden`, invisible copy of the bar at step 0, rendered only through `measure` variants (no test ids, accessible names, ids or handlers, so the live locators stay unique). Parts are tagged `data-fit-part` (`wordmark`, `import`, `more`, `harness-text`, `until`); each width is summed with its parent's `column-gap`, and `full` excludes the More replica. Because the ghost never depends on the chosen step, the fit cannot oscillate; an 8 px hysteresis only absorbs subpixel jitter (growing the step is immediate, shrinking needs 8 px of spare room). `useAppBarFit` watches the header and the ghost with two `ResizeObserver`s, so a window resize, a UI zoom change and a content change (a badge appears) all re-measure. The observers are created in a layout effect and disconnected on cleanup, which keeps React StrictMode's double mount to one pair. The chosen step is on the header as `data-fit-step` (a test seam).
 
