@@ -6,7 +6,7 @@ import path from "node:path";
 import { test, expect, type APIRequestContext, type E2EBackend, type Locator, type Page } from "./fixtures";
 import { gotoApp } from "./helpers";
 import { startGitHubStub, type GitHubStub, type StubRoute } from "./github-stub";
-import { pickHarness } from "./launch-helpers";
+import { harnessStatus, pickHarness } from "./launch-helpers";
 
 /**
  * E2E coverage for the "Resolve with Agetor" dialog
@@ -407,10 +407,12 @@ test.afterAll(async ({ backend }) => {
     }).catch(() => { /* best-effort cleanup */ });
   }
   for (const fixture of pipelineFixtures.splice(0)) {
-    await fetch(`${backend.apiBase}/pipelines/${fixture.pipelineId}`, {
-      method: "DELETE",
-      headers: { authorization: `Bearer ${backend.apiToken}` },
-    }).catch(() => { /* best-effort cleanup */ });
+    if (fixture.pipelineId) {
+      await fetch(`${backend.apiBase}/pipelines/${fixture.pipelineId}`, {
+        method: "DELETE",
+        headers: { authorization: `Bearer ${backend.apiToken}` },
+      }).catch(() => { /* best-effort cleanup */ });
+    }
     for (const profileId of fixture.profileIds) {
       await fetch(`${backend.apiBase}/agent-profiles/${profileId}`, {
         method: "DELETE",
@@ -725,6 +727,55 @@ test.describe("Resolve with Agetor dialog", () => {
     // Change returns to the still-unavailable manual harness — blocked again.
     await dlg.getByTestId("launch-pipeline-change").click();
     await expect(submit).toBeDisabled();
+  });
+
+  test("launch parity: the PR dialog carries the same launch fields, status, gate and layout as the issue dialog", async ({ page, backend }) => {
+    test.setTimeout(120_000);
+    await page.setViewportSize({ width: 1280, height: 900 });
+    const manualHarnessLabel = `Parity Unavailable Harness ${Date.now()}`;
+    const harnessId = await createUnavailableHarnessRest(backend, manualHarnessLabel);
+    trackPipelineFixture("", [], [harnessId]);
+
+    await gotoApp(page, backend.bootBase);
+    const dlg = await openResolveConflictsDialog(page);
+
+    // Labelled fields, the model refresh button and the profile picker's "Manage agents…" row.
+    await expect(dlg.getByTestId("launch-refresh-models")).toBeVisible();
+    await expect(dlg.getByTestId("launch-harness-picker-trigger")).toHaveAccessibleName(/^Harness\b/);
+    await expect(dlg.getByTestId("launch-model-picker-trigger")).toHaveAccessibleName(/^Model\b/);
+    await expect(dlg.getByTestId("launch-effort-picker-trigger")).toHaveAccessibleName(/^Effort\b/);
+    await dlg.getByTestId("agent-profile-picker-trigger").click();
+    await expect(page.getByTestId("agent-profile-picker-manage")).toBeVisible();
+    await page.keyboard.press("Escape");
+    await expect(dlg).toBeVisible();
+
+    // Two columns from md: the prompt on the left, the Workspace / Agent sections on the right,
+    // and the footer in view.
+    const prompt = await dlg.getByTestId("prompt-textarea").boundingBox();
+    const workspace = await dlg.getByTestId("launch-section-workspace").boundingBox();
+    expect(workspace!.x).toBeGreaterThan(prompt!.x + prompt!.width - 8);
+    await expect(dlg.getByTestId("resolve-conflicts-submit")).toBeInViewport();
+
+    // Status dot: the available stub is "ok"; a harness whose binary is missing reads "error".
+    await expect(dlg.getByTestId("launch-harness-picker-trigger").getByTestId("launch-harness-status")).toHaveAttribute("data-tone", "ok", {
+      timeout: CONVERGE_TIMEOUT,
+    });
+    expect(await harnessStatus(dlg, manualHarnessLabel)).toBe("error");
+
+    // Picking it blocks Run with the hint under the picker AND the reason beside the button.
+    await pickHarness(dlg, manualHarnessLabel);
+    await expect(dlg.getByTestId("launch-agent-unavailable-hint")).toContainText("not found on PATH", { timeout: CONVERGE_TIMEOUT });
+    const submit = dlg.getByTestId("resolve-conflicts-submit");
+    await expect(submit).toBeDisabled();
+    const reason = dlg.getByTestId("launch-run-blocked-reason");
+    await expect(reason).toContainText("can't start");
+    // The dialog's Run points at ITS reason, not at the always-mounted panel's.
+    const describedBy = await submit.getAttribute("aria-describedby");
+    expect(describedBy).toBeTruthy();
+    expect(await reason.getAttribute("id")).toBe(describedBy);
+    // The always-mounted panel renders its own reason (its form is empty): ids stay unique.
+    await expect(page.getByTestId("new-task-panel").getByTestId("launch-run-blocked-reason")).toBeVisible();
+    await expect(page.locator(`[id="${describedBy}"]`)).toHaveCount(1);
   });
 
   test("pipeline picker: Manage pipelines closes both dialogs, confirming a dirty draft first", async ({ page, backend }) => {

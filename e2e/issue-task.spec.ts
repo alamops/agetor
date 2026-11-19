@@ -7,7 +7,7 @@ import { fileURLToPath } from "node:url";
 import { test, expect, type APIRequestContext, type E2EBackend, type Locator, type Page } from "./fixtures";
 import { dialogBranchPicker, gotoApp, openSelectProjects, putPreference, selectBaseBranch } from "./helpers";
 import { startGitHubStub, type GitHubStub, type StubRoute } from "./github-stub";
-import { expectEffort, expectHarness, expectModel, pickHarness } from "./launch-helpers";
+import { expectEffort, expectHarness, expectModel, expectSpeed, maxModeToggle, pickHarness } from "./launch-helpers";
 import { plantFakeCodexAppServer, writeFakeCodexCatalog, type FakeCodexModel } from "../src/bun/test-codex-app-server.ts";
 
 /**
@@ -1548,7 +1548,7 @@ const CODEX_STUB_BIN = (() => {
   return plantFakeCodexAppServer({ pages: [], dir: CODEX_STUB_DIR, version: "codex-cli 0.166.0", catalogFile });
 })();
 
-test.describe("task from a Git issue: remembered picks across re-opens", () => {
+test.describe("task from a Git issue: remembered picks seed the dialog", () => {
   test.use({ backendEnv: { AGETOR_CODEX_BIN: CODEX_STUB_BIN } });
 
   test("a second open of the issue dialog keeps the remembered codex model and effort", async ({ page, request, freshBackend }) => {
@@ -1590,6 +1590,30 @@ test.describe("task from a Git issue: remembered picks across re-opens", () => {
       await expectHarness(reopened, "Codex");
       await expectModel(reopened, CODEX_CLI_ONLY);
       await expectEffort(reopened, "high");
+    } finally {
+      await freshStub.close();
+    }
+  });
+
+  test("the dialog seeds the remembered Speed and Max Mode of the remembered harness (cursor)", async ({ page, request, freshBackend }) => {
+    test.setTimeout(120_000);
+    const headers = { authorization: `Bearer ${freshBackend.apiToken}`, "content-type": "application/json" };
+    const freshStub = await startGitHubStub(freshBackend.githubStubPort, issueRoutes());
+    try {
+      await registerProject(freshBackend.apiBase, freshBackend.apiToken, projectDir);
+      const enabled = await request.patch(`${freshBackend.apiBase}/harnesses/cursor`, { headers, data: { enabled: true } });
+      expect(enabled.ok(), await enabled.text()).toBeTruthy();
+      await putPreference(request, freshBackend, "defaultHarness", "cursor");
+      await putPreference(request, freshBackend, "lastModel:cursor", "gpt-5.3-codex");
+      await putPreference(request, freshBackend, "lastSpeed:cursor", "fast");
+      await putPreference(request, freshBackend, "lastMaxMode:cursor", "true");
+
+      await gotoApp(page, freshBackend.bootBase);
+      const dialog = await openIssueTaskDialog(page);
+      await expectHarness(dialog, "Cursor");
+      await expectModel(dialog, "gpt-5.3-codex");
+      await expectSpeed(dialog, "fast");
+      await expect(await maxModeToggle(dialog)).toHaveAttribute("aria-checked", "true");
     } finally {
       await freshStub.close();
     }
