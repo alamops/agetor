@@ -39,6 +39,7 @@ import {
 import {
   NEW_TASK_PANEL_DEFAULT_WIDTH,
   NEW_TASK_PANEL_MAX_WIDTH,
+  NEW_TASK_PANEL_MIN_BOARD_WIDTH,
   NEW_TASK_PANEL_MIN_WIDTH,
   clampNewTaskPanelWidth,
   readNewTaskPanelWidth,
@@ -427,7 +428,7 @@ export function NewTaskForm({ onSubmit, agents, harnesses, stacks = [], onOpenSe
           label="Resize new task panel"
           value={width}
           min={NEW_TASK_PANEL_MIN_WIDTH}
-          max={Math.max(NEW_TASK_PANEL_MIN_WIDTH, Math.min(NEW_TASK_PANEL_MAX_WIDTH, (typeof window === "undefined" ? 1440 : window.innerWidth) - 480))}
+          max={Math.max(NEW_TASK_PANEL_MIN_WIDTH, Math.min(NEW_TASK_PANEL_MAX_WIDTH, (typeof window === "undefined" ? 1440 : window.innerWidth) - NEW_TASK_PANEL_MIN_BOARD_WIDTH))}
           onChange={onResizeChange}
           onCommit={onResizeCommit}
           onReset={onResizeReset}
