@@ -1463,6 +1463,8 @@ test.describe("task from a Git issue", () => {
     await expect(page.getByTestId("launch-model-picker-popover")).toBeVisible();
     await page.keyboard.press("ControlOrMeta+Enter");
     await page.waitForTimeout(1_000);
+    // Inert: neither a pick nor a submit — the picker is still open and the dialog stays.
+    await expect(page.getByTestId("launch-model-picker-popover")).toBeVisible();
     await expect(dialog).toBeVisible();
     await page.keyboard.press("Escape"); // closes the picker only
     await expect(page.getByTestId("launch-model-picker-popover")).toHaveCount(0);

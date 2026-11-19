@@ -261,6 +261,9 @@ export function Picker({
       return;
     }
     if (e.key === "Enter") {
+      // Cmd/Ctrl+Enter is the form's "run it" chord: while a picker is open it is
+      // inert (it must neither pick a row nor reach the form), so leave it alone.
+      if (e.metaKey || e.ctrlKey) return;
       e.preventDefault();
       if (active >= 0) choose(active);
       return;
