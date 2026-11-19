@@ -373,12 +373,15 @@ export function useTaskLaunch(
   const selectedProfile = agentProfileId ? (profiles.find((p) => p.id === agentProfileId) ?? null) : null;
   // Module-cached (App mounts it at boot) — a Git dialog that opens later
   // reads the resolved list instantly.
+  // The always-mounted panel (source mode) waits for the boot preferences read first: the list is
+  // prefs-gated in App too, so an early `GET /pipelines` can never delay the theme's first paint
+  // under the per-host connection cap (e2e/theme.spec.ts).
   const {
     pipelines,
     loaded: pipelinesLoaded,
     loading: pipelinesLoading,
     error: pipelinesError,
-  } = usePipelines({ enabled: open && withPipelines });
+  } = usePipelines({ enabled: open && withPipelines && (!source || prefsLoaded) });
   const selectedPipeline = pipelineId ? (pipelines.find((p) => p.id === pipelineId) ?? null) : null;
 
   // Every open starts with no pipeline selected — there's deliberately no
