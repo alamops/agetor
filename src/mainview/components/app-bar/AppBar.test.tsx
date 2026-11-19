@@ -68,8 +68,6 @@ describe("AppBar", () => {
     expect(ghost).not.toContain("aria-label");
     expect(ghost).not.toContain("<button");
     expect(ghost).toContain('data-fit-part="wordmark"');
-    expect(ghost).toContain('data-fit-part="import"');
-    expect(ghost).toContain('data-fit-part="more"');
     expect(ghost).toContain('data-fit-part="harness-text"');
   });
 
@@ -93,11 +91,12 @@ describe("AppBar", () => {
     expect(count(html, "electrobun-webkit-app-region-no-drag")).toBe(6);
   });
 
-  test("step 0 shows the wordmark and the Import button; More is not rendered live", () => {
+  test("step 0 shows the wordmark and the Import button; there is no More menu", () => {
     expect(html).toContain("<h1");
     expect(html).toContain(">Agetor<");
     expect(html).toContain('aria-label="Import Claude Code sessions and OpenCode sessions"');
-    expect(html).not.toContain('data-testid="app-bar-more"');
+    expect(html).not.toContain("app-bar-more");
+    expect(html).not.toContain("More actions");
   });
 
   test("accessible names are unchanged", () => {

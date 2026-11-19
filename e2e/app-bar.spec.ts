@@ -201,20 +201,9 @@ test.describe("app bar", () => {
           await expectReachable(page, bar.getByRole("button", { name: "Worktrees", exact: true }), `Worktrees at ${where}`);
           await expectReachable(page, harnessesButton(page), `Harnesses at ${where}`);
 
-          // Import is either a bar button or reachable through More.
-          const importButton = bar.getByTestId("import-claude-sessions-open");
-          if (await importButton.count()) {
-            await expectReachable(page, importButton, `Import at ${where}`);
-          } else {
-            const more = bar.getByTestId("app-bar-more");
-            await expectReachable(page, more, `More at ${where}`);
-            await more.click();
-            const item = page.getByRole("menuitem", { name: "Import sessions…" });
-            await expect(item, `Import in More at ${where}`).toBeVisible();
-            await page.keyboard.press("Escape");
-            await expect(item).toBeHidden();
-            await expect(more, `focus returns to More at ${where}`).toBeFocused();
-          }
+          // Import is a bar button at every width and zoom: there is no More menu.
+          await expectReachable(page, bar.getByTestId("import-claude-sessions-open"), `Import at ${where}`);
+          await expect(bar.getByTestId("app-bar-more"), `no More button at ${where}`).toHaveCount(0);
         }
         if (zoom === 100) expect(steps[0], "1440 px @ 100% needs no collapse").toBe(0);
         for (let i = 1; i < steps.length; i++) {
@@ -341,10 +330,40 @@ test.describe("app bar", () => {
       await expect(panel).toBeVisible();
       await panel.getByRole("heading", { name: "Other accounts" }).dblclick();
       await panel.dblclick({ position: { x: 4, y: 4 } });
-      // Give a (wrongly) fired request time to land before asserting none did.
-      await page.waitForTimeout(500);
-      expect(zoomCalls, "a double-click in the panel must not toggle the zoom").toHaveLength(1);
       await expect(panel).toBeVisible();
+      // Sentinel instead of a sleep: requests are handled in order, so once a
+      // later double-click on empty bar space has landed (exactly two calls),
+      // a wrongly fired panel double-click would already show as a third.
+      await page.keyboard.press("Escape");
+      await expect(panel).toBeHidden();
+      await page.mouse.dblclick(720, 20);
+      await expect
+        .poll(() => zoomCalls.length, { message: "only the two empty-bar double-clicks toggle the zoom" })
+        .toBe(2);
+    } finally {
+      await cleanup(backend, arranged);
+    }
+  });
+
+  test("opening the Harnesses panel after an idle bar shows current ages, not the last render's", async ({
+    page,
+    freshBackend: backend,
+  }) => {
+    test.setTimeout(240_000);
+    const arranged = await arrange(backend);
+    try {
+      await page.clock.install();
+      await page.setViewportSize({ width: 1440, height: 900 });
+      await gotoApp(page, backend.bootBase);
+      const button = harnessesButton(page);
+      await expect(button).toBeVisible();
+      // Nine idle minutes with no data change (the 2 s polls are frozen with
+      // the clock). The bar's own timer fires at most every 30 min.
+      await page.clock.fastForward("09:00");
+      await button.click();
+      const panel = page.getByRole("dialog", { name: "Harnesses" });
+      await expect(panel).toBeVisible();
+      await expect(panel.getByText(/updated 9m ago/).first(), "ages are read when the panel opens").toBeVisible();
     } finally {
       await cleanup(backend, arranged);
     }

@@ -1,7 +1,7 @@
 import { useLayoutEffect, useState, type RefObject } from "react";
 import { chooseFitStep, type AppBarPartWidths, type AppBarStep } from "@/lib/app-bar-fit";
 
-type PartName = "wordmark" | "import" | "more" | "harness-text" | "until";
+type PartName = "wordmark" | "harness-text" | "until";
 
 /** Σ of the widths of every `[data-fit-part=name]` in `ghost`, each plus the
  *  `column-gap` of its parent flex row: the room the part frees when hidden. */
@@ -19,14 +19,9 @@ function partWidth(ghost: HTMLElement, name: PartName): number {
 }
 
 function measureParts(ghost: HTMLElement): AppBarPartWidths {
-  // The ghost always carries a More replica (it is a step-2 part), but step 0
-  // does not show it, so it is not part of the full width.
-  const more = partWidth(ghost, "more");
   return {
-    full: ghost.scrollWidth - more,
+    full: ghost.scrollWidth,
     wordmark: partWidth(ghost, "wordmark"),
-    importAction: partWidth(ghost, "import"),
-    more,
     harnessText: partWidth(ghost, "harness-text"),
     until: partWidth(ghost, "until"),
   };

@@ -65,8 +65,8 @@ export function buildAppMenu(): MenuItem[] {
     },
     {
       // Every app bar action is reachable from the menu bar (HIG), including
-      // the ones the bar collapses into More or that RunPanel covers. No
-      // accelerators: they would collide with webview shortcuts.
+      // the ones RunPanel covers. No accelerators: they would collide with
+      // webview shortcuts.
       label: "Go",
       submenu: [
         webviewItem("Pipelines", "pipelines"),

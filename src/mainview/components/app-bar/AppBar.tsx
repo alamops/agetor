@@ -1,7 +1,6 @@
 import { memo, useCallback, useEffect, useId, useMemo, useRef, useState } from "react";
-import { FolderGit2, GitPullRequest, Import, MoreHorizontal, Settings, Workflow, type LucideIcon } from "lucide-react";
+import { FolderGit2, GitPullRequest, Import, Settings, Workflow, type LucideIcon } from "lucide-react";
 import { Button } from "@/components/ui/button";
-import { ContextMenu, type ContextMenuItem } from "@/components/ui/context-menu";
 import { Tooltip } from "@/components/ui/tooltip";
 import { api } from "@/lib/api";
 import { stepHides } from "@/lib/app-bar-fit";
@@ -24,7 +23,7 @@ export interface AppBarProps {
   /** The Pipelines page (or a pipeline run) is showing: its button reads as pressed. */
   pipelinesActive: boolean;
   /** Bumped by App when something else took over the screen (a menu action):
-   *  closes the panel and the More menu. */
+   *  closes the panel. */
   dismissNonce: number;
   onOpenGit(): void;
   onOpenImportSessions(): void;
@@ -45,8 +44,6 @@ interface ActionSpec {
   onClick: () => void;
   testId?: string;
   pressed?: boolean;
-  /** `data-fit-part` on the ghost replica. */
-  fitPart?: "import";
 }
 
 /** The 32 px px-pinned icon box (D-P1): the bar is 40 px at every UI zoom, so
@@ -56,8 +53,8 @@ const ICON_BOX = "h-[32px] w-[32px] shrink-0";
 /**
  * Whether a double-click that reached the header's `onDoubleClick` should
  * toggle the window zoom. React events bubble through portals, so the Harnesses
- * panel and the More menu (both portaled to `document.body`) deliver their
- * double-clicks here even though they are not inside the header in the DOM:
+ * panel (portaled to `document.body`) delivers its double-clicks here even
+ * though it is not inside the header in the DOM:
  * `header.contains(target)` rejects those. A double-click on a control inside
  * the header (`no-drag`) is rejected too; only empty bar space toggles.
  */
@@ -86,22 +83,20 @@ export function isBarZoomDoubleClick(
  * title bar does (a click on a control must not).
  *
  * Fit: a hidden, inert copy of the bar at step 0 (the ghost) is measured, and
- * `useAppBarFit` picks the collapse step (wordmark → Import into More →
- * Harnesses text → "until"). The ghost renders only through `measure`
+ * `useAppBarFit` picks the collapse step (wordmark → Harnesses text and count
+ * → "until"). Every action button stays in the bar at every width. The ghost renders only through `measure`
  * variants: no testids, names or handlers, so the live bar's locators stay
  * unique. Contract: docs/architecture/app-bar.md.
  */
 export const AppBar = memo(function AppBar(p: AppBarProps) {
   const headerRef = useRef<HTMLElement>(null);
   const ghostRef = useRef<HTMLDivElement>(null);
-  const moreRef = useRef<HTMLButtonElement>(null);
   const step = useAppBarFit(headerRef, ghostRef);
   const hides = stepHides(step);
   const panelId = useId();
 
   const [panelOpen, setPanelOpen] = useState(false);
   const [anchor, setAnchor] = useState<HTMLElement | null>(null);
-  const [moreAt, setMoreAt] = useState<{ x: number; y: number } | null>(null);
   const [tick, setTick] = useState(0);
   const bump = useCallback(() => setTick((t) => t + 1), []);
 
@@ -118,12 +113,7 @@ export const AppBar = memo(function AppBar(p: AppBarProps) {
   // Something else took over the screen (a menu action): close our popovers.
   useEffect(() => {
     setPanelOpen(false);
-    setMoreAt(null);
   }, [p.dismissNonce]);
-  // The More button disappears below step 2; its menu goes with it.
-  useEffect(() => {
-    if (!hides.importInMore) setMoreAt(null);
-  }, [hides.importInMore]);
 
   // The Harnesses button, kept as state (the panel positions itself from it)
   // and as a ref (closing with `restoreFocus` focuses it).
@@ -152,7 +142,6 @@ export const AppBar = memo(function AppBar(p: AppBarProps) {
       icon: Import,
       onClick: p.onOpenImportSessions,
       testId: "import-claude-sessions-open",
-      fitPart: "import",
     },
     { key: "worktrees", label: "Worktrees", tooltip: "Worktrees", icon: FolderGit2, onClick: p.onOpenWorktrees },
     {
@@ -166,23 +155,6 @@ export const AppBar = memo(function AppBar(p: AppBarProps) {
     },
     { key: "settings", label: "Settings", tooltip: "Settings", icon: Settings, onClick: p.onOpenSettings },
   ];
-  const liveActions = actions.filter((a) => !(a.key === "import" && hides.importInMore));
-
-  const moreItems = useMemo<ContextMenuItem[]>(
-    () => [{ id: "import", label: "Import sessions…", icon: Import, onSelect: p.onOpenImportSessions }],
-    [p.onOpenImportSessions],
-  );
-
-  const toggleMore = () => {
-    if (moreAt) {
-      setMoreAt(null);
-      return;
-    }
-    const r = moreRef.current?.getBoundingClientRect();
-    if (!r) return;
-    setPanelOpen(false);
-    setMoreAt({ x: r.left, y: r.bottom + 4 });
-  };
 
   return (
     <header
@@ -210,14 +182,16 @@ export const AppBar = memo(function AppBar(p: AppBarProps) {
           buttonRef={setAnchorEl}
           now={now}
           onToggle={() => {
-            setMoreAt(null);
+            // Opening shows "updated N ago" and "resets in" from `now`: read
+            // the wall clock again, so a bar idle for minutes opens current.
+            if (!panelOpen) bump();
             setPanelOpen((v) => !v);
           }}
         />
       </div>
 
       <div className="flex shrink-0 items-center gap-1">
-        {liveActions.map((a) => (
+        {actions.map((a) => (
           <Tooltip key={a.key} label={a.tooltip} align="end">
             <Button
               variant={a.pressed ? "secondary" : "ghost"}
@@ -231,21 +205,6 @@ export const AppBar = memo(function AppBar(p: AppBarProps) {
             </Button>
           </Tooltip>
         ))}
-        {hides.importInMore && (
-          <Button
-            ref={moreRef}
-            variant="ghost"
-            size="icon"
-            className={cn(ICON_BOX, "electrobun-webkit-app-region-no-drag", moreAt && "bg-accent")}
-            aria-label="More actions"
-            aria-haspopup="menu"
-            aria-expanded={moreAt !== null}
-            data-testid="app-bar-more"
-            onClick={toggleMore}
-          >
-            <MoreHorizontal className="size-4" aria-hidden="true" />
-          </Button>
-        )}
       </div>
 
       <HarnessesPanel
@@ -259,15 +218,6 @@ export const AppBar = memo(function AppBar(p: AppBarProps) {
         onOpenHarnessSettings={p.onOpenHarnessSettings}
         onOpenStackHistory={p.onOpenStackHistory}
         onOpenFailoverTask={p.onOpenFailoverTask}
-      />
-      <ContextMenu
-        open={moreAt !== null}
-        x={moreAt?.x ?? 0}
-        y={moreAt?.y ?? 0}
-        items={moreItems}
-        onClose={() => setMoreAt(null)}
-        label="More actions"
-        testId="app-bar-more-menu"
       />
 
       {/* The measurement ghost: the whole bar at step 0, invisible and inert.
@@ -299,17 +249,10 @@ export const AppBar = memo(function AppBar(p: AppBarProps) {
         </div>
         <div className="flex items-center gap-1">
           {actions.map((a) => (
-            <span
-              key={a.key}
-              className={cn(ICON_BOX, "inline-flex items-center justify-center")}
-              {...(a.fitPart ? { "data-fit-part": a.fitPart } : {})}
-            >
+            <span key={a.key} className={cn(ICON_BOX, "inline-flex items-center justify-center")}>
               <a.icon className="size-4" />
             </span>
           ))}
-          <span data-fit-part="more" className={cn(ICON_BOX, "inline-flex items-center justify-center")}>
-            <MoreHorizontal className="size-4" />
-          </span>
         </div>
       </div>
     </header>

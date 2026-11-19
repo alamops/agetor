@@ -77,7 +77,8 @@ export function AccountUsageRow(p: AccountUsageRowProps) {
             TONE_TEXT[p.tone],
           )}
         >
-          <StatusDot tone={p.tone} label={p.statusText} className="size-1.5" />
+          {/* The chip spells the state out, so the dot is decorative here (no double announcement). */}
+          <StatusDot tone={p.tone} className="size-1.5" />
           {p.statusText}
         </span>
       </div>

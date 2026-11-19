@@ -90,6 +90,12 @@ describe("AccountUsageRow content", () => {
     expect(markup).toContain('data-testid="harnesses-panel-account-acct-a"');
   });
 
+  test("the status is announced once: the chip's dot is decorative", () => {
+    const markup = html({ statusText: "Cooling until 14:30", tone: "warning" });
+    expect(markup).not.toContain('aria-label="Cooling until 14:30"');
+    expect(markup).toContain('aria-hidden="true"');
+  });
+
   test("running tasks are counted", () => {
     expect(html({ runningTasks: 1 })).toContain("1 running task<");
     expect(html({ runningTasks: 3 })).toContain("3 running tasks");

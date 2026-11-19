@@ -8,7 +8,7 @@ The bar replaced a per-account chip strip. That **reverses** harness-stacks gril
 
 | File | Role |
 |---|---|
-| `src/mainview/components/app-bar/AppBar.tsx` | the `<header>`, the actions, the More menu, the measurement ghost, panel state |
+| `src/mainview/components/app-bar/AppBar.tsx` | the `<header>`, the actions, the measurement ghost, panel state |
 | `.../HarnessesButton.tsx` | the button: live variant and the `measure` variant |
 | `.../HarnessesPanel.tsx`, `StackSection.tsx` | the portaled panel and one live stack's section |
 | `.../AccountUsageRow.tsx`, `BarMeter.tsx`, `StatusDot.tsx` | leaf components |
@@ -23,7 +23,7 @@ The bar replaced a per-account chip strip. That **reverses** harness-stacks gril
 
 - The header is **pinned at 40 px with an 80 px left inset** at every UI zoom (`h-[40px] pl-[80px]`). The inset clears the macOS traffic lights; `trafficLightOffset` in `src/bun/index.ts` is tuned to this height, so change them together.
 - UI zoom sets the root font size, so every rem scales. The control **boxes** are px (icon buttons `32px`, the Harnesses button `32px` tall, the logo `28px`); the glyphs and text inside still scale. A rem-sized `size-9` would be 61 px at 170 % and cannot fit a 40 px bar.
-- The header is a **drag region**. Only controls carry `electrobun-webkit-app-region-no-drag` (each button, never a wrapper), so empty bar space moves the window. A double-click on empty space calls `api.toggleWindowZoom()`; a double-click on a control must not (the handler skips targets inside `.electrobun-webkit-app-region-no-drag`). React events bubble through portals, so a double-click inside the portaled Harnesses panel or More menu also reaches the header's handler; `isBarZoomDoubleClick` (`AppBar.tsx`) rejects any target that is not inside the header's own DOM (`header.contains(target)`), so only empty bar space toggles the zoom.
+- The header is a **drag region**. Only controls carry `electrobun-webkit-app-region-no-drag` (each button, never a wrapper), so empty bar space moves the window. A double-click on empty space calls `api.toggleWindowZoom()`; a double-click on a control must not (the handler skips targets inside `.electrobun-webkit-app-region-no-drag`). React events bubble through portals, so a double-click inside the portaled Harnesses panel also reaches the header's handler; `isBarZoomDoubleClick` (`AppBar.tsx`) rejects any target that is not inside the header's own DOM (`header.contains(target)`), so only empty bar space toggles the zoom.
 - `overflow-x: clip` on the header is the last resort: the document never scrolls sideways. The Harnesses button is the one item that shrinks (`min-w-0`, truncating).
 - Icon buttons use `ui/tooltip.tsx`. Accessible names and test ids are unchanged (`Git`, `Import Claude Code sessions and OpenCode sessions`, `Worktrees`, `Pipelines`, `Settings`, `pipelines-button`, `import-claude-sessions-open`). The e2e helper `headerSettingsButton` is the Settings button inside the `banner` landmark.
 - **RunPanel** keeps its full-window backdrop while open, so a press on the bar closes it instead of reaching the bar. The native menu is the way to reach the bar's actions then.
@@ -37,15 +37,14 @@ The bar replaced a per-account chip strip. That **reverses** harness-stacks gril
 |---|---|
 | 0 | nothing |
 | 1 | the wordmark |
-| 2 | Import moves into the **⋯ More** menu (see the note below: it frees no width on its own) |
-| 3 | "Harnesses", the count and the % |
-| 4 | "until HH:MM" |
+| 2 | "Harnesses", the count and the % |
+| 3 | "until HH:MM" |
 
-The logo, dot, meter, failover badge, Git, Worktrees, Pipelines and Settings never hide. Past step 4 the header clips.
+The logo, dot, meter, failover badge, Git, **Import**, Worktrees, Pipelines and Settings never hide. Past step 3 the header clips.
 
-**Step 2 never wins alone.** Import and the More button are the same 32 px box with the same gap, so `requiredWidth(2) == requiredWidth(1)`: if step 1 does not fit, step 2 does not either, and the fit goes 0 → 1 → 3. Import therefore only moves into the More menu together with step 3 (`app-bar-fit.test.ts` pins this with equal Import and More widths). The step stays in the ladder (the owner's order, and it would start to matter if the two widths ever differ); it costs nothing.
+**There is no overflow menu.** Import used to move into a ⋯ More menu at step 2, but the two are the same 32 px box with the same gap, so that step freed no width and only added a control, a menu and a state to keep in sync. The owner dropped both (2026-11-18): every action button is a bar button at every width and zoom, and Import is also in the native **Go** menu.
 
-The widths come from a **ghost**: an `inert`, `aria-hidden`, invisible copy of the bar at step 0, rendered only through `measure` variants (no test ids, accessible names, ids or handlers, so the live locators stay unique). Parts are tagged `data-fit-part` (`wordmark`, `import`, `more`, `harness-text`, `until`); each width is summed with its parent's `column-gap`, and `full` excludes the More replica. Because the ghost never depends on the chosen step, the fit cannot oscillate; an 8 px hysteresis only absorbs subpixel jitter (growing the step is immediate, shrinking needs 8 px of spare room). `useAppBarFit` watches the header and the ghost with two `ResizeObserver`s, so a window resize, a UI zoom change and a content change (a badge appears) all re-measure. The observers are created in a layout effect and disconnected on cleanup, which keeps React StrictMode's double mount to one pair. The chosen step is on the header as `data-fit-step` (a test seam).
+The widths come from a **ghost**: an `inert`, `aria-hidden`, invisible copy of the bar at step 0, rendered only through `measure` variants (no test ids, accessible names, ids or handlers, so the live locators stay unique). Parts are tagged `data-fit-part` (`wordmark`, `harness-text`, `until`); each width is summed with its parent's `column-gap`, and `full` is the ghost's `scrollWidth`. Because the ghost never depends on the chosen step, the fit cannot oscillate; an 8 px hysteresis only absorbs subpixel jitter (growing the step is immediate, shrinking needs 8 px of spare room). `useAppBarFit` watches the header and the ghost with two `ResizeObserver`s, so a window resize, a UI zoom change and a content change (a badge appears) all re-measure. The observers are created in a layout effect and disconnected on cleanup, which keeps React StrictMode's double mount to one pair. The chosen step is on the header as `data-fit-step` (a test seam).
 
 ## Harnesses button and panel
 
@@ -59,24 +58,23 @@ The widths come from a **ghost**: an `inert`, `aria-hidden`, invisible copy of t
 - **Dot**: the worst tone over the enabled accounts; grey with none enabled.
 - **Failover badge and rows**: non-archived tasks whose `harnessState` has `pendingSwap` ("switching to X") or `allExhausted` ("waiting for quota until HH:MM"). They are listed under their stack and open on click (`openPipelineStep` for a hidden step, `openTask` otherwise); rows on a stack that isn't live go in "Other failover activity".
 - The panel lists live stacks first, then the other accounts ordered running → problem → DB order. Each row shows the status in words, so color is never the only signal.
-- **Clock**: `useBarClock` re-renders at the next instant the model changes on its own (a cooldown ends, a meter resets, a snapshot goes stale; clamped 1 s – 30 min) and every 30 s while the panel is open. One timer per bar. `now` is re-read when the data changes.
+- **Clock**: `useBarClock` re-renders at the next instant the model changes on its own (a cooldown ends, a meter resets, a snapshot goes stale; clamped 1 s – 30 min) and every 30 s while the panel is open. One timer per bar. `now` is re-read when the data changes **and when the panel opens** (`AppBar`'s `onToggle` bumps the tick in the same batch as opening), so "updated N ago" and "resets in" are current on first paint even after an idle stretch.
 - Provider and CLI text (quota `reason`, a cooldown's `message`, a status `reason`/`authHelp`) renders only as React text children. There is no `dangerouslySetInnerHTML` under `components/app-bar/`.
 
 ## Escape, focus and ⌘F
 
 - The panel is a portaled, non-modal `role="dialog"` carrying `data-popover-open=""` **only while open**, so RunPanel and the board's search box yield Escape to it. It also carries `data-popover-keys="escape-only"`, so ⌘F stays live while it is open (`FIND_SHORTCUT_BLOCKING_LAYERS` excludes it).
 - Its Escape listener is on `document` in the bubble phase (React's root handlers run first), checks `e.defaultPrevented` first, then claims the event. Focus returns to the button only when it was inside the panel. A press outside, a window resize and every action also close it.
-- The More menu is the shared `ui/context-menu.tsx` (portaled, roving focus, focus restore), anchored at the More button.
 - Any `position: fixed` overlay here portals to `document.body`: RunPanel's `<aside>` has a transform, which rebases `fixed` onto itself.
 
 ## Native menu actions
 
 - `buildAppMenu()` (`src/bun/app-menu.ts`) is the template `installNativeMenu` installs. **Settings… (⌘,)** sits after About in the Agetor menu, and a **Go** menu holds Pipelines, Worktrees…, Git Pull Requests and Issues… and Import Sessions…, with no accelerators. The webview items have the ids `webview:<action>`; `APP_MENU_ACTIONS` (`src/shared/types.ts`) is the list both sides validate against.
 - A click goes `application-menu-clicked` → `menuActionFromClick` → `deliverMenuAction`. With a window and a client attached it broadcasts `{ type: "menu_action", action }` on `/app/events`. Otherwise it parks the action in a pending slot (`pending-open.ts`, the same 10 s TTL as a notification deep link) that the `/app/events` route flushes to the next client, and it focuses the window or creates one (the cold start). A CLI client streaming `/app/events` receives an action id only and ignores it. **No `ROUTE_POLICY` change**: no route is added and `/app/events` is already `SSE_LEGACY`.
-- In the webview `runMenuAction(action)` (`App.tsx`) is the one place an action runs. The event handler and the ⌘, listener (`isSettingsShortcut`) both call it. It does nothing while a modal dialog is open (`MENU_ACTION_BLOCKING_LAYERS`), and every action is an idempotent "open", never a toggle, so a ⌘, that reaches both the page and the native menu can't flip anything back. It bumps `dismissNonce`, which closes the panel and the More menu.
+- In the webview `runMenuAction(action)` (`App.tsx`) is the one place an action runs. The event handler and the ⌘, listener (`isSettingsShortcut`) both call it. It does nothing while a modal dialog is open (`MENU_ACTION_BLOCKING_LAYERS`), and every action is an idempotent "open", never a toggle, so a ⌘, that reaches both the page and the native menu can't flip anything back. It bumps `dismissNonce`, which closes the panel.
 
 ## Test seams
 
-- `data-testid`: `app-bar`, `harnesses-button` (+ `-dot`, `-count`, `-meter`, `-badge`, `-until`), `harnesses-panel`, `harnesses-panel-stack-<id>`, `harnesses-panel-account-<id>`, `harnesses-panel-failover-<taskId>`, `harness-cooldown-chip`, `app-bar-more`, `app-bar-more-menu`, `board-task-count`. The header's `data-fit-step` is the collapse step.
+- `data-testid`: `app-bar`, `harnesses-button` (+ `-dot`, `-count`, `-meter`, `-badge`, `-until`), `harnesses-panel`, `harnesses-panel-stack-<id>`, `harnesses-panel-account-<id>`, `harnesses-panel-failover-<taskId>`, `harness-cooldown-chip`, `board-task-count`. The header's `data-fit-step` is the collapse step.
 - e2e injects `menu_action` into the webview's own `/app/events` stream (`installSseInjector`, `injectSseFrame`); the native menu itself needs the live smoke (`bun run dev:hmr`, data dir `~/.agetor-dev`).
 - Pure rules are unit-tested (`harness-bar.test.ts`, `app-bar-fit.test.ts`, `app-menu.test.ts`, `src/bun/app-menu.test.ts`); components render statically (`components/app-bar/*.test.tsx`); `e2e/app-bar.spec.ts` covers widths, zoom, the panel and the menu actions.
