@@ -44,6 +44,7 @@ async function columnOf(request: APIRequestContext, backend: E2EBackend, id: str
 const cardOf = (page: Page, id: string): Locator => page.locator(`[data-task-id="${id}"]`);
 const liveRegion = (page: Page): Locator => page.locator('[role="status"][id^="DndLiveRegion"]');
 const taskMenu = (page: Page): Locator => page.getByTestId("task-context-menu");
+const boardSearch = (page: Page): Locator => page.getByPlaceholder(/^Search title, prompt/);
 // The run panel is the `<aside>` holding its resize handle. `aside.last()` is
 // not a test for "closed": with no panel mounted, the last aside is the New task
 // sidebar, which has a textarea of its own. The panel unmounts after its exit
@@ -154,13 +155,58 @@ test("a click elsewhere cancels a keyboard drag, so keys typed afterwards cannot
   await expect(liveRegion(page)).toContainText(`${title} is over Ready`);
   // A press on the board's search box, outside the card: dnd-kit alone would
   // keep the drag live (it ends only on its own keys).
-  await page.getByPlaceholder(/^Search title, prompt/).click();
+  await boardSearch(page).click();
   await expect(liveRegion(page)).toContainText(`Moving ${title} was cancelled`);
+  // dnd-kit's focus restore must not pull focus back to the card either.
+  await page.waitForTimeout(300);
+  await expect(boardSearch(page)).toBeFocused();
   // Space and an arrow typed now go to the input, not to the held card.
   await page.keyboard.press("ArrowRight");
   await page.keyboard.press("Space");
+  await expect(boardSearch(page)).toHaveValue(" ");
   await expect(liveRegion(page)).not.toContainText("was dropped");
-  await expect.poll(() => columnOf(request, backend, task.id), { timeout: 3_000 }).toBe("backlog");
+  // A drop would PATCH within a few frames; a poll that is true at once cannot
+  // tell, so give it that time and check once.
+  await page.waitForTimeout(500);
+  expect(await columnOf(request, backend, task.id)).toBe("backlog");
+});
+
+test("a press on the held card itself cancels the drag, so it cannot stay held while a button acts", async ({ page, request, backend }) => {
+  const title = `kbd-self-press ${randomUUID()}`;
+  const task = await createTask(request, backend, title);
+  await gotoApp(page, backend.bootBase);
+  const card = cardOf(page, task.id);
+  await expect(card).toBeVisible({ timeout: 10_000 });
+  await card.focus();
+
+  await page.keyboard.press("Space");
+  await page.keyboard.press("ArrowRight");
+  await expect(liveRegion(page)).toContainText(`${title} is over Ready`);
+  await card.click();
+  await expect(liveRegion(page)).toContainText(`Moving ${title} was cancelled`);
+  await page.waitForTimeout(500);
+  expect(await columnOf(request, backend, task.id)).toBe("backlog");
+});
+
+test("focus moved off a held card by Cmd/Ctrl+F stays on the board search box", async ({ page, request, backend }) => {
+  const title = `kbd-find-cancel ${randomUUID()}`;
+  const task = await createTask(request, backend, title);
+  await gotoApp(page, backend.bootBase);
+  const card = cardOf(page, task.id);
+  await expect(card).toBeVisible({ timeout: 10_000 });
+  await card.focus();
+
+  await page.keyboard.press("Space");
+  await page.keyboard.press("ArrowRight");
+  await expect(liveRegion(page)).toContainText(`${title} is over Ready`);
+  await page.keyboard.press("ControlOrMeta+f");
+  await expect(liveRegion(page)).toContainText(`Moving ${title} was cancelled`);
+  await expect(boardSearch(page)).toBeFocused();
+  // dnd-kit re-focuses the card a frame after a drag ends with focus elsewhere;
+  // the search box must still own focus after that.
+  await page.waitForTimeout(300);
+  await expect(boardSearch(page)).toBeFocused();
+  await expect(card).not.toBeFocused();
 });
 
 test("Escape that cancels a keyboard drag does not also close the open run panel", async ({ page, request, backend }) => {
@@ -188,6 +234,33 @@ test("Escape that cancels a keyboard drag does not also close the open run panel
   // With no drag held, Escape closes the panel as before.
   await page.keyboard.press("Escape");
   await expect(runPanel(page)).toHaveCount(0);
+});
+
+test("Escape that cancels a keyboard drag does not also close the run panel's message search", async ({ page, request, backend }) => {
+  const title = `kbd-esc-search ${randomUUID()}`;
+  const task = await createTask(request, backend, title);
+  await gotoApp(page, backend.bootBase);
+  const card = cardOf(page, task.id);
+  await expect(card).toBeVisible({ timeout: 10_000 });
+  await card.click();
+  const panel = runPanel(page);
+  await expect(panel.locator("textarea")).toBeVisible();
+  await panel.getByRole("button", { name: "Search messages" }).click();
+  const searchBar = panel.locator("[data-search-open]");
+  await expect(searchBar).toBeVisible();
+  await card.focus();
+
+  await page.keyboard.press("Space");
+  await page.keyboard.press("ArrowRight");
+  await expect(liveRegion(page)).toContainText(`${title} is over Ready`);
+  await page.keyboard.press("Escape");
+  await expect(liveRegion(page)).toContainText(`Moving ${title} was cancelled`);
+  await page.waitForTimeout(300);
+  await expect(searchBar).toBeVisible();
+  // With no drag held, Escape peels the search bar first, as before.
+  await page.keyboard.press("Escape");
+  await expect(searchBar).toHaveCount(0);
+  await expect(runPanel(page)).toHaveCount(1);
 });
 
 test("a review card reaches Done, even when that column is scrolled off-screen", async ({ page, request, backend }) => {

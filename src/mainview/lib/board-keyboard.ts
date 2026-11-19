@@ -31,6 +31,23 @@ export function cancelBoardDrag(doc: Document = document): void {
   doc.dispatchEvent(new view.KeyboardEvent("keydown", { code: BOARD_CANCEL_CODE, key: BOARD_CANCEL_CODE, bubbles: true }));
 }
 
+/** After a focus-leave cancel, puts focus back where the user sent it. dnd-kit's
+ *  `RestoreFocus` re-focuses the card in a `requestAnimationFrame` when the
+ *  active element is elsewhere once the drag ends, which undoes the move that
+ *  caused the cancel (Cmd/Ctrl+F to the board search). Two frames later that
+ *  restore has run, so the user's target wins. A target that left the document
+ *  is skipped. */
+export function restoreFocusAfterCancel(target: unknown, doc: Document = document): void {
+  const view = doc.defaultView;
+  const el = target as { isConnected?: boolean; focus?: () => void } | null;
+  if (!view || !el || typeof el.focus !== "function") return;
+  view.requestAnimationFrame(() =>
+    view.requestAnimationFrame(() => {
+      if (el.isConnected && doc.activeElement !== el) el.focus?.();
+    }),
+  );
+}
+
 /** True when a pointer press or a focus change landed outside the held card,
  *  which is when the drag must end. `target` null (focus left the document)
  *  counts as outside. */
@@ -43,6 +60,7 @@ export function isOutsideCard(card: { contains(node: never): boolean } | null, t
  *  Escape handler that is not part of the drag (the run panel's) leaves the
  *  key to dnd-kit's cancel. */
 export const BOARD_DRAG_ATTR = "data-board-drag";
+export const BOARD_DRAG_SELECTOR = `[${BOARD_DRAG_ATTR}]`;
 
 export function setBoardDragging(on: boolean, doc: Document = document): void {
   if (on) doc.body.setAttribute(BOARD_DRAG_ATTR, "");

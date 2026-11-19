@@ -43,15 +43,66 @@ export function promptPreview(prompt: string, maxChars = 280): string {
  *  long unbroken paragraph (a 400 KB paste took 17 s), and only the first
  *  `maxChars` of the result are shown. Inline syntax only shrinks text, so a
  *  prefix of 8x the cap nearly always leaves enough; when it does not (a
- *  paragraph of long links), the prefix grows until it does or `s` is whole. */
+ *  paragraph of long links), the prefix grows until it does or `s` is whole.
+ *  The cut never lands inside a link, image or code span (`closeOpenSpan`),
+ *  or the half-cut syntax would show up raw. */
 function stripBounded(s: string, maxChars: number): string {
   let limit = Math.max(maxChars, 1) * 8;
   for (;;) {
-    const part = s.length <= limit ? s : s.slice(0, limit);
+    const end = s.length <= limit ? s.length : closeOpenSpan(s, limit);
+    const part = end === s.length ? s : s.slice(0, end);
     const out = stripInline(part);
     if (part.length === s.length || out.length > maxChars) return out;
     limit *= 4;
   }
+}
+
+/** How far past the cut to look for the end of a span the cut fell inside. A
+ *  presigned URL is a few KB; past this the span is not worth the work (and
+ *  stripInline is quadratic), so the cut stays where it was. */
+const SPAN_LOOKAHEAD = 8192;
+
+/** `end`, moved forward to the close of the link, image or code span that `end`
+ *  falls inside: the `)` of `[text](url)` or the closing backtick run. Each
+ *  step either finds its closer within `SPAN_LOOKAHEAD` or leaves `end` alone. */
+function closeOpenSpan(s: string, end: number): number {
+  const reach = (from: number, needle: string, width: number): number => {
+    const at = s.indexOf(needle, from);
+    return at === -1 || at - end > SPAN_LOOKAHEAD ? end : at + width;
+  };
+  // Link text open (`[text` cut before its `]`), then the destination.
+  for (let i = 0; i < 4; i++) {
+    const head = s.slice(0, end);
+    const open = head.lastIndexOf("[");
+    if (open > head.lastIndexOf("]")) {
+      const next = reach(end, "]", 1);
+      if (next === end) break;
+      end = next;
+      continue;
+    }
+    // Destination open: `](` with no `)` after it, or the cut just after `]`
+    // with `(` next.
+    const dest = head.lastIndexOf("](");
+    const destOpen = dest !== -1 && head.indexOf(")", dest) === -1;
+    if (destOpen || (head.endsWith("]") && s[end] === "(")) {
+      const next = reach(end, ")", 1);
+      if (next === end) break;
+      end = next;
+      continue;
+    }
+    break;
+  }
+  // An odd run count of backticks means a code span is open.
+  const ticks = (s.slice(0, end).match(/`+/g) ?? []).length;
+  if (ticks % 2 === 1) {
+    const close = s.indexOf("`", end);
+    if (close !== -1 && close - end <= SPAN_LOOKAHEAD) {
+      let stop = close;
+      while (s[stop] === "`") stop++;
+      end = stop;
+    }
+  }
+  return end;
 }
 
 function dropFrontMatter(lines: string[]): string[] {

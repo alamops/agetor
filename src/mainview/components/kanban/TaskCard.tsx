@@ -7,7 +7,7 @@ import { AWAITING_RING_CLASS } from "@/lib/awaiting";
 import { AwaitingGlow } from "@/components/ui/awaiting-glow";
 import { taskTypeIcon } from "@/lib/task-type-icon";
 import { promptPreview } from "@/lib/prompt-preview";
-import { cancelBoardDrag, handleCardKeyDown, isOutsideCard } from "@/lib/board-keyboard";
+import { cancelBoardDrag, handleCardKeyDown, isOutsideCard, restoreFocusAfterCancel } from "@/lib/board-keyboard";
 import { taskActionFlags } from "@/lib/task-card-actions";
 import { PipelineHat } from "@/components/pipelines/PipelineHat";
 import { taskTypeMeta, type HarnessLimitState, type HarnessStack, type Task } from "../../../shared/types.ts";
@@ -96,17 +96,22 @@ function TaskCardImpl({ task, homeDir, stacks = [], limitStates = [], onStart, o
   );
   // dnd-kit's keyboard drag listens on the document and ends only on its own
   // keys, so a drag outlives the card's focus. While this card is held, a press
-  // outside it or focus leaving it puts it back (`lib/board-keyboard.ts`).
+  // outside it, any press on the held card, or focus leaving it puts it back
+  // (`lib/board-keyboard.ts`).
   useEffect(() => {
     if (!isDragging) return;
     const leave = (e: Event) => {
       const card = cardRef.current;
       if (e.type === "focusout") {
         // Only focus leaving THIS card counts, not some other field blurring.
-        if (isOutsideCard(card, e.target) || !isOutsideCard(card, (e as FocusEvent).relatedTarget)) return;
-      } else if (!isOutsideCard(card, e.target)) {
+        const next = (e as FocusEvent).relatedTarget;
+        if (isOutsideCard(card, e.target) || !isOutsideCard(card, next)) return;
+        cancelBoardDrag();
+        restoreFocusAfterCancel(next);
         return;
       }
+      // A press anywhere, the held card and its buttons included: a card
+      // that stayed held while its Run button acted would keep taking keys.
       cancelBoardDrag();
     };
     document.addEventListener("pointerdown", leave, true);

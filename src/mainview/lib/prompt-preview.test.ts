@@ -69,6 +69,27 @@ describe("promptPreview", () => {
     expect(out.length).toBeGreaterThan(200);
   });
 
+  test("a link, image or code span longer than the prefix is not cut open", () => {
+    const url = `https://example.com/${"p".repeat(2500)}`;
+    expect(promptPreview(`See [the log](${url}) and [the trace](${url}) for details.`)).toBe("See the log and the trace for details.");
+    expect(promptPreview(`See ![the chart](${url}) for details.`)).toBe("See the chart for details.");
+    expect(promptPreview(`Run \`${"x ".repeat(1200)}\` then stop.`)).toStartWith("Run x x x");
+    expect(promptPreview(`Run \`${"x ".repeat(1200)}\` then stop.`)).not.toContain("`");
+    // The 2,240-char cut falls inside the link text, on `]`, between `]` and `(`, and in the URL.
+    for (let n = 2215; n <= 2245; n++) {
+      expect(promptPreview(`[label](https://e.com/${"p".repeat(n)}) tail`)).toBe("label tail");
+    }
+  });
+
+  test("an unclosed link or code span far past the prefix stays bounded", () => {
+    for (const unit of ["[a](", "`"]) {
+      const start = performance.now();
+      const out = promptPreview(`${unit}${"p".repeat(400_000)}`);
+      expect(performance.now() - start).toBeLessThan(500);
+      expect(out.length).toBeLessThanOrEqual(280);
+    }
+  });
+
   test("never generates markup it did not receive", () => {
     expect(promptPreview("Plain sentence.")).not.toMatch(/</);
   });

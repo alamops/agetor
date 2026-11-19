@@ -7,6 +7,8 @@ import {
   cancelBoardDrag,
   handleCardKeyDown,
   isOutsideCard,
+  restoreFocusAfterCancel,
+  BOARD_DRAG_SELECTOR,
   setBoardDragging,
   makeBoardAnnouncements,
   nextColumnX,
@@ -225,5 +227,43 @@ describe("leaving a held card", () => {
     expect([...attrs]).toEqual(["data-board-drag"]);
     setBoardDragging(false, doc);
     expect(attrs.size).toBe(0);
+  });
+
+  test("the drag selector matches the attribute setBoardDragging sets", () => {
+    expect(BOARD_DRAG_SELECTOR).toBe("[data-board-drag]");
+  });
+
+  test("restoreFocusAfterCancel refocuses the target two frames later, after dnd-kit's restore", () => {
+    const frames: (() => void)[] = [];
+    const log: string[] = [];
+    const target = { isConnected: true, focus: () => log.push("target") };
+    const doc = {
+      activeElement: { tag: "card" },
+      defaultView: { requestAnimationFrame: (f: () => void) => frames.push(f) },
+    } as unknown as Document;
+    restoreFocusAfterCancel(target, doc);
+    expect(frames).toHaveLength(1);
+    frames.shift()!(); // dnd-kit's rAF runs in this frame and re-focuses the card
+    expect(log).toEqual([]);
+    expect(frames).toHaveLength(1);
+    frames.shift()!();
+    expect(log).toEqual(["target"]);
+  });
+
+  test("restoreFocusAfterCancel leaves a focused, detached or missing target alone", () => {
+    const run = (target: unknown, active: unknown) => {
+      const frames: (() => void)[] = [];
+      const doc = { activeElement: active, defaultView: { requestAnimationFrame: (f: () => void) => frames.push(f) } } as unknown as Document;
+      restoreFocusAfterCancel(target, doc);
+      while (frames.length) frames.shift()!();
+    };
+    let calls = 0;
+    const focus = () => { calls++; };
+    const focused = { isConnected: true, focus };
+    run(focused, focused);
+    run({ isConnected: false, focus }, null);
+    run(null, null);
+    run({}, null);
+    expect(calls).toBe(0);
   });
 });
