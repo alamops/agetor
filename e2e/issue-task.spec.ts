@@ -1460,13 +1460,11 @@ test.describe("task from a Git issue", () => {
     // Hold the thread: the prompt is still empty, which is not the user's omission.
     let release!: () => void;
     const gate = new Promise<void>((r) => (release = r));
-    await page.route(
-      (url) => url.pathname === "/github/issue-thread",
-      async (route) => {
-        await gate;
-        await route.continue();
-      },
-    );
+    const threadUrl = (url: URL) => url.pathname === "/github/issue-thread";
+    await page.route(threadUrl, async (route) => {
+      await gate;
+      await route.continue();
+    });
     const opened = openIssueTaskDialog(page);
     const dialog = page.getByTestId("issue-task-dialog");
     const reason = dialog.getByTestId("launch-run-blocked-reason");
@@ -1479,12 +1477,11 @@ test.describe("task from a Git issue", () => {
     await expect(dialog.getByTestId("issue-task-submit")).toBeEnabled({ timeout: CONVERGE_TIMEOUT });
 
     // A failed fetch shows the error, not a request for a prompt there is no field for.
-    await page.unroute((url) => url.pathname === "/github/issue-thread");
+    await page.unroute(threadUrl);
     await dialog.getByTestId("launch-cancel").click();
     await expect(dialog).toBeHidden();
-    await page.route(
-      (url) => url.pathname === "/github/issue-thread",
-      (route) => route.fulfill({ status: 500, contentType: "application/json", body: JSON.stringify({ error: "thread unavailable" }) }),
+    await page.route(threadUrl, (route) =>
+      route.fulfill({ status: 500, contentType: "application/json", body: JSON.stringify({ error: "thread unavailable" }) }),
     );
     await page.getByTestId("issue-work-with-agetor").click();
     await expect(dialog).toBeVisible({ timeout: CONVERGE_TIMEOUT });

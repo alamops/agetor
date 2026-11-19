@@ -121,6 +121,11 @@ export function ResolveConflictsDialog({ open, onClose, context, onCreated, onMa
     pipelineProblem: launch.pipelineProblem,
   });
   const canSubmit = !!context && !submitting && gate.canRun;
+  // The gate's reason is about the form, which is only on screen once the harnesses have loaded
+  // and the PR still has a resolve context: while they load, after a failed fetch, or once the
+  // PR's state changed, the footer must not ask for a project or a harness the user cannot pick.
+  const formShown = !launch.loading && !launch.loadError && !!context;
+  const footerReason = formShown ? gate.runBlockedReason : launch.loading ? "Loading harnesses…" : null;
 
   // Changed since the dialog opened: the prompt, attached references, or a
   // selected pipeline (the worktree row is locked to the PR head).
@@ -291,7 +296,7 @@ export function ResolveConflictsDialog({ open, onClose, context, onCreated, onMa
 
         <DialogFooter className="block">
           <LaunchFooter
-            reason={gate.runBlockedReason}
+            reason={footerReason}
             error={submitError}
             cancel={{ label: "Cancel", onClick: onClose, disabled: submitting, testId: "launch-cancel" }}
             primary={{ label: "Run task", onClick: () => void submit(), disabled: !canSubmit, testId: "resolve-conflicts-submit", busy: submitting }}

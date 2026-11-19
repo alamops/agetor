@@ -6,7 +6,7 @@
 | Source | Pipeline task text and the owner's screenshot (outside the repo, transcribed in the investigation §1); `docs/plans/new-task-ui-ux-investigation.md`; `docs/plans/new-task-ui-ux-grill.md` (the contract) with `docs/plans/new-task-ui-ux-grill/round-{1,2}/answers.json` |
 | Flags | none |
 | Gates | grilled (2 rounds, complete, no one-way doors); approved by owner as written on 2026-11-18, with the §8 assumptions as defaults |
-| Status | implemented on the branch; code-review rounds 1–4 fixed (see "Execution notes — review round 1", "— review round 2", "Review round 3" and "Review round 4"). The full e2e suite (532 tests) was green at round 1; round 2 re-ran only the affected specs (listed in its notes). Deviations are listed under "Execution notes" at the end. |
+| Status | implemented on the branch; code-review rounds 1–5 fixed (see "Execution notes — review round 1", "— review round 2", "Review round 3", "Review round 4" and "Review round 5"). The full e2e suite (532 tests) has not been run green on the final head yet: round 1 had one real failure, fixed and followed only by a partial re-run, and rounds 2–5 re-ran only the affected specs (listed in their notes); the Test Writer step runs the full suite. Deviations are listed under "Execution notes" at the end. |
 | Branch | `fix/agetor-new-task-ui-improvement` |
 | Base SHA | `4d7f8bfb93320076aa86292d614d84d4b883ba7d` |
 
@@ -977,3 +977,9 @@ The round-2 review at `70dca452` sent the branch back with R-M1, R-S1–R-S3 and
 - **N5 fixed.** The Status line names rounds 1–4.
 - **Left as is (owner decisions).** Plan A3 (Add to backlog stays enabled for a pipeline the server's `createTask` refuses) and the merge order with `fix/agetor-app-bar-ui-improvement`'s `KanbanFilters` change.
 - **Verification.** `bun run typecheck` clean; `bun test src/mainview src/shared` 4477 pass, 0 fail. E2e on private ports (`launch-layout`, `new-task-submit`, `launch-behaviors`, `issue-task`, `resolve-conflicts`): 49 passed, 0 failed. The full 532-test suite still runs on the final head before the PR.
+
+### Review round 5 — Bug Fix
+
+- **R5-S1 fixed.** `ResolveConflictsDialog` shows its footer reason only once the form is on screen (harnesses loaded, no load error, a resolve context), as the issue dialog does. While the harnesses load the footer says "Loading harnesses…"; after a failed fetch, or once the PR's state changed, it shows nothing. New `resolve-conflicts.spec.ts` case fails `GET /harnesses` with a 500 and expects the error and no `launch-run-blocked-reason`.
+- **R5-N1 fixed.** `issue-task.spec.ts` holds the thread route's predicate in one const, so `page.unroute` removes the route it registered (Playwright compares function matchers by reference).
+- **R5-N2 fixed.** The Status line says the full e2e suite has not been run green on the final head; the Test Writer step runs it.

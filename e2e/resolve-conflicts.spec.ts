@@ -778,6 +778,37 @@ test.describe("Resolve with Agetor dialog", () => {
     await expect(page.locator(`[id="${describedBy}"]`)).toHaveCount(1);
   });
 
+  test("a failed harness fetch shows the error, not a footer reason about a form that is not on screen", async ({ page, backend }) => {
+    test.setTimeout(90_000);
+    await gotoApp(page, backend.bootBase);
+
+    // Open the Git dialog on the PR by hand: the shared helper waits for the prompt field, which
+    // a failed fetch never renders.
+    await page.getByRole("button", { name: "Git", exact: true }).click();
+    const gitDialog = page.getByRole("dialog");
+    await expect(gitDialog).toBeVisible();
+    const projectSelect = gitDialog.getByRole("combobox", { name: "Project" });
+    await expect(projectSelect).toBeVisible({ timeout: CONVERGE_TIMEOUT });
+    if ((await projectSelect.inputValue()) !== projectDir) await projectSelect.selectOption({ value: projectDir });
+    await gitDialog.getByRole("button", { name: `#${PR_NUMBER} ${PR_TITLE}` }).click();
+    const resolveButton = gitDialog.getByRole("button", { name: "Resolve with Agetor", exact: true });
+    await expect(resolveButton).toBeVisible({ timeout: CONVERGE_TIMEOUT });
+
+    // The dialog fetches the harnesses itself when it opens; fail that one request.
+    const harnessesUrl = (url: URL) => url.pathname === "/harnesses";
+    await page.route(harnessesUrl, (route) =>
+      route.fulfill({ status: 500, contentType: "application/json", body: JSON.stringify({ error: "harnesses unavailable" }) }),
+    );
+    await resolveButton.click();
+    const dlg = page.getByTestId("resolve-conflicts-dialog");
+    await expect(dlg).toBeVisible({ timeout: CONVERGE_TIMEOUT });
+    await expect(dlg.getByText("harnesses unavailable")).toBeVisible({ timeout: CONVERGE_TIMEOUT });
+    // No form is on screen, so the footer neither says "Add a project" nor "Checking … availability".
+    await expect(dlg.getByTestId("launch-run-blocked-reason")).toHaveCount(0);
+    await expect(dlg.getByTestId("resolve-conflicts-submit")).toBeDisabled();
+    await page.unroute(harnessesUrl);
+  });
+
   test("pipeline picker: Manage pipelines closes both dialogs, confirming a dirty draft first", async ({ page, backend }) => {
     test.setTimeout(90_000);
     await gotoApp(page, backend.bootBase);
