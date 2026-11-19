@@ -5741,8 +5741,21 @@ function matchNumberedModal(tail: string): ScrapeMatch | null {
   // path picks up the new starting position. Without this the second-
   // tick stability check would silently match the old position and
   // navigate from a stale index.
+  //
+  // So is the question: the card's text with the cursor glyph removed (the
+  // same text `identityOf` uses). Two questions with identical choices and
+  // cursor ("Do you want to proceed?" for two different commands) are two
+  // dialogs: with labels and cursor alone, answering the first in the
+  // terminal left its card standing for the second (same fingerprint, so
+  // neither swept nor re-registered), and the card drive refused it forever.
+  // A cursor-only move changes only `@cursorIndex`, never the question text.
+  const question = paneText
+    .split("\n")
+    .map((l) => l.replace(/^\s*[❯›]\s?/, "").trim())
+    .filter((l) => l.length > 0)
+    .join("\n");
   const fingerprint = sha1(
-    `numbered:${choices.map((c) => `${c.key}|${c.label}`).join("/")}|@${cursorIndex}`,
+    `numbered:${choices.map((c) => `${c.key}|${c.label}`).join("/")}|@${cursorIndex}|${question}`,
   );
   // A trailing `Esc to cancel …` footer marks a fully-drawn interactive modal
   // (the tool-use permission prompt, edit/plan dialogs, …). Streamed numbered

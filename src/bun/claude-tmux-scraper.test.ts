@@ -741,6 +741,47 @@ test("scrapeOnce masks a typed OAuth code before cutting a card window: a wrappe
   });
 });
 
+test("scrapeOnce: a second numbered question with the same choices and cursor replaces the first one's card", async () => {
+  const quiet = { paneWorking: false, paneIdle: false, watchdogArmed: false };
+  const ask = (command: string) => [
+    "⏺ Bash(" + command + ")",
+    "",
+    " Bash command",
+    "",
+    "   " + command,
+    "",
+    " Do you want to proceed?",
+    " ❯ 1. Yes",
+    "   2. No",
+    "",
+    " Esc to cancel",
+  ].join("\n");
+  // Identical choices and cursor, different questions: two dialogs.
+  const first = pickScrapeMatch(ask("rm -rf build"), quiet)!;
+  const second = pickScrapeMatch(ask("git push --force"), quiet)!;
+  expect(first.fingerprint).not.toBe(second.fingerprint);
+  // A cursor move on the same question is still a new fingerprint (navigation),
+  // and the same frame again is the same one (suppression and stability hold).
+  const moved = pickScrapeMatch(ask("rm -rf build").replace(" ❯ 1. Yes\n   2. No", "   1. Yes\n ❯ 2. No"), quiet)!;
+  expect(moved.fingerprint).not.toBe(first.fingerprint);
+  expect(pickScrapeMatch(ask("rm -rf build"), quiet)!.fingerprint).toBe(first.fingerprint);
+
+  await withScrapeTask(ask("rm -rf build"), async ({ pending, tick, setPane }) => {
+    await tick();
+    await tick();
+    const [card] = pending();
+    expect(card!.paneText).toContain("rm -rf build");
+    // Answered in the terminal; claude asks about the next command.
+    setPane(ask("git push --force"));
+    await tick();
+    await tick();
+    const cards = pending();
+    expect(cards).toHaveLength(1);
+    expect(cards[0]!.id).not.toBe(card!.id);
+    expect(cards[0]!.paneText).toContain("git push --force");
+  });
+});
+
 test("scrapeOnce → registerTmuxPrompt — two stable ticks on the reconstructed Chrome prompt register one answerable card, hideKeys included", async () => {
   await withScrapeTask(CHROME_UNNUMBERED_PANE, async ({ taskId, runId, pending, tick }) => {
     // The unnumbered matcher is NOT high-confidence, so the first sighting only
