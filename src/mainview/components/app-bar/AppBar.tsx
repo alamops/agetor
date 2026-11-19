@@ -199,6 +199,9 @@ export const AppBar = memo(function AppBar(p: AppBarProps) {
               className={cn(ICON_BOX, "electrobun-webkit-app-region-no-drag")}
               onClick={a.onClick}
               aria-label={a.label}
+              // A view switch, not a toggle (pressing it again stays on the
+              // page), so the state is `aria-current`, not `aria-pressed`.
+              aria-current={a.pressed ? "page" : undefined}
               data-testid={a.testId}
             >
               <a.icon className="size-4" aria-hidden="true" />

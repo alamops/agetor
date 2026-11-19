@@ -64,7 +64,9 @@ The widths come from a **ghost**: an `inert`, `aria-hidden`, invisible copy of t
 ## Escape, focus and ⌘F
 
 - The panel is a portaled, non-modal `role="dialog"` carrying `data-popover-open=""` **only while open**, so RunPanel and the board's search box yield Escape to it. It also carries `data-popover-keys="escape-only"`, so ⌘F stays live while it is open (`FIND_SHORTCUT_BLOCKING_LAYERS` excludes it).
+- Opening moves focus into the panel. It renders `visibility: hidden` until it is measured and placed, and a hidden element can't take focus, so the focus call is its own layout effect keyed on `open` and "placed", not part of the placement effect (a re-placement while open never takes focus back).
 - Its Escape listener is on `document` in the bubble phase (React's root handlers run first), checks `e.defaultPrevented` first, then claims the event. Focus returns to the button only when it was inside the panel. A press outside, a window resize and every action also close it.
+- The Pipelines button is a view switch, not a toggle (pressing it on the Pipelines page stays there), so its active state is `aria-current="page"` alongside the `secondary` variant, never `aria-pressed`.
 - Any `position: fixed` overlay here portals to `document.body`: RunPanel's `<aside>` has a transform, which rebases `fixed` onto itself.
 
 ## Native menu actions

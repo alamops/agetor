@@ -120,6 +120,16 @@ describe("AppBar", () => {
     expect(offButton).not.toContain("bg-secondary");
   });
 
+  test("the Pipelines button announces the current view, not a toggle", () => {
+    const tag = (m: string) => m.match(/<button[^>]*data-testid="pipelines-button"[^>]*>/)?.[0] ?? "";
+    const on = tag(markup({ pipelinesActive: true }));
+    expect(on).toContain('aria-current="page"');
+    expect(on).not.toContain("aria-pressed");
+    expect(tag(markup())).not.toContain("aria-current");
+    // No other bar action claims to be the current page.
+    expect(markup({ pipelinesActive: true }).match(/aria-current="page"/g)).toHaveLength(1);
+  });
+
   test("the panel is closed on first render", () => {
     expect(html).toContain('aria-expanded="false"');
     expect(html).not.toContain('data-testid="harnesses-panel"');

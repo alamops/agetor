@@ -73,16 +73,21 @@ async function patchHarness(backend: E2EBackend, id: string, enabled: boolean): 
 }
 
 async function waitForAllExhausted(backend: E2EBackend, taskId: string): Promise<void> {
-  const deadline = Date.now() + 20_000;
   let last = "";
-  while (Date.now() < deadline) {
-    const res = await fetch(`${backend.apiBase}/tasks/${taskId}`, { headers: bearerHeaders(backend) });
-    const task = (await res.json()) as { column: string; harnessState: { allExhausted?: unknown } | null };
-    last = `${task.column} ${JSON.stringify(task.harnessState)}`;
-    if (task.harnessState?.allExhausted != null && task.column !== "running") return;
-    await new Promise((r) => setTimeout(r, 200));
-  }
-  throw new Error(`task ${taskId} never reached all-exhausted (last: ${last})`);
+  await expect
+    .poll(
+      async () => {
+        const res = await fetch(`${backend.apiBase}/tasks/${taskId}`, { headers: bearerHeaders(backend) });
+        const task = (await res.json()) as { column: string; harnessState: { allExhausted?: unknown } | null };
+        last = `${task.column} ${JSON.stringify(task.harnessState)}`;
+        return task.harnessState?.allExhausted != null && task.column !== "running";
+      },
+      { timeout: 20_000, intervals: [200], message: `task ${taskId} never reached all-exhausted` },
+    )
+    .toBe(true)
+    .catch((err: unknown) => {
+      throw new Error(`${err instanceof Error ? err.message : String(err)} (last: ${last})`);
+    });
 }
 
 async function arrange(backend: E2EBackend): Promise<Arranged> {
@@ -204,6 +209,19 @@ test.describe("app bar", () => {
           // Import is a bar button at every width and zoom: there is no More menu.
           await expectReachable(page, bar.getByTestId("import-claude-sessions-open"), `Import at ${where}`);
           await expect(bar.getByTestId("app-bar-more"), `no More button at ${where}`).toHaveCount(0);
+
+          // The live bar hides exactly what the measured step says (the
+          // ladder in docs/architecture/app-bar.md): the wordmark from step 1,
+          // the "Harnesses" text and the count from step 2. The dot, meter and
+          // failover badge never hide.
+          const button = harnessesButton(page);
+          await expect(bar.getByRole("heading", { name: "Agetor", exact: true }), `wordmark at ${where} (step ${step})`).toHaveCount(
+            step >= 1 ? 0 : 1,
+          );
+          await expect(button.getByTestId("harnesses-button-count"), `count at ${where} (step ${step})`).toHaveCount(step >= 2 ? 0 : 1);
+          await expect(button.getByTestId("harnesses-button-dot"), `dot at ${where}`).toBeVisible();
+          await expect(button.getByTestId("harnesses-button-meter"), `meter at ${where}`).toBeVisible();
+          await expect(button.getByTestId("harnesses-button-badge"), `failover badge at ${where}`).toHaveText("1");
         }
         if (zoom === 100) expect(steps[0], "1440 px @ 100% needs no collapse").toBe(0);
         for (let i = 1; i < steps.length; i++) {
@@ -357,8 +375,13 @@ test.describe("app bar", () => {
       await gotoApp(page, backend.bootBase);
       const button = harnessesButton(page);
       await expect(button).toBeVisible();
-      // Nine idle minutes with no data change (the 2 s polls are frozen with
-      // the clock). The bar's own timer fires at most every 30 min.
+      // Nine idle minutes with no data change. `clock.install()` does not
+      // stop time (only `pauseAt()` would): the page's timers keep running in
+      // real time, and `fastForward` fires each due timer at most once. The
+      // 2 s polls therefore still run but bring no new data, so nothing
+      // re-reads the wall clock before the panel opens, and the bar's own
+      // timer is not due inside these nine minutes (its nearest wait in this
+      // arrangement is longer; R-S1's red proof showed the stale age).
       await page.clock.fastForward("09:00");
       await button.click();
       const panel = page.getByRole("dialog", { name: "Harnesses" });
@@ -447,5 +470,159 @@ test.describe("app bar", () => {
     } finally {
       await cleanup(backend, arranged);
     }
+  });
+
+  test("opening the Harnesses panel moves focus into it, and Escape from inside returns it to the button", async ({
+    page,
+    backend,
+  }) => {
+    // HarnessesPanel places itself and then takes focus, on the commit that
+    // makes it visible (a `visibility: hidden` element can't take focus);
+    // app-bar.md: "Focus returns to the button only when it was inside the
+    // panel". Without the first half, a keyboard
+    // user who opens the panel lands back on the bar, and the panel (portaled
+    // to the end of <body>) is far away in the tab order.
+    await page.setViewportSize({ width: 1440, height: 900 });
+    await gotoApp(page, backend.bootBase);
+    const button = harnessesButton(page);
+    const panel = page.getByRole("dialog", { name: "Harnesses" });
+    const focusInPanel = () =>
+      page.evaluate(() => !!document.activeElement?.closest('[data-testid="harnesses-panel"]'));
+
+    // By keyboard: focus the button, press Enter.
+    await button.focus();
+    await page.keyboard.press("Enter");
+    await expect(panel).toBeVisible();
+    await expect.poll(focusInPanel, { message: "focus moves into the open panel" }).toBe(true);
+    await page.keyboard.press("Escape");
+    await expect(panel).toBeHidden();
+    await expect(button).toBeFocused();
+
+    // By pointer: same.
+    await button.click();
+    await expect(panel).toBeVisible();
+    await expect.poll(focusInPanel, { message: "focus moves into the open panel" }).toBe(true);
+  });
+
+  test("the Harnesses panel closes on a second press of its button, a press outside and a window resize", async ({
+    page,
+    backend,
+  }) => {
+    await page.setViewportSize({ width: 1440, height: 900 });
+    await gotoApp(page, backend.bootBase);
+    const button = harnessesButton(page);
+    const panel = page.getByRole("dialog", { name: "Harnesses" });
+    await expect(button).toBeVisible();
+    await expect(button).toHaveAttribute("aria-expanded", "false");
+
+    await button.click();
+    await expect(panel).toBeVisible();
+    await expect(button).toHaveAttribute("aria-expanded", "true");
+
+    // A second press on the button closes it. The button is the panel's
+    // anchor, so the outside-press handler leaves it to the toggle (a press
+    // that closed on mousedown and reopened on click would leave it open).
+    await button.click();
+    await expect(panel).toBeHidden();
+    await expect(button).toHaveAttribute("aria-expanded", "false");
+
+    // A press outside closes it and leaves focus where the press put it.
+    await button.click();
+    await expect(panel).toBeVisible();
+    const search = page.getByRole("textbox", { name: "Search tasks" });
+    await search.click();
+    await expect(panel).toBeHidden();
+    await expect(search).toBeFocused();
+    await expect(button).not.toBeFocused();
+
+    // A press inside does not close it.
+    await button.click();
+    await expect(panel).toBeVisible();
+    await panel.click({ position: { x: 4, y: 4 } });
+    await expect(panel).toBeVisible();
+
+    // A window resize closes it (its fixed position was measured for the old size).
+    await page.setViewportSize({ width: 1100, height: 900 });
+    await expect(panel).toBeHidden();
+    await expect(button).toHaveAttribute("aria-expanded", "false");
+  });
+
+  test("menu actions are idempotent opens, close the Harnesses panel, ignore unknown ids, and ⌘, works from the composer", async ({
+    page,
+    backend,
+  }) => {
+    await page.setViewportSize({ width: 1440, height: 900 });
+    await installSseInjector(page, "/app/events");
+    await gotoApp(page, backend.bootBase);
+    const inject = (event: Record<string, unknown>) => injectSseFrame(page, "/app/events", event);
+    const menu = (action: unknown) => inject({ type: "menu_action", action, ts: Date.now() });
+    const settings = page.getByRole("dialog").filter({ has: page.getByRole("heading", { name: "Settings" }) });
+
+    // ⌘, (Ctrl+, off macOS) with focus in the New Task composer opens
+    // Settings once; pressing it again leaves the one dialog open, never a
+    // toggle back to closed.
+    const composer = page.locator("aside").first().getByTestId("prompt-textarea");
+    await composer.click();
+    await expect(composer).toBeFocused();
+    await page.keyboard.press("ControlOrMeta+Comma");
+    await expect(settings).toBeVisible();
+    await page.keyboard.press("ControlOrMeta+Comma");
+    await expect(settings).toBeVisible();
+    await expect(settings).toHaveCount(1);
+    await page.keyboard.press("Escape");
+    await expect(settings).toBeHidden();
+
+    // An unknown action id (a newer core) is ignored: the open Harnesses
+    // panel stays open, while the stream keeps delivering. The sentinel is a
+    // later `harness_usage` frame on the same stream, which updates the
+    // claude-code row in place.
+    await harnessesButton(page).click();
+    const panel = page.getByRole("dialog", { name: "Harnesses" });
+    await expect(panel).toBeVisible();
+    await expect(panel.getByTestId("harnesses-panel-account-claude-code")).toBeVisible();
+    await menu("no-such-action");
+    await menu(42);
+    const now = Date.now();
+    await inject({
+      type: "harness_usage",
+      quota: {
+        harnessId: "claude-code",
+        kind: "claude-code",
+        planType: "max",
+        status: "ok",
+        source: "cache",
+        fetchedAtMs: now,
+        meters: [{ id: "five_hour", label: "Session (5h)", usedPercent: 37, resetsAtMs: now + 3 * HOUR_MS }],
+        reason: null,
+      } satisfies HarnessQuota,
+    });
+    await expect(panel.getByTestId("harnesses-panel-account-claude-code")).toContainText("37%");
+    await expect(panel).toBeVisible();
+
+    // ⌘, while the (non-modal) panel is open opens Settings and closes the panel.
+    await page.keyboard.press("ControlOrMeta+Comma");
+    await expect(settings).toBeVisible();
+    await expect(panel).toBeHidden();
+    await page.keyboard.press("Escape");
+    await expect(settings).toBeHidden();
+
+    // "Pipelines" twice stays on the Pipelines page (an open, not a toggle).
+    // The Worktrees action after them is the sentinel: frames are handled in
+    // order, so once its dialog shows, both Pipelines frames have run.
+    await menu("pipelines");
+    await expect(page.getByTestId("pipelines-page")).toBeVisible();
+    await menu("pipelines");
+    await menu("worktrees");
+    await expect(page.getByRole("dialog", { name: "Worktrees" })).toBeVisible();
+    await page.keyboard.press("Escape");
+    await expect(page.getByRole("dialog", { name: "Worktrees" })).toBeHidden();
+    // The current view, not just a mounted page: an animated page that is
+    // leaving stays in the DOM (opacity 0 still counts as visible), while the
+    // bar's Pipelines button reads as pressed only while the view is Pipelines,
+    // and announces it to assistive tech as the current page.
+    await expect(page.getByTestId("pipelines-button")).toHaveClass(/(^|\s)bg-secondary(\s|$)/);
+    await expect(page.getByTestId("pipelines-button")).toHaveAttribute("aria-current", "page");
+    await expect(page.getByTestId("pipelines-page")).toBeVisible();
+    await expect(page.getByTestId("board-task-count")).toHaveCount(0);
   });
 });

@@ -117,7 +117,9 @@ export function HarnessesPanel({ open, anchor, panelId, onClose, ...body }: Harn
     if (!open) setPos(null);
   }, [open]);
 
-  // Place under the anchor and take focus once the panel has a measured box.
+  // Place under the anchor once the panel has a measured box. Focus waits for
+  // the effect below: until `pos` is committed the panel is
+  // `visibility: hidden`, and a hidden element cannot take focus.
   useLayoutEffect(() => {
     if (!open) return;
     const panel = panelRef.current;
@@ -133,8 +135,15 @@ export function HarnessesPanel({ open, anchor, panelId, onClose, ...body }: Harn
         viewportHeight: window.innerHeight,
       }),
     );
-    panel.focus({ preventScroll: true });
   }, [open, anchor]);
+
+  // Take focus once per open, on the commit that makes the panel visible.
+  // Keyed on the boolean, so a re-placement while open never steals focus
+  // back from a control inside the panel.
+  const placed = pos !== null;
+  useLayoutEffect(() => {
+    if (open && placed) panelRef.current?.focus({ preventScroll: true });
+  }, [open, placed]);
 
   useEffect(() => {
     if (!open) return;

@@ -332,8 +332,8 @@ function AppInner() {
   // only by the Harnesses panel's "Swap history" link, cleared by every other
   // Settings entry point and on close (same rule as the agent id above).
   const [settingsInitialStackHistoryId, setSettingsInitialStackHistoryId] = useState<string | null>(null);
-  // Bumped by `runMenuAction`: the app bar closes its Harnesses panel and More
-  // menu when a menu action takes over the screen.
+  // Bumped by `runMenuAction`: the app bar closes its Harnesses panel when a
+  // menu action takes over the screen.
   const [appBarDismissNonce, setAppBarDismissNonce] = useState(0);
   // `runMenuAction` is declared far below the app-events effect that calls
   // it; the ref keeps that effect's deps (and its subscription) stable.

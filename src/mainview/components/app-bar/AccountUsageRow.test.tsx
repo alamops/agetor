@@ -93,7 +93,17 @@ describe("AccountUsageRow content", () => {
   test("the status is announced once: the chip's dot is decorative", () => {
     const markup = html({ statusText: "Cooling until 14:30", tone: "warning" });
     expect(markup).not.toContain('aria-label="Cooling until 14:30"');
-    expect(markup).toContain('aria-hidden="true"');
+    // Target the dot itself (StatusDot carries `data-tone`): lucide icons in
+    // the row are aria-hidden by default, so a bare `aria-hidden` match on the
+    // whole row would pass whatever the dot did.
+    const dots = markup.match(/<span[^>]*\bdata-tone="[^"]*"[^>]*>/g) ?? [];
+    expect(dots).toHaveLength(1);
+    expect(dots[0]).toContain('data-tone="warning"');
+    expect(dots[0]).toContain('aria-hidden="true"');
+    expect(dots[0]).not.toContain('role="img"');
+    expect(dots[0]).not.toContain("aria-label");
+    // The words carry the state.
+    expect(markup).toContain("Cooling until 14:30");
   });
 
   test("running tasks are counted", () => {
