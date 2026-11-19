@@ -1411,6 +1411,48 @@ test.describe("task from a Git issue", () => {
     await expect(summary).toContainText("develop");
   });
 
+  test("manage agents: the footer row is reachable by keyboard, confirms a dirty draft, then opens Settings → Agents", async ({ page, backend }) => {
+    test.setTimeout(120_000);
+    await gotoApp(page, backend.bootBase);
+    const issueTaskDialog = await openIssueTaskDialog(page);
+    const summary = issueTaskDialog.getByTestId("worktree-options").getByTestId("selected-branches");
+    await selectBaseBranch(page, issueTaskDialog, projectDir, "develop");
+    await expect(summary).toContainText("develop", { timeout: CONVERGE_TIMEOUT });
+
+    const trigger = issueTaskDialog.getByTestId("agent-profile-picker-trigger");
+    const manage = page.getByTestId("agent-profile-picker-manage");
+    const confirmDialog = page
+      .locator('[role="dialog"]')
+      .filter({ has: page.getByText("Discard this task draft and open Settings → Agents?") });
+
+    // Tab walks from the search box to the footer row (it used to close the popover).
+    await trigger.click();
+    await expect(page.getByTestId("agent-profile-picker-popover")).toBeVisible();
+    await page.keyboard.press("Tab");
+    await expect(manage).toBeFocused();
+    // Shift+Tab walks back to the search box; Tab again and Enter activates the row.
+    await page.keyboard.press("Shift+Tab");
+    await expect(page.getByTestId("agent-profile-picker-search")).toBeFocused();
+    await page.keyboard.press("Tab");
+    await page.keyboard.press("Enter");
+
+    // The draft is dirty (a picked base ref): Cancel keeps the dialog and the ref.
+    await expect(confirmDialog).toBeVisible({ timeout: CONVERGE_TIMEOUT });
+    await confirmDialog.getByRole("button", { name: "Cancel", exact: true }).click();
+    await expect(issueTaskDialog).toBeVisible();
+    await expect(summary).toContainText("develop");
+
+    // Discard closes both dialogs and opens Settings on the Agents section.
+    await trigger.click();
+    await manage.click();
+    await expect(confirmDialog).toBeVisible({ timeout: CONVERGE_TIMEOUT });
+    await confirmDialog.getByRole("button", { name: "Discard draft", exact: true }).click();
+    await expect(issueTaskDialog).toBeHidden({ timeout: CONVERGE_TIMEOUT });
+    const settings = page.getByRole("dialog").filter({ has: page.locator("#settings-dialog-title") });
+    await expect(settings).toBeVisible({ timeout: CONVERGE_TIMEOUT });
+    await expect(settings.getByRole("button", { name: "Agents", exact: true })).toHaveAttribute("aria-current", "page");
+  });
+
   test("launch layout: two columns from md with a sticky footer, one column below it", async ({ page, backend }) => {
     test.setTimeout(90_000);
     await page.setViewportSize({ width: 1280, height: 900 });
@@ -1444,7 +1486,11 @@ test.describe("task from a Git issue", () => {
     await expect(dialog.getByTestId("launch-harness-picker-trigger")).toHaveAccessibleName(/^Harness\b/);
     await expect(dialog.getByTestId("launch-model-picker-trigger")).toHaveAccessibleName(/^Model\b/);
     await expect(dialog.getByTestId("launch-effort-picker-trigger")).toHaveAccessibleName(/^Effort\b/);
-    await expect(dialog.getByTestId("launch-harness-status").first()).toHaveAttribute("data-tone", /ok|warn|error|unknown/);
+    // The status dot reads the harness's real state: the e2e backend's Claude Code is the
+    // available stub, so its tone is "ok" — never the "unknown" placeholder.
+    await expect(dialog.getByTestId("launch-harness-picker-trigger").getByTestId("launch-harness-status")).toHaveAttribute("data-tone", "ok", {
+      timeout: CONVERGE_TIMEOUT,
+    });
     // "Manage agents…" is offered in the Git dialog's profile picker.
     await dialog.getByTestId("agent-profile-picker-trigger").click();
     await expect(page.getByTestId("agent-profile-picker-manage")).toBeVisible();
