@@ -1,7 +1,7 @@
 import { useId, type ReactNode } from "react";
 import { RefreshCw, Workflow } from "lucide-react";
 import { Button } from "@/components/ui/button";
-import { Field, FieldDescription, FieldLabel, Label } from "@/components/ui/field";
+import { Field, FieldDescription, FieldLabel, Label, fieldDescriptionId } from "@/components/ui/field";
 import { Notice } from "@/components/ui/notice";
 import { Picker, type PickerItem } from "@/components/ui/picker";
 import { Switch } from "@/components/ui/switch";
@@ -104,8 +104,10 @@ export function TaskLaunchPickers({
   const note = usageNote(kind, model, modelRow?.label);
 
   // ---- Hints under the harness (or the profile card) ------------------------
-  const availabilityHints = (status: typeof selectedStatus, testIdSuffix = "") => (
-    <>
+  // The wrapper carries the field's description id (it hides itself while empty), so the harness
+  // picker's `aria-describedby` reads the hints a sighted user sees under it.
+  const availabilityHints = (status: typeof selectedStatus, testIdSuffix = "", descriptionId?: string) => (
+    <div id={descriptionId} className="space-y-1.5 empty:hidden">
       {status && !status.available && !effectiveStackFallback ? (
         <Notice tone="danger" data-testid={`launch-agent-unavailable-hint${testIdSuffix}`}>
           <div className="font-medium">{status.reason}</div>
@@ -116,7 +118,7 @@ export function TaskLaunchPickers({
       {showStackFallback ? (
         <p data-testid="launch-stack-fallback-hint" className="text-2xs text-muted-foreground">{STACK_FALLBACK_HINT}</p>
       ) : null}
-    </>
+    </div>
   );
 
   // ---- 1. Pipeline -------------------------------------------------------------
@@ -133,17 +135,20 @@ export function TaskLaunchPickers({
             pipelines={pipelines}
             onManage={onManagePipelines}
             disabled={disabled || pipelinesUnavailable}
+            aria-describedby={fieldDescriptionId(id("pipeline"))}
           />
         </div>
-        {pipelinesLoading && pipelines.length === 0 ? (
-          <p data-testid="launch-pipelines-loading" className="text-2xs text-muted-foreground">Loading pipelines…</p>
-        ) : pipelinesUnavailable ? (
-          <p data-testid="launch-pipelines-error" className="text-2xs text-danger">
-            Couldn't load pipelines {pipelinesError ? `— ${pipelinesError}` : ""}
-          </p>
-        ) : pipelines.length === 0 && pipelineId === null ? (
-          <p className="text-2xs text-muted-foreground">No pipelines yet. Create one on the Pipelines page.</p>
-        ) : null}
+        <div id={fieldDescriptionId(id("pipeline"))} className="empty:hidden">
+          {pipelinesLoading && pipelines.length === 0 ? (
+            <p data-testid="launch-pipelines-loading" className="text-2xs text-muted-foreground">Loading pipelines…</p>
+          ) : pipelinesUnavailable ? (
+            <p data-testid="launch-pipelines-error" className="text-2xs text-danger">
+              Couldn't load pipelines {pipelinesError ? `— ${pipelinesError}` : ""}
+            </p>
+          ) : pipelines.length === 0 && pipelineId === null ? (
+            <p className="text-2xs text-muted-foreground">No pipelines yet. Create one on the Pipelines page.</p>
+          ) : null}
+        </div>
       </Field>
 
       {selectedPipeline ? (
@@ -241,8 +246,9 @@ export function TaskLaunchPickers({
           stacks={stacks}
           disabled={disabled}
           statusTone={launch.statusTone}
+          aria-describedby={fieldDescriptionId(id("harness"))}
         />
-        {availabilityHints(selectedStatus)}
+        {availabilityHints(selectedStatus, "", fieldDescriptionId(id("harness")))}
       </Field>
 
       <div className="space-y-1.5">
@@ -273,6 +279,7 @@ export function TaskLaunchPickers({
             items={modelItems}
             searchable={modelItems.length > 8}
             disabled={disabled}
+            aria-describedby={note ? fieldDescriptionId(id("model")) : undefined}
           />
         </Field>
         <Field controlId={id("effort")} className="min-w-0">
@@ -292,7 +299,7 @@ export function TaskLaunchPickers({
         </Field>
       </div>
       {note ? (
-        <p data-testid="launch-usage-note" className="text-2xs text-muted-foreground">{note}</p>
+        <p id={fieldDescriptionId(id("model"))} data-testid="launch-usage-note" className="text-2xs text-muted-foreground">{note}</p>
       ) : null}
     </>
   );
@@ -332,6 +339,7 @@ export function TaskLaunchPickers({
         variants={codeVariants}
         onModeChange={launch.setMode}
         disabled={disabled}
+        aria-describedby={fieldDescriptionId(id("variant"))}
       />
       <FieldDescription>How much the agent asks before it edits files or runs commands. Applies to Code.</FieldDescription>
     </Field>

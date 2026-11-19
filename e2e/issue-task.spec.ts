@@ -1498,6 +1498,25 @@ test.describe("task from a Git issue", () => {
     await expect(dialog).toBeVisible();
   });
 
+  test("launch parity: ↻ in the dialog re-probes the harness, then refetches both model lists", async ({ page, backend }) => {
+    test.setTimeout(90_000);
+    await gotoApp(page, backend.bootBase);
+    const dialog = await openIssueTaskDialog(page);
+    const refresh = dialog.getByTestId("launch-refresh-models");
+    await expect(refresh).toBeEnabled({ timeout: CONVERGE_TIMEOUT });
+
+    // The dialog fetches for itself (no panel state to borrow), so the round trip is: a per-harness
+    // POST, then a re-read of the kind-level and the per-harness catalogs.
+    const probe = page.waitForRequest((r) => r.method() === "POST" && /\/agent-models\?harness=/.test(r.url()));
+    const kindList = page.waitForRequest((r) => r.method() === "GET" && /\/agent-models$/.test(new URL(r.url()).pathname + new URL(r.url()).search));
+    const harnessList = page.waitForRequest((r) => r.method() === "GET" && /\/agent-models\/harnesses$/.test(new URL(r.url()).pathname));
+    await refresh.click();
+    await Promise.all([probe, kindList, harnessList]);
+    // It settles back to idle and the picker still offers a model.
+    await expect(refresh).toBeEnabled({ timeout: CONVERGE_TIMEOUT });
+    await expect(dialog.getByTestId("launch-model-picker-trigger")).toHaveAttribute("data-value", /.+/);
+  });
+
   test("launch keyboard: Cmd/Ctrl+Enter runs the task from the dialog, but not while a picker is open", async ({ page, request, backend }) => {
     test.setTimeout(90_000);
     await gotoApp(page, backend.bootBase);

@@ -84,24 +84,37 @@ describe("launch style guard", () => {
   });
 
   test("nothing a Git launch dialog renders uses an InfoTip: its portaled panel carries the popover marker outside the dialog", () => {
-    // The dialogs themselves plus every component they render around the launch pickers.
-    const rendered = [
-      "kanban/CreateTaskFromIssueDialog.tsx",
-      "kanban/ResolveConflictsDialog.tsx",
-      "kanban/TaskLaunchPickers.tsx",
-      "kanban/WorkspaceSection.tsx",
-      "kanban/WorktreeOptions.tsx",
-      "kanban/ProjectSelection.tsx",
-      "kanban/TaskTypePicker.tsx",
-      "kanban/AgentProfilePicker.tsx",
-      "kanban/ReferencesPicker.tsx",
-      "kanban/PromptComposer.tsx",
-      "kanban/LaunchSection.tsx",
-      "kanban/LaunchFooter.tsx",
-      "pipelines/PipelinePicker.tsx",
-    ];
-    for (const f of rendered) {
-      // `grep` is unreliable on PromptComposer (a literal zero-width space); readFileSync is not.
+    // The closure of component imports from the two dialogs, so a component added later is covered
+    // without anyone remembering to list it. `PromptComposer` is read with readFileSync because a
+    // literal zero-width space makes `grep` treat it as binary.
+    const seen = new Set<string>();
+    const queue = ["kanban/CreateTaskFromIssueDialog.tsx", "kanban/ResolveConflictsDialog.tsx"];
+    const importRe = /from\s+["']((?:@\/components|\.{1,2})\/[^"']+)["']/g;
+    while (queue.length > 0) {
+      const f = queue.pop() as string;
+      if (seen.has(f)) continue;
+      seen.add(f);
+      for (const m of read(f).matchAll(importRe)) {
+        const spec = m[1] as string;
+        const target = spec.startsWith("@/components/")
+          ? spec.slice("@/components/".length)
+          : path.relative(ROOT, path.resolve(path.dirname(rel(f)), spec));
+        if (target.startsWith("..")) continue; // lib/, shared/: not components
+        for (const ext of [".tsx", ".ts"]) {
+          const candidate = target.endsWith(ext) ? target : target + ext;
+          try {
+            readFileSync(rel(candidate));
+            queue.push(candidate);
+            break;
+          } catch {
+            // not this extension
+          }
+        }
+      }
+    }
+    expect(seen.size).toBeGreaterThan(10); // the walk really followed the imports
+    for (const f of seen) {
+      if (f === "ui/info-tip.tsx") continue; // the primitive's own definition
       expect({ f, hit: /<InfoTip\b/.test(read(f)) }).toEqual({ f, hit: false });
     }
   });

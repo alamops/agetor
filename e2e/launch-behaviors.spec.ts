@@ -13,10 +13,12 @@ import {
   expectSpeed,
   fillNewTask,
   newTaskPanel,
+  openMore,
   pickEffort,
   pickHarness,
   pickModel,
   pickSpeed,
+  runTaskButton,
   setPrimaryMode,
   expectPrimaryMode,
 } from "./launch-helpers";
@@ -36,9 +38,12 @@ import { CODE_PLAN_MODE } from "../src/shared/types.ts";
  * P3 a remembered model only the CLI's catalog knows is applied once the
  *    catalog lands.
  * P4 the `defaultHarness` preference selects its harness on reload.
- * P5 a selected pipeline deleted through the API is cleared from the form.
+ * P5 a selected pipeline deleted on the Pipelines page is cleared from the form.
  * P6 a selected agent profile deleted through the API is cleared too.
  * P7 Isolate stays as set across two submits.
+ * P8 a remembered Fast tier is dropped when the remembered model (applied once the catalog lands)
+ *    offers no Fast tier.
+ * P9 a selected pipeline that cannot start blocks Run task (with its reason) but not Add to backlog.
  *
  * The backend's claude is the opt-in stub with a model catalog that carries a
  * Fast-capable `opus-6`; its codex is the app-server stub with a catalog of
@@ -59,9 +64,12 @@ writeFileSync(
 
 const CODEX_FAST = "gpt-7-e2e";
 const CODEX_PLAIN = "gpt-6.1-sol";
+// Known only to the CLI's catalog (not the curated rows) and without a Fast tier: P8's remembered model.
+const CODEX_LITE = "gpt-7-e2e-lite";
 const CODEX_CATALOG: FakeCodexModel[] = [
   { id: CODEX_FAST, displayName: "GPT-7 E2E", efforts: ["low", "high"], defaultEffort: "low", fast: true },
   { id: CODEX_PLAIN, displayName: "GPT-6.1 Sol", efforts: ["low", "medium", "high"], defaultEffort: "medium" },
+  { id: CODEX_LITE, displayName: "GPT-7 E2E Lite", efforts: ["low"], defaultEffort: "low" },
 ];
 const CODEX_BIN = (() => {
   const dir = path.join(WORK_DIR, "codex");
@@ -72,7 +80,6 @@ const CODEX_BIN = (() => {
 })();
 
 const CLAUDE_MODEL = "opus-6";
-const CLAUDE_FALLBACK_MODEL = "opus-5.5";
 
 function auth(backend: E2EBackend): { authorization: string } {
   return { authorization: `Bearer ${backend.apiToken}` };
@@ -250,9 +257,8 @@ test.describe("New Task panel: assembled launch behaviors", () => {
     await putPreference(request, freshBackend, "lastModel:claude-code", CLAUDE_MODEL);
     await gotoApp(page, freshBackend.bootBase);
     const panel = newTaskPanel(page);
+    // `expectModel` reads the trigger's `data-value`, so it fails while the form is still on the default row.
     await expectModel(panel, CLAUDE_MODEL);
-    // The default row is not what the form ended on.
-    await expect(panel.getByTestId("launch-model-picker-trigger")).not.toHaveAttribute("data-value", CLAUDE_FALLBACK_MODEL);
   });
 
   test("P4: the defaultHarness preference selects its harness on reload", async ({ page, request, freshBackend }) => {
@@ -265,7 +271,7 @@ test.describe("New Task panel: assembled launch behaviors", () => {
     await expectHarness(newTaskPanel(page), "Codex");
   });
 
-  test("P5: a selected pipeline deleted through the API is cleared from the form", async ({ page, request, freshBackend }) => {
+  test("P5: a selected pipeline deleted on the Pipelines page is cleared from the form", async ({ page, request, freshBackend }) => {
     const name = `P5 pipeline ${randomUUID().slice(0, 6)}`;
     const created = await request.post(`${freshBackend.apiBase}/pipelines`, {
       headers: json(freshBackend),
@@ -369,5 +375,74 @@ test.describe("New Task panel: assembled launch behaviors", () => {
     await isolate.check();
     const third = await submitToBacklog(page, request, freshBackend, "p7-third");
     expect(third.isolation).toBe("worktree");
+  });
+
+  test("P8: a remembered Fast tier is dropped when the remembered model offers none", async ({ page, request, freshBackend }) => {
+    await enableCodexAndWait(request, freshBackend);
+    // Fast was remembered for a model the catalog now lists without a Fast tier: the seed applies the
+    // model once the catalog lands, and the tier must be judged against THAT model, not the default.
+    await putPreference(request, freshBackend, "defaultHarness", "codex");
+    await putPreference(request, freshBackend, "lastModel:codex", CODEX_LITE);
+    await putPreference(request, freshBackend, "lastSpeed:codex", "fast");
+    await gotoApp(page, freshBackend.bootBase);
+    const panel = newTaskPanel(page);
+    await expectHarness(panel, "Codex");
+    await expectModel(panel, CODEX_LITE);
+    // The Speed control only shows while a tier is on or the model offers one; with the tier dropped
+    // and no tier on offer it is gone, whereas a kept "fast" would leave the picker on screen.
+    await openMore(panel);
+    await expect(panel.getByTestId("launch-speed")).toHaveCount(0);
+  });
+
+  test("P9: a pipeline that cannot start blocks Run task with its reason, and Add to backlog stays enabled", async ({ page, request, freshBackend }) => {
+    const name = `P9 pipeline ${randomUUID().slice(0, 6)}`;
+    // A saved draft: its only step has no agent, which the server refuses at create.
+    const created = await request.post(`${freshBackend.apiBase}/pipelines`, {
+      headers: json(freshBackend),
+      data: {
+        name,
+        description: "",
+        graph: {
+          steps: [
+            {
+              id: "s1",
+              name: "Plan",
+              instructions: "",
+              agentProfileId: null,
+              position: { x: 0, y: 0 },
+              subagents: { profileIds: [], cap: null },
+              transition: "choose",
+              join: "any",
+            },
+          ],
+          edges: [],
+          startStepId: "s1",
+        },
+      },
+    });
+    expect(created.ok(), await created.text()).toBeTruthy();
+    const { id } = (await created.json()) as { id: string };
+    const project = `launch-behaviors-p9-${randomUUID().slice(0, 8)}`;
+    await registerProject(freshBackend, project);
+
+    await gotoApp(page, freshBackend.bootBase);
+    const panel = newTaskPanel(page);
+    await selectProject(page, panel, project);
+    await fillNewTask(page, { title: "p9 title", prompt: "p" });
+    await expect(runTaskButton(panel)).toBeEnabled({ timeout: 20_000 });
+
+    await panel.getByTestId("launch-pipeline-picker").getByTestId("pipeline-picker-trigger").click();
+    await page.getByTestId("pipeline-picker-popover").locator(`[data-testid="pipeline-picker-row"][data-pipeline-id="${id}"]`).click();
+    const problem = panel.getByTestId("launch-pipeline-problem");
+    await expect(problem).toContainText('step "Plan" has no agent', { timeout: 20_000 });
+    await expect(runTaskButton(panel)).toBeDisabled();
+    await expect(panel.getByTestId("launch-run-blocked-reason")).toBeVisible();
+    // Backlog is the "queue it anyway" path: the server still validates the graph on create.
+    await expect(backlogButton(panel)).toBeEnabled();
+
+    // Clearing the pipeline restores a normal launch.
+    await panel.getByTestId("launch-pipeline-change").click();
+    await expect(problem).toHaveCount(0);
+    await expect(runTaskButton(panel)).toBeEnabled({ timeout: 20_000 });
   });
 });

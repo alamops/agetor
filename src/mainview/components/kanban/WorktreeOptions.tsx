@@ -4,7 +4,7 @@ import { api, type BranchNamingConfig } from "@/lib/api";
 import { Input } from "@/components/ui/input";
 import { Button } from "@/components/ui/button";
 import { Switch } from "@/components/ui/switch";
-import { Field, FieldDescription, FieldLabel } from "@/components/ui/field";
+import { Field, FieldDescription, FieldLabel, fieldDescriptionId } from "@/components/ui/field";
 import { cn } from "@/lib/utils";
 import { IDENTIFIER_INPUT_PROPS } from "@/lib/identifier-input";
 import { branchFieldState, type BranchFieldState } from "@/lib/branch-field";
@@ -379,7 +379,7 @@ function LiveWorktreeOptions({
   const labels = useMemo(() => projectRowLabels(repos.map((repo) => repo.path)), [repos]);
 
   const branchNameField = effectiveIsolate ? (
-    <Field controlId={`${uid}-branch-name`} invalid={!branchValidation.ok}>
+    <Field controlId={`${uid}-branch-name`}>
       <FieldLabel>Branch name</FieldLabel>
       <div className="relative">
         <Input
@@ -387,7 +387,11 @@ function LiveWorktreeOptions({
           data-testid="branch-name-input"
           {...IDENTIFIER_INPUT_PROPS}
           aria-invalid={!branchValidation.ok || undefined}
-          aria-describedby={!branchValidation.ok ? `${uid}-branch-name-error` : undefined}
+          aria-describedby={
+              [!branchValidation.ok ? `${uid}-branch-name-error` : null, repos.length > 1 ? fieldDescriptionId(`${uid}-branch-name`) : null]
+                .filter(Boolean)
+                .join(" ") || undefined
+            }
           value={branchField.displayValue}
           onChange={(e) => { setBranchOverride(e.target.value); setBranchDirty(true); }}
           placeholder="feature/my-task"

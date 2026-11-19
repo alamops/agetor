@@ -102,6 +102,35 @@ describe("TaskLaunchPickers — hints", () => {
     expect(html).toContain('data-testid="launch-usage-note"');
     expect(html).toContain("uses 2x the usage of Opus");
   });
+  test("the pipeline loading, error and empty hints each render in the one place the picker points at", () => {
+    const hintsId = (html: string) => html.match(/aria-describedby="([^"]*pipeline-description)"/)?.[1];
+    const loading = renderToStaticMarkup(
+      <TaskLaunchPickers launch={fakeLaunch({ pipelinesLoading: true, pipelinesLoaded: false })} layout="flat" hideProfilePicker />,
+    );
+    expect(loading).toContain('data-testid="launch-pipelines-loading"');
+    const error = renderToStaticMarkup(
+      <TaskLaunchPickers launch={fakeLaunch({ pipelinesError: "boom", pipelinesLoaded: false })} layout="flat" hideProfilePicker />,
+    );
+    expect(error).toContain('data-testid="launch-pipelines-error"');
+    expect(error).toContain("boom");
+    const empty = renderToStaticMarkup(<TaskLaunchPickers launch={fakeLaunch()} layout="flat" hideProfilePicker />);
+    expect(empty).toContain("No pipelines yet");
+    for (const html of [loading, error, empty]) {
+      const id = hintsId(html);
+      expect(id).toBeDefined();
+      expect(html).toContain(`id="${id}"`);
+    }
+  });
+  test("each field's help text is named by its control's aria-describedby", () => {
+    const html = renderToStaticMarkup(
+      <TaskLaunchPickers launch={fakeLaunch({ kind: "claude-code", agent: "claude-code", model: "fable-5.2" })} layout="flat" hideProfilePicker />,
+    );
+    for (const suffix of ["harness-description", "model-description", "pipeline-description"]) {
+      const id = html.match(new RegExp(`aria-describedby="([^"]*${suffix})"`))?.[1];
+      expect({ suffix, id: id !== undefined }).toEqual({ suffix, id: true });
+      expect(html).toContain(`id="${id}"`);
+    }
+  });
 });
 
 describe("tracked setters only", () => {

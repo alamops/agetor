@@ -641,12 +641,16 @@ export function useTaskLaunch(
   useEffect(() => {
     if (speed === "off" || speedOptionsKey === null || seedUnresolved()) return;
     if (!speedOptions.includes(speed)) setSpeed("off");
+    // `model` is a dependency on purpose: a remembered model's seed releases its hold when the form
+    // renders it, and two models can offer the same tier set, so the tier set alone would not re-judge.
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [kind, speed, speedOptionsKey]);
+  }, [kind, model, speed, speedOptionsKey]);
   useEffect(() => {
     if (seedUnresolved()) return;
     if (!maxModeAvailable && maxMode) setMaxMode(false);
-  }, [maxModeAvailable, maxMode]);
+    // `model` for the same reason as the Fast tier above: the seed's hold releases on the model change.
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [maxModeAvailable, maxMode, model]);
   useEffect(() => {
     if (!modes.some((m) => m.id === mode)) {
       const fallback = modes[0]?.id;

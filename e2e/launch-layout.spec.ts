@@ -193,5 +193,12 @@ test.describe("New Task panel layout", () => {
     await page.reload();
     await expect(panel.getByTestId("new-task-panel-resize")).toHaveAttribute("aria-valuenow", "500");
     await expect.poll(width).toBe(500);
+
+    // A smaller window clamps what is shown (the board keeps 480 px), not what the user chose.
+    const full = page.viewportSize()!;
+    await page.setViewportSize({ width: 900, height: full.height });
+    await expect.poll(width).toBe(420);
+    await page.setViewportSize(full);
+    await expect.poll(width).toBe(500);
   });
 });

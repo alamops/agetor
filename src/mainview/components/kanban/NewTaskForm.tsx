@@ -141,9 +141,12 @@ export function NewTaskForm({ onSubmit, agents, harnesses, stacks = [], onOpenSe
   // drag is in flight, so the panel follows the pointer without lag.
   const [width, setWidth] = useState(() => readNewTaskPanelWidth(typeof window === "undefined" ? 1440 : window.innerWidth));
   const [resizing, setResizing] = useState(false);
+  // The width the user chose (stored, dragged or reset to): a smaller window clamps what is shown,
+  // never this, so widening the window again gives the chosen width back.
+  const preferredWidth = useRef(width);
   useEffect(() => {
     // A smaller window re-clamps the panel so the board keeps its room.
-    const onResize = () => setWidth((w) => clampNewTaskPanelWidth(w, window.innerWidth));
+    const onResize = () => setWidth(clampNewTaskPanelWidth(preferredWidth.current, window.innerWidth));
     window.addEventListener("resize", onResize);
     return () => window.removeEventListener("resize", onResize);
   }, []);
@@ -333,10 +336,12 @@ export function NewTaskForm({ onSubmit, agents, harnesses, stacks = [], onOpenSe
   }, []);
   const onResizeCommit = useCallback((w: number) => {
     setResizing(false);
+    preferredWidth.current = w;
     setWidth(w);
     writeNewTaskPanelWidth(w);
   }, []);
   const onResizeReset = useCallback(() => {
+    preferredWidth.current = NEW_TASK_PANEL_DEFAULT_WIDTH;
     setWidth(NEW_TASK_PANEL_DEFAULT_WIDTH);
     writeNewTaskPanelWidth(NEW_TASK_PANEL_DEFAULT_WIDTH);
   }, []);

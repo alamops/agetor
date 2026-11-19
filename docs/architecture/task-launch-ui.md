@@ -45,7 +45,7 @@ Every surface renders from `useTaskLaunch` (`lib/use-task-launch.ts`); `lib/laun
 | choose one of many, searchable or long | `ui/picker.tsx` (`Picker`) |
 | choose one of 2–4 always-visible values | `ui/segmented-control.tsx` (a radiogroup): Type, Code \| Plan, Speed |
 | on / off | `ui/switch.tsx` with a `FieldLabel` (Isolate, Max Mode) |
-| a labelled control | `ui/field.tsx`: `Field` + `FieldLabel htmlFor` + `useFieldControl()`; `FieldDescription`, `FieldError` |
+| a labelled control | `ui/field.tsx`: `Field controlId` + `FieldLabel htmlFor`; help text is a `FieldDescription` (or an element with `fieldDescriptionId(controlId)`) and the control names it in `aria-describedby`; an error is a `Notice` or a `role="alert"` line the control also names |
 | an inline message | `ui/notice.tsx` (`info`, `warning`, `danger`, `muted`) |
 | rare fields | `ui/disclosure.tsx` via `LaunchSection` / `MoreOptions` |
 | a modal | `ui/dialog.tsx` + `DialogHeader/Title/Description/Body/Footer/Close` |
@@ -79,7 +79,7 @@ Layout chrome lives in `localStorage` through `lib/panel-collapse.ts` and `lib/p
 
 - `agetor:launch:<panel|dialog>:<workspace|agent>:collapsed` — a section's collapsed flag (default open)
 - `agetor:launch:<panel|dialog>:<workspace|agent>:more` — More options open (default closed)
-- `agetor:newTaskPanelWidth` — the panel width (px)
+- `agetor:newTaskPanelWidth` — the panel width (px) — the width the user chose; a narrower window clamps what is shown, never the choice, so a wider window gives it back
 - `agetor:newTaskPanelCollapsed` — the whole panel
 
 The two Git dialogs share the `dialog` surface keys.

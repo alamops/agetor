@@ -4,7 +4,7 @@
 // e2e/launch-keyboard.spec.ts.
 import { describe, expect, test } from "bun:test";
 import { renderToStaticMarkup } from "react-dom/server";
-import { Field, FieldError, FieldLabel, useFieldControl } from "./field.tsx";
+import { Field, FieldDescription, FieldLabel, fieldDescriptionId } from "./field.tsx";
 import { Picker } from "./picker.tsx";
 import { SegmentedControl } from "./segmented-control.tsx";
 import { Notice } from "./notice.tsx";
@@ -13,35 +13,20 @@ import { ResizeHandle } from "./resize-handle.tsx";
 import { Kbd } from "./kbd.tsx";
 import { Dialog, DialogBody, DialogFooter, DialogHeader, DialogTitle } from "./dialog.tsx";
 
-function Control() {
-  const c = useFieldControl();
-  return <input {...c} />;
-}
-
 describe("Field", () => {
-  test("the label's htmlFor equals the control's id, and the description is linked", () => {
+  test("the label's htmlFor equals the control's id, and the description carries the id the control names", () => {
     const html = renderToStaticMarkup(
       <Field controlId="x-1">
         <FieldLabel>Title</FieldLabel>
-        <Control />
+        <input id="x-1" aria-describedby={fieldDescriptionId("x-1")} />
+        <FieldDescription>Shown under the control</FieldDescription>
       </Field>,
     );
     expect(html).toContain('for="x-1"');
     expect(html).toContain('id="x-1"');
+    expect(fieldDescriptionId("x-1")).toBe("x-1-description");
     expect(html).toContain('aria-describedby="x-1-description"');
-    expect(html).not.toContain("aria-invalid");
-  });
-  test("an invalid field marks the control and links the error", () => {
-    const html = renderToStaticMarkup(
-      <Field controlId="x-2" invalid>
-        <FieldLabel>Branch name</FieldLabel>
-        <Control />
-        <FieldError>Bad name</FieldError>
-      </Field>,
-    );
-    expect(html).toContain('aria-invalid="true"');
-    expect(html).toContain('aria-describedby="x-2-description x-2-error"');
-    expect(html).toContain('role="alert"');
+    expect(html).toContain('<p id="x-1-description"');
   });
 });
 
