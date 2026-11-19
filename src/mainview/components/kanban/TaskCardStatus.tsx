@@ -65,7 +65,12 @@ export function TaskCardStatus({ task, stacks, limitStates }: { task: Task; stac
   const todo = task.todoProgress && task.todoProgress.total > 0 ? task.todoProgress : null;
   const sent = task.sentFiles && task.sentFiles.length > 0 ? task.sentFiles : null;
   return (
-    <div data-part="status" className="flex flex-wrap items-center gap-x-2.5 gap-y-1 empty:hidden">
+    <div
+      data-part="status"
+      // Sits 4 px under the identity line (the card's 8 px gap minus 4), and
+      // takes no gap at all when it is empty and hidden.
+      className="flex flex-wrap items-center gap-x-2.5 gap-y-1 empty:hidden [[data-part=identity]+&]:-mt-1"
+    >
       {subagents > 0 && (
         <CardStat icon={Bot} title={`${subagents} background task${subagents > 1 ? "s" : ""} running`}>
           {subagents}

@@ -57,9 +57,10 @@ actions       primary button(s) + ⋯
 | Space | picks the card up |
 | ← / → | moves it to the previous / next column (the board scrolls to it) |
 | Space | drops it, through the same `onDragEnd` as a pointer drop |
-| Escape | puts it back |
+| Escape or Tab | puts it back (Tab keeps focus on the card; a second Tab moves on) |
+| Enter while held | ignored: the task does not open out from under the drag |
 
-`lib/board-keyboard.ts` holds the key codes, the coordinate getter and the announcements; App wires them (`KeyboardSensor`, `DndContext accessibility`). The card root is the sensor's **activator node** (`setActivatorNodeRef`): dnd-kit starts a keyboard drag only when the key event's target is that node, so Space on a nested button (like `⋯`) activates the button instead. Announcements name the task and the column, never the task id.
+dnd-kit's keyboard sensor listens on the **document**, so a drag that outlived the card's focus would keep taking Space and the arrows typed anywhere else (the run panel's composer). That is why Tab cancels. `lib/board-keyboard.ts` holds the key codes, the coordinate getter and the announcements; App wires them (`KeyboardSensor`, `DndContext accessibility`). The card root is the sensor's **activator node** (`setActivatorNodeRef`): dnd-kit starts a keyboard drag only when the key event's target is that node, so Space on a nested button (like `⋯`) activates the button instead. Announcements name the task and the column, never the task id.
 
 ## Hooks e2e relies on
 

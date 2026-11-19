@@ -29,12 +29,17 @@ const TONE: Record<PipelineRunStatus, string> = {
 export function PipelineHat({ run }: { run: PipelineRunState }) {
   const progress = pipelineStepProgress(run);
   const line = stepLine(run, progress);
-  const runs = progress.runsLabel ? ` · ${progress.runsLabel}` : "";
+  // No snapshot yet (before the first Run): `0/0` says nothing, so the count
+  // is left out of the band and the tooltip.
+  const showCount = progress.total > 0 || progress.done;
+  const tooltip = [run.pipelineName, [showCount ? progress.countLabel : "", progress.runsLabel].filter(Boolean).join(" · ")]
+    .filter(Boolean)
+    .join(" — ");
   return (
     <div
       data-testid="task-card-pipeline"
       data-status={run.status}
-      title={`${run.pipelineName} — ${progress.countLabel}${runs}`}
+      title={tooltip}
       className={cn(
         "flex flex-col gap-1 rounded-tl-[4px_7px] rounded-tr-[7px] border-b px-3 py-2",
         TONE[run.status],
@@ -45,9 +50,11 @@ export function PipelineHat({ run }: { run: PipelineRunState }) {
         <span data-must-not-truncate className="min-w-0 flex-1 text-xs font-semibold leading-[18px] [overflow-wrap:anywhere]">
           {run.pipelineName}
         </span>
-        <span data-must-not-truncate className="shrink-0 text-xs font-semibold leading-[18px] tabular-nums">
-          {progress.countLabel}
-        </span>
+        {showCount && (
+          <span data-must-not-truncate className="shrink-0 text-xs font-semibold leading-[18px] tabular-nums">
+            {progress.countLabel}
+          </span>
+        )}
       </div>
       {line && (
         <div className="flex items-start gap-1.5 text-[11px] font-medium leading-4">

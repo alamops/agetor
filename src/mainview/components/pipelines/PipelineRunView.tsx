@@ -53,7 +53,7 @@ import {
   type SubagentFlowNode,
   type SubagentSatellite,
 } from "@/lib/pipelines";
-import { pipelineStepProgress, stepNameById } from "../../../shared/pipeline.ts";
+import { pipelineRunHeaderText, pipelineStepProgress, stepNameById } from "../../../shared/pipeline.ts";
 import type {
   Handoff,
   PipelineBlockKind,
@@ -966,7 +966,7 @@ export function PipelineRunView({ taskId, onOpenTask, onBack, onOpenSettingsAgen
         </Badge>
         {progress && (
           <span className="text-xs text-muted-foreground" data-testid="pipeline-run-progress">
-            {[progress.done ? "" : progress.label, progress.runsLabel].filter(Boolean).join(" · ") || progress.label}
+            {pipelineRunHeaderText(progress)}
           </span>
         )}
         <div className="ml-auto flex items-center gap-2">

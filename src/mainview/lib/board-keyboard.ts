@@ -5,12 +5,14 @@ import type { Announcements, KeyboardCoordinateGetter } from "@dnd-kit/core";
  *
  * Space picks a card up and drops it, ← → jump to the previous / next
  * column, Escape puts it back. Enter is not a drag key: it opens the task
- * (the card's own `onKeyDown`). Tab is not an end key either, so focus can
- * still leave the card without silently dropping it somewhere.
+ * (the card's own `onKeyDown`) and is ignored while a drag is held. Tab
+ * cancels, like Escape: dnd-kit listens on the document, so a drag that
+ * outlived the card's focus would keep taking Space and the arrows typed
+ * anywhere else (the run panel's composer) and move the card.
  */
 export const BOARD_KEYBOARD_CODES = {
   start: ["Space"],
-  cancel: ["Escape"],
+  cancel: ["Escape", "Tab"],
   end: ["Space"],
 };
 
@@ -94,14 +96,17 @@ export function makeBoardAnnouncements(
  * The card root's `onKeyDown`: Enter on the card ITSELF opens the task (Enter
  * on a nested button belongs to that button), and every other key goes on to
  * dnd-kit's own handler, which starts a drag on Space only when the target is
- * the card's activator node. Returns true when it opened the task.
+ * the card's activator node. While `isDragging` the card is held, so Enter does
+ * not open the task out from under the drag. Returns true when it opened the
+ * task.
  */
 export function handleCardKeyDown(
   e: { key: string; target: unknown; currentTarget: unknown; preventDefault: () => void },
   open: () => void,
   dragKeyDown?: () => void,
+  isDragging = false,
 ): boolean {
-  if (e.key === "Enter" && e.target === e.currentTarget) {
+  if (e.key === "Enter" && e.target === e.currentTarget && !isDragging) {
     e.preventDefault();
     open();
     return true;

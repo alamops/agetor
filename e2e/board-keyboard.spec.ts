@@ -6,8 +6,8 @@ import { gotoApp } from "./helpers";
 /**
  * Keyboard access to the kanban board (docs/architecture/task-card.md,
  * "Keyboard"): Tab reaches a card, Enter opens it, Space picks it up, ← →
- * move it between columns, Space drops it, Escape puts it back, and the
- * card's `⋯` button opens the task menu from the keyboard without starting a
+ * move it between columns, Space drops it, Escape or Tab puts it back (Enter
+ * is ignored while it is held), and the card's `⋯` button opens the task menu from the keyboard without starting a
  * drag. Tasks are created over the API (isolation "none", a temp dir) and
  * never started, so no agent runs.
  */
@@ -94,6 +94,46 @@ test("Escape cancels a keyboard drag and leaves the card in its column", async (
   expect(await columnOf(request, backend, task.id)).toBe("backlog");
 });
 
+test("Enter while a card is held does not open it, and Escape still puts it back", async ({ page, request, backend }) => {
+  const title = `kbd-held-enter ${randomUUID()}`;
+  const task = await createTask(request, backend, title);
+  await gotoApp(page, backend.bootBase);
+  const card = cardOf(page, task.id);
+  await expect(card).toBeVisible({ timeout: 10_000 });
+  await card.focus();
+
+  await page.keyboard.press("Space");
+  await expect(liveRegion(page)).toContainText(`${title} is over Backlog`);
+  await page.keyboard.press("Enter");
+  // The run panel did not open out from under the drag, and the drag is still live.
+  await expect(page.locator("aside").last().locator("textarea")).toHaveCount(0);
+  await page.keyboard.press("ArrowRight");
+  await expect(liveRegion(page)).toContainText(`${title} is over Ready`);
+  await page.keyboard.press("Escape");
+  await expect(liveRegion(page)).toContainText(`Moving ${title} was cancelled`);
+  expect(await columnOf(request, backend, task.id)).toBe("backlog");
+});
+
+test("Tab cancels a keyboard drag, so keys typed afterwards cannot move the card", async ({ page, request, backend }) => {
+  const title = `kbd-tab-cancel ${randomUUID()}`;
+  const task = await createTask(request, backend, title);
+  await gotoApp(page, backend.bootBase);
+  const card = cardOf(page, task.id);
+  await expect(card).toBeVisible({ timeout: 10_000 });
+  await card.focus();
+
+  await page.keyboard.press("Space");
+  await page.keyboard.press("ArrowRight");
+  await expect(liveRegion(page)).toContainText(`${title} is over Ready`);
+  await page.keyboard.press("Tab");
+  await expect(liveRegion(page)).toContainText(`Moving ${title} was cancelled`);
+  // The document-level key listener is gone: another ArrowRight / Escape does nothing.
+  await page.keyboard.press("ArrowRight");
+  await page.keyboard.press("ArrowRight");
+  await expect(liveRegion(page)).toContainText(`Moving ${title} was cancelled`);
+  expect(await columnOf(request, backend, task.id)).toBe("backlog");
+});
+
 test("a review card reaches Done, even when that column is scrolled off-screen", async ({ page, request, backend }) => {
   const task = await createTask(request, backend, `kbd-done ${randomUUID()}`);
   await patchColumn(request, backend, task.id, "review");
@@ -121,8 +161,9 @@ test("Space on the ⋯ button opens the task menu and does not pick the card up"
   await page.keyboard.press("Space");
 
   await expect(taskMenu(page)).toBeVisible();
-  // No drag started: dnd-kit announced nothing, and the card did not move.
-  await expect(liveRegion(page)).not.toContainText("Picked up");
+  // No drag started: a pick-up is announced at once as "<title> is over
+  // <column>", and nothing was.
+  await expect(liveRegion(page)).not.toContainText("is over");
   expect(await columnOf(request, backend, task.id)).toBe("backlog");
 });
 

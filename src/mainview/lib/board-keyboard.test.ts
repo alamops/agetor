@@ -103,10 +103,11 @@ describe("boardKeyboardCoordinates", () => {
 });
 
 describe("keyboard codes", () => {
-  test("Space starts and drops, Escape cancels, Enter and Tab are not drag keys", () => {
+  test("Space starts and drops, Escape and Tab cancel, Enter is not a drag key", () => {
     expect(BOARD_KEYBOARD_CODES.start).toEqual(["Space"]);
     expect(BOARD_KEYBOARD_CODES.end).toEqual(["Space"]);
-    expect(BOARD_KEYBOARD_CODES.cancel).toEqual(["Escape"]);
+    expect(BOARD_KEYBOARD_CODES.cancel).toEqual(["Escape", "Tab"]);
+    expect(BOARD_KEYBOARD_CODES.end).not.toContain("Enter");
   });
 
   test("instructions mention every key", () => {
@@ -156,6 +157,14 @@ describe("handleCardKeyDown", () => {
     const k = ev("Enter", card);
     expect(handleCardKeyDown(k.e, () => { opened++; }, () => { drag++; })).toBe(true);
     expect([opened, drag, k.prevented()]).toEqual([1, 0, true]);
+  });
+
+  test("Enter while the card is held in a keyboard drag does not open it", () => {
+    let opened = 0;
+    let drag = 0;
+    const k = ev("Enter", card);
+    expect(handleCardKeyDown(k.e, () => { opened++; }, () => { drag++; }, true)).toBe(false);
+    expect([opened, drag, k.prevented()]).toEqual([0, 1, false]);
   });
 
   test("Enter on a nested button does not open the card", () => {

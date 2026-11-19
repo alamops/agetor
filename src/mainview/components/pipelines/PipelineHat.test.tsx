@@ -38,6 +38,12 @@ describe("PipelineHat", () => {
     expect(m).toContain("2/10");
   });
 
+  test("an idle run (no snapshot yet) shows no 0/0 count", () => {
+    const m = html(run({ status: "idle", snapshot: null }));
+    expect(m).toContain("My Implementation Pipeline");
+    expect(m).not.toContain("0/0");
+  });
+
   test("running: info tone and the active step line", () => {
     const m = html(running());
     expect(m).toContain("bg-info/10");

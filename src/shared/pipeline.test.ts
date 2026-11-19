@@ -32,6 +32,7 @@ import {
   parseHandoff,
   parseHandoffFilePath,
   parseHandoffInner,
+  pipelineRunHeaderText,
   pipelineStepProgress,
   renderHandoffFile,
   resolveNextSteps,
@@ -2239,6 +2240,21 @@ describe("pipelineStepProgress", () => {
     const progress = pipelineStepProgress(run);
     expect(progress.active).toBe(1);
     expect(progress.label).toBe("0/2 · Branch B");
+  });
+
+  test("the run view header: a live run shows count, step and run counts; a done run only the run counts", () => {
+    const live = pipelineStepProgress(makeRun({
+      status: "running",
+      snapshot: tenSnapshot(),
+      history: [rec(1, "s1"), rec(2, "s2"), rec(3, "s3", null)],
+      active: [{ stepId: "s3", taskId: "t3", seq: 3 }],
+    }));
+    expect(pipelineRunHeaderText(live)).toBe("2/10 · Step 3 · 3 step runs");
+    const done = pipelineStepProgress(makeRun({ status: "done", snapshot: tenSnapshot(), history: loopHistory() }));
+    expect(pipelineRunHeaderText(done)).toBe("13 step runs · 3 re-runs");
+    expect(pipelineRunHeaderText(done)).not.toContain("13/10");
+    // Done with nothing executed: never an empty span.
+    expect(pipelineRunHeaderText(pipelineStepProgress(makeRun({ status: "done" })))).toBe("✓ Done");
   });
 
   test("total is 0 before the first run (no snapshot)", () => {

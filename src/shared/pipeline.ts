@@ -1763,3 +1763,14 @@ export function pipelineStepProgress(run: PipelineRunState): PipelineStepProgres
 
   return { completed, active, total, done, executions, reruns, current, countLabel, label, runsLabel };
 }
+
+/**
+ * The progress text in the run view's header. The status badge beside it
+ * already says "Done", so a finished run shows only the execution counts
+ * (`13 step runs · 3 re-runs`); any other run shows `<n>/<total> · <current>`
+ * followed by them. A finished run with no executions falls back to the count
+ * label rather than rendering an empty span.
+ */
+export function pipelineRunHeaderText(progress: PipelineStepProgress): string {
+  return [progress.done ? "" : progress.label, progress.runsLabel].filter(Boolean).join(" · ") || progress.label;
+}

@@ -145,8 +145,8 @@ function TaskCardImpl({ task, homeDir, stacks = [], limitStates = [], onStart, o
       {...attributes}
       // After the spreads, so it composes dnd-kit's key handler instead of
       // replacing it. Enter on the card itself (never on a nested button)
-      // opens the task.
-      onKeyDown={(e) => handleCardKeyDown(e, () => onOpen(task), () => listeners?.onKeyDown?.(e))}
+      // opens the task, unless the card is held in a keyboard drag.
+      onKeyDown={(e) => handleCardKeyDown(e, () => onOpen(task), () => listeners?.onKeyDown?.(e), isDragging)}
     >
       {task.unread && !isOpen && (
         // Static dot for "has assistant messages you haven't read yet" —
@@ -171,10 +171,8 @@ function TaskCardImpl({ task, homeDir, stacks = [], limitStates = [], onStart, o
           <TypeIcon className={cn("mr-1.5 inline-block size-3.5 align-[-2px]", type.iconClass)} role="img" aria-label={type.label} />
           {task.title}
         </h3>
-        <div className="flex flex-col gap-1 empty:hidden">
-          <TaskCardIdentity task={task} />
-          <TaskCardStatus task={task} stacks={stacks} limitStates={limitStates} />
-        </div>
+        <TaskCardIdentity task={task} />
+        <TaskCardStatus task={task} stacks={stacks} limitStates={limitStates} />
         {preview && (
           <p data-part="preview" className="line-clamp-2 text-xs leading-normal text-muted-foreground">
             {preview}
