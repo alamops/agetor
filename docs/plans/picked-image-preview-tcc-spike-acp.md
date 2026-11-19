@@ -14,7 +14,7 @@ A headless core from this worktree at wave 1 (`src/bun/headless.ts`), `AGETOR_DA
 ## fx — `deepseek/deepseek-v4-flash`, `yolo` (Full access)
 
 - The first `ls`/`sips` and `read_file` calls used the path as the model retyped it (a plain space before `PM`), so they failed with `No such file or directory` / `Path not found`. That is the model not reproducing U+202F, not a TCC denial.
-- The agent then listed the Desktop (`ls -1 /Users/alamosaravali/Desktop | grep -i 'Screenshot 2026-11-18'`: it saw both screenshots), found the real name, and ran `sips -g pixelWidth -g pixelHeight` on it: `pixelWidth: 333`, `pixelHeight: 174`. Final answer: "333 × 174 pixels". Run status `succeeded`.
+- The agent then listed the Desktop (`ls -1 ~/Desktop | grep -i 'Screenshot 2026-11-18'`: it saw both screenshots), found the real name, and ran `sips -g pixelWidth -g pixelHeight` on it: `pixelWidth: 333`, `pixelHeight: 174`. Final answer: "333 × 174 pixels". Run status `succeeded`.
 - Verdict: **reads**. A disclaimed fx child can list `~/Desktop` and read a screenshot through its shell tool, and no prompt was raised. Its `read_file` tool was not conclusively tested (the model could not type the U+202F path), so that one tool is unverified, not shown broken.
 
 ## cursor — `grok-4.7`, `gpt-5.2`, `auto`; `auto` mode

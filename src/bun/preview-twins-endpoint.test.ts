@@ -10,10 +10,13 @@ import {
   readFileSync,
   rmSync,
   symlinkSync,
+  truncateSync,
   writeFileSync,
 } from "node:fs";
 import { tmpdir } from "node:os";
 import path from "node:path";
+import { MAX_FILE_PREVIEW_BYTES } from "../shared/attachments.ts";
+import { rmTestDataDir } from "./test-data-dir.ts";
 import { makeTestNative } from "./test-native.ts";
 
 const DATA_DIR = mkdtempSync(path.join(tmpdir(), "agetor-preview-twins-endpoint-"));
@@ -43,6 +46,7 @@ let dataDir: string;
 let twinPath: (p: string) => string | null;
 let writePreviewTwin: (dataDir: string, p: string) => Promise<unknown>;
 let setDragReader: (fn: (() => string[]) | null) => void;
+let sweepIdle: (() => Promise<void>) | undefined;
 
 beforeAll(async () => {
   ({ dataDir } = await import("./db.ts"));
@@ -51,6 +55,7 @@ beforeAll(async () => {
   const twins = await import("./preview-twins.ts");
   twinPath = (p) => twins.previewTwinPath(dataDir, p);
   writePreviewTwin = twins.writePreviewTwin;
+  sweepIdle = () => twins.__forTest.idle();
   ({ setDragPasteboardReaderForTests: setDragReader } = await import("./drag-pasteboard.ts"));
   const native = makeTestNative({ openFileDialog: async () => answer });
   server = startApiServer({ native }) as unknown as { stop: () => void };
@@ -58,9 +63,11 @@ beforeAll(async () => {
   cliToken = CLI_TOKEN;
 });
 
-afterAll(() => {
+afterAll(async () => {
   server?.stop?.();
+  await sweepIdle?.();
   rmSync(SCRATCH, { recursive: true, force: true });
+  rmTestDataDir(DATA_DIR);
 });
 
 afterEach(() => {
@@ -107,6 +114,59 @@ describe("/refs/pick writes a twin of each picked image", () => {
     const res = await post("/refs/pick", { mode: "folder" });
     expect(res.status).toBe(200);
     expect(hasTwin(inside)).toBe(false);
+  });
+
+  test("native panel, folder mode: even a file the panel hands back is not twinned", async () => {
+    // Only a files-mode pick twins (the guard in the native branch); a folder
+    // pick never reads file bytes, whatever the panel answers.
+    const png = file("folder-mode-file.png");
+    answer = [png];
+    const res = await post("/refs/pick", { mode: "folder" });
+    expect(res.status).toBe(200);
+    expect(((await res.json()) as { refs: unknown[] }).refs).toHaveLength(1);
+    expect(hasTwin(png)).toBe(false);
+  });
+
+  test("native panel: every image of a multi-file pick gets its own twin", async () => {
+    const a = file("multi-a.png", PNG_A);
+    const b = file("multi-b.webp", PNG_B);
+    const c = file("multi-c.heic", PNG_A);
+    answer = [a, b, c];
+    const res = await post("/refs/pick", { mode: "files" });
+    expect(((await res.json()) as { refs: unknown[] }).refs).toHaveLength(3);
+    expect(readFileSync(twinPath(a)!).equals(PNG_A)).toBe(true);
+    expect(readFileSync(twinPath(b)!).equals(PNG_B)).toBe(true);
+    expect(readFileSync(twinPath(c)!).equals(PNG_A)).toBe(true);
+  });
+
+  test("native panel cancelled: an empty answer, no error", async () => {
+    answer = [];
+    const res = await post("/refs/pick", { mode: "files" });
+    expect(res.status).toBe(200);
+    expect(((await res.json()) as { refs: unknown[] }).refs).toEqual([]);
+  });
+
+  test("the CLI token cannot pick (desktop-only), so it never writes a twin", async () => {
+    const png = file("pick-cli.png");
+    answer = [png];
+    const res = await post("/refs/pick", { mode: "files" }, cliToken);
+    expect(res.status).toBe(403);
+    expect(((await res.json()) as { code?: string }).code).toBe("desktop-only");
+    expect(hasTwin(png)).toBe(false);
+  });
+
+  test.skipIf(isRoot)("a picked image is served from its twin once the original becomes unreadable (pick → block → preview)", async () => {
+    const png = file("assembled.png", PNG_B);
+    answer = [png];
+    expect((await post("/refs/pick", { mode: "files" })).status).toBe(200);
+    chmodSync(png, 0o000);
+    try {
+      const res = await preview(png);
+      expect(res.status).toBe(200);
+      expect(Buffer.from(await res.arrayBuffer()).equals(PNG_B)).toBe(true);
+    } finally {
+      chmodSync(png, 0o600);
+    }
   });
 
   test("native panel: a symlinked png gets no twin", async () => {
@@ -159,6 +219,70 @@ describe("/refs/drag twins only non-uploadable images the drop vouches for", () 
     expect(res.status).toBe(200);
     expect(hasTwin(heic)).toBe(false);
   });
+
+  test("a request with no body at all (the pre-twin webview) still answers the refs", async () => {
+    const heic = file("drag-nobody.heic");
+    setDragReader(() => [heic]);
+    const res = await fetch(`http://127.0.0.1:${PORT}/refs/drag`, {
+      method: "POST",
+      headers: { authorization: `Bearer ${token}` },
+    });
+    expect(res.status).toBe(200);
+    expect(((await res.json()) as { refs: Array<{ path: string }> }).refs.map((r) => r.path)).toEqual([heic]);
+    expect(hasTwin(heic)).toBe(false);
+  });
+
+  test("every non-uploadable image type is twinned when named; every uploadable one never is", async () => {
+    const twinned = ["heic", "svg", "bmp", "ico", "avif", "HEIC"].map((ext) => file(`drag-kind.${ext}`));
+    const uploaded = ["png", "jpg", "jpeg", "gif", "webp", "PNG"].map((ext) => file(`drag-kind.${ext}`));
+    const all = [...twinned, ...uploaded];
+    setDragReader(() => all);
+    const res = await post("/refs/drag", { names: all.map((p) => path.basename(p)) });
+    expect(((await res.json()) as { refs: unknown[] }).refs).toHaveLength(all.length);
+    for (const p of twinned) expect({ p, twin: hasTwin(p) }).toEqual({ p, twin: true });
+    for (const p of uploaded) expect({ p, twin: hasTwin(p) }).toEqual({ p, twin: false });
+  });
+
+  test("a directory or a symlink on the pasteboard is never twinned, even when named", async () => {
+    const dir = path.join(SCRATCH, `${++n}-drag-dir.heic`);
+    mkdirSync(dir);
+    const target = file("drag-link-target.heic");
+    const link = path.join(SCRATCH, `${++n}-drag-link.heic`);
+    symlinkSync(target, link);
+    setDragReader(() => [dir, link]);
+    const res = await post("/refs/drag", { names: [path.basename(dir), path.basename(link)] });
+    expect(((await res.json()) as { refs: unknown[] }).refs).toHaveLength(2);
+    expect(hasTwin(dir)).toBe(false);
+    expect(hasTwin(link)).toBe(false);
+  });
+
+  test("at most 256 names are honored: a name past the cap vouches for nothing", async () => {
+    const within = file("drag-cap-within.heic");
+    const beyond = file("drag-cap-beyond.heic");
+    const fillers = Array.from({ length: 255 }, (_, i) => `filler-${i}.txt`);
+    setDragReader(() => [within, beyond]);
+    // Index 255 is the 256th name (honored); index 256 is the 257th (dropped).
+    await post("/refs/drag", { names: [...fillers, path.basename(within), path.basename(beyond)] });
+    expect(hasTwin(within)).toBe(true);
+    expect(hasTwin(beyond)).toBe(false);
+  });
+
+  test("non-string names are ignored, not coerced", async () => {
+    const heic = file("drag-nested.heic");
+    setDragReader(() => [heic]);
+    // `String(["x.heic"])` is "x.heic": a coercing reader would let a nested
+    // array vouch for the file.
+    await post("/refs/drag", { names: [[path.basename(heic)], 123, null] });
+    expect(hasTwin(heic)).toBe(false);
+  });
+
+  test("the CLI token cannot drag (desktop-only), so it never writes a twin", async () => {
+    const heic = file("drag-cli.heic");
+    setDragReader(() => [heic]);
+    const res = await post("/refs/drag", { names: [path.basename(heic)] }, cliToken);
+    expect(res.status).toBe(403);
+    expect(hasTwin(heic)).toBe(false);
+  });
 });
 
 describe("/refs/resolve twins only for the app caller that asks for it", () => {
@@ -200,6 +324,32 @@ describe("/refs/resolve twins only for the app caller that asks for it", () => {
     await post("/refs/resolve", { paths: [png], names: [path.basename(png)], previewTwins: "true" });
     await post("/refs/resolve", { paths: [png], names: [path.basename(png)], previewTwins: 1 });
     expect(hasTwin(png)).toBe(false);
+  });
+
+  test("a missing file and a directory resolve as before and get no twin", async () => {
+    const gone = path.join(SCRATCH, `${++n}-resolve-gone.png`);
+    const dir = path.join(SCRATCH, `${++n}-resolve-dir.png`);
+    mkdirSync(dir);
+    const res = await post("/refs/resolve", {
+      paths: [gone, dir],
+      names: [path.basename(gone), path.basename(dir)],
+      previewTwins: true,
+    });
+    const { refs } = (await res.json()) as { refs: Array<{ path: string; isDirectory: boolean }> };
+    expect(refs.map((r) => r.isDirectory)).toEqual([true]); // the missing path is dropped, as always
+    expect(hasTwin(gone)).toBe(false);
+    expect(hasTwin(dir)).toBe(false);
+  });
+
+  test("the response shape is unchanged by the flag (same refs with and without it)", async () => {
+    const png = file("resolve-shape.png");
+    const txt = file("resolve-shape.txt", "x");
+    const plain = await (await post("/refs/resolve", { paths: [png, txt] })).json();
+    const twinned = await (
+      await post("/refs/resolve", { paths: [png, txt], names: [path.basename(png)], previewTwins: true })
+    ).json();
+    expect(twinned).toEqual(plain);
+    expect(hasTwin(png)).toBe(true);
   });
 
   test("the CLI token with the flag still gets no twin (D17)", async () => {
@@ -309,6 +459,63 @@ describe("/files/preview falls back to the twin only when the original is denied
       symlinkSync(readable, twin);
       const res = await preview(orig);
       expect(res.status).toBe(403);
+    });
+
+    // Only an `ok` or `not-modified` twin replaces the denial. A twin that is
+    // missing, not a regular file or too large keeps the ORIGINAL's 403: the
+    // chip must not turn amber (404) or claim the file is too big (413)
+    // because of the cache.
+    test.skipIf(isRoot)(`${mode}: a twin that is a directory keeps the 403 (not a 404)`, async () => {
+      await enter();
+      const orig = lockedImage("denied-dirtwin.png");
+      mkdirSync(twinPath(orig)!, { recursive: true });
+      try {
+        expect((await preview(orig)).status).toBe(403);
+      } finally {
+        rmSync(twinPath(orig)!, { recursive: true, force: true });
+      }
+    });
+
+    test.skipIf(isRoot)(`${mode}: a twin over the preview cap keeps the 403 (not a 413)`, async () => {
+      await enter();
+      const orig = lockedImage("denied-bigtwin.png");
+      const twin = twinPath(orig)!;
+      mkdirSync(path.dirname(twin), { recursive: true });
+      writeFileSync(twin, "");
+      truncateSync(twin, MAX_FILE_PREVIEW_BYTES + 1);
+      try {
+        expect((await preview(orig)).status).toBe(403);
+      } finally {
+        rmSync(twin, { force: true });
+      }
+    });
+
+    test.skipIf(isRoot)(`${mode}: the twin is keyed by the exact path (a U+202F/space twin is not used)`, async () => {
+      await enter();
+      // The denied original has a narrow no-break space; the only twin on disk
+      // belongs to the same name with a plain space.
+      const spaced = file("Screenshot 2.40.41 PM.png", PNG_B);
+      const narrow = path.join(path.dirname(spaced), path.basename(spaced).replace(" PM", " PM"));
+      writeFileSync(narrow, PNG_A);
+      locked.push(narrow);
+      await writePreviewTwin(dataDir, spaced);
+      chmodSync(narrow, 0o000);
+      expect(hasTwin(spaced)).toBe(true);
+      expect(hasTwin(narrow)).toBe(false);
+      expect((await preview(narrow)).status).toBe(403);
+    });
+
+    test.skipIf(isRoot)(`${mode}: the twin is served with the requested path's content type, not one sniffed from its bytes`, async () => {
+      await enter();
+      // PNG bytes under an uppercase `.WEBP` name: the type comes from the
+      // path the chip asked for, as it does for a readable original.
+      const orig = file("upper.WEBP", PNG_A);
+      await writePreviewTwin(dataDir, orig);
+      chmodSync(orig, 0o000);
+      locked.push(orig);
+      const res = await preview(orig);
+      expect(res.status).toBe(200);
+      expect(res.headers.get("content-type")).toBe("image/webp");
     });
 
     test.skipIf(isRoot)(`${mode}: If-None-Match with the twin's ETag is 304`, async () => {

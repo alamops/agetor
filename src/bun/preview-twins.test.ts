@@ -49,7 +49,13 @@ function fixture() {
 const PNG = Buffer.from([0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a, 1, 2, 3, 4]);
 const isRoot = typeof process.getuid === "function" && process.getuid() === 0;
 
-beforeEach(() => __forTest.reset());
+// Drain any fire-and-forget sweep an earlier write left running (this file and
+// the endpoint test share the module), so `reset` never orphans a live loop that
+// would then pick up this test's queued request and add a pass.
+beforeEach(async () => {
+  await __forTest.idle();
+  __forTest.reset();
+});
 afterEach(async () => {
   await __forTest.idle();
 });
@@ -122,6 +128,45 @@ describe("writePreviewTwin", () => {
     truncateSync(orig, PREVIEW_TWIN_MAX_BYTES + 1);
     expect(await writePreviewTwin(dataDir, orig)).toEqual({ kind: "skipped", reason: "too-large" });
     expect(existsSync(previewTwinPath(dataDir, orig)!)).toBe(false);
+  });
+
+  test("a file of exactly the cap is still twinned (the cap is inclusive)", async () => {
+    const { dataDir, src } = fixture();
+    const orig = path.join(src, "edge.png");
+    writeFileSync(orig, "");
+    truncateSync(orig, PREVIEW_TWIN_MAX_BYTES);
+    const r = await writePreviewTwin(dataDir, orig);
+    expect(r).toEqual({ kind: "written", twinPath: previewTwinPath(dataDir, orig)!, bytes: PREVIEW_TWIN_MAX_BYTES });
+    expect(statSync(previewTwinPath(dataDir, orig)!).size).toBe(PREVIEW_TWIN_MAX_BYTES);
+  });
+
+  test("a path through a file (ENOTDIR) is `missing`", async () => {
+    const { dataDir, src } = fixture();
+    const notADir = path.join(src, "plain.txt");
+    writeFileSync(notADir, "x");
+    expect(await writePreviewTwin(dataDir, path.join(notADir, "inner.png"))).toEqual({
+      kind: "skipped",
+      reason: "missing",
+    });
+  });
+
+  test("`previews` that is a regular file is `unsafe-dir`; the file is left as it was", async () => {
+    const { dataDir, src, previews } = fixture();
+    writeFileSync(previews, "not a directory");
+    const orig = path.join(src, "shot.png");
+    writeFileSync(orig, PNG);
+    expect(await writePreviewTwin(dataDir, orig)).toEqual({ kind: "skipped", reason: "unsafe-dir" });
+    expect(readFileSync(previews, "utf8")).toBe("not a directory");
+  });
+
+  test("the first write creates `previews` as a private directory", async () => {
+    const { dataDir, src, previews } = fixture();
+    const orig = path.join(src, "shot.png");
+    writeFileSync(orig, PNG);
+    expect((await writePreviewTwin(dataDir, orig)).kind).toBe("written");
+    const st = statSync(previews);
+    expect(st.isDirectory()).toBe(true);
+    expect(st.mode & 0o077).toBe(0); // no group/other access to the cache
   });
 
   test("a symlink at the final component is `symlink`; its target is untouched", async () => {
@@ -208,6 +253,50 @@ describe("writePreviewTwin", () => {
     expect(previewTwinPath(dataDir, dir)).not.toBeNull(); // looks like a png by name
     expect(existsSync(previewTwinPath(dataDir, dir)!)).toBe(false); // but a directory is never twinned
   });
+
+  test("writePreviewTwinsForRefs keeps going past a ref that can't be twinned, and never throws", async () => {
+    const { dataDir, src } = fixture();
+    const gone = path.join(src, "gone.png");
+    const link = path.join(src, "link.png");
+    const good = path.join(src, "good.png");
+    writeFileSync(good, PNG);
+    symlinkSync(good, link);
+    await writePreviewTwinsForRefs(dataDir, [
+      { path: gone, isDirectory: false },
+      { path: link, isDirectory: false },
+      { path: good, isDirectory: false },
+    ]);
+    expect(existsSync(previewTwinPath(dataDir, gone)!)).toBe(false);
+    expect(existsSync(previewTwinPath(dataDir, link)!)).toBe(false);
+    expect(readFileSync(previewTwinPath(dataDir, good)!).equals(PNG)).toBe(true);
+  });
+
+  test("warns once per skip reason (with the path), and never for a non-image", async () => {
+    const { dataDir, src } = fixture();
+    const warnings: string[] = [];
+    const realWarn = console.warn;
+    console.warn = (...args: unknown[]) => {
+      warnings.push(args.map(String).join(" "));
+    };
+    try {
+      await writePreviewTwin(dataDir, path.join(src, "first-gone.png"));
+      await writePreviewTwin(dataDir, path.join(src, "second-gone.png"));
+      writeFileSync(path.join(src, "note.txt"), "x");
+      await writePreviewTwin(dataDir, path.join(src, "note.txt"));
+      const target = path.join(src, "t.png");
+      writeFileSync(target, PNG);
+      symlinkSync(target, path.join(src, "l.png"));
+      await writePreviewTwin(dataDir, path.join(src, "l.png"));
+    } finally {
+      console.warn = realWarn;
+    }
+    const twinWarnings = warnings.filter((w) => w.includes("preview twin skipped"));
+    expect(twinWarnings).toHaveLength(2);
+    expect(twinWarnings[0]).toContain("(missing)");
+    expect(twinWarnings[0]).toContain("first-gone.png");
+    expect(twinWarnings[1]).toContain("(symlink)");
+    expect(warnings.some((w) => w.includes("note.txt"))).toBe(false);
+  });
 });
 
 describe("sweepPreviewTwins", () => {
@@ -269,6 +358,32 @@ describe("sweepPreviewTwins", () => {
     expect(existsSync(fresh)).toBe(true); // an in-flight write is never swept
   });
 
+  test("unlinks a planted FIFO (a special file) and leaves a subdirectory alone", async () => {
+    const { dataDir, previews } = fixture();
+    mkdirSync(previews, { recursive: true });
+    const fifo = path.join(previews, `${"9".repeat(64)}.png`);
+    expect(spawnSync("/usr/bin/mkfifo", [fifo]).status).toBe(0);
+    const sub = path.join(previews, "sub");
+    mkdirSync(sub);
+    writeFileSync(path.join(sub, `${"8".repeat(64)}.png`), Buffer.alloc(100, 1));
+    const twin = seed(previews, `${"7".repeat(64)}.png`, 10, 1000);
+    const r = await sweepPreviewTwins(dataDir, 0);
+    expect(r).toEqual({ kept: 0, evicted: 1, removedOther: 1 });
+    expect(existsSync(fifo)).toBe(false);
+    expect(existsSync(twin)).toBe(false);
+    // Never recursed into, and never counted against the cap.
+    expect(readdirSync(sub)).toHaveLength(1);
+  });
+
+  test("a fresh .tmp file never counts against the cap or gets evicted as a twin", async () => {
+    const { dataDir, previews } = fixture();
+    const tmp = seed(previews, `.${"6".repeat(64)}.0000abcd.tmp`, 1000, 1000);
+    const twin = seed(previews, `${"5".repeat(64)}.png`, 100, 500);
+    expect(await sweepPreviewTwins(dataDir, 100)).toEqual({ kept: 1, evicted: 0, removedOther: 0 });
+    expect(existsSync(tmp)).toBe(true);
+    expect(existsSync(twin)).toBe(true);
+  });
+
   test("does nothing when `previews` is a symlink", async () => {
     const { dataDir, src, previews } = fixture();
     const elsewhere = path.join(src, "elsewhere");
@@ -294,6 +409,41 @@ describe("requestPreviewTwinSweep", () => {
     await __forTest.idle();
     expect(__forTest.passes()).toBeGreaterThanOrEqual(1);
     expect(__forTest.passes()).toBeLessThanOrEqual(2);
+  });
+
+  test("requests that arrive mid-sweep collapse into exactly one follow-up pass (none is lost)", async () => {
+    const { dataDir, previews } = fixture();
+    mkdirSync(previews, { recursive: true });
+    for (let i = 0; i < 5; i++) requestPreviewTwinSweep(dataDir);
+    await __forTest.idle();
+    expect(__forTest.passes()).toBe(2);
+  });
+
+  test("a request after the sweep went idle starts a new pass", async () => {
+    const { dataDir, previews } = fixture();
+    mkdirSync(previews, { recursive: true });
+    requestPreviewTwinSweep(dataDir);
+    await __forTest.idle();
+    expect(__forTest.passes()).toBe(1);
+    requestPreviewTwinSweep(dataDir);
+    await __forTest.idle();
+    expect(__forTest.passes()).toBe(2);
+  });
+
+  test("the follow-up pass sweeps the data dir of the latest request", async () => {
+    const first = fixture();
+    const second = fixture();
+    const victim = path.join(second.previews, `${"4".repeat(64)}.png`);
+    mkdirSync(first.previews, { recursive: true });
+    mkdirSync(second.previews, { recursive: true });
+    // A symlink is removed by any pass, whatever the cap: proof the queued
+    // pass ran against `second`, not `first` again.
+    symlinkSync(path.join(second.previews, "nowhere"), victim);
+    requestPreviewTwinSweep(first.dataDir);
+    requestPreviewTwinSweep(second.dataDir);
+    await __forTest.idle();
+    expect(__forTest.passes()).toBe(2);
+    expect(existsSync(victim) || readdirSync(second.previews).includes(path.basename(victim))).toBe(false);
   });
 
   test("a write requests a sweep, so the cache stays under the cap over time", async () => {

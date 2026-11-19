@@ -6,7 +6,7 @@
 | Source | The owner's report in the pipeline task prompt (restated in §1, per grill D19); investigation `docs/plans/picked-image-preview-tcc-investigation.md`; grill record `docs/plans/picked-image-preview-tcc-grill.md` (D1–D20, answers in `docs/plans/picked-image-preview-tcc-grill/round-1/answers.json`); two planning-time owner answers (§8 P1, P2) |
 | Flags | none |
 | Gates | Grilled (20/20 answered); 2 planning-time questions answered by the owner. The twin work (waves 2–3) is gated by the S1 spike (grill D15). |
-| Status | implemented on the branch (waves 0–4 done, e2e and unit green except as listed in §10.3; the §10.2 deviations apply); V1, the live check on a signed build, is owner-assisted and still to do |
+| Status | implemented on the branch (waves 0–4 done; the §10.2 deviations apply). Tests extended and run 2026-11-18 (§10.4): typecheck clean, the targeted suites and the e2e run recipe green; the full `bun test` has 9 failures, none in this change's files (§10.4). V1, the live check on a signed build, is owner-assisted and still to do |
 | Branch | `fix/agetor-broken-for-visibility-file` (the agetor task branch). Do **not** cut a new branch in this worktree: agetor re-checks out `task.branch` on the next run. |
 | Base SHA | `4d7f8bfb` (HEAD when execution started; the planning docs are `0e168acb` on top of it) |
 
@@ -179,7 +179,7 @@
 **Where twins are created — the three gestures of D2, each pinned to a user action [owner decision P1 + planner hardening].**
 1. **`/refs/pick`, files mode, in both the native and the fake-dir branches.** The panel runs in Agetor's process and the user names the file.
 2. **`/refs/drag`.** The webview now sends `{ names: string[] }`, the basenames of the `File`s the drop actually carried (rung 2 already cross-checks those). The core twins only file refs that are `isImagePath && !isScreenshotUploadablePath` (heic, svg, bmp, ico, avif) and whose basename is in `names`. That closes most of the "agent overwrites the drag pasteboard mid-drag" race [planner hardening]. A drag of png/jpg/gif/webp still uploads to `screenshots/`, unchanged.
-3. **`/refs/resolve`, only when `callerOf(req) === "app"` and the body carries `previewTwins: true`.** Only the new `api.resolveCapturedRefs` sends it, and only `capture-refs` rung 1 (a paste or drop of `file://` URLs) calls that.
+3. **`/refs/resolve`, only when `callerOf(req) === "app"` and the body carries `previewTwins: true`, and only for a path whose basename is in the body's `names` (the carried `File`s, as on `/refs/drag`; added by code review M1, §10.2 item 6).** Only the new `api.resolveCapturedRefs` sends it, and only `capture-refs` rung 1 (a paste or drop of `file://` URLs) calls that.
    - **Why the flag [planner; required to keep D26(j)]:** `SentFilesCard`, the handoff artifact chips and the `@`-scope highlighter call `/refs/resolve` on *agent-chosen* paths with the app token, and with no user action. Twinning every app-caller resolve would read agent-named protected files in-process automatically. D2 meant "a paste of a Finder-copied file", which this implements.
    - **Accepted residual (owner, P1):** an agent can put a file reference on the general clipboard. If the user pastes it, the core copies that file into `previews/`, where the agent can read it. `security.md` documents this.
    - The `SCREENSHOT_UPLOADABLE` regex moves to `src/shared/attachments.ts` as `isScreenshotUploadablePath`, so the core and the webview share one implementation. That is the repo rule: extend `src/shared`, don't fork it.
@@ -233,7 +233,7 @@ export function isScreenshotUploadablePath(path: string): boolean; // /\.(png|jp
 
 // src/mainview/lib/api.ts (T7)
 dragRefs: (names: string[]) => Promise<TaskReference[]>;          // POST /refs/drag { names }
-resolveCapturedRefs: (paths: string[]) => Promise<TaskReference[]>; // POST /refs/resolve { paths, previewTwins: true }
+resolveCapturedRefs: (paths: string[], names: string[]) => Promise<TaskReference[]>; // POST /refs/resolve { paths, names, previewTwins: true } (names: §10.2 item 6)
 // resolveRefs is unchanged and never sends previewTwins
 
 // src/bun/preview-twins.ts (T6, new) — takes dataDir so tests don't need db.ts
@@ -375,7 +375,7 @@ bun node_modules/@playwright/test/cli.js test e2e/markdown-images.spec.ts e2e/se
 ## 7. Invariants, runtime shape & risks
 
 **Invariants (each enforced in one place):**
-- **No in-process read of a path named by agent-writable data.** Twin writes run only inside the three gesture handlers in `server.ts`: pick, drag (names-checked) and resolve (app + `previewTwins`). This is pinned by the U3 call-site allowlist. Every other `/refs/resolve` caller goes through `api.resolveRefs`, which never sends the flag (also pinned by U3).
+- **No in-process read of a path named by agent-writable data.** Twin writes run only inside the three gesture handlers in `server.ts`: pick, drag (names-checked) and resolve (app + `previewTwins`, names-checked). This is pinned by the U3 call-site allowlist. Every other `/refs/resolve` caller goes through `api.resolveRefs`, which never sends the flag (also pinned by U3).
 - **Every twin read is disclaimed while the switch is on, and never follows a symlink.** It happens at the single fallback call in `/files/preview` (`followSymlinks: false`).
 - **No in-process write or sweep through a redirected `previews/`.** `isPlainDirBelow(dataDir, previews)` runs inside `preview-twins.ts` before every write and every sweep. The timing race between the check and the I/O is the same accepted residual `no-follow.ts:115-121` documents.
 - **Twin writes never follow a destination symlink.** They write a `wx` temp file and then `rename`, in `writePreviewTwin`.
@@ -482,3 +482,51 @@ bun node_modules/@playwright/test/cli.js test e2e/markdown-images.spec.ts e2e/se
 - Re-check the no-prompt result on the first signed release (the dev build is ad-hoc signed).
 - The cursor `Invalid params` ticket (S2 note).
 
+### 10.4 Test results (Test Writer step, 2026-11-18, at `c130ea77` + the uncommitted test additions)
+
+Machine load 25–40 throughout; e2e on private ports (`CI=1 AGETOR_E2E_VITE_PORT=5473 AGETOR_E2E_PORT_OFFSET=2600`, one worker) because two other worktrees were running Playwright on the default ports.
+
+- **Typecheck:** clean (`tsc --noEmit` covers `src` and `e2e`).
+- **Targeted suites** (the run recipe's list plus `src/mainview/lib/api-preview-twins.test.ts` and `src/shared/attachments.test.ts`): 12 files, **359 pass, 0 fail**.
+- **E2e run recipe:** `attachment-chips.spec.ts` **6/6**; `markdown-images`, `sent-files`, `binary-diff`, `issue-task` **31/31**.
+- **Can fail:** 21 mutations of `preview-twins.ts`, `server.ts`, `api.ts` and `capture-refs.ts` and 5 of `AttachmentChips`, `MdImage`, `SentFilesCard` and `BinaryFilePreview` were each caught by a new test.
+- **Full `bun test`:** 545 files, **13,682 pass, 32 skip, 9 fail** (1,200 s). None is in a file this change touches:
+  - `at-file-filter.test.ts` (perf ceiling, 20 ms vs 15 ms), `orchestrator-checkout-branch.test.ts`, `orchestrator-opencode-server.test.ts`, `orchestrator-hold-scope-claim.test.ts` (hook timeout): each **passes when run alone** (load flakes).
+  - `github-network.test.ts` ×5 ("… without a network call when unauthenticated"): **fail alone too, and are environment-dependent**: the tests delete `GITHUB_TOKEN`/`GH_TOKEN`, but `gh` is logged in on this machine, so the code under test still finds a token and calls the API. This branch changes no GitHub code.
+  - The previously known failures (tmux-socket ×2, reconcile cancel) did not fail in this run.
+
+Tests added in this step:
+- `src/bun/preview-twins.test.ts` (+11): the inclusive 25 MB cap, `ENOTDIR` as `missing`, `previews` as a plain file (`unsafe-dir`), the 0700 cache dir, `writePreviewTwinsForRefs` continuing past a failed ref, one warning per skip reason (none for a non-image), a FIFO and a subdirectory planted in the cache, a fresh `.tmp` never counted, and coalescing (exactly one follow-up pass, against the latest data dir).
+- `src/bun/preview-twins-endpoint.test.ts` (+18): a folder-mode pick never twins even a file, a multi-image pick, a cancelled pick, the CLI token refused on pick and drag, pick → `chmod 000` → preview 200 through the real routes, every image type on drag (5 twinned, 5 uploadable), a directory or symlink on the pasteboard, the 256-name cap, no coercion of non-string names, missing/directory paths on resolve, an unchanged response shape, a twin that is a directory or over the preview cap keeping the 403, the exact-path key (U+202F vs space) end to end, and the requested path's content type.
+- `src/mainview/lib/api-preview-twins.test.ts` (new): the wire bodies of `resolveCapturedRefs`, `resolveRefs` and `dragRefs`, and `fetchBlobBytes` mapping 403 → `denied`.
+- `src/mainview/lib/capture-refs.test.ts` (+1): the default `api.dragRefs` receives the carried names.
+- E2e (+5): a 500 and a 413 attachment chip (neutral, own copy, still opens); a blocked chip whose `/open-path` answers 404 turning amber, then retrying after the dialog closes; the `MdImage` `unavailable` fallback; a `SentFilesCard` thumbnail 404 reading "Preview unavailable", never "missing"; and the PDF pane's `denied` line in the local diff.
+
+
+### 10.5 Test Loop (pipeline step 9, 2026-11-18, at `c130ea77` + the uncommitted additions)
+
+An independent code review (round 3) found **no must-fix items**. Four hardening nits were fixed in this step:
+- **N2.** The sweep re-`lstat`s a victim (ino + mtime) before unlinking it. A re-pick that renamed a fresh twin over the old name between the listing and the eviction no longer loses the newest twin (`preview-twins.ts`).
+- **N5.** `preview-twins.test.ts` awaits `__forTest.idle()` before `reset()`. A sweep loop from an earlier test or file could otherwise survive the reset and add a pass to the next test's count. `preview-twins-endpoint.test.ts` awaits the sweep and removes its data dir with `rmTestDataDir`.
+- **N3.** `preview-twins-callers.test.ts` pins the exact import lines of `preview-twins.ts` (`server.ts`, `index.ts`, `headless.ts`). This catches an aliased import (`writePreviewTwin as w`) that the call-count regex would miss. A mutation proved the test fails on one.
+- **N1.** The sync-I/O wording in `docs/architecture/security.md` is corrected.
+
+Left for the owner, because each one revisits a grill decision:
+- **S1.** Every picked or dragged image is twinned, even when the original is readable. Also, `O_NOFOLLOW` guards only the last path component, which leaves a narrow race on a pick inside an agent-writable folder. Probing first would twin only originals that come back `denied`, but that costs one disclaimed spawn per gesture, and the twin e2e could no longer simulate a denial with `chmod`.
+- **S2.** Twins have no age bound; only the 500 MB cap (D6) evicts them.
+- **S3.** No proven production gesture reaches the `/refs/resolve` twin path after M1 (D2 "paste").
+- **N4.** There is no count cap for many tiny twins.
+- **Q1.** `/open-path`'s in-process `existsSync` on a denied path. This predates the branch.
+- **Q2.** Whether the NFD and NFC forms of a name match between `File.name` and the pasteboard path. Add an accented name to V1.
+
+Results:
+- **Typecheck:** clean. The webview production build (`vite build`) succeeds.
+- **Targeted suites** (the 12 files in §10.4): **360 pass, 0 fail**.
+- **Full `bun test`**, before the fixes (load 25): 545 files, **13,683 pass, 32 skip, 8 fail**. None is in a file this change touches:
+  - `github-network.test.ts` ×5 depends on the environment (`gh` is logged in).
+  - `orchestrator-hold-scope-claim.test.ts` (hook timeout), `orchestrator.test.ts` ("sendInput folds a follow-up") and `cli/tui/Dashboard.test.tsx` ("resumed replay_meta") **each pass when run alone** (load flakes).
+- **E2e** on private ports (`CI=1 AGETOR_E2E_VITE_PORT=5473 AGETOR_E2E_PORT_OFFSET=2600`):
+  - The run recipe passes **37/37**: `attachment-chips` 6, and `markdown-images`, `sent-files`, `binary-diff` and `issue-task` 31.
+  - The neighbouring specs on the composer drop/paste, markdown and handoff surfaces pass **72/72**: `at-file-autocomplete`, `pasted-content`, `no-query-token`, `quote`, `markdown-readability`, `formatted-handoff` and `bundle-export-import`.
+  - No test needed a retry.
+- **Full `bun test` after the fixes** (final run, load 13–25): 545 files, **13,685 pass, 32 skip, 7 fail, 1 unhandled error**. None is in a file this change touches. `github-network.test.ts` ×5 depends on the environment. `orchestrator-hold-scope-claim.test.ts` (hook timeout) and `pipeline-stop-spawn-claim.test.ts` (5 s timeout; its `waitFor` rejection is the unhandled error) each **pass when run alone**. `orchestrator-hold-scope-claim` timed out under load in all three full runs (§10.4 and both of this step's), so it is a load flake that predates this branch.

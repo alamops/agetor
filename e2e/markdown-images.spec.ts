@@ -405,6 +405,59 @@ test.describe("markdown image rendering", () => {
     }
   });
 
+  test("an image whose preview fails another way (500) is a neutral 'unavailable' chip that still opens", async ({
+    page,
+    request,
+    backend,
+  }) => {
+    test.setTimeout(60_000);
+    // Outside the task's workdir, so the bubble keeps the absolute path (see
+    // `createAndStartUserImageTask`).
+    const imgDir = mkdtempSync(path.join(tmpdir(), "agetor-e2e-md-images-500-"));
+    const imgPath = path.join(imgDir, "flaky.png");
+    writeFileSync(imgPath, Buffer.from(FAKE_PNG_1X1_BASE64, "base64"));
+    const title = `md-images-e2e-unavailable ${randomUUID()}`;
+    await createAndStartUserImageTask(request, backend, title, imgPath, `![flaky](${imgPath})`);
+
+    // A headless core serves this file fine; fake a 500 at the network
+    // boundary (with CORS headers, or the browser drops the stubbed answer).
+    const cors = {
+      "access-control-allow-origin": "*",
+      "access-control-allow-headers": "authorization, content-type, *",
+      "access-control-allow-methods": "GET, OPTIONS",
+    };
+    await page.route(
+      (url) => url.pathname === "/files/preview" && url.searchParams.get("path") === imgPath,
+      async (route) => {
+        if (route.request().method() === "OPTIONS") {
+          await route.fulfill({ status: 204, headers: cors });
+          return;
+        }
+        await route.fulfill({
+          status: 500,
+          headers: { ...cors, "content-type": "application/json" },
+          body: JSON.stringify({ error: "stubbed 500" }),
+        });
+      },
+    );
+
+    await gotoApp(page, backend.bootBase);
+    const panel = await openTask(page, title);
+
+    const chip = panel.locator('.rounded-br-md .agetor-md [data-testid="md-image-fallback"]');
+    await expect(chip).toHaveCount(1, { timeout: CONVERGE_TIMEOUT });
+    await expect(chip).toHaveAttribute("data-reason", "unavailable");
+    await expect(chip).toHaveAttribute("title", `Preview unavailable. Click to open.\n${imgPath}`);
+    expect(await chip.getAttribute("class")).not.toContain("border-warning");
+    await expect(panel.locator('.rounded-br-md .agetor-md [data-testid="md-image"]')).toHaveCount(0);
+
+    const openRequest = page.waitForRequest((r) => r.url().includes("/open-path"), { timeout: CONVERGE_TIMEOUT });
+    await chip.click();
+    await openRequest;
+    await expect(page.locator("#attachment-open-error-title")).toBeVisible({ timeout: CONVERGE_TIMEOUT });
+    await expect(page.locator("#attachment-not-found-title")).toHaveCount(0);
+  });
+
   test("MdImage renders inline content only — no new .agetor-md wrapper containers", async ({
     page,
     request,

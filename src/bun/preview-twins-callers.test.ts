@@ -37,6 +37,24 @@ describe("who may write a preview twin", () => {
     expect(hits.get("bun/server.ts")).toBe(4);
   });
 
+  test("preview-twins.ts is imported only by server.ts, index.ts and headless.ts, with exact names", () => {
+    // Pins the import list too, so an aliased import (`writePreviewTwin as w`) or
+    // a write function handed out as a callback can't slip past the call count.
+    const imports = new Map<string, string[]>();
+    for (const file of sourceFiles(SRC)) {
+      if (rel(file) === "bun/preview-twins.ts") continue;
+      const text = readFileSync(file, "utf8");
+      if (!text.includes("preview-twins")) continue;
+      const lines = text.split("\n").filter((l) => l.includes("preview-twins") && /\bimport\b|\bfrom\b/.test(l));
+      imports.set(rel(file), lines.map((l) => l.trim()));
+    }
+    expect(Object.fromEntries([...imports].sort(([a], [b]) => a.localeCompare(b)))).toEqual({
+      "bun/headless.ts": ['import { requestPreviewTwinSweep } from "./preview-twins.ts";'],
+      "bun/index.ts": ['import { requestPreviewTwinSweep } from "./preview-twins.ts";'],
+      "bun/server.ts": ['import { previewTwinPath, writePreviewTwinsForRefs } from "./preview-twins.ts";'],
+    });
+  });
+
   test("the /refs/resolve call is guarded by the app caller and the previewTwins flag", () => {
     const server = readFileSync(path.join(SRC, "bun/server.ts"), "utf8");
     expect(server).toMatch(/caller === "app" && body\.previewTwins === true\) \{[^}]*await writePreviewTwinsForRefs\(dataDir, refs, \(ref\) => names\.has\(/);

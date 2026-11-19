@@ -292,6 +292,54 @@ test.describe("sent files to user", () => {
     }
   });
 
+  test("a thumbnail that 404s for a file the stat found says 'Preview unavailable', never 'missing', and still opens", async ({
+    page,
+    request,
+    backend,
+  }) => {
+    test.setTimeout(60_000);
+    const title = `sent-files-e2e-thumb404 ${randomUUID()}`;
+    const { pngPath } = await createAndStartFakeSentFilesTask(request, backend, title);
+
+    // The stat (`/refs/resolve`) still finds the file; only its thumbnail
+    // request 404s. Faked at the network boundary, with CORS headers so the
+    // browser hands the stubbed answer to the app.
+    const cors = {
+      "access-control-allow-origin": "*",
+      "access-control-allow-headers": "authorization, content-type, *",
+      "access-control-allow-methods": "GET, OPTIONS",
+    };
+    await page.route(
+      (url) => url.pathname === "/files/preview" && url.searchParams.get("path") === pngPath,
+      async (route) => {
+        if (route.request().method() === "OPTIONS") {
+          await route.fulfill({ status: 204, headers: cors });
+          return;
+        }
+        await route.fulfill({
+          status: 404,
+          headers: { ...cors, "content-type": "application/json" },
+          body: JSON.stringify({ error: `not found: ${pngPath}` }),
+        });
+      },
+    );
+
+    await gotoApp(page, backend.bootBase);
+    const panel = await openTask(page, title);
+    await waitForScenarioComplete(panel);
+
+    const tile = sentFilesCards(panel).nth(0).locator(`[data-testid="sent-file-tile"][data-path="${pngPath}"]`);
+    await expect(tile).toHaveAttribute("title", `Preview unavailable. Click to open.\n${pngPath}`, { timeout: 20_000 });
+    await expect(tile.getByText("missing", { exact: true })).toHaveCount(0);
+    await expect(tile.locator("img")).toHaveCount(0);
+
+    const openRequest = page.waitForRequest((r) => r.url().includes("/open-path"), { timeout: 20_000 });
+    await tile.click();
+    await openRequest;
+    await expect(page.locator("#attachment-open-error-title")).toBeVisible({ timeout: 20_000 });
+    await expect(page.locator("#attachment-not-found-title")).toHaveCount(0);
+  });
+
   test("clicking a tile opens the headless 'Couldn't open' dialog", async ({ page, request, backend }) => {
     const title = `sent-files-e2e-open ${randomUUID()}`;
     const { mdPath } = await createAndStartFakeSentFilesTask(request, backend, title);

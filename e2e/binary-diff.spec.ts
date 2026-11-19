@@ -397,6 +397,57 @@ test.describe("binary diff previews", () => {
     expect(await blocked.getAttribute("class")).not.toContain("text-warning");
   });
 
+  test("a PDF new side the core can't read shows the macOS-privacy line, and the old side still renders", async ({
+    page,
+    request,
+    backend,
+  }) => {
+    test.setTimeout(60_000); // pdf.js is a lazily-loaded ~1MB chunk; first fetch can be slow.
+    const dir = await initRepo();
+    const title = `binary-diff-pdf-denied-${randomUUID()}`;
+
+    await writeFile(path.join(dir, "doc.pdf"), makePdf(["Committed page one"]));
+    await commitAll(dir, "add pdf");
+    await writeFile(path.join(dir, "doc.pdf"), makePdf(["Modified page one"]));
+    await createDiffTask(request, backend, title, dir);
+
+    // Same stand-in as the image test above: `git diff` can't list an
+    // unreadable file, so the new side's 403 is faked at the network
+    // boundary. The PDF pane fetches through `api.fetchBlobBytes`, which
+    // turns the 403 into "denied".
+    const cors = {
+      "access-control-allow-origin": "*",
+      "access-control-allow-headers": "authorization, content-type, *",
+      "access-control-allow-methods": "GET, OPTIONS",
+    };
+    await page.route(/\/tasks\/[^/]+\/diff\/blob\?.*side=new/, async (route) => {
+      if (route.request().method() === "OPTIONS") {
+        await route.fulfill({ status: 204, headers: cors });
+        return;
+      }
+      await route.fulfill({
+        status: 403,
+        headers: { ...cors, "content-type": "application/json" },
+        body: JSON.stringify({ error: "not readable" }),
+      });
+    });
+
+    await gotoApp(page, backend.bootBase);
+    const dialog = await openDiffDialog(page, title);
+    const block = fileBlock(dialog, "doc.pdf");
+    await expect(block).toBeVisible();
+
+    const blocked = block.getByText("Preview blocked by macOS privacy", { exact: false });
+    await expect(blocked).toBeVisible({ timeout: 20_000 });
+    await expect(block.getByText("Couldn't load PDF", { exact: true })).toHaveCount(0);
+    // Only the old side draws a page.
+    const canvases = block.locator("canvas");
+    await expect(canvases).toHaveCount(1, { timeout: 20_000 });
+    await expect
+      .poll(() => canvases.first().evaluate((el) => (el as HTMLCanvasElement).width), { timeout: 20_000 })
+      .toBeGreaterThan(0);
+  });
+
   test("renders a 2-up PDF preview with a working page pager", async ({ page, request, backend }) => {
     test.setTimeout(60_000); // pdf.js is a lazily-loaded ~1MB chunk; first fetch can be slow.
 

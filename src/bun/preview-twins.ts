@@ -194,7 +194,7 @@ export async function sweepPreviewTwins(
     } catch {
       return result; // no cache yet
     }
-    const twins: Array<{ file: string; size: number; mtimeMs: number }> = [];
+    const twins: Array<{ file: string; size: number; mtimeMs: number; ino: number }> = [];
     const now = Date.now();
     for (const name of names) {
       const file = path.join(dir, name);
@@ -213,7 +213,7 @@ export async function sweepPreviewTwins(
           }
           continue;
         }
-        twins.push({ file, size: st.size, mtimeMs: st.mtimeMs });
+        twins.push({ file, size: st.size, mtimeMs: st.mtimeMs, ino: st.ino });
       } catch {
         // Raced with another removal or unreadable: leave it for the next pass.
       }
@@ -224,6 +224,10 @@ export async function sweepPreviewTwins(
     for (; i < twins.length && total > capBytes; i++) {
       const victim = twins[i]!;
       try {
+        // A re-pick may have renamed a fresh twin over this name since the
+        // listing; evicting it would drop the newest twin, not the oldest.
+        const cur = await lstat(victim.file);
+        if (cur.ino !== victim.ino || cur.mtimeMs !== victim.mtimeMs) continue;
         await unlink(victim.file);
         total -= victim.size;
         result.evicted++;

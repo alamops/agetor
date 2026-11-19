@@ -643,3 +643,20 @@ test("rung 1 with no injected resolver uses api.resolveCapturedRefs (twins), nev
     api.resolveRefs = realPlain;
   }
 });
+
+test("rung 2 with no injected dragRefs uses api.dragRefs with the carried names", async () => {
+  const real = api.dragRefs;
+  const seen: string[][] = [];
+  api.dragRefs = async (names) => {
+    seen.push(names);
+    return [{ path: "/Users/x/pic.heic", isDirectory: false }];
+  };
+  try {
+    const dt = makeTransfer([{ kind: "file", file: new File(["x"], "pic.heic", { type: "image/heic" }) }]);
+    const r = await captureDroppedOrPastedItems(dt, {});
+    expect(seen).toEqual([["pic.heic"]]);
+    expect(r.items.map((i) => i.ref.path)).toEqual(["/Users/x/pic.heic"]);
+  } finally {
+    api.dragRefs = real;
+  }
+});
