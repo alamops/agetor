@@ -5,6 +5,17 @@ import { tmpdir } from "node:os";
 import path from "node:path";
 import { test, expect, type APIRequestContext, type E2EBackend, type Locator, type Page } from "./fixtures";
 import { gotoApp } from "./helpers";
+import {
+  effortField,
+  expectHarness,
+  harnessPicker,
+  maxModeToggle,
+  modeField,
+  modelField,
+  openMore,
+  pickHarness,
+  speedOption,
+} from "./launch-helpers";
 import { AGENT_PROFILE_LIMITS } from "../src/shared/agent-profile.ts";
 
 /**
@@ -101,6 +112,1320 @@ async function openSettingsHarnesses(page: Page): Promise<Locator> {
   await expect(dialog.getByRole("heading", { name: "Settings" })).toBeVisible();
   await dialog.getByRole("button", { name: "Harnesses", exact: true }).click();
   return dialog;
+}
+
+/**
+ * The Settings modal itself, located by its own title id — NOT bare
+ * `getByRole("dialog")`, which becomes ambiguous (strict-mode violation on
+ * `toBeHidden()` etc.) the moment the "Discard unsaved changes?" confirm
+ * stacks a second `role="dialog"` on top of it. `Dialog` puts the role on the
+ * fixed full-screen backdrop, so a click near the top-left corner of this
+ * locator lands on the backdrop (outside the panel) — see `clickBackdrop`.
+ */
+function settingsModal(page: Page): Locator {
+  return page.getByRole("dialog").filter({ has: page.locator("#settings-dialog-title") });
+}
+
+/** The shared confirm dialog (`ui/confirm.tsx`) the dirty-leave guard raises. */
+function discardConfirm(page: Page): Locator {
+  return page.getByRole("dialog", { name: "Discard unsaved changes?", exact: true });
+}
+
+/** Click the modal's dimmed backdrop (the `role="dialog"` overlay's own
+ *  padding, outside the panel) — the panel stops propagation, the overlay
+ *  routes the click to `onClose`. */
+async function clickBackdrop(modal: Locator): Promise<void> {
+  await modal.click({ position: { x: 4, y: 4 } });
+}
+
+/** From an already-loaded app: opens Settings → Agents → Add agent and waits
+ *  for the editor subpage. Returns the modal and the (empty) form. */
+async function openAddSubpage(page: Page): Promise<{ modal: Locator; form: Locator }> {
+  await openSettingsAgents(page);
+  const modal = settingsModal(page);
+  await modal.getByTestId("agent-profile-add").click();
+  const form = modal.getByTestId("agent-profile-form");
+  await expect(form).toBeVisible();
+  await expect(modal.getByRole("heading", { name: "Add agent" })).toBeVisible();
+  return { modal, form };
+}
+
+/** Asserts the modal is back on the plain Agents list (section view). */
+async function expectAgentsList(modal: Locator): Promise<void> {
+  await expect(modal.getByRole("heading", { name: "Settings" })).toBeVisible();
+  await expect(modal.getByTestId("agent-profiles-section")).toBeVisible();
+  await expect(modal.getByTestId("agent-profile-editor")).toHaveCount(0);
+  await expect(modal.getByRole("button", { name: "Back", exact: true })).toHaveCount(0);
+}
+
+// ---- REST helpers ----
+
+async function getAgentProfile(request: APIRequestContext, backend: E2EBackend, id: string): Promise<any> {
+  const res = await request.get(`${backend.apiBase}/agent-profiles/${id}`, { headers: auth(backend) });
+  expect(res.ok(), `GET /agent-profiles/${id} -> ${res.status()}`).toBeTruthy();
+  return res.json();
+}
+
+async function getProfileIdByName(request: APIRequestContext, backend: E2EBackend, name: string): Promise<string> {
+  const res = await request.get(`${backend.apiBase}/agent-profiles`, { headers: auth(backend) });
+  expect(res.ok(), `GET /agent-profiles -> ${res.status()}`).toBeTruthy();
+  const list = (await res.json()) as { id: string; name: string }[];
+  const found = list.find((p) => p.name === name);
+  expect(found, `no agent profile named "${name}"`).toBeTruthy();
+  return found!.id;
+}
+
+async function patchHarness(
+  request: APIRequestContext,
+  backend: E2EBackend,
+  id: string,
+  body: Record<string, unknown>,
+): Promise<void> {
+  const res = await request.patch(`${backend.apiBase}/harnesses/${id}`, { headers: auth(backend), data: body });
+  expect(res.ok(), `PATCH /harnesses/${id} -> ${res.status()}: ${await res.text()}`).toBeTruthy();
+}
+
+async function createHarness(
+  request: APIRequestContext,
+  backend: E2EBackend,
+  body: Record<string, unknown>,
+): Promise<{ id: string }> {
+  const res = await request.post(`${backend.apiBase}/harnesses`, { headers: auth(backend), data: body });
+  expect(res.ok(), `POST /harnesses -> ${res.status()}: ${await res.text()}`).toBeTruthy();
+  return res.json();
+}
+
+async function createAgentProfileRest(
+  request: APIRequestContext,
+  backend: E2EBackend,
+  body: Record<string, unknown>,
+): Promise<{ id: string; name: string }> {
+  const res = await request.post(`${backend.apiBase}/agent-profiles`, { headers: auth(backend), data: body });
+  expect(res.ok(), `POST /agent-profiles -> ${res.status()}: ${await res.text()}`).toBeTruthy();
+  return res.json();
+}
+
+async function deleteAgentProfileRest(request: APIRequestContext, backend: E2EBackend, id: string): Promise<void> {
+  const res = await request.delete(`${backend.apiBase}/agent-profiles/${id}`, { headers: auth(backend) });
+  expect(res.ok(), `DELETE /agent-profiles/${id} -> ${res.status()}`).toBeTruthy();
+}
+
+test.describe("agent profiles — Settings surface", () => {
+  test("Form validation & pickers: Save gated on name, picker fields present, name capped at 80 chars, save reflects choices", async ({
+    page,
+    request,
+    backend,
+  }) => {
+    await gotoApp(page, backend.bootBase);
+    const dialog = await openSettingsAgents(page);
+    const section = dialog.getByTestId("agent-profiles-section");
+
+    await section.getByTestId("agent-profile-add").click();
+    const form = dialog.getByTestId("agent-profile-form");
+    await expect(form).toBeVisible();
+
+    const nameInput = form.getByTestId("agent-profile-name");
+    const saveButton = form.getByTestId("agent-profile-save");
+    await expect(saveButton).toBeDisabled();
+
+    await nameInput.fill(WIDGET_BUILDER_NAME);
+    await expect(saveButton).toBeEnabled();
+
+    // hideProfilePicker: the manual harness/mode/model/effort block renders
+    // directly — the AgentProfilePicker (which would let a profile pick
+    // itself) never mounts inside this form.
+    await expect(form.getByTestId("agent-profile-picker")).toHaveCount(0);
+    await expect(form.getByText("Harness", { exact: true })).toBeVisible();
+    await expect(modeField(form).trigger).toBeVisible();
+    await expect(modelField(form).trigger).toBeVisible();
+    await expect(effortField(form).trigger).toBeVisible();
+
+    // Only Claude Code is enabled at this point (cursor ships disabled by
+    // migration 032, and this is the very first test in the suite) — one
+    // harness button, selected by default ("default" variant = bg-primary).
+    // The harness buttons render off TaskLaunchPickers' own `/harnesses`
+    // fetch (one probe per harness), which under parallel-run load outlasts
+    // the 5s default — the form itself is up long before the buttons are.
+    await expect(harnessPicker(form)).toBeVisible({ timeout: CONVERGE_TIMEOUT });
+    await expectHarness(form, "Claude Code");
+
+    // Switch model first, then mode, then effort — in that order — so each
+    // later pick lands after any auto-reset effect the earlier one could
+    // trigger (TaskLaunchPickers.tsx's kind/model-keyed effort/mode reset
+    // effects), and reads back as exactly what was picked.
+    await modelField(form).selectOption("sonnet-5");
+    await modeField(form).selectOption("plan");
+    await effortField(form).selectOption("medium");
+
+    await form.getByTestId("agent-profile-instructions").fill(WIDGET_BUILDER_INSTRUCTIONS);
+
+    await saveButton.click();
+    await expect(form).toBeHidden();
+
+    const row = section.locator('[data-testid="agent-profile-row"]').filter({ hasText: WIDGET_BUILDER_NAME });
+    await expect(row).toBeVisible();
+    // agentProfileSummary joins the model as a person reads it (modelDisplayName) and raw ids for effort/mode.
+    await expect(row).toContainText("Claude Code");
+    await expect(row).toContainText("Sonnet 5");
+    await expect(row).toContainText("medium");
+    await expect(row).toContainText("plan");
+    await expect(row).toContainText(WIDGET_BUILDER_INSTRUCTIONS);
+
+    widgetBuilderId = await getProfileIdByName(request, backend, WIDGET_BUILDER_NAME);
+    createdProfileIds.push(widgetBuilderId);
+    const stored = await getAgentProfile(request, backend, widgetBuilderId);
+    expect(stored.harness).toBe("claude-code");
+    expect(stored.model).toBe("sonnet-5");
+    expect(stored.effort).toBe("medium");
+    expect(stored.mode).toBe("plan");
+
+    // Name over 80 chars is capped by the input's `maxLength` — a throwaway
+    // second Add form, cancelled afterward.
+    await section.getByTestId("agent-profile-add").click();
+    const capForm = dialog.getByTestId("agent-profile-form");
+    await expect(capForm).toBeVisible();
+    const capName = capForm.getByTestId("agent-profile-name");
+    await capName.pressSequentially("x".repeat(AGENT_PROFILE_LIMITS.name + 10));
+    await expect(capName).toHaveValue("x".repeat(AGENT_PROFILE_LIMITS.name));
+    await capForm.getByTestId("agent-profile-cancel").click();
+    await expect(capForm).toBeHidden();
+  });
+
+  test("Edit seeding: every field reflects the saved values; an unchanged save is byte-identical (seed-race regression)", async ({
+    page,
+    request,
+    backend,
+  }) => {
+    await gotoApp(page, backend.bootBase);
+    const dialog = await openSettingsAgents(page);
+    const section = dialog.getByTestId("agent-profiles-section");
+
+    const before = await getAgentProfile(request, backend, widgetBuilderId);
+
+    const row = section.locator('[data-testid="agent-profile-row"]').filter({ hasText: WIDGET_BUILDER_NAME });
+    await row.getByTestId("agent-profile-edit").click();
+    const form = dialog.getByTestId("agent-profile-form");
+    await expect(form).toBeVisible();
+
+    await expect(form.getByTestId("agent-profile-name")).toHaveValue(WIDGET_BUILDER_NAME);
+    await modelField(form).expectValue("sonnet-5");
+    await effortField(form).expectValue("medium");
+    await modeField(form).expectValue("plan");
+    await expect(form.getByTestId("agent-profile-instructions")).toHaveValue(WIDGET_BUILDER_INSTRUCTIONS);
+    // Harness buttons render only once TaskLaunchPickers' `/harnesses` fetch
+    // lands (one probe per harness) — past the 5s default under load.
+    await expectHarness(form, "Claude Code");
+    await expect(form.locator('[data-testid="skills-picker-chip"]')).toHaveCount(0);
+
+    await form.getByTestId("agent-profile-save").click();
+    await expect(form).toBeHidden();
+
+    const after = await getAgentProfile(request, backend, widgetBuilderId);
+    expect(after.harness).toBe(before.harness);
+    expect(after.model).toBe(before.model);
+    expect(after.effort).toBe(before.effort);
+    expect(after.mode).toBe(before.mode);
+    expect(after.speed).toBe(before.speed);
+    expect(after.maxMode).toBe(before.maxMode);
+    expect(after.instructions).toBe(before.instructions);
+    expect(after.skills).toEqual(before.skills);
+  });
+
+  test("Skills picker: remove/backspace/comma/dedupe/slash-strip/tab-commit/escape-list-only/suggestion-click", async ({
+    page,
+    backend,
+  }) => {
+    await gotoApp(page, backend.bootBase);
+    const dialog = await openSettingsAgents(page);
+    const section = dialog.getByTestId("agent-profiles-section");
+
+    await section.getByTestId("agent-profile-add").click();
+    const form = dialog.getByTestId("agent-profile-form");
+    await expect(form).toBeVisible();
+    await form.getByTestId("agent-profile-name").fill(`Skills Scratch ${randomUUID()}`);
+
+    const skillsPicker = form.getByTestId("skills-picker");
+    const input = skillsPicker.getByTestId("skills-picker-input");
+    const chips = skillsPicker.locator('[data-testid="skills-picker-chip"]');
+
+    // "," commits free text.
+    await input.click();
+    await input.fill("alpha-skill");
+    await input.press(",");
+    await expect(skillsPicker.locator('[data-testid="skills-picker-chip"][data-skill="alpha-skill"]')).toBeVisible();
+    await expect(chips).toHaveCount(1);
+
+    // Duplicate names are ignored.
+    await input.fill("alpha-skill");
+    await input.press("Enter");
+    await expect(chips).toHaveCount(1);
+
+    // A leading "/" is stripped.
+    await input.fill("/beta-skill");
+    await input.press("Enter");
+    await expect(skillsPicker.locator('[data-testid="skills-picker-chip"][data-skill="beta-skill"]')).toBeVisible();
+    await expect(chips).toHaveCount(2);
+
+    // Backspace on an empty input removes the last chip (beta-skill, added
+    // most recently).
+    await expect(input).toHaveValue("");
+    await input.press("Backspace");
+    await expect(chips).toHaveCount(1);
+    await expect(skillsPicker.locator('[data-testid="skills-picker-chip"][data-skill="beta-skill"]')).toHaveCount(0);
+
+    // Chips remove via the × button.
+    await skillsPicker
+      .locator('[data-testid="skills-picker-chip"][data-skill="alpha-skill"]')
+      .getByTestId("skills-picker-remove")
+      .click();
+    await expect(chips).toHaveCount(0);
+
+    // Tab commits non-empty typed free text exactly like Enter/"," — see
+    // this file's header comment. A query with zero suggestion matches still
+    // commits via the free-text fallback.
+    const uniqueQuery = `zzz-${randomUUID().slice(0, 8)}`;
+    await input.fill(uniqueQuery);
+    await expect(skillsPicker.locator('[data-testid="skills-picker-row"]')).toHaveCount(0);
+    await input.press("Tab");
+    await expect(skillsPicker.locator(`[data-testid="skills-picker-chip"][data-skill="${uniqueQuery}"]`)).toBeVisible();
+    await expect(chips).toHaveCount(1);
+
+    // Tab on an input that normalizes to "" (a bare "/") commits nothing and
+    // lets the browser's native Tab focus-move through (no preventDefault).
+    await input.fill("/");
+    await input.press("Tab");
+    await expect(chips).toHaveCount(1);
+    await expect(input).not.toBeFocused();
+
+    // A leading slash is ignored when filtering suggestions.
+    await input.click();
+    await input.fill("/code");
+    await expect(
+      skillsPicker.locator('[data-testid="skills-picker-row"][data-skill="code-review"]'),
+    ).toBeVisible({ timeout: 5_000 });
+
+    // Escape closes only the suggestion popover, not the Settings dialog.
+    // "code" reliably matches the hardcoded CLAUDE_BUILTINS "/code-review"
+    // suggestion regardless of the machine's own ~/.claude contents.
+    await input.click();
+    await input.fill("code");
+    const codeReviewRow = skillsPicker.locator('[data-testid="skills-picker-row"][data-skill="code-review"]');
+    await expect(codeReviewRow).toBeVisible({ timeout: 5_000 });
+    await input.press("Escape");
+    await expect(codeReviewRow).toBeHidden();
+    // Still on the editor subpage: the popover consumed the Escape, so the
+    // modal neither popped back to the list nor closed.
+    await expect(dialog.getByRole("heading", { name: "Add agent" })).toBeVisible();
+    await expect(form).toBeVisible();
+    await input.fill("");
+
+    // A suggestion row is clicked only if one actually renders — never
+    // assumed. "simplify" (bare, no slash) matches the hardcoded
+    // CLAUDE_BUILTINS "/simplify" suggestion by name.
+    await input.fill("simplify");
+    const simplifyRow = skillsPicker.locator('[data-testid="skills-picker-row"][data-skill="simplify"]');
+    const rowCount = await simplifyRow.count();
+    if (rowCount > 0) {
+      await simplifyRow.click();
+      await expect(skillsPicker.locator('[data-testid="skills-picker-chip"][data-skill="simplify"]')).toBeVisible();
+    }
+    // else: environment-dependent — this machine's discovery didn't surface
+    // the row within the query window; skip the click sub-step per the task
+    // brief's own carve-out.
+
+    await form.getByTestId("agent-profile-cancel").click();
+    await expect(form).toBeHidden();
+  });
+
+  test("Sidebar click with a dirty draft asks to discard: decline keeps the draft, accept navigates and drops it", async ({
+    page,
+    backend,
+  }) => {
+    await gotoApp(page, backend.bootBase);
+    const { modal, form } = await openAddSubpage(page);
+    const draftName = `Draft Discard ${randomUUID()}`;
+    const draftInstructions = "Draft instructions that a sidebar click must not silently drop.";
+    await form.getByTestId("agent-profile-name").fill(draftName);
+    await form.getByTestId("agent-profile-instructions").fill(draftInstructions);
+
+    // The draft no longer survives a section switch silently — the editor is
+    // a subpage, so leaving it is guarded. Decline keeps everything.
+    await modal.getByRole("button", { name: "General", exact: true }).click();
+    const confirm = discardConfirm(page);
+    await expect(confirm).toBeVisible();
+    await expect(confirm).toContainText("Your edits to this agent will be lost.");
+    await confirm.getByRole("button", { name: "Cancel", exact: true }).click();
+    await expect(confirm).toBeHidden();
+    await expect(modal.getByRole("heading", { name: "Add agent" })).toBeVisible();
+    await expect(form.getByTestId("agent-profile-name")).toHaveValue(draftName);
+    await expect(form.getByTestId("agent-profile-instructions")).toHaveValue(draftInstructions);
+    await expect(modal.getByRole("button", { name: "Agents", exact: true })).toHaveAttribute("aria-current", "page");
+
+    // Accept navigates to General…
+    await modal.getByRole("button", { name: "General", exact: true }).click();
+    await expect(confirm).toBeVisible();
+    await confirm.getByRole("button", { name: "Discard", exact: true }).click();
+    await expect(confirm).toBeHidden();
+    await expect(modal.getByRole("heading", { name: "Settings" })).toBeVisible();
+    await expect(modal.getByRole("button", { name: "General", exact: true })).toHaveAttribute("aria-current", "page");
+    await expect(form).toHaveCount(0);
+
+    // …and coming back to Agents shows the LIST, not the old draft; a fresh
+    // Add form is empty.
+    await modal.getByRole("button", { name: "Agents", exact: true }).click();
+    await expectAgentsList(modal);
+    await modal.getByTestId("agent-profile-add").click();
+    const fresh = modal.getByTestId("agent-profile-form");
+    await expect(fresh).toBeVisible();
+    await expect(fresh.getByTestId("agent-profile-name")).toHaveValue("");
+    await expect(fresh.getByTestId("agent-profile-instructions")).toHaveValue("");
+    await fresh.getByTestId("agent-profile-cancel").click();
+    await expectAgentsList(modal);
+  });
+
+  test("Add opens an editor subpage: heading, Back button, list hidden, sidebar keeps Agents current; clean Back pops with no confirm", async ({
+    page,
+    backend,
+  }) => {
+    await gotoApp(page, backend.bootBase);
+    const { modal, form } = await openAddSubpage(page);
+
+    // The list is REPLACED by the editor (not rendered beside/under it).
+    await expect(modal.getByTestId("agent-profile-editor")).toBeVisible();
+    await expect(form).toBeVisible();
+    await expect(modal.getByTestId("agent-profiles-section")).toHaveCount(0);
+    await expect(modal.getByTestId("agent-profile-add")).toHaveCount(0);
+    await expect(modal.getByRole("button", { name: "Back", exact: true })).toBeVisible();
+    await expect(modal.getByRole("heading", { name: "Settings" })).toHaveCount(0);
+    // The sidebar stays and keeps Agents highlighted.
+    await expect(modal.getByRole("button", { name: "Agents", exact: true })).toHaveAttribute("aria-current", "page");
+
+    // Untouched form: Back pops straight to the list, no confirm.
+    await modal.getByRole("button", { name: "Back", exact: true }).click();
+    await expectAgentsList(modal);
+    await expect(discardConfirm(page)).toHaveCount(0);
+    await expect(modal.getByRole("button", { name: "Agents", exact: true })).toHaveAttribute("aria-current", "page");
+  });
+
+  test("Edit opens the editor subpage for that row; an untouched (even fully seeded) form pops on Back, Escape and backdrop with no confirm", async ({
+    page,
+    backend,
+  }) => {
+    await gotoApp(page, backend.bootBase);
+    await openSettingsAgents(page);
+    const modal = settingsModal(page);
+    const row = modal.locator('[data-testid="agent-profile-row"]').filter({ hasText: WIDGET_BUILDER_NAME });
+    await row.getByTestId("agent-profile-edit").click();
+
+    const form = modal.getByTestId("agent-profile-form");
+    await expect(modal.getByRole("heading", { name: "Edit agent" })).toBeVisible();
+    await expect(modal.getByTestId("agent-profile-editor")).toBeVisible();
+    await expect(modal.getByTestId("agent-profiles-section")).toHaveCount(0);
+    await expect(modal.getByRole("button", { name: "Agents", exact: true })).toHaveAttribute("aria-current", "page");
+    await expect(form.getByTestId("agent-profile-name")).toHaveValue(WIDGET_BUILDER_NAME);
+    // Wait for the async launch seeding (harness fetch, preference reads) to
+    // fully settle — an untouched Edit form must not read dirty afterwards.
+    await expectHarness(form, "Claude Code");
+    await modelField(form).expectValue("sonnet-5");
+    await modeField(form).expectValue("plan");
+
+    // Back.
+    await modal.getByRole("button", { name: "Back", exact: true }).click();
+    await expectAgentsList(modal);
+    await expect(discardConfirm(page)).toHaveCount(0);
+
+    // Escape pops (does NOT close the modal), still no confirm.
+    await row.getByTestId("agent-profile-edit").click();
+    await expect(modal.getByRole("heading", { name: "Edit agent" })).toBeVisible();
+    await expectHarness(form, "Claude Code");
+    await page.keyboard.press("Escape");
+    await expectAgentsList(modal);
+    await expect(discardConfirm(page)).toHaveCount(0);
+    await expect(modal).toBeVisible();
+
+    // Backdrop click pops too.
+    await row.getByTestId("agent-profile-edit").click();
+    await expect(modal.getByRole("heading", { name: "Edit agent" })).toBeVisible();
+    await clickBackdrop(modal);
+    await expectAgentsList(modal);
+    await expect(discardConfirm(page)).toHaveCount(0);
+    await expect(modal).toBeVisible();
+
+    // From the list (section view), Escape now closes the modal outright.
+    await page.keyboard.press("Escape");
+    await expect(modal).toBeHidden();
+  });
+
+  test("Clean Add: Escape and backdrop pop to the list with no confirm and keep the Settings modal open", async ({
+    page,
+    backend,
+  }) => {
+    await gotoApp(page, backend.bootBase);
+    const { modal } = await openAddSubpage(page);
+
+    await page.keyboard.press("Escape");
+    await expectAgentsList(modal);
+    await expect(discardConfirm(page)).toHaveCount(0);
+    await expect(modal).toBeVisible();
+
+    await modal.getByTestId("agent-profile-add").click();
+    await expect(modal.getByRole("heading", { name: "Add agent" })).toBeVisible();
+    await clickBackdrop(modal);
+    await expectAgentsList(modal);
+    await expect(discardConfirm(page)).toHaveCount(0);
+    await expect(modal).toBeVisible();
+  });
+
+  test("Dirty Back confirms: decline keeps the draft on the form, accept pops to the list and discards it", async ({
+    page,
+    backend,
+  }) => {
+    await gotoApp(page, backend.bootBase);
+    const { modal, form } = await openAddSubpage(page);
+    const draftName = `Dirty Back ${randomUUID()}`;
+    await form.getByTestId("agent-profile-name").fill(draftName);
+    await form.getByTestId("agent-profile-instructions").fill("Half-written instructions.");
+
+    await modal.getByRole("button", { name: "Back", exact: true }).click();
+    const confirm = discardConfirm(page);
+    await expect(confirm).toBeVisible();
+    await expect(confirm.getByRole("button", { name: "Discard", exact: true })).toBeVisible();
+    // Decline → still on the form, draft intact.
+    await confirm.getByRole("button", { name: "Cancel", exact: true }).click();
+    await expect(confirm).toBeHidden();
+    await expect(modal.getByRole("heading", { name: "Add agent" })).toBeVisible();
+    await expect(form.getByTestId("agent-profile-name")).toHaveValue(draftName);
+    await expect(form.getByTestId("agent-profile-instructions")).toHaveValue("Half-written instructions.");
+
+    // Accept → list; the draft is gone (a fresh Add form is empty).
+    await modal.getByRole("button", { name: "Back", exact: true }).click();
+    await expect(confirm).toBeVisible();
+    await confirm.getByRole("button", { name: "Discard", exact: true }).click();
+    await expect(confirm).toBeHidden();
+    await expectAgentsList(modal);
+    // Nothing was saved.
+    await expect(
+      modal.locator('[data-testid="agent-profile-row"]').filter({ hasText: draftName }),
+    ).toHaveCount(0);
+    await modal.getByTestId("agent-profile-add").click();
+    await expect(modal.getByTestId("agent-profile-form").getByTestId("agent-profile-name")).toHaveValue("");
+    await modal.getByTestId("agent-profile-cancel").click();
+    await expectAgentsList(modal);
+  });
+
+  test("Dirty Escape confirms: Escape on the confirm declines and keeps the draft, accept pops to the list", async ({
+    page,
+    backend,
+  }) => {
+    await gotoApp(page, backend.bootBase);
+    const { modal, form } = await openAddSubpage(page);
+    const draftName = `Dirty Escape ${randomUUID()}`;
+    await form.getByTestId("agent-profile-name").fill(draftName);
+
+    await page.keyboard.press("Escape");
+    const confirm = discardConfirm(page);
+    await expect(confirm).toBeVisible();
+    // Escape while the confirm is on top closes only the confirm (= decline).
+    await page.keyboard.press("Escape");
+    await expect(confirm).toBeHidden();
+    await expect(modal.getByRole("heading", { name: "Add agent" })).toBeVisible();
+    await expect(form.getByTestId("agent-profile-name")).toHaveValue(draftName);
+
+    await page.keyboard.press("Escape");
+    await expect(confirm).toBeVisible();
+    await confirm.getByRole("button", { name: "Discard", exact: true }).click();
+    await expect(confirm).toBeHidden();
+    await expectAgentsList(modal);
+    // Popped, not closed.
+    await expect(modal).toBeVisible();
+  });
+
+  test("Dirty backdrop click confirms: decline keeps the draft, accept pops to the list", async ({ page, backend }) => {
+    await gotoApp(page, backend.bootBase);
+    const { modal, form } = await openAddSubpage(page);
+    const draftName = `Dirty Backdrop ${randomUUID()}`;
+    await form.getByTestId("agent-profile-name").fill(draftName);
+
+    await clickBackdrop(modal);
+    const confirm = discardConfirm(page);
+    await expect(confirm).toBeVisible();
+    await confirm.getByRole("button", { name: "Cancel", exact: true }).click();
+    await expect(confirm).toBeHidden();
+    await expect(modal.getByRole("heading", { name: "Add agent" })).toBeVisible();
+    await expect(form.getByTestId("agent-profile-name")).toHaveValue(draftName);
+
+    await clickBackdrop(modal);
+    await expect(confirm).toBeVisible();
+    await confirm.getByRole("button", { name: "Discard", exact: true }).click();
+    await expect(confirm).toBeHidden();
+    await expectAgentsList(modal);
+    await expect(modal).toBeVisible();
+  });
+
+  test("Dirty header X confirms: decline keeps the draft, accept closes the whole Settings modal", async ({
+    page,
+    backend,
+  }) => {
+    await gotoApp(page, backend.bootBase);
+    const { modal, form } = await openAddSubpage(page);
+    const draftName = `Dirty Close ${randomUUID()}`;
+    await form.getByTestId("agent-profile-name").fill(draftName);
+
+    await modal.getByRole("button", { name: "Close", exact: true }).click();
+    const confirm = discardConfirm(page);
+    await expect(confirm).toBeVisible();
+    await confirm.getByRole("button", { name: "Cancel", exact: true }).click();
+    await expect(confirm).toBeHidden();
+    await expect(modal).toBeVisible();
+    await expect(form.getByTestId("agent-profile-name")).toHaveValue(draftName);
+
+    await modal.getByRole("button", { name: "Close", exact: true }).click();
+    await expect(confirm).toBeVisible();
+    await confirm.getByRole("button", { name: "Discard", exact: true }).click();
+    await expect(confirm).toBeHidden();
+    await expect(modal).toBeHidden();
+
+    // Reopening Settings starts fresh on General (no stale draft/subpage).
+    await page.getByRole("button", { name: "Settings", exact: true }).click();
+    await expect(settingsModal(page).getByRole("heading", { name: "Settings" })).toBeVisible();
+    await expect(settingsModal(page).getByTestId("agent-profile-editor")).toHaveCount(0);
+  });
+
+  test("Reopening Settings after closing from the Add subpage starts on General with no editor mounted, and closing again restores focus to the gear", async ({
+    page,
+    backend,
+  }) => {
+    await gotoApp(page, backend.bootBase);
+    const { modal } = await openAddSubpage(page);
+
+    // Clean form: the header X closes the whole modal with no confirm.
+    await modal.getByRole("button", { name: "Close", exact: true }).click();
+    await expect(discardConfirm(page)).toHaveCount(0);
+    await expect(modal).toBeHidden();
+
+    const gear = page.getByRole("button", { name: "Settings", exact: true });
+    await gear.click();
+    await expect(modal.getByRole("heading", { name: "Settings" })).toBeVisible();
+    await expect(modal.getByRole("button", { name: "General", exact: true })).toHaveAttribute("aria-current", "page");
+    await expect(modal.getByTestId("agent-profile-editor")).toHaveCount(0);
+    await expect(modal.getByTestId("agent-profile-form")).toHaveCount(0);
+
+    // The editor was never mounted on the reopen, so its autoFocus Name input
+    // can't have been recorded as the focus-restore target — closing returns
+    // focus to the element that opened Settings.
+    await page.keyboard.press("Escape");
+    await expect(modal).toBeHidden();
+    await expect(gear).toBeFocused();
+  });
+
+  test("Dirty Edit (rename, never saved): Back confirms, accept leaves the stored profile untouched", async ({
+    page,
+    request,
+    backend,
+  }) => {
+    await gotoApp(page, backend.bootBase);
+    await openSettingsAgents(page);
+    const modal = settingsModal(page);
+    const row = modal.locator('[data-testid="agent-profile-row"]').filter({ hasText: WIDGET_BUILDER_NAME });
+    await row.getByTestId("agent-profile-edit").click();
+    const form = modal.getByTestId("agent-profile-form");
+    await expect(form.getByTestId("agent-profile-name")).toHaveValue(WIDGET_BUILDER_NAME);
+    await form.getByTestId("agent-profile-name").fill(`${WIDGET_BUILDER_NAME} renamed`);
+
+    await modal.getByRole("button", { name: "Back", exact: true }).click();
+    const confirm = discardConfirm(page);
+    await expect(confirm).toBeVisible();
+    await confirm.getByRole("button", { name: "Discard", exact: true }).click();
+    await expectAgentsList(modal);
+
+    const stored = await getAgentProfile(request, backend, widgetBuilderId);
+    expect(stored.name).toBe(WIDGET_BUILDER_NAME);
+    await expect(row).toBeVisible();
+  });
+
+  test("Cancel on a dirty form pops to the list immediately, with no confirm", async ({ page, backend }) => {
+    await gotoApp(page, backend.bootBase);
+    const { modal, form } = await openAddSubpage(page);
+    await form.getByTestId("agent-profile-name").fill(`Dirty Cancel ${randomUUID()}`);
+    await form.getByTestId("agent-profile-instructions").fill("Discarded by Cancel.");
+
+    await form.getByTestId("agent-profile-cancel").click();
+    await expectAgentsList(modal);
+    await expect(discardConfirm(page)).toHaveCount(0);
+    await expect(modal).toBeVisible();
+  });
+
+  test("A change to ONLY a launch picker (Mode select) counts as dirty", async ({ page, backend }) => {
+    await gotoApp(page, backend.bootBase);
+    const { modal, form } = await openAddSubpage(page);
+    // Name and every text field stay untouched. Let the picker block finish
+    // its async seeding first, so the pick below is unambiguously the user's.
+    await expectHarness(form, "Claude Code");
+    await expect(form.getByTestId("agent-profile-name")).toHaveValue("");
+    await modeField(form).selectOption("plan");
+    await modeField(form).expectValue("plan");
+
+    await modal.getByRole("button", { name: "Back", exact: true }).click();
+    const confirm = discardConfirm(page);
+    await expect(confirm).toBeVisible();
+    await confirm.getByRole("button", { name: "Cancel", exact: true }).click();
+    await expect(confirm).toBeHidden();
+    await expect(modal.getByRole("heading", { name: "Add agent" })).toBeVisible();
+    await modeField(form).expectValue("plan");
+
+    await modal.getByRole("button", { name: "Back", exact: true }).click();
+    await expect(confirm).toBeVisible();
+    await confirm.getByRole("button", { name: "Discard", exact: true }).click();
+    await expectAgentsList(modal);
+  });
+
+  test("Cursor speed picker and max-mode toggle: appear for a supporting model, hide for claude-code, persist maxMode", async ({
+    page,
+    request,
+    backend,
+  }) => {
+    await patchHarness(request, backend, "cursor", { enabled: true });
+
+    await gotoApp(page, backend.bootBase);
+    const dialog = await openSettingsAgents(page);
+    const section = dialog.getByTestId("agent-profiles-section");
+
+    await section.getByTestId("agent-profile-add").click();
+    const form = dialog.getByTestId("agent-profile-form");
+    await expect(form).toBeVisible();
+    const cursorName = `Cursor MaxMode Test ${randomUUID()}`;
+    await form.getByTestId("agent-profile-name").fill(cursorName);
+
+    await pickHarness(form, "Cursor");
+    await expectHarness(form, "Cursor");
+
+    // "Codex 5.3" (CURSOR_MODEL_SPECS["gpt-5.3-codex"]) supports BOTH the
+    // fast variant and Max Mode at the default cursor effort ("high") — see
+    // src/shared/types.ts's cursorModelSupportsFast/cursorModelSupportsMaxMode
+    // and that spec's effortIds/fastEfforts entries.
+    await modelField(form).selectOption("gpt-5.3-codex");
+    await effortField(form).expectValue("high");
+
+    // Speed and Max Mode sit behind Agent → More options.
+    await openMore(form);
+    const maxModeSwitch = await maxModeToggle(form);
+    const speedPicker = form.getByTestId("launch-speed");
+    await expect(maxModeSwitch).toBeVisible();
+    await expect(speedPicker).toBeVisible();
+    await expect(speedPicker).toHaveAttribute("data-value", "off");
+    await expect(await speedOption(form, "off")).toBeChecked();
+    await expect(await speedOption(form, "fast")).not.toBeChecked();
+    // Cursor offers no Ultrafast tier.
+    await expect(speedPicker.getByTestId("launch-speed-ultrafast")).toHaveCount(0);
+
+    await maxModeSwitch.click();
+    await expect(maxModeSwitch).toHaveAttribute("aria-checked", "true");
+
+    await form.getByTestId("agent-profile-save").click();
+    await expect(form).toBeHidden();
+
+    const cursorProfileId = await getProfileIdByName(request, backend, cursorName);
+    createdProfileIds.push(cursorProfileId);
+    const stored = await getAgentProfile(request, backend, cursorProfileId);
+    expect(stored.harness).toBe("cursor");
+    expect(stored.model).toBe("gpt-5.3-codex");
+    expect(stored.maxMode).toBe(true);
+    expect(stored.speed).toBe("off");
+
+    // Switching the form back to claude-code hides both toggles.
+    const row = section.locator('[data-testid="agent-profile-row"]').filter({ hasText: cursorName });
+    await row.getByTestId("agent-profile-edit").click();
+    const editForm = dialog.getByTestId("agent-profile-form");
+    await expect(editForm).toBeVisible();
+    await openMore(editForm);
+    await expect(editForm.getByTestId("launch-max-mode-toggle")).toBeVisible();
+    await pickHarness(editForm, "Claude Code");
+    await expect(editForm.getByTestId("launch-max-mode-toggle")).toHaveCount(0);
+    await expect(editForm.getByTestId("launch-speed")).toHaveCount(0);
+    await editForm.getByTestId("agent-profile-cancel").click();
+    await expect(editForm).toBeHidden();
+
+    await patchHarness(request, backend, "cursor", { enabled: false });
+  });
+
+  test("Disabled-harness marker: shows while cursor is disabled, clears once re-enabled", async ({
+    page,
+    request,
+    backend,
+  }) => {
+    await patchHarness(request, backend, "cursor", { enabled: true });
+    const markerProfile = await createAgentProfileRest(request, backend, {
+      name: `Cursor Marker Test ${randomUUID()}`,
+      harness: "cursor",
+      model: "cursor-grok-4.6",
+      effort: "high",
+      mode: "auto",
+      speed: "off",
+      maxMode: false,
+      instructions: "",
+      skills: [],
+    });
+    createdProfileIds.push(markerProfile.id);
+    await patchHarness(request, backend, "cursor", { enabled: false });
+
+    await gotoApp(page, backend.bootBase);
+    const dialog = await openSettingsAgents(page);
+    const section = dialog.getByTestId("agent-profiles-section");
+    const row = section.locator('[data-testid="agent-profile-row"]').filter({ hasText: markerProfile.name });
+    await expect(row).toBeVisible();
+    await expect(row.getByTestId("agent-profile-card-harness-disabled")).toBeVisible();
+
+    await dialog.getByRole("button", { name: "Close", exact: true }).click();
+    await expect(dialog).toBeHidden();
+
+    await patchHarness(request, backend, "cursor", { enabled: true });
+
+    await gotoApp(page, backend.bootBase);
+    const dialog2 = await openSettingsAgents(page);
+    const section2 = dialog2.getByTestId("agent-profiles-section");
+    const row2 = section2.locator('[data-testid="agent-profile-row"]').filter({ hasText: markerProfile.name });
+    await expect(row2).toBeVisible();
+    await expect(row2.getByTestId("agent-profile-card-harness-disabled")).toHaveCount(0);
+  });
+
+  test("Harness delete blocked by a bound profile; succeeds once the profile is gone", async ({
+    page,
+    request,
+    backend,
+  }) => {
+    const homeDir = await mkdtemp(path.join(tmpdir(), "agetor-e2e-agent-profiles-settings-harness-"));
+    guardHarnessId = `guard-harness-${randomUUID().slice(0, 8)}`;
+    const guardLabel = `Guard Harness ${randomUUID().slice(0, 8)}`;
+    const harness = await createHarness(request, backend, {
+      id: guardHarnessId,
+      kind: "claude-code",
+      label: guardLabel,
+      home: homeDir,
+    });
+    expect(harness.id).toBe(guardHarnessId);
+
+    const guardProfileName = `Harness Guard Test ${randomUUID()}`;
+    const profile = await createAgentProfileRest(request, backend, {
+      name: guardProfileName,
+      harness: guardHarnessId,
+      model: "opus-5",
+      effort: "high",
+      mode: "auto",
+      speed: "off",
+      maxMode: false,
+      instructions: "",
+      skills: [],
+    });
+    guardProfileId = profile.id;
+
+    await gotoApp(page, backend.bootBase);
+    const dialog = await openSettingsHarnesses(page);
+    const deleteButton = dialog.getByRole("button", { name: `Delete ${guardLabel}` });
+    await expect(deleteButton).toBeVisible();
+    await deleteButton.click();
+
+    const confirmDialog = page.getByRole("dialog").filter({ hasText: `Delete "${guardLabel}"?` });
+    await expect(confirmDialog).toBeVisible();
+    await confirmDialog.getByRole("button", { name: "Delete", exact: true }).click();
+    await expect(confirmDialog).toBeHidden();
+
+    // The delete was refused server-side (409, a profile still references
+    // it) — surfaced as a toast naming the blocking agent by name. Scoped to
+    // the sonner toast region so the text search can't match anything else
+    // on the page.
+    const toaster = page.locator("[data-sonner-toaster]");
+    await expect(toaster.getByText(`Couldn't delete "${guardLabel}"`)).toBeVisible({ timeout: CONVERGE_TIMEOUT });
+    const toastDescription = toaster.getByText(/In use by 1 agent/);
+    await expect(toastDescription).toBeVisible();
+    await expect(toastDescription).toContainText(guardProfileName);
+    // The harness row is still there — the delete did not go through.
+    await expect(dialog.getByRole("button", { name: `Delete ${guardLabel}` })).toBeVisible();
+
+    await deleteAgentProfileRest(request, backend, guardProfileId);
+    guardProfileId = "";
+
+    await deleteButton.click();
+    const confirmDialog2 = page.getByRole("dialog").filter({ hasText: `Delete "${guardLabel}"?` });
+    await expect(confirmDialog2).toBeVisible();
+    await confirmDialog2.getByRole("button", { name: "Delete", exact: true }).click();
+    await expect(confirmDialog2).toBeHidden();
+    await expect(dialog.getByRole("button", { name: `Delete ${guardLabel}` })).toHaveCount(0);
+    guardHarnessId = "";
+  });
+
+  test("Duplicate name rejected case-insensitively on rename; a fresh profile reads 'not used by any task yet'", async ({
+    page,
+    request,
+    backend,
+  }) => {
+    await gotoApp(page, backend.bootBase);
+    const dialog = await openSettingsAgents(page);
+    const section = dialog.getByTestId("agent-profiles-section");
+
+    const freshName = `Task Count Fresh ${randomUUID()}`;
+    await section.getByTestId("agent-profile-add").click();
+    const createForm = dialog.getByTestId("agent-profile-form");
+    await expect(createForm).toBeVisible();
+    await createForm.getByTestId("agent-profile-name").fill(freshName);
+    await createForm.getByTestId("agent-profile-save").click();
+    await expect(createForm).toBeHidden();
+    createdProfileIds.push(await getProfileIdByName(request, backend, freshName));
+
+    const freshRow = section.locator('[data-testid="agent-profile-row"]').filter({ hasText: freshName });
+    await expect(freshRow).toBeVisible();
+    await expect(freshRow.getByTestId("agent-profile-task-count")).toHaveText("Not used by any task yet");
+
+    // Rename to a name that clashes case-insensitively with "Widget Builder"
+    // (created in scenario 1, still present).
+    await freshRow.getByTestId("agent-profile-edit").click();
+    const editForm = dialog.getByTestId("agent-profile-form");
+    await expect(editForm).toBeVisible();
+    await editForm.getByTestId("agent-profile-name").fill(WIDGET_BUILDER_NAME.toLowerCase());
+    await editForm.getByTestId("agent-profile-save").click();
+    await expect(editForm.getByTestId("agent-profile-form-error")).toContainText("already in use");
+    // The rejected save keeps the user on the editor with the error shown.
+    // The list is not rendered while the editor subpage is up, so Cancel back
+    // to it before checking the rows.
+    await editForm.getByTestId("agent-profile-cancel").click();
+    await expect(editForm).toBeHidden();
+    await expect(section).toBeVisible();
+
+    // The row still shows the ORIGINAL name — the rejected save didn't
+    // rename it, and no duplicate row was created. `.filter({hasText: string})`
+    // matches case-INsensitively, which would make a lowercase needle match
+    // the still-present "Widget Builder" row too — use a case-sensitive
+    // RegExp so this actually proves no "widget builder …" row exists.
+    await expect(section.locator('[data-testid="agent-profile-row"]').filter({ hasText: freshName })).toBeVisible();
+    await expect(
+      section
+        .locator('[data-testid="agent-profile-row"]')
+        .filter({ hasText: new RegExp(WIDGET_BUILDER_NAME.toLowerCase()) }),
+    ).toHaveCount(0);
+  });
+
+  test("Duplicate: prefilled subpage, save creates the copy, second duplicate is '(copy 2)', untouched Back is clean, dirty Back confirms", async ({
+    page,
+    request,
+    backend,
+  }) => {
+    const sourceName = `Duplicate Source ${randomUUID()}`;
+    const sourceInstructions = `Distinctive duplicate instructions ${randomUUID()}`;
+    const source = await createAgentProfileRest(request, backend, {
+      name: sourceName,
+      harness: "claude-code",
+      model: "sonnet-5",
+      effort: "medium",
+      mode: "plan",
+      speed: "off",
+      maxMode: false,
+      instructions: sourceInstructions,
+      skills: ["code-review"],
+    });
+    createdProfileIds.push(source.id);
+
+    await gotoApp(page, backend.bootBase);
+    await openSettingsAgents(page);
+    const modal = settingsModal(page);
+    // The copy's name contains the source name, so a hasText-only filter matches
+    // both rows once the copy exists. "(copy)" is only on the copies.
+    const sourceRow = () =>
+      modal
+        .locator('[data-testid="agent-profile-row"]')
+        .filter({ hasText: sourceName })
+        .filter({ hasNotText: "(copy)" });
+    const heading = modal.locator("#settings-dialog-title");
+
+    // Duplicate → prefilled subpage → Save.
+    const dupButton = sourceRow().getByTestId("agent-profile-duplicate");
+    await expect(dupButton).toHaveText("Duplicate");
+    await dupButton.click();
+    const form = modal.getByTestId("agent-profile-form");
+    await expect(form).toBeVisible();
+    await expect(heading).toHaveText("Duplicate agent");
+    await expect(modal.getByRole("heading", { name: "Duplicate agent", exact: true })).toBeVisible();
+    await expect(form.getByTestId("agent-profile-name")).toHaveValue(`${sourceName} (copy)`);
+    await expect(form.getByTestId("agent-profile-instructions")).toHaveValue(sourceInstructions);
+    // These are not the blank-create defaults (opus-5.5 / auto), so a missed
+    // launch seed cannot pass the way a Claude Code harness check can.
+    await modelField(form).expectValue("sonnet-5");
+    await effortField(form).expectValue("medium");
+    await modeField(form).expectValue("plan");
+    await expect(form.locator('[data-testid="skills-picker-chip"][data-skill="code-review"]')).toBeVisible();
+    await expect(modal.getByTestId("agent-profile-editor")).toBeVisible();
+    await form.getByTestId("agent-profile-save").click();
+    await expect(form).toBeHidden();
+    await expectAgentsList(modal);
+    const copyName = `${sourceName} (copy)`;
+    await expect(modal.locator('[data-testid="agent-profile-row"]').filter({ hasText: copyName })).toBeVisible();
+    const copyId = await getProfileIdByName(request, backend, copyName);
+    createdProfileIds.push(copyId);
+    const copy = await getAgentProfile(request, backend, copyId);
+    expect(copy.harness).toBe("claude-code");
+    expect(copy.model).toBe("sonnet-5");
+    expect(copy.effort).toBe("medium");
+    expect(copy.mode).toBe("plan");
+    expect(copy.instructions).toBe(sourceInstructions);
+    expect(copy.skills).toEqual(["code-review"]);
+    expect(copy.id).not.toBe(source.id);
+
+    const sourceAfter = await getAgentProfile(request, backend, source.id);
+    expect(sourceAfter.name).toBe(sourceName);
+    expect(sourceAfter.instructions).toBe(sourceInstructions);
+    expect(sourceAfter.model).toBe("sonnet-5");
+    expect(sourceAfter.mode).toBe("plan");
+    expect(sourceAfter.effort).toBe("medium");
+    expect(sourceAfter.skills).toEqual(["code-review"]);
+    await expect(sourceRow()).toBeVisible();
+
+    // Open the saved copy: this is an edit of the new agent, and the source text survived.
+    const copyRow = modal.locator('[data-testid="agent-profile-row"]').filter({ hasText: copyName });
+    await copyRow.getByTestId("agent-profile-edit").click();
+    await expect(form).toBeVisible();
+    await expect(heading).toHaveText("Edit agent");
+    await expect(form.getByTestId("agent-profile-name")).toHaveValue(copyName);
+    await expect(form.getByTestId("agent-profile-instructions")).toHaveValue(sourceInstructions);
+    await modelField(form).expectValue("sonnet-5");
+    await expect(form.locator('[data-testid="skills-picker-chip"][data-skill="code-review"]')).toBeVisible();
+    await form.getByTestId("agent-profile-cancel").click();
+    await expect(form).toBeHidden();
+    await expectAgentsList(modal);
+
+    // Edit of the source still opens the original, not the duplicate draft.
+    await sourceRow().getByTestId("agent-profile-edit").click();
+    await expect(form).toBeVisible();
+    await expect(heading).toHaveText("Edit agent");
+    await expect(form.getByTestId("agent-profile-name")).toHaveValue(sourceName);
+    await form.getByTestId("agent-profile-cancel").click();
+    await expect(form).toBeHidden();
+
+    // Second duplicate of the same source → "(copy 2)". Untouched Back: no confirm.
+    await sourceRow().getByTestId("agent-profile-duplicate").click();
+    await expect(form).toBeVisible();
+    await expect(heading).toHaveText("Duplicate agent");
+    await expect(form.getByTestId("agent-profile-name")).toHaveValue(`${sourceName} (copy 2)`);
+    await modelField(form).expectValue("sonnet-5");
+    await effortField(form).expectValue("medium");
+    await modeField(form).expectValue("plan");
+    await expectHarness(form, "Claude Code");
+    await modal.getByRole("button", { name: "Back", exact: true }).click();
+    await expect(discardConfirm(page)).toHaveCount(0);
+    await expectAgentsList(modal);
+    await expect(
+      modal.locator('[data-testid="agent-profile-row"]').filter({ hasText: `${sourceName} (copy 2)` }),
+    ).toHaveCount(0);
+
+    // Dirty Back: rename → confirm; Cancel stays, Discard returns without creating.
+    await sourceRow().getByTestId("agent-profile-duplicate").click();
+    await expect(form).toBeVisible();
+    const renamed = `${sourceName} renamed copy`;
+    await form.getByTestId("agent-profile-name").fill(renamed);
+    await modal.getByRole("button", { name: "Back", exact: true }).click();
+    const confirm = discardConfirm(page);
+    await expect(confirm).toBeVisible();
+    await confirm.getByRole("button", { name: "Cancel", exact: true }).click();
+    await expect(confirm).toBeHidden();
+    await expect(heading).toHaveText("Duplicate agent");
+    await expect(form.getByTestId("agent-profile-name")).toHaveValue(renamed);
+    await modal.getByRole("button", { name: "Back", exact: true }).click();
+    await expect(confirm).toBeVisible();
+    await confirm.getByRole("button", { name: "Discard", exact: true }).click();
+    await expect(confirm).toBeHidden();
+    await expectAgentsList(modal);
+    await expect(modal.locator('[data-testid="agent-profile-row"]').filter({ hasText: renamed })).toHaveCount(0);
+    const listRes = await request.get(`${backend.apiBase}/agent-profiles`, { headers: auth(backend) });
+    const names = ((await listRes.json()) as { name: string }[]).map((p) => p.name);
+    expect(names).not.toContain(renamed);
+    expect(names).not.toContain(`${sourceName} (copy 2)`);
+  });
+
+  test("Duplicate copies cursor speed and max mode without changing the source", async ({ page, request, backend }) => {
+    await patchHarness(request, backend, "cursor", { enabled: true });
+    try {
+      const sourceName = `Cursor Duplicate ${randomUUID()}`;
+      const source = await createAgentProfileRest(request, backend, {
+        name: sourceName,
+        harness: "cursor",
+        model: "gpt-5.3-codex",
+        effort: "high",
+        mode: "ask",
+        speed: "fast",
+        maxMode: true,
+        instructions: "",
+        skills: [],
+      });
+      createdProfileIds.push(source.id);
+
+      await gotoApp(page, backend.bootBase);
+      await openSettingsAgents(page);
+      const modal = settingsModal(page);
+      const sourceRow = modal
+        .locator('[data-testid="agent-profile-row"]')
+        .filter({ hasText: sourceName })
+        .filter({ hasNotText: "(copy)" });
+      await sourceRow.getByTestId("agent-profile-duplicate").click();
+      const form = modal.getByTestId("agent-profile-form");
+      await expect(form).toBeVisible();
+      await expect(modal.locator("#settings-dialog-title")).toHaveText("Duplicate agent");
+      await expect(form.getByTestId("agent-profile-name")).toHaveValue(`${sourceName} (copy)`);
+      await expectHarness(form, "Cursor");
+      await modelField(form).expectValue("gpt-5.3-codex");
+      await modeField(form).expectValue("ask");
+      await expect(await maxModeToggle(form)).toHaveAttribute("aria-checked", "true");
+      await expect(form.getByTestId("launch-speed")).toHaveAttribute("data-value", "fast");
+      await expect(await speedOption(form, "fast")).toBeChecked();
+
+      await form.getByTestId("agent-profile-save").click();
+      await expect(form).toBeHidden();
+
+      const copyName = `${sourceName} (copy)`;
+      const copyId = await getProfileIdByName(request, backend, copyName);
+      createdProfileIds.push(copyId);
+      const copy = await getAgentProfile(request, backend, copyId);
+      expect(copy.harness).toBe("cursor");
+      expect(copy.model).toBe("gpt-5.3-codex");
+      expect(copy.mode).toBe("ask");
+      expect(copy.speed).toBe("fast");
+      expect(copy.maxMode).toBe(true);
+
+      const sourceAfter = await getAgentProfile(request, backend, source.id);
+      expect(sourceAfter.name).toBe(sourceName);
+      expect(sourceAfter.speed).toBe("fast");
+      expect(sourceAfter.maxMode).toBe(true);
+      expect(sourceAfter.model).toBe("gpt-5.3-codex");
+    } finally {
+      await patchHarness(request, backend, "cursor", { enabled: false });
+    }
+  });
+
+  async function mkSource(request: APIRequestContext, backend: E2EBackend, label: string) {
+    const name = `${label} ${randomUUID()}`;
+    const src = await createAgentProfileRest(request, backend, {
+      name,
+      harness: "claude-code",
+      model: "sonnet-5",
+      effort: "medium",
+      mode: "plan",
+      instructions: "dup-from-edit",
+      skills: [],
+    });
+    createdProfileIds.push(src.id);
+    return { name, id: src.id };
+  }
+
+  async function openEditFor(page: Page, name: string): Promise<{ modal: Locator; form: Locator }> {
+    await openSettingsAgents(page);
+    const modal = settingsModal(page);
+    await modal
+      .locator('[data-testid="agent-profile-row"]')
+      .filter({ hasText: name })
+      .filter({ hasNotText: "(copy)" })
+      .getByTestId("agent-profile-edit")
+      .click();
+    const form = modal.getByTestId("agent-profile-form");
+    await expect(form).toBeVisible();
+    await expect(modal.getByRole("heading", { name: "Edit agent", exact: true })).toBeVisible();
+    return { modal, form };
+  }
+
+  async function taskCountOf(request: APIRequestContext, backend: E2EBackend, id: string): Promise<number> {
+    return (await getAgentProfile(request, backend, id)).taskCount;
+  }
+
+  async function createBoundTask(request: APIRequestContext, backend: E2EBackend, profileId: string, title: string) {
+    const dir = await mkdtemp(path.join(tmpdir(), "agetor-dup-"));
+    const res = await request.post(`${backend.apiBase}/tasks`, {
+      headers: auth(backend),
+      data: { title, prompt: "noop", workdir: dir, isolation: "none", agentProfileId: profileId },
+    });
+    expect(res.ok(), `POST /tasks -> ${res.status()}: ${await res.text()}`).toBeTruthy();
+    return (await res.json()) as { id: string };
+  }
+
+  test("Edit page Duplicate: heading becomes Duplicate agent with '<saved name> (copy)'", async ({
+    page,
+    request,
+    backend,
+  }) => {
+    const src = await mkSource(request, backend, "EditDup");
+    await gotoApp(page, backend.bootBase);
+    const { modal, form } = await openEditFor(page, src.name);
+    await form.getByTestId("agent-profile-form-duplicate").click();
+    await expect(modal.getByRole("heading", { name: "Duplicate agent", exact: true })).toBeVisible();
+    await expect(form.getByTestId("agent-profile-name")).toHaveValue(`${src.name} (copy)`);
+  });
+
+  test("Edit page Duplicate with dirty name: Cancel keeps draft and Edit heading; Discard prefills from SAVED name", async ({
+    page,
+    request,
+    backend,
+  }) => {
+    const src = await mkSource(request, backend, "DirtyDup");
+    await gotoApp(page, backend.bootBase);
+    const { modal, form } = await openEditFor(page, src.name);
+    const dirty = `${src.name} DIRTY`;
+    await form.getByTestId("agent-profile-name").fill(dirty);
+    await form.getByTestId("agent-profile-form-duplicate").click();
+    const confirm = discardConfirm(page);
+    await expect(confirm).toBeVisible();
+    await confirm.getByRole("button", { name: "Cancel", exact: true }).click();
+    await expect(confirm).toBeHidden();
+    await expect(form.getByTestId("agent-profile-name")).toHaveValue(dirty);
+    await expect(modal.getByRole("heading", { name: "Edit agent", exact: true })).toBeVisible();
+
+    await form.getByTestId("agent-profile-form-duplicate").click();
+    await expect(confirm).toBeVisible();
+    await confirm.getByRole("button", { name: "Discard", exact: true }).click();
+    await expect(modal.getByRole("heading", { name: "Duplicate agent", exact: true })).toBeVisible();
+    await expect(modal.getByTestId("agent-profile-form").getByTestId("agent-profile-name")).toHaveValue(
+      `${src.name} (copy)`,
+    );
+  });
+
+  test("Duplicate without copy-tasks: checkbox unchecked by default, new taskCount 0, source unchanged", async ({
+    page,
+    request,
+    backend,
+  }) => {
+    const src = await mkSource(request, backend, "NoCopyTasks");
+    await createBoundTask(request, backend, src.id, `nocopy-${randomUUID()}`);
+    expect(await taskCountOf(request, backend, src.id)).toBe(1);
+
+    await gotoApp(page, backend.bootBase);
+    const { modal, form } = await openEditFor(page, src.name);
+    await form.getByTestId("agent-profile-form-duplicate").click();
+    await expect(modal.getByRole("heading", { name: "Duplicate agent", exact: true })).toBeVisible();
+    const box = form.getByTestId("agent-profile-copy-tasks");
+    await expect(box).not.toBeChecked();
+    await form.getByTestId("agent-profile-save").click();
+    await expect(form).toBeHidden();
+
+    const copyId = await getProfileIdByName(request, backend, `${src.name} (copy)`);
+    createdProfileIds.push(copyId);
+    expect(await taskCountOf(request, backend, copyId)).toBe(0);
+    expect(await taskCountOf(request, backend, src.id)).toBe(1);
+  });
+
+  test("Duplicate with copy-tasks checked: new profile gets 1 backlog task copy, source unchanged", async ({
+    page,
+    request,
+    backend,
+  }) => {
+    const src = await mkSource(request, backend, "CopyTasks");
+    const title = `copyme-${randomUUID()}`;
+    await createBoundTask(request, backend, src.id, title);
+
+    await gotoApp(page, backend.bootBase);
+    const { modal, form } = await openEditFor(page, src.name);
+    await form.getByTestId("agent-profile-form-duplicate").click();
+    await expect(modal.getByRole("heading", { name: "Duplicate agent", exact: true })).toBeVisible();
+    await form.getByTestId("agent-profile-copy-tasks").check();
+    await form.getByTestId("agent-profile-save").click();
+    await expect(form).toBeHidden();
+
+    const copyId = await getProfileIdByName(request, backend, `${src.name} (copy)`);
+    createdProfileIds.push(copyId);
+    expect(await taskCountOf(request, backend, copyId)).toBe(1);
+    expect(await taskCountOf(request, backend, src.id)).toBe(1);
+
+    const res = await request.get(`${backend.apiBase}/tasks`, { headers: auth(backend) });
+    expect(res.ok()).toBeTruthy();
+    const tasks = (await res.json()) as any[];
+    const copied = tasks.filter((t) => t.agentProfileId === copyId);
+    expect(copied).toHaveLength(1);
+    expect(copied[0].title).toContain(title);
+    expect(copied[0].column).toBe("backlog");
+  });
+
+  test("Copy tasks leaves an existing-branch task on the original and copies the ordinary one", async ({
+    page,
+    request,
+    backend,
+  }) => {
+    const src = await mkSource(request, backend, "ExistingBranch");
+    const ordinaryTitle = `ordinary-${randomUUID()}`;
+    const branchTitle = `on-branch-${randomUUID()}`;
+    await createBoundTask(request, backend, src.id, ordinaryTitle);
+    const branchTask = await createExistingBranchTask(request, backend, src.id, branchTitle);
+    expect(await taskCountOf(request, backend, src.id)).toBe(2);
+
+    await gotoApp(page, backend.bootBase);
+    const { modal, form } = await openEditFor(page, src.name);
+    await form.getByTestId("agent-profile-form-duplicate").click();
+    await expect(modal.getByRole("heading", { name: "Duplicate agent", exact: true })).toBeVisible();
+    await expect(form.getByText("tasks on an existing branch stay on the original")).toBeVisible();
+    await form.getByTestId("agent-profile-copy-tasks").check();
+    await form.getByTestId("agent-profile-save").click();
+    await expect(form).toBeHidden();
+
+    const toaster = page.locator("[data-sonner-toaster]");
+    await expect(
+      toaster.getByText("1 task couldn't be copied: task works on an existing branch — not copied"),
+    ).toBeVisible();
+
+    const copyId = await getProfileIdByName(request, backend, `${src.name} (copy)`);
+    createdProfileIds.push(copyId);
+    expect(await taskCountOf(request, backend, copyId)).toBe(1);
+    expect(await taskCountOf(request, backend, src.id)).toBe(2);
+
+    const res = await request.get(`${backend.apiBase}/tasks`, { headers: auth(backend) });
+    expect(res.ok()).toBeTruthy();
+    const tasks = (await res.json()) as {
+      id: string;
+      title: string;
+      column: string;
+      agentProfileId: string | null;
+      branchSource: string;
+    }[];
+    const copied = tasks.filter((t) => t.agentProfileId === copyId);
+    expect(copied).toHaveLength(1);
+    expect(copied[0]!.title).toBe(ordinaryTitle);
+    expect(copied[0]!.column).toBe("backlog");
+    const kept = tasks.find((t) => t.id === branchTask.id);
+    expect(kept?.agentProfileId).toBe(src.id);
+    expect(kept?.branchSource).toBe("existing");
+    expect(kept?.title).toBe(branchTitle);
+  });
+});
+
+function git(cwd: string, args: string[]): void {
+  execFileSync("git", args, { cwd, stdio: ["ignore", "pipe", "pipe"] });
+}
+
+/** A local branch with no remote. `createTask`'s existingBranch path fetch is
+ *  best-effort, then it resolves `refs/heads/<branch>`. */
+async function initRepoWithBranch(backend: E2EBackend, branch: string): Promise<string> {
+  const dir = path.join(backend.dataDir, `dup-repo-${randomUUID()}`);
+  await mkdir(dir, { recursive: true });
+  git(dir, ["init", "-q", "-b", "main"]);
+  git(dir, ["config", "user.email", "e2e@example.com"]);
+  git(dir, ["config", "user.name", "e2e"]);
+  git(dir, ["config", "commit.gpgsign", "false"]);
+  git(dir, ["commit", "-q", "--allow-empty", "-m", "init"]);
+  git(dir, ["branch", branch]);
+  return dir;
+}
+
+async function createExistingBranchTask(
+  request: APIRequestContext,
+  backend: E2EBackend,
+  profileId: string,
+  title: string,
+) {
+  const branch = "pr-head";
+  const workdir = await initRepoWithBranch(backend, branch);
+  const res = await request.post(`${backend.apiBase}/tasks`, {
+    headers: auth(backend),
+    data: {
+      title,
+      prompt: "noop",
+      workdir,
+      isolation: "worktree",
+      existingBranch: branch,
+      agentProfileId: profileId,
+    },
+  });
+  expect(res.ok(), `POST /tasks existingBranch -> ${res.status()}: ${await res.text()}`).toBeTruthy();
+  return (await res.json()) as { id: string; branchSource: string };
 }
 
 test.afterAll(async ({ backend }) => {
