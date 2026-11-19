@@ -7,7 +7,7 @@ import { AWAITING_RING_CLASS } from "@/lib/awaiting";
 import { AwaitingGlow } from "@/components/ui/awaiting-glow";
 import { taskTypeIcon } from "@/lib/task-type-icon";
 import { promptPreview } from "@/lib/prompt-preview";
-import { cancelBoardDrag, handleCardKeyDown, isOutsideCard, restoreFocusAfterCancel } from "@/lib/board-keyboard";
+import { cancelBoardDrag, handleCardKeyDown, isOutsideCard } from "@/lib/board-keyboard";
 import { taskActionFlags } from "@/lib/task-card-actions";
 import { PipelineHat } from "@/components/pipelines/PipelineHat";
 import { taskTypeMeta, type HarnessLimitState, type HarnessStack, type Task } from "../../../shared/types.ts";
@@ -107,7 +107,6 @@ function TaskCardImpl({ task, homeDir, stacks = [], limitStates = [], onStart, o
         const next = (e as FocusEvent).relatedTarget;
         if (isOutsideCard(card, e.target) || !isOutsideCard(card, next)) return;
         cancelBoardDrag();
-        restoreFocusAfterCancel(next);
         return;
       }
       // A press anywhere, the held card and its buttons included: a card

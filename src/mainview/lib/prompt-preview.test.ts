@@ -75,9 +75,32 @@ describe("promptPreview", () => {
     expect(promptPreview(`See ![the chart](${url}) for details.`)).toBe("See the chart for details.");
     expect(promptPreview(`Run \`${"x ".repeat(1200)}\` then stop.`)).toStartWith("Run x x x");
     expect(promptPreview(`Run \`${"x ".repeat(1200)}\` then stop.`)).not.toContain("`");
-    // The 2,240-char cut falls inside the link text, on `]`, between `]` and `(`, and in the URL.
+    // The 2,240-char cut falls in the URL (a short label, a long URL).
     for (let n = 2215; n <= 2245; n++) {
       expect(promptPreview(`[label](https://e.com/${"p".repeat(n)}) tail`)).toBe("label tail");
+    }
+  });
+
+  test("a link whose text is longer than the prefix is not cut open", () => {
+    // The 2,240-char cut falls inside the link text, on `]` (n = 2238 puts `]` at
+    // index 2239) and between `]` and `(`. A cut link would show as `[aaa…`.
+    for (let n = 2230; n <= 2245; n++) {
+      const out = promptPreview(`[${"a".repeat(n)}](https://e.com/x) tail`);
+      expect(out).toBe(`${"a".repeat(279)}…`);
+    }
+    const spaced = promptPreview(`[${"a ".repeat(1500)}](https://e.com/x) tail`);
+    expect(spaced).not.toMatch(/[[\]()]/);
+    expect(spaced.startsWith("a a a")).toBe(true);
+  });
+
+  test("a code span that closes far past the prefix stays bounded, emphasis-heavy or not", () => {
+    // The closer is beyond the lookahead, so the cut stays; the emphasis pattern
+    // is quadratic, so chasing a closer 150 KB away would take seconds.
+    for (const unit of ["*a ", "_b ", "p"]) {
+      const start = performance.now();
+      const out = promptPreview(`Run \`${unit.repeat(50_000)}\` tail`);
+      expect(performance.now() - start).toBeLessThan(500);
+      expect(out.length).toBeLessThanOrEqual(280);
     }
   });
 

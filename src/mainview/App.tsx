@@ -2075,8 +2075,21 @@ function AppInner() {
 
   // `data-board-drag` on <body> while a card is held: the run panel's document
   // Escape handler leaves the key to dnd-kit's cancel instead of also closing.
-  const onDragStart = useCallback(() => setBoardDragging(true), []);
-  const onDragCancel = useCallback(() => setBoardDragging(false), []);
+  //
+  // dnd-kit's `RestoreFocus` re-focuses the card after any keyboard drag that
+  // ends with focus elsewhere, which would undo a cancel caused by focus moving
+  // on (Tab, or Cmd/Ctrl+F to the board search). A cancel turns it off in the
+  // same batched update that ends the drag, and the next drag turns it back on:
+  // a drop into another column remounts the card, and that one needs the restore.
+  const [restoreFocus, setRestoreFocus] = useState(true);
+  const onDragStart = useCallback(() => {
+    setBoardDragging(true);
+    setRestoreFocus(true);
+  }, []);
+  const onDragCancel = useCallback(() => {
+    setBoardDragging(false);
+    setRestoreFocus(false);
+  }, []);
   const onDragEnd = useCallback(async (e: DragEndEvent) => {
     setBoardDragging(false);
     const id = String(e.active.id);
@@ -2113,7 +2126,8 @@ function AppInner() {
       (id) => COLUMNS.find((c) => c.id === id)?.label ?? "",
     ),
     screenReaderInstructions: { draggable: BOARD_SCREEN_READER_INSTRUCTIONS },
-  }), []);
+    restoreFocus,
+  }), [restoreFocus]);
 
   // `startTask` materializes the worktree, which can re-pin the branch when a
   // create-time uniqueness race is only detectable once the branch actually
