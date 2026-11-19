@@ -1772,5 +1772,7 @@ export function pipelineStepProgress(run: PipelineRunState): PipelineStepProgres
  * label rather than rendering an empty span.
  */
 export function pipelineRunHeaderText(progress: PipelineStepProgress): string {
-  return [progress.done ? "" : progress.label, progress.runsLabel].filter(Boolean).join(" · ") || progress.label;
+  // No snapshot yet (an idle run before its first Run): `0/0` says nothing.
+  const showCount = !progress.done && progress.total > 0;
+  return [showCount ? progress.label : "", progress.runsLabel].filter(Boolean).join(" · ") || (progress.done ? progress.label : "");
 }

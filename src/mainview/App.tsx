@@ -64,7 +64,7 @@ import { WelcomeDialog } from "@/components/onboarding/WelcomeDialog";
 import { OnboardingChecklist } from "@/components/onboarding/OnboardingChecklist";
 import type { UpdateSnapshot } from "@/lib/api";
 import { useConfirm } from "@/components/ui/confirm";
-import { BOARD_KEYBOARD_CODES, BOARD_SCREEN_READER_INSTRUCTIONS, boardKeyboardCoordinates, makeBoardAnnouncements } from "@/lib/board-keyboard";
+import { BOARD_KEYBOARD_CODES, BOARD_SCREEN_READER_INSTRUCTIONS, boardKeyboardCoordinates, makeBoardAnnouncements, setBoardDragging } from "@/lib/board-keyboard";
 import { toast } from "sonner";
 import { Toaster } from "@/components/ui/sonner";
 import { dismissPending, dismissTaskToast, hasPendingToast, notifyFilesSent, notifyWaitingInput, toastApiError, toastError, toastFxAutoResumeExhausted, toastFxAutoResumeFired, toastHarnessExhausted, toastHarnessSwap, toastHarnessUnusable, toastPending, toastPipelineReview, toastSendFailed, toastSessionEnded, toastSuccess, toastUnknownCommand, type ToastArgs } from "@/lib/toasts";
@@ -2073,7 +2073,12 @@ function AppInner() {
     setError(e instanceof Error ? e.message : String(e));
   }, []);
 
+  // `data-board-drag` on <body> while a card is held: the run panel's document
+  // Escape handler leaves the key to dnd-kit's cancel instead of also closing.
+  const onDragStart = useCallback(() => setBoardDragging(true), []);
+  const onDragCancel = useCallback(() => setBoardDragging(false), []);
   const onDragEnd = useCallback(async (e: DragEndEvent) => {
+    setBoardDragging(false);
     const id = String(e.active.id);
     const col = e.over?.id as ColumnId | undefined;
     if (!col) return;
@@ -2895,7 +2900,7 @@ const runTaskMenuAction = useCallback((action: TaskMenuAction, snapshot: Task, r
                     className="kanban-scroll absolute inset-0 overflow-x-scroll"
                     onScroll={(e) => saveBoardScroll(e.currentTarget.scrollLeft, e.currentTarget.scrollTop)}
                   >
-                    <DndContext sensors={sensors} onDragEnd={onDragEnd} accessibility={boardAccessibility}>
+                    <DndContext sensors={sensors} onDragStart={onDragStart} onDragEnd={onDragEnd} onDragCancel={onDragCancel} accessibility={boardAccessibility}>
                       <div className="flex gap-3 p-4">
                         {visibleColumns.map((c) => (
                           <Column

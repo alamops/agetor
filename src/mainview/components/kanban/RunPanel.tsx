@@ -600,7 +600,7 @@ export function RunPanel({ task, stickyUserMessages, agents, harnesses, stacks =
     const onKey = (e: KeyboardEvent) => {
       if (e.key !== "Escape") return;
       if (e.defaultPrevented) return;
-      if (document.querySelector('[role="dialog"][aria-modal="true"], [data-popover-open], [data-quote-open], [data-search-open]')) return;
+      if (document.querySelector('[role="dialog"][aria-modal="true"], [data-popover-open], [data-quote-open], [data-search-open], [data-board-drag]')) return;
       e.preventDefault();
       onCloseRef.current();
     };

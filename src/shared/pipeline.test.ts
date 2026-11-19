@@ -2255,6 +2255,9 @@ describe("pipelineStepProgress", () => {
     expect(pipelineRunHeaderText(done)).not.toContain("13/10");
     // Done with nothing executed: never an empty span.
     expect(pipelineRunHeaderText(pipelineStepProgress(makeRun({ status: "done" })))).toBe("✓ Done");
+    // An idle run before its first Run has no snapshot: no `0/0`, and the
+    // header omits its span.
+    expect(pipelineRunHeaderText(pipelineStepProgress(makeRun({ status: "idle" })))).toBe("");
   });
 
   test("total is 0 before the first run (no snapshot)", () => {

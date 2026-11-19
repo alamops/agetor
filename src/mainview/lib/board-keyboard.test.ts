@@ -2,8 +2,12 @@ import { describe, expect, test } from "bun:test";
 import {
   BOARD_KEYBOARD_CODES,
   BOARD_SCREEN_READER_INSTRUCTIONS,
+  BOARD_CANCEL_CODE,
   boardKeyboardCoordinates,
+  cancelBoardDrag,
   handleCardKeyDown,
+  isOutsideCard,
+  setBoardDragging,
   makeBoardAnnouncements,
   nextColumnX,
 } from "./board-keyboard.ts";
@@ -106,7 +110,7 @@ describe("keyboard codes", () => {
   test("Space starts and drops, Escape and Tab cancel, Enter is not a drag key", () => {
     expect(BOARD_KEYBOARD_CODES.start).toEqual(["Space"]);
     expect(BOARD_KEYBOARD_CODES.end).toEqual(["Space"]);
-    expect(BOARD_KEYBOARD_CODES.cancel).toEqual(["Escape", "Tab"]);
+    expect(BOARD_KEYBOARD_CODES.cancel).toEqual(["Escape", "Tab", BOARD_CANCEL_CODE]);
     expect(BOARD_KEYBOARD_CODES.end).not.toContain("Enter");
   });
 
@@ -178,5 +182,48 @@ describe("handleCardKeyDown", () => {
     let drag = 0;
     handleCardKeyDown(ev(" ", button).e, () => {}, () => { drag++; });
     expect(drag).toBe(1);
+  });
+});
+
+describe("leaving a held card", () => {
+  const inside = {};
+  const card = { contains: (n: unknown) => n === inside };
+
+  test("a press or focus outside the card is outside; inside or no card is not", () => {
+    expect(isOutsideCard(card, {})).toBe(true);
+    expect(isOutsideCard(card, null)).toBe(true);
+    expect(isOutsideCard(card, inside)).toBe(false);
+    expect(isOutsideCard(null, {})).toBe(false);
+  });
+
+  test("the private cancel code is a cancel key no keyboard can send", () => {
+    expect(BOARD_KEYBOARD_CODES.cancel).toContain(BOARD_CANCEL_CODE);
+    expect(BOARD_CANCEL_CODE).not.toBe("Escape");
+  });
+
+  test("cancelBoardDrag dispatches a keydown with that code on the document", () => {
+    const seen: { type: string; init: Record<string, unknown> }[] = [];
+    class FakeKeyboardEvent {
+      constructor(public type: string, public init: Record<string, unknown>) {}
+    }
+    const doc = {
+      defaultView: { KeyboardEvent: FakeKeyboardEvent },
+      dispatchEvent: (e: FakeKeyboardEvent) => { seen.push(e); return true; },
+    } as unknown as Document;
+    cancelBoardDrag(doc);
+    expect(seen).toHaveLength(1);
+    expect(seen[0]!.type).toBe("keydown");
+    expect(seen[0]!.init.code).toBe(BOARD_CANCEL_CODE);
+    // A document with no window (detached) is a no-op, not a throw.
+    cancelBoardDrag({ defaultView: null } as unknown as Document);
+  });
+
+  test("setBoardDragging marks and unmarks the body", () => {
+    const attrs = new Set<string>();
+    const doc = { body: { setAttribute: (n: string) => attrs.add(n), removeAttribute: (n: string) => attrs.delete(n) } } as unknown as Document;
+    setBoardDragging(true, doc);
+    expect([...attrs]).toEqual(["data-board-drag"]);
+    setBoardDragging(false, doc);
+    expect(attrs.size).toBe(0);
   });
 });

@@ -30,7 +30,7 @@ actions       primary button(s) + ⋯
 
 ## Pipeline hat
 
-`PipelineHat` shows the full pipeline name (wraps), progress on the right and a step line. Progress is `pipelineStepProgress` ([pipelines.md](pipelines.md)): `n/total` over distinct steps, or `✓ Done`. Tooltip: `<name> — <progress> · <N step runs · M re-runs>`. Tones: running and review `info`, blocked `warning`, done `success`, cancelled and idle muted.
+`PipelineHat` shows the full pipeline name (wraps), progress on the right and a step line. Progress is `pipelineStepProgress` ([pipelines.md](pipelines.md)): `n/total` over distinct steps, or `✓ Done`. Tooltip: `<name> — <progress> · <N step runs · M re-runs>`; a run with no snapshot yet (idle, before its first Run) leaves the count out of the band and the tooltip, and the run view header hides it too, so there is no `0/0` and the tooltip is `<name>` plus any run counts. Tones: running and review `info`, blocked `warning`, done `success`, cancelled and idle muted.
 
 ## Actions
 
@@ -58,9 +58,10 @@ actions       primary button(s) + ⋯
 | ← / → | moves it to the previous / next column (the board scrolls to it) |
 | Space | drops it, through the same `onDragEnd` as a pointer drop |
 | Escape or Tab | puts it back (Tab keeps focus on the card; a second Tab moves on) |
+| a click elsewhere, or focus leaving the card | puts it back |
 | Enter while held | ignored: the task does not open out from under the drag |
 
-dnd-kit's keyboard sensor listens on the **document**, so a drag that outlived the card's focus would keep taking Space and the arrows typed anywhere else (the run panel's composer). That is why Tab cancels. `lib/board-keyboard.ts` holds the key codes, the coordinate getter and the announcements; App wires them (`KeyboardSensor`, `DndContext accessibility`). The card root is the sensor's **activator node** (`setActivatorNodeRef`): dnd-kit starts a keyboard drag only when the key event's target is that node, so Space on a nested button (like `⋯`) activates the button instead. Announcements name the task and the column, never the task id.
+dnd-kit's keyboard sensor listens on the **document**, so a drag that outlived the card's focus would keep taking Space and the arrows typed anywhere else (the run panel's composer). That is why Tab cancels. dnd-kit itself cancels only on its cancel codes, a window resize and a hidden tab, so while a card is held `TaskCard` listens (capture phase) for a `pointerdown` or `focusout` that lands outside the card and calls `cancelBoardDrag`, which dispatches a keydown with a private code, `BOARD_CANCEL_CODE`, listed in `BOARD_KEYBOARD_CODES.cancel`. It is not a synthetic Escape: the run panel's own document Escape handler would act on that too. For the same reason App sets `data-board-drag` on `<body>` from `onDragStart` until `onDragEnd`/`onDragCancel`, and the run panel's Escape handler skips while it is set, so the Escape that puts a card back does not also close the open panel. `lib/board-keyboard.ts` holds the key codes, the coordinate getter and the announcements; App wires them (`KeyboardSensor`, `DndContext accessibility`). The card root is the sensor's **activator node** (`setActivatorNodeRef`): dnd-kit starts a keyboard drag only when the key event's target is that node, so Space on a nested button (like `⋯`) activates the button instead. Announcements name the task and the column, never the task id.
 
 ## Hooks e2e relies on
 

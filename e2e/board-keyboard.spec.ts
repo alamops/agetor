@@ -44,6 +44,11 @@ async function columnOf(request: APIRequestContext, backend: E2EBackend, id: str
 const cardOf = (page: Page, id: string): Locator => page.locator(`[data-task-id="${id}"]`);
 const liveRegion = (page: Page): Locator => page.locator('[role="status"][id^="DndLiveRegion"]');
 const taskMenu = (page: Page): Locator => page.getByTestId("task-context-menu");
+// The run panel is the `<aside>` holding its resize handle. `aside.last()` is
+// not a test for "closed": with no panel mounted, the last aside is the New task
+// sidebar, which has a textarea of its own. The panel unmounts after its exit
+// animation, so `toHaveCount(0)` means it is closed.
+const runPanel = (page: Page): Locator => page.locator("aside").filter({ has: page.getByTestId("run-panel-resize") });
 
 test("Enter on a focused card opens its run panel", async ({ page, request, backend }) => {
   const task = await createTask(request, backend, `kbd-open ${randomUUID()}`);
@@ -53,7 +58,7 @@ test("Enter on a focused card opens its run panel", async ({ page, request, back
   await card.focus();
   await expect(card).toBeFocused();
   await page.keyboard.press("Enter");
-  await expect(page.locator("aside").last().locator("textarea")).toBeVisible();
+  await expect(runPanel(page).locator("textarea")).toBeVisible();
 });
 
 test("Space, →, Space moves a card to the next column; the live region names the task, not its id", async ({ page, request, backend }) => {
@@ -105,10 +110,12 @@ test("Enter while a card is held does not open it, and Escape still puts it back
   await page.keyboard.press("Space");
   await expect(liveRegion(page)).toContainText(`${title} is over Backlog`);
   await page.keyboard.press("Enter");
-  // The run panel did not open out from under the drag, and the drag is still live.
-  await expect(page.locator("aside").last().locator("textarea")).toHaveCount(0);
+  // The drag is still live: the arrow moves the card. Asserting this first
+  // gives the Enter keydown time to have opened the panel, were it going to.
   await page.keyboard.press("ArrowRight");
   await expect(liveRegion(page)).toContainText(`${title} is over Ready`);
+  // The run panel did not open out from under the drag.
+  await expect(runPanel(page)).toHaveCount(0);
   await page.keyboard.press("Escape");
   await expect(liveRegion(page)).toContainText(`Moving ${title} was cancelled`);
   expect(await columnOf(request, backend, task.id)).toBe("backlog");
@@ -134,6 +141,55 @@ test("Tab cancels a keyboard drag, so keys typed afterwards cannot move the card
   expect(await columnOf(request, backend, task.id)).toBe("backlog");
 });
 
+test("a click elsewhere cancels a keyboard drag, so keys typed afterwards cannot move the card", async ({ page, request, backend }) => {
+  const title = `kbd-click-cancel ${randomUUID()}`;
+  const task = await createTask(request, backend, title);
+  await gotoApp(page, backend.bootBase);
+  const card = cardOf(page, task.id);
+  await expect(card).toBeVisible({ timeout: 10_000 });
+  await card.focus();
+
+  await page.keyboard.press("Space");
+  await page.keyboard.press("ArrowRight");
+  await expect(liveRegion(page)).toContainText(`${title} is over Ready`);
+  // A press on the board's search box, outside the card: dnd-kit alone would
+  // keep the drag live (it ends only on its own keys).
+  await page.getByPlaceholder(/^Search title, prompt/).click();
+  await expect(liveRegion(page)).toContainText(`Moving ${title} was cancelled`);
+  // Space and an arrow typed now go to the input, not to the held card.
+  await page.keyboard.press("ArrowRight");
+  await page.keyboard.press("Space");
+  await expect(liveRegion(page)).not.toContainText("was dropped");
+  await expect.poll(() => columnOf(request, backend, task.id), { timeout: 3_000 }).toBe("backlog");
+});
+
+test("Escape that cancels a keyboard drag does not also close the open run panel", async ({ page, request, backend }) => {
+  const title = `kbd-esc-panel ${randomUUID()}`;
+  const task = await createTask(request, backend, title);
+  await gotoApp(page, backend.bootBase);
+  const card = cardOf(page, task.id);
+  await expect(card).toBeVisible({ timeout: 10_000 });
+  await card.click();
+  const composer = runPanel(page).locator("textarea");
+  await expect(composer).toBeVisible();
+  await card.focus();
+
+  await page.keyboard.press("Space");
+  await page.keyboard.press("ArrowRight");
+  await expect(liveRegion(page)).toContainText(`${title} is over Ready`);
+  await page.keyboard.press("Escape");
+  await expect(liveRegion(page)).toContainText(`Moving ${title} was cancelled`);
+  // A panel that was closed stays mounted through its 250 ms exit animation, so
+  // "still visible" right away proves nothing: wait it out, then it must still
+  // be there and on screen.
+  await page.waitForTimeout(600);
+  await expect(runPanel(page)).toHaveCount(1);
+  await expect(runPanel(page)).toHaveClass(/translate-x-0/);
+  // With no drag held, Escape closes the panel as before.
+  await page.keyboard.press("Escape");
+  await expect(runPanel(page)).toHaveCount(0);
+});
+
 test("a review card reaches Done, even when that column is scrolled off-screen", async ({ page, request, backend }) => {
   const task = await createTask(request, backend, `kbd-done ${randomUUID()}`);
   await patchColumn(request, backend, task.id, "review");
@@ -146,6 +202,8 @@ test("a review card reaches Done, even when that column is scrolled off-screen",
 
   await page.keyboard.press("Space");
   await page.keyboard.press("ArrowRight");
+  // The board scrolls to Done smoothly: drop only once the card is over it.
+  await expect(liveRegion(page)).toContainText("is over Done", { timeout: 10_000 });
   await page.keyboard.press("Space");
 
   await expect.poll(() => columnOf(request, backend, task.id), { timeout: 10_000 }).toBe("done");
@@ -208,6 +266,7 @@ test("a pipeline parent moved by keyboard keeps its column and says why", async 
 
   await page.keyboard.press("Space");
   await page.keyboard.press("ArrowRight");
+  await expect(liveRegion(page)).toContainText(`${title} is over Ready`);
   await page.keyboard.press("Space");
 
   await expect(page.getByText("This pipeline task's column is managed by its run.")).toBeVisible();

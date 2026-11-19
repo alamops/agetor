@@ -8,13 +8,46 @@ import type { Announcements, KeyboardCoordinateGetter } from "@dnd-kit/core";
  * (the card's own `onKeyDown`) and is ignored while a drag is held. Tab
  * cancels, like Escape: dnd-kit listens on the document, so a drag that
  * outlived the card's focus would keep taking Space and the arrows typed
- * anywhere else (the run panel's composer) and move the card.
+ * anywhere else (the run panel's composer) and move the card. dnd-kit only
+ * cancels on its own codes, a resize and a hidden tab, so a click elsewhere
+ * or focus moving off the card cancels through `cancelBoardDrag`.
  */
+export const BOARD_CANCEL_CODE = "AgetorCancelDrag";
+
 export const BOARD_KEYBOARD_CODES = {
   start: ["Space"],
-  cancel: ["Escape", "Tab"],
+  // The private code is no key a keyboard can send, and unlike a synthetic
+  // Escape no other document listener (the run panel's) acts on it.
+  cancel: ["Escape", "Tab", BOARD_CANCEL_CODE],
   end: ["Space"],
 };
+
+/** Cancels the keyboard drag in progress, if any: dnd-kit's document keydown
+ *  listener takes the private cancel code like a key. No drag, no listener,
+ *  no effect. */
+export function cancelBoardDrag(doc: Document = document): void {
+  const view = doc.defaultView;
+  if (!view) return;
+  doc.dispatchEvent(new view.KeyboardEvent("keydown", { code: BOARD_CANCEL_CODE, key: BOARD_CANCEL_CODE, bubbles: true }));
+}
+
+/** True when a pointer press or a focus change landed outside the held card,
+ *  which is when the drag must end. `target` null (focus left the document)
+ *  counts as outside. */
+export function isOutsideCard(card: { contains(node: never): boolean } | null, target: unknown): boolean {
+  if (!card) return false;
+  return target == null || !card.contains(target as never);
+}
+
+/** Marks the document while any board drag is held, so a document-level
+ *  Escape handler that is not part of the drag (the run panel's) leaves the
+ *  key to dnd-kit's cancel. */
+export const BOARD_DRAG_ATTR = "data-board-drag";
+
+export function setBoardDragging(on: boolean, doc: Document = document): void {
+  if (on) doc.body.setAttribute(BOARD_DRAG_ATTR, "");
+  else doc.body.removeAttribute(BOARD_DRAG_ATTR);
+}
 
 export interface BoardColumnRect {
   id: string;

@@ -347,4 +347,4 @@ Small, two-way, recorded here so review sees them (owner has not separately rati
 3. **`onDelete`, `onDiff`, `onArchive` and `onUnarchive` are removed from `TaskCard`, `Column` and the `<Column>` call in `App.tsx`.** The card no longer has those buttons, so the props would be dead; the menu keeps using the same handlers through `runTaskMenuAction`.
 4. **Identity line.** The identity text is `name · model · mode` in one truncating span, as §2.2 says; the plan's mockup variant omitted the mode.
 5. **Blocked hat line** names the step the block is on (`run.blocked[].stepId`), falling back to the live step, then to the bare word `Blocked`.
-6. **Bounds spec.** The worst-case pipeline state uses a 70-character pipeline name: with the plan's 26-character name a deliberately broken hat (`truncate`) still passed, so the check could not fail. With the longer name it fails as required.
+6. **Bounds spec.** The worst-case pipeline state uses a 68-character pipeline name: with the plan's 26-character name a deliberately broken hat (`truncate`) still passed, so the check could not fail. With the longer name it fails as required.

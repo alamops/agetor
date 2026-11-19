@@ -1,4 +1,4 @@
-import { memo, useCallback, useMemo } from "react";
+import { memo, useCallback, useEffect, useMemo, useRef } from "react";
 import { useDraggable } from "@dnd-kit/core";
 import { CSS } from "@dnd-kit/utilities";
 import { Card } from "@/components/ui/card";
@@ -7,7 +7,7 @@ import { AWAITING_RING_CLASS } from "@/lib/awaiting";
 import { AwaitingGlow } from "@/components/ui/awaiting-glow";
 import { taskTypeIcon } from "@/lib/task-type-icon";
 import { promptPreview } from "@/lib/prompt-preview";
-import { handleCardKeyDown } from "@/lib/board-keyboard";
+import { cancelBoardDrag, handleCardKeyDown, isOutsideCard } from "@/lib/board-keyboard";
 import { taskActionFlags } from "@/lib/task-card-actions";
 import { PipelineHat } from "@/components/pipelines/PipelineHat";
 import { taskTypeMeta, type HarnessLimitState, type HarnessStack, type Task } from "../../../shared/types.ts";
@@ -62,9 +62,9 @@ interface Props {
   /** Opens the task menu (Diff, Archive, Unarchive, Delete…): right-click or
    *  the menu key on the card, or the card's `⋯` button, which anchors it at
    *  the button. Diff/Archive/Delete are no longer card buttons, so there is
-   *  no per-action prop for them. Right-click (or keyboard menu-key) on the card. `pos` is where App.tsx's
-   *  task context menu should anchor — omitted entirely when the caller
-   *  doesn't wire it up (no menu to open). */
+   *  no per-action prop for them. `pos` is where App.tsx's task context menu
+   *  should anchor — omitted entirely when the caller doesn't wire it up (no
+   *  menu to open). */
   onContextMenu?: (t: Task, pos: { x: number; y: number }) => void;
   /** True while this task's menu is open (App's `menuTaskId`): drives the
    *  `⋯` button's `aria-expanded`, per the ARIA menu-button pattern. */
@@ -85,13 +85,37 @@ function TaskCardImpl({ task, homeDir, stacks = [], limitStates = [], onStart, o
   // One stable callback ref for both dnd-kit nodes: an inline arrow would be
   // re-attached (null, then the node) on every render and make dnd-kit's
   // node state churn.
+  const cardRef = useRef<HTMLDivElement | null>(null);
   const setRefs = useCallback(
     (node: HTMLDivElement | null) => {
+      cardRef.current = node;
       setNodeRef(node);
       setActivatorNodeRef(node);
     },
     [setNodeRef, setActivatorNodeRef],
   );
+  // dnd-kit's keyboard drag listens on the document and ends only on its own
+  // keys, so a drag outlives the card's focus. While this card is held, a press
+  // outside it or focus leaving it puts it back (`lib/board-keyboard.ts`).
+  useEffect(() => {
+    if (!isDragging) return;
+    const leave = (e: Event) => {
+      const card = cardRef.current;
+      if (e.type === "focusout") {
+        // Only focus leaving THIS card counts, not some other field blurring.
+        if (isOutsideCard(card, e.target) || !isOutsideCard(card, (e as FocusEvent).relatedTarget)) return;
+      } else if (!isOutsideCard(card, e.target)) {
+        return;
+      }
+      cancelBoardDrag();
+    };
+    document.addEventListener("pointerdown", leave, true);
+    document.addEventListener("focusout", leave, true);
+    return () => {
+      document.removeEventListener("pointerdown", leave, true);
+      document.removeEventListener("focusout", leave, true);
+    };
+  }, [isDragging]);
   const style = transform ? { transform: CSS.Translate.toString(transform) } : undefined;
   const type = taskTypeMeta(task.taskType);
   const TypeIcon = taskTypeIcon(type.icon);

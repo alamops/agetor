@@ -964,7 +964,7 @@ export function PipelineRunView({ taskId, onOpenTask, onBack, onOpenSettingsAgen
         >
           {STATUS_LABEL[run.status]}
         </Badge>
-        {progress && (
+        {progress && pipelineRunHeaderText(progress) !== "" && (
           <span className="text-xs text-muted-foreground" data-testid="pipeline-run-progress">
             {pipelineRunHeaderText(progress)}
           </span>

@@ -28,7 +28,7 @@ export function promptPreview(prompt: string, maxChars = 280): string {
   const lines = dropFrontMatter(withoutComments.split("\n"));
 
   const prose = firstProseBlock(lines);
-  if (prose) return cap(stripInline(prose), maxChars);
+  if (prose) return cap(stripBounded(prose, maxChars), maxChars);
 
   // Nothing but headings, tables and fences: show what the prompt does say.
   const fallback = withoutFences(lines)
@@ -36,7 +36,22 @@ export function promptPreview(prompt: string, maxChars = 280): string {
     .map(stripLinePrefix)
     .map((l) => l.replace(/^\s{0,3}#{1,6}\s+/, "").replace(/^\s*\|/, "").replace(/\|\s*$/, "").replace(/\s*\|\s*/g, " "))
     .join(" ");
-  return cap(stripInline(fallback), maxChars);
+  return cap(stripBounded(fallback, maxChars), maxChars);
+}
+
+/** `stripInline` on a prefix of `s`. The emphasis pattern is quadratic on a
+ *  long unbroken paragraph (a 400 KB paste took 17 s), and only the first
+ *  `maxChars` of the result are shown. Inline syntax only shrinks text, so a
+ *  prefix of 8x the cap nearly always leaves enough; when it does not (a
+ *  paragraph of long links), the prefix grows until it does or `s` is whole. */
+function stripBounded(s: string, maxChars: number): string {
+  let limit = Math.max(maxChars, 1) * 8;
+  for (;;) {
+    const part = s.length <= limit ? s : s.slice(0, limit);
+    const out = stripInline(part);
+    if (part.length === s.length || out.length > maxChars) return out;
+    limit *= 4;
+  }
 }
 
 function dropFrontMatter(lines: string[]): string[] {

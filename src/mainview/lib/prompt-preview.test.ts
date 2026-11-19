@@ -52,6 +52,23 @@ describe("promptPreview", () => {
     expect(out.endsWith("…")).toBe(true);
   });
 
+  test("a huge unbroken paragraph stays fast and still previews its start", () => {
+    for (const unit of ["word ", "*a ", "_b ", "[x](y "]) {
+      const start = performance.now();
+      const out = promptPreview(unit.repeat(100_000));
+      expect(performance.now() - start).toBeLessThan(500);
+      expect(out.length).toBeLessThanOrEqual(280);
+      expect(out.endsWith("…")).toBe(true);
+    }
+  });
+
+  test("a paragraph of long links still fills the preview", () => {
+    const link = `[label](https://example.com/${"p".repeat(120)}) `;
+    const out = promptPreview(link.repeat(200));
+    expect(out.startsWith("label label label")).toBe(true);
+    expect(out.length).toBeGreaterThan(200);
+  });
+
   test("never generates markup it did not receive", () => {
     expect(promptPreview("Plain sentence.")).not.toMatch(/</);
   });
