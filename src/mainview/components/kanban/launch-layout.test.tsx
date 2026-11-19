@@ -52,7 +52,11 @@ describe("LaunchFooter", () => {
     const blocked = renderToStaticMarkup(<LaunchFooter primary={{ ...base, disabled: true }} reason="Add a title, a prompt and a project" />);
     expect(blocked).toContain('data-testid="launch-run-blocked-reason"');
     expect(blocked).toContain("Add a title, a prompt and a project");
-    expect(blocked).toContain('aria-describedby="launch-run-blocked-reason"');
+    // The id is per instance (useId), so a dialog's Run never resolves to the panel's reason.
+    const id = /<p id="([^"]+)" data-testid="launch-run-blocked-reason"/.exec(blocked)?.[1];
+    expect(id).toBeTruthy();
+    expect(blocked).toContain(`aria-describedby="${id}"`);
+    expect(id).not.toBe("launch-run-blocked-reason");
     const ok = renderToStaticMarkup(<LaunchFooter primary={base} reason="stale" />);
     expect(ok).not.toContain("launch-run-blocked-reason");
   });
