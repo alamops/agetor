@@ -39,32 +39,47 @@ export function ResizeHandle({
 }: ResizeHandleProps) {
   const drag = React.useRef<{ startX: number; startWidth: number; last: number } | null>(null);
   const [dragging, setDragging] = React.useState(false);
+  // The window listeners below outlive a render: read the latest callbacks through a ref.
+  const cbs = React.useRef({ onChange, onCommit, min, max });
+  cbs.current = { onChange, onCommit, min, max };
+  const cleanup = React.useRef<(() => void) | null>(null);
+  React.useEffect(() => () => cleanup.current?.(), []);
 
   const clamp = (w: number) => Math.min(max, Math.max(min, Math.round(w)));
 
+  // The drag listens on `window`, not on the 6 px handle: the pointer leaves it at once, and
+  // pointer capture is not guaranteed for every pointer (a synthetic or touch pointer).
   const onPointerDown = (e: React.PointerEvent<HTMLDivElement>) => {
     if (e.button !== 0) return;
     e.preventDefault();
-    e.currentTarget.setPointerCapture?.(e.pointerId);
-    drag.current = { startX: e.clientX, startWidth: value, last: value };
+    const d = { startX: e.clientX, startWidth: value, last: value };
+    drag.current = d;
     setDragging(true);
-  };
-  const onPointerMove = (e: React.PointerEvent<HTMLDivElement>) => {
-    const d = drag.current;
-    if (!d) return;
-    const next = clamp(d.startWidth + (e.clientX - d.startX));
-    if (next !== d.last) {
-      d.last = next;
-      onChange(next);
-    }
-  };
-  const end = (e: React.PointerEvent<HTMLDivElement>) => {
-    const d = drag.current;
-    if (!d) return;
-    drag.current = null;
-    setDragging(false);
-    e.currentTarget.releasePointerCapture?.(e.pointerId);
-    onCommit(d.last);
+    const move = (ev: PointerEvent) => {
+      const { min: lo, max: hi } = cbs.current;
+      const next = Math.min(hi, Math.max(lo, Math.round(d.startWidth + (ev.clientX - d.startX))));
+      if (next !== d.last) {
+        d.last = next;
+        cbs.current.onChange(next);
+      }
+    };
+    const end = () => {
+      window.removeEventListener("pointermove", move);
+      window.removeEventListener("pointerup", end);
+      window.removeEventListener("pointercancel", end);
+      cleanup.current = null;
+      drag.current = null;
+      setDragging(false);
+      cbs.current.onCommit(d.last);
+    };
+    window.addEventListener("pointermove", move);
+    window.addEventListener("pointerup", end);
+    window.addEventListener("pointercancel", end);
+    cleanup.current = () => {
+      window.removeEventListener("pointermove", move);
+      window.removeEventListener("pointerup", end);
+      window.removeEventListener("pointercancel", end);
+    };
   };
 
   const onKeyDown = (e: React.KeyboardEvent<HTMLDivElement>) => {
@@ -92,9 +107,6 @@ export function ResizeHandle({
       data-testid={testId}
       data-dragging={dragging || undefined}
       onPointerDown={onPointerDown}
-      onPointerMove={onPointerMove}
-      onPointerUp={end}
-      onPointerCancel={end}
       onKeyDown={onKeyDown}
       onDoubleClick={onReset}
       className={cn(

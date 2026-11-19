@@ -209,17 +209,17 @@ describe("WorktreeOptions — launch UI contract", () => {
     expect(markup).not.toContain('type="checkbox"');
     const tag = openingTag(markup, "isolate-toggle");
     expect(tag).toContain('role="switch"');
-    expect(tag).toContain('id="launch-isolate"');
-    expect(markup).toContain('for="launch-isolate"');
+    const id = /id="([^"]+-isolate)"/.exec(tag)![1]!;
+    expect(markup).toContain(`for="${id}"`);
   });
   test("Projects and Branch name have associated labels", () => {
     const markup = renderToStaticMarkup(
       <WorktreeOptions state={state()} repos={[ONE_REPO]} onReposChange={() => {}} />,
     );
-    expect(markup).toContain('for="launch-projects-control"');
-    expect(markup).toContain('id="launch-projects-control"');
-    expect(markup).toContain('for="launch-branch-name"');
-    expect(markup).toContain('id="launch-branch-name"');
+    for (const suffix of ["projects", "branch-name"]) {
+      const id = new RegExp(`id="([^"]+-${suffix})"`).exec(markup)![1]!;
+      expect(markup).toContain(`for="${id}"`);
+    }
   });
   test("renderBranchName can wrap or hide the Branch name field", () => {
     const wrapped = renderToStaticMarkup(

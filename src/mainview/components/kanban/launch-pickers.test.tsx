@@ -91,7 +91,8 @@ describe("SpeedPicker / TaskTypePicker", () => {
     expect(html).toContain('role="radiogroup"');
     expect(html.match(/role="radio"/g)?.length).toBe(3);
     expect(html).toContain("Bug");
-    expect(html).toContain('aria-labelledby="task-type-picker-label"');
+    const labelId = /aria-labelledby="([^"]+)"/.exec(html)![1]!;
+    expect(html).toContain(`id="${labelId}"`);
   });
 });
 

@@ -1409,4 +1409,70 @@ test.describe("task from a Git issue", () => {
     await expect(issueTaskDialog).toBeVisible();
     await expect(summary).toContainText("develop");
   });
+
+  test("launch layout: two columns from md with a sticky footer, one column below it", async ({ page, backend }) => {
+    test.setTimeout(90_000);
+    await page.setViewportSize({ width: 1280, height: 900 });
+    await gotoApp(page, backend.bootBase);
+    const dialog = await openIssueTaskDialog(page);
+    const prompt = dialog.getByTestId("prompt-textarea");
+    const workspace = dialog.getByTestId("launch-section-workspace");
+    await expect(workspace).toBeVisible();
+
+    // Wide: the prompt (left) and the Workspace/Agent sections (right) sit side by side.
+    const wide = { prompt: (await prompt.boundingBox())!, workspace: (await workspace.boundingBox())! };
+    expect(wide.workspace.x).toBeGreaterThan(wide.prompt.x + wide.prompt.width - 8);
+
+    // The footer never scrolls away: Run task is in the viewport at the top of the form.
+    const run = dialog.getByTestId("issue-task-submit");
+    await expect(run).toBeInViewport();
+
+    // Narrow: below 768 px it is one column, the sections stack under the prompt, and the
+    // sticky footer is still visible.
+    await page.setViewportSize({ width: 700, height: 900 });
+    await expect(run).toBeInViewport();
+    const narrow = { prompt: (await prompt.boundingBox())!, workspace: (await workspace.boundingBox())! };
+    expect(narrow.workspace.y).toBeGreaterThan(narrow.prompt.y + narrow.prompt.height - 8);
+  });
+
+  test("launch parity: the picker fields are labelled, the refresh button and Manage agents are present", async ({ page, backend }) => {
+    test.setTimeout(90_000);
+    await gotoApp(page, backend.bootBase);
+    const dialog = await openIssueTaskDialog(page);
+    await expect(dialog.getByTestId("launch-refresh-models")).toBeVisible();
+    await expect(dialog.getByTestId("launch-harness-picker-trigger")).toHaveAccessibleName(/^Harness\b/);
+    await expect(dialog.getByTestId("launch-model-picker-trigger")).toHaveAccessibleName(/^Model\b/);
+    await expect(dialog.getByTestId("launch-effort-picker-trigger")).toHaveAccessibleName(/^Effort\b/);
+    await expect(dialog.getByTestId("launch-harness-status").first()).toHaveAttribute("data-tone", /ok|warn|error|unknown/);
+    // "Manage agents…" is offered in the Git dialog's profile picker.
+    await dialog.getByTestId("agent-profile-picker-trigger").click();
+    await expect(page.getByTestId("agent-profile-picker-manage")).toBeVisible();
+    await page.keyboard.press("Escape");
+    await expect(dialog).toBeVisible();
+  });
+
+  test("launch keyboard: Cmd/Ctrl+Enter runs the task from the dialog, but not while a picker is open", async ({ page, request, backend }) => {
+    test.setTimeout(90_000);
+    await gotoApp(page, backend.bootBase);
+    const dialog = await openIssueTaskDialog(page);
+    const submit = dialog.getByTestId("issue-task-submit");
+    await expect(submit).toBeEnabled({ timeout: CONVERGE_TIMEOUT });
+
+    // A picker is open: the chord is inert, the dialog stays.
+    await dialog.getByTestId("launch-model-picker-trigger").click();
+    await expect(page.getByTestId("launch-model-picker-popover")).toBeVisible();
+    await page.keyboard.press("ControlOrMeta+Enter");
+    await page.waitForTimeout(1_000);
+    await expect(dialog).toBeVisible();
+    await page.keyboard.press("Escape"); // closes the picker only
+    await expect(page.getByTestId("launch-model-picker-popover")).toHaveCount(0);
+    await expect(dialog).toBeVisible();
+
+    // Picker closed: the chord runs it.
+    await dialog.getByTestId("prompt-textarea").focus();
+    await page.keyboard.press("ControlOrMeta+Enter");
+    await expect(dialog).toBeHidden({ timeout: CONVERGE_TIMEOUT });
+    const task = await awaitCreatedTask(request, backend, CARD_TITLE);
+    expect(task.column).not.toBe("backlog");
+  });
 });

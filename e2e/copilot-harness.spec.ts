@@ -245,7 +245,11 @@ test.describe("GitHub Copilot harness", () => {
     await expect(form.getByTestId("launch-mode-variant-picker-trigger")).toContainText("Auto");
     await form.getByTestId("launch-mode-variant-picker-trigger").click();
     const popover = page.getByTestId("launch-mode-variant-picker-popover");
-    await expect(popover.getByRole("option")).toHaveText(["Auto", "Read-only"]);
+    await expect(popover.getByRole("option")).toHaveCount(2);
+    expect(await popover.getByRole("option").evaluateAll((els) => els.map((e) => e.getAttribute("aria-label")))).toEqual([
+      "Auto",
+      "Read-only",
+    ]);
     await page.keyboard.press("Escape");
     await setPrimaryMode(form, "plan");
     await modeField(form).expectValue("plan");

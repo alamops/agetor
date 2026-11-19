@@ -71,7 +71,8 @@ export function PipelinePicker({
         onChange={(v) => onChange(v === NONE ? null : v)}
         items={items}
         searchable
-        emptyLabel={pipelines.length === 0 ? "No pipelines yet." : "No matches."}
+        emptyLabel="No matches."
+        trailing={pipelines.length === 0 ? "No pipelines yet." : undefined}
         disabled={disabled}
         renderValue={() =>
           selectedPipeline ? (

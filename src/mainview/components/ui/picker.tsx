@@ -39,6 +39,9 @@ export interface PickerProps {
   placeholder?: string;
   /** Text under the list when no row matches. */
   emptyLabel?: string;
+  /** Content after the last row, inside the listbox (e.g. "No agents yet." when
+   *  the only row is the "none" choice). Not selectable. */
+  trailing?: React.ReactNode;
   /** A row under the list (e.g. "Manage agents…"), rendered inside the
    *  popover. A function receives `close` so the row can dismiss the popover. */
   footer?: React.ReactNode | ((close: () => void) => React.ReactNode);
@@ -101,6 +104,7 @@ export function Picker({
   placeholder = "Select…",
   emptyLabel = "No matches",
   footer,
+  trailing,
   disabled,
   id,
   testId,
@@ -401,6 +405,7 @@ export function Picker({
             );
           })
         )}
+        {trailing ? <div className="px-2.5 py-2 text-xs text-muted-foreground">{trailing}</div> : null}
       </div>
       {footer && (
         <div className="shrink-0 border-t border-border p-1">

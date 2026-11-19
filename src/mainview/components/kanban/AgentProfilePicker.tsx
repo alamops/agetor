@@ -78,7 +78,8 @@ export function AgentProfilePicker({
         onChange={(v) => onChange(v === NONE ? null : v)}
         items={items}
         searchable
-        emptyLabel={profiles.length === 0 ? "No agents yet." : "No matches."}
+        emptyLabel="No matches."
+        trailing={profiles.length === 0 ? "No agents yet." : undefined}
         disabled={disabled}
         triggerClassName="h-auto min-h-9 py-1.5"
         renderValue={() =>

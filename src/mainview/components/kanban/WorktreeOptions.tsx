@@ -1,4 +1,4 @@
-import { type Dispatch, type ReactNode, type SetStateAction, useEffect, useMemo, useState } from "react";
+import { type Dispatch, type ReactNode, type SetStateAction, useEffect, useId, useMemo, useState } from "react";
 import { ChevronRight, GitBranch, SlidersHorizontal } from "lucide-react";
 import { api, type BranchNamingConfig } from "@/lib/api";
 import { Input } from "@/components/ui/input";
@@ -277,44 +277,41 @@ type Props =
  * checked, disabled Isolate switch.
  */
 export function WorktreeOptions(props: Props) {
-  if ("locked" in props) {
-    const { branch, projectPath } = props.locked;
-    return (
-      <div data-testid="worktree-options-locked" className="space-y-3">
-        <Field controlId="launch-projects-control">
-          <FieldLabel>Projects</FieldLabel>
-          <SelectProjectsButton
-            id="launch-projects-control"
-            label={projectPath ? projectDisplayName(projectPath) : "Project"}
-            onClick={() => {}}
-            locked
-          />
-        </Field>
-
-        <Field controlId="launch-locked-branch">
-          <FieldLabel>Branch</FieldLabel>
-          <Input
-            id="launch-locked-branch"
-            data-testid="locked-branch"
-            readOnly
-            value={branch}
-            className="font-mono text-xs"
-          />
-          <FieldDescription>PR head branch — checked out as-is.</FieldDescription>
-        </Field>
-
-        <IsolateRow
-          checked
-          disabled
-          onChange={() => {}}
-          title="Always isolated — the PR's head branch is checked out in its own worktree, so your checkout stays clean."
-          note={null}
-        />
-      </div>
-    );
-  }
-
+  if ("locked" in props) return <LockedWorktreeOptions {...props.locked} />;
   return <LiveWorktreeOptions {...props} />;
+}
+
+/** The PR-conflicts variant (see {@link WorktreeOptions}). Ids are per instance: the
+ *  New Task panel is always mounted next to an open dialog, so a fixed id would collide. */
+function LockedWorktreeOptions({ branch, projectPath }: { branch: string; projectPath?: string }) {
+  const uid = useId();
+  return (
+    <div data-testid="worktree-options-locked" className="space-y-3">
+      <Field controlId={`${uid}-projects`}>
+        <FieldLabel>Projects</FieldLabel>
+        <SelectProjectsButton
+          id={`${uid}-projects`}
+          label={projectPath ? projectDisplayName(projectPath) : "Project"}
+          onClick={() => {}}
+          locked
+        />
+      </Field>
+
+      <Field controlId={`${uid}-branch`}>
+        <FieldLabel>Branch</FieldLabel>
+        <Input id={`${uid}-branch`} data-testid="locked-branch" readOnly value={branch} className="font-mono text-xs" />
+        <FieldDescription>PR head branch — checked out as-is.</FieldDescription>
+      </Field>
+
+      <IsolateRow
+        checked
+        disabled
+        onChange={() => {}}
+        title="Always isolated — the PR's head branch is checked out in its own worktree, so your checkout stays clean."
+        note={null}
+      />
+    </div>
+  );
 }
 
 /** The Isolate switch with its associated label (`getByLabel("Isolate (worktree)")`). */
@@ -331,14 +328,15 @@ function IsolateRow({
   title: string;
   note: string | null;
 }) {
+  const id = `${useId()}-isolate`;
   return (
-    <Field controlId="launch-isolate" className="space-y-1">
+    <Field controlId={id} className="space-y-1">
       <div className="flex min-h-9 items-center justify-between gap-3 rounded-md border border-input bg-background px-3" title={title}>
         <FieldLabel className="flex min-w-0 flex-1 cursor-pointer items-center gap-1.5 text-sm font-normal text-foreground">
           <GitBranch className="size-3.5 shrink-0 text-muted-foreground" aria-hidden />
           <span>Isolate (worktree)</span>
         </FieldLabel>
-        <Switch id="launch-isolate" data-testid="isolate-toggle" checked={checked} disabled={disabled} onCheckedChange={onChange} />
+        <Switch id={id} data-testid="isolate-toggle" checked={checked} disabled={disabled} onCheckedChange={onChange} />
       </div>
       {note ? <FieldDescription>{note}</FieldDescription> : null}
     </Field>
@@ -353,6 +351,7 @@ function LiveWorktreeOptions({
   renderBranchName,
 }: Extract<Props, { state: WorktreeOptionsState }>) {
   const [selectOpen, setSelectOpen] = useState(false);
+  const uid = useId();
   const {
     setIsolate,
     forceIsolate,
@@ -380,15 +379,15 @@ function LiveWorktreeOptions({
   const labels = useMemo(() => projectRowLabels(repos.map((repo) => repo.path)), [repos]);
 
   const branchNameField = effectiveIsolate ? (
-    <Field controlId="launch-branch-name" invalid={!branchValidation.ok}>
+    <Field controlId={`${uid}-branch-name`} invalid={!branchValidation.ok}>
       <FieldLabel>Branch name</FieldLabel>
       <div className="relative">
         <Input
-          id="launch-branch-name"
+          id={`${uid}-branch-name`}
           data-testid="branch-name-input"
           {...IDENTIFIER_INPUT_PROPS}
           aria-invalid={!branchValidation.ok || undefined}
-          aria-describedby={!branchValidation.ok ? "launch-branch-name-error" : undefined}
+          aria-describedby={!branchValidation.ok ? `${uid}-branch-name-error` : undefined}
           value={branchField.displayValue}
           onChange={(e) => { setBranchOverride(e.target.value); setBranchDirty(true); }}
           placeholder="feature/my-task"
@@ -412,7 +411,7 @@ function LiveWorktreeOptions({
         </Button>
       </div>
       {!branchValidation.ok ? (
-        <p id="launch-branch-name-error" role="alert" className="text-2xs text-danger">{branchValidation.reason}</p>
+        <p id={`${uid}-branch-name-error`} role="alert" className="text-2xs text-danger">{branchValidation.reason}</p>
       ) : branchDirty && hasBranchTemplateTags(branchOverride) ? (
         <p className="truncate font-mono text-2xs text-muted-foreground" title={branchField.resolved}>
           → {branchField.resolved}
@@ -439,10 +438,10 @@ function LiveWorktreeOptions({
 
   return (
     <div data-testid="worktree-options" className="space-y-3">
-      <Field controlId="launch-projects-control">
+      <Field controlId={`${uid}-projects`}>
         <FieldLabel>Projects</FieldLabel>
         <SelectProjectsButton
-          id="launch-projects-control"
+          id={`${uid}-projects`}
           label={projectSelectionLabel(repos)}
           onClick={() => setSelectOpen(true)}
         />

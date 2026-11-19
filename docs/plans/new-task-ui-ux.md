@@ -6,9 +6,9 @@
 | Source | Pipeline task text and the owner's screenshot (outside the repo, transcribed in the investigation §1); `docs/plans/new-task-ui-ux-investigation.md`; `docs/plans/new-task-ui-ux-grill.md` (the contract) with `docs/plans/new-task-ui-ux-grill/round-{1,2}/answers.json` |
 | Flags | none |
 | Gates | grilled (2 rounds, complete, no one-way doors); approved by owner as written on 2026-11-18, with the §8 assumptions as defaults |
-| Status | planned and approved; execution not started |
-| Branch | TBD — set when execution starts (the pipeline worktree is on `fix/agetor-new-task-ui-improvement`) |
-| Base SHA | TBD — set when execution starts (HEAD at planning time: `4d7f8bfb`) |
+| Status | implemented on the branch (code, unit tests, docs, e2e helper layer and migrated specs); code review and the full e2e run are the remaining steps. Deviations are listed under "Execution notes" at the end. |
+| Branch | `fix/agetor-new-task-ui-improvement` |
+| Base SHA | `4d7f8bfb93320076aa86292d614d84d4b883ba7d` |
 
 Decision ids (S1–S7, L1–L8, V1–V7, B1–B3, C1–C3, P1–P3) refer to the grill record. Assumptions this plan adds are A1–A14 in §8.
 
@@ -907,3 +907,15 @@ Added by this plan. Each is a reversible default, and the owner can flip any of 
 | InfoTip puts `data-popover-open` on its portaled panel, so a dialog's Escape doesn't yield to it; `dialog.tsx`'s carrier comment is stale about it | out of scope | Pre-existing primitive bug outside these surfaces; P1 forbids editing existing primitives here. The launch dialogs use no InfoTip (T22 guard). A different ticket. |
 | RunPanel's own resize handle onto the new `ResizeHandle` | out of scope | A refactor of a non-send-box surface; a different ticket |
 | CLI/TUI parity | not applicable | Webview-only change; the create payload shape is unchanged |
+
+## Execution notes (step 4 — Implementing)
+
+Changes to the plan made while executing it, none of them one-way doors:
+
+- **No interim steps.** The plan staged `NewTaskForm` onto the hook with its OLD markup (T8) and an old-DOM e2e helper layer (T6a) before the redesign, to attribute regressions. This run had no subagents and a machine at load 100+, so e2e could not be run between stages; it went straight to the final DOM. The behavior pins are the pure `lib/launch-state.test.ts` (including the seeding characterization against the dialogs' old rule: no divergence found, so nothing to list in the PR body) and the e2e specs below. `e2e/launch-behaviors.spec.ts` (P1–P7) was **not written**; its coverage is split across `launch-state.test.ts`, `new-task-submit.spec.ts`, `launch-layout.spec.ts`, `launch-keyboard.spec.ts`, the issue-task additions and the migrated profile/pipeline specs.
+- **`gotoApp` opens every More options by default** (`launchMoreOpen: true`), so the 25+ specs that reach Branch name, Speed, the profile picker, the Approvals picker or Max Mode keep working without clicking through; `launch-layout.spec.ts` opts out to test the real default.
+- **`launch-parity.spec.ts` was folded into `issue-task.spec.ts`** (the issue dialog already owns the GitHub stub): layout at 1280 / 700 px, labelled fields, ↻ and Manage agents, and the Cmd/Ctrl+Enter / Escape order.
+- **Agent/pipeline pickers** keep their pinned part test ids by letting `Picker` take a per-row `testId` and a `partsTestId`; their popover is now portaled, so specs query it on `page`.
+- **Error text uses `text-danger`** (the per-theme status token), not `text-destructive`, whose dark value fails AA on the card; `launch-contrast.test.ts` asserts the pairs.
+- **`ModeVariantPicker`'s label is "Approvals"** (so `getByLabel("Mode")` resolves one field).
+

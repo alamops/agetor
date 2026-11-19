@@ -1,3 +1,4 @@
+import { useId } from "react";
 import { SegmentedControl } from "@/components/ui/segmented-control";
 import { Label } from "@/components/ui/field";
 import { cn } from "@/lib/utils";
@@ -21,12 +22,14 @@ export function TaskTypePicker({
   className?: string;
   disabled?: boolean;
 }) {
+  // Per-instance: the panel is always mounted beside an open issue dialog.
+  const labelId = `${useId()}-type-label`;
   return (
     <div className={cn("space-y-1.5", className)}>
-      <Label id="task-type-picker-label">Type</Label>
+      <Label id={labelId}>Type</Label>
       <div data-testid="task-type-picker">
         <SegmentedControl
-          aria-labelledby="task-type-picker-label"
+          aria-labelledby={labelId}
           value={value}
           onChange={(v) => onChange(v as TaskType)}
           disabled={disabled}

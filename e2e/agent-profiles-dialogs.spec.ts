@@ -601,10 +601,14 @@ test.describe("agent profile picker in the shared launch dialogs", () => {
     await picker.getByTestId("agent-profile-picker-trigger").click();
     const popover = page.getByTestId("agent-profile-picker-popover");
     await expect(popover).toBeVisible();
-    await expect(popover).toHaveAttribute("data-popover-open", "");
+    // The marker sits on the picker's ROOT (inside the dialog, where `Dialog` looks for it) and
+    // only while open — never on the portaled panel (docs/architecture/task-launch-ui.md).
+    await expect(issueTaskDialog.locator("[data-popover-open]")).toHaveCount(1);
+    await expect(popover).not.toHaveAttribute("data-popover-open", /.*/);
 
     await page.keyboard.press("Escape");
     await expect(popover).toBeHidden();
+    await expect(issueTaskDialog.locator("[data-popover-open]")).toHaveCount(0);
     await expect(issueTaskDialog).toBeVisible();
 
     await page.keyboard.press("Escape");
