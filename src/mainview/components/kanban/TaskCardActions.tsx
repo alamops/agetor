@@ -33,6 +33,10 @@ const BTN = "h-7 gap-1.5 px-2.5 text-xs";
  */
 export function TaskCardActions({ task, menuOpen, onStart, onCancel, onOpen, onOpenAttention, onReviewPipeline, onMarkDone, onMore }: Props) {
   const { pendingCount } = taskActionFlags(task);
+  const actions = cardActions(task);
+  // Answer (N) next to Done and `⋯` (an awaiting task in Review) needs the
+  // 20 px of its trailing arrow: without it the row is 8 px too wide in WebKit.
+  const shareRow = actions.length > 1;
   const render = (action: CardAction) => {
     switch (action) {
       case "review-gate":
@@ -59,7 +63,7 @@ export function TaskCardActions({ task, menuOpen, onStart, onCancel, onOpen, onO
           >
             <MessageCircleQuestion className="size-3.5" />
             {awaitingLabel(pendingCount)}
-            <ArrowRight className="size-3.5" />
+            {!shareRow && <ArrowRight className="size-3.5" />}
           </Button>
         );
       case "stop":
@@ -85,7 +89,7 @@ export function TaskCardActions({ task, menuOpen, onStart, onCancel, onOpen, onO
   return (
     // The row owns its clicks: nothing in it opens the card.
     <div data-part="actions" className="flex items-center gap-1.5" onClick={(e) => e.stopPropagation()}>
-      {cardActions(task).map(render)}
+      {actions.map(render)}
       {onMore && (
         <Button
           type="button"

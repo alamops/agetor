@@ -1500,7 +1500,7 @@ function AppInner() {
   const pipelineGateRef = useRef(new Map<string, { runStartedAt: number | null; seqs: number[] }>());
   useEffect(() => {
     /** Refetch just one pipeline parent and merge the three fields the
-     *  board's `PipelineBadge`, the card's column and the "needs input"
+     *  card's pipeline hat, the card's column and the "needs input"
      *  glow read — never the whole snapshot (a wholesale replace would
      *  revert a concurrent optimistic patch, same rule `mergeTaskFields`'s
      *  doc comment states). A failed refetch just leaves the 2s `/tasks`
@@ -1784,8 +1784,8 @@ function AppInner() {
       }
       // Pipeline run-state changes ride their own kind (D12,
       // `docs/plans/pipelines.md`). The event only carries a status/active-
-      // step-ids summary, not the full `PipelineRunState` the board's
-      // `PipelineBadge` and an open run view need, so the parent is
+      // step-ids summary, not the full `PipelineRunState` the card's
+      // pipeline hat and an open run view need, so the parent is
       // refetched (coalesced per parent, see `refetchPipelineParent`) and
       // only its run-derived fields merged in.
       if (ev.kind === "pipeline") {
@@ -1921,7 +1921,7 @@ function AppInner() {
     return tasks.filter((t) => {
       // Hidden pipeline STEP tasks never appear as their own board cards
       // (D11, `docs/plans/pipelines.md`) — they're driven entirely from the
-      // pipeline run view, opened via the parent's `PipelineBadge`. `tasks`
+      // pipeline run view, opened via the parent card's pipeline hat. `tasks`
       // state itself still holds them (the run panel's `selected`-sync
       // effect and `GET /tasks/:id/pipeline` both need the full list/row).
       if (t.pipelineParentId != null) return false;
@@ -2078,7 +2078,7 @@ function AppInner() {
   //
   // dnd-kit's `RestoreFocus` re-focuses the card after any keyboard drag that
   // ends with focus elsewhere, which would undo a cancel caused by focus moving
-  // on (Tab, or Cmd/Ctrl+F to the board search). A cancel turns it off in the
+  // on (Cmd/Ctrl+F to the board search). A cancel turns it off in the
   // same batched update that ends the drag, and the next drag turns it back on:
   // a drop into another column remounts the card, and that one needs the restore.
   const [restoreFocus, setRestoreFocus] = useState(true);
