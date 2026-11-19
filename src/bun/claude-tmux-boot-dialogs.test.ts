@@ -164,7 +164,6 @@ async function boot(
 describe("boot poller — add-dir auto-confirm (preference on)", () => {
   test("two untrusted repositories: Down+Enter each, ≥500 ms after mount, ≥150 ms apart, a status line per repo, then ready", async () => {
     const b = await boot({ dialogs: [REPO_E, REPO_F] }, { autoTrustDirectories: DIRS });
-    const t0 = Date.now();
     try {
       await until(() => b.statuses().some((s) => s.includes("ready (jsonl:")), 25_000, "ready status");
       // The last repository's line lands on the poller's next tick after the file appears.
@@ -172,8 +171,9 @@ describe("boot poller — add-dir auto-confirm (preference on)", () => {
       const keys = b.tmux.keys();
       expect(keys.map((k) => k.k)).toEqual(["Down", "Enter", "Down", "Enter"]);
       expect(keys.every((k) => !k.literal)).toBe(true);
-      // Never inside the arm window of the first dialog, and a clear gap before each Enter.
-      expect(keys[0]!.t - t0).toBeGreaterThanOrEqual(0);
+      // A clear gap before each Enter. (Keys inside the arm window would have been
+      // refused by the stub and turned the footer held: the exact four keys
+      // above are what proves none were sent there.)
       expect(keys[1]!.t - keys[0]!.t).toBeGreaterThanOrEqual(130);
       expect(keys[3]!.t - keys[2]!.t).toBeGreaterThanOrEqual(130);
       const lines = b.statuses().filter((s) => s.startsWith("auto-confirmed Claude's"));
@@ -439,6 +439,28 @@ describe("deferred prompt paste (defect 3)", () => {
       await b.stop();
     }
   }, 40_000);
+});
+
+describe("deferred prompt paste during an auto-confirm (no card ever exists)", () => {
+  test("the paste waits while the dialog is on the pane being auto-confirmed, then lands exactly once after it", async () => {
+    // Short readiness windows, and a dialog that refuses two confirms: the
+    // tracker retries for several seconds with NO card registered, so only the
+    // "a dialog is on the pane" guard keeps the paste out of it.
+    setDeferredPromptTimeoutMs(300);
+    setBootTimeoutMs(15_000);
+    const b = await boot({ dialogs: [REPO_E], refuseEnters: 2 }, { autoTrustDirectories: DIRS, deferredPrompt: "a very large prompt", withRun: true });
+    const pastes = () => b.tmux.calls().filter((c) => c.argv[0] === "paste-buffer");
+    try {
+      await until(() => b.tmux.state().done, 30_000, "the dialog auto-confirmed");
+      expect(activeTmuxPromptsForTask(b.taskId)).toHaveLength(0);
+      const confirmedAt = b.tmux.keys().filter((k) => k.k === "Enter" && !k.literal).at(-1)!.t;
+      await until(() => pastes().length === 1, 15_000, "the deferred paste");
+      expect(pastes()[0]!.t).toBeGreaterThan(confirmedAt);
+      expect(b.statuses().some((s) => s.includes("delivering prompt anyway"))).toBe(false);
+    } finally {
+      await b.stop();
+    }
+  }, 60_000);
 });
 
 /** What the answer route does once `answerTmuxPromptInPane` reports success. */

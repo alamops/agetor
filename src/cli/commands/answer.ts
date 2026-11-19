@@ -340,13 +340,20 @@ async function answerTmux(client: AgetorClient, req: TmuxPromptRequest): Promise
     if (p.isCancel(code)) return cancel();
     body = { code: (code as string).trim() };
   } else {
-    const choice = await p.select({ message: "Choose", options: tmuxCardRows(req) });
+    // Choice labels come from the pane: third-party text, escaped like the pane.
+    const options = tmuxCardRows(req).map((r) => ({ ...r, label: escapeFreeText(r.label) }));
+    const choice = await p.select({ message: "Choose", options });
     if (p.isCancel(choice)) return cancel();
     body = tmuxAnswerBody(choice as string);
   }
   try {
     const res = await client.answerTmuxPrompt(req.id, body);
-    out(res.ok ? c.green("✓ answered") : c.red(res.error ?? "failed to answer"));
+    if (res.ok && res.held) {
+      // Claude refused the confirm and the card came back: it is still waiting.
+      out(c.yellow(`${TMUX_HELD_HINT} Run \`agetor answer\` again.`));
+    } else {
+      out(res.ok ? c.green("✓ answered") : c.red(escapeFreeText(res.error ?? "failed to answer")));
+    }
   } catch (e) {
     // The route's refusal (409 the prompt changed, 410 the session is gone, 400
     // invalid input) carries a fixed sentence that never quotes a typed code.

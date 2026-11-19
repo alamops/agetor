@@ -10,7 +10,7 @@ import { readClaudeAccount } from "./harness-discovery.ts";
 import { claudeRootFor } from "./harness-config-root.ts";
 import { loginEvidence } from "./harness-stacks.ts";
 import { resolveTmuxBin } from "./tmux-resolution.ts";
-import { coreSpawn } from "./core-spawn.ts";
+import { childEnv, coreSpawn } from "./core-spawn.ts";
 
 const VERSION_PROBE_TIMEOUT_MS = 2000;
 
@@ -495,7 +495,7 @@ async function probeClaudeAuth(
       stdin: "ignore",
       stdout: "pipe",
       stderr: "pipe",
-      env: { ...process.env, ...env },
+      env: childEnv(env),
     }) as Bun.Subprocess<"ignore", "pipe", "pipe">;
   } catch {
     return CLAUDE_AUTH_UNKNOWN;

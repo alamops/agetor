@@ -122,6 +122,29 @@ describe("matchAddDirAutoTrust", () => {
     expect(m.footer).toBe("cutoff");
   });
 
+  test("the 'make the window taller' lock is never auto-confirmed (claude refuses every confirm there)", () => {
+    const locked = pane("add-dir-startup-cutoff").replace(
+      " Enter to confirm · Esc to cancel",
+      " Esc to cancel · To add it, first make the window taller",
+    );
+    const d = parseAddDirDialog(locked)!;
+    expect(d.footer).toBe("locked");
+    expect(d.trailer).toBe(true);
+    expect(matchAddDirAutoTrust(locked, [{ name: "repo-long", paths: [d.path!] }])).toBeNull();
+  });
+
+  test("a held dialog with an Adding: trailer stays held, and is still auto-confirmable", () => {
+    const held = pane("add-dir-startup-cutoff").replace(
+      " Enter to confirm · Esc to cancel",
+      " Esc to exit · To add it, press ↓ to Yes, then Enter",
+    );
+    const d = parseAddDirDialog(held)!;
+    expect(d.footer).toBe("held");
+    expect(d.trailer).toBe(true);
+    expect(d.title).toBeNull();
+    expect(matchAddDirAutoTrust(held, [{ name: "repo-long", paths: [d.path!] }])!.footer).toBe("held");
+  });
+
   test("the path must be one agetor passed", () => {
     expect(matchAddDirAutoTrust(pane("add-dir-startup-armed"), [{ name: "other", paths: ["/Users/me/other"] }])).toBeNull();
   });

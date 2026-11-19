@@ -74,7 +74,13 @@ export interface AutoTrustDirectory {
   paths: string[];
 }
 
-export type AddDirFooter = "armed" | "held" | "cutoff";
+/** `armed`: Enter to confirm. `held`: claude refused a key (`press ↓ to Yes,
+ *  then Enter`). `cutoff`: an armed footer with the `Adding:` trailer under it
+ *  (the title scrolled off; claude still accepts Down + Enter, spike P10).
+ *  `locked`: `first make the window taller`, under which claude refuses every
+ *  confirm (decoded guard `confirm ? !cutOff && …`): never driven, only carded
+ *  for the user to answer in a taller terminal. */
+export type AddDirFooter = "armed" | "held" | "cutoff" | "locked";
 
 export interface AddDirDialog {
   /** `startup` = No, exit; `later` = a mid-session `/add-dir` (No, leave it
@@ -92,6 +98,9 @@ export interface AddDirDialog {
   /** Row of the confirming choice. */
   yesIndex: number;
   footer: AddDirFooter;
+  /** The path came from the `Adding:` trailer below the footer (the dialog is
+   *  taller than the pane and its title scrolled off), whatever the footer. */
+  trailer: boolean;
   /** Title + path + labels. The cursor and the footer are deliberately left
    *  out: it is how a drive recognises "the same dialog" across a repaint. */
   identity: string;
@@ -193,11 +202,15 @@ export function parseAddDirDialog(pane: string): AddDirDialog | null {
   if (path === null || path === "") path = trailerPath;
 
   const footerLine = lines[footerAt]!;
-  const footer: AddDirFooter =
-    trailerPath !== null || /first make the window taller/i.test(footerLine)
-      ? "cutoff"
-      : HELD_FOOTER_RE.test(footerLine)
-        ? "held"
+  // The footer line decides the state: a held dialog with a trailer is still
+  // held (its safety nets apply), and only the "make the window taller" hint
+  // is locked.
+  const footer: AddDirFooter = /first make the window taller/i.test(footerLine)
+    ? "locked"
+    : HELD_FOOTER_RE.test(footerLine)
+      ? "held"
+      : trailerPath !== null
+        ? "cutoff"
         : "armed";
   const labels = [rows[0]!.label, rows[1]!.label];
   return {
@@ -208,6 +221,7 @@ export function parseAddDirDialog(pane: string): AddDirDialog | null {
     cursorIndex,
     yesIndex: 1,
     footer,
+    trailer: trailerPath !== null,
     identity: `${pair.variant}|${title ?? ""}|${path ?? ""}|${labels.join("/")}`,
   };
 }
@@ -238,7 +252,9 @@ export function matchAddDirAutoTrust(
   if (dirs.length === 0) return null;
   const d = parseAddDirDialog(pane);
   if (!d || d.variant !== "startup" || d.path === null) return null;
-  if (d.title === null && d.footer !== "cutoff") return null;
+  // Claude refuses every confirm under the "make the window taller" hint.
+  if (d.footer === "locked") return null;
+  if (d.title === null && !d.trailer) return null;
   const dir = dirs.find((x) => x.paths.some((p) => p === d.path));
   if (!dir) return null;
   return {

@@ -2259,7 +2259,7 @@ export const api = {
   answerTmuxPrompt: (id: string, body: TmuxPromptAnswerBody) =>
     // `retry: false`: a replayed answer would type the keys (an Enter, an OAuth
     // code) into the pane a second time.
-    j<{ ok: boolean; error?: string }>(`/tmux-prompts/${id}/answer`, {
+    j<{ ok: boolean; error?: string; held?: boolean }>(`/tmux-prompts/${id}/answer`, {
       method: "POST",
       body: JSON.stringify(body),
     }, { retry: false }),

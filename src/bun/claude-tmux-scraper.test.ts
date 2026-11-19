@@ -719,6 +719,28 @@ async function withScrapeTask(
   }
 }
 
+test("scrapeOnce masks a typed OAuth code before cutting a card window: a wrapped code whose prompt line is above the window never reaches a card", async () => {
+  const codeRows = Array.from({ length: 6 }, (_, i) => `SECRETCODE${i}`.padEnd(80, "x"));
+  const pane = [
+    " Browser didn't open? Use the url below to sign in",
+    " Paste code here if prompted > SECRETCODEhead",
+    ...codeRows,
+    "",
+    " Login failed: the code was not accepted.",
+    " Check that you copied the whole code.",
+    " Codes expire after a few minutes.",
+    " Open the sign-in page again to get a new one.",
+    " The browser window can be closed.",
+    " Press Enter to retry.",
+  ].join("\n");
+  await withScrapeTask(pane, async ({ pending, tick }) => {
+    for (let i = 0; i < 4; i++) await tick();
+    const cards = pending();
+    expect(cards.length).toBeGreaterThan(0);
+    for (const card of cards) expect(card.paneText).not.toContain("SECRETCODE");
+  });
+});
+
 test("scrapeOnce → registerTmuxPrompt — two stable ticks on the reconstructed Chrome prompt register one answerable card, hideKeys included", async () => {
   await withScrapeTask(CHROME_UNNUMBERED_PANE, async ({ taskId, runId, pending, tick }) => {
     // The unnumbered matcher is NOT high-confidence, so the first sighting only

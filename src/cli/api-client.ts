@@ -403,7 +403,7 @@ export class AgetorClient {
   answerTmuxPrompt(
     id: string,
     body: { key?: string; reject?: boolean; enter?: boolean; code?: string },
-  ): Promise<{ ok: boolean; error?: string }> {
+  ): Promise<{ ok: boolean; error?: string; held?: boolean }> {
     return this.req("POST", `/tmux-prompts/${encodeURIComponent(id)}/answer`, body);
   }
   /** `message` is the reason an OpenCode card's `reject` may carry; the core

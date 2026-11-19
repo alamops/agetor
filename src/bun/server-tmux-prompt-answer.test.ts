@@ -262,14 +262,55 @@ describe("drive results and tokens", () => {
     expect(c.session.keys().map((k) => k.k)).toEqual(["Up", "Up", "s"]);
   });
 
-  test("a refused confirm re-cards: the response is ok and a held card replaces the old one", async () => {
+  test("a refused confirm re-cards: the response is ok + held, and a held card replaces the old one", async () => {
     const c = card({ dialogs: [REPO_E], refuseEnters: 1 });
     const res = await post(c.req.id, { key: "2" });
     expect(res.status).toBe(200);
-    expect(await res.json()).toEqual({ ok: true });
+    // `held` lets the CLI and TUI say claude is still waiting instead of "answered".
+    expect(await res.json()).toEqual({ ok: true, held: true });
     expect(findTmuxPromptById(c.req.id)).toBeNull();
     const { activeTmuxPromptsForTask } = await import("./interactions.ts");
     const [held] = activeTmuxPromptsForTask(c.taskId);
     expect(held!.held).toBe(true);
   }, 20_000);
+});
+
+describe("reject, and one answer at a time", () => {
+  test("{reject:true} sends one Escape and resolves the card, on a choice card and on an Enter-only card", async () => {
+    for (const cfg of [{ dialogs: [REPO_E] }, { dialogs: [{ kind: "enter-only" as const }] }]) {
+      const c = card(cfg);
+      const res = await post(c.req.id, { reject: true });
+      expect(res.status).toBe(200);
+      expect(await res.json()).toEqual({ ok: true });
+      expect(c.session.keys().map((k) => k.k)).toEqual(["Escape"]);
+      expect(findTmuxPromptById(c.req.id)).toBeNull();
+    }
+  });
+
+  test("reject must be exactly true: anything else is a 400 and nothing is typed", async () => {
+    const c = card({ dialogs: [REPO_E] });
+    for (const reject of [false, "x", 1]) {
+      const res = await post(c.req.id, { reject });
+      expect(res.status).toBe(400);
+    }
+    expect(c.session.keys()).toEqual([]);
+    expect(findTmuxPromptById(c.req.id)).not.toBeNull();
+  });
+
+  test("{reject:true} with the session gone → 410 and the card stays", async () => {
+    const c = card({ dialogs: [{ kind: "enter-only" }] }, { withSession: false });
+    const res = await post(c.req.id, { reject: true });
+    expect(res.status).toBe(410);
+    expect(findTmuxPromptById(c.req.id)).not.toBeNull();
+  });
+
+  test("a second answer to the same card while the first is in flight is refused (409) and types nothing", async () => {
+    const c = card({ dialogs: [{ kind: "enter-only" }] });
+    const [a, b] = await Promise.all([post(c.req.id, { enter: true }), post(c.req.id, { enter: true })]);
+    const statuses = [a.status, b.status].sort();
+    expect(statuses).toEqual([200, 409]);
+    const refused = a.status === 409 ? a : b;
+    expect((await refused.json()).error).toBe("this prompt is already being answered");
+    expect(c.session.keys().map((k) => k.k)).toEqual(["Enter"]);
+  });
 });

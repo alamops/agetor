@@ -4,7 +4,7 @@ import { randomUUID } from "node:crypto";
 import { tmpdir } from "node:os";
 import path from "node:path";
 import { rmTestDataDir } from "./test-data-dir.ts";
-import { makeScriptedClaudeTmux } from "./test-scripted-claude-tmux.ts";
+import { makeScriptedClaudeTmux, type ScriptedConfig, type ScriptedSession } from "./test-scripted-claude-tmux.ts";
 
 /* ────────────────────────────────────────────────────────────────────────── *
  * TT6 — docs/plans/claude-enter-to-confirm-prompts.md (defect 4, owner D11).
@@ -17,6 +17,8 @@ import { makeScriptedClaudeTmux } from "./test-scripted-claude-tmux.ts";
 
 const testDataDir = mkdtempSync(path.join(tmpdir(), "agetor-claude-session-fresh-"));
 process.env.AGETOR_DATA_DIR = testDataDir;
+// `bun test` runs every file in one process: restored in afterAll.
+const savedClaudeBin = process.env.AGETOR_CLAUDE_BIN;
 process.env.AGETOR_CLAUDE_BIN = "claude";
 
 const { spawnAgent, resolveClaudeResume } = await import("./agents.ts");
@@ -35,6 +37,8 @@ afterAll(() => {
   if (savedTmux === undefined) delete process.env.AGETOR_TMUX_BIN;
   else process.env.AGETOR_TMUX_BIN = savedTmux;
   if (savedDriver !== undefined) process.env.AGETOR_CLAUDE_DRIVER = savedDriver;
+  if (savedClaudeBin === undefined) delete process.env.AGETOR_CLAUDE_BIN;
+  else process.env.AGETOR_CLAUDE_BIN = savedClaudeBin;
   scripted.cleanup();
   rmTestDataDir(testDataDir);
 });
@@ -44,6 +48,7 @@ const HARNESS = { id: "claude-code", kind: "claude-code", label: "Claude Code", 
 
 interface Launch {
   taskId: string;
+  session: ScriptedSession;
   argv: string[];
   chunks: Array<{ stream: string; data: string }>;
   stamped: Array<{ id: string; jsonlExistedThen: boolean }>;
@@ -57,7 +62,7 @@ interface Launch {
  *  every later file in this process (`launch-settle.test.ts`). */
 const DEFAULT_TEST_BOOT_TIMEOUT_MS = 2_000;
 
-async function launch(o: { resumeSessionId?: string | null; writeJsonlFor?: string; dialogs: Array<{ kind: "enter-only" }> | []; autoTrustDirectories?: Array<{ name: string; paths: string[] }> }): Promise<Launch> {
+async function launch(o: { resumeSessionId?: string | null; writeJsonlFor?: string; dialogs: ScriptedConfig["dialogs"]; autoTrustDirectories?: Array<{ name: string; paths: string[] }> }): Promise<Launch> {
   const taskId = randomUUID();
   const bootsBefore = claudeBootsInFlight();
   const timeoutOverride = setBootTimeoutMs(null);
@@ -93,6 +98,7 @@ async function launch(o: { resumeSessionId?: string | null; writeJsonlFor?: stri
   agent.done.catch(() => {});
   return {
     taskId,
+    session,
     get argv() {
       const call = session.calls().find((c) => c.argv[0] === "new-session");
       const raw = call?.argv ?? [];
@@ -207,7 +213,7 @@ describe("spawnAgent claude branch — session id timing and the resume check", 
     }
   }, 30_000);
 
-  test("a swap planned mid-boot (no file yet) finds no id to transfer: the stamp has not happened", async () => {
+  test("a boot still on its first screen (no file yet) records no session id, so a swap then has none to transfer", async () => {
     setBootTimeoutMs(1_500);
     const l = await launch({ dialogs: [{ kind: "enter-only" }] });
     try {
@@ -232,6 +238,23 @@ describe("spawnAgent forwards the auto-trust list to the driver and changes no a
     } finally {
       await plain.stop();
       await trusted.stop();
+    }
+  }, 30_000);
+
+  test("the list reaches the boot poller: spawnAgent's add-dir dialog for a passed directory is auto-confirmed", async () => {
+    const dir = "/Users/me/.agetor/worktrees/x/repo-e";
+    setBootTimeoutMs(6_000);
+    const l = await launch({
+      dialogs: [{ kind: "add-dir", repo: "repo-e", path: dir }],
+      autoTrustDirectories: [{ name: "repo-e", paths: [dir] }],
+    });
+    try {
+      const deadline = Date.now() + 15_000;
+      while (!l.session.state().done && Date.now() < deadline) await new Promise((r) => setTimeout(r, 50));
+      expect(l.session.keys().map((k) => k.k)).toEqual(["Down", "Enter"]);
+      expect(l.session.state().done).toBe(true);
+    } finally {
+      await l.stop();
     }
   }, 30_000);
 });

@@ -822,7 +822,7 @@ export async function moveTaskToMember(args: MoveTaskToMemberArgs): Promise<Move
  *
  * `forceOffCurrent` is for a start pre-flight that failed on the current
  * account even though the cached member snapshot looked usable (a fresh-auth
- * probe or the per-model CLI floor is newer than the 15 s status cache). It
+ * probe or the per-model CLI floor is newer than the 60 s status cache). It
  * treats the current account as unusable for this turn and moves to a backup
  * exactly like a disabled/logged-out member would.
  */
@@ -834,7 +834,7 @@ export async function prepareTaskHarness(
 }
 
 /** One pass of {@link prepareTaskHarness}. `freshAuth` re-probes every
- *  account's login instead of reading the 15 s cache: a manual start that the
+ *  account's login instead of reading the 60 s cache: a manual start that the
  *  cache says is logged out everywhere gets one fresh pass before it is
  *  refused, so logging in and pressing Start again works at once. */
 async function prepareTaskHarnessPass(
@@ -876,6 +876,11 @@ async function prepareTaskHarnessPass(
     : member
       ? memberUnusableReason(member, task)
       : "account left the stack";
+  // The cache (60 s) may predate a login the user just did on THIS account:
+  // never move a manual start off it on a cached "logged out".
+  if (opts.manual && !freshAuth && unusable === NOT_LOGGED_IN_REASON) {
+    return prepareTaskHarnessPass(taskId, opts, true);
+  }
   if (!unusable) {
     if (opts.manual) {
       // A manual turn is a fresh lap and clears the exhausted countdown. It

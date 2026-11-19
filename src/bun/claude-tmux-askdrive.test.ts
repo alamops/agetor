@@ -447,13 +447,22 @@ describe("confirmStartupDialog — live-read key drive over a recorded fake tmux
     "Quick safety check: Is this a project you created or one you trust?\n\n"
     + (cursorOnYes ? "  No, exit\n❯ Yes, I trust this folder\n" : "❯ No, exit\n  Yes, I trust this folder\n")
     + "\nEnter to confirm · Esc to cancel\n";
-  const live = { firstSeenAt: 0, rematch: (pane: string) => matchStartupConsentDialog(pane) };
+  const live = { stillCurrent: () => true, firstSeenAt: 0, rematch: (pane: string) => matchStartupConsentDialog(pane) };
   const dialog = (cursorIndex: number | null, acceptIndex: number) => ({
     name: "trust-folder",
     choices: [{ key: "1", label: "No, exit" }, { key: "2", label: "Yes, I trust this folder" }],
     cursorIndex,
     acceptIndex,
     fingerprint: `fp-${cursorIndex}`,
+  });
+
+  test("a boot whose session was replaced (a respawn reuses the tmux name) sends no key", async () => {
+    const fake = makeFakeTmux({ emptyPaneOnEnter: false });
+    fake.setPane(trustPane(false));
+    await withDrive(fake, async ({ taskId, sessionName }) => {
+      expect(await confirmStartupDialog(taskId, sessionName, dialog(0, 1), { ...live, stillCurrent: () => false })).toBe(false);
+      expect(fake.times().filter((c) => c.k === "Down" || c.k === "Enter")).toEqual([]);
+    });
   });
 
   test("Down then Enter, at least STARTUP_CONFIRM_KEY_GAP_MS apart", async () => {
@@ -509,10 +518,12 @@ describe("confirmStartupDialog — live-read key drive over a recorded fake tmux
     const fake = makeFakeTmux({ emptyPaneOnEnter: false });
     fake.setPane(trustPane(false));
     await withDrive(fake, async ({ taskId, sessionName }) => {
-      const noCursor = { firstSeenAt: 0, rematch: (pane: string) => ({ ...matchStartupConsentDialog(pane)!, cursorIndex: null }) };
+      const noCursor = { stillCurrent: () => true, firstSeenAt: 0, rematch: (pane: string) => ({ ...matchStartupConsentDialog(pane)!, cursorIndex: null }) };
       expect(await confirmStartupDialog(taskId, sessionName, dialog(0, 1), noCursor)).toBe(false);
       expect(fake.calls().filter((a) => a[0] === "send-keys")).toEqual([]);
     });
+
+
   });
 
   test("waits out the 500 ms arm window after the dialog first appeared", async () => {

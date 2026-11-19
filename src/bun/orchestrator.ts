@@ -2543,7 +2543,7 @@ async function startTaskInner(
 
   // Harness pre-flight. A fresh-auth probe and the per-model CLI floor can
   // fail on the current account even when the cached stack snapshot said it
-  // was usable (the status cache is up to 15 s / one poll old). When this task
+  // was usable (the status cache is up to 60 s old). When this task
   // is on a real stack, move to a usable backup once instead of refusing the
   // Run — the whole point of the train. A non-stack task keeps the exact same
   // error it always had.

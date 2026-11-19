@@ -344,7 +344,8 @@ export function AnswerOverlay({
         setSubmitting(true);
         client
           .answerTmuxPrompt(req.id, tmuxAnswerBody(row.value))
-          .then((r) => onDone(r.ok ? "✓ answered" : `! ${r.error ?? "failed"}`))
+          // `held`: claude refused the confirm and the card came back.
+          .then((r) => onDone(r.ok ? (r.held ? `! ${TMUX_HELD_HINT}` : "✓ answered") : `! ${r.error ?? "failed"}`))
           .catch((e) => onDone(`! ${tmuxFailureText(e)}`));
       }
 

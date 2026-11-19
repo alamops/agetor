@@ -14,6 +14,9 @@ import { rmTestDataDir } from "./test-data-dir.ts";
 
 const testDataDir = mkdtempSync(path.join(tmpdir(), "agetor-fake-prompt-markers-"));
 process.env.AGETOR_DATA_DIR = testDataDir;
+// `bun test` runs every file in one process: both restored in afterAll.
+const savedDriver = process.env.AGETOR_CLAUDE_DRIVER;
+const savedClaudeBin = process.env.AGETOR_CLAUDE_BIN;
 process.env.AGETOR_CLAUDE_DRIVER = "fake";
 process.env.AGETOR_CLAUDE_BIN = "/bin/echo";
 // `sessionExists` must reflect ONLY the fake pane: a tmux that never has a
@@ -28,7 +31,10 @@ const { tasks, runs } = await import("./db.ts");
 const { makeTask } = await import("../cli/test-fixtures.ts");
 
 afterAll(() => {
-  delete process.env.AGETOR_CLAUDE_DRIVER;
+  if (savedDriver === undefined) delete process.env.AGETOR_CLAUDE_DRIVER;
+  else process.env.AGETOR_CLAUDE_DRIVER = savedDriver;
+  if (savedClaudeBin === undefined) delete process.env.AGETOR_CLAUDE_BIN;
+  else process.env.AGETOR_CLAUDE_BIN = savedClaudeBin;
   if (savedTmuxBin === undefined) delete process.env.AGETOR_TMUX_BIN;
   else process.env.AGETOR_TMUX_BIN = savedTmuxBin;
   rmTestDataDir(testDataDir);

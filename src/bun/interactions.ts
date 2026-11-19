@@ -261,8 +261,10 @@ export interface TmuxPromptRequest {
    *  confirm and now shows its "held" footer (`To add it, press ↓ to Yes,
    *  then Enter`): the user's click did not take, choose again. */
   held?: boolean;
-  /** Cursor-independent identity of the dialog this card was registered for
-   *  (server-side only, never mirrored to the webview). The card drive
+  /** Cursor-independent identity of the dialog this card was registered for.
+   *  It travels with the card (SSE, `/interactions/pending`) but no client
+   *  reads it; it holds nothing the card's `paneText` doesn't (the add-dir
+   *  path, or a hash). The card drive
    *  re-reads the live pane and refuses to send a key unless the dialog on
    *  screen has this same identity: the fingerprint of a menu includes its
    *  cursor, which moves. Absent on a card the drive does not re-verify. */

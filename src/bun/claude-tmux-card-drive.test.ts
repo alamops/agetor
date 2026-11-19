@@ -165,9 +165,15 @@ describe("answerTmuxPromptInPane — choice cards", () => {
     expect(await answerTmuxPromptInPane(card, { kind: "choice", key: "2" })).toEqual({ ok: true, recarded: true });
     const [held] = activeTmuxPromptsForTask(d.taskId);
     expect(held!.cursorIndex).toBe(0);
+    const captures = () => d.session.calls().filter((c) => c.argv[0] === "capture-pane").length;
+    const before = captures();
     const answering = answerTmuxPromptInPane(held!, { kind: "choice", key: "2" });
+    // Wait for the drive's first read (the arm wait starts right after it), so
+    // the cursor provably moves BETWEEN the two reads, whatever the machine load.
+    const deadline = Date.now() + 10_000;
+    while (captures() === before && Date.now() < deadline) await Bun.sleep(5);
+    expect(captures()).toBeGreaterThan(before);
     // During the 500 ms arm wait the user moves the cursor to "Yes, add it".
-    await Bun.sleep(150);
     d.session.patch({ cursor: 1 });
     expect(await answering).toEqual({ ok: true });
     // Planned from the live cursor (on Yes): the held safety net, Up, Down, Enter.

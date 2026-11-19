@@ -665,6 +665,13 @@ function authed<F extends (req: any) => Response | Promise<Response>>(fn: F): F 
 // bound to one terminal id, valid for 30 s and consumed by its first use — it
 // is a lookup key, not a derivation of any credential, so a URL that leaks into
 // a log or history is dead before anyone can replay it.
+/** Cards (`TmuxPromptRequest.id`) an answer is being delivered to right now.
+ *  A second answer for the same card while the first is in flight (the app and
+ *  `agetor answer` at once) is refused before it can type into the pane: the
+ *  drive's identity check can't tell an Enter-only or code screen from the
+ *  same screen still on the pane a moment after the first answer. */
+const tmuxAnswersInFlight = new Set<string>();
+
 const WS_TICKET_TTL_MS = 30_000;
 const wsTickets = new Map<string, { terminalId: string; expiresAt: number }>();
 
@@ -8183,115 +8190,128 @@ export function startApiServer(
           if (given !== 1) {
             return json({ error: "exactly one of key, reject, enter or code" }, { status: 400, headers: corsHeaders(req) });
           }
-          const cardKind = pending.answerKind ?? "choice";
-          // Reject: the user wants none of the options. Esc the modal and drop
-          // the card. Once no card is pending the message box re-enables, so
-          // the user sends their redirect as a normal, separate turn — no
-          // in-flight Esc-then-send interrupt (which is what corrupts the run
-          // accounting). The modal having been Esc'd, the message reaches claude.
-          if (body.reject !== undefined) {
-            if (body.reject !== true) {
-              return json({ error: "reject must be true" }, { status: 400, headers: corsHeaders(req) });
+          if (tmuxAnswersInFlight.has(pending.id)) {
+            return json(
+              { ok: false, error: "this prompt is already being answered" },
+              { status: 409, headers: corsHeaders(req) },
+            );
+          }
+          tmuxAnswersInFlight.add(pending.id);
+          try {
+            const cardKind = pending.answerKind ?? "choice";
+            // Reject: the user wants none of the options. Esc the modal and drop
+            // the card. Once no card is pending the message box re-enables, so
+            // the user sends their redirect as a normal, separate turn — no
+            // in-flight Esc-then-send interrupt (which is what corrupts the run
+            // accounting). The modal having been Esc'd, the message reaches claude.
+            if (body.reject !== undefined) {
+              if (body.reject !== true) {
+                return json({ error: "reject must be true" }, { status: 400, headers: corsHeaders(req) });
+              }
+              if (!(await sessionExists(pending.taskId))) {
+                return json(
+                  { ok: false, error: "tmux session is gone — cancel the run and start a new one" },
+                  { status: 410, headers: corsHeaders(req) },
+                );
+              }
+              await sendModalKeys(pending.taskId, ["Escape"]);
+              markTmuxPromptAnswered(pending.taskId, pending.fingerprint);
+              const ok = answerTmuxPrompt(req.params.id, { key: "__external__" });
+              return json({ ok }, { headers: corsHeaders(req) });
             }
+            let action: PromptAction;
+            let sentinel: string;
+            if (body.enter !== undefined) {
+              if (body.enter !== true || cardKind !== "enter") {
+                return json({ error: "this prompt does not take Enter" }, { status: 400, headers: corsHeaders(req) });
+              }
+              action = { kind: "enter" };
+              sentinel = TMUX_ENTER_ANSWER;
+            } else if (body.code !== undefined) {
+              if (cardKind !== "code") {
+                return json({ error: "this prompt does not take a code" }, { status: 400, headers: corsHeaders(req) });
+              }
+              const checked = validateOAuthCode(body.code);
+              if (!checked.ok) {
+                // A fixed sentence per error code: the value is never quoted back.
+                return json({ error: oauthCodeErrorText(checked.error) }, { status: 400, headers: corsHeaders(req) });
+              }
+              action = { kind: "code", code: checked.code };
+              sentinel = TMUX_CODE_ANSWER;
+            } else {
+              const key = typeof body.key === "string" ? body.key : "";
+              if (!key) {
+                return json({ error: "key required" }, { status: 400, headers: corsHeaders(req) });
+              }
+              if (cardKind !== "choice") {
+                return json({ error: "this prompt takes no choice" }, { status: 400, headers: corsHeaders(req) });
+              }
+              // Reject anything not in the recorded choice set — the request
+              // ships the exact keys we want the user to be able to send, and
+              // the UI is the only legitimate caller, so an unknown key here
+              // is an attempt to inject arbitrary keystrokes. Letting it
+              // through would let any code that reaches this endpoint type
+              // into the user's REPL.
+              if (!pending.choices.some((c) => c.key === key)) {
+                return json(
+                  { error: `key '${key}' is not one of the registered choices` },
+                  { status: 400, headers: corsHeaders(req) },
+                );
+              }
+              action = { kind: "choice", key };
+              sentinel = key;
+            }
+            // Drive tmux FIRST. If the session is gone or send-keys
+            // fails, we must not resolve the interaction — doing so would
+            // remove the card from the UI while leaving claude paused on
+            // the modal. The user clicks "Yes", the card vanishes, and
+            // nothing actually happens. Surface the failure so the UI
+            // can leave the card up for retry.
             if (!(await sessionExists(pending.taskId))) {
               return json(
                 { ok: false, error: "tmux session is gone — cancel the run and start a new one" },
                 { status: 410, headers: corsHeaders(req) },
               );
             }
-            await sendModalKeys(pending.taskId, ["Escape"]);
+            const driven = await answerTmuxPromptInPane(pending, action);
+            if (!driven.ok) {
+              if (driven.reason === "no-session") {
+                return json(
+                  { ok: false, error: "tmux session is gone — cancel the run and start a new one" },
+                  { status: 410, headers: corsHeaders(req) },
+                );
+              }
+              if (driven.reason === "dialog-changed") {
+                return json(
+                  { ok: false, error: "the prompt changed on screen — the card will refresh" },
+                  { status: 409, headers: corsHeaders(req) },
+                );
+              }
+              if (driven.reason === "wrong-kind") {
+                return json({ error: "this prompt does not take that answer" }, { status: 400, headers: corsHeaders(req) });
+              }
+              return json(
+                { ok: false, error: "failed to deliver keystroke to tmux" },
+                { status: 500, headers: corsHeaders(req) },
+              );
+            }
+            // Stamp the fingerprint as just-answered before resolving so
+            // the next scrape tick (which may catch the modal still on
+            // screen mid-repaint) doesn't register a ghost duplicate. See
+            // `markTmuxPromptAnswered` for why this is two-step.
             markTmuxPromptAnswered(pending.taskId, pending.fingerprint);
-            const ok = answerTmuxPrompt(req.params.id, { key: "__external__" });
-            return json({ ok }, { headers: corsHeaders(req) });
+            // A refused confirm already replaced this card with a held one. The
+            // card may also have been settled while the add-dir drive verified the
+            // dialog left (the boot poller / scraper sweeps a card whose dialog is
+            // gone): the keys were delivered, so that is still a success, never
+            // `{ ok: false }` (which the CLI and TUI print as "failed").
+            if (!driven.recarded) answerTmuxPrompt(req.params.id, { key: sentinel });
+            // `held`: claude refused the confirm and the card came back; the CLI
+            // and TUI say so instead of "answered" (the app sees the new card).
+            return json({ ok: true, ...(driven.recarded ? { held: true } : {}) }, { headers: corsHeaders(req) });
+          } finally {
+            tmuxAnswersInFlight.delete(pending.id);
           }
-          let action: PromptAction;
-          let sentinel: string;
-          if (body.enter !== undefined) {
-            if (body.enter !== true || cardKind !== "enter") {
-              return json({ error: "this prompt does not take Enter" }, { status: 400, headers: corsHeaders(req) });
-            }
-            action = { kind: "enter" };
-            sentinel = TMUX_ENTER_ANSWER;
-          } else if (body.code !== undefined) {
-            if (cardKind !== "code") {
-              return json({ error: "this prompt does not take a code" }, { status: 400, headers: corsHeaders(req) });
-            }
-            const checked = validateOAuthCode(body.code);
-            if (!checked.ok) {
-              // A fixed sentence per error code: the value is never quoted back.
-              return json({ error: oauthCodeErrorText(checked.error) }, { status: 400, headers: corsHeaders(req) });
-            }
-            action = { kind: "code", code: checked.code };
-            sentinel = TMUX_CODE_ANSWER;
-          } else {
-            const key = typeof body.key === "string" ? body.key : "";
-            if (!key) {
-              return json({ error: "key required" }, { status: 400, headers: corsHeaders(req) });
-            }
-            if (cardKind !== "choice") {
-              return json({ error: "this prompt takes no choice" }, { status: 400, headers: corsHeaders(req) });
-            }
-            // Reject anything not in the recorded choice set — the request
-            // ships the exact keys we want the user to be able to send, and
-            // the UI is the only legitimate caller, so an unknown key here
-            // is an attempt to inject arbitrary keystrokes. Letting it
-            // through would let any code that reaches this endpoint type
-            // into the user's REPL.
-            if (!pending.choices.some((c) => c.key === key)) {
-              return json(
-                { error: `key '${key}' is not one of the registered choices` },
-                { status: 400, headers: corsHeaders(req) },
-              );
-            }
-            action = { kind: "choice", key };
-            sentinel = key;
-          }
-          // Drive tmux FIRST. If the session is gone or send-keys
-          // fails, we must not resolve the interaction — doing so would
-          // remove the card from the UI while leaving claude paused on
-          // the modal. The user clicks "Yes", the card vanishes, and
-          // nothing actually happens. Surface the failure so the UI
-          // can leave the card up for retry.
-          if (!(await sessionExists(pending.taskId))) {
-            return json(
-              { ok: false, error: "tmux session is gone — cancel the run and start a new one" },
-              { status: 410, headers: corsHeaders(req) },
-            );
-          }
-          const driven = await answerTmuxPromptInPane(pending, action);
-          if (!driven.ok) {
-            if (driven.reason === "no-session") {
-              return json(
-                { ok: false, error: "tmux session is gone — cancel the run and start a new one" },
-                { status: 410, headers: corsHeaders(req) },
-              );
-            }
-            if (driven.reason === "dialog-changed") {
-              return json(
-                { ok: false, error: "the prompt changed on screen — the card will refresh" },
-                { status: 409, headers: corsHeaders(req) },
-              );
-            }
-            if (driven.reason === "wrong-kind") {
-              return json({ error: "this prompt does not take that answer" }, { status: 400, headers: corsHeaders(req) });
-            }
-            return json(
-              { ok: false, error: "failed to deliver keystroke to tmux" },
-              { status: 500, headers: corsHeaders(req) },
-            );
-          }
-          // Stamp the fingerprint as just-answered before resolving so
-          // the next scrape tick (which may catch the modal still on
-          // screen mid-repaint) doesn't register a ghost duplicate. See
-          // `markTmuxPromptAnswered` for why this is two-step.
-          markTmuxPromptAnswered(pending.taskId, pending.fingerprint);
-          // A refused confirm already replaced this card with a held one. The
-          // card may also have been settled while the add-dir drive verified the
-          // dialog left (the boot poller / scraper sweeps a card whose dialog is
-          // gone): the keys were delivered, so that is still a success, never
-          // `{ ok: false }` (which the CLI and TUI print as "failed").
-          if (!driven.recarded) answerTmuxPrompt(req.params.id, { key: sentinel });
-          return json({ ok: true }, { headers: corsHeaders(req) });
         }),
       },
 

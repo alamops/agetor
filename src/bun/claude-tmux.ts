@@ -2389,7 +2389,7 @@ export function registerFakePromptPane(taskId: string, pane: FakePromptPane): vo
   const runId = tasks.get(taskId)?.runId;
   if (!runId) return;
   const lines = pane.text.split("\n");
-  const tail = lines.slice(Math.max(0, lines.length - SCRAPE_TAIL_LINES)).join("\n");
+  const tail = redactPaneSecrets(lines.slice(Math.max(0, lines.length - SCRAPE_TAIL_LINES)).join("\n"));
   const match = pickScrapeMatch(tail, { paneWorking: false, paneIdle: false, watchdogArmed: false, boot: true });
   if (!match) return;
   registerTmuxPrompt({
@@ -2498,7 +2498,8 @@ async function driveCard(
   // The capture awaited: the session may have been disposed or superseded.
   if (!stillCurrent()) return { ok: false, reason: "send-failed" };
   const lines = live.split("\n");
-  const tail = lines.slice(Math.max(0, lines.length - SCRAPE_TAIL_LINES)).join("\n");
+  // Masked exactly as at registration, so the card's fingerprint compares.
+  const tail = redactPaneSecrets(lines.slice(Math.max(0, lines.length - SCRAPE_TAIL_LINES)).join("\n"));
 
   if (action.kind === "enter") {
     const screen = matchEnterOnlyScreen(tail);
@@ -2533,6 +2534,8 @@ async function driveCard(
   if (targetIndex < 0) return { ok: false, reason: "dialog-changed" };
 
   const addDir = parseAddDirDialog(tail);
+  // Claude refuses every confirm under the "make the window taller" lock.
+  if (addDir?.footer === "locked") return { ok: false, reason: "dialog-changed" };
   const arrowNav = typeof pending.cursorIndex === "number";
   if (!arrowNav) {
     // y/N: the literal keystroke, then Enter (no cursor to read).
@@ -2589,6 +2592,9 @@ async function driveCard(
   const afterTail = afterLines.slice(Math.max(0, afterLines.length - SCRAPE_TAIL_LINES)).join("\n");
   const still = after === null ? null : parseAddDirDialog(afterTail);
   if (!still || still.identity !== addDir.identity) return { ok: true };
+  // Replaced or torn down during the wait: the keys were delivered, but the
+  // dialog on that tmux name now belongs to another boot. Card nothing.
+  if (!stillCurrent()) return { ok: true };
   // Still on screen (refused): replace the card with one that says so.
   const card = pickScrapeMatch(afterTail, { paneWorking: false, paneIdle: false, watchdogArmed: false });
   if (!card || typeof card.cursorIndex !== "number") return { ok: true };
@@ -6143,7 +6149,9 @@ function matchUnnumberedModal(tail: string): ScrapeMatch | null {
 function matchAddDirFamily(tail: string): ScrapeMatch | null | undefined {
   const d = parseAddDirDialog(tail);
   if (!d) return undefined;
-  if (d.cursorIndex === null) return null;
+  // No readable cursor, or the "make the window taller" lock (claude refuses
+  // every confirm until the pane is taller): the "Open in Terminal" card.
+  if (d.cursorIndex === null || d.footer === "locked") return null;
   const paneText = tail
     .split("\n")
     .map((l) => l.trimEnd())
@@ -6838,6 +6846,9 @@ async function confirmStartupDialog(
   sessionName: string,
   m: StartupDialogMatch,
   live: {
+    /** False once the session this boot belongs to was replaced or torn down
+     *  (a respawn reuses the tmux name): no key may be sent after that. */
+    stillCurrent: () => boolean;
     /** Epoch ms the poller first saw this dialog (its identity), for the 500 ms arm wait. */
     firstSeenAt: number;
     /** Re-run the consent matcher with the spawn's own context on a fresh capture. */
@@ -6852,12 +6863,13 @@ async function confirmStartupDialog(
   // dialog flips to its "held" footer), so wait out the arm window first.
   const armWait = STARTUP_DIALOG_ARM_MS - (Date.now() - live.firstSeenAt);
   if (armWait > 0) await Bun.sleep(armWait);
+  if (!live.stillCurrent()) return false;
   // Every keystroke is computed from a LIVE read of the same dialog, never from
   // the match that scheduled the attempt: the cursor may have moved since, or
   // the dialog may be gone, and the two-row select WRAPS — a Down from "Yes"
   // lands on "No, exit", where an accepted Enter exits claude.
   const cap = await tmux(["capture-pane", "-p", "-t", sessionName]);
-  if (!cap.ok) return false;
+  if (!cap.ok || !live.stillCurrent()) return false;
   const fresh = live.rematch(cap.stdout);
   if (!fresh || startupDialogIdentity(fresh) !== startupDialogIdentity(m)) return false;
   // No readable cursor: no direction is safe. Send nothing; the tracker retries.
@@ -6868,10 +6880,12 @@ async function confirmStartupDialog(
     heldAddDir: fresh.addDir?.footer === "held",
   });
   for (const arrow of keys) {
+    if (!live.stillCurrent()) return false;
     bumpIfLive();
     if (!(await tmux(["send-keys", "-t", sessionName, arrow])).ok) return false;
     await Bun.sleep(STARTUP_CONFIRM_KEY_GAP_MS);
   }
+  if (!live.stillCurrent()) return false;
   bumpIfLive();
   return (await tmux(["send-keys", "-t", sessionName, "Enter"])).ok;
 }
@@ -8086,7 +8100,9 @@ async function scrapeOnce(state: SessionState): Promise<void> {
   }
   const lines = cap.stdout.split("\n");
   const tailLines = lines.slice(Math.max(0, lines.length - SCRAPE_TAIL_LINES));
-  const tail = tailLines.join("\n");
+  // Masked once, before any matcher cuts its card window out of it: a typed
+  // OAuth code wraps onto rows a window could keep without the prompt line.
+  const tail = redactPaneSecrets(tailLines.join("\n"));
   // Second, STYLED read of the same pane — only when the live prompt row is
   // non-bare, the one case where it can change `paneIdle` (a dim composer
   // placeholder is idle; typed text is not — see `isPlaceholderRow`). Taken
@@ -9793,6 +9809,10 @@ export async function spawnClaudeViaTmux(opts: ClaudeLaunchOptions): Promise<Spa
         let lastDialogAt = Date.now();
         while (!windowOver()) {
           await Bun.sleep(STARTUP_DIALOG_POLL_MS);
+          // Superseded or torn down: a respawn reuses this tmux name, so
+          // `has-session` below would answer for the NEW session, and this
+          // poller would then drive keys into the new boot's dialogs.
+          if (sessions.get(opts.taskId) !== state) return;
           if (!resumedAtSpawn) {
             if (bootSettled) {
               // The window closed under us (JSONL found, or the boot timed out).
@@ -9808,8 +9828,6 @@ export async function spawnClaudeViaTmux(opts: ClaudeLaunchOptions): Promise<Spa
               for (const line of startupConfirm.flushConfirmed()) opts.onChunk("status", line);
               return;
             }
-          } else if (sessions.get(opts.taskId) !== state) {
-            return; // superseded or torn down while the resume window was open
           }
           if (!(await tmux(["has-session", "-t", "=" + sessionName])).ok) return;
           const pane = (await tmux(["capture-pane", "-p", "-t", sessionName])).stdout;
@@ -9860,6 +9878,7 @@ export async function spawnClaudeViaTmux(opts: ClaudeLaunchOptions): Promise<Spa
             lastDialogAt = now;
             if (step.attempt) {
               await confirmStartupDialog(opts.taskId, sessionName, step.attempt, {
+                stillCurrent: () => sessions.get(opts.taskId) === state,
                 firstSeenAt: dialogFirstSeenAt,
                 rematch: (p) => matchStartupConsentDialog(p, consentCtx),
               });
@@ -9911,7 +9930,8 @@ export async function spawnClaudeViaTmux(opts: ClaudeLaunchOptions): Promise<Spa
           // can answer and unblock boot. Mirror the runtime scraper's tail
           // slice, stability gate, and external-dismissal sweep.
           const paneLines = pane.split("\n");
-          const tail = paneLines.slice(Math.max(0, paneLines.length - SCRAPE_TAIL_LINES)).join("\n");
+          // Masked before matching, as the runtime scraper does.
+          const tail = redactPaneSecrets(paneLines.slice(Math.max(0, paneLines.length - SCRAPE_TAIL_LINES)).join("\n"));
           // Footer arm only — no turn is in flight during boot, so the
           // stuck-turn watchdog arm doesn't apply here (see
           // `matchUnparsableModal`). This is the fix for the screenshotted
@@ -10029,10 +10049,22 @@ export async function spawnClaudeViaTmux(opts: ClaudeLaunchOptions): Promise<Spa
         sawStartupPromptThisWindow
         || activeTmuxPromptsForTask(opts.taskId).length > 0
         || !deferredPasteSettled;
+      // A replaced session's wait must not re-arm on the new session's dialogs
+      // (same tmux name), nor go on to kill it below.
+      if (sessions.get(opts.taskId) !== state) break;
       if (blockedOnUser && (await tmux(["has-session", "-t", "=" + sessionName])).ok) continue;
       break;
     }
     bootSettled = true;
+    if (sessions.get(opts.taskId) !== state) {
+      // Superseded (a respawn or teardown replaced this session): the tmux name
+      // now belongs to the new one, so kill nothing and record nothing. Settle
+      // this boot's own queued turns so their promises don't hang.
+      const err = new Error("jsonl-discovery-timeout");
+      state.pendingEndTurn = null;
+      for (const slot of state.turnQueue.splice(0)) slot.reject?.(err);
+      return;
+    }
     if (!found) {
       const stillAlive = (await tmux(["has-session", "-t", "=" + sessionName])).ok;
       // Capture whatever claude actually printed inside the pane so the user

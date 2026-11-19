@@ -224,6 +224,27 @@ describe("Start pre-flight on a harness stack", () => {
     }
   }, 20_000);
 
+  test("a current account the cache still says is logged out, but that the user just logged in to, is not left", async () => {
+    const a = account("out");
+    const b = account("in");
+    const stack = stacks.harnessStacks.create({ label: "login-stale", kind: "claude-code", members: [a.id, b.id] });
+    try {
+      const task = makeTask(a.id);
+      // The /harnesses poll cached A as logged out (60 s TTL)…
+      await status.refreshClaudeAuth([db.harnesses.get(a.id)!, db.harnesses.get(b.id)!]);
+      expect(status.peekClaudeLoggedIn(db.harnesses.get(a.id)!)).toBe(false);
+      // …then the user ran `claude auth login` for A and pressed Start.
+      a.set("in");
+      const started = await orch.startTask(task.id);
+      expect(started).toHaveProperty("runId");
+      await settled(task.id);
+      expect(db.tasks.get(task.id)!.agent).toBe(a.id);
+      expect(db.runs.listForTask(task.id)[0]!.agent).toBe(a.id);
+    } finally {
+      stacks.harnessStacks.delete(stack.id);
+    }
+  }, 20_000);
+
   test("after an all-logged-out refusal, logging in and pressing Start again at once goes through", async () => {
     const a = account("out");
     const b = account("out");
