@@ -6,7 +6,7 @@
 | Source | Pipeline task "Alamo Pipeline (No Video)" (request quoted in §2 and in `docs/plans/app-bar-redesign-investigation.md` §0); investigation `docs/plans/app-bar-redesign-investigation.md`; grill record `docs/plans/app-bar-redesign-grill.md` (28 decisions, answers in `docs/plans/app-bar-redesign-grill/round-{1,2}/answers.json`) |
 | Flags | none |
 | Gates | grilled (2 rounds, complete) + approved by owner as written (2026-11-18, including the planner calls in §8 #6–#13) |
-| Status | executing — Wave 1 done |
+| Status | implemented (Waves 1–4 committed; Wave 5 verification recorded in §10); review and the owner's live smoke (V1) pending |
 | Branch | `fix/agetor-app-bar-ui-improvement` |
 | Base SHA | `4d7f8bfb93320076aa86292d614d84d4b883ba7d` |
 
@@ -367,3 +367,27 @@ New in planning (reversible; a reviewer should see them):
 | Historical plans (`harness-usage-tracker.md`, `hide-disabled-harnesses-topbar.md`, `harness-account-stacks*.md`) | Out of scope | Left as history; this plan records the reversal |
 | Existing data to backfill | None | No schema or preference change |
 | `ROUTE_POLICY` | No change needed | D-P11; `route-policy.test.ts` stays green (T3 acceptance g) |
+
+## 10. Execution record (implementation step)
+
+Waves 1–4 were committed one per wave on `fix/agetor-app-bar-ui-improvement` (base `4d7f8bfb`). The step ran without sub-agents, so each wave was verified by the coordinator reading its own diff and running the gates.
+
+Deviations from the plan, each with its reason. None is a one-way door (no auth, data or public-contract change); all are reversible and listed for the reviewer.
+
+1. **RunPanel's backdrop blocks the bar, so the "Harnesses button is clickable with RunPanel open" claim in E1 was false.** RunPanel renders a full-window `fixed inset-0 z-30` "Close task panel" button, so a press on the bar closes the panel instead of reaching it. This is existing behavior and the plan kept RunPanel as is (grill 13). E1 therefore asserts no sideways scroll with RunPanel open and drives the actions through the injected `menu_action`, and closes RunPanel before it clicks the bar. The native menu is the way to reach the bar's actions then.
+2. **`deliverMenuAction` with no window parks the action even when a client is attached** (the plan's acceptance (c) was silent on that combination). A client with no window is a CLI streaming `/app/events`, not a webview, so broadcasting alone would have lost the click on a cold start.
+3. **`useBarClock(nextChangeAt, panelOpen, tick, onTick)`** instead of returning `now`. `AppBar` re-reads `Date.now()` whenever the data or the tick changes, so a fresh poll is never judged by a clock from minutes ago, and the timer re-arms after a clamped wait. Only `AppBar` calls it.
+4. **The measurement ghost is a child of the header** (not a sibling), so `overflow-x: clip` also contains it; its `full` width excludes the More replica.
+5. **`HarnessesButton` has an optional `now` prop** (default `Date.now()`) so "until HH:MM" uses the bar's clock and renders deterministically in tests. `StatusDot`'s `label` is optional (omitted = decorative, as in the ghost). `BarMeter` accepts a `data-testid`.
+6. **`KanbanFilters` shrinks to the window.** At 720 px and 170 % zoom the fixed rem widths of the filter controls overflowed the document by 123 px (the e2e matrix caught it). Every control is now `max-w-full`, the search box has `min-w-[min(10rem,100%)]`, and the archive `Select` keeps its width on a wrapper (its own wrapper div has no definite width).
+7. **`e2e/harness-stack-switch.spec.ts`** used `getByTitle("Settings")`, which the tooltip change removes; it now uses `headerSettingsButton`. `e2e/usage-tracker.spec.ts` no longer asserts the exact enabled count (the shared worker backend has other harnesses enabled).
+8. The brand icon's SVG carries a `<title>`, so the usage-tracker spec targets the label span instead of `getByText`.
+
+Wave 5 results:
+
+- `bun run typecheck`: green.
+- `bun test`: 13,690 pass, 7 fail: five in `src/bun/github-network.test.ts` (they reproduce when that file runs alone on this machine), one `getGitStatus` timeout under a load average above 100, and one unnamed test. None is in a file this change touches; they were not compared against the base commit. Every new and touched test file passes: `harness-bar`, `app-bar-fit`, `app-menu` (both), `pending-open`, `KanbanFilters`, `SettingsDialog`, `components/app-bar/*`, `route-policy`, `claudemd-citations`.
+- Each new unit test was shown red against a deliberately broken copy (headroom `min`→`max`, the cooldown branch, the hysteresis return, the ⌘, modifier check, the count equality, the no-window delivery rule, the ghost's `inert` and test id).
+- e2e: `e2e/app-bar.spec.ts` (3 tests), `e2e/usage-tracker.spec.ts` and `e2e/board-search-shortcut.spec.ts` pass.
+- Not done here: the live smoke V1 needs the owner's screen (traffic-light alignment at 170 %, drag and double-click, the native menu items, a cold-start menu click, and that ⌘, opens Settings once).
+

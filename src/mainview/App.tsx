@@ -2084,14 +2084,18 @@ function AppInner() {
    *  2 s poll hasn't picked the task up. */
   const openFailoverTask = useCallback((taskId: string) => {
     void (async () => {
-      let task: Task | null = findTaskById(tasksRef.current, taskId);
-      if (!task) {
-        const fresh = await refresh();
-        task = fresh ? findTaskById(fresh, taskId) : null;
+      try {
+        let task: Task | null = findTaskById(tasksRef.current, taskId);
+        if (!task) {
+          const fresh = await refresh();
+          task = fresh ? findTaskById(fresh, taskId) : null;
+        }
+        if (!task) return;
+        if (task.pipelineParentId) openPipelineStep(task.pipelineParentId, task.id);
+        else openTask(task);
+      } catch {
+        // Best-effort, like the `open_task` handler: no-op on a fetch failure.
       }
-      if (!task) return;
-      if (task.pipelineParentId) openPipelineStep(task.pipelineParentId, task.id);
-      else openTask(task);
     })();
   }, [refresh, openPipelineStep, openTask]);
   /** The ONE place a native-menu action (and ⌘,) runs in the webview. A modal
