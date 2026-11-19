@@ -6,7 +6,7 @@
 | Source | Pipeline task text and the owner's screenshot (outside the repo, transcribed in the investigation §1); `docs/plans/new-task-ui-ux-investigation.md`; `docs/plans/new-task-ui-ux-grill.md` (the contract) with `docs/plans/new-task-ui-ux-grill/round-{1,2}/answers.json` |
 | Flags | none |
 | Gates | grilled (2 rounds, complete, no one-way doors); approved by owner as written on 2026-11-18, with the §8 assumptions as defaults |
-| Status | implemented on the branch (code, unit tests, docs, e2e helper layer and migrated specs); code review and the full e2e run are the remaining steps. Deviations are listed under "Execution notes" at the end. |
+| Status | implemented on the branch, code-review round 1 fixed (see "Execution notes — review round 1"); code review round 2 and the full e2e result are the remaining steps. Deviations are listed under "Execution notes" at the end. |
 | Branch | `fix/agetor-new-task-ui-improvement` |
 | Base SHA | `4d7f8bfb93320076aa86292d614d84d4b883ba7d` |
 
@@ -918,4 +918,23 @@ Changes to the plan made while executing it, none of them one-way doors:
 - **Agent/pipeline pickers** keep their pinned part test ids by letting `Picker` take a per-row `testId` and a `partsTestId`; their popover is now portaled, so specs query it on `page`.
 - **Error text uses `text-danger`** (the per-theme status token), not `text-destructive`, whose dark value fails AA on the card; `launch-contrast.test.ts` asserts the pairs.
 - **`ModeVariantPicker`'s label is "Approvals"** (so `getByLabel("Mode")` resolves one field).
+
+## Execution notes — review round 1 (step 6 — Implementing)
+
+The code review of `57175e2a` sent the branch back. What changed, and what was re-scoped:
+
+- **B1 (blocker) fixed.** `e2e/agent-profiles-settings.spec.ts` was restored from `4d7f8bfb` (26 tests) and moved onto `launch-helpers.ts` (`modelField`/`effortField`/`modeField`, `pickHarness`/`expectHarness`, `openMore` + `speedOption`/`maxModeToggle`; the speed assertions are `toBeChecked()` radios now). 26/26 pass.
+- **M1 fixed.** `useTaskLaunch` bumps a `seedGeneration` on every self-fetch open and the pending-seed effect is keyed on it. `e2e/issue-task.spec.ts` "a second open of the issue dialog keeps the remembered codex model and effort" is red without the dep and green with it.
+- **A second defect found by the new P2 pin, fixed.** A remembered Fast tier (and cursor Max Mode) was dropped on every restart when the remembered model was one only the CLI catalog knows: the reset effects ran in the same commit that applied the seed, against the default model. The seed now holds them (`seedHold`, `PendingSeed.settled`) until the form renders the applied model, and judges them against the fallback model when the catalog rules the remembered one out.
+- **M2 delivered**, with these re-scopes:
+  - `e2e/launch-behaviors.spec.ts` P1–P7 are written on the final DOM (the plan's "on today's DOM first" staging was already dropped in step 4). P5 deletes the pipeline from the Pipelines page, which is what refreshes the shared list; P6 deletes the profile through the API and closes Settings, which refreshes the profile list. Neither list is polled, so an API-only delete is correctly not noticed until a refresh.
+  - `launch-parity.spec.ts` stays folded into `issue-task.spec.ts` (issue dialog) and `resolve-conflicts.spec.ts` (PR dialog: labelled fields, ↻, Manage agents row, two columns, status tone `ok`/`error`, the unavailable-harness hint and the visible blocked reason). The self-fetch-only behaviors are asserted in the issue spec: remembered Speed and Max Mode seed the dialog (cursor), and the per-open re-seed (codex). The logged-out `warn` tone has no e2e stub that can produce it; it stays pinned by `harnessStatusTone` in `launch-state.test.ts`.
+  - T9: codex Fast and cursor Fast + Max Mode submit e2e are in `new-task-submit.spec.ts` (the codex app-server stub gained a `fast` flag that serves a `priority` service tier).
+  - T16: "Manage agents…" is covered end to end in `issue-task.spec.ts`: Tab reaches the footer row, a dirty draft asks to discard, Cancel keeps the dialog, Discard opens Settings on Agents.
+  - SC14: the **after** screenshots (panel default, panel with More options, issue dialog, PR dialog, light and dark) are in `~/.agetor/screenshots/new-task-ui-after/` (not committed). The **before** image of the panel is the owner's screenshot that opened this task; the other "before" shots need the base commit checked out and are taken at PR time.
+  - T23 (peer re-check, 2026-11-18): the three peers now have commits. A trial merge (`git merge-tree`) of each into this branch conflicts in two files only: `e2e/harness-stack-switch.spec.ts` (with `fix/agetor-app-bar-ui-improvement`) and `docs/architecture/pipelines.md` (with `fix/agetor-card-ui-improvement`); every other overlap (`App.tsx`, `CLAUDE.md`, `tailwind.config.js`, `RunPanel.tsx`, `helpers.ts`) merges cleanly. None adds `text-2xs`/`text-3xs`, Field, a picker or a segmented control.
+- **S1** `LaunchFooter`'s reason id is `useId()`, so a dialog's Run never resolves to the always-mounted panel's reason (unit + PR-dialog e2e).
+- **S2** `Picker`'s Tab walks the panel's own stops (search or list, then the footer controls) and closes only at either end; Enter and the arrows belong to a focused footer control.
+- **S3** `ReferencesPicker` no longer renders an `InfoTip` (its help is plain text), and the style guard now scans every component the Git dialogs render. The primitive bug itself stays out of scope (P1).
+- **S4** the status-tone assertion in the parity test asserts `ok` and the PR parity test also asserts `error`; neither can pass on a placeholder.
 
