@@ -83,9 +83,26 @@ describe("launch style guard", () => {
     expect(src).toContain("useTaskLaunch(");
   });
 
-  test("a Git launch dialog uses no InfoTip: its portaled panel carries the popover marker outside the dialog", () => {
-    for (const f of ["kanban/CreateTaskFromIssueDialog.tsx", "kanban/ResolveConflictsDialog.tsx"]) {
-      expect({ f, hit: /\bInfoTip\b/.test(read(f)) }).toEqual({ f, hit: false });
+  test("nothing a Git launch dialog renders uses an InfoTip: its portaled panel carries the popover marker outside the dialog", () => {
+    // The dialogs themselves plus every component they render around the launch pickers.
+    const rendered = [
+      "kanban/CreateTaskFromIssueDialog.tsx",
+      "kanban/ResolveConflictsDialog.tsx",
+      "kanban/TaskLaunchPickers.tsx",
+      "kanban/WorkspaceSection.tsx",
+      "kanban/WorktreeOptions.tsx",
+      "kanban/ProjectSelection.tsx",
+      "kanban/TaskTypePicker.tsx",
+      "kanban/AgentProfilePicker.tsx",
+      "kanban/ReferencesPicker.tsx",
+      "kanban/PromptComposer.tsx",
+      "kanban/LaunchSection.tsx",
+      "kanban/LaunchFooter.tsx",
+      "pipelines/PipelinePicker.tsx",
+    ];
+    for (const f of rendered) {
+      // `grep` is unreliable on PromptComposer (a literal zero-width space); readFileSync is not.
+      expect({ f, hit: /<InfoTip\b/.test(read(f)) }).toEqual({ f, hit: false });
     }
   });
 

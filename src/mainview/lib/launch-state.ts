@@ -58,7 +58,14 @@ export type PickCache = Record<AgentKind, LaunchPicks>;
 
 /** A remembered `lastModel:<kind>` the curated list lacks, held until discovery
  *  shows it is real. `applied` flips once it has been applied. */
-export type PendingSeeds = Partial<Record<AgentKind, { model: string; effort: string | null; applied?: boolean }>>;
+export type PendingSeeds = Partial<Record<AgentKind, PendingSeed>>;
+export interface PendingSeed {
+  model: string;
+  effort: string | null;
+  applied?: boolean;
+  /** The catalog ruled the remembered model out: nothing is waiting on it any more. */
+  settled?: boolean;
+}
 
 export function defaultPicks(kind: AgentKind): LaunchPicks {
   return {
@@ -316,7 +323,7 @@ export type SeedOutcome =
 export function resolveSeedOutcome(a: {
   kind: AgentKind;
   currentModel: string;
-  pending: { model: string; effort: string | null; applied?: boolean } | undefined;
+  pending: PendingSeed | undefined;
   rows: readonly ModelOption[];
   discovered: readonly DiscoveredModel[];
   loggedIn: boolean | null | undefined;

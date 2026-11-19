@@ -1,7 +1,6 @@
 import { useEffect, useRef, useState } from "react";
 import { FilePlus, FolderPlus, X } from "lucide-react";
 import { Button } from "@/components/ui/button";
-import { InfoTip } from "@/components/ui/info-tip";
 import { cn } from "@/lib/utils";
 import { iconForRef, refBasename } from "@/lib/file-icons";
 import { captureDroppedOrPastedItems } from "@/lib/capture-refs";
@@ -38,6 +37,8 @@ export function dropHintMessage(
   if (skipped > 0 && !items.length) return messages.nothingToAttach;
   return null;
 }
+
+const REFS_HELP = "Attach files or folders with the buttons or drag from Finder. Absolute paths are inlined into the prompt as text.";
 
 interface Props {
   refs: TaskReference[];
@@ -252,11 +253,6 @@ export function ReferencesPicker({
         <span className="inline-flex items-center gap-1">
           {label}{" "}
           {refs.length > 0 && <span className="font-mono">({refs.length})</span>}
-          <InfoTip
-            text="Attach files or folders with the buttons or drag from Finder. Absolute paths are inlined into the prompt as text."
-            label="About files and folders"
-            align="left"
-          />
         </span>
         {buttons}
       </summary>
@@ -264,6 +260,9 @@ export function ReferencesPicker({
         {refs.length > 0
           ? chips
           : <p className="text-3xs text-muted-foreground">No files attached yet.</p>}
+        {/* Plain text, not an InfoTip: this picker renders inside the Git launch dialogs, where a
+            portaled tip's Escape would close the dialog and drop the draft (docs/architecture/task-launch-ui.md). */}
+        <p className="text-3xs text-muted-foreground">{REFS_HELP}</p>
         {hint && <p className="text-3xs text-muted-foreground">{hint}</p>}
       </div>
       {dropOverlay}

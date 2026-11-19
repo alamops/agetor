@@ -1,3 +1,4 @@
+import { useId } from "react";
 import { Loader2 } from "lucide-react";
 import { Button } from "@/components/ui/button";
 import { Kbd } from "@/components/ui/kbd";
@@ -41,7 +42,9 @@ export function LaunchFooter({
   className?: string;
 }) {
   const mac = isMacPlatform();
-  const reasonId = "launch-run-blocked-reason";
+  // Unique per instance: the always-mounted panel and an open dialog both render a footer, and a
+  // shared id would make a dialog's Run `aria-describedby` resolve to the panel's reason.
+  const reasonId = useId();
   const showReason = !!reason && !!primary.disabled;
   return (
     <div className={cn("space-y-2", className)}>

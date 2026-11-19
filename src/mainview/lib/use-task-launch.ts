@@ -569,6 +569,26 @@ export function useTaskLaunch(
   // kind's catalog loads its tiers read `["off"]` and must not reset a tier.
   const speedOptionsKey = tiersKnown ? speedOptions.join(",") : null;
 
+  // A remembered model is still waiting for the catalog to vouch for it (or against it): the
+  // remembered Fast tier and Max Mode belong to THAT model, so the reset effects below must not
+  // judge them against the default the form shows meanwhile. They re-run when the model changes.
+  const seedHold = useRef<{ kind: AgentKind; model: string } | null>(null);
+  const seedUnresolved = () => {
+    if (initial || modelTouched.current[kind]) {
+      seedHold.current = null;
+      return false;
+    }
+    // The seed was just applied (`setModel` is queued, the form still renders the old model).
+    const held = seedHold.current;
+    if (held) {
+      if (held.kind === kind && held.model !== model) return true;
+      seedHold.current = null;
+      return false;
+    }
+    const pending = pendingSeed.current[kind];
+    return !!pending && !pending.settled && pending.model !== model;
+  };
+
   // Apply a remembered model the curated list lacked (or the CLI's own default)
   // once the loaded rows show it is real — unless the user already chose one.
   // Never fights a later manual pick. An `initial` launch never runs it.
@@ -580,6 +600,8 @@ export function useTaskLaunch(
     if (out.action === "apply") {
       if (out.first && pending) {
         pending.applied = true;
+        pending.settled = false;
+        seedHold.current = { kind, model: out.model };
         pickCache.current[kind] = { ...pickCache.current[kind], model: out.model };
         setModel(out.model);
         const offered = effortOptionsFor(kind, out.model, models);
@@ -592,7 +614,12 @@ export function useTaskLaunch(
       return;
     }
     pickCache.current[kind] = { ...pickCache.current[kind], model: out.model };
+    if (pending) pending.settled = true;
     if (out.model !== model) setModel(out.model);
+    // The remembered model is not coming (the trusted catalog lacks it): the tier and Max Mode
+    // that were held back for it are judged against the model the form falls back to.
+    if (speed !== "off" && !speedOptionsFor(kind, out.model, effort, models).includes(speed)) setSpeed("off");
+    if (maxMode && !(kind === "cursor" && cursorModelSupportsMaxMode(out.model))) setMaxMode(false);
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [kind, modelsKey, prefsLoaded, seedGeneration]);
 
@@ -609,11 +636,12 @@ export function useTaskLaunch(
   // cursor: the model/effort pair lost its Fast variant; fx, codex, claude: the
   // model's discovered flags changed. Never while the tiers are unknown.
   useEffect(() => {
-    if (speed === "off" || speedOptionsKey === null) return;
+    if (speed === "off" || speedOptionsKey === null || seedUnresolved()) return;
     if (!speedOptions.includes(speed)) setSpeed("off");
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [kind, speed, speedOptionsKey]);
   useEffect(() => {
+    if (seedUnresolved()) return;
     if (!maxModeAvailable && maxMode) setMaxMode(false);
   }, [maxModeAvailable, maxMode]);
   useEffect(() => {

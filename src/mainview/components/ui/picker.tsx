@@ -130,6 +130,7 @@ export function Picker({
   const panelRef = React.useRef<HTMLDivElement>(null);
   const searchRef = React.useRef<HTMLInputElement>(null);
   const listRef = React.useRef<HTMLDivElement>(null);
+  const footerRef = React.useRef<HTMLDivElement>(null);
   const typeBuffer = React.useRef<{ text: string; at: number }>({ text: "", at: 0 });
   const parts = partsTestId ?? testId;
   const reactId = React.useId();
@@ -257,9 +258,22 @@ export function Picker({
     }
     if (e.key === "Tab") {
       e.preventDefault();
-      close(true);
+      // The panel's tab stops, in order: the search box (or the list), then each
+      // focusable control of the footer ("Manage agents…"). Tab walks them, and
+      // leaving either end closes the popover and returns focus to the trigger.
+      const stops = [
+        (searchable ? searchRef.current : listRef.current) as HTMLElement | null,
+        ...Array.from(footerRef.current?.querySelectorAll<HTMLElement>("button:not([disabled]), a[href], input:not([disabled]), [tabindex]:not([tabindex='-1'])") ?? []),
+      ].filter((el): el is HTMLElement => !!el);
+      const at = stops.findIndex((el) => el === e.target || el.contains(e.target as Node));
+      const to = stops[(at < 0 ? 0 : at) + (e.shiftKey ? -1 : 1)];
+      if (to) to.focus({ preventScroll: true });
+      else close(true);
       return;
     }
+    // Enter, arrows and type-ahead drive the list; inside the footer they belong to the
+    // focused control (a button's own Enter/Space activation).
+    if (footerRef.current?.contains(e.target as Node)) return;
     if (e.key === "Enter") {
       // Cmd/Ctrl+Enter is the form's "run it" chord: while a picker is open it is
       // inert (it must neither pick a row nor reach the form), so leave it alone.
@@ -411,7 +425,7 @@ export function Picker({
         {trailing ? <div className="px-2.5 py-2 text-xs text-muted-foreground">{trailing}</div> : null}
       </div>
       {footer && (
-        <div className="shrink-0 border-t border-border p-1">
+        <div ref={footerRef} className="shrink-0 border-t border-border p-1">
           {typeof footer === "function" ? footer(() => close(false)) : footer}
         </div>
       )}
