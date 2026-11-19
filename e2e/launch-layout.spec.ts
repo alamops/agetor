@@ -201,4 +201,19 @@ test.describe("New Task panel layout", () => {
     await page.setViewportSize(full);
     await expect.poll(width).toBe(500);
   });
+
+  test("a session that starts in a narrow window gives the saved width back when the window widens", async ({ page, freshBackend }) => {
+    await gotoApp(page, freshBackend.bootBase, { launchMoreOpen: false });
+    const full = page.viewportSize()!;
+    await page.evaluate(() => localStorage.setItem("agetor:newTaskPanelWidth", "500"));
+    // Start narrow: shown width is limited by the window (900 - 480 board), the saved one is not.
+    await page.setViewportSize({ width: 900, height: full.height });
+    await page.reload();
+    const panel = newTaskPanel(page);
+    const width = async () => Math.round((await panel.boundingBox())!.width);
+    await expect.poll(width).toBe(420);
+    await page.setViewportSize(full);
+    await expect.poll(width).toBe(500);
+    await expect(panel.getByTestId("new-task-panel-resize")).toHaveAttribute("aria-valuenow", "500");
+  });
 });

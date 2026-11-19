@@ -299,7 +299,14 @@ function LockedWorktreeOptions({ branch, projectPath }: { branch: string; projec
 
       <Field controlId={`${uid}-branch`}>
         <FieldLabel>Branch</FieldLabel>
-        <Input id={`${uid}-branch`} data-testid="locked-branch" readOnly value={branch} className="font-mono text-xs" />
+        <Input
+          id={`${uid}-branch`}
+          data-testid="locked-branch"
+          readOnly
+          value={branch}
+          aria-describedby={fieldDescriptionId(`${uid}-branch`)}
+          className="font-mono text-xs"
+        />
         <FieldDescription>PR head branch — checked out as-is.</FieldDescription>
       </Field>
 
@@ -336,7 +343,14 @@ function IsolateRow({
           <GitBranch className="size-3.5 shrink-0 text-muted-foreground" aria-hidden />
           <span>Isolate (worktree)</span>
         </FieldLabel>
-        <Switch id={id} data-testid="isolate-toggle" checked={checked} disabled={disabled} onCheckedChange={onChange} />
+        <Switch
+          id={id}
+          data-testid="isolate-toggle"
+          checked={checked}
+          disabled={disabled}
+          aria-describedby={note ? fieldDescriptionId(id) : undefined}
+          onCheckedChange={onChange}
+        />
       </div>
       {note ? <FieldDescription>{note}</FieldDescription> : null}
     </Field>

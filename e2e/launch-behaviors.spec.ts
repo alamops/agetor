@@ -391,6 +391,9 @@ test.describe("New Task panel: assembled launch behaviors", () => {
     // The Speed control only shows while a tier is on or the model offers one; with the tier dropped
     // and no tier on offer it is gone, whereas a kept "fast" would leave the picker on screen.
     await openMore(panel);
+    // openMore is a no-op when the toggle is missing, so prove the section is really open first:
+    // otherwise the negative check below would pass on a closed section.
+    await expect(panel.getByTestId("launch-more-agent")).toHaveAttribute("aria-expanded", "true");
     await expect(panel.getByTestId("launch-speed")).toHaveCount(0);
   });
 

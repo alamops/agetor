@@ -139,11 +139,15 @@ export function NewTaskForm({ onSubmit, agents, harnesses, stacks = [], onOpenSe
   // Resizable width (320–560, default 384), read synchronously for the same
   // reason as `collapsed`. `resizing` turns the width transition off while a
   // drag is in flight, so the panel follows the pointer without lag.
-  const [width, setWidth] = useState(() => readNewTaskPanelWidth(typeof window === "undefined" ? 1440 : window.innerWidth));
+  // The width the user chose (stored, dragged or reset to), limited only to the panel's own
+  // 320-560 range: a smaller window clamps what is shown, never this, so widening the window
+  // again gives the chosen width back, even in a session that started narrow.
+  const [storedWidth] = useState(() => readNewTaskPanelWidth(Number.POSITIVE_INFINITY));
+  const preferredWidth = useRef(storedWidth);
+  const [width, setWidth] = useState(() =>
+    clampNewTaskPanelWidth(storedWidth, typeof window === "undefined" ? 1440 : window.innerWidth),
+  );
   const [resizing, setResizing] = useState(false);
-  // The width the user chose (stored, dragged or reset to): a smaller window clamps what is shown,
-  // never this, so widening the window again gives the chosen width back.
-  const preferredWidth = useRef(width);
   useEffect(() => {
     // A smaller window re-clamps the panel so the board keeps its room.
     const onResize = () => setWidth(clampNewTaskPanelWidth(preferredWidth.current, window.innerWidth));

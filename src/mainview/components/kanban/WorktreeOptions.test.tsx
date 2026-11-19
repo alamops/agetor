@@ -112,6 +112,10 @@ describe("WorktreeOptions — live", () => {
     expect(isolate).toContain('aria-checked="true"');
     expect(disabled(isolate)).toBe(true);
     expect(markup).toContain("Always on when more than one project is selected.");
+    // The note is the switch's accessible description, not just text beside it.
+    const noteId = /aria-describedby="([^"]+)"/.exec(isolate)?.[1];
+    expect(noteId).toBeDefined();
+    expect(markup).toMatch(new RegExp(`<p id="${noteId}"[^>]*>Always on when more than one project is selected\\.`));
     // The shared branch name is used in every repository, with the server's
     // `-N` fallback where one already exists.
     expect(markup).toContain("This name is used in every project");
@@ -121,6 +125,8 @@ describe("WorktreeOptions — live", () => {
     const markup = live([repo("/repos/api")], { isolate: false, effectiveIsolate: false });
     expect(markup).toContain('data-testid="branch-row-api"');
     expect(openingTag(markup, "isolate-toggle")).toContain('aria-checked="false"');
+    // No note, so nothing dangles: the switch names no description.
+    expect(openingTag(markup, "isolate-toggle")).not.toContain("aria-describedby");
     expect(markup).not.toContain('data-testid="branch-name-input"');
   });
 
@@ -191,6 +197,14 @@ describe("WorktreeOptions — locked (PR-conflict dialog)", () => {
     expect(disabled(isolate)).toBe(true);
     // A locked PR task never edits the shared branch name.
     expect(markup).not.toContain('data-testid="branch-name-input"');
+  });
+
+  test("the Branch help text is the locked Branch input's accessible description", () => {
+    const markup = renderToStaticMarkup(<WorktreeOptions locked={{ branch: "fix/pr-head", projectPath: "/repos/api" }} />);
+    const describedBy = /aria-describedby="([^"]+)"/.exec(openingTag(markup, "locked-branch"))?.[1];
+    expect(describedBy).toBeDefined();
+    expect(markup).toContain(`<p id="${describedBy}"`);
+    expect(markup.slice(markup.indexOf(`<p id="${describedBy}"`))).toContain("PR head branch — checked out as-is.");
   });
 
   test("falls back to the generic Project label when no path is carried", () => {
