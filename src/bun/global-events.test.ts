@@ -1,15 +1,28 @@
-import { test, expect } from "bun:test";
+import { afterAll, test, expect } from "bun:test";
 import { mkdtempSync } from "node:fs";
 import { tmpdir } from "node:os";
 import path from "node:path";
 
-process.env.AGETOR_DATA_DIR = mkdtempSync(path.join(tmpdir(), "agetor-global-events-"));
+const DATA_DIR = mkdtempSync(path.join(tmpdir(), "agetor-global-events-"));
+process.env.AGETOR_DATA_DIR = DATA_DIR;
+// bun test runs every file in one process: put back what this file overrides.
+const ENV_KEYS = ["AGETOR_CLAUDE_DRIVER", "AGETOR_CLAUDE_BIN", "AGETOR_TMUX_BIN", "AGETOR_CLAUDE_ARGS"] as const;
+const SAVED_ENV = Object.fromEntries(ENV_KEYS.map((k) => [k, process.env[k]]));
 // Same fake-claude harness orchestrator.test.ts uses — keeps the test
 // hermetic (no real tmux, no real CLI).
 process.env.AGETOR_CLAUDE_DRIVER = "fake";
 process.env.AGETOR_CLAUDE_BIN = "/bin/echo";
 process.env.AGETOR_TMUX_BIN = "/bin/echo";
 process.env.AGETOR_CLAUDE_ARGS = "";
+
+afterAll(async () => {
+  const { __testing } = await import("./interactions.ts");
+  __testing.reset();
+  for (const k of ENV_KEYS) {
+    if (SAVED_ENV[k] === undefined) delete process.env[k];
+    else process.env[k] = SAVED_ENV[k];
+  }
+});
 
 import type { GlobalEvent, RunEvent } from "../shared/types.ts";
 

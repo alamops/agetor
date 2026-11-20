@@ -85,6 +85,8 @@ beforeAll(async () => {
   driverMod = await import("./opencode-driver.ts");
   ocsMod = await import("./orchestrator-opencode-server.ts");
   fakeMarkers = (await import("./fixtures/opencode/fake-serve.ts")).FAKE_OC_MARKERS;
+  // Earlier files in this process leave cards pending; a card for a task this file never made would hold a server busy.
+  interactions.__testing.reset();
   db.harnesses.setEnabled("opencode", true);
   // Boot order: servers adopted, orphans reconciled, THEN the wake handler.
   await serverMod.adoptOpencodeServers();
@@ -1576,6 +1578,32 @@ test("busy gate: an open card with no tracked turn keeps its harness busy until 
   expect(orch.__opencodeServerForTest.harnessBusy("opencode-busy2")).toBe(false);
   interactions.cancelPendingForTask(task.id, "test");
   expect(orch.__opencodeServerForTest.harnessBusy("opencode-busy1")).toBe(false);
+});
+
+test("busy gate: a card for a deleted task, or for a task on another kind of harness, never holds an OpenCode harness", async () => {
+  addHarness("opencode-orphan1");
+  const reg = (taskId: string) =>
+    interactions.registerFxPermission({
+      taskId,
+      runId: "run-none",
+      toolCall: { toolCallId: "tc", title: "t", kind: "execute" } as never,
+      options: [{ optionId: "once", name: "Once", kind: "allow_once" }] as never,
+      mode: "ask",
+    });
+  const busy = () => orch.__opencodeServerForTest.harnessBusy("opencode-orphan1");
+  // A task that does not exist (deleted while its card stayed pending).
+  const gone = reg("task-that-was-deleted");
+  expect(busy()).toBe(true); // conservative until the read settles
+  await waitFor(() => !busy(), 5_000, "the deleted task's card to stop counting busy");
+  // A task on a cursor harness.
+  const cursorTask = await newTask({ prompt: "idle", agent: "cursor" });
+  const other = reg(cursorTask.id);
+  await sleep(100);
+  expect(busy()).toBe(false);
+  interactions.cancelPendingForTask("task-that-was-deleted", "test");
+  interactions.cancelPendingForTask(cursorTask.id, "test");
+  await gone.answer.catch(() => undefined);
+  await other.answer.catch(() => undefined);
 });
 
 test("busy gate: a failed harness read for a new card is retried once, so the card stops blocking other harnesses (review N2)", async () => {

@@ -118,7 +118,9 @@ test("a run claimed in memory but not yet in the snapshot still produces the qui
   // index.ts's union: the claimed run is named.
   const union = () => quitRunningTasks(snapshot.current(), orchestrator.liveRunTaskIds());
   const d = decide(() => union().map((t) => t.taskId));
-  expect(d).toEqual({ kind: "confirm", completely: false, runningTaskIds: [taskId] });
+  // Other files in a shared process may leave their own live runs: assert on this task's id, not an exact list.
+  expect(d).toMatchObject({ kind: "confirm", completely: false });
+  expect((d as { runningTaskIds: string[] }).runningTaskIds).toContain(taskId);
   expect(union().filter((t) => t.taskId === taskId)).toEqual([{ taskId, title: taskId }]);
 
   snapshot.stop();

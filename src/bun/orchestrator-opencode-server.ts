@@ -259,6 +259,8 @@ const OPENCODE_ACTIVE_PROBE_MS = 5_000;
  */
 const opencodeHarnessOfTask = new Map<string, string>();
 const HARNESS_OF_TASK_MAX = 2000;
+/** Recorded for a card whose task no longer exists: it matches no harness id, so it never holds a server. */
+const NO_OPENCODE_HARNESS = "\u0000no-task";
 
 function noteOpencodeHarnessOfTask(taskId: string, harnessId: string): void {
   opencodeHarnessOfTask.delete(taskId);
@@ -291,7 +293,8 @@ function pruneOpencodeHarnessOfTask(): void {
 function loadHarnessOfCardTask(taskId: string): void {
   const read = async (): Promise<void> => {
     const task = await tasks.get(taskId);
-    if (task) noteOpencodeHarnessOfTask(taskId, deps.taskHarnessId(task));
+    // A task that is gone has no OpenCode server to hold: record a sentinel so its card stops counting busy everywhere.
+    noteOpencodeHarnessOfTask(taskId, task ? deps.taskHarnessId(task) : NO_OPENCODE_HARNESS);
   };
   void read().catch(() => read()).catch((err: unknown) => {
     console.warn(`[agetor] opencode: couldn't read the harness of task ${taskId} (retried once); its open card keeps counting as busy:`, err);
