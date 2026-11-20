@@ -1,6 +1,6 @@
 import type { AgentKind, Harness, HarnessQuota } from "../../shared/types.ts";
 import { USAGE_MIN_REFRESH_MS, USAGE_SUPPORTED_KINDS } from "../../shared/types.ts";
-import { harnessUsage, harnesses } from "../db.ts";
+import { harnessUsage, harnesses } from "../db-async.ts";
 import { broadcastAppEvent } from "../quit-guard.ts";
 import { fetchClaudeQuota } from "./claude-usage.ts";
 import { fetchCodexQuota } from "./codex-usage.ts";
@@ -103,14 +103,14 @@ export async function refreshOne(
   harnessId: string,
   opts?: { force?: boolean },
 ): Promise<HarnessQuota | null> {
-  const harness = harnesses.getByIdOrKind(harnessId);
+  const harness = await harnesses.getByIdOrKind(harnessId);
   if (!harness || !harness.enabled) return null;
 
   const provider = resolveProvider(harness.kind);
   if (!provider) return null;
 
   if (!opts?.force) {
-    const cached = harnessUsage.get(harness.id);
+    const cached = await harnessUsage.get(harness.id);
     if (cached && Date.now() - cached.fetchedAtMs < USAGE_MIN_REFRESH_MS) {
       return cached;
     }
@@ -151,7 +151,7 @@ export async function refreshOne(
     };
   }
 
-  harnessUsage.upsert(quota);
+  await harnessUsage.upsert(quota);
   broadcastAppEvent({ type: "harness_usage", quota, ts: Date.now() });
   return quota;
 }
@@ -163,9 +163,10 @@ let pollInFlight = false;
 /**
  * Sweep every enabled harness that has a usage provider and refresh its
  * quota snapshot (respecting `refreshOne`'s freshness floor — a harness
- * whose snapshot is still fresh is a no-op read, not a refetch). Never
- * throws: a per-harness failure is logged and skipped so one bad provider
- * can't abort the sweep for the rest. Overlapping calls (e.g. a slow sweep
+ * whose snapshot is still fresh is a no-op read, not a refetch). A
+ * per-harness failure is logged and skipped so one bad provider can't abort
+ * the sweep for the rest; only a failed read of the harness list itself (the
+ * database worker restarting) rejects, and both timer callers catch it. Overlapping calls (e.g. a slow sweep
  * still running when the next timer tick fires) are no-ops via the
  * module-level `pollInFlight` guard, mirroring `reapIdleSessions`.
  */
@@ -173,7 +174,7 @@ export async function pollAllUsage(): Promise<void> {
   if (pollInFlight) return;
   pollInFlight = true;
   try {
-    const candidates = harnesses.list().filter((h) => h.enabled && USAGE_PROVIDERS[h.kind]);
+    const candidates = (await harnesses.list()).filter((h) => h.enabled && USAGE_PROVIDERS[h.kind]);
     for (const h of candidates) {
       // Yield between harnesses — mirrors reapIdleSessions's per-candidate
       // `Bun.sleep(0)` so a large harness list never blocks the event loop.

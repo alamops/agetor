@@ -1,6 +1,6 @@
 import pkg from "../../package.json" with { type: "json" };
 import { API_TOKEN, CLI_TOKEN, formatHostForUrl, getApiPort, resolveApiHost } from "./api-config.ts";
-import { db, dataDir, subagents, preferences } from "./db.ts";
+import { dataDir } from "./db-path.ts";
 import {
   freezeLaunches,
   launchesInFlight,
@@ -36,7 +36,7 @@ import {
 import { daemonLog } from "./daemon-log.ts";
 import { bootReadySignal } from "./boot-gate.ts";
 import { installCoreLog, registerLogSecret } from "./core-log.ts";
-import { setTaskDecorations } from "./db-async.ts";
+import { preferences, runs, setTaskDecorations, subagents } from "./db-async.ts";
 import { awaitDbReady, drainCoreForQuit } from "./boot-db.ts";
 import { countPendingForTask, pendingCountsByTask, preloadPipelineParents } from "./interactions.ts";
 import { countTerminals, terminalCountsByTask } from "./terminals.ts";
@@ -91,15 +91,9 @@ const SUBAGENT_HOLD_MAX_MS = 6 * 60 * 60 * 1000; // 6h
  *  diagnosable from the single line it did emit. */
 let loggedHasRunningWorkError = false;
 
-function hasRunningRuns(): boolean {
+async function hasRunningRuns(): Promise<boolean> {
   try {
-    return (
-      db
-        .query<{ one: number }, []>(
-          "SELECT 1 AS one FROM runs WHERE status = 'running' LIMIT 1",
-        )
-        .get() != null
-    );
+    return (await runs.runningTasks()).length > 0;
   } catch {
     return false;
   }
@@ -108,10 +102,10 @@ function hasRunningRuns(): boolean {
 /** Daemon-wide "is anything still working?" — running runs OR running
  *  background agents/workflows (subagent rows started within
  *  `SUBAGENT_HOLD_MAX_MS`). Exported for tests. */
-export function hasRunningWork(): boolean {
-  if (hasRunningRuns()) return true;
+export async function hasRunningWork(): Promise<boolean> {
+  if (await hasRunningRuns()) return true;
   try {
-    return subagents.hasAnyRunning(Date.now() - SUBAGENT_HOLD_MAX_MS);
+    return await subagents.hasAnyRunning(Date.now() - SUBAGENT_HOLD_MAX_MS);
   } catch (err) {
     if (!loggedHasRunningWorkError) {
       loggedHasRunningWorkError = true;
@@ -552,13 +546,25 @@ export async function runDaemon(): Promise<void> {
   // process alive on its own — the listening server does that.
   if (idleTimeoutMs > 0) {
     let idleSince: number | null = null;
-    const timer = setInterval(() => {
-      if (hasRunningWork() || attachedClientCount() > 0) {
+    // Single-flight: a check whose database reads are still in flight when
+    // the next tick fires is not doubled up.
+    let checking = false;
+    const check = async (): Promise<void> => {
+      if (await hasRunningWork() || attachedClientCount() > 0) {
         idleSince = null;
         return;
       }
       if (idleSince == null) idleSince = Date.now();
       else if (Date.now() - idleSince >= idleTimeoutMs) shutdown("idle timeout", 0, { realStop: true });
+    };
+    const timer = setInterval(() => {
+      if (checking) return;
+      checking = true;
+      void check()
+        .catch((err: unknown) => daemonLog(`idle check failed: ${String(err)}`))
+        .finally(() => {
+          checking = false;
+        });
     }, IDLE_CHECK_MS);
     timer.unref();
   }

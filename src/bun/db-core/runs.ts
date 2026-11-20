@@ -436,6 +436,17 @@ export function makeRuns(conn: Database) {
           .get(runId) !== null
       );
     },
+    /** Every task with a genuinely `running` run row, once each, with its
+     *  title (`""` when the task row is gone). The desktop quit prompt names
+     *  them; the headless idle check only needs to know there is one. */
+    runningTasks(): Array<{ taskId: string; title: string }> {
+      return conn.query<{ taskId: string; title: string }, []>(
+        `SELECT r.task_id AS taskId, COALESCE(MAX(t.title), '') AS title
+           FROM runs r LEFT JOIN tasks t ON t.id = r.task_id
+          WHERE r.status = 'running'
+          GROUP BY r.task_id`,
+      ).all();
+    },
     /** Whether a task has a genuinely `running` run row. A held run (row
      *  `succeeded`, background agents still live) is not "live". */
     hasRunning(taskId: string): boolean {

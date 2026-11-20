@@ -6,7 +6,7 @@ import type { WebSocketHandler } from "bun";
 import pkg from "../../package.json" with { type: "json" };
 import { API_TOKEN, DEFAULT_API_HOST, formatHostForUrl, getApiPort, nonLoopbackBindWarning } from "./api-config.ts";
 import { removeCoreCreds } from "./core-creds.ts";
-import { applyRoutePolicy, callerOf, desktopOnlyResponse, type ApiCaller } from "./route-policy.ts";
+import { applyRoutePolicy, callerOf, desktopOnlyResponse, isDbWorkerError, type ApiCaller } from "./route-policy.ts";
 import { callerProjectTree, gateCallerPath, probePaths } from "./caller-fs.ts";
 import { readTextNoFollow } from "./no-follow.ts";
 import { openFileBytes, settleFileBytes } from "./core-file-read.ts";
@@ -36,7 +36,7 @@ import {
   clampWindowByBytes,
   isHiddenContinuationUserText,
   resolveAnchoredMinId,
-} from "./db.ts";
+} from "./db-async.ts";
 import { refreshOne } from "./usage/poller.ts";
 import { beginLagLabel } from "./event-loop-lag.ts";
 import { resolveResumeCursor } from "./event-resume.ts";
@@ -57,7 +57,7 @@ import {
   runArchivedHistoryRetentionPass,
 } from "./retention.ts";
 import { advancePipeline, cancelPipelineRun, isPipelineStepTask, retryPipelineStep, reviewHumanStep, startPipelineRun } from "./pipeline-runner.ts";
-import { approvePlan, effectiveContent, planSlug, setEditedContent } from "./task-plans.ts";
+import { approvePlan, effectiveContent, planSlug } from "./task-plans.ts";
 import { checkAllHarnesses } from "./agent-status.ts";
 import { claudeJsonDirFor, effectiveHome, expandHomePath, harnessStacks, StackChangedError, StackInputError, validateInput as validateStackInput } from "./harness-stacks.ts";
 import { claudeConfigDirFor } from "./harness-config-root.ts";
@@ -348,7 +348,7 @@ import {
   type BundleImportError,
 } from "./bundle.ts";
 import { pickedPaths, singlePickedPath } from "./native-pick.ts";
-import type { AgentProfilePatch } from "./db.ts";
+import type { AgentProfilePatch } from "./db-async.ts";
 import { duplicateAgentName } from "../shared/duplicate-name.ts";
 import { resolveSpeedInput } from "../shared/speed.ts";
 import { parseOpencodeServerInput } from "../shared/opencode.ts";
@@ -403,8 +403,8 @@ function blobContentType(relPath: string, kind: "image" | "pdf"): string {
 // filter over `listForTask` (already exported, already indexed by task_id)
 // is fine here; `/tasks` itself uses the grouped `runningCountsByTask()`
 // query instead of calling this per row.
-function withRunningSubagents(t: Task): Task & { runningSubagents: number } {
-  const runningSubagents = subagents.listForTask(t.id).filter((s) => s.status === "running").length;
+async function withRunningSubagents(t: Task): Promise<Task & { runningSubagents: number }> {
+  const runningSubagents = (await subagents.listForTask(t.id)).filter((s) => s.status === "running").length;
   // `stalledSince` rides the same decoration: transient in-memory server
   // state (the turn-stall watchdog's mark) that the DB-derived Task can't
   // carry — see stall-registry.ts.
@@ -858,8 +858,8 @@ function filterPatch(raw: unknown): { patch: Partial<Task> } | { error: string }
  *  null when the caller may proceed. Mirrors the archived-freeze that the
  *  task PATCH route enforces so a direct API caller can't stash/edit drafts on
  *  a frozen task the UI has already made read-only. */
-function backlogGuard(req: { params: { id: string } } & Request): Response | null {
-  const task = tasks.get(req.params.id);
+async function backlogGuard(req: { params: { id: string } } & Request): Promise<Response | null> {
+  const task = await tasks.get(req.params.id);
   if (!task) {
     return json({ error: "not found" }, { status: 404, headers: corsHeaders(req) });
   }
@@ -875,8 +875,8 @@ function backlogGuard(req: { params: { id: string } } & Request): Response | nul
 /** Shared precondition for the cursor-plan-mutation routes (PATCH edit,
  *  approve): the task must exist and not be archived. Mirrors `backlogGuard`
  *  — same archived-freeze policy applied to the `plans` JSON column. */
-function planGuard(req: { params: { id: string } } & Request): Response | null {
-  const task = tasks.get(req.params.id);
+async function planGuard(req: { params: { id: string } } & Request): Promise<Response | null> {
+  const task = await tasks.get(req.params.id);
   if (!task) {
     return json({ error: "not found" }, { status: 404, headers: corsHeaders(req) });
   }
@@ -895,8 +895,8 @@ function planGuard(req: { params: { id: string } } & Request): Response | null {
  *  tool_use). Identical check, identical 400 shape, in both the PATCH edit
  *  route and the approve route — factored out so they can't drift. Returns
  *  the harness kind alongside so the approve route can branch on it. */
-function planKindGuard(req: Request, task: Task): Response | null {
-  const kind = harnesses.getByIdOrKind(task.agent)?.kind;
+async function planKindGuard(req: Request, task: Task): Promise<Response | null> {
+  const kind = (await harnesses.getByIdOrKind(task.agent))?.kind;
   if (kind !== "cursor" && kind !== "copilot") {
     return json(
       { error: "plan approval is only supported for cursor or GitHub Copilot tasks" },
@@ -1073,11 +1073,11 @@ function parseSkillsBody(raw: unknown): { skills: string[] } | { error: string }
  * route never issues N queries for N profiles. A profile with no bound tasks
  * simply isn't a key in the map, hence the `?? 0` default.
  */
-function withTaskCount(p: AgentProfile): AgentProfile {
-  return { ...p, taskCount: agentProfiles.taskCount(p.id) };
+async function withTaskCount(p: AgentProfile): Promise<AgentProfile> {
+  return { ...p, taskCount: await agentProfiles.taskCount(p.id) };
 }
-function withTaskCounts(list: AgentProfile[]): AgentProfile[] {
-  const counts = agentProfiles.taskCounts();
+async function withTaskCounts(list: AgentProfile[]): Promise<AgentProfile[]> {
+  const counts = await agentProfiles.taskCounts();
   return list.map((p) => ({ ...p, taskCount: counts.get(p.id) ?? 0 }));
 }
 
@@ -1110,11 +1110,11 @@ const inFlightCloneIds = new Set<string>();
  * `withPipelineTaskCounts` uses one grouped `pipelines.taskCounts()` map so
  * `GET /pipelines` never issues N queries for N pipelines.
  */
-function withPipelineTaskCount(p: Pipeline): Pipeline {
-  return { ...p, taskCount: pipelines.taskCount(p.id) };
+async function withPipelineTaskCount(p: Pipeline): Promise<Pipeline> {
+  return { ...p, taskCount: await pipelines.taskCount(p.id) };
 }
-function withPipelineTaskCounts(list: Pipeline[]): Pipeline[] {
-  const counts = pipelines.taskCounts();
+async function withPipelineTaskCounts(list: Pipeline[]): Promise<Pipeline[]> {
+  const counts = await pipelines.taskCounts();
   return list.map((p) => ({ ...p, taskCount: counts.get(p.id) ?? 0 }));
 }
 
@@ -1391,9 +1391,9 @@ function parsePipelineMaxSteps(body: Record<string, unknown>): { value: number |
  * precedence: a resolvable `agentProfileId` wins and the seven manual fields
  * (`opencodeServer` included) are not forwarded to it.
  */
-function validateCloneLaunch(
+async function validateCloneLaunch(
   body: Record<string, unknown>,
-): { agentProfileId?: string; agent?: string; mode?: string; model?: string; effort?: string | null; speed?: Speed; maxMode?: boolean; opencodeServer?: OpencodeServerMode } | { error: string } {
+): Promise<{ agentProfileId?: string; agent?: string; mode?: string; model?: string; effort?: string | null; speed?: Speed; maxMode?: boolean; opencodeServer?: OpencodeServerMode } | { error: string }> {
   let agentProfileId: string | undefined;
   if (body.agentProfileId !== undefined && body.agentProfileId !== null) {
     if (typeof body.agentProfileId !== "string") {
@@ -1401,13 +1401,13 @@ function validateCloneLaunch(
     }
     const trimmed = body.agentProfileId.trim();
     if (trimmed) {
-      const profile = agentProfiles.get(trimmed);
+      const profile = await agentProfiles.get(trimmed);
       if (!profile) {
         return { error: `unknown agent profile "${trimmed}"` };
       }
       // `createTask` resolves the profile's own harness and fails on a
       // dangling one — catch that here too, before anything is cloned.
-      if (!harnesses.getByIdOrKind(profile.harness)) {
+      if (!await harnesses.getByIdOrKind(profile.harness)) {
         return { error: `unknown harness "${profile.harness}"` };
       }
       agentProfileId = trimmed;
@@ -1437,7 +1437,7 @@ function validateCloneLaunch(
 
   if (agentProfileId) return { agentProfileId };
 
-  if (typeof body.agent === "string" && !harnesses.getByIdOrKind(body.agent)) {
+  if (typeof body.agent === "string" && !await harnesses.getByIdOrKind(body.agent)) {
     return { error: `unknown harness "${body.agent}"` };
   }
 
@@ -1673,7 +1673,7 @@ async function gateStackMemberRoots(req: Request, memberIds: readonly string[]):
     if (expanded !== root) roots.add(path.resolve(expanded));
   };
   for (const id of memberIds) {
-    const harness = harnesses.getByIdOrKind(id);
+    const harness = await harnesses.getByIdOrKind(id);
     if (!harness || (harness.kind !== "claude-code" && harness.kind !== "codex")) continue;
     addRoot(effectiveHome(harness));
     if (harness.kind === "claude-code") addRoot(claudeJsonDirFor(harness));
@@ -1896,7 +1896,7 @@ export function startApiServer(
       },
 
       "/projects": {
-        GET: authed((req) => json(projects.list(), { headers: corsHeaders(req) })),
+        GET: authed(async (req) => json(await projects.list(), { headers: corsHeaders(req) })),
         // Register a project by absolute path — the headless/CLI equivalent of
         // the native folder picker at /projects/pick.
         POST: authed(async (req) => {
@@ -1918,12 +1918,12 @@ export function startApiServer(
             typeof body.name === "string" && body.name.trim()
               ? body.name.trim()
               : path.basename(p) || p;
-          return json(projects.upsert(p, name), { headers: corsHeaders(req) });
+          return json(await projects.upsert(p, name), { headers: corsHeaders(req) });
         }),
         DELETE: authed(async (req) => {
           const { path: p } = (await req.json().catch(() => ({}))) as { path?: string };
           if (!p) return json({ error: "path required" }, { status: 400, headers: corsHeaders(req) });
-          projects.delete(p);
+          await projects.delete(p);
           return new Response(null, { status: 204, headers: corsHeaders(req) });
         }),
       },
@@ -2026,8 +2026,8 @@ export function startApiServer(
           // see validateCloneLaunch's doc comment. Only checked when eli5 is
           // actually going to run.
           const runEli5 = body.eli5 !== false;
-          const launch: ReturnType<typeof validateCloneLaunch> =
-            runEli5 ? validateCloneLaunch(body) : {};
+          const launch: Awaited<ReturnType<typeof validateCloneLaunch>> =
+            runEli5 ? await validateCloneLaunch(body) : {};
           if ("error" in launch) {
             return json({ error: launch.error, cloneId }, { status: 400, headers: corsHeaders(req) });
           }
@@ -2040,7 +2040,7 @@ export function startApiServer(
           // to prevent.
           let launchProfile: AgentProfile | null = null;
           if (runEli5 && launch.agentProfileId) {
-            launchProfile = agentProfiles.get(launch.agentProfileId);
+            launchProfile = await agentProfiles.get(launch.agentProfileId);
             if (!launchProfile) {
               return json({ error: `unknown agent profile "${launch.agentProfileId}"`, cloneId }, { status: 400, headers: corsHeaders(req) });
             }
@@ -2054,7 +2054,7 @@ export function startApiServer(
           // start-time check; validateCloneLaunch already proved the
           // harness ids resolve.
           if (runEli5) {
-            const launchHarness = harnesses.getByIdOrKind(launchProfile ? launchProfile.harness : (launch.agent ?? "claude-code"));
+            const launchHarness = await harnesses.getByIdOrKind(launchProfile ? launchProfile.harness : (launch.agent ?? "claude-code"));
             if (launchHarness) {
               const launchModel = launchProfile ? launchProfile.model : (launch.model ?? DEFAULT_MODEL[launchHarness.kind]);
               const floorError = await minCliVersionError(launchHarness, launchModel);
@@ -2098,7 +2098,7 @@ export function startApiServer(
             if (!cloned.ok) {
               return json({ error: cloned.error, cloneId }, { status: 502, headers: corsHeaders(req) });
             }
-            const project = projects.upsert(dest, resolved.repo);
+            const project = await projects.upsert(dest, resolved.repo);
 
             // The explainer task runs with isolation "none" so ELI5.md lands
             // directly in the clone the user just registered, not on a branch in
@@ -2196,7 +2196,7 @@ export function startApiServer(
           if (!picked) {
             return json({ project: null }, { headers: corsHeaders(req) });
           }
-          const project = projects.upsert(picked, path.basename(picked) || picked);
+          const project = await projects.upsert(picked, path.basename(picked) || picked);
           return json({ project }, { headers: corsHeaders(req) });
         }),
         // Removal-by-path lives on `DELETE /projects` (used by both the webview
@@ -2230,7 +2230,7 @@ export function startApiServer(
           // the scalar column (that is null by design) — omitting them left
           // every task branch of a multi task visible here.
           const managed = new Set<string>();
-          for (const t of tasks.list()) {
+          for (const t of await tasks.list()) {
             if (t.branch) managed.add(t.branch);
             for (const repo of t.repositories ?? []) {
               if (repo.branch) managed.add(repo.branch);
@@ -2244,11 +2244,11 @@ export function startApiServer(
       // when the project has no stored config (or isn't registered), so the
       // client always renders a usable form. PUT persists a validated config.
       "/projects/settings": {
-        GET: authed((req) => {
+        GET: authed(async (req) => {
           const url = new URL(req.url);
           const p = url.searchParams.get("path");
           if (!p) return json({ error: "path required" }, { status: 400, headers: corsHeaders(req) });
-          const config = projects.get(p)?.branchConfig ?? DEFAULT_BRANCH_CONFIG;
+          const config = (await projects.get(p))?.branchConfig ?? DEFAULT_BRANCH_CONFIG;
           return json(config, { headers: corsHeaders(req) });
         }),
         PUT: authed(async (req) => {
@@ -2260,7 +2260,7 @@ export function startApiServer(
           if ("error" in coerced) {
             return json({ error: coerced.error }, { status: 400, headers: corsHeaders(req) });
           }
-          const updated = projects.setBranchConfig(body.path, coerced.config);
+          const updated = await projects.setBranchConfig(body.path, coerced.config);
           if (!updated) {
             return json({ error: "project not found" }, { status: 404, headers: corsHeaders(req) });
           }
@@ -3481,7 +3481,7 @@ export function startApiServer(
           // on top of a request that already succeeded.
           if (typeof body.taskId === "string" && body.taskId) {
             try {
-              const task = tasks.get(body.taskId);
+              const task = await tasks.get(body.taskId);
               // Guards: archived tasks are frozen (same contract as PATCH /
               // backlog), and the task must actually belong to the project the
               // PR was created from — a stale/mistargeted taskId must not stamp
@@ -3504,9 +3504,9 @@ export function startApiServer(
                   const repo = (task.repositories ?? []).find(
                     (r) => r.worktreePath === dir || r.path === dir,
                   );
-                  if (repo) tasks.appendRepositoryPr(task.id, repo.name, entry);
+                  if (repo) await tasks.appendRepositoryPr(task.id, repo.name, entry);
                 } else if (task.workdir === dir || task.worktreePath === dir) {
-                  tasks.appendPr(task.id, entry);
+                  await tasks.appendPr(task.id, entry);
                 }
               }
             } catch (err) {
@@ -4324,7 +4324,7 @@ export function startApiServer(
       "/github/tokens": {
         GET: authed(async (req) => {
           const tokens = listGitHubTokens().map(sanitizedTokenInfo);
-          const detectedHosts = await remoteHostsForDirs(projects.list().map((p) => p.path));
+          const detectedHosts = await remoteHostsForDirs((await projects.list()).map((p) => p.path));
           return json({ tokens, detectedHosts }, { headers: corsHeaders(req) });
         }),
         PUT: authed(async (req) => {
@@ -4336,7 +4336,7 @@ export function startApiServer(
           const label = typeof body.label === "string" && body.label.trim() ? body.label.trim() : null;
           setGitHubToken(host, token, label);
           const tokens = listGitHubTokens().map(sanitizedTokenInfo);
-          const detectedHosts = await remoteHostsForDirs(projects.list().map((p) => p.path));
+          const detectedHosts = await remoteHostsForDirs((await projects.list()).map((p) => p.path));
           return json({ tokens, detectedHosts }, { headers: corsHeaders(req) });
         }),
       },
@@ -4353,10 +4353,10 @@ export function startApiServer(
       // `lastEffort:<agent>`). Values are opaque strings — the meaning
       // lives in whichever caller writes them.
       "/preferences": {
-        GET: authed((req) => {
+        GET: authed(async (req) => {
           // `modelCatalog:*` rows are the core's own persisted discovery
           // catalogs (model-discovery.ts): server-managed, never listed.
-          const all = preferences.list();
+          const all = await preferences.list();
           for (const key of Object.keys(all)) {
             if (key.startsWith(MODEL_CATALOG_PREF_PREFIX)) delete all[key];
           }
@@ -4389,7 +4389,7 @@ export function startApiServer(
             if (normalized === null) {
               return json({ error: ARCHIVED_HISTORY_RETENTION_INVALID_ERROR }, { status: 400, headers: corsHeaders(req) });
             }
-            preferences.set(req.params.key, normalized);
+            await preferences.set(req.params.key, normalized);
             // Turning retention on (or changing its age) asks for a pass soon
             // — debounced inside `requestRetentionPass`, so a user stepping
             // through the Settings select doesn't start one per click. "off"
@@ -4408,7 +4408,7 @@ export function startApiServer(
             if (isDisclaimOffValue(body.value) && callerOf(req) === "cli") {
               return desktopOnlyResponse(req, corsHeaders);
             }
-            preferences.set(req.params.key, body.value);
+            await preferences.set(req.params.key, body.value);
             // Apply the stored value to the in-memory switch (app: immediately,
             // D5; headless: stays on, logs when the value is off, D6).
             applyDisclaimPreferenceWrite(native ? "app" : "headless", body.value, (m) => console.log(m));
@@ -4446,7 +4446,7 @@ export function startApiServer(
             await setTmuxSource(body.value);
             return new Response(null, { status: 204, headers: corsHeaders(req) });
           }
-          preferences.set(req.params.key, body.value);
+          await preferences.set(req.params.key, body.value);
           return new Response(null, { status: 204, headers: corsHeaders(req) });
         }),
       },
@@ -4454,17 +4454,17 @@ export function startApiServer(
       // Database size / maintenance (docs/plans/non-blocking-session-restore.md
       // §2.4): Settings → General "Archived task history", `agetor compact`.
       "/db/stats": {
-        GET: authed((req) => json(dbStats(activeRunCount()), { headers: corsHeaders(req) })),
+        GET: authed(async (req) => json(await dbStats(activeRunCount()), { headers: corsHeaders(req) })),
       },
-      // `VACUUM` rewrites the whole file synchronously on the single main
-      // thread, so every other request stalls for its duration (the stats'
-      // `compactEstimateSec`). It is refused while any run is live — a stalled
-      // loop would freeze the streaming transcripts and miss tmux/JSONL
-      // events — and while a retention pass is mid-yield (its writes would
-      // interleave with the rebuild). Opts out of the idle timeout: a large
-      // database can take minutes.
+      // `VACUUM` rewrites the whole file in one call on the database worker,
+      // so every other database call (nearly every request) waits for its
+      // duration (the stats' `compactEstimateSec`). It is refused while any
+      // run is live — a stalled writer would freeze the streaming transcripts
+      // and miss tmux/JSONL events — and while a retention pass is mid-yield
+      // (its writes would interleave with the rebuild). Opts out of the idle
+      // timeout: a large database can take minutes.
       "/db/compact": {
-        POST: authed((req) => {
+        POST: authed(async (req) => {
           // A retention pass is checked first: it is the database's own
           // maintenance (and ends on its own), so it names the more specific
           // reason when both hold.
@@ -4483,8 +4483,10 @@ export function startApiServer(
           }
           server.timeout(req, 0);
           try {
-            return json({ ok: true, ...compactDatabase() }, { headers: corsHeaders(req) });
+            return json({ ok: true, ...(await compactDatabase()) }, { headers: corsHeaders(req) });
           } catch (err) {
+            // A worker crash or restart is the routes layer's 503, not a failed VACUUM.
+            if (isDbWorkerError(err)) throw err;
             return json(
               { error: err instanceof Error ? err.message : String(err) },
               { status: 500, headers: corsHeaders(req) },
@@ -4503,11 +4505,19 @@ export function startApiServer(
               { status: 409, headers: corsHeaders(req) },
             );
           }
-          const days = configuredRetentionDays();
+          const days = await configuredRetentionDays();
           if (days === null) {
             return json(
               { error: "archived-history retention is off" },
               { status: 400, headers: corsHeaders(req) },
+            );
+          }
+          // Checked again after the preference read: a pass another request
+          // started meanwhile is still a 409, not a zero-result 200.
+          if (isRetentionRunning()) {
+            return json(
+              { error: "archived-history retention is already running" },
+              { status: 409, headers: corsHeaders(req) },
             );
           }
           server.timeout(req, 0);
@@ -4673,7 +4683,7 @@ export function startApiServer(
       // `/harnesses/:id/usage` below, which is the unrelated task-count
       // blast-radius probe.
       "/usage": {
-        GET: authed((req) => json(harnessUsage.getAll(), { headers: corsHeaders(req) })),
+        GET: authed(async (req) => json(await harnessUsage.getAll(), { headers: corsHeaders(req) })),
       },
 
       // Per-harness availability + version. Replaces the per-kind `/agents`
@@ -4701,7 +4711,7 @@ export function startApiServer(
           void noteHarnessStatuses(statuses);
           return json(
             {
-              harnesses: harnesses.list(),
+              harnesses: await harnesses.list(),
               statuses,
               stacks: await harnessStacks.list(),
               limitStates: await harnessStacks.listLimitStates(),
@@ -4794,11 +4804,11 @@ export function startApiServer(
           if (body.profileMcpServers !== undefined && typeof body.profileMcpServers !== "boolean") {
             return json({ error: "profileMcpServers must be a boolean" }, { status: 400, headers: corsHeaders(req) });
           }
-          if (harnesses.get(body.id)) {
+          if (await harnesses.get(body.id)) {
             return json({ error: `harness "${body.id}" already exists` }, { status: 409, headers: corsHeaders(req) });
           }
           try {
-            const created = harnesses.insert({
+            const created = await harnesses.insert({
               id: body.id.trim(),
               kind: body.kind,
               label: body.label.trim(),
@@ -4814,6 +4824,7 @@ export function startApiServer(
             void refreshHarnessModels(created.id);
             return json(created, { headers: corsHeaders(req) });
           } catch (e) {
+            if (isDbWorkerError(e)) throw e; // the routes layer's 503
             return json({ error: (e as Error).message }, { status: 400, headers: corsHeaders(req) });
           }
         }),
@@ -4846,6 +4857,7 @@ export function startApiServer(
               { status: 201, headers: corsHeaders(req) },
             );
           } catch (err) {
+            if (isDbWorkerError(err)) throw err; // the routes layer's 503
             if (err instanceof StackInputError) {
               return json({ error: err.message, blockers: err.blockers }, { status: 400, headers: corsHeaders(req) });
             }
@@ -4907,6 +4919,7 @@ export function startApiServer(
             );
             return json(preview, { headers: corsHeaders(req) });
           } catch (err) {
+            if (isDbWorkerError(err)) throw err; // the routes layer's 503
             return json({ error: (err as Error).message }, { status: 400, headers: corsHeaders(req) });
           }
         }),
@@ -4971,6 +4984,7 @@ export function startApiServer(
               { headers: corsHeaders(req) },
             );
           } catch (err) {
+            if (isDbWorkerError(err)) throw err; // the routes layer's 503
             if (err instanceof StackChangedError) {
               const changed: HarnessStackChanged = {
                 error: "This stack changed elsewhere",
@@ -5008,7 +5022,7 @@ export function startApiServer(
           // says why (the cancel also hands held follow-ups back to the
           // backlog), then drop the rest of the failover state.
           for (const taskId of affected) {
-            if (tasks.get(taskId)?.harnessState?.scheduledSwitch) {
+            if ((await tasks.get(taskId))?.harnessState?.scheduledSwitch) {
               await cancelScheduledAccountSwitch(taskId, "scheduled account switch cancelled — the stack was deleted");
             }
             await cancelHarnessRetryForTask(taskId, "automatic account retry cancelled — the stack was deleted");
@@ -5024,11 +5038,11 @@ export function startApiServer(
       // Add-harness picker renders these as one-click "use existing account"
       // entries. Identity fields only; never tokens or account uuids.
       "/harness-discovery": {
-        GET: authed((req) => {
+        GET: authed(async (req) => {
           // The directory each registered account's claude actually reads
           // (claudeConfigDirFor), not the spawn pin: an account with only an
           // env-map HOME pins nothing yet reads `<HOME>/.claude`.
-          const registeredHomes = harnesses.list()
+          const registeredHomes = (await harnesses.list())
             .filter((h) => h.kind === "claude-code")
             .map((h) => claudeConfigDirFor(h));
           return json(
@@ -5039,14 +5053,14 @@ export function startApiServer(
       },
 
       "/harnesses/:id": {
-        GET: authed((req) => {
-          const h = harnesses.get(req.params.id);
+        GET: authed(async (req) => {
+          const h = await harnesses.get(req.params.id);
           return h
             ? json(h, { headers: corsHeaders(req) })
             : json({ error: "not found" }, { status: 404, headers: corsHeaders(req) });
         }),
         PATCH: authed(async (req) => {
-          const current = harnesses.get(req.params.id);
+          const current = await harnesses.get(req.params.id);
           if (!current) {
             return json({ error: "not found" }, { status: 404, headers: corsHeaders(req) });
           }
@@ -5082,9 +5096,9 @@ export function startApiServer(
               { status: 400, headers: corsHeaders(req) },
             );
           }
-          const applyEnabled = () => {
+          const applyEnabled = async () => {
             if (typeof body.enabled !== "boolean") return;
-            harnesses.setEnabled(req.params.id, body.enabled);
+            await harnesses.setEnabled(req.params.id, body.enabled);
             // Re-enabling a harness that was previously excluded from every
             // discovery sweep (disabled harnesses are skipped — see
             // model-discovery.ts's discoveryTargets) needs its own probe now
@@ -5095,11 +5109,11 @@ export function startApiServer(
             if (body.enabled) void refreshHarnessModels(req.params.id);
           };
           if (!hasConfigPatch) {
-            applyEnabled();
+            await applyEnabled();
             if (typeof body.profileMcpServers === "boolean") {
-              harnesses.update(req.params.id, { profileMcpServers: body.profileMcpServers });
+              await harnesses.update(req.params.id, { profileMcpServers: body.profileMcpServers });
             }
-            return json(harnesses.get(req.params.id), { headers: corsHeaders(req) });
+            return json(await harnesses.get(req.params.id), { headers: corsHeaders(req) });
           }
           const patch: Parameters<typeof harnesses.update>[1] = {};
           if (typeof body.profileMcpServers === "boolean") patch.profileMcpServers = body.profileMcpServers;
@@ -5178,7 +5192,7 @@ export function startApiServer(
               return json(refusal, { status: 409, headers: corsHeaders(req) });
             }
           }
-          applyEnabled();
+          await applyEnabled();
           try {
             const saved = await dbOp("harnesses.updateGuarded", [req.params.id, patch, mirrorSignature]);
             if (!saved.ok) {
@@ -5204,6 +5218,7 @@ export function startApiServer(
             void refreshHarnessModels(updated.id);
             return json(updated, { headers: corsHeaders(req) });
           } catch (e) {
+            if (isDbWorkerError(e)) throw e; // the routes layer's 503
             if (e instanceof HarnessBuiltinError) {
               return json({ error: e.message }, { status: 400, headers: corsHeaders(req) });
             }
@@ -5218,7 +5233,7 @@ export function startApiServer(
             // the row delete, so a task assigned in this window still gets a
             // 409 with its conversation untouched (review R13-S2).
             const copies = await collectHarnessSessionCopies(req.params.id);
-            harnesses.delete(req.params.id);
+            await harnesses.delete(req.params.id);
             await removeHarnessSessionCopies(copies);
             // The row (and, with it, its provenance rows) is gone, so the
             // account's mirror backups and records can never be restored. Best effort:
@@ -5238,6 +5253,7 @@ export function startApiServer(
             await noteHarnessRemoved(req.params.id);
             return new Response(null, { status: 204, headers: corsHeaders(req) });
           } catch (e) {
+            if (isDbWorkerError(e)) throw e; // the routes layer's 503
             if (e instanceof HarnessInUseError) {
               return json(
                 { error: e.message, taskIds: e.taskIds, profileIds: e.profileIds },
@@ -5254,7 +5270,7 @@ export function startApiServer(
 
       // User-global reusable prompt snippets — not tied to any task/project.
       "/saved-prompts": {
-        GET: authed((req) => json(savedPrompts.list(), { headers: corsHeaders(req) })),
+        GET: authed(async (req) => json(await savedPrompts.list(), { headers: corsHeaders(req) })),
         POST: authed(async (req) => {
           const raw = await req.json().catch(() => null);
           const body = (raw && typeof raw === "object" && !Array.isArray(raw) ? raw : {}) as {
@@ -5265,14 +5281,14 @@ export function startApiServer(
           const content = typeof body.content === "string" ? body.content.trim() : "";
           if (!name) return json({ error: "name required" }, { status: 400, headers: corsHeaders(req) });
           if (!content) return json({ error: "content required" }, { status: 400, headers: corsHeaders(req) });
-          const created = savedPrompts.insert({ name, content });
+          const created = await savedPrompts.insert({ name, content });
           return json(created, { headers: corsHeaders(req) });
         }),
       },
 
       "/saved-prompts/:id": {
         PATCH: authed(async (req) => {
-          const current = savedPrompts.get(req.params.id);
+          const current = await savedPrompts.get(req.params.id);
           if (!current) {
             return json({ error: "not found" }, { status: 404, headers: corsHeaders(req) });
           }
@@ -5292,13 +5308,13 @@ export function startApiServer(
             if (!content) return json({ error: "content required" }, { status: 400, headers: corsHeaders(req) });
             patch.content = content;
           }
-          const updated = savedPrompts.update(req.params.id, patch);
+          const updated = await savedPrompts.update(req.params.id, patch);
           return updated
             ? json(updated, { headers: corsHeaders(req) })
             : json({ error: "not found" }, { status: 404, headers: corsHeaders(req) });
         }),
-        DELETE: authed((req) => {
-          const removed = savedPrompts.delete(req.params.id);
+        DELETE: authed(async (req) => {
+          const removed = await savedPrompts.delete(req.params.id);
           return removed
             ? json({ ok: true }, { headers: corsHeaders(req) })
             : json({ error: "not found" }, { status: 404, headers: corsHeaders(req) });
@@ -5320,7 +5336,7 @@ export function startApiServer(
       // its own defensive normalize+cap for the parse path (direct DB writes,
       // migrations), but the HTTP route now rejects instead of mangling.
       "/agent-profiles": {
-        GET: authed((req) => json(withTaskCounts(agentProfiles.list()), { headers: corsHeaders(req) })),
+        GET: authed(async (req) => json(await withTaskCounts(await agentProfiles.list()), { headers: corsHeaders(req) })),
         POST: authed(async (req) => {
           const raw = await req.json().catch(() => null);
           if (!raw || typeof raw !== "object" || Array.isArray(raw)) {
@@ -5334,7 +5350,7 @@ export function startApiServer(
 
           const harnessRef = typeof body.harness === "string" ? body.harness.trim() : "";
           if (!harnessRef) return json({ error: "harness required" }, { status: 400, headers: corsHeaders(req) });
-          const harness = harnesses.getByIdOrKind(harnessRef);
+          const harness = await harnesses.getByIdOrKind(harnessRef);
           if (!harness) {
             return json({ error: `unknown harness "${harnessRef}"` }, { status: 400, headers: corsHeaders(req) });
           }
@@ -5372,7 +5388,7 @@ export function startApiServer(
           }
 
           try {
-            const created = agentProfiles.insert({
+            const created = await agentProfiles.insert({
               name,
               harness: harness.id,
               model,
@@ -5384,8 +5400,9 @@ export function startApiServer(
               instructions,
               skills,
             });
-            return json(withTaskCount(created), { headers: corsHeaders(req) });
+            return json(await withTaskCount(created), { headers: corsHeaders(req) });
           } catch (e) {
+            if (isDbWorkerError(e)) throw e; // the routes layer's 503
             if (e instanceof AgentProfileNameError) {
               return json({ error: e.message }, { status: 409, headers: corsHeaders(req) });
             }
@@ -5401,7 +5418,7 @@ export function startApiServer(
         POST: authed(async (req) => {
           const bad = (error: string, status = 400) =>
             json({ error }, { status, headers: corsHeaders(req) });
-          const source = agentProfiles.get(req.params.id);
+          const source = await agentProfiles.get(req.params.id);
           if (!source) return bad("not found", 404);
           const raw = await req.json().catch(() => null);
           if (!raw || typeof raw !== "object" || Array.isArray(raw)) return bad("invalid body");
@@ -5423,7 +5440,7 @@ export function startApiServer(
               ? typeof body.name === "string"
                 ? body.name.trim()
                 : ""
-              : duplicateAgentName(source.name, agentProfiles.list().map((p) => p.name));
+              : duplicateAgentName(source.name, (await agentProfiles.list()).map((p) => p.name));
           const nameError = agentProfileNameError(name);
           if (nameError) return bad(nameError);
 
@@ -5431,7 +5448,7 @@ export function startApiServer(
           if ("harness" in body) {
             const harnessRef = typeof body.harness === "string" ? body.harness.trim() : "";
             if (!harnessRef) return bad("harness required");
-            const harness = harnesses.getByIdOrKind(harnessRef);
+            const harness = await harnesses.getByIdOrKind(harnessRef);
             if (!harness) return bad(`unknown harness "${harnessRef}"`);
             harnessId = harness.id;
           }
@@ -5486,13 +5503,14 @@ export function startApiServer(
             if ("notFound" in result) return bad("not found", 404);
             return json(
               {
-                profile: withTaskCount(result.profile),
+                profile: await withTaskCount(result.profile),
                 copiedTasks: result.copiedTasks,
                 taskCopyErrors: result.taskCopyErrors,
               },
               { status: 201, headers: corsHeaders(req) },
             );
           } catch (e) {
+            if (isDbWorkerError(e)) throw e; // the routes layer's 503
             if (e instanceof AgentProfileNameError) return bad(e.message, 409);
             return bad((e as Error).message);
           }
@@ -5500,14 +5518,14 @@ export function startApiServer(
       },
 
       "/agent-profiles/:id": {
-        GET: authed((req) => {
-          const p = agentProfiles.get(req.params.id);
+        GET: authed(async (req) => {
+          const p = await agentProfiles.get(req.params.id);
           return p
-            ? json(withTaskCount(p), { headers: corsHeaders(req) })
+            ? json(await withTaskCount(p), { headers: corsHeaders(req) })
             : json({ error: "not found" }, { status: 404, headers: corsHeaders(req) });
         }),
         PATCH: authed(async (req) => {
-          const current = agentProfiles.get(req.params.id);
+          const current = await agentProfiles.get(req.params.id);
           if (!current) {
             return json({ error: "not found" }, { status: 404, headers: corsHeaders(req) });
           }
@@ -5527,7 +5545,7 @@ export function startApiServer(
           if ("harness" in body) {
             const harnessRef = typeof body.harness === "string" ? body.harness.trim() : "";
             if (!harnessRef) return json({ error: "harness required" }, { status: 400, headers: corsHeaders(req) });
-            const harness = harnesses.getByIdOrKind(harnessRef);
+            const harness = await harnesses.getByIdOrKind(harnessRef);
             if (!harness) {
               return json({ error: `unknown harness "${harnessRef}"` }, { status: 400, headers: corsHeaders(req) });
             }
@@ -5578,23 +5596,24 @@ export function startApiServer(
           }
 
           try {
-            const updated = agentProfiles.update(req.params.id, patch);
+            const updated = await agentProfiles.update(req.params.id, patch);
             return updated
-              ? json(withTaskCount(updated), { headers: corsHeaders(req) })
+              ? json(await withTaskCount(updated), { headers: corsHeaders(req) })
               : json({ error: "not found" }, { status: 404, headers: corsHeaders(req) });
           } catch (e) {
+            if (isDbWorkerError(e)) throw e; // the routes layer's 503
             if (e instanceof AgentProfileNameError) {
               return json({ error: e.message }, { status: 409, headers: corsHeaders(req) });
             }
             return json({ error: (e as Error).message }, { status: 400, headers: corsHeaders(req) });
           }
         }),
-        DELETE: authed((req) => {
+        DELETE: authed(async (req) => {
           // Deleting a profile always succeeds — a task already launched from
           // it keeps its own frozen snapshot (D7), so there's nothing to
           // guard against the way `/harnesses/:id` DELETE must guard against
           // in-use tasks/profiles.
-          const removed = agentProfiles.delete(req.params.id);
+          const removed = await agentProfiles.delete(req.params.id);
           return removed
             ? json({ ok: true }, { headers: corsHeaders(req) })
             : json({ error: "not found" }, { status: 404, headers: corsHeaders(req) });
@@ -5609,7 +5628,7 @@ export function startApiServer(
       // always 400s with the parser's own message rather than a generic db
       // error; a name clash surfaces as 409 via `PipelineNameError`.
       "/pipelines": {
-        GET: authed((req) => json(withPipelineTaskCounts(pipelines.list()), { headers: corsHeaders(req) })),
+        GET: authed(async (req) => json(await withPipelineTaskCounts(await pipelines.list()), { headers: corsHeaders(req) })),
         POST: authed(async (req) => {
           const raw = await req.json().catch(() => null);
           if (!raw || typeof raw !== "object" || Array.isArray(raw)) {
@@ -5646,9 +5665,10 @@ export function startApiServer(
               graph: graphResult.graph,
               ...(maxStepsResult.value !== undefined ? { maxSteps: maxStepsResult.value } : {}),
             };
-            const created = pipelines.insert(input);
-            return json(withPipelineTaskCount(created), { status: 201, headers: corsHeaders(req) });
+            const created = await pipelines.insert(input);
+            return json(await withPipelineTaskCount(created), { status: 201, headers: corsHeaders(req) });
           } catch (e) {
+            if (isDbWorkerError(e)) throw e; // the routes layer's 503
             if (e instanceof PipelineNameError) {
               return json({ error: e.message }, { status: 409, headers: corsHeaders(req) });
             }
@@ -5658,14 +5678,14 @@ export function startApiServer(
       },
 
       "/pipelines/:id": {
-        GET: authed((req) => {
-          const p = pipelines.get(req.params.id);
+        GET: authed(async (req) => {
+          const p = await pipelines.get(req.params.id);
           return p
-            ? json(withPipelineTaskCount(p), { headers: corsHeaders(req) })
+            ? json(await withPipelineTaskCount(p), { headers: corsHeaders(req) })
             : json({ error: "not found" }, { status: 404, headers: corsHeaders(req) });
         }),
         PATCH: authed(async (req) => {
-          const current = pipelines.get(req.params.id);
+          const current = await pipelines.get(req.params.id);
           if (!current) {
             return json({ error: "not found" }, { status: 404, headers: corsHeaders(req) });
           }
@@ -5706,24 +5726,25 @@ export function startApiServer(
           }
 
           try {
-            const updated = pipelines.update(req.params.id, patch);
+            const updated = await pipelines.update(req.params.id, patch);
             return updated
-              ? json(withPipelineTaskCount(updated), { headers: corsHeaders(req) })
+              ? json(await withPipelineTaskCount(updated), { headers: corsHeaders(req) })
               : json({ error: "not found" }, { status: 404, headers: corsHeaders(req) });
           } catch (e) {
+            if (isDbWorkerError(e)) throw e; // the routes layer's 503
             if (e instanceof PipelineNameError) {
               return json({ error: e.message }, { status: 409, headers: corsHeaders(req) });
             }
             return json({ error: (e as Error).message }, { status: 400, headers: corsHeaders(req) });
           }
         }),
-        DELETE: authed((req) => {
+        DELETE: authed(async (req) => {
           // Deleting a pipeline always succeeds — a parent task already
           // launched from it keeps its own frozen `pipelineRun.snapshot`
           // (D8, docs/plans/pipelines.md), so there's nothing to guard
           // against the way `/harnesses/:id` DELETE must guard against
           // in-use harnesses/profiles.
-          const removed = pipelines.delete(req.params.id);
+          const removed = await pipelines.delete(req.params.id);
           return removed
             ? json({ ok: true }, { headers: corsHeaders(req) })
             : json({ error: "not found" }, { status: 404, headers: corsHeaders(req) });
@@ -5855,6 +5876,7 @@ export function startApiServer(
           try {
             r = await commitBundleImport(body.text, body.options, body.planFingerprint);
           } catch (e) {
+            if (isDbWorkerError(e)) throw e; // the routes layer's 503
             return json(
               { error: `import failed — nothing was imported: ${(e as Error).message}` },
               { status: 500, headers: corsHeaders(req) },
@@ -5876,7 +5898,7 @@ export function startApiServer(
       // for `?model=`. Touches no files, so no path gate.
       "/harnesses/:id/limit-state": {
         DELETE: authed(async (req) => {
-          const harness = harnesses.getByIdOrKind(req.params.id);
+          const harness = await harnesses.getByIdOrKind(req.params.id);
           if (!harness) return json({ error: "not found" }, { status: 404, headers: corsHeaders(req) });
           const params = new URL(req.url).searchParams;
           const model = params.get("model")?.trim().toLowerCase();
@@ -5897,7 +5919,7 @@ export function startApiServer(
       // account's config root, so a CLI-token caller is path-gated.
       "/harnesses/:id/mirror-restore": {
         POST: authed(async (req) => {
-          const harness = harnesses.getByIdOrKind(req.params.id);
+          const harness = await harnesses.getByIdOrKind(req.params.id);
           if (!harness) return json({ error: "not found" }, { status: 404, headers: corsHeaders(req) });
           const rootRefusal = await gateStackMemberRoots(req, [harness.id]);
           if (rootRefusal) return rootRefusal;
@@ -5906,6 +5928,7 @@ export function startApiServer(
             const result: MirrorRestoreResult = await restoreMirror(harness.id);
             return json(result, { headers: corsHeaders(req) });
           } catch (err) {
+            if (isDbWorkerError(err)) throw err; // the routes layer's 503
             return json({ error: (err as Error).message }, { status: 400, headers: corsHeaders(req) });
           }
         }),
@@ -5915,12 +5938,12 @@ export function startApiServer(
       // running task ids (so we can warn "N tasks are still using this")
       // plus the total task count for context.
       "/harnesses/:id/usage": {
-        GET: authed((req) => {
-          const h = harnesses.get(req.params.id);
+        GET: authed(async (req) => {
+          const h = await harnesses.get(req.params.id);
           if (!h) {
             return json({ error: "not found" }, { status: 404, headers: corsHeaders(req) });
           }
-          return json(harnesses.usage(req.params.id), { headers: corsHeaders(req) });
+          return json(await harnesses.usage(req.params.id), { headers: corsHeaders(req) });
         }),
       },
 
@@ -5930,7 +5953,7 @@ export function startApiServer(
       // claude-code only: other kinds have no local usage source wired yet.
       "/harnesses/:id/account-usage": {
         GET: authed(async (req) => {
-          const h = harnesses.getByIdOrKind(req.params.id);
+          const h = await harnesses.getByIdOrKind(req.params.id);
           if (!h) {
             return json({ error: "not found" }, { status: 404, headers: corsHeaders(req) });
           }
@@ -5972,8 +5995,8 @@ export function startApiServer(
       // execs a shell with this env applied (drift-free: reuses harnessEnv).
       // Headless-safe (no native bridge), unlike open-terminal below.
       "/harnesses/:id/shell-env": {
-        GET: authed((req) => {
-          const harness = harnesses.getByIdOrKind(req.params.id);
+        GET: authed(async (req) => {
+          const harness = await harnesses.getByIdOrKind(req.params.id);
           if (!harness) {
             return json({ error: "harness not found" }, { status: 404, headers: corsHeaders(req) });
           }
@@ -6002,7 +6025,7 @@ export function startApiServer(
       // `/tasks/:id/open-tmux`.
       "/harnesses/:id/open-terminal": {
         POST: authed(async (req) => {
-          const harness = harnesses.getByIdOrKind(req.params.id);
+          const harness = await harnesses.getByIdOrKind(req.params.id);
           if (!harness) {
             return json({ error: "harness not found" }, { status: 404, headers: corsHeaders(req) });
           }
@@ -6076,7 +6099,7 @@ export function startApiServer(
           // (keyed by harness id, not kind).
           const harnessId = new URL(req.url).searchParams.get("harness");
           if (harnessId) {
-            if (!harnesses.get(harnessId)) {
+            if (!await harnesses.get(harnessId)) {
               return json({ error: "unknown harness" }, { status: 404, headers: corsHeaders(req) });
             }
             await refreshHarnessModels(harnessId);
@@ -6136,7 +6159,7 @@ export function startApiServer(
           if (!agentParam) {
             return json({ error: "agent required" }, { status: 400, headers: corsHeaders(req) });
           }
-          const harness = harnesses.getByIdOrKind(agentParam);
+          const harness = await harnesses.getByIdOrKind(agentParam);
           if (!harness) {
             return json({ error: "agent required" }, { status: 400, headers: corsHeaders(req) });
           }
@@ -6193,14 +6216,14 @@ export function startApiServer(
       },
 
       "/tasks": {
-        GET: authed((req) => {
+        GET: authed(async (req) => {
           const query = parseTaskListQuery(new URL(req.url).searchParams);
           if ("error" in query) {
             return json({ error: query.error }, { status: 400, headers: corsHeaders(req) });
           }
-          const counts = subagents.runningCountsByTask();
+          const counts = await subagents.runningCountsByTask();
           return json(
-            tasks.list(query).map((t) => ({
+            (await tasks.list(query)).map((t) => ({
               ...t,
               // M-S3: the list route ships the trimmed pipelineRun variant
               // (no handoffs, no profile snapshots) — see the field's doc.
@@ -6314,15 +6337,15 @@ export function startApiServer(
           if ("error" in result) {
             return json({ error: result.error }, { status: 400, headers: corsHeaders(req) });
           }
-          return json(withRunningSubagents(result.task), { headers: corsHeaders(req) });
+          return json(await withRunningSubagents(result.task), { headers: corsHeaders(req) });
         }),
       },
 
       "/tasks/:id": {
-        GET: authed((req) => {
-          const t = tasks.get(req.params.id);
+        GET: authed(async (req) => {
+          const t = await tasks.get(req.params.id);
           return t
-            ? json(withRunningSubagents(t), { headers: corsHeaders(req) })
+            ? json(await withRunningSubagents(t), { headers: corsHeaders(req) })
             : json({ error: "not found" }, { status: 404, headers: corsHeaders(req) });
         }),
         PATCH: authed(async (req) => {
@@ -6381,7 +6404,7 @@ export function startApiServer(
               { status: 400, headers: corsHeaders(req) },
             );
           }
-          const before = tasks.get(req.params.id);
+          const before = await tasks.get(req.params.id);
           if (!before) {
             return json({ error: "not found" }, { status: 404, headers: corsHeaders(req) });
           }
@@ -6483,7 +6506,7 @@ export function startApiServer(
           // kanban shows a stuck row whose AgentSelect can't reflect its
           // own value and whose startTask fails downstream with the same
           // (less obvious) error. Catch it at the boundary.
-          if (typeof patch.agent === "string" && !harnesses.getByIdOrKind(patch.agent)) {
+          if (typeof patch.agent === "string" && !await harnesses.getByIdOrKind(patch.agent)) {
             return json(
               { error: `unknown harness: ${patch.agent}` },
               { status: 400, headers: corsHeaders(req) },
@@ -6502,7 +6525,7 @@ export function startApiServer(
           const sameStackAccountSwitch = Boolean(
             beforeStack && afterStack && beforeStack.id === afterStack.id,
           );
-          if (sameStackAccountSwitch && runs.hasRunning(before.id)) {
+          if (sameStackAccountSwitch && await runs.hasRunning(before.id)) {
             return json(
               { error: "stop the run before switching accounts" },
               { status: 409, headers: corsHeaders(req) },
@@ -6552,7 +6575,7 @@ export function startApiServer(
           }
           if ("effort" in patch && patch.effort === null) {
             const resolvedAgent = typeof patch.agent === "string" ? patch.agent : before.agent;
-            const resolvedHarness = harnesses.getByIdOrKind(resolvedAgent);
+            const resolvedHarness = await harnesses.getByIdOrKind(resolvedAgent);
             const resolvedKind = resolvedHarness?.kind ?? null;
             const resolvedModel =
               typeof patch.model === "string" ? patch.model : before.model;
@@ -6605,7 +6628,7 @@ export function startApiServer(
             await beginManualAccountSwitch(before.id, before.agent, patch.agent);
           }
           try {
-            const updated = tasks.update(req.params.id, patch);
+            const updated = await tasks.update(req.params.id, patch);
             if (!updated) {
               await clearManualAccountSwitch(before.id);
               return json({ error: "not found" }, { status: 404, headers: corsHeaders(req) });
@@ -6663,9 +6686,9 @@ export function startApiServer(
             // pre-reconcile snapshot — otherwise the header would flash
             // "no move" until the next fetch.
             const responseTask = sameStackAccountSwitch
-              ? tasks.get(req.params.id) ?? updated
+              ? await tasks.get(req.params.id) ?? updated
               : updated;
-            return json(withRunningSubagents(responseTask), { headers: corsHeaders(req) });
+            return json(await withRunningSubagents(responseTask), { headers: corsHeaders(req) });
           } finally {
             if (sameStackAccountSwitch) await releaseTaskAccountSwitch(before.id);
           }
@@ -6679,7 +6702,7 @@ export function startApiServer(
           // M7: exempt an ORPHANED step (its parent row no longer exists) —
           // there is no pipeline task left to redirect to, so refusing here
           // would leave the row permanently undeletable (orphan cleanup).
-          const existing = tasks.get(req.params.id);
+          const existing = await tasks.get(req.params.id);
           if (existing && isPipelineStepTask(existing) && !await isOrphanedPipelineStep(existing)) {
             return json(
               { error: "step task belongs to a pipeline — act on the pipeline task" },
@@ -6703,7 +6726,7 @@ export function startApiServer(
       // members' roots, so a CLI-token caller is path-gated on all of them.
       "/tasks/:id/switch-account": {
         POST: authed(async (req) => {
-          const task = tasks.get(req.params.id);
+          const task = await tasks.get(req.params.id);
           if (!task) return json({ error: "not found" }, { status: 404, headers: corsHeaders(req) });
           if (task.archivedAt != null) {
             return json(
@@ -6721,12 +6744,13 @@ export function startApiServer(
           server.timeout(req, 0);
           try {
             const result: SwitchAccountResult = await switchTaskAccountNow(req.params.id);
-            const fresh = tasks.get(req.params.id);
+            const fresh = await tasks.get(req.params.id);
             return json(
-              { ...result, task: withRunningSubagents(fresh ?? result.task) },
+              { ...result, task: await withRunningSubagents(fresh ?? result.task) },
               { headers: corsHeaders(req) },
             );
           } catch (err) {
+            if (isDbWorkerError(err)) throw err; // the routes layer's 503
             if (err instanceof SwitchAccountRefusedError) {
               return json(err.body, { status: 409, headers: corsHeaders(req) });
             }
@@ -6734,7 +6758,7 @@ export function startApiServer(
           }
         }),
         DELETE: authed(async (req) => {
-          if (!tasks.get(req.params.id)) {
+          if (!await tasks.get(req.params.id)) {
             return json({ error: "not found" }, { status: 404, headers: corsHeaders(req) });
           }
           // A scheduled switch being applied right now is past the point of
@@ -6752,9 +6776,9 @@ export function startApiServer(
           }
           // `cancelled` says whether a switch was actually scheduled, so a
           // caller can tell a cancel from a no-op.
-          const cancelled = tasks.get(req.params.id)?.harnessState?.scheduledSwitch != null;
+          const cancelled = (await tasks.get(req.params.id))?.harnessState?.scheduledSwitch != null;
           const task = await cancelScheduledAccountSwitch(req.params.id);
-          return json({ task: withRunningSubagents(task), cancelled }, { headers: corsHeaders(req) });
+          return json({ task: await withRunningSubagents(task), cancelled }, { headers: corsHeaders(req) });
         }),
       },
 
@@ -6767,7 +6791,7 @@ export function startApiServer(
           // from spawning a step turn the parent's `pipelineRun` never
           // asked for. Same orphan exemption as DELETE/archive: a step
           // whose parent row is gone has no pipeline left to redirect to.
-          const existing = tasks.get(req.params.id);
+          const existing = await tasks.get(req.params.id);
           if (existing && isPipelineStepTask(existing) && !await isOrphanedPipelineStep(existing)) {
             return json(
               { error: "step task is managed by its pipeline — retry the pipeline task instead" },
@@ -6799,7 +6823,7 @@ export function startApiServer(
           server.timeout(req, 0);
           const result = await retryImport(req.params.id, await claudeSessionScanOptions());
           return "error" in result
-            ? json(result, { status: tasks.get(req.params.id) ? 400 : 404, headers: corsHeaders(req) })
+            ? json(result, { status: await tasks.get(req.params.id) ? 400 : 404, headers: corsHeaders(req) })
             : json(result, { headers: corsHeaders(req) });
         }),
       },
@@ -6812,7 +6836,7 @@ export function startApiServer(
           server.timeout(req, 0);
           const result = await retryOpencodeImport(req.params.id);
           return "error" in result
-            ? json(result, { status: tasks.get(req.params.id) ? 400 : 404, headers: corsHeaders(req) })
+            ? json(result, { status: await tasks.get(req.params.id) ? 400 : 404, headers: corsHeaders(req) })
             : json(result, { headers: corsHeaders(req) });
         }),
       },
@@ -6925,7 +6949,7 @@ export function startApiServer(
           // task's archive/unarchive lifecycle is owned by its pipeline
           // parent (D9, docs/plans/pipelines.md). M7: same orphan exemption
           // too.
-          const existing = tasks.get(req.params.id);
+          const existing = await tasks.get(req.params.id);
           if (existing && isPipelineStepTask(existing) && !await isOrphanedPipelineStep(existing)) {
             return json(
               { error: "step task belongs to a pipeline — act on the pipeline task" },
@@ -6968,8 +6992,8 @@ export function startApiServer(
           // column — the client only reads it when it explicitly asked for
           // `awaitTeardown`, and it's absent (not `undefined`-valued) on the
           // ordinary fire-and-forget path.
-          const payload: ReturnType<typeof withRunningSubagents> & { teardown?: typeof result.teardown } =
-            withRunningSubagents(result.task);
+          const payload: Awaited<ReturnType<typeof withRunningSubagents>> & { teardown?: typeof result.teardown } =
+            await withRunningSubagents(result.task);
           if (result.teardown) payload.teardown = result.teardown;
           return json(payload, { headers: corsHeaders(req) });
         }),
@@ -6980,7 +7004,7 @@ export function startApiServer(
           // Same pipeline-step guard as archive above: a step row's
           // archive/unarchive lifecycle belongs to its pipeline parent, and
           // an orphaned step (parent row gone) is the one exemption.
-          const existing = tasks.get(req.params.id);
+          const existing = await tasks.get(req.params.id);
           if (existing && isPipelineStepTask(existing) && !await isOrphanedPipelineStep(existing)) {
             return json(
               { error: "step task belongs to a pipeline — act on the pipeline task" },
@@ -6991,7 +7015,7 @@ export function startApiServer(
           const result = await unarchiveTask(req.params.id);
           return "error" in result
             ? json(result, { status: 400, headers: corsHeaders(req) })
-            : json(withRunningSubagents(result.task), { headers: corsHeaders(req) });
+            : json(await withRunningSubagents(result.task), { headers: corsHeaders(req) });
         }),
       },
 
@@ -7007,7 +7031,7 @@ export function startApiServer(
         DELETE: authed(async (req) => {
           server.timeout(req, 0);
           const result = await removeTaskRepository(req.params.id, req.params.name);
-          if ("task" in result) return json({ task: withRunningSubagents(result.task) }, { headers: corsHeaders(req) });
+          if ("task" in result) return json({ task: await withRunningSubagents(result.task) }, { headers: corsHeaders(req) });
           return result.status === 404
             ? json({ error: result.error }, { status: 404, headers: corsHeaders(req) })
             : json({ error: result.error, code: result.code }, { status: 409, headers: corsHeaders(req) });
@@ -7021,17 +7045,17 @@ export function startApiServer(
       // 400s for a task that was never bound to a pipeline (`pipelineId`
       // null) — the run view has no business asking for one.
       "/tasks/:id/pipeline": {
-        GET: authed((req) => {
-          const task = tasks.get(req.params.id);
+        GET: authed(async (req) => {
+          const task = await tasks.get(req.params.id);
           if (!task) {
             return json({ error: "not found" }, { status: 404, headers: corsHeaders(req) });
           }
           if (!task.pipelineId) {
             return json({ error: "task is not a pipeline task" }, { status: 400, headers: corsHeaders(req) });
           }
-          const steps = tasks.stepsForParent(task.id);
+          const steps = await tasks.stepsForParent(task.id);
           return json(
-            { task: withRunningSubagents(task), steps: steps.map(withRunningSubagents) },
+            { task: await withRunningSubagents(task), steps: await Promise.all(steps.map(withRunningSubagents)) },
             { headers: corsHeaders(req) },
           );
         }),
@@ -7093,7 +7117,7 @@ export function startApiServer(
           const result = await advancePipeline(req.params.id, { nextStepIds, handoff, fromTaskId });
           return "error" in result
             ? json({ error: result.error }, { status: result.status, headers: corsHeaders(req) })
-            : json(withRunningSubagents(result.task), { headers: corsHeaders(req) });
+            : json(await withRunningSubagents(result.task), { headers: corsHeaders(req) });
         }),
       },
 
@@ -7157,7 +7181,7 @@ export function startApiServer(
           });
           return "error" in result
             ? json({ error: result.error }, { status: result.status, headers: corsHeaders(req) })
-            : json(withRunningSubagents(result.task), { headers: corsHeaders(req) });
+            : json(await withRunningSubagents(result.task), { headers: corsHeaders(req) });
         }),
       },
 
@@ -7181,7 +7205,7 @@ export function startApiServer(
           const result = await retryPipelineStep(req.params.id, { taskId });
           return "error" in result
             ? json({ error: result.error }, { status: result.status, headers: corsHeaders(req) })
-            : json(withRunningSubagents(result.task), { headers: corsHeaders(req) });
+            : json(await withRunningSubagents(result.task), { headers: corsHeaders(req) });
         }),
       },
 
@@ -7190,7 +7214,7 @@ export function startApiServer(
           const result = await cancelPipelineRun(req.params.id);
           return "error" in result
             ? json({ error: result.error }, { status: result.status, headers: corsHeaders(req) })
-            : json(withRunningSubagents(result.task), { headers: corsHeaders(req) });
+            : json(await withRunningSubagents(result.task), { headers: corsHeaders(req) });
         }),
       },
 
@@ -7207,7 +7231,7 @@ export function startApiServer(
       // build failed, …).
       "/tasks/:id/pipeline/restart": {
         POST: authed(async (req) => {
-          const task = tasks.get(req.params.id);
+          const task = await tasks.get(req.params.id);
           if (!task) {
             return json({ error: "not found" }, { status: 404, headers: corsHeaders(req) });
           }
@@ -7256,21 +7280,21 @@ export function startApiServer(
       },
 
       "/tasks/:id/runs": {
-        GET: authed((req) => json(runs.listForTask(req.params.id), { headers: corsHeaders(req) })),
+        GET: authed(async (req) => json(await runs.listForTask(req.params.id), { headers: corsHeaders(req) })),
       },
 
       // Snapshot of the background/sub agents tracked for a task — drives the
       // run panel's read-only tab strip on open, and is polled (like /runs)
       // as a backstop to the live `subagent` SSE deltas.
       "/tasks/:id/subagents": {
-        GET: authed((req) => json(subagents.listForTask(req.params.id), { headers: corsHeaders(req) })),
+        GET: authed(async (req) => json(await subagents.listForTask(req.params.id), { headers: corsHeaders(req) })),
       },
 
       // Everything the task's worktree changed vs its pinned base ref. Returns
       // a friendly `note` (empty `files`) when there's no worktree or no diff.
       "/tasks/:id/diff": {
         GET: authed(async (req) => {
-          const t = tasks.get(req.params.id);
+          const t = await tasks.get(req.params.id);
           if (!t) return json({ error: "not found" }, { status: 404, headers: corsHeaders(req) });
           const repo = new URL(req.url).searchParams.get("repo");
           if (repo && !(t.repositories ?? []).some((r) => r.name === repo)) {
@@ -7293,7 +7317,7 @@ export function startApiServer(
       // /files/preview's trust posture).
       "/tasks/:id/diff/blob": {
         GET: authed(async (req) => {
-          const t = tasks.get(req.params.id);
+          const t = await tasks.get(req.params.id);
           if (!t) return json({ error: "not found" }, { status: 404, headers: corsHeaders(req) });
 
           const url = new URL(req.url);
@@ -7354,11 +7378,11 @@ export function startApiServer(
       // errors with "can't find session".
       "/tasks/:id/open-tmux": {
         POST: authed(async (req) => {
-          const task = tasks.get(req.params.id);
+          const task = await tasks.get(req.params.id);
           if (!task) {
             return json({ error: "task not found" }, { status: 404, headers: corsHeaders(req) });
           }
-          const harness = harnesses.getByIdOrKind(task.agent);
+          const harness = await harnesses.getByIdOrKind(task.agent);
           if (harness?.kind !== "claude-code") {
             return json(
               { error: "tmux attach is only available for claude-code tasks" },
@@ -7472,7 +7496,7 @@ export function startApiServer(
       // recompute what a sibling call already knows.
       "/tasks/:id/git-status": {
         GET: authed(async (req) => {
-          const t = tasks.get(req.params.id);
+          const t = await tasks.get(req.params.id);
           if (!t) {
             return json({ error: "not found" }, { status: 404, headers: corsHeaders(req) });
           }
@@ -7532,7 +7556,7 @@ export function startApiServer(
       // answering 204 with no body, so older clients are unaffected.
       "/tasks/:id/teardown-preview": {
         GET: authed(async (req) => {
-          const t = tasks.get(req.params.id);
+          const t = await tasks.get(req.params.id);
           if (!t) {
             return json({ error: "not found" }, { status: 404, headers: corsHeaders(req) });
           }
@@ -7567,7 +7591,7 @@ export function startApiServer(
           }
           let abs = raw;
           if (!path.isAbsolute(abs)) {
-            const t = body.taskId ? tasks.get(body.taskId) : null;
+            const t = body.taskId ? await tasks.get(body.taskId) : null;
             const cwd = t?.worktreePath ?? t?.workdir;
             if (!cwd) {
               return json(
@@ -7610,7 +7634,7 @@ export function startApiServer(
           }
           let abs = raw;
           if (!path.isAbsolute(abs)) {
-            const t = body.taskId ? tasks.get(body.taskId) : null;
+            const t = body.taskId ? await tasks.get(body.taskId) : null;
             const cwd = t?.worktreePath ?? t?.workdir;
             if (!cwd) {
               return json(
@@ -8427,7 +8451,7 @@ export function startApiServer(
       },
 
       "/tasks/:id/interactions/pending": {
-        GET: authed((req) => {
+        GET: authed(async (req) => {
           const id = req.params.id;
           let pending = listPendingForTask(id);
           // H4: a pipeline PARENT never has interactions registered against
@@ -8436,9 +8460,9 @@ export function startApiServer(
           // `pendingInteractionCount`. Union the steps' pending requests here
           // too, so the id the board showed as "waiting on you" is the id
           // whose pending list actually carries the cards to answer.
-          const task = tasks.get(id);
+          const task = await tasks.get(id);
           if (task?.pipelineId) {
-            for (const step of tasks.stepsForParent(id)) pending = pending.concat(listPendingForTask(step.id));
+            for (const step of await tasks.stepsForParent(id)) pending = pending.concat(listPendingForTask(step.id));
             pending.sort((a, b) => a.createdAt - b.createdAt);
           }
           return json(pending, { headers: corsHeaders(req) });
@@ -8451,7 +8475,7 @@ export function startApiServer(
       // collide with DELETE/PATCH on the `/:itemId` member route.
       "/tasks/:id/backlog": {
         POST: authed(async (req) => {
-          const blocked = backlogGuard(req);
+          const blocked = await backlogGuard(req);
           if (blocked) return blocked;
           const body = (await req.json().catch(() => ({}))) as {
             text?: unknown;
@@ -8467,19 +8491,19 @@ export function startApiServer(
               { status: 400, headers: corsHeaders(req) },
             );
           }
-          const updated = backlog.add(req.params.id, { text, references });
+          const updated = await backlog.add(req.params.id, { text, references });
           return updated
             ? json(updated, { headers: corsHeaders(req) })
             : json({ error: "not found" }, { status: 404, headers: corsHeaders(req) });
         }),
         PUT: authed(async (req) => {
-          const blocked = backlogGuard(req);
+          const blocked = await backlogGuard(req);
           if (blocked) return blocked;
           const body = (await req.json().catch(() => ({}))) as { order?: unknown };
           const order = Array.isArray(body.order)
             ? body.order.filter((x): x is string => typeof x === "string")
             : [];
-          const updated = backlog.reorder(req.params.id, order);
+          const updated = await backlog.reorder(req.params.id, order);
           return updated
             ? json(updated, { headers: corsHeaders(req) })
             : json({ error: "not found" }, { status: 404, headers: corsHeaders(req) });
@@ -8488,7 +8512,7 @@ export function startApiServer(
 
       "/tasks/:id/backlog/:itemId": {
         PATCH: authed(async (req) => {
-          const blocked = backlogGuard(req);
+          const blocked = await backlogGuard(req);
           if (blocked) return blocked;
           const body = (await req.json().catch(() => ({}))) as {
             text?: unknown;
@@ -8502,8 +8526,7 @@ export function startApiServer(
           // Parity with POST: an edit must not leave a draft with neither text
           // nor references. Only enforced when the item actually exists (an
           // unknown id is a no-op in `updateItem`, handled below).
-          const current = tasks
-            .get(req.params.id)
+          const current = (await tasks.get(req.params.id))
             ?.backlog.find((m) => m.id === req.params.itemId);
           if (current) {
             const nextText = patch.text !== undefined ? patch.text : current.text;
@@ -8516,15 +8539,15 @@ export function startApiServer(
               );
             }
           }
-          const updated = backlog.updateItem(req.params.id, req.params.itemId, patch);
+          const updated = await backlog.updateItem(req.params.id, req.params.itemId, patch);
           return updated
             ? json(updated, { headers: corsHeaders(req) })
             : json({ error: "not found" }, { status: 404, headers: corsHeaders(req) });
         }),
-        DELETE: authed((req) => {
-          const blocked = backlogGuard(req);
+        DELETE: authed(async (req) => {
+          const blocked = await backlogGuard(req);
           if (blocked) return blocked;
-          const updated = backlog.remove(req.params.id, req.params.itemId);
+          const updated = await backlog.remove(req.params.id, req.params.itemId);
           return updated
             ? json(updated, { headers: corsHeaders(req) })
             : json({ error: "not found" }, { status: 404, headers: corsHeaders(req) });
@@ -8541,17 +8564,17 @@ export function startApiServer(
       // 400 for the same condition) since detaching is a task mutation the
       // archived freeze already covers everywhere else.
       "/tasks/:id/agent-profile": {
-        DELETE: authed((req) => {
-          const task = tasks.get(req.params.id);
+        DELETE: authed(async (req) => {
+          const task = await tasks.get(req.params.id);
           if (!task) {
             return json({ error: "not found" }, { status: 404, headers: corsHeaders(req) });
           }
           if (task.archivedAt != null) {
             return json({ error: "task is archived" }, { status: 409, headers: corsHeaders(req) });
           }
-          const updated = tasks.setAgentProfile(req.params.id, null, null);
+          const updated = await tasks.setAgentProfile(req.params.id, null, null);
           return updated
-            ? json(withRunningSubagents(updated), { headers: corsHeaders(req) })
+            ? json(await withRunningSubagents(updated), { headers: corsHeaders(req) })
             : json({ error: "not found" }, { status: 404, headers: corsHeaders(req) });
         }),
       },
@@ -8564,7 +8587,7 @@ export function startApiServer(
       // to set/clear a dot (plan §3/§4).
       "/tasks/:id/seen": {
         POST: authed(async (req) => {
-          const updated = tasks.markSeen(req.params.id);
+          const updated = await tasks.markSeen(req.params.id);
           // Opening the task (panel open/switch, "Mark as read") removes its
           // OS notification (D6a). A step's entry belongs to its pipeline
           // parent (D16).
@@ -8573,8 +8596,8 @@ export function startApiServer(
             ? json(updated, { headers: corsHeaders(req) })
             : json({ error: "not found" }, { status: 404, headers: corsHeaders(req) });
         }),
-        DELETE: authed((req) => {
-          const updated = tasks.markUnread(req.params.id);
+        DELETE: authed(async (req) => {
+          const updated = await tasks.markUnread(req.params.id);
           return updated
             ? json(updated, { headers: corsHeaders(req) })
             : json({ error: "not found" }, { status: 404, headers: corsHeaders(req) });
@@ -8586,7 +8609,7 @@ export function startApiServer(
       // routes are the only writers of `editedContent`/`status` thereafter.
       "/tasks/:id/plans/:planId": {
         PATCH: authed(async (req) => {
-          const blocked = planGuard(req);
+          const blocked = await planGuard(req);
           if (blocked) return blocked;
           const body = (await req.json().catch(() => ({}))) as { editedContent?: unknown };
           if (body.editedContent !== null && typeof body.editedContent !== "string") {
@@ -8620,18 +8643,20 @@ export function startApiServer(
               { status: 400, headers: corsHeaders(req) },
             );
           }
-          const task = tasks.get(req.params.id);
+          const task = await tasks.get(req.params.id);
           if (!task) return json({ error: "not found" }, { status: 404, headers: corsHeaders(req) });
-          const kindBlocked = planKindGuard(req, task);
+          const kindBlocked = await planKindGuard(req, task);
           if (kindBlocked) return kindBlocked;
-          const nextPlans = setEditedContent(task.plans, req.params.planId, body.editedContent ?? null);
-          if (!nextPlans) {
+          // Read, check and write in one transaction on the worker: the
+          // kind check above awaited, and a plan detected since must survive.
+          const outcome = await dbOp("server.setPlanEditedContent", [req.params.id, req.params.planId, body.editedContent ?? null]);
+          if (outcome === "not-pending") {
             return json(
               { error: "plan not found or not pending" },
               { status: 400, headers: corsHeaders(req) },
             );
           }
-          const updated = tasks.update(req.params.id, { plans: nextPlans });
+          const updated = outcome === "ok" ? await tasks.get(req.params.id) : null;
           return updated
             ? json(updated, { headers: corsHeaders(req) })
             : json({ error: "not found" }, { status: 404, headers: corsHeaders(req) });
@@ -8661,7 +8686,7 @@ export function startApiServer(
           }
           approvalsInFlight.add(key);
           try {
-            const blocked = planGuard(req);
+            const blocked = await planGuard(req);
             if (blocked) return blocked;
 
             // Single fresh snapshot for the whole request: `content`, the
@@ -8675,10 +8700,10 @@ export function startApiServer(
             // concurrent PATCH, because PATCH never touches `status`, so
             // `approvePlan`'s pending-check below still holds against this
             // snapshot even if a PATCH races in.)
-            const task = tasks.get(req.params.id);
+            const task = await tasks.get(req.params.id);
             if (!task) return json({ error: "not found" }, { status: 404, headers: corsHeaders(req) });
 
-            const kindBlocked = planKindGuard(req, task);
+            const kindBlocked = await planKindGuard(req, task);
             if (kindBlocked) return kindBlocked;
 
             const plan = task.plans.find((p) => p.id === req.params.planId);
@@ -8727,7 +8752,7 @@ export function startApiServer(
             // user's repo): the effective plan always rides inline in the
             // approval message and the plan record keeps `filePath: null`.
             // Cursor keeps its `.cursor/plans/*.plan.md` file, unchanged.
-            const isCopilot = harnesses.getByIdOrKind(task.agent)?.kind === "copilot";
+            const isCopilot = (await harnesses.getByIdOrKind(task.agent))?.kind === "copilot";
             const agentLabel = isCopilot ? "GitHub Copilot" : "cursor";
             let relPath: string | null = null;
             let message: string;
@@ -8782,21 +8807,19 @@ export function startApiServer(
             // plan stays pending, so the task must stay in the mode it was
             // in. Only reverted while the mode is still the `auto` this
             // request wrote — a concurrent edit wins.
-            const revertFlip = () => {
-              if (flipToAuto && tasks.get(task.id)?.mode === "auto") {
-                tasks.update(task.id, { mode: task.mode });
-              }
+            const revertFlip = async () => {
+              if (flipToAuto) await dbOp("server.revertModeIfAuto", [task.id, task.mode]);
             };
-            if (flipToAuto) tasks.update(task.id, { mode: "auto" });
+            if (flipToAuto) await tasks.update(task.id, { mode: "auto" });
             let sendResult: Awaited<ReturnType<typeof sendInput>>;
             try {
               sendResult = await sendInput(task.runId, message);
             } catch (err) {
-              revertFlip();
+              await revertFlip();
               throw err;
             }
             if (!sendResult.delivered) {
-              revertFlip();
+              await revertFlip();
               // Any plan file is already written but nothing was sent — leave
               // the plan pending so the user can retry the approve action.
               return json(
@@ -8844,7 +8867,7 @@ export function startApiServer(
                 { status: 409, headers: corsHeaders(req) },
               );
             }
-            const updated = tasks.update(req.params.id, { plans: result.plans });
+            const updated = await tasks.update(req.params.id, { plans: result.plans });
             if (!updated) {
               return json(
                 {
@@ -8895,7 +8918,7 @@ export function startApiServer(
       "/tasks/:id/fx-auto-resume": {
         DELETE: authed(async (req) => {
           const taskId = req.params.id;
-          if (!tasks.get(taskId)) {
+          if (!await tasks.get(taskId)) {
             return json({ error: "not found" }, { status: 404, headers: corsHeaders(req) });
           }
           const cancelled = await cancelFxAutoResume(taskId, "cancelled");
@@ -8934,13 +8957,13 @@ export function startApiServer(
             ? (body.references as TaskReference[])
             : [];
           const draft = text.trim() || references.length > 0 ? { text, references } : null;
-          const updated = drafts.set(req.params.id, draft);
+          const updated = await drafts.set(req.params.id, draft);
           return updated
             ? json(updated, { headers: corsHeaders(req) })
             : json({ error: "not found" }, { status: 404, headers: corsHeaders(req) });
         }),
-        DELETE: authed((req) => {
-          const updated = drafts.set(req.params.id, null);
+        DELETE: authed(async (req) => {
+          const updated = await drafts.set(req.params.id, null);
           return updated
             ? json(updated, { headers: corsHeaders(req) })
             : json({ error: "not found" }, { status: 404, headers: corsHeaders(req) });
@@ -8979,7 +9002,7 @@ export function startApiServer(
       // headers + 200). A bare `authed(...)` would gate OPTIONS on the
       // bearer header — preflight doesn't carry it, so authed would 401
       // and WebKit's fetch rejects with the unhelpful "Load failed".
-      "/runs/:id/rebuild-events": { GET: authed((req) => {
+      "/runs/:id/rebuild-events": { GET: authed(async (req) => {
         try {
           // Optional `?limit=` caps the response to the most recent N mapped
           // events (ascending) — an event-count cut AND a byte budget
@@ -9004,7 +9027,7 @@ export function startApiServer(
           const limit = Number.isFinite(limitRaw) && limitRaw > 0
             ? Math.max(1, Math.min(Math.floor(limitRaw), 2000))
             : EVENTS_REPLAY_LIMIT;
-          const run = runs.get(req.params.id);
+          const run = await runs.get(req.params.id);
           if (!run) return json({ error: "run not found" }, { status: 404, headers: corsHeaders(req) });
           if (!run.claudeSessionId) {
             return json(
@@ -9012,7 +9035,7 @@ export function startApiServer(
               { headers: corsHeaders(req) },
             );
           }
-          const task = tasks.get(run.taskId);
+          const task = await tasks.get(run.taskId);
           if (!task) return json({ error: "task not found" }, { status: 404, headers: corsHeaders(req) });
           // Reconstruct the cwd claude was launched against. Worktree tasks
           // had cwd = worktreePath; isolation=none had cwd = workdir.
@@ -9022,7 +9045,7 @@ export function startApiServer(
           // CLAUDE_CONFIG_DIR, or `<HOME>/.claude` for an env-map HOME, or the
           // built-in's `~/.claude`); an unknown agent falls back to the
           // `configDir: null` branch inside jsonlPathFor.
-          const harness = harnesses.getByIdOrKind(task.agent);
+          const harness = await harnesses.getByIdOrKind(task.agent);
           const jsonlPath = jsonlPathFor(
             cwd,
             run.claudeSessionId,
@@ -9143,6 +9166,7 @@ export function startApiServer(
           // on PR #230). Response shape unchanged: `{ events, source }`.
           return json({ events, source: jsonlPath }, { headers: corsHeaders(req) });
         } catch (e) {
+          if (isDbWorkerError(e)) throw e; // the routes layer's 503
           const msg = (e as Error).message ?? String(e);
           console.error("[agetor] /runs/:id/rebuild-events failed:", e);
           return json(
@@ -9152,10 +9176,10 @@ export function startApiServer(
         }
       }) },
 
-      "/runs/:id/events": authed((req) => {
+      "/runs/:id/events": authed(async (req) => {
         const runId = req.params.id;
         const stream = new ReadableStream({
-          start(controller) {
+          async start(controller) {
             attachedClients++;
             const enc = new TextEncoder();
             const send = (e: RunEvent | { type: "ping" }) => {
@@ -9186,7 +9210,39 @@ export function startApiServer(
               if (buffer) buffer.push(e);
               else send(e);
             });
-            for (const ev of runs.events(runId)) {
+            let ping: ReturnType<typeof setInterval> | null = null;
+            let cleanedUp = false;
+            const cleanup = () => {
+              if (cleanedUp) return;
+              cleanedUp = true;
+              if (ping) clearInterval(ping);
+              unsubscribe();
+              try {
+                controller.close();
+              } catch {
+                // Already closed by the client going away.
+              }
+              attachedClients--;
+            };
+            // Registered before the history read: the client can go away
+            // while it is in flight.
+            if (req.signal.aborted) {
+              cleanup();
+              return;
+            }
+            req.signal.addEventListener("abort", cleanup, { once: true });
+            let history: Awaited<ReturnType<typeof runs.events>>;
+            try {
+              history = await runs.events(runId);
+            } catch (err) {
+              // The database worker is restarting or gone: end the stream;
+              // the client reconnects and replays.
+              console.warn(`[agetor] /runs/${runId}/events replay failed:`, (err as Error)?.message ?? String(err));
+              cleanup();
+              return;
+            }
+            if (cleanedUp) return;
+            for (const ev of history) {
               if (ev.subagentId) continue;
               send({
                 runId,
@@ -9199,13 +9255,7 @@ export function startApiServer(
             const drained = buffer;
             buffer = null;
             for (const ev of drained) send(ev);
-            const ping = setInterval(() => send({ type: "ping" }), 15_000);
-            req.signal.addEventListener("abort", () => {
-              clearInterval(ping);
-              unsubscribe();
-              controller.close();
-              attachedClients--;
-            });
+            ping = setInterval(() => send({ type: "ping" }), 15_000);
           },
         });
         return new Response(stream, {
@@ -9597,9 +9647,9 @@ export function startApiServer(
       // as always) correctly reports more history to page through even
       // though the `limit`-worth of rows technically existed.
       "/tasks/:id/events/page": {
-        GET: authed((req) => {
+        GET: authed(async (req) => {
           const taskId = req.params.id;
-          if (!tasks.get(taskId)) {
+          if (!await tasks.get(taskId)) {
             return json({ error: "not found" }, { status: 404, headers: corsHeaders(req) });
           }
           const url = new URL(req.url);
@@ -9615,7 +9665,7 @@ export function startApiServer(
           const limit = Number.isFinite(limitRaw) && limitRaw > 0
             ? Math.max(1, Math.min(Math.floor(limitRaw), 2000))
             : EVENTS_REPLAY_LIMIT;
-          const rows = runs.eventsForTask(taskId, {
+          const rows = await runs.eventsForTask(taskId, {
             beforeId: beforeIdRaw,
             limit,
             maxBytes: EVENTS_PAGE_MAX_BYTES,
@@ -9631,7 +9681,7 @@ export function startApiServer(
             subagentId: ev.subagentId,
           }));
           const earliestId = events.length > 0 ? events[0]!.id : null;
-          const hasMore = earliestId !== null && runs.hasEventsBefore(taskId, earliestId);
+          const hasMore = earliestId !== null && await runs.hasEventsBefore(taskId, earliestId);
           return json({ events, earliestId, hasMore }, { headers: corsHeaders(req) });
         }),
       },
@@ -9639,9 +9689,9 @@ export function startApiServer(
       // `:id` is only a 404-on-unknown-task existence gate — the payload
       // itself is global (every task, every harness), not scoped to `:id`.
       "/tasks/:id/messages/history": {
-        GET: authed((req) => {
+        GET: authed(async (req) => {
           const taskId = req.params.id;
-          const task = tasks.get(taskId);
+          const task = await tasks.get(taskId);
           if (!task) {
             return json({ error: "not found" }, { status: 404, headers: corsHeaders(req) });
           }
@@ -9650,13 +9700,13 @@ export function startApiServer(
           const limit = Number.isFinite(limitRaw) && limitRaw > 0
             ? Math.max(1, Math.min(Math.floor(limitRaw), 200))
             : 50;
-          const rows = runs.userMessageHistory(limit);
+          const rows = await runs.userMessageHistory(limit);
           // Resolve each distinct agent id/kind to its human harness label
           // once per request rather than per row.
           const agentLabels = new Map<string, string>();
           for (const row of rows) {
             if (agentLabels.has(row.taskAgent)) continue;
-            agentLabels.set(row.taskAgent, harnesses.getByIdOrKind(row.taskAgent)?.label ?? row.taskAgent);
+            agentLabels.set(row.taskAgent, (await harnesses.getByIdOrKind(row.taskAgent))?.label ?? row.taskAgent);
           }
           const messages = rows.map((row) => ({
             id: row.id,
@@ -9707,7 +9757,7 @@ export function startApiServer(
           if (req.signal.aborted) return new Response(null, { status: 204, headers: corsHeaders(req) });
         }
         const stream = new ReadableStream({
-          start(controller) {
+          async start(controller) {
             attachedClients++;
             const enc = new TextEncoder();
             // A SAVED row carries its `run_events.id` both in the JSON and as
@@ -9743,12 +9793,23 @@ export function startApiServer(
             };
             // Unified task-level stream: one scrollback per task, merging
             // events across every run. Subscribe before replay (same race
-            // protection as the per-run endpoint).
+            // protection as the per-run endpoint). The replay is a database
+            // read, so live events keep arriving while it is in flight: they
+            // wait in `buffer`. A saved row committed before that read is in
+            // the replay, and its live send may land either in the buffer or
+            // after it is drained, so every saved row at or below the last id
+            // the replay covered (`replayedThrough`) is dropped as a duplicate.
+            // Live-only frames (no id) always go through.
             let buffer: RunEvent[] | null = [];
+            let replayedThrough = 0;
+            const sendLive = (e: RunEvent) => {
+              if (typeof e.id === "number" && e.id <= replayedThrough) return;
+              send(e);
+            };
             const unsubscribe = subscribe((e) => {
               if (e.taskId !== taskId) return;
               if (buffer) buffer.push(e);
-              else send(e);
+              else sendLive(e);
             });
             let ping: ReturnType<typeof setInterval> | null = null;
             // One idempotent teardown for both exits — the client aborting
@@ -9777,6 +9838,13 @@ export function startApiServer(
               if (!set) streamDrop.open.set(taskId, (set = new Set()));
               set.add(cleanup);
             }
+            // Registered before the replay read: the client can go away while
+            // it is in flight.
+            if (req.signal.aborted) {
+              cleanup();
+              return;
+            }
+            req.signal.addEventListener("abort", cleanup, { once: true });
             // Cap replay to the most recent EVENTS_REPLAY_LIMIT events instead
             // of the task's full history — a task with thousands of events
             // used to replay every one of them on every SSE (re)connect.
@@ -9801,8 +9869,8 @@ export function startApiServer(
             // `anchorReplay` above).
             // Shared by the no-cursor connect and the snapshot answer, so a
             // snapshot is exactly the window a fresh connect would get.
-            const freshWindow = () => {
-              const window = runs.eventsForTask(taskId, {
+            const freshWindow = async () => {
+              const window = await runs.eventsForTask(taskId, {
                 limit: EVENTS_REPLAY_LIMIT,
                 maxBytes: EVENTS_REPLAY_MAX_BYTES,
                 minEvents: MIN_REPLAY_EVENTS,
@@ -9811,35 +9879,47 @@ export function startApiServer(
                   : {}),
               });
               const earliestId = window.length > 0 ? window[0]!.id : null;
-              const hasMore = earliestId !== null && runs.hasEventsBefore(taskId, earliestId);
+              const hasMore = earliestId !== null && await runs.hasEventsBefore(taskId, earliestId);
               return { window, earliestId, hasMore };
             };
             let meta: TaskEventsReplayMeta;
-            let replay: ReturnType<typeof freshWindow>["window"];
-            if (cursor === null) {
-              const fresh = freshWindow();
-              meta = { earliestId: fresh.earliestId, hasMore: fresh.hasMore };
-              replay = fresh.window;
-            } else {
-              // Resume: only the rows after the cursor, subagent rows included.
-              // `earliestId`/`hasMore` describe a window, which a resume
-              // doesn't send, so the client is told to leave its own alone.
-              // Snapshot (gap too big, or a cursor from another database):
-              // the fresh window plus `snapshotRequired`, so the client
-              // replaces what it holds instead of splicing across the gap.
-              const after = runs.eventsForTaskAfter(taskId, cursor, {
-                maxEvents: EVENTS_REPLAY_LIMIT,
-                maxBytes: EVENTS_REPLAY_MAX_BYTES,
-              });
-              if (after.kind === "resume") {
-                meta = { earliestId: null, hasMore: false, resumedAfter: cursor };
-                replay = after.rows;
-              } else {
-                const fresh = freshWindow();
-                meta = { earliestId: fresh.earliestId, hasMore: fresh.hasMore, snapshotRequired: true };
+            let replay: Awaited<ReturnType<typeof freshWindow>>["window"];
+            try {
+              if (cursor === null) {
+                const fresh = await freshWindow();
+                meta = { earliestId: fresh.earliestId, hasMore: fresh.hasMore };
                 replay = fresh.window;
+              } else {
+                // Resume: only the rows after the cursor, subagent rows included.
+                // `earliestId`/`hasMore` describe a window, which a resume
+                // doesn't send, so the client is told to leave its own alone.
+                // Snapshot (gap too big, or a cursor from another database):
+                // the fresh window plus `snapshotRequired`, so the client
+                // replaces what it holds instead of splicing across the gap.
+                const after = await runs.eventsForTaskAfter(taskId, cursor, {
+                  maxEvents: EVENTS_REPLAY_LIMIT,
+                  maxBytes: EVENTS_REPLAY_MAX_BYTES,
+                });
+                if (after.kind === "resume") {
+                  meta = { earliestId: null, hasMore: false, resumedAfter: cursor };
+                  replay = after.rows;
+                  // The client holds everything up to its cursor already.
+                  replayedThrough = cursor;
+                } else {
+                  const fresh = await freshWindow();
+                  meta = { earliestId: fresh.earliestId, hasMore: fresh.hasMore, snapshotRequired: true };
+                  replay = fresh.window;
+                }
               }
+            } catch (err) {
+              // The database worker is restarting or gone: end the stream; the
+              // client reconnects with its cursor and resumes.
+              console.warn(`[agetor] /tasks/${taskId}/events replay failed:`, (err as Error)?.message ?? String(err));
+              cleanup();
+              return;
             }
+            if (cleanedUp) return;
+            for (const ev of replay) replayedThrough = Math.max(replayedThrough, ev.id);
             sendNamed(TASK_EVENTS_REPLAY_META_EVENT, meta);
             for (const ev of replay) {
               send({
@@ -9854,10 +9934,8 @@ export function startApiServer(
             }
             const drained = buffer;
             buffer = null;
-            for (const ev of drained) send(ev);
+            for (const ev of drained) sendLive(ev);
             ping = setInterval(() => send({ type: "ping" }), 15_000);
-            if (req.signal.aborted) cleanup();
-            else req.signal.addEventListener("abort", cleanup, { once: true });
           },
         });
         return new Response(stream, {

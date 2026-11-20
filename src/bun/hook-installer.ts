@@ -1,5 +1,5 @@
 import path from "node:path";
-import { dataDir } from "./db.ts";
+import { dataDir } from "./db-path.ts";
 import { readTaskDirFile, taskDirExists, writeTaskDirFileAtomic } from "./task-dir-fs.ts";
 import { isValidPermissionEntry } from "../shared/claude-permissions.ts";
 

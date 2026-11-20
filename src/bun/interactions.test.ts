@@ -1314,12 +1314,18 @@ test("the boot preload loads stored step parents, so the first card carries its 
   await makeTaskWithCwd("pre-archived");
   db.run(`UPDATE tasks SET pipeline_parent_id = 'pre-parent' WHERE id IN ('pre-step', 'pre-archived')`);
   db.run(`UPDATE tasks SET archived_at = 1 WHERE id = 'pre-archived'`);
-  clearPipelineParentCacheForTests();
-  expect(await preloadPipelineParents()).toBeGreaterThanOrEqual(1);
-  const step = await makePrompt("pre-step", "r1", "fp-pre-step");
-  expect(step.req.pipelineParentId).toBe("pre-parent");
-  const archived = await makePrompt("pre-archived", "r1", "fp-pre-archived");
-  expect(archived.req.pipelineParentId).toBeUndefined();
-  cancelPendingForTask("pre-step", "done");
-  cancelPendingForTask("pre-archived", "done");
+  try {
+    clearPipelineParentCacheForTests();
+    expect(await preloadPipelineParents()).toBeGreaterThanOrEqual(1);
+    const step = await makePrompt("pre-step", "r1", "fp-pre-step");
+    expect(step.req.pipelineParentId).toBe("pre-parent");
+    const archived = await makePrompt("pre-archived", "r1", "fp-pre-archived");
+    expect(archived.req.pipelineParentId).toBeUndefined();
+  } finally {
+    cancelPendingForTask("pre-step", "done");
+    cancelPendingForTask("pre-archived", "done");
+    // bun test shares one db.ts singleton across files: an archived_at = 1 row
+    // left behind is an old archived task to every later retention test.
+    db.run(`DELETE FROM tasks WHERE id IN ('pre-parent', 'pre-step', 'pre-archived')`);
+  }
 });

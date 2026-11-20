@@ -18,7 +18,7 @@ import {
 import { createHash, randomBytes } from "node:crypto";
 import { registerLogSecret } from "./core-log.ts";
 import path from "node:path";
-import { dataDir } from "./db.ts";
+import { dataDir } from "./db-path.ts";
 import { resolveTmuxBin, tmuxSocketArgs, ensureDisclaimedServer, tmuxEnv } from "./tmux-resolution.ts";
 import { SCRUBBED_ENV_KEYS, childEnv, coreSpawn, coreSpawnSync } from "./core-spawn.ts";
 import { openReadNoFollow } from "./no-follow.ts";

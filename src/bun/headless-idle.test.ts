@@ -57,7 +57,7 @@ async function createClaudeTask(title: string) {
 
 test("hasRunningWork is false against an empty db", async () => {
   const { hasRunningWork } = await import("./headless.ts");
-  expect(hasRunningWork()).toBe(false);
+  expect(await hasRunningWork()).toBe(false);
 });
 
 test("a running run row makes hasRunningWork true", async () => {
@@ -83,7 +83,7 @@ test("a running run row makes hasRunningWork true", async () => {
   });
 
   try {
-    expect(hasRunningWork()).toBe(true);
+    expect(await hasRunningWork()).toBe(true);
   } finally {
     db.run(`DELETE FROM tasks WHERE id = ?`, [taskId]);
   }
@@ -114,7 +114,7 @@ test("a recent running subagent row makes hasRunningWork true with zero running 
 
     // The feature's core assertion: no running run row, yet a running
     // background agent alone is enough to report work in flight.
-    expect(hasRunningWork()).toBe(true);
+    expect(await hasRunningWork()).toBe(true);
   } finally {
     db.run(`DELETE FROM tasks WHERE id = ?`, [taskId]);
   }
@@ -142,10 +142,10 @@ test("settling the running subagent row makes hasRunningWork false again", async
       startedAt: Date.now(),
       endedAt: null,
     });
-    expect(hasRunningWork()).toBe(true);
+    expect(await hasRunningWork()).toBe(true);
 
     subagents.setStatus(agentId, "completed", Date.now());
-    expect(hasRunningWork()).toBe(false);
+    expect(await hasRunningWork()).toBe(false);
   } finally {
     db.run(`DELETE FROM tasks WHERE id = ?`, [taskId]);
   }
@@ -180,7 +180,7 @@ test("a running subagent row started past the 6h hold ceiling does not hold the 
       endedAt: null,
     });
 
-    expect(hasRunningWork()).toBe(false);
+    expect(await hasRunningWork()).toBe(false);
   } finally {
     db.run(`DELETE FROM tasks WHERE id = ?`, [taskId]);
   }

@@ -2165,6 +2165,21 @@ export function activeRunCount(): number {
 }
 
 /**
+ * Ids of the tasks this process is driving a run for (`active`) or still
+ * starting one for (`startingTaskIds`, held through the whole bounded-spawn
+ * pending window), each once. Synchronous on purpose: the desktop app's
+ * `before-quit` hook cannot await, and it unions this with its database
+ * snapshot (index.ts, `quitRunningTasks`), which can trail a fresh start by a
+ * read. Like `activeRunCount`, a claude run held open by background subagents
+ * is still in `active`, so it counts.
+ */
+export function liveRunTaskIds(): string[] {
+  const ids = new Set(startingTaskIds);
+  for (const run of active.values()) ids.add(run.taskId);
+  return [...ids];
+}
+
+/**
  * How many launches this process is still in the middle of: spawns that hold
  * a task's start claim (`startingTaskIds`, which covers the codex/cursor/…
  * one-shot launches and claude's own pre-JSONL spawn), claude sessions that

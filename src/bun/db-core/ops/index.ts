@@ -7,6 +7,8 @@ import { harnessStacksOps } from "./harness-stacks-ops.ts";
 import { pipelineOps } from "./pipeline-ops.ts";
 import { backlogOps } from "./backlog-ops.ts";
 import { orchestratorOps } from "./orchestrator-ops.ts";
+import { retentionOps } from "./retention-ops.ts";
+import { serverOps } from "./server-ops.ts";
 
 export { defineOp };
 export type { OpCtx, OpDef };
@@ -34,6 +36,8 @@ export const ops = {
   ...pipelineOps,
   ...backlogOps,
   ...orchestratorOps,
+  ...retentionOps,
+  ...serverOps,
 };
 
 export type OpRegistry = typeof ops;

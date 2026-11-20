@@ -1,7 +1,8 @@
 // MUST stay the first import: it sets the channel's default AGETOR_DATA_DIR /
 // API port as a side effect, and ESM evaluates imports in order — anything below
-// that reaches db.ts (which opens and migrates SQLite on import) would otherwise
-// open the wrong data dir (docs/plans/always-on-host.md §3.6).
+// that reaches db-path.ts (which resolves the data dir on import, and from it the
+// database file the worker opens) would otherwise use the wrong data dir
+// (docs/plans/always-on-host.md §3.6).
 import "./channel-defaults.ts";
 import { writeFileSync, existsSync } from "node:fs";
 import { isAbsolute } from "node:path";
@@ -10,17 +11,19 @@ import { rehydratePath } from "./login-path.ts";
 import { startApiServer, API_PORT, API_TOKEN, type ApiNative } from "./server.ts";
 import { CLI_TOKEN, DEFAULT_API_HOST, resolveApiHost } from "./api-config.ts";
 import { installCoreLog, registerLogSecret } from "./core-log.ts";
-import { setTaskDecorations } from "./db-async.ts";
+import { onRevChanged, runs, preferences, setTaskDecorations } from "./db-async.ts";
 import { awaitDbReady, createQuitSequencer, runQuitSequence } from "./boot-db.ts";
 import { countPendingForTask, pendingCountsByTask, preloadPipelineParents } from "./interactions.ts";
 import { countTerminals, terminalCountsByTask } from "./terminals.ts";
-import { db, harnesses, pidFilePath, tasks, dataDir, preferences } from "./db.ts";
+import { pidFilePath, dataDir } from "./db-path.ts";
+import { createRunningTasksSnapshot, quitRunningTasks } from "./running-tasks-snapshot.ts";
 import {
   freezeLaunches,
   startOpencodeServerDriver,
   stopOpencodeServersOnQuit,
   stopOpencodeServerDriver,
   launchesInFlight,
+  liveRunTaskIds,
   reconcileHarnessFailover,
   reconcileOrphans,
   reconcilePendingHarnessSwaps,
@@ -590,6 +593,18 @@ startPeriodicDiscovery();
 // The boot restore above is done: let the routes through (boot-gate.ts).
 markBootReady();
 
+// The quit prompt's running tasks, kept fresh in memory: the `before-quit`
+// hook below is synchronous and cannot await a database read. Re-read on task
+// revision changes, at most every 250 ms.
+const RUNNING_TASKS_SNAPSHOT_MIN_INTERVAL_MS = 250;
+const runningTasksSnapshot = createRunningTasksSnapshot({
+  read: () => runs.runningTasks(),
+  onChange: (cb) => onRevChanged(() => cb()),
+  minIntervalMs: RUNNING_TASKS_SNAPSHOT_MIN_INTERVAL_MS,
+  log: (m) => console.warn(m),
+});
+runningTasksSnapshot.start();
+
 // Complete (or visibly block) harness-stack swaps a restart interrupted. After
 // the gate: a completion mirrors config and copies a transcript, which must not
 // hold every route. Each task is claimed first, so a Run or message cannot race
@@ -740,18 +755,12 @@ Electrobun.events.on("before-quit", (event: { response?: { allow: boolean } }) =
     consumeQuitCompletely,
     gate: quitLaunchGate,
     hasSupervisor: supervisor !== null,
-    runningTaskIds: () => {
-      try {
-        return db
-          .query<{ task_id: string }, []>(`SELECT DISTINCT task_id FROM runs WHERE status = 'running'`)
-          .all()
-          .map((r) => r.task_id);
-      } catch {
-        // If the DB is unavailable for any reason, allow the quit — the cost
-        // of a missed warning is small; the cost of trapping the user is high.
-        return [];
-      }
-    },
+    // This hook cannot await. The database snapshot (`runningTasksSnapshot`)
+    // trails a fresh start by up to one read and keeps its last good answer
+    // while the database is unreadable, so it is unioned with the runs this
+    // process is driving or starting right now (`liveRunTaskIds`, read
+    // synchronously): a run started just before Quit is always named.
+    runningTaskIds: () => quitRunningTasks(runningTasksSnapshot.current(), liveRunTaskIds()).map((t) => t.taskId),
   });
   if (decision.kind === "veto") {
     event.response = { allow: false };
@@ -761,8 +770,9 @@ Electrobun.events.on("before-quit", (event: { response?: { allow: boolean } }) =
     broadcastAppEvent({
       type: "quit_request",
       runningRunCount: decision.runningTaskIds.length,
-      runningTaskTitles: decision.runningTaskIds
-        .map((id) => tasks.get(id)?.title ?? "")
+      runningTaskTitles: quitRunningTasks(runningTasksSnapshot.current(), liveRunTaskIds())
+        .filter((t) => decision.runningTaskIds.includes(t.taskId))
+        .map((t) => t.title)
         .filter((t) => t.length > 0)
         .slice(0, 10),
       backgroundArmed,

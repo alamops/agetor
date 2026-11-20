@@ -1,6 +1,6 @@
 import { Updater } from "electrobun/bun";
 import { publishGlobalEvent } from "./orchestrator.ts";
-import { dataDir } from "./db.ts";
+import { dataDir } from "./db-path.ts";
 import { writeHandbackMarker } from "./login-daemon-state.ts";
 import type { UpdateStatus } from "../shared/types.ts";
 

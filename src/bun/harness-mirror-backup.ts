@@ -27,7 +27,7 @@ import { lstatSync, mkdirSync } from "node:fs";
 import { lstat, open, rm, unlink } from "node:fs/promises";
 import path from "node:path";
 import { assertSafeRelPath, atomicWriteFile, copyRegularFileDetailed } from "./harness-file-transfer.ts";
-import { dataDir } from "./db.ts";
+import { dataDir } from "./db-path.ts";
 import { READ_NOFOLLOW } from "./no-follow.ts";
 import { isSafePathSegment } from "../shared/harness-mirror.ts";
 

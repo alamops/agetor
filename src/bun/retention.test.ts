@@ -742,23 +742,23 @@ describe("retention_swept_tasks record under concurrent task changes", () => {
 // ---------------------------------------------------------------------------
 
 describe("requestRetentionPass / configuredRetentionDays", () => {
-  test("configuredRetentionDays follows the preference and the env kill switch", () => {
-    expect(ret.configuredRetentionDays()).toBe(30); // absent → default
+  test("configuredRetentionDays follows the preference and the env kill switch", async () => {
+    expect(await ret.configuredRetentionDays()).toBe(30); // absent → default
     dbm.preferences.set(ARCHIVED_HISTORY_RETENTION_PREF, "off");
-    expect(ret.configuredRetentionDays()).toBeNull();
+    expect(await ret.configuredRetentionDays()).toBeNull();
     dbm.preferences.set(ARCHIVED_HISTORY_RETENTION_PREF, "OFF");
-    expect(ret.configuredRetentionDays()).toBeNull();
+    expect(await ret.configuredRetentionDays()).toBeNull();
     dbm.preferences.set(ARCHIVED_HISTORY_RETENTION_PREF, "45");
-    expect(ret.configuredRetentionDays()).toBe(45);
+    expect(await ret.configuredRetentionDays()).toBe(45);
     dbm.preferences.set(ARCHIVED_HISTORY_RETENTION_PREF, "garbage");
-    expect(ret.configuredRetentionDays()).toBeNull(); // unparsable → off (fail closed)
+    expect(await ret.configuredRetentionDays()).toBeNull(); // unparsable → off (fail closed)
     dbm.preferences.set(ARCHIVED_HISTORY_RETENTION_PREF, "0");
-    expect(ret.configuredRetentionDays()).toBeNull(); // an off-word, never the default
+    expect(await ret.configuredRetentionDays()).toBeNull(); // an off-word, never the default
     dbm.preferences.set(ARCHIVED_HISTORY_RETENTION_PREF, "45");
     process.env.AGETOR_ARCHIVED_HISTORY_RETENTION = "0";
-    expect(ret.configuredRetentionDays()).toBeNull(); // env wins over the pref
+    expect(await ret.configuredRetentionDays()).toBeNull(); // env wins over the pref
     delete process.env.AGETOR_ARCHIVED_HISTORY_RETENTION;
-    expect(ret.configuredRetentionDays()).toBe(45);
+    expect(await ret.configuredRetentionDays()).toBe(45);
   });
 
   test("a request while a pass is running queues exactly one re-run", async () => {
@@ -818,7 +818,7 @@ describe("dbStats / compactDatabase", () => {
     const result = await ret.runArchivedHistoryRetentionPass({ now, days: 30 });
     log.mockRestore();
 
-    const stats = ret.dbStats(3);
+    const stats = await ret.dbStats(3);
     expect(Object.keys(stats).sort()).toEqual(
       ["activeRunCount", "compactEstimateSec", "fileBytes", "freelistCount", "pageCount", "pageSize", "reclaimableBytes", "retention", "walBytes"],
     );
@@ -837,7 +837,7 @@ describe("dbStats / compactDatabase", () => {
     expect(stats.retention.lastRunAt).toBeGreaterThan(0);
 
     dbm.preferences.set(ARCHIVED_HISTORY_RETENTION_PREF, "off");
-    expect(ret.dbStats(0).retention.days).toBeNull();
+    expect((await ret.dbStats(0)).retention.days).toBeNull();
   });
 
   test("dbStats reports running while a pass is in flight", async () => {
@@ -845,10 +845,10 @@ describe("dbStats / compactDatabase", () => {
     const now = Date.now();
     seedTask(now - 40 * DAY, { heavy: 20 });
     const pass = ret.runArchivedHistoryRetentionPass({ now, days: 30, sliceMs: 0 });
-    expect(ret.dbStats(0).retention.running).toBe(true);
+    expect((await ret.dbStats(0)).retention.running).toBe(true);
     await pass;
     log.mockRestore();
-    expect(ret.dbStats(0).retention.running).toBe(false);
+    expect((await ret.dbStats(0)).retention.running).toBe(false);
   });
 
   test("compactDatabase refuses while a pass is running", async () => {
@@ -856,7 +856,7 @@ describe("dbStats / compactDatabase", () => {
     const now = Date.now();
     seedTask(now - 40 * DAY, { heavy: 20 });
     const pass = ret.runArchivedHistoryRetentionPass({ now, days: 30, sliceMs: 0 });
-    expect(() => ret.compactDatabase()).toThrow(/retention pass is running/);
+    await expect(ret.compactDatabase()).rejects.toThrow(/retention pass is running/);
     await pass;
     log.mockRestore();
   });
@@ -870,14 +870,14 @@ describe("dbStats / compactDatabase", () => {
     log.mockRestore();
 
     const eventsBefore = dbm.runs.events(old.runIds[0]!).length;
-    expect(ret.dbStats(0).freelistCount).toBeGreaterThan(0); // trimming freed overflow pages
+    expect((await ret.dbStats(0)).freelistCount).toBeGreaterThan(0); // trimming freed overflow pages
 
-    const result = ret.compactDatabase();
+    const result = await ret.compactDatabase();
     expect(result.beforeBytes).toBeGreaterThan(0);
     expect(result.afterBytes).toBeLessThan(result.beforeBytes);
     expect(result.durationMs).toBeGreaterThanOrEqual(0);
 
-    const stats = ret.dbStats(0);
+    const stats = await ret.dbStats(0);
     expect(stats.freelistCount).toBe(0);
     expect(stats.reclaimableBytes).toBe(0);
     expect(stats.walBytes).toBe(0);
