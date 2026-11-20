@@ -474,6 +474,27 @@ function logCursorAskWriteError(err: unknown): void {
   console.error("[interactions] cursor ask write failed", err);
 }
 
+let cardRegisteredListener: ((taskId: string) => void) | null = null;
+
+/**
+ * A listener called synchronously each time a card is registered for a task
+ * (any kind), so a module that needs the task's harness in a synchronous check
+ * can load it. Returns the previous listener (tests restore it).
+ */
+export function setCardRegisteredListener(fn: ((taskId: string) => void) | null): ((taskId: string) => void) | null {
+  const prev = cardRegisteredListener;
+  cardRegisteredListener = fn;
+  return prev;
+}
+
+function noteCardRegistered(taskId: string): void {
+  try {
+    cardRegisteredListener?.(taskId);
+  } catch (e) {
+    console.error("[interactions] card listener failed", e);
+  }
+}
+
 /** The orchestrator installs its SSE fan-out. Returns the previous fn. */
 export function setRunEventEmitter(fn: RunEventEmitter): RunEventEmitter {
   const prev = emitRunEvent;
@@ -614,6 +635,7 @@ export function registerScrapedAskQuestions(args: {
   };
   // No awaiter — the answer is driven via send-keys, not a promise resolve.
   askQuestions.set(id, { req, resolve: () => { /* scraper-sourced: no hook promise */ } });
+  noteCardRegistered(req.taskId);
   // The orchestrator's `emit` fan-out has no per-listener try/catch, so a
   // throwing listener must not strand this entry as a phantom pending card.
   try {
@@ -750,6 +772,7 @@ export function registerCursorAskQuestions(args: RegisterCursorAskArgs): {
     resolveCursor = resolve;
   });
   askQuestions.set(id, { req, resolve: () => { /* cursor: the awaiter is resolveCursor */ }, resolveCursor, cursorAnswer });
+  noteCardRegistered(req.taskId);
   cursorAskByTool.set(key, id);
   try {
     broadcast(req);
@@ -874,6 +897,7 @@ export function registerTmuxPrompt(args: {
   };
   const answer = new Promise<TmuxPromptAnswer>((resolve) => {
     tmuxPrompts.set(id, { req, resolve });
+    noteCardRegistered(req.taskId);
   });
   // The orchestrator's `emit` fan-out has no per-listener try/catch, so a
   // throwing listener must not strand this entry as a phantom pending card.
@@ -961,6 +985,7 @@ export function registerFxPermission(args: {
   };
   const answer = new Promise<FxPermissionAnswer>((resolve) => {
     fxPermissions.set(id, { req, resolve });
+    noteCardRegistered(req.taskId);
   });
   // The orchestrator's `emit` fan-out has no per-listener try/catch, so a
   // throwing listener must not strand this entry as a phantom pending card.
@@ -1106,6 +1131,7 @@ export function registerOpencodePermission(args: {
   };
   fxPermissions.set(id, entry);
   opencodePermByRequest.set(key, id);
+  noteCardRegistered(entry.req.taskId);
   try {
     broadcast(req);
   } catch (err) {
@@ -1199,6 +1225,7 @@ export function registerOpencodeAskQuestions(args: {
   };
   askQuestions.set(id, entry);
   opencodeAskByForm.set(key, id);
+  noteCardRegistered(entry.req.taskId);
   try {
     broadcast(req);
   } catch (err) {

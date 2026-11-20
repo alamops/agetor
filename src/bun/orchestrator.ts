@@ -1604,7 +1604,7 @@ export async function reconcileOrphans(): Promise<number> {
   // A server=agetor task whose last turn is over but whose background subagents
   // still run on the server (after a restart or a hand-over): listen for them
   // again instead of orphaning their rows.
-  const lingeredTaskIds = opencodeServer.lingerHeldTasks(reattachedTaskIds);
+  const lingeredTaskIds = await opencodeServer.lingerHeldTasks(reattachedTaskIds);
   for (const heldId of heldTaskIds) {
     const task = tasks.get(heldId);
     if (!task) continue;
@@ -1622,7 +1622,7 @@ export async function reconcileOrphans(): Promise<number> {
     const openCodeTailLive =
       heldKind === "opencode" && (opencodeSessionActive(heldId) || hasOpencodeServerTurn(heldId) || lingeredTaskIds.has(heldId));
     if (!openCodeTailLive) {
-      released += orphanRunningOpencodeSubagents(heldId, "agetor restarted while it was running");
+      released += await orphanRunningOpencodeSubagents(heldId, "agetor restarted while it was running");
     }
     if (heldKind !== "claude-code") {
       // A live OpenCode tail owns its own rows (its `beforeSettle` retires
@@ -6117,7 +6117,7 @@ function attachDoneHandler(
       active.delete(runId);
       settlingTurnRuns.set(runId, taskId);
       // First thing, so nothing below can leave a settled server turn counted as busy.
-      const wasOpencodeServerRun = forgetOpencodeServerTurn(runId);
+      const wasOpencodeServerRun = await forgetOpencodeServerTurn(runId);
       // Nothing can arrive for a run that's no longer running — drop its
       // sent-files scratch space (plan §3 decision 4) so it can't leak.
       pendingSentFilesByRun.delete(runId);
@@ -6300,7 +6300,7 @@ function attachDoneHandler(
       const wasUnknownCommand = handle?.unknownCommand ?? false;
       active.delete(runId);
       settlingTurnRuns.set(runId, taskId);
-      const wasOpencodeServerRun = forgetOpencodeServerTurn(runId);
+      const wasOpencodeServerRun = await forgetOpencodeServerTurn(runId);
       pendingSentFilesByRun.delete(runId);
       // A driver that rejects after emitting a limit signal still has a stack
       // settlement to run (e.g. the CLI exits non-zero on the limit notice).
@@ -8115,11 +8115,11 @@ async function stopHeldTask(taskId: string, reason: string): Promise<void> {
   // subagents (which interrupts them) and retires their rows to release the
   // hold. Whatever the server runs on the session afterwards is a wake like
   // any other (plan R3): it becomes a run and pulls the card back.
-  if (isOpencodeServerTask(taskId)) {
+  if (await isOpencodeServerTask(taskId)) {
     noteOpencodeStopRequested(taskId);
     dropDeferredOpencodeWake(taskId);
     await disposeLingeringOpencodeTurns(taskId);
-    orphanRunningOpencodeSubagents(taskId, reason);
+    await orphanRunningOpencodeSubagents(taskId, reason);
     return;
   }
   // Ordering rule (§7 of the async-warmup plan): the interrupt must complete
@@ -10125,13 +10125,13 @@ async function dropOpencodeTask(taskId: string, reason: string): Promise<void> {
   // through a persisted tombstone (migration 083): a deleted task's runs are
   // about to go, and the watch otherwise names only a task's last session (an
   // archived task's older ones, or the old harness's after a switch).
-  tombstoneOpencodeSessionsOfTask(taskId);
+  await tombstoneOpencodeSessionsOfTask(taskId);
   await stopOpencodeServerTurnsOfTask(taskId, reason);
   // With or without a local handle: what the server still runs for the task
   // (its sessions, then their executing subagents) is interrupted over HTTP.
   await interruptOpencodeSessionsOfDroppedTask(taskId);
   await dropOpencodeSession(taskId);
-  orphanRunningOpencodeSubagents(taskId, reason);
+  await orphanRunningOpencodeSubagents(taskId, reason);
   scheduleOpencodeWatchRefresh();
 }
 
@@ -10154,7 +10154,7 @@ async function reattachOpencodeTurn(
 ): Promise<SpawnedAgent | null> {
   const harness = resolveHarness(harnessId);
   if (!harness) return null;
-  const turn = opencodeTurnOfRun(runId);
+  const turn = await opencodeTurnOfRun(runId);
   const major = turn?.major ?? opencodeMajor(await cachedCliVersion(harness));
   const standalone = turn?.server === "standalone";
   const { onSubagent, beforeSettle } = opencodeDriverHooks({ taskId, runId, harness, cwd, major, standalone });

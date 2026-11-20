@@ -1,4 +1,4 @@
-import { afterAll, expect, test } from "bun:test";
+import { afterAll, expect, spyOn, test } from "bun:test";
 import { randomUUID } from "node:crypto";
 import { appendFileSync, mkdirSync, mkdtempSync, rmSync, statSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
@@ -959,4 +959,49 @@ test("importedTaskPrompt unwraps the hidden continuation as sent and as claude d
   // An empty wrapper falls back to the title; no prompt at all uses it too.
   expect(importedTaskPrompt(wrapHarnessStackContinuation(""), "the title")).toBe("the title");
   expect(importedTaskPrompt(null, "the title")).toBe("the title");
+});
+
+test("a long transcript is stored a slice at a time: batched appendEvents calls, never one appendEvent per line", async () => {
+  const home = scratchDir("cc-import-batch-home-");
+  const cwd = path.join(home, "repo");
+  mkdirSync(cwd, { recursive: true });
+  const sessionId = `batch-${randomUUID()}`;
+  const lines: unknown[] = [];
+  for (let i = 0; i < 600; i++) {
+    lines.push({
+      type: i % 2 === 0 ? "user" : "assistant",
+      uuid: `${sessionId}-${i}`,
+      cwd,
+      timestamp: "2026-10-01T00:00:00.000Z",
+      message: i % 2 === 0
+        ? { role: "user", content: `question ${i}` }
+        : { role: "assistant", content: [{ type: "text", text: `answer ${i}` }], stop_reason: "end_turn" },
+    });
+  }
+  const config = plant({ home, sessionId, cwd, lines });
+  const rpc = (await import("./db-rpc.ts")).getDbRpc();
+  const seen: string[] = [];
+  const realCall = rpc.call.bind(rpc);
+  const spy = spyOn(rpc, "call").mockImplementation(((module: string, method: string, args: unknown[]) => {
+    seen.push(`${module}.${method}`);
+    return realCall(module as never, method, args);
+  }) as never);
+  let result;
+  try {
+    const imported = await importClaudeSessions([sessionId], baseOpts(home, config));
+    result = imported.results[0]!;
+    expect(result.error).toBeUndefined();
+    await pendingImportBackfill(result.taskId!);
+  } finally {
+    spy.mockRestore();
+  }
+  const task = tasks.get(result.taskId!)!;
+  expect(task.importedClaude?.status).toBe("ready");
+  const stored = runs.seenLineUuidsForRun(task.runId!);
+  for (let i = 0; i < 600; i++) expect(stored.has(`${sessionId}-${i}`)).toBe(true);
+  // Far fewer calls than lines, and none of them a per-line append.
+  expect(seen).not.toContain("runs.appendEvent");
+  const batches = seen.filter((c) => c === "runs.appendEvents").length;
+  expect(batches).toBeGreaterThanOrEqual(1);
+  expect(batches).toBeLessThan(100);
 });

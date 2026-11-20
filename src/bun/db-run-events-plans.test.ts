@@ -312,6 +312,22 @@ function invocationTable(s: Seed): Record<string, Invocation[]> {
         run: () => runs.appendEvent(s.runId, "status", "plan-guard append ts", null, null, 1_700_000_000_000),
       },
     ],
+    "runs.appendEvents": [
+      {
+        label: "appendEvents batch (keyed, unkeyed, subagent)",
+        run: () =>
+          runs.appendEvents(s.runId, [
+            { stream: "status", data: "plan-guard batch 0" },
+            { stream: "assistant", data: "plan-guard batch 1", lineUuid: `pg-${randomUUID()}`, subagentId: s.subagentId },
+          ]),
+      },
+    ],
+    "runs.firstStatusDataWithPrefixes": [
+      {
+        label: "firstStatusDataWithPrefixes(runIds, prefixes)",
+        run: () => runs.firstStatusDataWithPrefixes([s.runId, s.runId], ["opencode 2.x · server=", "opencode 1.x · server="]),
+      },
+    ],
     "runs.seenLineUuidsForTask": [
       { label: "seenLineUuidsForTask(taskId)", run: () => runs.seenLineUuidsForTask(s.taskId) },
     ],

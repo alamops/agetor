@@ -1632,10 +1632,10 @@ describe("cards shared between drivers, re-lists and stops (review round 2)", ()
     const t = start(run);
     expect(await doneWithin(t)).toBe(0);
     await waitFor(() => pending(taskId).length === 1, 10_000, "the child's permission card");
-    expect(wasOpencodeChildStoppedByAgetor(children[0]!)).toBe(false);
+    expect(await wasOpencodeChildStoppedByAgetor(children[0]!)).toBe(false);
     await t.dispose();
-    expect(wasOpencodeChildStoppedByAgetor(children[0]!)).toBe(true);
-    expect(wasOpencodeChildStoppedByAgetor(t.sessionId()!)).toBe(false);
+    expect(await wasOpencodeChildStoppedByAgetor(children[0]!)).toBe(true);
+    expect(await wasOpencodeChildStoppedByAgetor(t.sessionId()!)).toBe(false);
     void fake;
   });
 
@@ -2045,8 +2045,8 @@ describe("Stop order, wake take-over, sends and child syncs (review round 3)", (
         await sleep(20);
       }
     }
-    registerOpencodeChildSession({ taskId, runId, parentSessionId: sid, childSessionId: child, depth: 1, background: true });
-    if (orphan) expect(orphanRunningOpencodeChildrenOfTask(taskId)).toBe(1);
+    await registerOpencodeChildSession({ taskId, runId, parentSessionId: sid, childSessionId: child, depth: 1, background: true });
+    if (orphan) expect(await orphanRunningOpencodeChildrenOfTask(taskId)).toBe(1);
     return { taskId, runId, sid, child };
   }
 
@@ -2076,7 +2076,7 @@ describe("Stop order, wake take-over, sends and child syncs (review round 3)", (
     // The live child waits on a permission; neither row was orphaned (the core died with both `running`).
     const { taskId, runId, sid, child: live } = await crashLeftover(fake, true, false);
     const dead = (await rawPost(fake, "/api/session", { parentID: sid, title: "cut off" })).data.id as string;
-    registerOpencodeChildSession({ taskId, runId, parentSessionId: sid, childSessionId: dead, depth: 1, background: true });
+    await registerOpencodeChildSession({ taskId, runId, parentSessionId: sid, childSessionId: dead, depth: 1, background: true });
     const rowOf = (child: string) => childRows(taskId).find((r) => opencodeChildSessionOf(r) === child)!;
     expect([rowOf(live).status, rowOf(dead).status]).toEqual(["running", "running"]);
     const t = start(mk({ ...inprocArgs, taskId, runId, prompt: "after the crash", mode: "ask", resumeSessionId: sid }));

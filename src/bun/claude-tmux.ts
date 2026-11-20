@@ -10,7 +10,7 @@ import { open } from "node:fs/promises";
 import { homedir } from "node:os";
 import path from "node:path";
 import { createHash } from "node:crypto";
-import { runs, tasks } from "./db.ts";
+import { runs, tasks } from "./db-async.ts";
 import { effectiveClaudeConfigDir } from "./harness-discovery.ts";
 import { beginLagLabel } from "./event-loop-lag.ts";
 import { attachSubagentWatcher, detachWatcherFor, orphanRunningSubagents, subagentActivityWithin, type SubagentWatcherHandle } from "./claude-subagents.ts";
@@ -4274,8 +4274,10 @@ async function pollAskModalStillUp(
 
 async function collectAndRegisterAskCard(state: SessionState, firstTail: string): Promise<void> {
   if (state.askCollecting || state.askCardId) return;
-  const runId = tasks.get(state.taskId)?.runId;
+  const runId = (await tasks.get(state.taskId))?.runId;
   if (!runId) return;
+  // Re-check after the await: another tick may have started collecting.
+  if (state.askCollecting || state.askCardId) return;
   state.askCollecting = true;
   try {
     // Cheap first attempt: the JSONL tool_use. Claude writes it only when the
@@ -4875,11 +4877,13 @@ export interface JsonlReplayLine {
  * the whole stream — splitting a file across calls would fire a staged
  * `end_turn` at each slice's EOF. `pull` may return the next line
  * synchronously; a promise means the next chunk is still being read.
+ * `onProgress` runs at every slice boundary and once at the end; it may return
+ * a promise, which is awaited before the replay goes on.
  */
 export async function replayJsonlLines(
   pull: () => JsonlReplayLine | null | Promise<JsonlReplayLine | null>,
   onChunk: ChunkHandler,
-  opts?: { sliceMs?: number; onProgress?: (bytesConsumed: number) => void },
+  opts?: { sliceMs?: number; onProgress?: (bytesConsumed: number) => void | Promise<void> },
 ): Promise<void> {
   const sliceMs = opts?.sliceMs ?? 20;
   const state = makeSessionState({
@@ -4899,13 +4903,15 @@ export async function replayJsonlLines(
     if (piece.line.trim()) dispatchLine(state, piece.line);
     consumed += piece.bytes;
     if (Date.now() - sliceStart >= sliceMs) {
-      opts?.onProgress?.(consumed);
+      // Awaited: a caller that stores what the slice produced (a session
+      // import's batch) finishes doing so before the next slice starts.
+      await opts?.onProgress?.(consumed);
       await new Promise((r) => setImmediate(r));
       sliceStart = Date.now();
     }
   }
   if (state.pendingEndTurn) firePendingEndTurn(state);
-  opts?.onProgress?.(consumed);
+  await opts?.onProgress?.(consumed);
 }
 
 function isReplayPromise(
@@ -7819,8 +7825,12 @@ async function scrapeOnce(state: SessionState): Promise<void> {
   // interaction so the run panel can scope correctly; without one the
   // prompt would float unattached. Idle tasks (no run) skip — there's
   // nothing for the user to react to without an active session anyway.
-  const runId = tasks.get(state.taskId)?.runId;
+  const runId = (await tasks.get(state.taskId))?.runId;
   if (!runId) return;
+  // The lookup above is a database round trip: re-run the guards that were
+  // checked before it, so an overlapping tick cannot register a duplicate card.
+  if (state.drivingPrompt) return;
+  if (findTmuxPromptByFingerprint(state.taskId, match.fingerprint)) return;
 
   registerTmuxPrompt({
     taskId: state.taskId,
@@ -8641,13 +8651,14 @@ async function attachTailer(state: SessionState): Promise<{ watcherMs: number }>
   // dispose a prior handle first so a re-attach (reconcileOrphans defensive
   // overwrite) can't leave two watchers polling the same dir.
   state.subagentWatcher?.detach();
+  const attachRunId = (await tasks.get(state.taskId))?.runId;
   const watcher = attachSubagentWatcher({
     taskId: state.taskId,
     jsonlPath: state.jsonlPath,
     // For stall attribution only (the watcher's lag labels name the run);
     // `task.runId` is set before any spawn/reattach reaches here, and an
     // unknown run just means an unattributed label.
-    runId: tasks.get(state.taskId)?.runId ?? undefined,
+    runId: attachRunId ?? undefined,
     onApiError: (info) => signalSubagentApiError(state, info),
   });
   state.subagentWatcher = watcher;
@@ -9285,7 +9296,7 @@ export async function spawnClaudeViaTmux(opts: ClaudeLaunchOptions): Promise<Spa
           if (state.recentlyAnsweredFingerprints.has(generic.fingerprint)) continue;
           // Need an active run to attach the interaction to. The orchestrator
           // sets task.runId before spawning, so this is populated by boot time.
-          const runId = tasks.get(opts.taskId)?.runId;
+          const runId = (await tasks.get(opts.taskId))?.runId;
           if (!runId) continue;
           registerTmuxPrompt({
             taskId: opts.taskId,
@@ -9444,7 +9455,7 @@ export async function reattachSession(opts: ReattachOptions): Promise<SpawnedAge
   // runs in `finally`, so a throw or the `null` early return can't leak it.
   const endLagLabel = beginLagLabel(`reattach session · task ${opts.taskId}`, {
     taskId: opts.taskId,
-    runId: tasks.get(opts.taskId)?.runId ?? undefined,
+    runId: (await tasks.get(opts.taskId))?.runId ?? undefined,
   });
   try {
     return await reattachSessionBody(opts);
@@ -9483,6 +9494,8 @@ async function reattachSessionBody(opts: ReattachOptions): Promise<SpawnedAgent 
   // Conservatively assume not (bypassEnabled defaults to false) — cycling
   // to bypass after a restart needs a respawn (claude requires the flag
   // at launch anyway).
+  const reattachRunId = (await tasks.get(opts.taskId))?.runId ?? null;
+  const reattachRunLineUuids = reattachRunId ? await runs.seenLineUuidsForRun(reattachRunId) : new Set<string>();
   const state = makeSessionState({
     taskId: opts.taskId,
     sessionName,
@@ -9496,10 +9509,7 @@ async function reattachSessionBody(opts: ReattachOptions): Promise<SpawnedAgent 
     // Empty when this task has no run row yet — not `undefined`, which would
     // stage every historical end_turn. Imported uuids live on the seed run,
     // so they are absent from this set.
-    currentRunLineUuids: (() => {
-      const runId = tasks.get(opts.taskId)?.runId ?? null;
-      return runId ? runs.seenLineUuidsForRun(runId) : new Set<string>();
-    })(),
+    currentRunLineUuids: reattachRunLineUuids,
     onEndOfTurn: () => resolveDone?.(0),
     // Seed the chip-suppression baseline from the task's mode so the
     // offset-0 JSONL replay doesn't re-announce a mode the prior process

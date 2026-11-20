@@ -5,6 +5,7 @@ import { harnessMirrorOps } from "./harness-mirror-ops.ts";
 import { bundleOps } from "./bundle-ops.ts";
 import { harnessStacksOps } from "./harness-stacks-ops.ts";
 import { pipelineOps } from "./pipeline-ops.ts";
+import { backlogOps } from "./backlog-ops.ts";
 
 export { defineOp };
 export type { OpCtx, OpDef };
@@ -30,6 +31,7 @@ export const ops = {
   ...bundleOps,
   ...harnessStacksOps,
   ...pipelineOps,
+  ...backlogOps,
 };
 
 export type OpRegistry = typeof ops;

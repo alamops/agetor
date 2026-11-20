@@ -931,6 +931,28 @@ export function makeRuns(conn: Database) {
       );
       return { id: Number(result.lastInsertRowid), ts: stamp };
     },
+    /**
+     * Several `appendEvent` calls on one run in ONE transaction, in order: one
+     * thread hop and one commit for a whole batch (a session import's chunk, a
+     * child session's catch-up slice) instead of one per row. Each result is
+     * what `appendEvent` would have returned for that item (`null` when the
+     * `INSERT OR IGNORE` dedup hit an existing `(run_id, line_uuid)` row), in
+     * the same order. A throw rolls the whole batch back.
+     */
+    appendEvents(
+      runId: string,
+      items: ReadonlyArray<{
+        stream: RunEventStream;
+        data: string;
+        lineUuid?: string | null;
+        subagentId?: string | null;
+        ts?: number;
+      }>,
+    ): Array<AppendedEvent | null> {
+      return conn.transaction(() =>
+        items.map((it) => runs.appendEvent(runId, it.stream, it.data, it.lineUuid ?? null, it.subagentId ?? null, it.ts)),
+      ).immediate();
+    },
     /** Line uuids persisted on one run. Seeds `currentRunLineUuids` on
      *  reattach so a historical `end_turn` that lives on a different run
      *  (an imported seed run) dedups without staging. Uses the partial unique
@@ -1159,6 +1181,20 @@ export function makeRuns(conn: Database) {
        ORDER BY id DESC LIMIT 1`,
       ).get(runId, `${prefix}%`);
       return row?.data ?? null;
+    },
+    /** `lastStatusDataWithPrefix` for many runs at once, one result per run in
+     *  the order of `runIds`: the data of the run's newest matching status
+     *  event for the FIRST of `prefixes` that has one, else null. One call (one
+     *  thread hop) for a list, where a caller would otherwise await once per
+     *  run; each lookup is the same indexed query. */
+    firstStatusDataWithPrefixes(runIds: readonly string[], prefixes: readonly string[]): Array<string | null> {
+      return runIds.map((runId) => {
+        for (const prefix of prefixes) {
+          const data = runs.lastStatusDataWithPrefix(runId, prefix);
+          if (data !== null) return data;
+        }
+        return null;
+      });
     },
     /** One keyset page of a run's `tool_result` rows that archived-history
      *  retention may trim: payload over `minBytes` (UTF-8 bytes — `LENGTH` of a

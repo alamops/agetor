@@ -25,8 +25,8 @@ import {
   projects,
   runs,
   tasks,
-  type AppendedEvent,
-} from "./db.ts";
+} from "./db-async.ts";
+import { appendAndEmit } from "./run-emit-queue.ts";
 import { createTask, emitRunEvent } from "./orchestrator.ts";
 import { harnessEnv, resolveBin } from "./agents.ts";
 import { cachedCliVersion } from "./agent-status.ts";
@@ -109,8 +109,8 @@ function withCommitLock<T>(sessionId: string, fn: () => Promise<T>): Promise<T> 
   return run;
 }
 
-function sessionAlreadyBound(sessionId: string): boolean {
-  return tasks.findTaskByImportedOpencodeSession(sessionId) != null || runs.hasOpencodeSessionId(sessionId);
+async function sessionAlreadyBound(sessionId: string): Promise<boolean> {
+  return (await tasks.findTaskByImportedOpencodeSession(sessionId)) != null || (await runs.hasOpencodeSessionId(sessionId));
 }
 
 class ImportDeleted extends Error {
@@ -175,8 +175,8 @@ function exportFailedMessage(sessionId: string): string {
   return `couldn't read OpenCode session ${sessionId} — \`opencode session export\` failed`;
 }
 
-function requireTask(taskId: string): ImportedOpencodeSession {
-  const task = tasks.get(taskId);
+async function requireTask(taskId: string): Promise<ImportedOpencodeSession> {
+  const task = await tasks.get(taskId);
   if (!task) throw new ImportDeleted();
   if (!task.importedOpencode) throw new Error("task lost its import record");
   return task.importedOpencode;
@@ -185,18 +185,18 @@ function requireTask(taskId: string): ImportedOpencodeSession {
 /** Mark an in-flight import failed. A row that does not hold the session
  *  claim is updated in the JSON only — writing the claim would throw on the
  *  unique index and leave the row `importing` forever. */
-function failImport(taskId: string, message: string): void {
-  const current = tasks.get(taskId);
+async function failImport(taskId: string, message: string): Promise<void> {
+  const current = await tasks.get(taskId);
   if (!current?.importedOpencode) return;
   const next: ImportedOpencodeSession = { ...current.importedOpencode, status: "failed", error: message };
-  if (tasks.importedOpencodeSessionHeldElsewhere(taskId, next.sessionId)) {
-    tasks.setImportedOpencode(taskId, next, { claim: false });
+  if (await tasks.importedOpencodeSessionHeldElsewhere(taskId, next.sessionId)) {
+    await tasks.setImportedOpencode(taskId, next, { claim: false });
   } else {
     try {
-      tasks.setImportedOpencode(taskId, next);
+      await tasks.setImportedOpencode(taskId, next);
     } catch (err) {
       if (!(err instanceof ImportedOpencodeSessionTaken)) throw err;
-      tasks.setImportedOpencode(taskId, next, { claim: false });
+      await tasks.setImportedOpencode(taskId, next, { claim: false });
     }
   }
   // The webview's handler for this event only refetches tasks; the payload
@@ -227,30 +227,30 @@ function seedRun(task: Task, provenance: ImportedOpencodeSession, runId: string,
 /** Reattach or recreate the seed run of an import left `importing` (a crash
  *  between the claim and the seed insert). Provenance is written first, so
  *  this repair can always find the task. */
-function ensureSeedRun(task: Task): string {
+async function ensureSeedRun(task: Task): Promise<string> {
   const provenance = task.importedOpencode;
   if (!provenance) throw new Error("task lost its import record");
-  if (task.runId && runs.get(task.runId)) return task.runId;
-  const existing = runs.listForTask(task.id).find(
+  if (task.runId && (await runs.get(task.runId))) return task.runId;
+  const existing = (await runs.listForTask(task.id)).find(
     (r) => r.origin === "imported" && r.opencodeSessionId === provenance.sessionId,
   );
   const runId = existing?.id ?? randomUUID();
-  if (!existing) runs.insert(seedRun(task, provenance, runId, Date.now()));
-  tasks.update(task.id, { runId, column: "review" });
+  if (!existing) await runs.insert(seedRun(task, provenance, runId, Date.now()));
+  await tasks.update(task.id, { runId, column: "review" });
   return runId;
 }
 
 /** The harness whose state holds the session: the one it was listed under,
  *  else the task's own harness. */
-function exportHarnessFor(task: Task, provenance: ImportedOpencodeSession): Harness | null {
-  const listed = harnesses.get(provenance.harnessId);
+async function exportHarnessFor(task: Task, provenance: ImportedOpencodeSession): Promise<Harness | null> {
+  const listed = await harnesses.get(provenance.harnessId);
   if (listed?.kind === "opencode") return listed;
-  const own = harnesses.getByIdOrKind(task.agent);
+  const own = await harnesses.getByIdOrKind(task.agent);
   return own?.kind === "opencode" ? own : null;
 }
 
 async function exportFor(task: Task, provenance: ImportedOpencodeSession): Promise<OpencodeExport> {
-  const harness = exportHarnessFor(task, provenance);
+  const harness = await exportHarnessFor(task, provenance);
   if (!harness) throw new Error(`OpenCode harness "${provenance.harnessId}" no longer exists`);
   const major = opencodeMajor(await cachedCliVersion(harness));
   const exp = await runOpencodeExport({
@@ -279,36 +279,66 @@ async function writeEvents(
   events: ReadonlyArray<{ stream: RunEventStream; data: string; lineUuid: string }>,
   sliceMs: number,
 ): Promise<void> {
-  if (!tasks.exists(taskId)) throw new ImportDeleted();
+  if (!(await tasks.exists(taskId))) throw new ImportDeleted();
   let lastAssistant: number | null = null;
-  const flushAssistant = () => {
+  const flushAssistant = async (): Promise<void> => {
     if (lastAssistant != null) {
-      tasks.noteAssistantEvent(taskId, lastAssistant);
+      const id = lastAssistant;
       lastAssistant = null;
+      await tasks.noteAssistantEvent(taskId, id);
     }
+  };
+  // A slice's events are stored in one transaction and sent live in id order
+  // (`appendAndEmit`): one thread hop per batch, not per event. A batch ends at
+  // the slice time, or at the count / byte caps (the events are already in
+  // memory, so the slice time alone would not bound a batch's size).
+  let batch: Array<{ stream: RunEventStream; data: string; lineUuid: string }> = [];
+  let batchBytes = 0;
+  const flushBatch = async (): Promise<void> => {
+    if (batch.length === 0) return;
+    const items = batch;
+    batch = [];
+    batchBytes = 0;
+    let rows;
+    try {
+      rows = await appendAndEmit(
+        runId,
+        () => runs.appendEvents(runId, items.map((it) => ({ stream: it.stream, data: it.data, lineUuid: it.lineUuid, subagentId: null }))),
+        (stored) => {
+          stored.forEach((row, i) => {
+            if (row == null) return;
+            const it = items[i]!;
+            emitRunEvent({ id: row.id, runId, taskId, stream: it.stream, data: it.data, ts: row.ts });
+          });
+        },
+      );
+    } catch (err) {
+      if (!(await tasks.exists(taskId))) throw new ImportDeleted();
+      throw err;
+    }
+    rows.forEach((row, i) => {
+      if (row != null && items[i]!.stream === "assistant") lastAssistant = row.id;
+    });
   };
   let sliceStart = performance.now();
   for (const ev of events) {
-    let row: AppendedEvent | null;
-    try {
-      row = runs.appendEvent(runId, ev.stream, ev.data, ev.lineUuid, null);
-    } catch (err) {
-      if (!tasks.exists(taskId)) throw new ImportDeleted();
-      throw err;
-    }
-    if (row != null) {
-      emitRunEvent({ id: row.id, runId, taskId, stream: ev.stream, data: ev.data, ts: row.ts });
-      if (ev.stream === "assistant") lastAssistant = row.id;
-    }
-    if (performance.now() - sliceStart >= sliceMs) {
-      flushAssistant();
+    batch.push(ev);
+    batchBytes += ev.data.length;
+    if (batch.length >= IMPORT_BATCH_MAX_EVENTS || batchBytes >= IMPORT_BATCH_MAX_CHARS || performance.now() - sliceStart >= sliceMs) {
+      await flushBatch();
+      await flushAssistant();
       await yieldTurn();
-      if (!tasks.exists(taskId)) throw new ImportDeleted();
+      if (!(await tasks.exists(taskId))) throw new ImportDeleted();
       sliceStart = performance.now();
     }
   }
-  flushAssistant();
+  await flushBatch();
+  await flushAssistant();
 }
+
+/** The most events (and characters of event data) one import transaction carries. */
+const IMPORT_BATCH_MAX_EVENTS = 500;
+const IMPORT_BATCH_MAX_CHARS = 1_000_000;
 
 async function runBackfill(
   taskId: string,
@@ -316,21 +346,21 @@ async function runBackfill(
   known?: OpencodeExport,
 ): Promise<void> {
   if (opts?.backfillGate) await opts.backfillGate;
-  const task = tasks.get(taskId);
+  const task = await tasks.get(taskId);
   if (!task?.importedOpencode || task.importedOpencode.status !== "importing") return;
-  if (tasks.importedOpencodeSessionHeldElsewhere(taskId, task.importedOpencode.sessionId)) {
-    failImport(taskId, IMPORTED_OPENCODE_HELD_ELSEWHERE);
+  if (await tasks.importedOpencodeSessionHeldElsewhere(taskId, task.importedOpencode.sessionId)) {
+    await failImport(taskId, IMPORTED_OPENCODE_HELD_ELSEWHERE);
     return;
   }
   let runId: string;
   try {
-    runId = ensureSeedRun(task);
+    runId = await ensureSeedRun(task);
   } catch (err) {
     if (err instanceof ImportDeleted) return;
-    failImport(taskId, importFailureMessage(err));
+    await failImport(taskId, importFailureMessage(err));
     return;
   }
-  const provenance = tasks.get(taskId)?.importedOpencode ?? task.importedOpencode;
+  const provenance = (await tasks.get(taskId))?.importedOpencode ?? task.importedOpencode;
   try {
     const exp = known ?? await exportFor(task, provenance);
     const events = exportToEvents(exp);
@@ -338,12 +368,12 @@ async function runBackfill(
       events.push({ stream: "status", data: OPENCODE_UNFINISHED_STATUS, lineUuid: UNFINISHED_LINE_UUID });
     }
     await writeEvents(taskId, runId, events, opts?.sliceMs ?? IMPORT_SLICE_MS);
-    const current = requireTask(taskId);
-    tasks.setImportedOpencode(taskId, { ...current, status: "ready", error: null });
+    const current = await requireTask(taskId);
+    await tasks.setImportedOpencode(taskId, { ...current, status: "ready", error: null });
     broadcastAppEvent({ type: "claude_session_import", taskId, status: "ready", ts: Date.now() });
   } catch (err) {
     if (err instanceof ImportDeleted) return;
-    failImport(taskId, importFailureMessage(err));
+    await failImport(taskId, importFailureMessage(err));
   }
 }
 
@@ -365,28 +395,28 @@ export function pendingOpencodeImportBackfill(taskId: string): Promise<void> {
 /** Re-run the export for every import a crash left `importing`. Called at
  *  boot by both entry points; the claim and the seed row are already there. */
 export async function resumeIncompleteOpencodeImports(opts?: ImportOpencodeSessionsOptions): Promise<void> {
-  for (const taskId of tasks.importingOpencodeIds()) startBackfill(taskId, opts);
+  for (const taskId of await tasks.importingOpencodeIds()) startBackfill(taskId, opts);
 }
 
 export async function retryOpencodeImport(
   taskId: string,
   opts?: ImportOpencodeSessionsOptions,
 ): Promise<{ ok: true } | { error: string }> {
-  const task = tasks.get(taskId);
+  const task = await tasks.get(taskId);
   if (!task?.importedOpencode) return { error: "task is not an imported session" };
   if (task.importedOpencode.status !== "failed") return { error: "import is not failed" };
-  if (tasks.importedOpencodeSessionHeldElsewhere(taskId, task.importedOpencode.sessionId)) {
+  if (await tasks.importedOpencodeSessionHeldElsewhere(taskId, task.importedOpencode.sessionId)) {
     return { error: IMPORTED_OPENCODE_HELD_ELSEWHERE };
   }
   try {
-    tasks.setImportedOpencode(taskId, { ...task.importedOpencode, status: "importing", error: null });
+    await tasks.setImportedOpencode(taskId, { ...task.importedOpencode, status: "importing", error: null });
   } catch (err) {
     if (err instanceof ImportedOpencodeSessionTaken) return { error: IMPORTED_OPENCODE_HELD_ELSEWHERE };
     throw err;
   }
   startBackfill(taskId, opts);
   await pendingOpencodeImportBackfill(taskId);
-  const after = tasks.get(taskId);
+  const after = await tasks.get(taskId);
   if (!after) return { error: "task disappeared during retry" };
   if (!after.importedOpencode) return { error: "task lost its import record" };
   if (after.importedOpencode.status === "failed") {
@@ -420,7 +450,7 @@ export async function importOpencodeSessions(
   const results: ImportOpencodeSessionResult[] = [];
   let target: Harness | null = null;
   if (opts?.harnessId) {
-    target = harnesses.get(opts.harnessId);
+    target = await harnesses.get(opts.harnessId);
     if (target?.kind !== "opencode") {
       const error = `unknown OpenCode harness "${opts.harnessId}"`;
       return { results: ids.map((id) => ({ id, error })) };
@@ -455,9 +485,9 @@ function opencodeDataDirOf(h: Harness): string {
 }
 
 /** Error for a `harnessId` override that can't resume the session, or null. */
-function overrideMismatch(id: string, record: OpencodeSessionRecord, target: Harness): string | null {
+async function overrideMismatch(id: string, record: OpencodeSessionRecord, target: Harness): Promise<string | null> {
   if (record.harnessId === target.id) return null;
-  const listedUnder = harnesses.get(record.harnessId);
+  const listedUnder = await harnesses.get(record.harnessId);
   if (listedUnder?.kind === "opencode" && opencodeDataDirOf(listedUnder) === opencodeDataDirOf(target)) return null;
   const listedLabel = listedUnder?.label ?? record.harnessId;
   return `OpenCode session ${id} belongs to "${listedLabel}" — "${target.label}" reads another OpenCode data dir and couldn't continue it; import it under "${listedLabel}"`;
@@ -469,15 +499,15 @@ async function commitOne(
   target: Harness | null,
   opts: ImportOpencodeSessionsOptions | undefined,
 ): Promise<ImportOpencodeSessionResult> {
-  if (sessionAlreadyBound(id)) return { id, error: ALREADY_IMPORTED };
+  if (await sessionAlreadyBound(id)) return { id, error: ALREADY_IMPORTED };
   if (!record) return { id, error: "session not found" };
   if (record.blockedReason === "missing-folder") return { id, error: MISSING_FOLDER_IMPORT_ERROR };
-  const mismatch = target ? overrideMismatch(id, record, target) : null;
+  const mismatch = target ? await overrideMismatch(id, record, target) : null;
   if (mismatch) return { id, error: mismatch };
   const found = record;
 
   return withCommitLock(id, async () => {
-    if (sessionAlreadyBound(id)) return { id, error: ALREADY_IMPORTED };
+    if (await sessionAlreadyBound(id)) return { id, error: ALREADY_IMPORTED };
     // The caller gate comes first: nothing in this process may stat a folder
     // the caller is not allowed to reach (D24).
     if (opts?.gateCwd) {
@@ -486,7 +516,7 @@ async function commitOne(
     }
     // The folder can go away between the scan and this commit.
     if (!isDirectory(found.directory)) return { id, error: MISSING_FOLDER_IMPORT_ERROR };
-    const listedUnder = harnesses.get(found.harnessId);
+    const listedUnder = await harnesses.get(found.harnessId);
     if (listedUnder?.kind !== "opencode") return { id, error: `OpenCode harness "${found.harnessId}" no longer exists` };
     // One export serves the busy re-check, the task's launch fields and the
     // backfill. The scan's busy verdict can be up to 10 s old.
@@ -519,7 +549,7 @@ async function bindImportedSession(
   const title = opencodeImportTitle(id, summary, record.title);
   const prompt = capPrompt(summary.firstUserText ?? title);
   const launch = opencodeImportLaunch(summary);
-  projects.upsert(record.directory, path.basename(record.directory) || record.directory);
+  await projects.upsert(record.directory, path.basename(record.directory) || record.directory);
   const created = await createTask({
     title,
     prompt,
@@ -549,20 +579,20 @@ async function bindImportedSession(
   // resume can repair. The unique index claims the session id on this write.
   let claimed = false;
   try {
-    const claimedTask = tasks.setImportedOpencode(taskId, provenance);
+    const claimedTask = await tasks.setImportedOpencode(taskId, provenance);
     if (!claimedTask) {
-      tasks.delete(taskId);
+      await tasks.delete(taskId);
       return { id, error: "task disappeared before the seed run was written" };
     }
     claimed = true;
-    runs.insert(seedRun({ ...claimedTask, agent: harness.id }, provenance, runId, now));
-    tasks.update(taskId, { runId, column: "review" });
+    await runs.insert(seedRun({ ...claimedTask, agent: harness.id }, provenance, runId, now));
+    await tasks.update(taskId, { runId, column: "review" });
   } catch (err) {
     if (err instanceof ImportedOpencodeSessionTaken) {
-      tasks.delete(taskId);
+      await tasks.delete(taskId);
       return { id, error: ALREADY_IMPORTED };
     }
-    if (!claimed) tasks.delete(taskId);
+    if (!claimed) await tasks.delete(taskId);
     throw err;
   }
   startBackfill(taskId, opts, exp);

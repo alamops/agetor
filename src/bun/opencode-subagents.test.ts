@@ -1,4 +1,4 @@
-import { test, expect, beforeAll, afterAll, afterEach } from "bun:test";
+import { test, expect, beforeAll, afterAll, afterEach, spyOn } from "bun:test";
 import { mkdtempSync, readFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import path from "node:path";
@@ -84,12 +84,12 @@ function row(child: string): Subagent {
   return db.subagents.get(mod.opencodeSubagentId(child))!;
 }
 
-test("register inserts one running opencode_subagent row (idempotent) and emits started", () => {
+test("register inserts one running opencode_subagent row (idempotent) and emits started", async () => {
   installEmitter();
   const { taskId, runId } = seedTask();
   const child = `ses_reg${randomUUID().replace(/-/g, "")}`;
-  mod.registerOpencodeSubagent({ taskId, runId, notice: notice(child) });
-  mod.registerOpencodeSubagent({ taskId, runId, notice: notice(child) });
+  await mod.registerOpencodeSubagent({ taskId, runId, notice: notice(child) });
+  await mod.registerOpencodeSubagent({ taskId, runId, notice: notice(child) });
   const r = row(child);
   expect(r).toMatchObject({
     taskId, runId, sourcePath: `opencode-session:${child}`,
@@ -109,7 +109,7 @@ test("complete child: events appended under subagent_id, row completed, refresh 
   const { taskId, runId } = seedTask();
   const child = "ses_e82612922ffe6VVY5SiPNRsanX";
   installExports({ [child]: "v2-session-export-child.json" });
-  mod.registerOpencodeSubagent({ taskId, runId, notice: notice(child) });
+  await mod.registerOpencodeSubagent({ taskId, runId, notice: notice(child) });
   await mod.refreshOpencodeSubagents(refreshArgs(taskId));
   expect(row(child).status).toBe("completed");
   expect(row(child).endedAt).not.toBeNull();
@@ -139,7 +139,7 @@ test("v1 complete child export fills the tab", async () => {
   const { taskId, runId } = seedTask();
   const child = "ses_e825eafb7ffeOjjZhBrQwKVqet";
   installExports({ [child]: "v1-session-export-child.json" });
-  mod.registerOpencodeSubagent({ taskId, runId, notice: notice(child) });
+  await mod.registerOpencodeSubagent({ taskId, runId, notice: notice(child) });
   await mod.refreshOpencodeSubagents(refreshArgs(taskId, { major: 1 }));
   expect(row(child).status).toBe("completed");
   expect(db.runs.seenLineUuidsForSubagent(taskId, row(child).id).has("opencode:tool:prt_17da154d0001ErCrWx11EONtG1:use")).toBe(true);
@@ -150,7 +150,7 @@ test("unfinished child on a Standalone turn → failed with a status line (A6)",
   const { taskId, runId } = seedTask();
   const child = "ses_e8250f036ffepNNRrhaD7yBOwE";
   installExports({ [child]: "v2-session-export-bg-child-dead.json" });
-  mod.registerOpencodeSubagent({ taskId, runId, notice: notice(child, { description: "Sleep then list files", background: true }) });
+  await mod.registerOpencodeSubagent({ taskId, runId, notice: notice(child, { description: "Sleep then list files", background: true }) });
   await mod.refreshOpencodeSubagents(refreshArgs(taskId, { standalone: true }));
   expect(row(child).status).toBe("failed");
   // The child's own "Step interrupted" lands in its tab; the stop notice on the main stream.
@@ -164,7 +164,7 @@ test("unfinished child on a v2 Shared turn → orphaned once, re-checked and com
   const { taskId, runId } = seedTask();
   const child = `ses_shared${randomUUID().replace(/-/g, "")}`;
   installExports({ [child]: "v2-session-export-bg-child-dead.json" });
-  mod.registerOpencodeSubagent({ taskId, runId, notice: notice(child, { description: "Long job" }) });
+  await mod.registerOpencodeSubagent({ taskId, runId, notice: notice(child, { description: "Long job" }) });
   await mod.refreshOpencodeSubagents(refreshArgs(taskId, { standalone: false }));
   expect(row(child).status).toBe("orphaned");
   expect(db.subagents.hasRunning(taskId)).toBe(false);
@@ -187,7 +187,7 @@ test("an orphaned child re-checked by a later Standalone (or v1) turn stays orph
   const { taskId, runId } = seedTask();
   const child = `ses_orph${randomUUID().replace(/-/g, "")}`;
   installExports({ [child]: "v2-session-export-bg-child-dead.json" });
-  mod.registerOpencodeSubagent({ taskId, runId, notice: notice(child, { description: "Shared job" }) });
+  await mod.registerOpencodeSubagent({ taskId, runId, notice: notice(child, { description: "Shared job" }) });
   await mod.refreshOpencodeSubagents(refreshArgs(taskId, { standalone: false }));
   expect(row(child).status).toBe("orphaned");
   // A later turn ran Standalone / on v1: it says nothing about a child an
@@ -205,7 +205,7 @@ test("every settle fires the settle hook — a refresh that lands late still rel
     const { taskId, runId } = seedTask();
     const done = `ses_hook${randomUUID().replace(/-/g, "")}`;
     installExports({ [done]: "v2-session-export-child.json" });
-    mod.registerOpencodeSubagent({ taskId, runId, notice: notice(done) });
+    await mod.registerOpencodeSubagent({ taskId, runId, notice: notice(done) });
     await mod.refreshOpencodeSubagents(refreshArgs(taskId));
     expect(row(done).status).toBe("completed");
     expect(fired).toEqual([taskId]);
@@ -214,7 +214,7 @@ test("every settle fires the settle hook — a refresh that lands late still rel
   }
 });
 
-test("orphanRunningOpencodeSubagents flips only running OpenCode rows, posts a status line and fires the hook once", () => {
+test("orphanRunningOpencodeSubagents flips only running OpenCode rows, posts a status line and fires the hook once", async () => {
   installEmitter();
   const fired: string[] = [];
   const prev = mod.setOpencodeSubagentSettleHook((id) => fired.push(id));
@@ -222,8 +222,8 @@ test("orphanRunningOpencodeSubagents flips only running OpenCode rows, posts a s
     const { taskId, runId } = seedTask();
     const a = `ses_dropa${randomUUID().replace(/-/g, "")}`;
     const b = `ses_dropb${randomUUID().replace(/-/g, "")}`;
-    mod.registerOpencodeSubagent({ taskId, runId, notice: notice(a, { description: "Job A" }) });
-    mod.registerOpencodeSubagent({ taskId, runId, notice: notice(b) });
+    await mod.registerOpencodeSubagent({ taskId, runId, notice: notice(a, { description: "Job A" }) });
+    await mod.registerOpencodeSubagent({ taskId, runId, notice: notice(b) });
     db.subagents.setStatus(mod.opencodeSubagentId(b), "completed", Date.now());
     // A Claude row on the same task is left alone (its own watcher owns it).
     const claudeRow: Subagent = {
@@ -232,7 +232,7 @@ test("orphanRunningOpencodeSubagents flips only running OpenCode rows, posts a s
     };
     db.subagents.insertIfAbsent(claudeRow);
 
-    expect(mod.orphanRunningOpencodeSubagents(taskId, "the task switched harness")).toBe(1);
+    expect(await mod.orphanRunningOpencodeSubagents(taskId, "the task switched harness")).toBe(1);
     expect(row(a).status).toBe("orphaned");
     expect(row(b).status).toBe("completed");
     expect(db.subagents.get(claudeRow.id)?.status).toBe("running");
@@ -241,7 +241,7 @@ test("orphanRunningOpencodeSubagents flips only running OpenCode rows, posts a s
       'OpenCode subagent "Job A" was left unfinished — the task switched harness',
     ]);
     // Nothing left to flip: no second hook call.
-    expect(mod.orphanRunningOpencodeSubagents(taskId, "again")).toBe(0);
+    expect(await mod.orphanRunningOpencodeSubagents(taskId, "again")).toBe(0);
     expect(fired).toEqual([taskId]);
   } finally {
     mod.setOpencodeSubagentSettleHook(prev);
@@ -252,20 +252,20 @@ function seedBreadcrumb(runId: string, major: 1 | 2, server: "shared" | "standal
   db.runs.appendEvent(runId, "status", `opencode ${major}.x · server=${server} · model=OpenCode default · effort=auto · mode=auto`);
 }
 
-test("opencodeTurnOfRun reads the run's D-19 line and ignores this module's own OpenCode status lines", () => {
+test("opencodeTurnOfRun reads the run's D-19 line and ignores this module's own OpenCode status lines", async () => {
   const { runId } = seedTask();
-  expect(mod.opencodeTurnOfRun(runId)).toBeNull();
-  expect(mod.opencodeTurnOfRun(null)).toBeNull();
+  expect(await mod.opencodeTurnOfRun(runId)).toBeNull();
+  expect(await mod.opencodeTurnOfRun(null)).toBeNull();
   seedBreadcrumb(runId, 2, "standalone");
   // A later `OpenCode subagent …` line (LIKE is case-insensitive) must not shadow it.
   db.runs.appendEvent(runId, "status", 'OpenCode subagent "x" is still running — its tab fills when a later turn finishes');
-  expect(mod.opencodeTurnOfRun(runId)).toEqual({ major: 2, server: "standalone" });
+  expect(await mod.opencodeTurnOfRun(runId)).toEqual({ major: 2, server: "standalone" });
   const v1 = seedTask();
   seedBreadcrumb(v1.runId, 1, "n/a");
-  expect(mod.opencodeTurnOfRun(v1.runId)).toEqual({ major: 1, server: null });
+  expect(await mod.opencodeTurnOfRun(v1.runId)).toEqual({ major: 1, server: null });
 });
 
-test("orphanRunningOpencodeSubagents fails rows of a Standalone or v1 turn, orphans those of a Shared one", () => {
+test("orphanRunningOpencodeSubagents fails rows of a Standalone or v1 turn, orphans those of a Shared one", async () => {
   installEmitter();
   const cases = [
     { major: 2, server: "standalone", want: "failed" },
@@ -276,8 +276,8 @@ test("orphanRunningOpencodeSubagents fails rows of a Standalone or v1 turn, orph
     const { taskId, runId } = seedTask();
     seedBreadcrumb(runId, c.major, c.server);
     const child = `ses_turn${randomUUID().replace(/-/g, "")}`;
-    mod.registerOpencodeSubagent({ taskId, runId, notice: notice(child, { description: "Job" }) });
-    expect(mod.orphanRunningOpencodeSubagents(taskId, "the task was archived")).toBe(1);
+    await mod.registerOpencodeSubagent({ taskId, runId, notice: notice(child, { description: "Job" }) });
+    expect(await mod.orphanRunningOpencodeSubagents(taskId, "the task was archived")).toBe(1);
     expect(row(child).status).toBe(c.want);
   }
   expect(emitted.filter((e) => e.stream === "status").map((e) => e.data)).toEqual([
@@ -293,8 +293,8 @@ test("an orphaned row still unfinished past the re-check window is given up on (
   const stale = `ses_stale${randomUUID().replace(/-/g, "")}`;
   const fresh = `ses_fresh${randomUUID().replace(/-/g, "")}`;
   installExports({ [stale]: "v2-session-export-bg-child-dead.json", [fresh]: "v2-session-export-bg-child-dead.json" });
-  mod.registerOpencodeSubagent({ taskId, runId, notice: notice(stale, { description: "Stale job" }) });
-  mod.registerOpencodeSubagent({ taskId, runId, notice: notice(fresh, { description: "Fresh job" }) });
+  await mod.registerOpencodeSubagent({ taskId, runId, notice: notice(stale, { description: "Stale job" }) });
+  await mod.registerOpencodeSubagent({ taskId, runId, notice: notice(fresh, { description: "Fresh job" }) });
   db.subagents.setStatus(mod.opencodeSubagentId(stale), "orphaned", Date.now() - mod.ORPHAN_RECHECK_MAX_AGE_MS - 1000);
   db.subagents.setStatus(mod.opencodeSubagentId(fresh), "orphaned", Date.now() - 1000);
   await mod.refreshOpencodeSubagents(refreshArgs(taskId, { standalone: false }));
@@ -307,7 +307,7 @@ test("an orphaned row still unfinished past the re-check window is given up on (
   const late = `ses_late${randomUUID().replace(/-/g, "")}`;
   exportMod.__forTest.setExportRunner(async () => exportMod.parseOpencodeExport(
     readFileSync(path.join(FIXTURES, "v2-session-export-child.json"), "utf8"), 2));
-  mod.registerOpencodeSubagent({ taskId, runId, notice: notice(late) });
+  await mod.registerOpencodeSubagent({ taskId, runId, notice: notice(late) });
   db.subagents.setStatus(mod.opencodeSubagentId(late), "orphaned", Date.now() - mod.ORPHAN_RECHECK_MAX_AGE_MS - 1000);
   await mod.refreshOpencodeSubagents(refreshArgs(taskId));
   expect(row(late).status).toBe("completed");
@@ -317,7 +317,7 @@ test("v1: an unfinished child is failed even without --standalone", async () => 
   const { taskId, runId } = seedTask();
   const child = `ses_v1${randomUUID().replace(/-/g, "")}`;
   installExports({ [child]: null });
-  mod.registerOpencodeSubagent({ taskId, runId, notice: notice(child) });
+  await mod.registerOpencodeSubagent({ taskId, runId, notice: notice(child) });
   await mod.refreshOpencodeSubagents(refreshArgs(taskId, { major: 1 }));
   expect(row(child).status).toBe("failed");
 });
@@ -327,8 +327,8 @@ test("never left running after a final refresh — export missing or throwing", 
   const missing = `ses_miss${randomUUID().replace(/-/g, "")}`;
   const boom = `ses_boom${randomUUID().replace(/-/g, "")}`;
   installExports({ [missing]: null, [boom]: "throw" });
-  mod.registerOpencodeSubagent({ taskId, runId, notice: notice(missing) });
-  mod.registerOpencodeSubagent({ taskId, runId, notice: notice(boom) });
+  await mod.registerOpencodeSubagent({ taskId, runId, notice: notice(missing) });
+  await mod.registerOpencodeSubagent({ taskId, runId, notice: notice(boom) });
   await mod.refreshOpencodeSubagents(refreshArgs(taskId, { standalone: false }));
   expect(row(missing).status).toBe("orphaned");
   expect(row(boom).status).toBe("orphaned");
@@ -339,7 +339,7 @@ test("a non-final refresh leaves an unfinished child running but settles a compl
   const { taskId, runId } = seedTask();
   const notDone = `ses_nd${randomUUID().replace(/-/g, "")}`;
   installExports({ [notDone]: "v2-session-export-bg-child-dead.json" });
-  mod.registerOpencodeSubagent({ taskId, runId, notice: notice(notDone) });
+  await mod.registerOpencodeSubagent({ taskId, runId, notice: notice(notDone) });
   await mod.refreshOpencodeSubagents(refreshArgs(taskId, { final: false }));
   expect(row(notDone).status).toBe("running");
 });
@@ -349,7 +349,7 @@ test("a non-final refresh settles a complete child and fills its tab", async () 
   const { taskId, runId } = seedTask();
   const done = `ses_nfdone${randomUUID().replace(/-/g, "")}`;
   installExports({ [done]: "v2-session-export-child.json" });
-  mod.registerOpencodeSubagent({ taskId, runId, notice: notice(done) });
+  await mod.registerOpencodeSubagent({ taskId, runId, notice: notice(done) });
   await mod.refreshOpencodeSubagents(refreshArgs(taskId, { final: false }));
   expect(row(done).status).toBe("completed");
   expect(emitted.some((e) => e.subagentId === row(done).id && e.stream === "assistant")).toBe(true);
@@ -360,7 +360,7 @@ test("the re-check window only gives up on a final refresh; a throwing export st
   const { taskId, runId } = seedTask();
   const expired = `ses_exp${randomUUID().replace(/-/g, "")}`;
   installExports({ [expired]: "throw" });
-  mod.registerOpencodeSubagent({ taskId, runId, notice: notice(expired, { description: "Expired job" }) });
+  await mod.registerOpencodeSubagent({ taskId, runId, notice: notice(expired, { description: "Expired job" }) });
   db.subagents.setStatus(mod.opencodeSubagentId(expired), "orphaned", Date.now() - mod.ORPHAN_RECHECK_MAX_AGE_MS - 1000);
   // A mid-turn (non-final) refresh says nothing about a child left by an
   // earlier turn: it stays orphaned, no status line.
@@ -379,7 +379,7 @@ test("a row orphaned just inside the re-check window keeps being re-checked", as
   const { taskId, runId } = seedTask();
   const recent = `ses_recent${randomUUID().replace(/-/g, "")}`;
   installExports({ [recent]: null });
-  mod.registerOpencodeSubagent({ taskId, runId, notice: notice(recent) });
+  await mod.registerOpencodeSubagent({ taskId, runId, notice: notice(recent) });
   db.subagents.setStatus(mod.opencodeSubagentId(recent), "orphaned", Date.now() - mod.ORPHAN_RECHECK_MAX_AGE_MS + 60_000);
   await mod.refreshOpencodeSubagents(refreshArgs(taskId, { final: true }));
   expect(row(recent).status).toBe("orphaned");
@@ -388,7 +388,7 @@ test("a row orphaned just inside the re-check window keeps being re-checked", as
 test("the Claude subagent watcher never seeds opencode_subagent rows", async () => {
   const { taskId, runId } = seedTask();
   const child = `ses_watch${randomUUID().replace(/-/g, "")}`;
-  mod.registerOpencodeSubagent({ taskId, runId, notice: notice(child) });
+  await mod.registerOpencodeSubagent({ taskId, runId, notice: notice(child) });
   const { attachSubagentWatcher, subagentActivityWithin } = await import("./claude-subagents.ts");
   const dir = mkdtempSync(path.join(tmpdir(), "agetor-ocsub-watch-"));
   const handle = attachSubagentWatcher({ taskId, jsonlPath: path.join(dir, "session.jsonl"), manual: true });
@@ -404,8 +404,8 @@ test("the Claude subagent watcher never seeds opencode_subagent rows", async () 
 /* ── agetor-server turns: live child sessions (plan T12) ─────────────────── */
 
 const childId = (tag: string) => `ses_${tag}${randomUUID().replace(/-/g, "")}`;
-function reg(taskId: string, runId: string, child: string, over: Partial<Parameters<typeof import("./opencode-subagents.ts").registerOpencodeChildSession>[0]> = {}) {
-  mod.registerOpencodeChildSession({ taskId, runId, parentSessionId: "ses_parent", childSessionId: child, title: "Count files", agent: "General", depth: 1, ...over });
+async function reg(taskId: string, runId: string, child: string, over: Partial<Parameters<typeof import("./opencode-subagents.ts").registerOpencodeChildSession>[0]> = {}) {
+  await mod.registerOpencodeChildSession({ taskId, runId, parentSessionId: "ses_parent", childSessionId: child, title: "Count files", agent: "General", depth: 1, ...over });
 }
 const text = (child: string, msg: string, ord: number, data: string): OpencodeMappedChunk => ({
   stream: "assistant", data, lineUuid: `opencode:${child}:text:${msg}:${ord}`,
@@ -418,12 +418,12 @@ function childEvents(child: string): Array<{ id: number; stream: string; data: s
     .all(mod.opencodeSubagentId(child));
 }
 
-test("registerOpencodeChildSession creates one running opencode_subagent row, idempotently", () => {
+test("registerOpencodeChildSession creates one running opencode_subagent row, idempotently", async () => {
   installEmitter();
   const { taskId, runId } = seedTask();
   const child = childId("regc");
-  reg(taskId, runId, child);
-  reg(taskId, runId, child, { title: "Other title", depth: 3 });
+  await reg(taskId, runId, child);
+  await reg(taskId, runId, child, { title: "Other title", depth: 3 });
   expect(row(child)).toMatchObject({
     taskId, runId, parentKind: "opencode_subagent", sourcePath: `opencode-session:${child}`,
     status: "running", description: "Count files", agentType: "General", spawnDepth: 1, endedAt: null,
@@ -432,20 +432,20 @@ test("registerOpencodeChildSession creates one running opencode_subagent row, id
   expect(raw?.parent_kind).toBe("opencode_subagent");
   expect(emitted.filter((e) => e.stream === "subagent").map((e) => JSON.parse(e.data).phase)).toEqual(["started"]);
   // An existing row that already settled is not reopened by a replayed register.
-  mod.settleOpencodeChild({ taskId, childSessionId: child, outcome: "completed" });
-  reg(taskId, runId, child);
+  await mod.settleOpencodeChild({ taskId, childSessionId: child, outcome: "completed" });
+  await reg(taskId, runId, child);
   expect(row(child).status).toBe("completed");
 });
 
-test("ingestOpencodeChildChunks appends under the child's subagent id, dedupes by lineUuid and broadcasts stored frames", () => {
+test("ingestOpencodeChildChunks appends under the child's subagent id, dedupes by lineUuid and broadcasts stored frames", async () => {
   installEmitter();
   const { taskId, runId } = seedTask();
   const child = childId("ingc");
-  reg(taskId, runId, child);
+  await reg(taskId, runId, child);
   const a = text(child, "msg_1", 0, "hello");
   const b = text(child, "msg_1", 1, "world");
-  mod.ingestOpencodeChildChunks({ taskId, childSessionId: child, chunks: [a, b] });
-  mod.ingestOpencodeChildChunks({ taskId, childSessionId: child, chunks: [a, b, text(child, "msg_2", 0, "more")] });
+  await mod.ingestOpencodeChildChunks({ taskId, childSessionId: child, chunks: [a, b] });
+  await mod.ingestOpencodeChildChunks({ taskId, childSessionId: child, chunks: [a, b, text(child, "msg_2", 0, "more")] });
   const stored = childEvents(child);
   expect(stored.map((e) => e.data)).toEqual(["hello", "world", "more"]);
   const frames = emitted.filter((e) => e.subagentId === row(child).id && e.stream !== "subagent");
@@ -454,34 +454,34 @@ test("ingestOpencodeChildChunks appends under the child's subagent id, dedupes b
   expect(db.runs.seenLineUuidsForTask(taskId).size).toBe(0);
 });
 
-test("ingest drops usage lines, unknown children and rows of another task", () => {
+test("ingest drops usage lines, unknown children and rows of another task", async () => {
   installEmitter();
   const t1 = seedTask();
   const t2 = seedTask();
   const child = childId("dropc");
-  reg(t1.taskId, t1.runId, child);
-  mod.ingestOpencodeChildChunks({
+  await reg(t1.taskId, t1.runId, child);
+  await mod.ingestOpencodeChildChunks({
     taskId: t1.taskId, childSessionId: child,
     chunks: [{ stream: "status", data: 'fx-usage: {"inputTokens":1}', lineUuid: `opencode:${child}:usage:msg_1` }],
   });
-  mod.ingestOpencodeChildChunks({ taskId: t2.taskId, childSessionId: child, chunks: [text(child, "msg_1", 0, "x")] });
-  mod.ingestOpencodeChildChunks({ taskId: t1.taskId, childSessionId: "ses_nope", chunks: [text("ses_nope", "msg_1", 0, "x")] });
+  await mod.ingestOpencodeChildChunks({ taskId: t2.taskId, childSessionId: child, chunks: [text(child, "msg_1", 0, "x")] });
+  await mod.ingestOpencodeChildChunks({ taskId: t1.taskId, childSessionId: "ses_nope", chunks: [text("ses_nope", "msg_1", 0, "x")] });
   expect(childEvents(child)).toHaveLength(0);
   expect(emitted.filter((e) => e.stream !== "subagent")).toHaveLength(0);
 });
 
-test("ingest replace:true rewrites a tool_use in place (same row id) and re-broadcasts it; a missing target inserts", () => {
+test("ingest replace:true rewrites a tool_use in place (same row id) and re-broadcasts it; a missing target inserts", async () => {
   installEmitter();
   const { taskId, runId } = seedTask();
   const child = childId("repc");
-  reg(taskId, runId, child);
+  await reg(taskId, runId, child);
   const use = (name: string, extra: Partial<OpencodeMappedChunk> = {}): OpencodeMappedChunk => ({
     stream: "tool_use", data: JSON.stringify({ id: "call_1", name, input: {} }), lineUuid: `opencode:${child}:tool:call_1:use`, ...extra,
   });
-  mod.ingestOpencodeChildChunks({ taskId, childSessionId: child, chunks: [use("tool", { provisional: true })] });
+  await mod.ingestOpencodeChildChunks({ taskId, childSessionId: child, chunks: [use("tool", { provisional: true })] });
   const before = childEvents(child);
   expect(before).toHaveLength(1);
-  mod.ingestOpencodeChildChunks({ taskId, childSessionId: child, chunks: [use("Bash", { replace: true })] });
+  await mod.ingestOpencodeChildChunks({ taskId, childSessionId: child, chunks: [use("Bash", { replace: true })] });
   const after = childEvents(child);
   expect(after).toHaveLength(1);
   expect(after[0]!.id).toBe(before[0]!.id);
@@ -492,29 +492,29 @@ test("ingest replace:true rewrites a tool_use in place (same row id) and re-broa
   expect(JSON.parse(frames[1]!.data).name).toBe("Bash");
   // A replace whose target was never persisted inserts it.
   const lone: OpencodeMappedChunk = { stream: "tool_use", data: JSON.stringify({ id: "call_2", name: "Read", input: {} }), lineUuid: `opencode:${child}:tool:call_2:use`, replace: true };
-  mod.ingestOpencodeChildChunks({ taskId, childSessionId: child, chunks: [lone] });
+  await mod.ingestOpencodeChildChunks({ taskId, childSessionId: child, chunks: [lone] });
   expect(childEvents(child)).toHaveLength(2);
 });
 
-test("ingest brings an orphaned row back to running, and leaves a settled row's status alone", () => {
+test("ingest brings an orphaned row back to running, and leaves a settled row's status alone", async () => {
   installEmitter();
   const { taskId, runId } = seedTask();
   const live = childId("revc");
-  reg(taskId, runId, live);
+  await reg(taskId, runId, live);
   db.subagents.setStatus(mod.opencodeSubagentId(live), "orphaned", Date.now());
-  mod.ingestOpencodeChildChunks({ taskId, childSessionId: live, chunks: [text(live, "msg_1", 0, "still going")] });
+  await mod.ingestOpencodeChildChunks({ taskId, childSessionId: live, chunks: [text(live, "msg_1", 0, "still going")] });
   expect(row(live)).toMatchObject({ status: "running", endedAt: null });
   expect(emitted.filter((e) => e.stream === "subagent").map((e) => JSON.parse(e.data).phase)).toEqual(["started", "started"]);
 
   const done = childId("donec");
-  reg(taskId, runId, done);
-  mod.settleOpencodeChild({ taskId, childSessionId: done, outcome: "completed" });
-  mod.ingestOpencodeChildChunks({ taskId, childSessionId: done, chunks: [text(done, "msg_1", 0, "late line")] });
+  await reg(taskId, runId, done);
+  await mod.settleOpencodeChild({ taskId, childSessionId: done, outcome: "completed" });
+  await mod.ingestOpencodeChildChunks({ taskId, childSessionId: done, chunks: [text(done, "msg_1", 0, "late line")] });
   expect(row(done).status).toBe("completed");
   expect(childEvents(done).map((e) => e.data)).toEqual(["late line"]);
 });
 
-test("settleOpencodeChild maps each outcome, fires the hook once per settle and never reopens a settled row", () => {
+test("settleOpencodeChild maps each outcome, fires the hook once per settle and never reopens a settled row", async () => {
   installEmitter();
   const fired: string[] = [];
   const prev = mod.setOpencodeSubagentSettleHook((id) => fired.push(id));
@@ -527,8 +527,8 @@ test("settleOpencodeChild maps each outcome, fires the hook once per settle and 
     ] as const;
     for (const c of cases) {
       const child = childId(`set${c.outcome}`);
-      reg(taskId, runId, child);
-      mod.settleOpencodeChild({ taskId, childSessionId: child, outcome: c.outcome });
+      await reg(taskId, runId, child);
+      await mod.settleOpencodeChild({ taskId, childSessionId: child, outcome: c.outcome });
       expect(row(child).status).toBe(c.want);
       expect(row(child).endedAt).not.toBeNull();
     }
@@ -539,36 +539,36 @@ test("settleOpencodeChild maps each outcome, fires the hook once per settle and 
 
     // A second terminal for the same child: no change, no second hook.
     const firstChild = db.subagents.listForTask(taskId)[0]!;
-    mod.settleOpencodeChild({ taskId, childSessionId: mod.opencodeChildSessionOf(firstChild)!, outcome: "failed" });
+    await mod.settleOpencodeChild({ taskId, childSessionId: mod.opencodeChildSessionOf(firstChild)!, outcome: "failed" });
     expect(db.subagents.get(firstChild.id)?.status).toBe("completed");
     expect(fired).toHaveLength(3);
 
     // An unknown child or another task's id is ignored.
-    mod.settleOpencodeChild({ taskId, childSessionId: "ses_missing", outcome: "completed" });
+    await mod.settleOpencodeChild({ taskId, childSessionId: "ses_missing", outcome: "completed" });
     expect(fired).toHaveLength(3);
   } finally {
     mod.setOpencodeSubagentSettleHook(prev);
   }
 });
 
-test("settle settles an orphaned row (a late terminal), and a failed outcome's error lands in the child's tab once", () => {
+test("settle settles an orphaned row (a late terminal), and a failed outcome's error lands in the child's tab once", async () => {
   installEmitter();
   const { taskId, runId } = seedTask();
   const child = childId("errc");
-  reg(taskId, runId, child);
+  await reg(taskId, runId, child);
   db.subagents.setStatus(mod.opencodeSubagentId(child), "orphaned", Date.now());
-  mod.settleOpencodeChild({ taskId, childSessionId: child, outcome: "failed", error: "Upstream\u0007request failed" });
+  await mod.settleOpencodeChild({ taskId, childSessionId: child, outcome: "failed", error: "Upstream\u0007request failed" });
   expect(row(child).status).toBe("failed");
   expect(childEvents(child).map((e) => e.data)).toEqual(["opencode: Upstream request failed"]);
 
   // The mapper already wrote an error line for this child: no second one.
   const mapped = childId("errm");
-  reg(taskId, runId, mapped);
-  mod.ingestOpencodeChildChunks({
+  await reg(taskId, runId, mapped);
+  await mod.ingestOpencodeChildChunks({
     taskId, childSessionId: mapped,
     chunks: [{ stream: "status", data: "opencode: boom", lineUuid: `opencode:${mapped}:error:execution:msg_1` }],
   });
-  mod.settleOpencodeChild({ taskId, childSessionId: mapped, outcome: "failed", error: "boom" });
+  await mod.settleOpencodeChild({ taskId, childSessionId: mapped, outcome: "failed", error: "boom" });
   expect(childEvents(mapped).map((e) => e.data)).toEqual(["opencode: boom"]);
 });
 
@@ -643,9 +643,9 @@ test("sync fills only what is missing after a resync gap, and settles failed and
   installEmitter();
   const { taskId, runId } = seedTask();
   const child = childId("gapc");
-  reg(taskId, runId, child);
+  await reg(taskId, runId, child);
   // Live ingest got only the first line before the stream dropped.
-  mod.ingestOpencodeChildChunks({ taskId, childSessionId: child, chunks: [text(child, "msg_a1", 0, "first")] });
+  await mod.ingestOpencodeChildChunks({ taskId, childSessionId: child, chunks: [text(child, "msg_a1", 0, "first")] });
   const msgs = [userMsg("msg_u1"), asstMsg("msg_a1", "first"), asstMsg("msg_a2", "second"), idleMsg("failed", { message: "model refused" })];
   const { client } = stubClient(msgs);
   await mod.syncOpencodeChildFromServer({ taskId, runId, client, childSessionId: child });
@@ -662,7 +662,7 @@ test("sync of a child with no idle tail leaves it running and revives an orphane
   installEmitter();
   const { taskId, runId } = seedTask();
   const child = childId("runc");
-  reg(taskId, runId, child);
+  await reg(taskId, runId, child);
   db.subagents.setStatus(mod.opencodeSubagentId(child), "orphaned", Date.now());
   const { client } = stubClient([userMsg("msg_u1"), asstMsg("msg_a1", "working")], undefined, { [child]: { type: "running" } });
   await mod.syncOpencodeChildFromServer({ taskId, runId, client, childSessionId: child });
@@ -679,7 +679,7 @@ test("sync never revives an orphaned row the server does not list as active; a p
   const msgs = [userMsg("msg_u1"), asstMsg("msg_a1", "working")]; // no idle tail: an old child that never finished
 
   const idle = childId("s10a");
-  reg(taskId, runId, idle, { title: "Dig" });
+  await reg(taskId, runId, idle, { title: "Dig" });
   const orphanedAt = Date.now() - 1000;
   db.subagents.setStatus(mod.opencodeSubagentId(idle), "orphaned", orphanedAt);
   const notActive = stubClient(msgs, undefined, { ses_someone_else: { type: "running" } });
@@ -692,7 +692,7 @@ test("sync never revives an orphaned row the server does not list as active; a p
   expect(row(idle).status).toBe("failed");
   expect(row(idle).endedAt).not.toBe(orphanedAt);
   expect(fired).toEqual([taskId]);
-  expect(mod.listOpenOpencodeChildSessions(taskId)).not.toContain(idle);
+  expect(await mod.listOpenOpencodeChildSessions(taskId)).not.toContain(idle);
   expect(emitted.filter((e) => e.stream === "status").map((e) => e.data)).toEqual([
     'OpenCode subagent "Dig" is no longer running on the OpenCode server',
   ]);
@@ -700,7 +700,7 @@ test("sync never revives an orphaned row the server does not list as active; a p
 
   // The active-session listing failing is "not active", not "assume alive".
   const flaky = childId("s10b");
-  reg(taskId, runId, flaky);
+  await reg(taskId, runId, flaky);
   db.subagents.setStatus(mod.opencodeSubagentId(flaky), "orphaned", orphanedAt);
   const err = console.error;
   console.error = () => {};
@@ -713,7 +713,7 @@ test("sync never revives an orphaned row the server does not list as active; a p
 
   // A trailing idle still settles an orphan without asking who is active.
   const done = childId("s10c");
-  reg(taskId, runId, done);
+  await reg(taskId, runId, done);
   db.subagents.setStatus(mod.opencodeSubagentId(done), "orphaned", orphanedAt);
   const finished = stubClient([...msgs, idleMsg("succeeded")]);
   await mod.syncOpencodeChildFromServer({ taskId, runId, client: finished.client, childSessionId: done });
@@ -754,7 +754,7 @@ test("an orphaned child that finishes during the sync settles from its idle reco
   installEmitter();
   const { taskId, runId } = seedTask();
   const child = childId("race1");
-  reg(taskId, runId, child);
+  await reg(taskId, runId, child);
   db.subagents.setStatus(mod.opencodeSubagentId(child), "orphaned", Date.now() - 1000);
   const before = [userMsg("msg_u1"), asstMsg("msg_a1", "working")];
   const after = [...before, asstMsg("msg_a2", "the last words"), idleMsg("succeeded")];
@@ -770,7 +770,7 @@ test("a row orphaned while the sync reads its messages gets a second pass with t
   installEmitter();
   const { taskId, runId } = seedTask();
   const child = childId("race2");
-  reg(taskId, runId, child);
+  await reg(taskId, runId, child);
   const before = [userMsg("msg_u1"), asstMsg("msg_a1", "working")];
   const after = [...before, asstMsg("msg_a2", "done now"), idleMsg("succeeded")];
   // The turn's teardown parks the running row while the first page is in flight.
@@ -790,7 +790,7 @@ test("a child the server answers 404 for is settled for good: failed once, never
   try {
     const { taskId, runId } = seedTask();
     const gone = childId("s6a");
-    reg(taskId, runId, gone);
+    await reg(taskId, runId, gone);
     const notFound = {
       getSession: async () => null,
       listMessages: async () => {
@@ -802,7 +802,7 @@ test("a child the server answers 404 for is settled for good: failed once, never
     const first = row(gone);
     expect(first.status).toBe("failed");
     expect(first.endedAt).not.toBeNull();
-    expect(mod.listOpenOpencodeChildSessions(taskId)).not.toContain(gone);
+    expect(await mod.listOpenOpencodeChildSessions(taskId)).not.toContain(gone);
     const goneLines = () => emitted.filter((e) => e.stream === "status" && e.data.includes("no longer known to the OpenCode server"));
     expect(goneLines()).toHaveLength(1);
     expect(fired).toEqual([taskId]);
@@ -823,19 +823,19 @@ test("a child the server answers 404 for is settled for good: failed once, never
     // A recently orphaned row (a turn or a lost server parked it) that now 404s is settled too, not kept
     // open for the 24 h re-check window.
     const parked = childId("s6p");
-    reg(taskId, runId, parked);
+    await reg(taskId, runId, parked);
     db.subagents.setStatus(mod.opencodeSubagentId(parked), "orphaned", Date.now() - 1000);
-    expect(mod.listOpenOpencodeChildSessions(taskId)).toContain(parked);
+    expect(await mod.listOpenOpencodeChildSessions(taskId)).toContain(parked);
     fired.length = 0;
     await mod.syncOpencodeChildFromServer({ taskId, runId, client: notFound, childSessionId: parked });
     expect(row(parked).status).toBe("failed");
-    expect(mod.listOpenOpencodeChildSessions(taskId)).not.toContain(parked);
+    expect(await mod.listOpenOpencodeChildSessions(taskId)).not.toContain(parked);
     expect(fired).toEqual([taskId]);
 
     // A terminal row is left alone by a 404.
     const done = childId("s6b");
-    reg(taskId, runId, done);
-    mod.settleOpencodeChild({ taskId, childSessionId: done, outcome: "completed" });
+    await reg(taskId, runId, done);
+    await mod.settleOpencodeChild({ taskId, childSessionId: done, outcome: "completed" });
     fired.length = 0;
     await mod.syncOpencodeChildFromServer({ taskId, runId, client: notFound, childSessionId: done });
     expect(row(done).status).toBe("completed");
@@ -845,21 +845,21 @@ test("a child the server answers 404 for is settled for good: failed once, never
   }
 });
 
-test("listOpenOpencodeChildSessions: running rows and recently orphaned rows, not old orphans or settled rows (S6)", () => {
+test("listOpenOpencodeChildSessions: running rows and recently orphaned rows, not old orphans or settled rows (S6)", async () => {
   installEmitter();
   const { taskId, runId } = seedTask();
   const running = childId("s6run");
   const fresh = childId("s6new");
   const old = childId("s6old");
   const done = childId("s6done");
-  for (const c of [running, fresh, old, done]) reg(taskId, runId, c);
+  for (const c of [running, fresh, old, done]) await reg(taskId, runId, c);
   const now = Date.now();
   db.subagents.setStatus(mod.opencodeSubagentId(fresh), "orphaned", now - 60_000);
   db.subagents.setStatus(mod.opencodeSubagentId(old), "orphaned", now - mod.ORPHAN_RECHECK_MAX_AGE_MS - 60_000);
   db.subagents.setStatus(mod.opencodeSubagentId(done), "completed", now);
-  expect(mod.listOpenOpencodeChildSessions(taskId, now).sort()).toEqual([running, fresh].sort());
+  expect((await mod.listOpenOpencodeChildSessions(taskId, now)).sort()).toEqual([running, fresh].sort());
   // the age limit is measured from when it was orphaned
-  expect(mod.listOpenOpencodeChildSessions(taskId, now + mod.ORPHAN_RECHECK_MAX_AGE_MS).sort()).toEqual([running]);
+  expect((await mod.listOpenOpencodeChildSessions(taskId, now + mod.ORPHAN_RECHECK_MAX_AGE_MS)).sort()).toEqual([running]);
 });
 
 test("sync never throws: a missing session creates no row, a failing client leaves the row as it was", async () => {
@@ -870,7 +870,7 @@ test("sync never throws: a missing session creates no row, a failing client leav
   expect(db.subagents.get(mod.opencodeSubagentId(gone))).toBeNull();
 
   const child = childId("badc");
-  reg(taskId, runId, child);
+  await reg(taskId, runId, child);
   const broken = { getSession: async () => null, listMessages: async () => { throw new Error("connection refused"); } } as unknown as OpencodeClient;
   const err = console.error;
   console.error = () => {};
@@ -903,7 +903,7 @@ test("refreshOpencodeSubagents is a no-op for a turn carried by the agetor serve
   const { taskId, runId } = seedTask();
   seedBreadcrumb(runId, 2, "agetor");
   const child = childId("noopc");
-  reg(taskId, runId, child);
+  await reg(taskId, runId, child);
   db.subagents.setStatus(mod.opencodeSubagentId(child), "orphaned", Date.now() - 1000);
   const exported: string[] = [];
   prevRunner = exportMod.__forTest.setExportRunner(async (a) => {
@@ -914,7 +914,7 @@ test("refreshOpencodeSubagents is a no-op for a turn carried by the agetor serve
   expect(exported).toEqual([]);
   expect(row(child).status).toBe("orphaned");
   const running = childId("noopr");
-  reg(taskId, runId, running);
+  await reg(taskId, runId, running);
   await mod.refreshOpencodeSubagents(refreshArgs(taskId, { final: false }));
   expect(exported).toEqual([]);
   expect(row(running).status).toBe("running");
@@ -927,19 +927,19 @@ test("refreshOpencodeSubagents is a no-op for a turn carried by the agetor serve
   });
   seedBreadcrumb(tmuxRun, 2, "shared");
   const tmuxChild = childId("tmuxc");
-  mod.registerOpencodeSubagent({ taskId, runId: tmuxRun, notice: notice(tmuxChild) });
+  await mod.registerOpencodeSubagent({ taskId, runId: tmuxRun, notice: notice(tmuxChild) });
   await mod.refreshOpencodeSubagents(refreshArgs(taskId));
   expect(exported).toEqual([tmuxChild]);
 });
 
-test("orphanRunningOpencodeSubagents leaves an agetor-server child orphaned, never failed (the server outlives the turn)", () => {
+test("orphanRunningOpencodeSubagents leaves an agetor-server child orphaned, never failed (the server outlives the turn)", async () => {
   installEmitter();
   const { taskId, runId } = seedTask();
   seedBreadcrumb(runId, 2, "agetor");
-  expect(mod.opencodeTurnOfRun(runId)).toEqual({ major: 2, server: "agetor" });
+  expect(await mod.opencodeTurnOfRun(runId)).toEqual({ major: 2, server: "agetor" });
   const child = childId("orphc");
-  reg(taskId, runId, child, { title: "Job" });
-  expect(mod.orphanRunningOpencodeSubagents(taskId, "agetor restarted")).toBe(1);
+  await reg(taskId, runId, child, { title: "Job" });
+  expect(await mod.orphanRunningOpencodeSubagents(taskId, "agetor restarted")).toBe(1);
   expect(row(child).status).toBe("orphaned");
   expect(emitted.filter((e) => e.stream === "status").map((e) => e.data)).toEqual([
     'OpenCode subagent "Job" was left unfinished — agetor restarted',
@@ -953,7 +953,7 @@ test("an orphaned child stays open while the server can't be asked, and is settl
   const { taskId, runId } = seedTask();
   const msgs = [userMsg("msg_u1"), asstMsg("msg_a1", "working")];
   const child = childId("s6u");
-  reg(taskId, runId, child);
+  await reg(taskId, runId, child);
   const orphanedAt = Date.now() - 1000;
   db.subagents.setStatus(mod.opencodeSubagentId(child), "orphaned", orphanedAt);
   const err = console.error;
@@ -962,7 +962,7 @@ test("an orphaned child stays open while the server can't be asked, and is settl
     // The listing fails: nothing is known, so nothing is settled.
     await mod.syncOpencodeChildFromServer({ taskId, runId, client: stubClient(msgs, undefined, new Error("ECONNREFUSED")).client, childSessionId: child });
     expect(row(child)).toMatchObject({ status: "orphaned", endedAt: orphanedAt });
-    expect(mod.listOpenOpencodeChildSessions(taskId)).toContain(child);
+    expect(await mod.listOpenOpencodeChildSessions(taskId)).toContain(child);
     // The history read itself fails (server down): same.
     const down = { getSession: async () => null, listMessages: async () => { throw new Error("connection refused"); }, activeSessions: async () => ({}) } as unknown as OpencodeClient;
     await mod.syncOpencodeChildFromServer({ taskId, runId, client: down, childSessionId: child });
@@ -979,14 +979,14 @@ test("an orphaned child with no messages that the server doesn't list as active 
   installEmitter();
   const { taskId, runId } = seedTask();
   const orphan = childId("s6e");
-  reg(taskId, runId, orphan);
+  await reg(taskId, runId, orphan);
   db.subagents.setStatus(mod.opencodeSubagentId(orphan), "orphaned", Date.now() - 1000);
   await mod.syncOpencodeChildFromServer({ taskId, runId, client: stubClient([]).client, childSessionId: orphan });
   expect(row(orphan).status).toBe("failed");
 
   // A running row is never settled by the active listing: it may be about to start.
   const running = childId("s6r");
-  reg(taskId, runId, running);
+  await reg(taskId, runId, running);
   const { client, calls } = stubClient([userMsg("msg_u1"), asstMsg("msg_a1", "x")]);
   await mod.syncOpencodeChildFromServer({ taskId, runId, client, childSessionId: running });
   await mod.syncOpencodeChildFromServer({ taskId, runId, client: stubClient([]).client, childSessionId: running });
@@ -998,9 +998,9 @@ test("a dead child agetor itself stopped settles as cancelled, not failed", asyn
   installEmitter();
   const { taskId, runId } = seedTask();
   const child = childId("s6c");
-  reg(taskId, runId, child);
+  await reg(taskId, runId, child);
   db.subagents.setStatus(mod.opencodeSubagentId(child), "orphaned", Date.now() - 1000);
-  mod.noteOpencodeChildStoppedByAgetor({ taskId, childSessionId: child });
+  await mod.noteOpencodeChildStoppedByAgetor({ taskId, childSessionId: child });
   await mod.syncOpencodeChildFromServer({ taskId, runId, client: stubClient([userMsg("msg_u1")]).client, childSessionId: child });
   expect(row(child).status).toBe("cancelled");
 });
@@ -1014,22 +1014,22 @@ test("orphanOpencodeChild parks one running row (same status line), leaves its s
     seedBreadcrumb(runId, 2, "agetor");
     const dead = childId("ocd");
     const live = childId("ocl");
-    for (const c of [dead, live]) reg(taskId, runId, c, { title: "Job" });
+    for (const c of [dead, live]) await reg(taskId, runId, c, { title: "Job" });
     const other = seedTask();
     const otherChild = childId("oco");
-    reg(other.taskId, other.runId, otherChild);
+    await reg(other.taskId, other.runId, otherChild);
     fired.length = 0;
 
-    expect(mod.orphanOpencodeChild(taskId, dead)).toBe(true);
+    expect(await mod.orphanOpencodeChild(taskId, dead)).toBe(true);
     expect([row(dead).status, row(live).status]).toEqual(["orphaned", "running"]);
     expect(fired).toEqual([taskId]);
     expect(emitted.filter((e) => e.stream === "status").map((e) => e.data)).toEqual([
       'OpenCode subagent "Job" was left unfinished — the OpenCode server stopped',
     ]);
     // Idempotent, and never another task's row or an unknown child.
-    expect(mod.orphanOpencodeChild(taskId, dead)).toBe(false);
-    expect(mod.orphanOpencodeChild(taskId, otherChild)).toBe(false);
-    expect(mod.orphanOpencodeChild(taskId, childId("ocx"))).toBe(false);
+    expect(await mod.orphanOpencodeChild(taskId, dead)).toBe(false);
+    expect(await mod.orphanOpencodeChild(taskId, otherChild)).toBe(false);
+    expect(await mod.orphanOpencodeChild(taskId, childId("ocx"))).toBe(false);
     expect(row(otherChild).status).toBe("running");
     expect(fired).toEqual([taskId]);
     expect(emitted.filter((e) => e.stream === "status").length).toBe(1);
@@ -1053,15 +1053,15 @@ test("orphanRunningOpencodeChildrenOfTask parks a lost server's running children
     const a = childId("lsa");
     const b = childId("lsb");
     const done = childId("lsd");
-    for (const c of [a, b, done]) reg(taskId, runId, c, { title: "Job" });
-    mod.settleOpencodeChild({ taskId, childSessionId: done, outcome: "completed" });
+    for (const c of [a, b, done]) await reg(taskId, runId, c, { title: "Job" });
+    await mod.settleOpencodeChild({ taskId, childSessionId: done, outcome: "completed" });
     const other = seedTask();
     const otherChild = childId("lso");
-    reg(other.taskId, other.runId, otherChild);
+    await reg(other.taskId, other.runId, otherChild);
     fired.length = 0;
 
     expect(db.subagents.hasRunning(taskId)).toBe(true);
-    expect(mod.orphanRunningOpencodeChildrenOfTask(taskId)).toBe(2);
+    expect(await mod.orphanRunningOpencodeChildrenOfTask(taskId)).toBe(2);
     expect([row(a).status, row(b).status, row(done).status]).toEqual(["orphaned", "orphaned", "completed"]);
     expect(row(otherChild).status).toBe("running");
     expect(db.subagents.hasRunning(taskId)).toBe(false);
@@ -1071,7 +1071,7 @@ test("orphanRunningOpencodeChildrenOfTask parks a lost server's running children
       'OpenCode subagent "Job" was left unfinished — the OpenCode server stopped',
     ]);
     // Idempotent.
-    expect(mod.orphanRunningOpencodeChildrenOfTask(taskId)).toBe(0);
+    expect(await mod.orphanRunningOpencodeChildrenOfTask(taskId)).toBe(0);
     expect(fired).toEqual([taskId]);
 
     // The next sync against a server that no longer runs them settles them for good.
@@ -1085,9 +1085,9 @@ test("orphanRunningOpencodeChildrenOfTask parks a lost server's running children
 test("stopped-by-agetor notes: recorded without a subagent row, read from the DB, unknown ids false, expire after 24 h (C2)", async () => {
   const { taskId } = seedTask();
   const child = childId("stop");
-  expect(mod.wasOpencodeChildStoppedByAgetor(child)).toBe(false);
-  mod.noteOpencodeChildStoppedByAgetor({ taskId, childSessionId: child });
-  expect(mod.wasOpencodeChildStoppedByAgetor(child)).toBe(true);
+  expect(await mod.wasOpencodeChildStoppedByAgetor(child)).toBe(false);
+  await mod.noteOpencodeChildStoppedByAgetor({ taskId, childSessionId: child });
+  expect(await mod.wasOpencodeChildStoppedByAgetor(child)).toBe(true);
   // No subagent row (no tab) was invented for it.
   expect(db.subagents.get(mod.opencodeSubagentId(child))).toBeNull();
   expect(db.subagents.listForTask(taskId)).toEqual([]);
@@ -1100,31 +1100,31 @@ test("stopped-by-agetor notes: recorded without a subagent row, read from the DB
   // A fresh copy of the module (a restarted core has no in-memory state) still knows.
   const fresh = (await import(`./opencode-subagents.ts?restart=${randomUUID()}`)) as typeof import("./opencode-subagents.ts");
   expect(fresh).not.toBe(mod);
-  expect(fresh.wasOpencodeChildStoppedByAgetor(child)).toBe(true);
+  expect(await fresh.wasOpencodeChildStoppedByAgetor(child)).toBe(true);
   // ... including a note an earlier core wrote straight into the table.
   const earlier = childId("stope");
   db.db.run(`INSERT INTO opencode_stopped_children (child_session_id, task_id, stopped_at) VALUES (?, ?, ?)`, [earlier, taskId, Date.now() - 60_000]);
-  expect(fresh.wasOpencodeChildStoppedByAgetor(earlier)).toBe(true);
+  expect(await fresh.wasOpencodeChildStoppedByAgetor(earlier)).toBe(true);
 
   // Unknown and empty ids.
-  expect(mod.wasOpencodeChildStoppedByAgetor(childId("never"))).toBe(false);
-  expect(mod.wasOpencodeChildStoppedByAgetor("")).toBe(false);
+  expect(await mod.wasOpencodeChildStoppedByAgetor(childId("never"))).toBe(false);
+  expect(await mod.wasOpencodeChildStoppedByAgetor("")).toBe(false);
 
   // Expiry: true just inside the window, false at its edge and after.
   const t0 = Date.now();
   const old = childId("stopo");
-  mod.noteOpencodeChildStoppedByAgetor({ taskId, childSessionId: old }, t0);
-  expect(mod.wasOpencodeChildStoppedByAgetor(old, t0 + mod.OPENCODE_STOPPED_CHILD_TTL_MS - 1)).toBe(true);
-  expect(mod.wasOpencodeChildStoppedByAgetor(old, t0 + mod.OPENCODE_STOPPED_CHILD_TTL_MS)).toBe(false);
+  await mod.noteOpencodeChildStoppedByAgetor({ taskId, childSessionId: old }, t0);
+  expect(await mod.wasOpencodeChildStoppedByAgetor(old, t0 + mod.OPENCODE_STOPPED_CHILD_TTL_MS - 1)).toBe(true);
+  expect(await mod.wasOpencodeChildStoppedByAgetor(old, t0 + mod.OPENCODE_STOPPED_CHILD_TTL_MS)).toBe(false);
   // Re-noting refreshes the time.
-  mod.noteOpencodeChildStoppedByAgetor({ taskId, childSessionId: old }, t0 + 1000);
-  expect(mod.wasOpencodeChildStoppedByAgetor(old, t0 + mod.OPENCODE_STOPPED_CHILD_TTL_MS)).toBe(true);
+  await mod.noteOpencodeChildStoppedByAgetor({ taskId, childSessionId: old }, t0 + 1000);
+  expect(await mod.wasOpencodeChildStoppedByAgetor(old, t0 + mod.OPENCODE_STOPPED_CHILD_TTL_MS)).toBe(true);
   // A later note prunes the expired rows.
-  mod.noteOpencodeChildStoppedByAgetor({ taskId, childSessionId: childId("stopn") }, t0 + 2 * mod.OPENCODE_STOPPED_CHILD_TTL_MS);
+  await mod.noteOpencodeChildStoppedByAgetor({ taskId, childSessionId: childId("stopn") }, t0 + 2 * mod.OPENCODE_STOPPED_CHILD_TTL_MS);
   expect(db.db.query(`SELECT 1 FROM opencode_stopped_children WHERE child_session_id = ?`).get(old)).toBeNull();
 });
 
-test("listSettledOpencodeChildSessions is exactly the OpenCode rows listOpenOpencodeChildSessions leaves out", () => {
+test("listSettledOpencodeChildSessions is exactly the OpenCode rows listOpenOpencodeChildSessions leaves out", async () => {
   installEmitter();
   const { taskId, runId } = seedTask();
   const now = Date.now();
@@ -1132,7 +1132,7 @@ test("listSettledOpencodeChildSessions is exactly the OpenCode rows listOpenOpen
     running: childId("lr"), fresh: childId("lf"), old: childId("lo"), edge: childId("le"),
     done: childId("ld"), failed: childId("lx"), cancelled: childId("lc"),
   };
-  for (const c of Object.values(ids)) reg(taskId, runId, c);
+  for (const c of Object.values(ids)) await reg(taskId, runId, c);
   const set = (c: string, st: Subagent["status"], at: number) => db.subagents.setStatus(mod.opencodeSubagentId(c), st, at);
   set(ids.fresh, "orphaned", now - 60_000);
   set(ids.old, "orphaned", now - mod.ORPHAN_RECHECK_MAX_AGE_MS - 60_000);
@@ -1145,9 +1145,57 @@ test("listSettledOpencodeChildSessions is exactly the OpenCode rows listOpenOpen
     id: `claude-${randomUUID()}`, taskId, runId, parentKind: "subagent", agentType: null, description: null, spawnDepth: 1,
     sourcePath: "/tmp/agent-x.jsonl", toolUseId: null, status: "completed", startedAt: now, endedAt: now,
   });
-  const open = mod.listOpenOpencodeChildSessions(taskId, now).sort();
-  const settled = mod.listSettledOpencodeChildSessions(taskId, now).sort();
+  const open = (await mod.listOpenOpencodeChildSessions(taskId, now)).sort();
+  const settled = (await mod.listSettledOpencodeChildSessions(taskId, now)).sort();
   expect(open).toEqual([ids.running, ids.fresh].sort());
   expect(settled).toEqual([ids.old, ids.edge, ids.done, ids.failed, ids.cancelled].sort());
   expect(mod.OPENCODE_SUBAGENT_SOURCE_PREFIX).toBe("opencode-session:");
+});
+
+test("the driver's synchronous register, chunks and settle land in the order reported, whatever the database's pace", async () => {
+  installEmitter();
+  const { taskId, runId } = seedTask();
+  const child = childId("ord");
+  // What the driver does: calls back to back, nothing awaited between them.
+  const pending = [
+    mod.registerOpencodeChildSession({ taskId, runId, parentSessionId: "ses_parent", childSessionId: child, depth: 1 }),
+    mod.ingestOpencodeChildChunks({ taskId, childSessionId: child, chunks: [text(child, "msg_1", 0, "one"), text(child, "msg_1", 1, "two")] }),
+    mod.ingestOpencodeChildChunks({ taskId, childSessionId: child, chunks: [text(child, "msg_2", 0, "three")] }),
+    mod.settleOpencodeChild({ taskId, childSessionId: child, outcome: "completed" }),
+  ];
+  // A read queued behind them sees all of it: the child is settled, so it is no longer open.
+  expect(await mod.listOpenOpencodeChildSessions(taskId)).toEqual([]);
+  await Promise.all(pending);
+  expect(row(child).status).toBe("completed");
+  const stored = childEvents(child);
+  expect(stored.map((e) => e.data)).toEqual(["one", "two", "three"]);
+  // Live frames carry the stored ids, in id order, and the lifecycle frames bracket them.
+  const frames = emitted.filter((e) => e.subagentId === row(child).id);
+  expect(frames.map((e) => (e.stream === "subagent" ? JSON.parse(e.data).phase : e.data))).toEqual(["started", "one", "two", "three", "finished"]);
+  const ids = frames.filter((e) => e.stream !== "subagent").map((e) => e.id!);
+  expect(ids).toEqual([...ids].sort((a, b) => a - b));
+});
+
+test("a long list of chunks is stored in one transaction per batch, not one per chunk", async () => {
+  installEmitter();
+  const { taskId, runId } = seedTask();
+  const child = childId("batch");
+  await reg(taskId, runId, child);
+  const chunks = Array.from({ length: 300 }, (_, i) => text(child, `msg_${i}`, 0, `line ${i}`));
+  // Count what reaches the database client: one `appendEvents` call, no per-chunk `appendEvent`.
+  const rpc = (await import("./db-rpc.ts")).getDbRpc();
+  const seen: string[] = [];
+  const realCall = rpc.call.bind(rpc);
+  const spy = spyOn(rpc, "call").mockImplementation(((module: string, method: string, args: unknown[]) => {
+    seen.push(`${module}.${method}`);
+    return realCall(module as never, method, args);
+  }) as never);
+  try {
+    await mod.ingestOpencodeChildChunks({ taskId, childSessionId: child, chunks });
+  } finally {
+    spy.mockRestore();
+  }
+  expect(seen.filter((c) => c === "runs.appendEvents")).toHaveLength(1);
+  expect(seen).not.toContain("runs.appendEvent");
+  expect(childEvents(child)).toHaveLength(300);
 });

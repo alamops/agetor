@@ -17,8 +17,8 @@ import {
   runs,
   subagents,
   tasks,
-  type AppendedEvent,
-} from "./db.ts";
+} from "./db-async.ts";
+import { appendAndEmit } from "./run-emit-queue.ts";
 import { createTask, emitRunEvent } from "./orchestrator.ts";
 import { claudeModelIdFromArg } from "./agents.ts";
 import { coreSpawn } from "./core-spawn.ts";
@@ -38,7 +38,7 @@ import {
   MISSING_FOLDER_IMPORT_ERROR,
   agetorModeForClaudePermission,
 } from "../shared/claude-session-meta.ts";
-import type { ImportedClaudeSession, Run, Task } from "../shared/types.ts";
+import type { ImportedClaudeSession, Run, RunEventStream, Task } from "../shared/types.ts";
 import { isHarnessStackContinuation, stripHarnessStackContinuation } from "../shared/harness-stack.ts";
 import { normalizeDeliveredUserText } from "../shared/user-message.ts";
 
@@ -116,8 +116,8 @@ function withCommitLock<T>(sessionId: string, fn: () => Promise<T>): Promise<T> 
 
 const ALREADY_IMPORTED = "session is already imported";
 
-function sessionAlreadyBound(sessionId: string): boolean {
-  return tasks.findByImportedSessionId(sessionId) != null || runs.hasClaudeSessionId(sessionId);
+async function sessionAlreadyBound(sessionId: string): Promise<boolean> {
+  return (await tasks.findByImportedSessionId(sessionId)) != null || (await runs.hasClaudeSessionId(sessionId));
 }
 
 class ImportDeleted extends Error {
@@ -157,13 +157,13 @@ export function importedTaskPrompt(firstHumanPrompt: string | null, title: strin
 
 async function scanOptions(opts: ImportClaudeSessionsOptions | undefined): Promise<ScanClaudeSessionsOptions> {
   const homeDir = opts?.homeDir ?? (process.env.HOME || homedir());
-  const listed = opts?.harnesses ?? harnesses.list()
+  const listed = opts?.harnesses ?? (await harnesses.list())
     .filter((h) => h.kind === "claude-code")
     .map((h) => ({ id: h.id, kind: h.kind, home: h.home, env: h.env, bin: h.bin }));
   return {
     homeDir,
     env: opts?.env ?? process.env,
-    ownedSessionIds: hiddenClaudeSessionIds(),
+    ownedSessionIds: await hiddenClaudeSessionIds(),
     worktreeRoots: opts?.worktreeRoots ?? (await discoverAgetorWorktreeRoots(homeDir)),
     harnesses: listed,
     encodePath: opts?.encodePath,
@@ -303,25 +303,25 @@ function createTranscriptPull(
   }
 }
 
-function requireTask(taskId: string): ImportedClaudeSession {
-  const task = tasks.get(taskId);
+async function requireTask(taskId: string): Promise<ImportedClaudeSession> {
+  const task = await tasks.get(taskId);
   if (!task) throw new ImportDeleted();
   if (!task.importedClaude) throw new Error("task lost its import record");
   return task.importedClaude;
 }
 
-function noteBackfillOffset(
+async function noteBackfillOffset(
   taskId: string,
   offset: number,
   lastAssistant: { id: number | null },
   opts: ImportClaudeSessionsOptions | undefined,
-): void {
-  const current = requireTask(taskId);
+): Promise<void> {
+  const current = await requireTask(taskId);
   if (current.status === "importing" && current.backfillOffset !== offset) {
-    tasks.setImportedClaude(taskId, { ...current, backfillOffset: offset });
+    await tasks.setImportedClaude(taskId, { ...current, backfillOffset: offset });
   }
   if (lastAssistant.id != null) {
-    tasks.noteAssistantEvent(taskId, lastAssistant.id);
+    await tasks.noteAssistantEvent(taskId, lastAssistant.id);
     lastAssistant.id = null;
   }
   opts?.onBackfillProgress?.(taskId, offset);
@@ -346,7 +346,45 @@ async function replayFile(
     // long transcript. Check once up front and again on each yield. A
     // delete between those points fails the insert, and that failure is
     // the same stop.
-    if (!tasks.exists(taskId)) throw new ImportDeleted();
+    if (!(await tasks.exists(taskId))) throw new ImportDeleted();
+    // The lines of one slice, stored together (below). One transaction and one
+    // thread hop per slice instead of one per line of a transcript.
+    let pending: Array<{ stream: RunEventStream; data: string; lineUuid: string | null }> = [];
+    const flushPending = async (): Promise<void> => {
+      if (pending.length === 0) return;
+      const batch = pending;
+      pending = [];
+      let rows;
+      try {
+        // One run's inserts and their live sends stay in id order (`appendAndEmit`).
+        rows = await appendAndEmit(
+          runId,
+          () => runs.appendEvents(runId, batch.map((b) => ({ stream: b.stream, data: b.data, lineUuid: b.lineUuid, subagentId }))),
+          (stored) => {
+            stored.forEach((row, i) => {
+              if (row == null) return;
+              const b = batch[i]!;
+              emitRunEvent({
+                id: row.id,
+                runId,
+                taskId,
+                stream: b.stream,
+                data: b.data,
+                ts: row.ts,
+                ...(subagentId ? { subagentId } : {}),
+              });
+            });
+          },
+        );
+      } catch (err) {
+        if (!(await tasks.exists(taskId))) throw new ImportDeleted();
+        throw err;
+      }
+      if (!trackOffset) return;
+      rows.forEach((row, i) => {
+        if (row != null && batch[i]!.stream === "assistant") lastAssistant.id = row.id;
+      });
+    };
     // Stream complete lines and yield inside the replay. Reading or splitting
     // the whole transcript first would hold the main thread for a large JSONL.
     // `bound.size` grows when the file does, so a flush during the read is
@@ -356,35 +394,21 @@ async function replayFile(
     while (cursor < bound.size) {
       const sliceFrom = cursor;
       await replayJsonlLines(createTranscriptPull(fh, cursor, bound, opts?.readChunk), (stream, data, lineUuid) => {
-        let row: AppendedEvent | null;
-        try {
-          row = runs.appendEvent(runId, stream, data, lineUuid ?? null, subagentId);
-        } catch (err) {
-          if (!tasks.exists(taskId)) throw new ImportDeleted();
-          throw err;
-        }
-        if (row == null) return;
-        emitRunEvent({
-          id: row.id,
-          runId,
-          taskId,
-          stream,
-          data,
-          ts: row.ts,
-          ...(subagentId ? { subagentId } : {}),
-        });
-        if (trackOffset && stream === "assistant") lastAssistant.id = row.id;
+        pending.push({ stream, data, lineUuid: lineUuid ?? null });
       }, {
         sliceMs: opts?.sliceMs,
-        onProgress: (consumed) => {
+        onProgress: async (consumed) => {
+          // The slice's lines are stored before its offset is: a crash never
+          // records progress past a line that was not saved.
+          await flushPending();
           const absolute = sliceFrom + consumed;
           // The offset that equals the file size is written by the caller
           // after this replay returns, which is after the EOF turn-complete
           // banner. Persisting it from the in-loop checkpoint would let a
           // crash skip that banner on resume.
           if (trackOffset) {
-            if (absolute < bound.size) noteBackfillOffset(taskId, absolute, lastAssistant, opts);
-          } else if (!tasks.exists(taskId)) throw new ImportDeleted();
+            if (absolute < bound.size) await noteBackfillOffset(taskId, absolute, lastAssistant, opts);
+          } else if (!(await tasks.exists(taskId))) throw new ImportDeleted();
         },
       });
       const now = (await fh.stat()).size;
@@ -406,18 +430,18 @@ function importFailureMessage(err: unknown): string {
 /** Mark an in-flight import failed. A row that does not hold the session
  *  claim is updated in the JSON only — writing the claim would throw on the
  *  unique index and leave the row `importing` forever. */
-function failImport(taskId: string, message: string): void {
-  const current = tasks.get(taskId);
+async function failImport(taskId: string, message: string): Promise<void> {
+  const current = await tasks.get(taskId);
   if (!current?.importedClaude) return;
   const next: ImportedClaudeSession = { ...current.importedClaude, status: "failed", error: message };
-  if (tasks.importedSessionHeldElsewhere(taskId, next.sessionId)) {
-    tasks.setImportedClaude(taskId, next, { claim: false });
+  if (await tasks.importedSessionHeldElsewhere(taskId, next.sessionId)) {
+    await tasks.setImportedClaude(taskId, next, { claim: false });
   } else {
     try {
-      tasks.setImportedClaude(taskId, next);
+      await tasks.setImportedClaude(taskId, next);
     } catch (err) {
       if (!(err instanceof ImportedClaudeSessionTaken)) throw err;
-      tasks.setImportedClaude(taskId, next, { claim: false });
+      await tasks.setImportedClaude(taskId, next, { claim: false });
     }
   }
   broadcastAppEvent({ type: "claude_session_import", taskId, status: "failed", ts: Date.now() });
@@ -436,10 +460,10 @@ async function importSubagents(
   const now = Date.now();
   for (const name of names) {
     if (!name.startsWith("agent-") || !name.endsWith(".jsonl")) continue;
-    requireTask(taskId);
+    await requireTask(taskId);
     const id = name.slice("agent-".length, -".jsonl".length);
     const sourcePath = path.join(dir, name);
-    subagents.insertIfAbsent({
+    await subagents.insertIfAbsent({
       id,
       taskId,
       runId,
@@ -480,16 +504,16 @@ function seedRun(task: Task, provenance: ImportedClaudeSession, runId: string, n
  *  the existing seed row when it survived, otherwise insert one and continue.
  *  Provenance is written first so this repair can see the task — a seed row
  *  with no `importedClaude` is invisible to resume. */
-function ensureSeedRun(task: Task): string {
+async function ensureSeedRun(task: Task): Promise<string> {
   const provenance = task.importedClaude;
   if (!provenance) throw new Error("task lost its import record");
-  if (task.runId && runs.get(task.runId)) return task.runId;
-  const existing = runs.listForTask(task.id).find(
+  if (task.runId && (await runs.get(task.runId))) return task.runId;
+  const existing = (await runs.listForTask(task.id)).find(
     (r) => r.origin === "imported" && r.claudeSessionId === provenance.sessionId,
   );
   const runId = existing?.id ?? randomUUID();
-  if (!existing) runs.insert(seedRun(task, provenance, runId, Date.now()));
-  tasks.update(task.id, { runId, column: "review" });
+  if (!existing) await runs.insert(seedRun(task, provenance, runId, Date.now()));
+  await tasks.update(task.id, { runId, column: "review" });
   return runId;
 }
 
@@ -499,41 +523,41 @@ async function runBackfill(
   known?: ClaudeSessionRecord,
 ): Promise<void> {
   if (opts?.backfillGate) await opts.backfillGate;
-  const task = tasks.get(taskId);
+  const task = await tasks.get(taskId);
   if (!task?.importedClaude || task.importedClaude.status !== "importing") return;
   // Migration 070 leaves a losing duplicate `importing` with a null claim.
   // Taking the session id here throws, and the failure write used to throw
   // the same way, so the row stayed `importing` across boots.
-  if (tasks.importedSessionHeldElsewhere(taskId, task.importedClaude.sessionId)) {
-    failImport(taskId, IMPORTED_CLAUDE_HELD_ELSEWHERE);
+  if (await tasks.importedSessionHeldElsewhere(taskId, task.importedClaude.sessionId)) {
+    await failImport(taskId, IMPORTED_CLAUDE_HELD_ELSEWHERE);
     return;
   }
-  // Stays ahead of the transcript await when no gate is set. The launch scan
-  // reads ownership after `resumeIncompleteImports` returns, and this function
-  // runs synchronously up to that await.
+  // The task's own provenance already holds the session claim (the unique
+  // index), which is what the launch scan reads to hide an owned session, so
+  // the seed run does not have to exist before the scan runs.
   let runId: string;
   try {
-    runId = ensureSeedRun(task);
+    runId = await ensureSeedRun(task);
   } catch (err) {
     if (err instanceof ImportDeleted) return;
-    failImport(taskId, importFailureMessage(err));
+    await failImport(taskId, importFailureMessage(err));
     return;
   }
-  const provenance = tasks.get(taskId)?.importedClaude ?? task.importedClaude;
+  const provenance = (await tasks.get(taskId))?.importedClaude ?? task.importedClaude;
   try {
     const record = known?.sessionId === provenance.sessionId
       ? known
       : await findClaudeSession(provenance.sessionId, await scanOptions(opts));
     if (!record) throw new Error("session transcript is gone");
     await importSubagents(taskId, runId, record.jsonlPath, provenance.sessionId, opts);
-    const fresh = requireTask(taskId);
+    const fresh = await requireTask(taskId);
     const size = await replayFile(taskId, runId, record.jsonlPath, fresh.backfillOffset, null, opts, true);
-    const current = requireTask(taskId);
-    tasks.setImportedClaude(taskId, { ...current, backfillOffset: size, status: "ready", error: null });
+    const current = await requireTask(taskId);
+    await tasks.setImportedClaude(taskId, { ...current, backfillOffset: size, status: "ready", error: null });
     broadcastAppEvent({ type: "claude_session_import", taskId, status: "ready", ts: Date.now() });
   } catch (err) {
     if (err instanceof ImportDeleted) return;
-    failImport(taskId, importFailureMessage(err));
+    await failImport(taskId, importFailureMessage(err));
   }
 }
 
@@ -553,24 +577,24 @@ export function pendingImportBackfill(taskId: string): Promise<void> {
 }
 
 export async function resumeIncompleteImports(opts?: ImportClaudeSessionsOptions): Promise<void> {
-  for (const taskId of tasks.importingClaudeIds()) startBackfill(taskId, opts);
+  for (const taskId of await tasks.importingClaudeIds()) startBackfill(taskId, opts);
 }
 
 export async function retryImport(
   taskId: string,
   opts?: ImportClaudeSessionsOptions,
 ): Promise<{ ok: true } | { error: string }> {
-  const task = tasks.get(taskId);
+  const task = await tasks.get(taskId);
   if (!task?.importedClaude) return { error: "task is not an imported session" };
   if (task.importedClaude.status !== "failed") return { error: "import is not failed" };
   // Same claim the unique index enforces on import. A losing duplicate still
   // has failed provenance; rewriting it would either throw or, if the check
   // were skipped, replay onto a session another task owns.
-  if (tasks.importedSessionHeldElsewhere(taskId, task.importedClaude.sessionId)) {
+  if (await tasks.importedSessionHeldElsewhere(taskId, task.importedClaude.sessionId)) {
     return { error: IMPORTED_CLAUDE_HELD_ELSEWHERE };
   }
   try {
-    tasks.setImportedClaude(taskId, { ...task.importedClaude, status: "importing", error: null });
+    await tasks.setImportedClaude(taskId, { ...task.importedClaude, status: "importing", error: null });
   } catch (err) {
     if (err instanceof ImportedClaudeSessionTaken) {
       return { error: IMPORTED_CLAUDE_HELD_ELSEWHERE };
@@ -579,7 +603,7 @@ export async function retryImport(
   }
   startBackfill(taskId, opts);
   await pendingImportBackfill(taskId);
-  const after = tasks.get(taskId);
+  const after = await tasks.get(taskId);
   if (!after) return { error: "task disappeared during retry" };
   if (!after.importedClaude) return { error: "task lost its import record" };
   if (after.importedClaude.status === "failed") {
@@ -618,7 +642,7 @@ async function commitOne(
   // Fresh read, not the scanner's snapshot: a seed-insert crash leaves the
   // session id on the task and not yet on a run, and a snapshot taken before
   // a concurrent commit cannot see that commit.
-  if (sessionAlreadyBound(id)) return { id, error: ALREADY_IMPORTED };
+  if (await sessionAlreadyBound(id)) return { id, error: ALREADY_IMPORTED };
   if (!record) return { id, error: "session not found" };
   if (!record.firstHumanPrompt && record.messageCount === 0) return { id, error: "session has no messages" };
   if (record.blockedReason === "long-path") return { id, error: LONG_PATH_IMPORT_ERROR };
@@ -634,7 +658,7 @@ async function commitOne(
   const found = record;
 
   return withCommitLock(id, async () => {
-    if (sessionAlreadyBound(id)) return { id, error: ALREADY_IMPORTED };
+    if (await sessionAlreadyBound(id)) return { id, error: ALREADY_IMPORTED };
     // The caller gate comes first: nothing in this process may stat a folder
     // the caller is not allowed to reach (D24).
     if (opts?.gateCwd) {
@@ -654,7 +678,7 @@ async function bindImportedSession(
 ): Promise<ImportClaudeSessionResult> {
   const prompt = importedTaskPrompt(record.firstHumanPrompt, record.title);
   const model = record.model ? claudeModelIdFromArg(record.model) : null;
-  projects.upsert(record.cwd, path.basename(record.cwd) || record.cwd);
+  await projects.upsert(record.cwd, path.basename(record.cwd) || record.cwd);
   const created = await createTask({
     title: record.title,
     prompt,
@@ -685,28 +709,28 @@ async function bindImportedSession(
   // a retry sees the task even though no run row exists yet.
   let claimed = false;
   try {
-    const createdTask = tasks.setImportedClaude(taskId, provenance);
+    const createdTask = await tasks.setImportedClaude(taskId, provenance);
     if (!createdTask) {
-      tasks.delete(taskId);
+      await tasks.delete(taskId);
       return { id, error: "task disappeared before the seed run was written" };
     }
     claimed = true;
-    runs.insert(seedRun(
+    await runs.insert(seedRun(
       { ...createdTask, agent: record.harnessId! },
       provenance,
       runId,
       now,
     ));
-    tasks.update(taskId, { runId, column: "review" });
+    await tasks.update(taskId, { runId, column: "review" });
   } catch (err) {
     if (err instanceof ImportedClaudeSessionTaken) {
-      tasks.delete(taskId);
+      await tasks.delete(taskId);
       return { id, error: ALREADY_IMPORTED };
     }
     // Provenance is the claim. Keep the task when that write landed so resume
     // can insert the seed. A failure before it leaves an unbound row; delete
     // that row so the next attempt can bind a fresh task.
-    if (!claimed) tasks.delete(taskId);
+    if (!claimed) await tasks.delete(taskId);
     throw err;
   }
   startBackfill(taskId, opts, record);
