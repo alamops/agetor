@@ -18,6 +18,7 @@ import { iconForRef } from "@/lib/file-icons";
 import { cn } from "@/lib/utils";
 import { ContextMenu, type ContextMenuItem } from "@/components/ui/context-menu";
 import { AuthedImg } from "@/components/ui/authed-img";
+import { previewFailureTitle, type PreviewFailure } from "@/lib/preview-copy";
 import { CHECKERBOARD_STYLE } from "./BinaryFilePreview";
 import { AttachmentNotFoundDialog, AttachmentOpenErrorDialog } from "./AttachmentDialogs";
 import {
@@ -78,7 +79,7 @@ function subLineFor(tile: SentFileTile, isNotFound: boolean): string {
 function Tile({
   tile,
   isNotFound,
-  isPreviewFailed,
+  previewFailure,
   onPreviewFail,
   onClick,
   onOpenMenu,
@@ -88,12 +89,14 @@ function Tile({
    *  stat that came back without this path) — gates the click to the
    *  not-found dialog and drives the dimmed "missing" treatment. */
   isNotFound: boolean;
-  /** The tile's own thumbnail failed to load, independent of whether the
-   *  file itself still exists. Swaps the glyph for `ImageOff` but never
-   *  gates the click or shows "missing" — a broken preview request is not
-   *  proof the underlying file is gone. */
-  isPreviewFailed: boolean;
-  onPreviewFail: (path: string) => void;
+  /** Why the tile's own thumbnail failed to load (`undefined` while it
+   *  hasn't), independent of whether the file itself still exists. Swaps the
+   *  glyph for `ImageOff` and explains itself in the tooltip, but never gates
+   *  the click or shows "missing" — a broken preview request is not proof the
+   *  underlying file is gone (a 403 is the core being unable to read a
+   *  privacy-protected folder). */
+  previewFailure: PreviewFailure | undefined;
+  onPreviewFail: (path: string, failure: PreviewFailure) => void;
   onClick: () => void;
   onOpenMenu: (path: string, x: number, y: number) => void;
 }) {
@@ -102,12 +105,12 @@ function Tile({
     const Icon = tile.kind === "image" ? ImageOff : FileWarning;
     preview = <Icon className="size-8 text-warning" aria-hidden />;
   } else if (tile.previewable) {
-    preview = isPreviewFailed ? (
+    preview = previewFailure !== undefined ? (
       <ImageOff className="size-8 text-muted-foreground" aria-hidden />
     ) : (
       // Fetched with the auth header and shown as a `blob:` URL (D13/P9);
-      // any non-ok outcome (404, 413, network, decode) is a failed preview,
-      // same as the old `<img onError>`.
+      // any non-ok outcome (404, 403, 413, network, decode) is a failed
+      // preview, same as the old `<img onError>`.
       <AuthedImg
         url={api.filePreviewUrl(tile.path)}
         alt={tile.name}
@@ -116,7 +119,7 @@ function Tile({
         style={CHECKERBOARD_STYLE}
         placeholder={<span aria-hidden className="size-full animate-pulse bg-muted/30" />}
         onStatus={(status) => {
-          if (status !== "ok") onPreviewFail(tile.path);
+          if (status !== "ok") onPreviewFail(tile.path, status);
         }}
       />
     );
@@ -138,7 +141,13 @@ function Tile({
         data-testid="sent-file-tile"
         data-path={tile.path}
         data-kind={tile.kind}
-        title={tile.path}
+        title={
+          previewFailure !== undefined && !isNotFound
+            ? // A thumbnail 404 never claims "not found": the stat decides that
+              // (`isNotFound`), as it always has.
+              previewFailureTitle(previewFailure === "missing" ? "error" : previewFailure, tile.path)
+            : tile.path
+        }
         aria-label={`Open ${tile.name}`}
         onClick={onClick}
         onContextMenu={(e) => {
@@ -205,11 +214,12 @@ export function SentFilesCard({ call, result, taskId }: SentFilesCardProps) {
   // succeeds — never merely by dismissing the not-found dialog (the file
   // hasn't necessarily reappeared just because the dialog closed).
   const [notFound, setNotFound] = useState<ReadonlySet<string>>(new Set());
-  // A path whose `<img>` thumbnail failed to load — independent of whether
-  // the file itself still exists (a corrupt/unsupported image, a transient
-  // `/files/preview` hiccup, …). Only swaps the tile's glyph to `ImageOff`;
-  // never gates the click and never renders the "missing" sub-line.
-  const [previewFailed, setPreviewFailed] = useState<ReadonlySet<string>>(new Set());
+  // A path whose `<img>` thumbnail failed to load, with why — independent of
+  // whether the file itself still exists (a corrupt/unsupported image, a
+  // `/files/preview` 403 on a privacy-protected folder, a transient hiccup, …).
+  // Only swaps the tile's glyph to `ImageOff` and sets its tooltip; never gates
+  // the click and never renders the "missing" sub-line.
+  const [previewFailed, setPreviewFailed] = useState<ReadonlyMap<string, PreviewFailure>>(new Map());
   const [notFoundPath, setNotFoundPath] = useState<string | null>(null);
   const [openError, setOpenError] = useState<{ path: string; message: string } | null>(null);
   const [menu, setMenu] = useState<{ path: string; x: number; y: number } | null>(null);
@@ -273,8 +283,8 @@ export function SentFilesCard({ call, result, taskId }: SentFilesCardProps) {
     });
   };
 
-  const markPreviewFailed = (path: string) => {
-    setPreviewFailed((prev) => (prev.has(path) ? prev : new Set(prev).add(path)));
+  const markPreviewFailed = (path: string, failure: PreviewFailure) => {
+    setPreviewFailed((prev) => (prev.get(path) === failure ? prev : new Map(prev).set(path, failure)));
   };
 
   const handleOpenOrReveal = async (path: string, action: "open" | "reveal") => {
@@ -380,7 +390,7 @@ export function SentFilesCard({ call, result, taskId }: SentFilesCardProps) {
             key={tile.path}
             tile={tile}
             isNotFound={notFound.has(tile.path) || tile.exists === false}
-            isPreviewFailed={previewFailed.has(tile.path)}
+            previewFailure={previewFailed.get(tile.path)}
             onPreviewFail={markPreviewFailed}
             onClick={() => handleTileClick(tile)}
             onOpenMenu={openMenu}

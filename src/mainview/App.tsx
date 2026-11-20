@@ -25,8 +25,8 @@ import {
   X,
   type LucideIcon,
 } from "lucide-react";
-import { api, type AgentModelMap, type HarnessModelMap } from "@/lib/api";
-import { clampFontSizePercent, COLUMNS, type AgentStatus, type AppMenuAction, type ColumnId, type GlobalEvent, type Harness, type HarnessLimitState, type HarnessQuota, type HarnessStack, type Project, type Task, type TaskListOptions, type TaskType } from "../shared/types.ts";
+import { api, ApiError, type AgentModelMap, type HarnessModelMap } from "@/lib/api";
+import { clampFontSizePercent, COLUMNS, describeArchiveUncommittedChanges, isArchiveUncommittedChanges, type AgentStatus, type AppMenuAction, type ColumnId, type GlobalEvent, type Harness, type HarnessLimitState, type HarnessQuota, type HarnessStack, type Project, type Task, type TaskListOptions, type TaskType } from "../shared/types.ts";
 import { parseIssueUrl } from "../shared/issue-task.ts";
 import { Column } from "@/components/kanban/Column";
 import { ContextMenu, type ContextMenuItem, type ContextMenuLeafItem } from "@/components/ui/context-menu";
@@ -2306,11 +2306,34 @@ function AppInner() {
       });
       if (!ok) return;
     }
+    const base = active ? { force: true, stopRun: true } : {};
     const now = Date.now();
-    setTasks((cur) => cur.map((x) => (x.id === t.id ? { ...x, archivedAt: now } : x)));
+    const setArchivedAt = (archivedAt: number | null) =>
+      setTasks((cur) => cur.map((x) => (x.id === t.id ? { ...x, archivedAt } : x)));
+    setArchivedAt(now);
     try {
       setError(null);
-      await api.archiveTask(t.id, active ? { force: true, stopRun: true } : undefined);
+      try {
+        await api.archiveTask(t.id, active ? base : undefined);
+      } catch (e) {
+        // Archive removes the worktree; the core refused because that would
+        // discard uncommitted work. Nothing changed server-side, so the card
+        // comes back while the user decides.
+        if (!(e instanceof ApiError && e.status === 409 && isArchiveUncommittedChanges(e.body))) throw e;
+        setArchivedAt(t.archivedAt);
+        const ok = await confirm({
+          title: `Discard uncommitted changes in "${t.title}"?`,
+          description: describeArchiveUncommittedChanges(e.body.repositories),
+          confirmLabel: "Discard & archive",
+          variant: "destructive",
+        });
+        if (!ok) {
+          await refresh();
+          return;
+        }
+        setArchivedAt(now);
+        await api.archiveTask(t.id, { ...base, forceWorktree: true });
+      }
       dismissTaskToast(t.id);
       clearSelectedStepOf(t.id);
       await refresh();

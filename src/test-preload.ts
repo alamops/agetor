@@ -1,4 +1,6 @@
+import { afterAll } from "bun:test";
 import { tmpdir } from "node:os";
+import { createRunTmpdir, removeRunTmpdir } from "./test-run-tmpdir.ts";
 
 /**
  * Bun test preload (registered in bunfig.toml under `[test]`).
@@ -30,12 +32,34 @@ process.env.AGETOR_OPENCODE_BIN ??= "/nonexistent/agetor-test-opencode";
  * a spawn that passes a hand-built env without `TMPDIR` does not see this
  * override and falls back to whatever its own runtime picks, so a fixture
  * that must pin a child's temp dir sets `TMPDIR` in that env itself.
- * Every test already creates unique `mkdtemp` directories,
- * so sharing `/tmp` is safe; `AGETOR_TEST_KEEP_TMPDIR=1` opts out.
+ * `AGETOR_TEST_KEEP_TMPDIR=1` opts out of both this redirect and the run
+ * root below.
+ *
+ * One temp root per run (`src/test-run-tmpdir.ts`): `TMPDIR` points at
+ * `<base>/agt-run-<pid>-XXXXXX`, removed once the whole run is done, so the
+ * `mkdtemp` fixtures tests leave behind go with it instead of piling up
+ * (100k+ leaked `agetor-*` directories, tens of GB, before this). A root
+ * whose run died without exiting cleanly is swept by the next run.
+ * The name must not contain "agetor": `claude-session-scan.ts` hides any
+ * session whose cwd is under `os.tmpdir()` with "agetor" in its path, which
+ * would hide every fixture session under the root.
+ * `AGETOR_TEST_RETAIN_TMPDIR=1` keeps this run's root for inspection.
  */
-if (process.platform === "darwin" && process.env.AGETOR_TEST_KEEP_TMPDIR !== "1") {
-  const resolved = tmpdir();
-  if (resolved.startsWith("/var/folders/") || resolved.startsWith("/private/var/folders/")) {
-    process.env.TMPDIR = "/tmp";
+if (process.env.AGETOR_TEST_KEEP_TMPDIR !== "1") {
+  let base = tmpdir();
+  if (
+    process.platform === "darwin"
+    && (base.startsWith("/var/folders/") || base.startsWith("/private/var/folders/"))
+  ) {
+    base = "/tmp";
+  }
+  const runRoot = createRunTmpdir(base, "agt-run-");
+  process.env.TMPDIR = runRoot;
+  if (process.env.AGETOR_TEST_RETAIN_TMPDIR !== "1") {
+    // `bun test` fires neither `exit` nor `beforeExit` (Bun 1.3.10); an
+    // `afterAll` registered in a preload runs once, after every file, even
+    // when tests fail. The `exit` hook covers a runtime that does fire it.
+    afterAll(() => removeRunTmpdir(runRoot));
+    process.on("exit", () => removeRunTmpdir(runRoot));
   }
 }

@@ -36,6 +36,7 @@ import { applyHarnessAutoEnable } from "./harness-auto-enable.ts";
 import { initPipelineRunner, reconcilePipelineRuns } from "./pipeline-runner.ts";
 import { beginLagLabel, startLagMonitor, stopLagMonitor } from "./event-loop-lag.ts";
 import { scheduleRetention, stopRetentionTimers } from "./retention.ts";
+import { requestPreviewTwinSweep } from "./preview-twins.ts";
 import { ensureDisclaimedServer } from "./tmux-resolution.ts";
 import { DISCLAIM_PREF_KEY } from "./disclaim.ts";
 import { initDisclaimSwitch } from "./disclaim-switch.ts";
@@ -556,6 +557,8 @@ void getBackgroundStatus({ fresh: true }).catch((err) => {
 // up and restore/seed work has settled), then every 24 h; each fire reads the
 // preference fresh. Also re-armed on demand by `PUT /preferences/...`.
 scheduleRetention();
+// Trim the preview-twin cache to its cap (fire-and-forget; never blocks boot).
+requestPreviewTwinSweep(dataDir);
 
 // Claude sessions started outside Agetor (docs/plans/import-claude-code-sessions.md).
 // Scheduled only now that this process owns the API port: during a handoff

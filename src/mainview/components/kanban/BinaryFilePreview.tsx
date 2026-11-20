@@ -7,6 +7,7 @@ import { cn } from "@/lib/utils";
 import { api } from "@/lib/api";
 import { useAuthedObjectUrl } from "@/lib/authed-blob";
 import { loadPdfDocument, isRenderCancelledError, type PdfDoc } from "@/lib/pdf";
+import { PREVIEW_DENIED_COPY } from "@/lib/preview-copy";
 import { MAX_BLOB_PREVIEW_BYTES } from "../../../shared/attachments.ts";
 import type { DiffFile } from "../../../shared/types.ts";
 
@@ -23,6 +24,11 @@ export interface BinaryFilePreviewProps {
   fetchBytes?: (url: string) => Promise<ArrayBuffer>;
   /** Used in alt text / placeholder copy. */
   fileName?: string;
+  /** The URLs serve files from this machine's disk (a local task diff), so a
+   *  403 means the core couldn't read a privacy-protected folder and the pane
+   *  may say so. Left unset for a git host's PR blobs, where a 403 is an
+   *  authorization failure that macOS privacy has nothing to do with. */
+  localFiles?: boolean;
 }
 
 export type Side = "old" | "new";
@@ -109,21 +115,38 @@ const MAX_BLOB_PREVIEW_MB = Math.round(MAX_BLOB_PREVIEW_BYTES / 1_000_000);
 
 /* ------------------------------- Images -------------------------------- */
 
-type ImageErrorKind = "too-large" | "missing" | "generic";
+type ImageErrorKind = "too-large" | "missing" | "denied" | "generic";
 
 const IMAGE_ERROR_COPY: Record<ImageErrorKind, string> = {
   "too-large": `Too large to preview — ${MAX_BLOB_PREVIEW_MB} MB limit`,
   "missing": "Not present on this side",
+  "denied": PREVIEW_DENIED_COPY,
   "generic": "Couldn't load image",
 };
 
-function ImagePane({ side, status, url, fileName }: { side: Side; status: BinaryPreviewFileStatus; url: string | null; fileName?: string }) {
+/** Only a proven 404 is amber; every other failure is a neutral pane (the file
+ *  may well exist — it just can't be previewed here). */
+const NEUTRAL_ERROR_PANE =
+  "flex h-56 flex-col items-center justify-center gap-1.5 rounded-md border border-border/60 bg-muted/20 p-2 text-center";
+const AMBER_ERROR_PANE =
+  "flex h-56 flex-col items-center justify-center gap-1.5 rounded-md border border-warning/40 bg-warning/10 p-2 text-center";
+
+function ImagePane({
+  side, status, url, fileName, localFiles,
+}: {
+  side: Side;
+  status: BinaryPreviewFileStatus;
+  url: string | null;
+  fileName?: string;
+  localFiles?: boolean;
+}) {
   const [dims, setDims] = useState<{ w: number; h: number } | null>(null);
   // The bytes are fetched with the auth header and shown as a `blob:` URL
   // (D13/P9), so the hook already knows the status that the old `<img
   // onError>` + `api.probeBlobStatus` re-probe had to reconstruct: 413 reads
-  // "too large to preview", 404 "not present on this side", anything else (or
-  // a decode failure below) a generic failure.
+  // "too large to preview", 404 "not present on this side", 403 "preview
+  // blocked" (local files only — see `localFiles`), anything else (or a decode
+  // failure below) a generic failure.
   const blob = useAuthedObjectUrl(url);
   const [decodeFailed, setDecodeFailed] = useState(false);
 
@@ -137,14 +160,18 @@ function ImagePane({ side, status, url, fileName }: { side: Side; status: Binary
   const errorKind: ImageErrorKind | null =
     blob.status === "too-large" ? "too-large"
     : blob.status === "missing" ? "missing"
+    : blob.status === "denied" ? (localFiles ? "denied" : "generic")
     : blob.status === "error" || decodeFailed ? "generic"
     : null;
 
   if (errorKind) {
+    const amber = errorKind === "missing";
     return (
-      <div className="flex h-56 flex-col items-center justify-center gap-1.5 rounded-md border border-warning/40 bg-warning/10 p-2 text-center">
-        <ImageOff className="size-4 shrink-0 text-warning" />
-        <span className="text-[11px] text-warning">{IMAGE_ERROR_COPY[errorKind]}</span>
+      <div className={amber ? AMBER_ERROR_PANE : NEUTRAL_ERROR_PANE}>
+        <ImageOff className={cn("size-4 shrink-0", amber ? "text-warning" : "text-muted-foreground")} />
+        <span className={cn("text-[11px]", amber ? "text-warning" : "text-muted-foreground")}>
+          {IMAGE_ERROR_COPY[errorKind]}
+        </span>
       </div>
     );
   }
@@ -186,7 +213,7 @@ type PdfSideState =
   | { status: "deferred" }
   | { status: "loading" }
   | { status: "ready"; doc: PdfDoc; numPages: number }
-  | { status: "error"; kind: "too-large" | "missing" | "generic" };
+  | { status: "error"; kind: "too-large" | "missing" | "denied" | "generic" };
 
 function usePdfSide(
   url: string | null,
@@ -223,7 +250,11 @@ function usePdfSide(
       } catch (err) {
         if (cancelled) return;
         const msg = err instanceof Error ? err.message : "";
-        const kind = msg === "too-large" ? "too-large" : msg === "missing" ? "missing" : "generic";
+        const kind =
+          msg === "too-large" ? "too-large"
+          : msg === "missing" ? "missing"
+          : msg === "denied" ? "denied"
+          : "generic";
         setState({ status: "error", kind });
       }
     })();
@@ -295,14 +326,15 @@ function useVisibleOnce<T extends HTMLElement>(): [(el: T | null) => void, boole
   return [setRef, visible];
 }
 
-const PDF_ERROR_COPY: Record<"too-large" | "missing" | "generic", string> = {
+const PDF_ERROR_COPY: Record<"too-large" | "missing" | "denied" | "generic", string> = {
   "too-large": `Too large to preview — ${MAX_BLOB_PREVIEW_MB} MB limit`,
   "missing": "File not found",
+  "denied": PREVIEW_DENIED_COPY,
   "generic": "Couldn't load PDF",
 };
 
 function PdfPane({
-  side, status, state, page, width, containerRef,
+  side, status, state, page, width, containerRef, localFiles,
 }: {
   side: Side;
   status: BinaryPreviewFileStatus;
@@ -310,6 +342,7 @@ function PdfPane({
   page: number;
   width: number;
   containerRef: (el: HTMLDivElement | null) => void;
+  localFiles?: boolean;
 }) {
   const canvasRef = useRef<HTMLCanvasElement | null>(null);
   // Render failures distinct from a document-level load error (state.error)
@@ -352,7 +385,10 @@ function PdfPane({
     return (
       <div ref={containerRef} className="flex h-40 flex-col items-center justify-center gap-1.5 rounded-md border border-border/60 bg-muted/20 p-2 text-center">
         <Icon className="size-4 shrink-0 text-muted-foreground" />
-        <span className="text-[11px] italic text-muted-foreground">{PDF_ERROR_COPY[state.kind]}</span>
+        <span className="text-[11px] italic text-muted-foreground">
+          {/* A 403 only blames macOS privacy for files on this machine's disk. */}
+          {PDF_ERROR_COPY[state.kind === "denied" && !localFiles ? "generic" : state.kind]}
+        </span>
       </div>
     );
   }
@@ -383,7 +419,7 @@ function PdfPane({
 
 /* ------------------------------ Component -------------------------------- */
 
-export function BinaryFilePreview({ kind, status, oldUrl, newUrl, fetchBytes, fileName }: BinaryFilePreviewProps) {
+export function BinaryFilePreview({ kind, status, oldUrl, newUrl, fetchBytes, fileName, localFiles }: BinaryFilePreviewProps) {
   const doFetch = fetchBytes ?? api.fetchBlobBytes;
   const [page, setPage] = useState(1);
 
@@ -419,10 +455,10 @@ export function BinaryFilePreview({ kind, status, oldUrl, newUrl, fetchBytes, fi
     return (
       <div className="grid grid-cols-1 gap-3 sm:grid-cols-2">
         <Pane side="old" status={status}>
-          <ImagePane side="old" status={status} url={oldUrl} fileName={fileName} />
+          <ImagePane side="old" status={status} url={oldUrl} fileName={fileName} localFiles={localFiles} />
         </Pane>
         <Pane side="new" status={status}>
-          <ImagePane side="new" status={status} url={newUrl} fileName={fileName} />
+          <ImagePane side="new" status={status} url={newUrl} fileName={fileName} localFiles={localFiles} />
         </Pane>
       </div>
     );
@@ -434,10 +470,10 @@ export function BinaryFilePreview({ kind, status, oldUrl, newUrl, fetchBytes, fi
     <div ref={pdfRootRef} className="flex flex-col gap-2">
       <div className="grid grid-cols-1 gap-3 sm:grid-cols-2">
         <Pane side="old" status={status}>
-          <PdfPane side="old" status={status} state={oldState} page={page} width={oldWidth} containerRef={oldRef} />
+          <PdfPane side="old" status={status} state={oldState} page={page} width={oldWidth} containerRef={oldRef} localFiles={localFiles} />
         </Pane>
         <Pane side="new" status={status}>
-          <PdfPane side="new" status={status} state={newState} page={page} width={newWidth} containerRef={newRef} />
+          <PdfPane side="new" status={status} state={newState} page={page} width={newWidth} containerRef={newRef} localFiles={localFiles} />
         </Pane>
       </div>
       {showPager && (

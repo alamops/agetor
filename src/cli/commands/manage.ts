@@ -4,7 +4,7 @@ import { getClient, type Flags } from "../context.ts";
 import { resolveTask } from "../resolve.ts";
 import { c, out, printJson } from "../output.ts";
 import { ApiError, type PatchTaskInput } from "../api-client.ts";
-import { COLUMNS } from "../../shared/types.ts";
+import { COLUMNS, describeArchiveUncommittedChanges, isArchiveUncommittedChanges } from "../../shared/types.ts";
 import { flagValue } from "../args.ts";
 import { parseOpencodeServerFlag, parseSpeedFlag, usageError, warnOpencodeServerFlagIgnored } from "../usage.ts";
 import { escapeControlChars } from "../../shared/terminal-text.ts";
@@ -139,11 +139,29 @@ export async function cmdMove(args: string[], flags: Flags): Promise<void> {
 }
 
 export async function cmdArchive(args: string[], flags: Flags): Promise<void> {
-  const ref = args[0];
+  let ref: string | undefined;
+  let discardChanges = false;
+  for (const a of args) {
+    if (a === "--discard-changes") discardChanges = true;
+    else if (a.startsWith("-")) throw usageError("archive");
+    else if (ref === undefined) ref = a;
+    else throw usageError("archive");
+  }
   if (!ref) throw usageError("archive");
   const client = await getClient(flags);
   const task = await resolveTask(client, ref);
-  const updated = await client.archiveTask(task.id);
+  let updated: Task;
+  try {
+    updated = await client.archiveTask(task.id, { forceWorktree: discardChanges });
+  } catch (e) {
+    // Archive removes the worktree; the core refuses when that would discard
+    // uncommitted work, and nothing changed. Say why and how to go ahead.
+    if (e instanceof ApiError && e.status === 409 && isArchiveUncommittedChanges(e.body)) {
+      const names = e.body.repositories.map((n) => escapeControlChars(n));
+      throw new Error(`${describeArchiveUncommittedChanges(names)} Re-run with --discard-changes to archive anyway.`);
+    }
+    throw e;
+  }
   if (flags.json) return printJson(updated);
   out(`${c.gray("archived")} ${c.dim(updated.id.slice(0, 8))}`);
 }
