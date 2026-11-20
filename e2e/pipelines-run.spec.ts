@@ -1271,23 +1271,40 @@ async function waitForPendingCount(backend: E2EBackend, id: string, expected: nu
   }).toPass({ timeout: CONVERGE_TIMEOUT });
 }
 
-/** Wait until the board's own 2 s `/tasks` poll has delivered a step row of
- *  `parentId` (with a pending question, when `pending` is set). The
- *  attention landings resolve the step from App's already-polled list and
- *  never fetch (plan D13) — a click inside the poll window after a step was
- *  created lands on the run view alone, by design — so a test clicking an
- *  attention path waits for the poll first. */
+/** Wait until the board has been DELIVERED a step row of `parentId` (with a
+ *  pending question, when `pending` is set). The attention landings resolve
+ *  the step from App's already-merged list and never fetch (plan D13), so a
+ *  click before the board merged the step lands on the run view alone, by
+ *  design, and a test clicking an attention path waits first. The board
+ *  follows the core by `?delta=1` + push, so an old poll response can no
+ *  longer be matched (a delta carries only what changed): ask the core
+ *  directly until the state exists, then wait for a board `/tasks` request
+ *  that STARTED after that moment to finish; the board has merged it by then. */
 async function waitForPolledStep(page: Page, parentId: string, opts: { pending?: boolean } = {}): Promise<void> {
+  const hash = new URLSearchParams(page.url().slice(page.url().indexOf("#") + 1));
+  const apiBase = `http://127.0.0.1:${hash.get("api")}`;
+  const headers = { authorization: `Bearer ${hash.get("token")}` };
+  await expect
+    .poll(
+      async () => {
+        const res = await page.request.get(`${apiBase}/tasks?delta=1`, { headers });
+        const body = (await res.json()) as { tasks: TaskRow[] };
+        return body.tasks.some(
+          (t) => t.pipelineParentId === parentId && (!opts.pending || (t.pendingInteractionCount ?? 0) > 0),
+        );
+      },
+      { timeout: CONVERGE_TIMEOUT },
+    )
+    .toBe(true);
+  const since = Date.now();
   await page.waitForResponse(
-    async (r) => {
-      if (r.request().method() !== "GET" || new URL(r.url()).pathname !== "/tasks") return false;
-      const rows = (await r.json().catch(() => [])) as TaskRow[];
-      return rows.some(
-        (t) => t.pipelineParentId === parentId && (!opts.pending || (t.pendingInteractionCount ?? 0) > 0),
-      );
+    (r) => {
+      const u = new URL(r.url());
+      return r.request().method() === "GET" && u.pathname === "/tasks" && r.request().timing().startTime >= since;
     },
     { timeout: CONVERGE_TIMEOUT },
   );
+  await page.waitForTimeout(300);
 }
 
 function attentionChip(page: Page, stepId: string): Locator {
