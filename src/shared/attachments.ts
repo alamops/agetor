@@ -59,6 +59,21 @@ export function isImagePath(path: string): boolean {
   return IMAGE_EXT_RE.test(basename(path));
 }
 
+const SCREENSHOT_UPLOADABLE_EXT_RE = /\.(?:png|jpe?g|gif|webp)$/i;
+
+/** The four types `POST /screenshots` accepts (png/jpeg/gif/webp: the content
+ *  types a browser produces for an `<img>`-renderable blob). Deliberately
+ *  narrower than `isImagePath`: it decides which image refs recovered off the
+ *  drag pasteboard stay on the upload path (their bytes are copied to a file
+ *  Agetor owns, so they preview), and which are the ones that need a preview
+ *  twin instead (heic, svg, bmp, ico, avif attach by their original path).
+ *  The webview's `capture-refs` and the core's `/refs/drag` share this one
+ *  implementation. A directory ref (trailing `/`) never matches. */
+export function isScreenshotUploadablePath(path: string): boolean {
+  if (path.endsWith("/")) return false;
+  return SCREENSHOT_UPLOADABLE_EXT_RE.test(basename(path));
+}
+
 const PDF_EXT_RE = /\.pdf$/i;
 
 /** True iff `path`'s basename ends in `.pdf` (case-insensitive). Same

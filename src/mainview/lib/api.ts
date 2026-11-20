@@ -1025,12 +1025,34 @@ export const api = {
       method: "POST",
       body: JSON.stringify({ paths }),
     }).then((r) => r.refs),
+  /** `resolveRefs` for the `file://` paths of the user's OWN drop or paste
+   *  (`capture-refs` rung 1, and nothing else): the same stat, plus
+   *  `previewTwins: true`, which asks the core to also write a preview twin of
+   *  each image so its thumbnail survives macOS's privacy block on the folder
+   *  (docs/architecture/security.md, "Preview twins"). `names` are the basenames
+   *  of the `File`s the same drop/paste carried; the core twins only a path one
+   *  of them vouches for, so a `file://` line in dragged text (agent output)
+   *  can't make it copy a file the user never dropped. Every other caller of
+   *  `/refs/resolve` names agent-chosen paths and must keep using
+   *  `resolveRefs`, which never sends the flag. */
+  resolveCapturedRefs: (paths: string[], names: string[]) =>
+    j<{ refs: TaskReference[] }>("/refs/resolve", {
+      method: "POST",
+      body: JSON.stringify({ paths, names, previewTwins: true }),
+    }).then((r) => r.refs),
   /** Recover the real paths of the drag/drop that just ended, off the macOS
    *  drag pasteboard — WKWebView exposes no `file://` URLs on a drop, so this
    *  is the fallback for non-image files/folders dragged from Finder. The
-   *  server stats each (directory-ness correct, nonexistent dropped). */
-  dragRefs: () =>
-    j<{ refs: TaskReference[] }>("/refs/drag", { method: "POST" }).then((r) => r.refs),
+   *  server stats each (directory-ness correct, nonexistent dropped).
+   *  `names` are the basenames of the `File`s the drop carried; the core
+   *  writes preview twins only for non-uploadable images those names vouch
+   *  for, so a drag pasteboard an agent rewrote mid-drag can't make it copy a
+   *  file the user never dropped. */
+  dragRefs: (names: string[]) =>
+    j<{ refs: TaskReference[] }>("/refs/drag", {
+      method: "POST",
+      body: JSON.stringify({ names }),
+    }).then((r) => r.refs),
   listBranches: (dir: string) =>
     j<BranchInfo[]>(`/projects/branches?path=${encodeURIComponent(dir)}`),
   /** `git fetch --all --prune` on the project so newly pushed remote branches
@@ -2174,8 +2196,9 @@ export const api = {
    *  tag. `url` is typically one of `taskDiffBlobUrl`'s / `pullBlobUrl`'s
    *  token-less outputs; the header is the only credential. Throws an `Error` whose
    *  message distinguishes a missing blob ("missing", 404) from one over
-   *  the server's size cap ("too-large", 413) from any other failure, so
-   *  callers can render a matching empty state. */
+   *  the server's size cap ("too-large", 413) from one the core couldn't read
+   *  ("denied", 403) from any other failure, so callers can render a matching
+   *  empty state. */
   fetchBlobBytes: async (url: string): Promise<ArrayBuffer> => {
     const res = await fetch(url, {
       headers: { "authorization": `Bearer ${API_TOKEN}` },
@@ -2183,6 +2206,7 @@ export const api = {
     if (!res.ok) {
       if (res.status === 404) throw new Error("missing");
       if (res.status === 413) throw new Error("too-large");
+      if (res.status === 403) throw new Error("denied");
       throw new Error(`${res.status} ${res.statusText}`);
     }
     return res.arrayBuffer();

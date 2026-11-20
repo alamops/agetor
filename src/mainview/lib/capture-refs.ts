@@ -1,17 +1,17 @@
 import type { TaskReference } from "../../shared/types.ts";
 import { api } from "./api";
 import { refBasename } from "./path";
-
-// Deliberately narrower than `isImagePath` (shared/attachments.ts, 10
-// extensions incl. svg/heic/bmp/ico/avif): this predicate gates which
+// `isScreenshotUploadablePath` is deliberately narrower than `isImagePath`
+// (10 extensions incl. svg/heic/bmp/ico/avif): it gates which
 // pasteboard-recovered image refs get *excluded* so they fall through to
 // `POST /screenshots`, and that endpoint only accepts the four content-types
 // browsers actually produce for `<img>`-renderable blobs (png/jpeg/gif/webp
 // — see server.ts's `allowed` map). A ref for an extension outside this set
 // (e.g. `.svg`) must NOT be excluded here, or it would lose its recovered
 // path and then 415 on upload instead of just attaching by path like any
-// other non-image file.
-const SCREENSHOT_UPLOADABLE = /\.(png|jpe?g|gif|webp)$/i;
+// other non-image file. The core's `/refs/drag` uses the same predicate to
+// pick the refs that get a preview twin.
+import { isScreenshotUploadablePath } from "../../shared/attachments.ts";
 
 // `File` in a browser/WKWebView does NOT carry an absolute path (the `.path`
 // property is an Electron-only Chromium extension and is always undefined
@@ -149,14 +149,21 @@ function extractFilePaths(source: DataTransfer): string[] {
 
 export type ScreenshotUploader = (blob: Blob) => Promise<{ path: string; basename: string }>;
 
-/** Resolve absolute paths into references (server stats each). Injectable for
- *  tests; production callers pick up the real `api.resolveRefs`. */
-export type RefResolver = (paths: string[]) => Promise<TaskReference[]>;
+/** Resolve the absolute paths a drop/paste carried as `file://` URLs into
+ *  references (server stats each). Injectable for tests; production callers
+ *  pick up `api.resolveCapturedRefs`, which also asks the core to write a
+ *  preview twin of each image a carried `File` vouches for. `names` are the
+ *  basenames of the `File`s the same drop/paste carried: a `file://` line in
+ *  plain text (an agent's output dragged out of the transcript) carries no
+ *  `File`, so it gets a stat and a reference but never a twin. */
+export type RefResolver = (paths: string[], names: string[]) => Promise<TaskReference[]>;
 
 /** Recover the current drag's real paths off the macOS drag pasteboard
- *  (drop only — see `captureDroppedOrPastedItems`). Injectable for tests;
- *  production callers pick up the real `api.dragRefs`. */
-export type DragRefsFetcher = () => Promise<TaskReference[]>;
+ *  (drop only — see `captureDroppedOrPastedItems`). `names` are the basenames
+ *  of the `File`s the drop actually carried: the core only writes preview
+ *  twins for pasteboard paths a carried file vouches for. Injectable for
+ *  tests; production callers pick up the real `api.dragRefs`. */
+export type DragRefsFetcher = (names: string[]) => Promise<TaskReference[]>;
 
 /** Byte-copy a path-less blob to disk and get back its on-disk path.
  *  Injectable for tests; production callers pick up the real
@@ -263,7 +270,7 @@ export async function captureDroppedOrPastedItems(
 ): Promise<CaptureResult> {
   const kind = opts.kind ?? "drop";
   const uploader = opts.uploader ?? api.uploadScreenshot;
-  const resolver = opts.resolver ?? api.resolveRefs;
+  const resolver = opts.resolver ?? api.resolveCapturedRefs;
   const dragRefsFn = opts.dragRefs ?? api.dragRefs;
   const attachmentUploaderFn = opts.attachmentUploader ?? api.uploadAttachment;
 
@@ -280,7 +287,7 @@ export async function captureDroppedOrPastedItems(
 
   if (filePaths.length) {
     try {
-      const refs = await resolver(filePaths);
+      const refs = await resolver(filePaths, collected.map((c) => c.file.name));
       const items = refs.map((ref) => ({ ref, basename: refBasename(ref.path) }));
       return { items, skipped: Math.max(0, filePaths.length - refs.length), skippedFolders: 0 };
     } catch (e) {
@@ -295,13 +302,13 @@ export async function captureDroppedOrPastedItems(
   const carriedFiles = collected.length > 0 || typesSnapshot.includes("Files");
   if (kind === "drop" && carriedFiles) {
     try {
-      const dragged = await dragRefsFn();
+      const dragged = await dragRefsFn(collected.map((c) => c.file.name));
       // Only the four types `POST /screenshots` can actually take stay on
-      // the rung 3 upload path — see `SCREENSHOT_UPLOADABLE`. Every other
+      // the rung 3 upload path — see `isScreenshotUploadablePath`. Every other
       // extension (including other image-ish ones like .svg/.heic) is kept
       // here and recovers its path like any non-image file.
       const filtered = dragged.filter(
-        (ref) => !isTransientPath(ref.path) && !(!ref.isDirectory && SCREENSHOT_UPLOADABLE.test(ref.path)),
+        (ref) => !isTransientPath(ref.path) && !(!ref.isDirectory && isScreenshotUploadablePath(ref.path)),
       );
       // Consume the collected `File` (if any) matching `ref`'s basename and
       // return whether one was found.

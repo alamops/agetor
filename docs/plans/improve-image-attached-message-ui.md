@@ -15,6 +15,7 @@
 2. Referenced attachments render as **chips below the message body** instead of a raw `Referenced files/folders:` text block — image refs get a real **thumbnail**, other refs keep the house icon-chip idiom.
 3. Clicking a thumbnail/chip **opens the file** with the OS default app.
 4. If the file no longer exists, the thumbnail slot shows a **warning state** (icon + basename), and clicking it (or a failed open) surfaces an **"Attachment not found"** dialog.
+   > *Update 2026-11-18 (`docs/plans/picked-image-preview-tcc.md`):* the warning (amber) state is now **404-only**. A preview that is blocked (a 403: on macOS the core can't read a protected folder), too large or otherwise unavailable shows a neutral chip with an honest tooltip, and clicking it opens the file instead of the not-found dialog.
 5. `bun run typecheck` green; `bun test` green; zero behavior change for ordinary messages without attachments.
 
 ## 2. Context & constraints (grounded findings)
@@ -61,7 +62,7 @@ In the `isMeta === true` branch: if the joined text matches `imageSourceMetaPath
 Files owned: `src/mainview/lib/event-dedup.ts`, `src/mainview/lib/api.ts`, `src/mainview/components/kanban/AttachmentChips.tsx` (new), `src/mainview/components/kanban/RunPanel.tsx`.
 - `event-dedup.ts`: compose `canonicalizeAttachmentText` into the user key.
 - `api.ts`: `filePreviewUrl(path)` builder (mirrors the SSE `?token=` pattern).
-- `AttachmentChips.tsx`: props `{ references: string[] }` (dirs keep trailing `/`). Image ref → thumbnail button (`<img>` ~`h-16 max-w-40 rounded-md border border-border/60 object-cover`, `title` = full path); `onError` → warning chip (lucide `ImageOff`, amber-toned, basename). Non-image ref → existing icon-chip idiom as a button. Click: known-missing → not-found dialog; else `api.openPath` and on rejection → same dialog. Dialog: `useConfirm()` if it renders acceptably as single-action info, else a small local `<Dialog>` (header idiom from DiffDialog) saying the attachment was not found, showing the full path.
+- `AttachmentChips.tsx`: props `{ references: string[] }` (dirs keep trailing `/`). Image ref → thumbnail button (`<img>` ~`h-16 max-w-40 rounded-md border border-border/60 object-cover`, `title` = full path); `onError` → warning chip (lucide `ImageOff`, amber-toned, basename). *(2026-11-18: the amber chip is now for a proven 404 only; any other failure is a neutral chip that still opens the file — see §1.4.)* Non-image ref → existing icon-chip idiom as a button. Click: known-missing → not-found dialog; else `api.openPath` and on rejection → same dialog. Dialog: `useConfirm()` if it renders acceptably as single-action info, else a small local `<Dialog>` (header idiom from DiffDialog) saying the attachment was not found, showing the full path.
 - `RunPanel.tsx`: ordinary branch — normalize CRs, `splitReferences`, body = `stripImagePlaceholders(args)` through ReactMarkdown, chips below; command branch — replace inline chip map with `AttachmentChips`; `renderEvent` `status` case — return nothing for `imageSourceMetaPath` matches.
 
 ## 5. Work breakdown — test tasks (phase 6)
