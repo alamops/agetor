@@ -30,7 +30,7 @@ import {
 } from "lucide-react";
 import { api, type AgentModelMap, type HarnessModelMap } from "@/lib/api";
 import { Button } from "@/components/ui/button";
-import { clampFontSizePercent, COLUMNS, USAGE_SUPPORTED_KINDS, type AgentStatus, type ColumnId, type GlobalEvent, type Harness, type HarnessLimitState, type HarnessQuota, type HarnessStack, type Project, type Task, type TaskType } from "../shared/types.ts";
+import { clampFontSizePercent, COLUMNS, USAGE_SUPPORTED_KINDS, type AgentStatus, type ColumnId, type GlobalEvent, type Harness, type HarnessLimitState, type HarnessQuota, type HarnessStack, type Project, type Task, type TaskListOptions, type TaskType } from "../shared/types.ts";
 import { parseIssueUrl } from "../shared/issue-task.ts";
 import { AgentIcon } from "@/components/kanban/AgentIcon";
 import { Column } from "@/components/kanban/Column";
@@ -357,6 +357,10 @@ function AppInner() {
   // the welcome dialog for a beat before the first real fetch lands (same
   // class of bug the boot-splash minimum-dwell guards against elsewhere).
   const [tasksLoaded, setTasksLoaded] = useState(false);
+  // A successful `/tasks` poll that included archived tasks has landed. The
+  // board poll skips the archive unless a view needs it, and onboarding is
+  // one: "created a task" / "ran a task" must count archived tasks.
+  const [tasksWithArchivedLoaded, setTasksWithArchivedLoaded] = useState(false);
   // First successful `/projects` fetch — mirrors `tasksLoaded`/
   // `harnessesLoaded`. Onboarding's "project" step needs a live projects
   // list (added mid-session via NewTaskForm) to ever be able to check off,
@@ -765,13 +769,24 @@ function AppInner() {
   // the in-app toast sweep in `refresh()` below. A task that simply hasn't
   // been polled yet (just created, not in this set) is never swept.
   const polledTaskIdsRef = useRef<Set<string> | null>(null);
+  // What the next `/tasks` poll asks for (`TaskListArchived`). Written by the
+  // effect beside `taskMenu` below, read by `refresh()` (stable identity, so
+  // through a ref). Starts at `exclude` so the boot poll never ships the
+  // archive; that effect switches to the full list when a view needs it.
+  const taskListOptsRef = useRef<TaskListOptions>({ archived: "exclude" });
 
   /** Re-list tasks. Returns the fetched list so callers that need to inspect a
    *  task right after a mutation don't have to issue a second GET. `null` on
    *  failure — the last good snapshot stays rendered and the poll retries. */
   const refresh = useCallback(async (): Promise<Task[] | null> => {
     try {
-      const list = await api.listTasks();
+      const opts = taskListOptsRef.current;
+      const list = await api.listTasks(opts);
+      // The view changed what the poll should carry while this request was
+      // in flight (e.g. the board switched to All): a stale `exclude` answer
+      // landing after the `include` one would drop the archived cards until
+      // the next tick, so it is returned to the caller but not applied.
+      if (taskListOptsRef.current.archived !== opts.archived) return list;
       // `list` (unreconciled) is what callers get back for immediate reads
       // (e.g. re-checking a just-created task's branch); the reconciled,
       // identity-preserving version is what actually lands in state.
@@ -780,6 +795,9 @@ function AppInner() {
       // `loaded` input) — set unconditionally on every success, cheap no-op
       // once already true.
       setTasksLoaded(true);
+      // Onboarding's steps count archived tasks too, so they wait for a poll
+      // that carried them (see `onboardingVisibility`'s `loaded`).
+      if (opts.archived === "include") setTasksWithArchivedLoaded(true);
       // Toast-slot sweep (after a SUCCESSFUL poll only): a task whose toast
       // can no longer be acted on — archived, or listed by the previous poll
       // and gone from this one — must not keep an in-app toast up. O(n);
@@ -1969,7 +1987,10 @@ function AppInner() {
       // projects) must have resolved at least once — otherwise the checklist
       // can flash the compact "some steps missing" strip for an existing
       // user whose harnesses/projects just haven't loaded yet on a slow boot.
-      loaded: prefsLoaded && tasksLoaded && harnessesLoaded && projectsLoaded,
+      // A dismissed checklist never reads the steps; otherwise they need a
+      // task list that includes archived tasks (`tasksWithArchivedLoaded`).
+      loaded: prefsLoaded && tasksLoaded && harnessesLoaded && projectsLoaded
+        && (onboardingDismissedPref === "true" || tasksWithArchivedLoaded),
       steps: onboardingSteps,
       taskCount: tasks.length,
       welcomeAcknowledged,
@@ -1978,6 +1999,7 @@ function AppInner() {
       onboardingDismissedPref,
       prefsLoaded,
       tasksLoaded,
+      tasksWithArchivedLoaded,
       harnessesLoaded,
       projectsLoaded,
       onboardingSteps,
@@ -2438,6 +2460,37 @@ function AppInner() {
   useEffect(() => {
     if (taskMenu && !tasks.some((t) => t.id === taskMenu.task.id)) setTaskMenu(null);
   }, [taskMenu, tasks]);
+
+  // What the `/tasks` poll fetches (`taskListOptsRef`, read by `refresh()`).
+  // The Active board view leaves archived tasks on the server; a view that
+  // shows or counts them asks for the full list: the All/Archived board
+  // views, the Worktrees dialog (archived worktrees link to their task) and
+  // onboarding until it is dismissed (its steps count archived tasks).
+  // Whatever is open is kept by id whatever its archive state, so archiving
+  // the open task, or opening an archived one, never reads as the task
+  // vanishing (the selection effect closes the panel on a vanished id).
+  const needsArchivedTasks = archivedView !== "active"
+    || worktreesOpen
+    || (prefsLoaded && onboardingDismissedPref !== "true");
+  const keepTaskIds = [
+    selected?.id,
+    view.kind === "pipeline-run" ? view.taskId : undefined,
+    diffTask?.id,
+    taskMenu?.task.id,
+  ].filter((id): id is string => !!id);
+  const keepTaskIdsKey = keepTaskIds.join(",");
+  useEffect(() => {
+    taskListOptsRef.current = needsArchivedTasks
+      ? { archived: "include" }
+      : { archived: "exclude", keep: keepTaskIdsKey ? keepTaskIdsKey.split(",") : [] };
+  }, [needsArchivedTasks, keepTaskIdsKey]);
+  // Fetch right away when archived tasks become needed, so switching the
+  // board to All/Archived or opening Worktrees doesn't wait for the next
+  // tick (declared after the effect above, so the ref is already updated).
+  // A newly kept id needs no refetch: that task is already in the list.
+  useEffect(() => {
+    if (needsArchivedTasks) void refresh();
+  }, [needsArchivedTasks, refresh]);
 
   // Exhaustive dispatch from a `TaskMenuAction` (buildTaskContextMenu's pure
   // output) to the real App.tsx handler. State-transition actions target the

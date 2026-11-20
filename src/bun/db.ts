@@ -14,7 +14,7 @@ import { isSpeed, speedFromFast } from "../shared/speed.ts";
 import { OPENCODE_SERVER_INPUT_ERROR } from "../shared/opencode.ts";
 import { isMultiRepoTask, repositoriesForTask } from "../shared/multi-repo.ts";
 import { appendTaskPr, firstPrUrl, legacyTaskPrs, parseTaskPrs } from "../shared/task-prs.ts";
-import type { TaskPr, TaskRepository } from "../shared/types.ts";
+import type { TaskListArchived, TaskPr, TaskRepository } from "../shared/types.ts";
 import { AGENT_PROFILE_LIMITS, normalizeSkillName } from "../shared/agent-profile.ts";
 import { PIPELINE_CONTROL_CHAR_RE, validatePipelineGraph } from "../shared/pipeline.ts";
 import { decideForwardResume, type ForwardResumeSnapshotReason } from "./event-resume.ts";
@@ -1256,12 +1256,29 @@ export const tasks = {
   // for the whole result set (two single-pass scans over their respective
   // in-memory maps) instead of once per row via `toTask`'s per-task fallback
   // — this is the hot path hit by the 2s `/tasks` poll.
-  list(): Task[] {
-    const rows = db.query<TaskRow, []>(
+  //
+  // `archived` filters in SQL, before the runs join and `toTask`'s parse, so
+  // the board's `exclude` poll never touches an archived row (on a DB with
+  // thousands of archived tasks that is most of the list's bytes). `keepIds`
+  // are returned whatever their archive state. No argument returns every
+  // task, which every in-process caller relies on.
+  list(opts: { archived?: TaskListArchived; keepIds?: readonly string[] } = {}): Task[] {
+    const archived = opts.archived ?? "include";
+    const keepIds = opts.keepIds ?? [];
+    let where = "";
+    if (archived !== "include") {
+      const state = archived === "exclude" ? "tasks.archived_at IS NULL" : "tasks.archived_at IS NOT NULL";
+      where = keepIds.length > 0
+        ? `WHERE (${state} OR tasks.id IN (${keepIds.map(() => "?").join(", ")}))`
+        : `WHERE ${state}`;
+    }
+    const params = archived !== "include" ? [...keepIds] : [];
+    const rows = db.query<TaskRow, string[]>(
       `${TASKS_SELECT}
+         ${where}
          GROUP BY tasks.id
          ORDER BY tasks.created_at DESC`,
-    ).all();
+    ).all(...params);
     const pending = pendingCountsByTask();
     // D11: a pipeline parent task never has interactions registered against
     // its own (hidden, agent-less) id — every interaction happens on the
