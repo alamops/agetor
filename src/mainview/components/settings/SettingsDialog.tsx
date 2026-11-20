@@ -124,6 +124,10 @@ interface Props {
    *  opens (a deep link, e.g. "Edit in Settings" from a task's agent
    *  details). Wins over `initialSection`; absent/null falls back to it. */
   initialAgentProfileId?: string | null;
+  /** When set, the modal opens on that stack's swap-history subpage (the
+   *  app bar's Harnesses panel "Swap history" link). Wins over
+   *  `initialSection` and loses to `initialAgentProfileId`. */
+  initialStackHistoryId?: string | null;
   /** Navigate the app-level `view` to the pipelines page/editor — see
    *  `PipelinesSection`'s `onOpenPipelines` prop. The caller closes this
    *  dialog in the same callback. */
@@ -310,18 +314,20 @@ export function stackSavedHandler(
   return () => setView((current) => viewAfterSave(current, viewAtRender));
 }
 
-/** The view the modal opens on: a deep-linked agent's edit subpage, else the
- *  requested section, else General. */
-function entryView(
+/** The view the modal opens on: a deep-linked agent's edit subpage, else a
+ *  deep-linked stack's swap history, else the requested section, else General. */
+export function entryView(
   initialSection: SettingsSectionId | undefined,
   initialAgentProfileId: string | null | undefined,
+  initialStackHistoryId?: string | null,
 ): SettingsView {
   if (initialAgentProfileId) return openAgentEditor(initialAgentProfileId);
+  if (initialStackHistoryId) return openStackHistory(initialStackHistoryId);
   if (initialSection) return openSection(initialSection);
   return initialView();
 }
 
-export function SettingsDialog({ open, onClose, stickyUserMessages, onStickyUserMessagesChange, fxAutoResume, onFxAutoResumeChange, onChange, homeDir, dataDir, initialSection, initialAgentProfileId, onOpenPipelines, usage = NO_USAGE }: Props) {
+export function SettingsDialog({ open, onClose, stickyUserMessages, onStickyUserMessagesChange, fxAutoResume, onFxAutoResumeChange, onChange, homeDir, dataDir, initialSection, initialAgentProfileId, initialStackHistoryId, onOpenPipelines, usage = NO_USAGE }: Props) {
   const [version, setVersion] = useState<string>("");
   const [payload, setPayload] = useState<HarnessesPayload>({ harnesses: [], statuses: [] });
   const [defaultHarness, setDefaultHarness] = useState<string>("claude-code");
@@ -335,7 +341,7 @@ export function SettingsDialog({ open, onClose, stickyUserMessages, onStickyUser
   // Only the literal stored value "false" reads as off in this UI; unset or
   // anything else reads as on.
   const [disclaimSpawnedAgents, setDisclaimSpawnedAgents] = useState(true);
-  const [view, setView] = useState<SettingsView>(() => entryView(initialSection, initialAgentProfileId));
+  const [view, setView] = useState<SettingsView>(() => entryView(initialSection, initialAgentProfileId, initialStackHistoryId));
   // The view (and a per-open counter) must be correct on the very FIRST commit
   // after the modal opens: the dialog stays mounted while closed, and an
   // effect-driven reset would let that commit render the previous subpage —
@@ -344,16 +350,17 @@ export function SettingsDialog({ open, onClose, stickyUserMessages, onStickyUser
   // is adjusted during render, on the props' change, React's "derive state
   // from props" pattern. `openCount` rides in the agent editor's `key` so a
   // reopen onto the SAME profile id still mounts a fresh form.
-  const [entry, setEntry] = useState({ open, initialSection, initialAgentProfileId });
+  const [entry, setEntry] = useState({ open, initialSection, initialAgentProfileId, initialStackHistoryId });
   const [openCount, setOpenCount] = useState(0);
   if (
     entry.open !== open ||
     entry.initialSection !== initialSection ||
-    entry.initialAgentProfileId !== initialAgentProfileId
+    entry.initialAgentProfileId !== initialAgentProfileId ||
+    entry.initialStackHistoryId !== initialStackHistoryId
   ) {
-    setEntry({ open, initialSection, initialAgentProfileId });
+    setEntry({ open, initialSection, initialAgentProfileId, initialStackHistoryId });
     if (open) {
-      setView(entryView(initialSection, initialAgentProfileId));
+      setView(entryView(initialSection, initialAgentProfileId, initialStackHistoryId));
       if (!entry.open) setOpenCount((n) => n + 1);
     }
   }
@@ -439,7 +446,7 @@ export function SettingsDialog({ open, onClose, stickyUserMessages, onStickyUser
     // half-filled editor never greets the user on the next open.
     subpageDirtyRef.current = false;
     setFormError(null);
-  }, [open, initialSection, initialAgentProfileId]);
+  }, [open, initialSection, initialAgentProfileId, initialStackHistoryId]);
 
   const statusByHarness = useMemo(() => {
     const map = new Map(payload.statuses.map((s) => [s.harnessId, s]));

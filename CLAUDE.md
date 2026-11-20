@@ -77,6 +77,7 @@ Each doc below is the reference for its subsystem. A code comment cites the doc 
 | [clone-repository.md](docs/architecture/clone-repository.md) | clone input parsing, host resolution, the token retry, progress and cancel, the ELI5 task | `src/shared/clone-input.ts`, `clone.ts`, `CloneProjectDialog` |
 | [notifications.md](docs/architecture/notifications.md) | one OS notification per task, removal triggers, toast slots, notifications from a headless core | `task-notifier.ts`, `notification-hooks.ts`, `toast-slots.ts`, `headless-notifications.ts` |
 | [run-panel.md](docs/architecture/run-panel.md) | the single RunPanel instance, its per-task reset, key namespacing, the connection budget, resuming a dropped task stream | `RunPanel.tsx` |
+| [app-bar.md](docs/architecture/app-bar.md) | the window app bar: the Harnesses button and panel, the collapse ladder and measured fit, drag regions, zoom pinning, native menu actions | `components/app-bar/`, `lib/harness-bar.ts`, `lib/app-bar-fit.ts`, `lib/app-menu.ts`, `src/bun/app-menu.ts` |
 | [testing-seams.md](docs/architecture/testing-seams.md) | the native-picker and Downloads seams for e2e, the fake OpenCode server, and the harness-stack retry floor | `/refs/pick`, `/bundle/*`, `src/bun/fixtures/opencode/` |
 
 ## Rules that apply everywhere

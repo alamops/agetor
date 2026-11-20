@@ -35,6 +35,10 @@ interface Props {
    *  Cmd/Ctrl+F handler focuses (and selects) the box through it when no
    *  task details panel is open. */
   searchInputRef?: React.Ref<HTMLInputElement>;
+  /** The board's task count (moved here from the app bar, D-P16). Counted
+   *  over the non-step tasks, so a hidden pipeline step never inflates the
+   *  total. Absent (the Pipelines page) renders nothing. */
+  taskCount?: { visible: number; total: number };
 }
 
 const basename = (p: string) => {
@@ -60,6 +64,7 @@ export function KanbanFilters({
   harnesses,
   taskAgentIds,
   searchInputRef,
+  taskCount,
 }: Props) {
   const repoItems = projects.map((p) => ({
     value: p.path,
@@ -103,7 +108,11 @@ export function KanbanFilters({
     || typeFilter.length > 0;
 
   return (
-    <div className="flex shrink-0 items-center gap-2 border-b border-border/60 px-4 py-2">
+    // `flex-wrap` + `min-w-0`, and every control `max-w-full`: at narrow widths
+    // (or a large UI zoom, which scales the fixed rem widths) the controls wrap
+    // onto further lines and shrink to the row, instead of widening the
+    // document (docs/architecture/app-bar.md).
+    <div className="flex min-w-0 shrink-0 flex-wrap items-center gap-x-2 gap-y-2 border-b border-border/60 px-4 py-2">
       <MultiSearchSelect
         values={harnessFilter}
         onChange={onHarnessFilterChange}
@@ -111,9 +120,9 @@ export function KanbanFilters({
         emptyLabel="All harnesses"
         placeholder="Search harnesses…"
         leadingIcon={<Cpu className="size-3.5" />}
-        className="w-48"
+        className="w-48 max-w-full"
       />
-      <div className="relative flex-1 max-w-md">
+      <div className="relative min-w-[min(10rem,100%)] max-w-md flex-1">
         <Search className="pointer-events-none absolute left-2.5 top-1/2 size-3.5 -translate-y-1/2 text-muted-foreground" aria-hidden />
         <Input
           {...IDENTIFIER_INPUT_PROPS}
@@ -132,8 +141,7 @@ export function KanbanFilters({
             // `ui/dialog.tsx` already honors `defaultPrevented`.
             if (e.key !== "Escape") return;
             // A dismissable layer above the board — any dialog (modal or
-            // not, e.g. the usage popover, which carries no marker at all),
-            // an open popover, or the floating quote pill — owns this
+            // not, e.g. the Harnesses panel), an open popover, or the floating quote pill — owns this
             // Escape first: the box yields WITHOUT `preventDefault` so that
             // layer's own listener closes it, and the NEXT Escape blurs the
             // box. Without this bail, a chord that focused the box while
@@ -152,7 +160,7 @@ export function KanbanFilters({
         emptyLabel="All repos"
         placeholder="Search projects…"
         leadingIcon={<Folder className="size-3.5" />}
-        className="w-56"
+        className="w-56 max-w-full"
       />
       <MultiSearchSelect
         values={statusFilter}
@@ -161,7 +169,7 @@ export function KanbanFilters({
         emptyLabel="All statuses"
         placeholder="Search statuses…"
         leadingIcon={<Tag className="size-3.5" />}
-        className="w-48"
+        className="w-48 max-w-full"
       />
       <MultiSearchSelect
         values={typeFilter}
@@ -170,18 +178,22 @@ export function KanbanFilters({
         emptyLabel="All types"
         placeholder="Search types…"
         leadingIcon={<Shapes className="size-3.5" />}
-        className="w-44"
+        className="w-44 max-w-full"
       />
-      <Select
-        value={archivedView}
-        onChange={(e) => onArchivedViewChange(e.target.value as ArchivedView)}
-        className="w-36"
-        title="Filter by archive state"
-      >
-        <option value="active">Active only</option>
-        <option value="all">All</option>
-        <option value="archived">Archived only</option>
-      </Select>
+      {/* The width lives on this wrapper, not on the <select>: `Select` wraps
+          it in its own `relative` div, so a `max-w-full` on the <select> would
+          resolve against a box that has no definite width. */}
+      <div className="w-36 max-w-full">
+        <Select
+          value={archivedView}
+          onChange={(e) => onArchivedViewChange(e.target.value as ArchivedView)}
+          title="Filter by archive state"
+        >
+          <option value="active">Active only</option>
+          <option value="all">All</option>
+          <option value="archived">Archived only</option>
+        </Select>
+      </div>
       {anyActive && (
         <Button
           variant="ghost"
@@ -197,6 +209,16 @@ export function KanbanFilters({
         >
           Clear
         </Button>
+      )}
+      {taskCount && (
+        <span
+          data-testid="board-task-count"
+          className="ml-auto shrink-0 whitespace-nowrap text-xs text-muted-foreground"
+        >
+          {taskCount.visible === taskCount.total
+            ? `${taskCount.total} tasks`
+            : `${taskCount.visible} of ${taskCount.total} tasks`}
+        </span>
       )}
     </div>
   );
