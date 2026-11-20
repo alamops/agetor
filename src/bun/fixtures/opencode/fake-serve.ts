@@ -1664,7 +1664,10 @@ export async function startFakeOpencodeServer(opts: FakeOpencodeOptions = {}): P
       if (stopped) return;
       stopped = true;
       for (const r of runtimes.values()) r.exec?.ac.abort("shutdown");
-      await Promise.all([...runtimes.values()].flatMap((r) => (r.exec ? [r.exec.done] : [])));
+      // One entry per runtime, idle ones included (a resolved promise): the array's
+      // length sets how many microtask ticks pass before the server stops below,
+      // and an empty-array shortcut (flatMap) let stop() hang a test's afterEach.
+      await Promise.all([...runtimes.values()].map((r) => r.exec?.done ?? Promise.resolve()));
       // Stop the server (closing every socket) BEFORE closing the event streams' controllers. Closed
       // the other way round, an `/api/event` stream whose client had just aborted (its cancel()
       // not run yet) after the turn's events were written to it left `server.stop(true)` pending

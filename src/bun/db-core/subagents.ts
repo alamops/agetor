@@ -227,11 +227,11 @@ export function makeSubagents(conn: Database) {
      *  settled keeps its own status and timestamp. Returns the number of rows
      *  changed. */
     settleRunningForRun(runId: string, status: SubagentStatus, now: number): number {
-      const result = conn.run(
-        `UPDATE subagents SET status = ?, ended_at = ? WHERE run_id = ? AND status = 'running'`,
-        [status, now, runId],
-      );
-      return result.changes;
+      // Counted with RETURNING, not `.changes`: bun's `.changes` also counts the
+      // rows migration 093's revision triggers write (task_revs, task_rev_meta).
+      return conn.query<{ id: string }, [SubagentStatus, number, string]>(
+        `UPDATE subagents SET status = ?, ended_at = ? WHERE run_id = ? AND status = 'running' RETURNING id`,
+      ).all(status, now, runId).length;
     },
     /** taskId -> count of `running` rows. One grouped query, for the board poll. */
     runningCountsByTask(): Map<string, number> {
