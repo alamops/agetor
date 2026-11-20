@@ -1,0 +1,234 @@
+{
+  "version": 1,
+  "id": "non-blocking-core-grill-r1",
+  "title": "Grill — a multi-threaded, non-blocking Agetor core",
+  "skill": "implement",
+  "slug": "non-blocking-core",
+  "round": 1,
+  "flags": [],
+  "summary": "Before I plan this: **9 decisions** that set the shape of the change, then a confirm list of defaults I'd bet on (one click each).\n\nThe short version of what I found: the busy banner fires because **one thread does everything**, and two things keep it busy for seconds at a time: **(1)** the board's task-list poll re-reading and re-serializing every task every 2 s, and **(2)** the Claude subagent watcher draining whole transcripts with no yield. Real threads help most for the heavy reads that can't be avoided; the biggest win is not doing the work at all.\n\nStart with the two **Blocking** questions: they decide how big this change is.",
+  "proven": [
+    {
+      "text": "**The stalls are real and frequent.** A 250 ms `/health` prober on your running app saw **54 stalls of 1–10 s in 10 minutes**. A native `sample` during the stalls shows the core's JS thread ~30–40% inside synchronous SQLite reads (cold overflow-page `pread`s), the rest idle.",
+      "evidence": [{ "label": "fleet knowledge entry 18db0f48 (busy banner root cause)", "path": "docs/architecture/core-responsiveness.md", "line": 1 }]
+    },
+    {
+      "text": "**The board poll costs 0.56–1.16 s every 2 s on your installed 1.2.0** (28.8 MB per response). #305 (now on main) cuts it to the ~450 unarchived tasks, but each tick still rebuilds and re-sends every one of them.",
+      "evidence": [{ "label": "the list query reads every column of every row", "path": "src/bun/db.ts", "line": 1247, "lang": "ts", "code": "const TASKS_SELECT = `\n  SELECT tasks.*,\n         COALESCE(MAX(runs.status IN ${OPENABLE_STATUSES_SQL}), 0) AS has_openable_run\n    FROM tasks\n    LEFT JOIN runs ON runs.task_id = tasks.id\n`;" }]
+    },
+    {
+      "text": "**Threads work in the packaged runtime.** A spike on the exact Bun the app ships (1.3.13) started a Worker *inside* the app's own Worker, opened the same SQLite file in WAL mode, ran ~30 MB reads while the main thread wrote every 100 ms: **0 lock errors**, and `/health` max latency dropped **3–4×** versus doing the read on the main thread. It also bundles as a separate file, the way `daemon/headless.js` already ships.",
+      "evidence": [{ "label": "launcher already starts our code in a Worker", "path": "/Applications/Agetor.app/Contents/Resources/main.js", "line": 160, "lang": "js", "code": "new Worker(appEntrypointPath, {});" }]
+    },
+    {
+      "text": "**The subagent watcher's steady-state tick drains every running transcript in one synchronous go** (every 600 ms while anything runs), with no yield and no lag label. The dir-watcher callback does the same on every file append. The persisted 'attach subagent watcher' stall labels are attributed by overlap, so they don't prove the attach itself is the culprit.",
+      "evidence": [{ "label": "steady-state tick: step(Infinity)", "path": "src/bun/claude-subagents.ts", "line": 4192, "lang": "ts", "code": "function cycle(now: number): void {\n  if (detached || !seedDone || !firstCycleDone) return;\n  createCycleJob(false, () => now).step(Infinity);\n}\n\nfunction tick(): void {\n  if (detached) return;\n  const now = Date.now();\n  cycle(now);\n  scheduleNext(now);\n}" }]
+    },
+    "**Making every database call async is a ~900-call-site rewrite** across 46 files (tasks.* ~504, runs.* ~215, plus transactions and exit handlers that need synchronous results). A hybrid that moves only the heavy read paths is a handful of routes.",
+    "**`updated_at` can't drive an incremental refresh.** ~17 server-managed columns (unread watermarks, PR links, pipeline progress, checkout branch…) and 4 in-memory counts (pending questions, open terminals, running subagents, stall flag) change a task's JSON without bumping it.",
+    "**Your packaged core's logs go to `/dev/null`**, so every stall warning the lag monitor prints is lost. Only stalls that overlap a run's label survive, as a status line in that run."
+  ],
+  "sections": [
+    {
+      "id": "shape",
+      "title": "How big this change is",
+      "intro": "These two set the scope. Everything else follows from them.",
+      "questions": [
+        {
+          "id": "threading-model",
+          "type": "single",
+          "title": "How far should the multi-threading go?",
+          "impact": "blocking",
+          "why": "Decides whether this is a focused change (a few routes + the watcher) or a rewrite of the whole data layer.",
+          "context": "SQLite in Bun is synchronous, so whichever thread runs a query is blocked until it returns. The main thread also serves every HTTP request, SSE stream and timer. The heavy reads are a short list: the full task list, a task's event history (replay, pages, first load up to 16 MB), and the subagent transcript parsing.",
+          "options": [
+            {
+              "id": "hybrid",
+              "label": "Hybrid: worker threads for the heavy work",
+              "description": "A read-only **DB reader worker** (its own SQLite connection) serves the heavy reads: full task-list snapshots, event-history replay and pages. A **transcript worker** reads and parses subagent JSONL off the main thread and hands back parsed lines; the main thread does the small, ordered inserts. Writes and light reads stay on the main connection.",
+              "consequence": "Moves the cold-disk reads and big JSON parsing off the main thread. A few routes and the watcher change; the ~900 synchronous call sites don't. Tests keep an in-process fallback."
+            },
+            {
+              "id": "full-async",
+              "label": "Full DB worker: every query async",
+              "description": "All SQLite access moves to a worker; every `tasks.*` / `runs.*` call becomes `await`.",
+              "consequence": "~900 call sites in 46 files, every transaction and exit handler redesigned, async ordering risks in SSE sends. Weeks of work and a large regression surface."
+            },
+            {
+              "id": "no-threads",
+              "label": "No threads: just stop doing the work",
+              "description": "Incremental task list, cooperative watcher, SQLite cache, logs, all on the one thread.",
+              "consequence": "Smaller change, but a cold-disk read under memory pressure still freezes everything for its duration."
+            }
+          ],
+          "recommendation": { "value": "hybrid", "reason": "It moves exactly the work the samples showed blocking, at a fraction of the risk of a full rewrite, and the spike proved it on your runtime." }
+        },
+        {
+          "id": "board-refresh",
+          "type": "single",
+          "title": "How should the board and TUI keep their task lists fresh?",
+          "impact": "blocking",
+          "why": "This is the single biggest recurring cost: today every tick rebuilds and re-sends every visible task.",
+          "context": "Because `updated_at` misses most changes, any 'only what changed' scheme needs a real change counter. The cleanest source is the database itself: a small new table (`task_revs`: task id → revision) kept current by **SQLite triggers** on `tasks` and `runs`, so no write path can forget to bump it. Deletions leave a tombstone row. The in-memory counts (pending questions, terminals, running subagents, stall flag) are tiny and sent every tick as a sparse map instead.",
+          "options": [
+            {
+              "id": "delta-poll",
+              "label": "Delta poll",
+              "description": "`GET /tasks?since=<rev>` returns only rows whose revision moved (plus removed ids and the small count map). Plain `GET /tasks` stays exactly as today for older clients. Board keeps its 2 s tick; TUI its 1.5 s.",
+              "consequence": "An idle board costs one indexed lookup per tick instead of ~450 rows. One additive migration (a table + triggers)."
+            },
+            {
+              "id": "delta-plus-push",
+              "label": "Delta poll + push",
+              "description": "Same delta, plus a tiny `tasks-changed {rev}` event on the existing global SSE stream so the board fetches the delta the moment something changes, and the timer stretches to a 15 s safety net.",
+              "consequence": "Board updates feel instant and idle polling nearly disappears. No new connection (reuses the existing stream). A bit more client logic and one more event type."
+            },
+            {
+              "id": "etag",
+              "label": "Whole-list ETag / 304",
+              "description": "The server still builds the list, but returns 304 when nothing changed.",
+              "consequence": "Saves network and webview parsing only; the core still does the heavy read every tick."
+            }
+          ],
+          "recommendation": { "value": "delta-plus-push", "reason": "Push makes changes show up immediately and lets the poll become a safety net; the delta protocol underneath keeps it correct if an event is missed." }
+        }
+      ]
+    },
+    {
+      "id": "details",
+      "title": "Shape of the parts",
+      "questions": [
+        {
+          "id": "watcher-fix",
+          "type": "multi",
+          "title": "Which changes to the Claude subagent watcher?",
+          "impact": "shape",
+          "why": "The watcher is the second source of multi-second stalls on your machine.",
+          "context": "Its steady-state tick (`cycle()` → `step(Infinity)`, `src/bun/claude-subagents.ts:4192`) and the fs.watch callback (`:4034`) drain every running transcript synchronously. Each 256 KB chunk does a JSON.parse per line plus an autocommit INSERT and a broadcast per line.",
+          "options": [
+            { "id": "bounded", "label": "Deadline-bound every pass", "description": "Tick and dir-watcher passes run as cooperative jobs (20 ms slices with a yield), resuming next tick instead of draining everything at once." },
+            { "id": "worker-parse", "label": "Read + parse transcripts in the transcript worker", "description": "File reads and JSON.parse happen off the main thread; the main thread receives ready lines." },
+            { "id": "batch-insert", "label": "Batch inserts per chunk", "description": "One transaction per chunk instead of one autocommit per line; live sends still go out in id order right after the commit." },
+            { "id": "label-scope", "label": "Fix the lag label", "description": "The 'attach subagent watcher' label covers only the attach work itself, so stall reports stop blaming it for unrelated stalls." }
+          ],
+          "min": 1,
+          "recommendation": { "value": ["bounded", "worker-parse", "batch-insert", "label-scope"], "reason": "Each fixes a different piece; together they take the watcher off the critical path." }
+        },
+        {
+          "id": "other-blockers",
+          "type": "multi",
+          "title": "Which other main-thread blockers should this change also fix?",
+          "impact": "shape",
+          "why": "Smaller, rarer stalls the investigation found. Leaving one out means it stays.",
+          "options": [
+            { "id": "login-path", "label": "Boot: login-shell PATH probe", "description": "`login-path.ts` runs `$SHELL -ilc` synchronously at boot (up to 2 s). Make it async." },
+            { "id": "request-scans", "label": "Request-path file scans", "description": "Claude session scan, account usage (recursive read with an uncapped slice), worktrees listing: switch to async fs and cap reads." },
+            { "id": "ssh-config", "label": "git provider `ssh -G` probe", "description": "A synchronous spawn per call; make it async and cached." },
+            { "id": "rm-sync", "label": "Recursive rmSync on delete / clone cleanup", "description": "Switch to async removal." }
+          ],
+          "recommendation": { "value": ["login-path", "request-scans", "ssh-config", "rm-sync"], "reason": "They're small, contained, and each one can freeze the whole app for its duration." }
+        },
+        {
+          "id": "block-budget",
+          "type": "number",
+          "title": "What's the longest the main thread may be blocked by any single unit of work?",
+          "impact": "shape",
+          "why": "Becomes the acceptance bar the tests and the benchmark enforce.",
+          "context": "The previous responsiveness work set a 100 ms bar and measured 43–45 ms worst case for session restore.",
+          "unit": "ms",
+          "min": 20,
+          "max": 500,
+          "step": 10,
+          "recommendation": { "value": 100, "reason": "Matches the bar the codebase already tests against, and is well under what a person notices as a freeze." }
+        },
+        {
+          "id": "health-p95",
+          "type": "number",
+          "title": "Target /health p95 latency while heavy work runs (opening a long transcript, a big subagent run, the board polling)?",
+          "impact": "shape",
+          "why": "The busy banner keys off /health; this is the number that says the banner is gone.",
+          "unit": "ms",
+          "min": 10,
+          "max": 1000,
+          "step": 10,
+          "recommendation": { "value": 100, "reason": "Two missed 1.5 s probes trigger the banner; 100 ms p95 leaves a wide margin." }
+        },
+        {
+          "id": "delivery",
+          "type": "single",
+          "title": "How should it ship?",
+          "impact": "minor",
+          "why": "This touches the DB layer, the server, the watcher, the webview and the CLI.",
+          "options": [
+            { "id": "one-pr", "label": "One PR, one commit per wave", "description": "What you asked for: one PR later, reviewable wave by wave." },
+            { "id": "stack", "label": "A stack of PRs", "description": "e.g. logs + cache → delta task list → workers → watcher; each wired and green on its own." }
+          ],
+          "recommendation": { "value": "one-pr", "reason": "You asked for one PR; wave commits keep it reviewable." }
+        }
+      ]
+    },
+    {
+      "id": "confirm",
+      "title": "Defaults I'd use (confirm or override)",
+      "questions": [
+        {
+          "id": "sqlite-cache",
+          "type": "confirm",
+          "title": "SQLite memory settings",
+          "impact": "minor",
+          "context": "Today it's the 2 MB default against a 4.6 GB database, so every poll re-reads pages. mmap lets hot pages be served without a read syscall.",
+          "recommendation": { "value": "`cache_size` 64 MB and `mmap_size` 256 MB on the main connection; the reader worker gets the same.", "reason": "Small next to the webview's footprint, and it keeps the hot tables in memory." }
+        },
+        {
+          "id": "core-log",
+          "type": "confirm",
+          "title": "Persistent core log",
+          "impact": "minor",
+          "recommendation": { "value": "`~/.agetor/logs/core.log`, mode 0600, rotated at 5 MB × 3 files, written by a buffered async writer (never a sync write per line), secrets redacted. Every stall ≥ 1 s is logged, with or without a task label.", "reason": "Today's warnings vanish into /dev/null; this makes the next slowdown diagnosable." }
+        },
+        {
+          "id": "compact-out",
+          "type": "confirm",
+          "title": "Compact database (VACUUM)",
+          "impact": "minor",
+          "context": "A VACUUM on another thread still takes an exclusive lock, so the main thread's writes would have to wait on it, which is a block of its own.",
+          "recommendation": { "value": "Leave it as it is: manual, refused while a run is active. Out of scope.", "reason": "Moving it doesn't remove the lock; out of scope." }
+        },
+        {
+          "id": "busy-banner",
+          "type": "confirm",
+          "title": "The busy banner",
+          "impact": "minor",
+          "recommendation": { "value": "Keep it exactly as it is (observational; 3 s pending plus two missed /health probes).", "reason": "It's the right alarm; the fix is to stop tripping it." }
+        },
+        {
+          "id": "benchmark",
+          "type": "confirm",
+          "title": "Repeatable benchmark",
+          "impact": "minor",
+          "recommendation": { "value": "Add `scripts/measure-core-responsiveness.ts`: a headless core on a `.backup` copy of a real-sized DB in `~/.agetor-dev`, driving the board poll, a transcript replay and a subagent run, reporting /health p50/p95/max and the longest main-thread block, before and after. Never touches ~/.agetor.", "reason": "Turns 'feels faster' into numbers, and never touches your real ~/.agetor." }
+        },
+        {
+          "id": "e2e",
+          "type": "confirm",
+          "title": "E2E coverage",
+          "impact": "minor",
+          "recommendation": { "value": "Extend the busy-banner and board specs: a heavy load (big transcript replay + many tasks) runs while the test asserts the board keeps updating and the banner never appears; plus a delta/push spec for the board.", "reason": "The bug is user-visible; only the assembled app proves it's gone." }
+        }
+      ]
+    },
+    {
+      "id": "you",
+      "title": "Anything else",
+      "questions": [
+        {
+          "id": "done-means",
+          "type": "longtext",
+          "title": "Anything that has to be true before you'd call this done?",
+          "required": false,
+          "placeholder": "e.g. no busy banner during a day of normal use"
+        }
+      ]
+    }
+  ]
+}

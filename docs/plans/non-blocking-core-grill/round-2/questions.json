@@ -1,0 +1,117 @@
+{
+  "version": 1,
+  "id": "non-blocking-core-grill-r2",
+  "title": "Grill round 2 — the full async DB worker",
+  "skill": "implement",
+  "slug": "non-blocking-core",
+  "round": 2,
+  "flags": [],
+  "summary": "In round 1 you chose **\"Full DB worker: every query async\"** over my hybrid recommendation. That's your call and it's a sound end state: no SQLite query ever runs on the thread that serves the app. Round 1 accepted everything else.\n\nI measured what it touches so you can confirm the size, and it opens **five design decisions** I shouldn't make for you. Six questions; the first one sets how much of it lands in this run.",
+  "proven": [
+    "**Production scope, measured:** 1,022 call sites of the DB modules (`tasks.*`, `runs.*`, `harnesses.*`, …) in 36 files, plus 69 raw `db.query/run/exec/transaction` calls outside `db.ts`, and 25 transactions. Every caller, and every caller of those callers, becomes `async`.",
+    "**Test scope, measured:** 198 test files and ~5,980 synchronous DB calls (mostly fixture setup like `tasks.insert` / `tasks.get`). Converting those to `await` would roughly double the diff, so the plan keeps them synchronous through a test-only facade (question 4).",
+    "**The SSE ordering rule survives a worker.** `run_events` live sends must go out in id order right after their insert. A single worker processes messages first-in first-out and its replies resolve in order, so an emit queue per run keeps that invariant (question 3).",
+    "**Read-after-write stays consistent.** With every query on the worker's one connection, a write followed by a read always sees the write: same connection, same order."
+  ],
+  "sections": [
+    {
+      "id": "scope",
+      "title": "How much lands in this run",
+      "questions": [
+        {
+          "id": "full-async-scope",
+          "type": "single",
+          "title": "Full async DB worker: all of it in this run, or the foundation plus the hot paths first?",
+          "impact": "blocking",
+          "why": "Decides whether this run is one very large change or a large one plus a planned sequel.",
+          "context": "Round 1 answer, quoted: **threading-model = \"Full DB worker: every query async\"**. The end state is the same either way: SQLite opened only in the worker, nothing synchronous on the main thread. The question is how much of the 1,022 call sites this run converts. Until a module is converted it would still need the old main-thread connection, and two writer connections means a main-thread write can briefly wait on the worker's lock.",
+          "options": [
+            {
+              "id": "all-now",
+              "label": "All of it, in this run",
+              "description": "Every module, every route, every orchestrator path converted; the main-thread SQLite connection deleted at the end.",
+              "consequence": "The biggest single change this repo has seen (likely 10k+ changed lines across 36 files). Longest run, broadest regression surface, but no transitional state left behind."
+            },
+            {
+              "id": "staged",
+              "label": "Foundation + hot paths now, rest in follow-up PRs",
+              "description": "This run: the DB worker, the async data API, migrations in the worker, and conversion of everything on the hot paths (HTTP routes, SSE replay, the board delta, the subagent watcher, run start/stop/exit). Remaining modules (settings, bundles, harness-stack admin, imports…) stay on the main connection and are converted in later PRs.",
+              "consequence": "Every stall source you measured is fixed in this run. The main-thread connection survives until the sequel; a list of the remaining modules goes in the plan's ledger as owner-deferred."
+            }
+          ],
+          "recommendation": { "value": "staged", "reason": "Fixes every measured stall in this run with half the regression surface, and leaves a clean, listed remainder instead of an unreviewable diff." }
+        },
+        {
+          "id": "delivery-r2",
+          "type": "single",
+          "title": "Given that size, still one PR?",
+          "impact": "shape",
+          "why": "Round 1 you chose 'One PR, one commit per wave', before the size was known.",
+          "showIf": { "question": "full-async-scope", "in": ["all-now"] },
+          "options": [
+            { "id": "one-pr", "label": "Yes, one PR", "description": "One PR, one commit per wave." },
+            { "id": "stack", "label": "A stack of PRs", "description": "Foundation (worker + async API + logs + cache) → hot paths → remaining modules → removal of the main-thread connection. Each PR wired and green on its own." }
+          ],
+          "recommendation": { "value": "stack", "reason": "A 10k+ line single diff is very hard to review; a stack keeps each step readable without changing the end state." }
+        }
+      ]
+    },
+    {
+      "id": "design",
+      "title": "Design decisions the async move opens",
+      "questions": [
+        {
+          "id": "transactions",
+          "type": "single",
+          "title": "How should the 25 multi-statement transactions work once every query is async?",
+          "impact": "shape",
+          "why": "A transaction that reads, decides, then writes can't simply `await` between its statements without holding the write lock across thread hops.",
+          "options": [
+            {
+              "id": "named-ops",
+              "label": "Atomic operations inside the worker",
+              "description": "Each transaction becomes one named operation the worker runs start to finish (e.g. `tasks.archiveWithCascade(...)`); the caller makes one async call and gets the result.",
+              "consequence": "No lock held across hops; some orchestrator logic that sits inside a transaction today moves into the data layer."
+            },
+            {
+              "id": "async-tx",
+              "label": "Async transactions with a lock",
+              "description": "`await db.transaction(async (tx) => { … })`, holding BEGIN…COMMIT open across round-trips.",
+              "consequence": "Smaller code change, but every other write queues behind an open transaction while the main thread does work between statements."
+            }
+          ],
+          "recommendation": { "value": "named-ops", "reason": "Keeps the write lock short and the worker the only place that knows SQL." }
+        },
+        {
+          "id": "ordering",
+          "type": "confirm",
+          "title": "Event ordering",
+          "impact": "shape",
+          "context": "Today `appendEvent` returns the new row's id synchronously and the live SSE send follows immediately, so send order = id order (forward resume depends on it).",
+          "recommendation": { "value": "A per-run emit queue: inserts are sent to the worker in order, and each row's live send happens when its insert resolves, strictly in id order. Hot loops (subagent transcript lines) insert in batches of one transaction per chunk.", "reason": "Keeps the forward-resume invariant without making every emit wait on unrelated work." }
+        },
+        {
+          "id": "tests",
+          "type": "confirm",
+          "title": "Test strategy",
+          "impact": "shape",
+          "recommendation": { "value": "Under `bun test` the worker runs in-process (same async API, no thread) by default, and test fixtures keep their synchronous setup calls through a test-only facade on the same connection, so the ~5,980 test calls don't change. A dedicated suite runs the real Worker thread end to end.", "reason": "Keeps the db.ts singleton rules working and the diff about production code." }
+        },
+        {
+          "id": "worker-failure",
+          "type": "confirm",
+          "title": "If the DB worker crashes",
+          "impact": "shape",
+          "recommendation": { "value": "The main thread restarts it automatically; calls in flight reject with a clear error (routes answer 503 'database restarting'); the crash and restart are written to core.log. /health keeps answering throughout.", "reason": "A crashed worker should cost a retry, not a frozen app." }
+        },
+        {
+          "id": "boot",
+          "type": "confirm",
+          "title": "Boot order",
+          "impact": "minor",
+          "recommendation": { "value": "The worker opens the DB and runs migrations before the boot gate opens; /health and /info answer immediately as today, every other route waits for the gate as it does now.", "reason": "Same boot contract as today; only where the migration runs changes." }
+        }
+      ]
+    }
+  ]
+}
