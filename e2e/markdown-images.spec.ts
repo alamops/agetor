@@ -1,5 +1,5 @@
 import { randomUUID } from "node:crypto";
-import { closeSync, ftruncateSync, mkdtempSync, openSync, writeFileSync } from "node:fs";
+import { chmodSync, closeSync, existsSync, ftruncateSync, mkdtempSync, openSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import path from "node:path";
 import { test, expect, type APIRequestContext, type E2EBackend, type Locator, type Page } from "./fixtures";
@@ -144,6 +144,21 @@ async function createAndStartUserImageTask(
   ).toBeTruthy();
 
   return task;
+}
+
+/** Poll until the task's first turn has finished (its card moved to review). */
+async function waitForTaskInReview(request: APIRequestContext, backend: E2EBackend, taskId: string): Promise<void> {
+  await expect
+    .poll(
+      async () => {
+        const res = await request.get(`${backend.apiBase}/tasks/${taskId}`, {
+          headers: { authorization: `Bearer ${backend.apiToken}` },
+        });
+        return ((await res.json()) as { column?: string }).column;
+      },
+      { timeout: CONVERGE_TIMEOUT },
+    )
+    .toBe("review");
 }
 
 /** The run panel's slide-over `<aside>` — see sent-files.spec.ts's identical
@@ -340,6 +355,107 @@ test.describe("markdown image rendering", () => {
     await expect(chip).toHaveAttribute("data-reason", "too-large");
     await expect(chip).toHaveAttribute("title", `Image too large to preview: ${bigPath}`);
     await expect(panel.locator('.rounded-br-md .agetor-md [data-testid="md-image"]')).toHaveCount(0);
+  });
+
+  test("an image the core can't read is a neutral 'denied' chip that still opens (only a proven 404 is amber)", async ({
+    page,
+    request,
+    backend,
+  }) => {
+    test.skip(typeof process.getuid === "function" && process.getuid() === 0, "chmod 000 does not block root");
+    test.setTimeout(90_000);
+    const title = `md-images-e2e-denied ${randomUUID()}`;
+    const { task, shotPath, missingPath } = await createAndStartMdImageTask(request, backend, title);
+
+    // Let the fake turn finish (it writes shot.png at its start), THEN block the
+    // file, and only then open the page: the webview's HTTP cache would answer a
+    // revalidation of an earlier 200 with a 304 (the core can stat an unreadable
+    // file, so its ETag still matches), hiding the denial.
+    await waitForTaskInReview(request, backend, task.id);
+    expect(existsSync(shotPath)).toBe(true);
+    // `chmod 000` stands in for macOS's privacy block (the route answers 403
+    // for a file it can't read).
+    chmodSync(shotPath, 0o000);
+    try {
+      await gotoApp(page, backend.bootBase);
+      const panel = await openTask(page, title);
+      await waitForMdImageScenario(panel);
+
+      const fallbacks = panel.locator('[data-testid="md-image-fallback"]');
+      const shotChips = fallbacks.filter({ hasText: path.basename(shotPath) });
+      await expect(shotChips).toHaveCount(2, { timeout: CONVERGE_TIMEOUT });
+      for (let i = 0; i < 2; i++) {
+        const chip = shotChips.nth(i);
+        await expect(chip).toHaveAttribute("data-reason", "denied");
+        expect(await chip.getAttribute("class")).not.toContain("border-warning");
+        await expect(chip).toHaveAttribute("title", /^Preview blocked by macOS privacy/);
+      }
+      // The genuinely missing file is still the amber "not found" chip.
+      const missingChip = fallbacks.filter({ hasText: path.basename(missingPath) });
+      await expect(missingChip).toHaveAttribute("data-reason", "not-found");
+      expect(await missingChip.getAttribute("class")).toContain("border-warning");
+
+      // A click opens the file (the headless backend's 501 -> "couldn't open"
+      // dialog), never the not-found dialog.
+      await shotChips.first().click();
+      await expect(page.locator("#attachment-open-error-title")).toBeVisible({ timeout: CONVERGE_TIMEOUT });
+      await expect(page.locator("#attachment-not-found-title")).toHaveCount(0);
+    } finally {
+      chmodSync(shotPath, 0o600);
+    }
+  });
+
+  test("an image whose preview fails another way (500) is a neutral 'unavailable' chip that still opens", async ({
+    page,
+    request,
+    backend,
+  }) => {
+    test.setTimeout(60_000);
+    // Outside the task's workdir, so the bubble keeps the absolute path (see
+    // `createAndStartUserImageTask`).
+    const imgDir = mkdtempSync(path.join(tmpdir(), "agetor-e2e-md-images-500-"));
+    const imgPath = path.join(imgDir, "flaky.png");
+    writeFileSync(imgPath, Buffer.from(FAKE_PNG_1X1_BASE64, "base64"));
+    const title = `md-images-e2e-unavailable ${randomUUID()}`;
+    await createAndStartUserImageTask(request, backend, title, imgPath, `![flaky](${imgPath})`);
+
+    // A headless core serves this file fine; fake a 500 at the network
+    // boundary (with CORS headers, or the browser drops the stubbed answer).
+    const cors = {
+      "access-control-allow-origin": "*",
+      "access-control-allow-headers": "authorization, content-type, *",
+      "access-control-allow-methods": "GET, OPTIONS",
+    };
+    await page.route(
+      (url) => url.pathname === "/files/preview" && url.searchParams.get("path") === imgPath,
+      async (route) => {
+        if (route.request().method() === "OPTIONS") {
+          await route.fulfill({ status: 204, headers: cors });
+          return;
+        }
+        await route.fulfill({
+          status: 500,
+          headers: { ...cors, "content-type": "application/json" },
+          body: JSON.stringify({ error: "stubbed 500" }),
+        });
+      },
+    );
+
+    await gotoApp(page, backend.bootBase);
+    const panel = await openTask(page, title);
+
+    const chip = panel.locator('.rounded-br-md .agetor-md [data-testid="md-image-fallback"]');
+    await expect(chip).toHaveCount(1, { timeout: CONVERGE_TIMEOUT });
+    await expect(chip).toHaveAttribute("data-reason", "unavailable");
+    await expect(chip).toHaveAttribute("title", `Preview unavailable. Click to open.\n${imgPath}`);
+    expect(await chip.getAttribute("class")).not.toContain("border-warning");
+    await expect(panel.locator('.rounded-br-md .agetor-md [data-testid="md-image"]')).toHaveCount(0);
+
+    const openRequest = page.waitForRequest((r) => r.url().includes("/open-path"), { timeout: CONVERGE_TIMEOUT });
+    await chip.click();
+    await openRequest;
+    await expect(page.locator("#attachment-open-error-title")).toBeVisible({ timeout: CONVERGE_TIMEOUT });
+    await expect(page.locator("#attachment-not-found-title")).toHaveCount(0);
   });
 
   test("MdImage renders inline content only — no new .agetor-md wrapper containers", async ({
