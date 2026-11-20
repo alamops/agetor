@@ -80,7 +80,9 @@ export async function cmdLs(
     );
   }
   const client = await getClient(flags);
-  let tasks = await client.listTasks();
+  // The archive filter runs server-side; the client-side pass below stays
+  // as the guard for an older core that ignores `archived`.
+  let tasks = await client.listTasks({ archived: f.archived ? "only" : f.all ? "include" : "exclude" });
   // `GET /tasks` also returns hidden pipeline step tasks (D11,
   // docs/plans/pipelines.md) — hidden from `ls` by default, same as the
   // board and the TUI, since they're an implementation detail of the

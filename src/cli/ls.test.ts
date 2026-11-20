@@ -628,3 +628,24 @@ test("a multi task left with one repository still shows its repository count (ro
   expect(text).not.toContain("1 repos");
   expect(outputs.filter((l) => l.includes(" repo")).length).toBe(1);
 });
+
+test("archive flags pick the server-side filter: exclude by default, only for --archived, include for --all", async () => {
+  const seen: unknown[] = [];
+  currentClient = {
+    listTasks: async (opts?: unknown) => {
+      seen.push(opts);
+      return [];
+    },
+  } as unknown as AgetorClient;
+  await cmdLs([], flags);
+  await cmdLs(["--archived"], flags);
+  await cmdLs(["--all"], flags);
+  expect(seen).toEqual([{ archived: "exclude" }, { archived: "only" }, { archived: "include" }]);
+});
+
+test("an older core that ignores ?archived= still gets the client-side archive filter", async () => {
+  currentClient = makeClient([task({ id: "live-task-0001", title: "live one" }), task({ id: "arch-task-0002", title: "gone one", archivedAt: 5 })]);
+  await cmdLs([], flags);
+  expect(outputs.join("\n")).toContain("live one");
+  expect(outputs.join("\n")).not.toContain("gone one");
+});

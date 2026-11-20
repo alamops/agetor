@@ -3,6 +3,7 @@ import {
   probeLiveCore,
   type CoreCreds,
 } from "../bun/core-creds.ts";
+import { taskListPath, type TaskListOptions } from "../shared/types.ts";
 import type {
   Task,
   Run,
@@ -244,8 +245,10 @@ export class AgetorClient {
   }
 
   // ── tasks ────────────────────────────────────────────────────────────────
-  listTasks(): Promise<Task[]> {
-    return this.req("GET", "/tasks");
+  /** Every task by default; `{ archived: "exclude" }` skips archived ones
+   *  server-side (`TaskListArchived`). */
+  listTasks(opts: TaskListOptions = {}): Promise<Task[]> {
+    return this.req("GET", taskListPath(opts));
   }
   getTask(id: string): Promise<Task> {
     return this.req("GET", `/tasks/${encodeURIComponent(id)}`);

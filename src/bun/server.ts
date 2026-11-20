@@ -259,7 +259,10 @@ import {
   MIN_REPLAY_EVENTS,
   PIPELINE_LIMITS,
   TASK_EVENTS_REPLAY_META_EVENT,
+  TASK_LIST_ARCHIVED_VALUES,
+  TASK_LIST_KEEP_MAX,
   TASK_TYPES,
+  type TaskListArchived,
   normalizeArchivedHistoryRetentionValue,
   parseArchivedHistoryRetentionDays,
   supportedEfforts,
@@ -403,6 +406,31 @@ function withRunningSubagents(t: Task): Task & { runningSubagents: number } {
   // state (the turn-stall watchdog's mark) that the DB-derived Task can't
   // carry — see stall-registry.ts.
   return { ...t, runningSubagents, stalledSince: stalledSince(t.id) };
+}
+
+/** `GET /tasks`'s `archived` and `keep` params (`TaskListArchived`). An
+ *  absent `archived` is `include`, the route's original answer, so an older
+ *  CLI or webview gets every task as before. `keep` is a comma-separated id
+ *  list, at most `TASK_LIST_KEEP_MAX` ids; empty entries are dropped. */
+export function parseTaskListQuery(
+  params: URLSearchParams,
+): { archived: TaskListArchived; keepIds: string[] } | { error: string } {
+  const rawArchived = params.get("archived");
+  let archived: TaskListArchived = "include";
+  if (rawArchived !== null) {
+    if (!(TASK_LIST_ARCHIVED_VALUES as readonly string[]).includes(rawArchived)) {
+      return { error: `archived must be one of ${TASK_LIST_ARCHIVED_VALUES.join(", ")}` };
+    }
+    archived = rawArchived as TaskListArchived;
+  }
+  const rawKeep = params.get("keep");
+  const keepIds = rawKeep === null
+    ? []
+    : [...new Set(rawKeep.split(",").map((s) => s.trim()).filter((s) => s.length > 0))];
+  if (keepIds.length > TASK_LIST_KEEP_MAX) {
+    return { error: `keep names at most ${TASK_LIST_KEEP_MAX} task ids` };
+  }
+  return { archived, keepIds };
 }
 
 // Turn raw path strings into references: keep only existing absolute paths,
@@ -6150,9 +6178,13 @@ export function startApiServer(
 
       "/tasks": {
         GET: authed((req) => {
+          const query = parseTaskListQuery(new URL(req.url).searchParams);
+          if ("error" in query) {
+            return json({ error: query.error }, { status: 400, headers: corsHeaders(req) });
+          }
           const counts = subagents.runningCountsByTask();
           return json(
-            tasks.list().map((t) => ({
+            tasks.list(query).map((t) => ({
               ...t,
               // M-S3: the list route ships the trimmed pipelineRun variant
               // (no handoffs, no profile snapshots) — see the field's doc.

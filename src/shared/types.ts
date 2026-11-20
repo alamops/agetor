@@ -2151,6 +2151,35 @@ export interface TaskRepositoryInput {
   baseRef?: string;
 }
 
+/**
+ * `GET /tasks?archived=` — which tasks the list returns by archive state.
+ * `include` (the default when the param is absent) returns every task, as the
+ * route always did; `exclude` returns only unarchived tasks; `only` returns
+ * only archived ones. `keep=<id>,<id>` names tasks returned regardless of
+ * this filter. The 2 s board poll and the TUI ask for `exclude`, so a DB with
+ * thousands of archived tasks isn't re-serialized and re-parsed every tick
+ * (docs/architecture/core-responsiveness.md).
+ */
+export type TaskListArchived = "include" | "exclude" | "only";
+export const TASK_LIST_ARCHIVED_VALUES: readonly TaskListArchived[] = ["include", "exclude", "only"];
+/** Most ids one `GET /tasks?keep=` may name; a longer list is a 400. */
+export const TASK_LIST_KEEP_MAX = 50;
+export interface TaskListOptions {
+  archived?: TaskListArchived;
+  keep?: readonly string[];
+}
+/** The `GET /tasks` path for `opts`, shared by the webview and CLI clients.
+ *  `include` and an empty `keep` add nothing, so the default stays the bare
+ *  `/tasks` older cores understand. */
+export function taskListPath(opts: TaskListOptions = {}): string {
+  const params = new URLSearchParams();
+  if (opts.archived && opts.archived !== "include") params.set("archived", opts.archived);
+  const keep = [...new Set((opts.keep ?? []).filter((id) => id.length > 0))].slice(0, TASK_LIST_KEEP_MAX);
+  if (params.has("archived") && keep.length > 0) params.set("keep", keep.join(","));
+  const qs = params.toString();
+  return qs ? `/tasks?${qs}` : "/tasks";
+}
+
 export interface Task {
   id: string;
   title: string;
