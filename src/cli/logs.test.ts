@@ -41,7 +41,7 @@ let onTaskEvents: ((e: RunEvent) => void) | null = null;
 let onGlobalEvents: ((e: GlobalEvent) => void) | null = null;
 const osNotifyCalls: Array<{ n: Parameters<typeof realNotify.osNotify>[0]; deps: Parameters<typeof realNotify.osNotify>[1] }> = [];
 
-mock.module("./context.ts", () => ({
+void mock.module("./context.ts", () => ({
   ...realContextSnapshot,
   getClient: async () => {
     if (!currentClient) throw new Error("no fake client set for this test");
@@ -49,7 +49,7 @@ mock.module("./context.ts", () => ({
   },
 }));
 
-mock.module("./output.ts", () => ({
+void mock.module("./output.ts", () => ({
   ...realOutputSnapshot,
   c: {
     dim: (s: string) => s,
@@ -70,7 +70,7 @@ mock.module("./output.ts", () => ({
   },
 }));
 
-mock.module("./sse.ts", () => ({
+void mock.module("./sse.ts", () => ({
   ...realSseSnapshot,
   streamSse: (
     pathname: string,
@@ -88,7 +88,7 @@ mock.module("./sse.ts", () => ({
 
 // `osNotify` is captured, never run: a real one would ring the bell and could
 // spawn a helper or osascript.
-mock.module("./notify.ts", () => ({
+void mock.module("./notify.ts", () => ({
   ...realNotifySnapshot,
   osNotify: async (n: Parameters<typeof realNotify.osNotify>[0], deps: Parameters<typeof realNotify.osNotify>[1]) => {
     osNotifyCalls.push({ n, deps });
@@ -96,10 +96,10 @@ mock.module("./notify.ts", () => ({
 }));
 
 afterAll(() => {
-  mock.module("./context.ts", () => realContextSnapshot);
-  mock.module("./output.ts", () => realOutputSnapshot);
-  mock.module("./sse.ts", () => realSseSnapshot);
-  mock.module("./notify.ts", () => realNotifySnapshot);
+  void mock.module("./context.ts", () => realContextSnapshot);
+  void mock.module("./output.ts", () => realOutputSnapshot);
+  void mock.module("./sse.ts", () => realSseSnapshot);
+  void mock.module("./notify.ts", () => realNotifySnapshot);
 });
 
 const { cmdLogs, pipelineLogsHint } = await import("./commands/logs.ts");

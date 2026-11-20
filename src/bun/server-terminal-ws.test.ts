@@ -64,7 +64,7 @@ beforeAll(async () => {
 
 afterAll(async () => {
   const { killTerminalsForTask } = await import("./terminals.ts");
-  killTerminalsForTask(taskId);
+  await killTerminalsForTask(taskId);
   server?.stop?.();
   if (SAVED_SHELL === undefined) delete process.env.SHELL;
   else process.env.SHELL = SAVED_SHELL;

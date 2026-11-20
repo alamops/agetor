@@ -80,7 +80,7 @@ beforeEach(() => {
 afterEach(() => {
   handle?.close();
   handle = null;
-  server?.stop(true);
+  void server?.stop(true);
 });
 
 /** Resolve once `n` events arrived (or fail after a bounded wait). */

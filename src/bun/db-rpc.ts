@@ -116,7 +116,7 @@ export function reconstructDbError(payload: DbErrorPayload): Error {
 // ---- client ----
 
 export interface DbRpcOptions {
-  /** Defaults to the `AGETOR_DB_MODE` env var, then "inprocess" under NODE_ENV=test, else "worker". */
+  /** Defaults to the `AGETOR_DB_MODE` env var (`inprocess` only under NODE_ENV=test or AGETOR_E2E_HARNESS_SEAMS=1), then "inprocess" under NODE_ENV=test, else "worker". */
   mode?: DbMode;
   /** Worker mode: the database file. Defaults to `resolveDbPath()`. */
   dbPath?: string;
@@ -183,6 +183,10 @@ function toError(e: unknown): Error {
 /** Environment default, read when a client is created. */
 function defaultMode(): DbMode {
   const fromEnv = process.env.AGETOR_DB_MODE;
+  // `inprocess` is the plan's kill switch (docs/plans/non-blocking-core.md §5):
+  // it runs the one connection on the main thread instead of the worker, a debug
+  // escape hatch if the worker misbehaves. Honored anywhere and warned at boot
+  // (getDbRpc). It never adds a second connection: in-process mode starts no worker.
   if (fromEnv === "worker" || fromEnv === "inprocess") return fromEnv;
   return process.env.NODE_ENV === "test" ? "inprocess" : "worker";
 }
@@ -557,7 +561,13 @@ export function getDbRpc(): DbRpc {
     defaultRpc = createDbRpc();
     if (!modeLogged) {
       modeLogged = true;
-      console.info(`[agetor:db-rpc] database mode: ${defaultRpc.mode}`);
+      if (defaultRpc.mode === "inprocess" && process.env.NODE_ENV !== "test") {
+        console.warn(
+          "[agetor:db-rpc] database mode: inprocess (AGETOR_DB_MODE kill switch): SQLite runs on the main thread, so a heavy query can stall the app",
+        );
+      } else {
+        console.info(`[agetor:db-rpc] database mode: ${defaultRpc.mode}`);
+      }
     }
   }
   return defaultRpc;

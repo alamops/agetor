@@ -660,7 +660,7 @@ test("notification-triggered adoption (onAdopted, settle handler) runs synchrono
     const old = recorder();
     const oldDone = __forTest.pushTurnSlot(state, old.onChunk);
     const order: string[] = [];
-    oldDone.then(() => order.push("old-run-then"));
+    void oldDone.then(() => order.push("old-run-then")).catch(() => {});
 
     __forTest.dispatchLine(state, endTurnLineId("old run's last line", "msg-old", "uuid-old"));
     expect(state.turnQueue.length).toBe(1); // staged, not fired

@@ -1493,7 +1493,7 @@ test("bumpActivity alone (a turn resolving purely from claude's own JSONL conten
   state.lastKeystrokeAt = staleKeystroke;
   state.lastActivityAt = 0;
   try {
-    __forTest.pushTurnSlot(state, () => {});
+    void __forTest.pushTurnSlot(state, () => {}).catch(() => {});
     appendFileSync(jsonlPath, endTurnLine("done"));
     __forTest.flushSync(state);
 
@@ -1577,7 +1577,7 @@ test("sendTurn(...).pasteOutcome resolves a PASTE_DROPPED_OUTCOME-shaped failure
   // otherwise surface as an unhandled-rejection failure unrelated to this
   // test's actual assertion (pasteOutcome, below). Chained via `.then`
   // (not awaited) so it doesn't delay the synchronous teardown below.
-  agentPromise.then((agent) => agent.done.catch(() => {}));
+  void agentPromise.then((agent) => agent.done.catch(() => {})).catch(() => {});
   // Tear down the session SYNCHRONOUSLY, before the queued tmux op's
   // microtask gets a chance to run — queueTmuxOp's identity gate
   // (`sessions.get(taskId) === expectedState`) then drops the op body

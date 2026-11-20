@@ -128,7 +128,7 @@ beforeAll(async () => {
 
 afterAll(async () => {
   const { killTerminalsForTask } = await import("./terminals.ts");
-  killTerminalsForTask(taskId);
+  await killTerminalsForTask(taskId);
   headless?.stop?.();
   appServer?.stop?.();
   // The disclaim preference and the in-memory switch both go back to how this
@@ -700,7 +700,7 @@ test("tmux_source: the CLI token can't set it through PUT /preferences/:key; the
     expect(tmux.getTmuxSource()).toBe("system");
   } finally {
     // No preference delete exists; an unset key and "system" read the same.
-    tmux.setTmuxSource(before === "bundled" ? "bundled" : "system");
+    await tmux.setTmuxSource(before === "bundled" ? "bundled" : "system");
   }
 });
 

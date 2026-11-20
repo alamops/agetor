@@ -921,13 +921,15 @@ describe("finding 5: cooldown clears are conditional", () => {
     const own = makeTask(a, "plain codex work", { model: "fixture-codex-model" } as Partial<Task>);
     const newer = makeTask(a, "plain codex work", { model: "fixture-codex-model" } as Partial<Task>);
     const signal = { reason: "rate_limit", resetAtMs: null, message: "429 for the model", source: "codex-error", model: "fixture-codex-model" };
-    const feed = (target: Task, after?: () => void) => orch.__setChunkHandlerTapForTest((tapRunId, hooked, handler) => {
+    const feed = (target: Task, after?: () => void | Promise<void>) => orch.__setChunkHandlerTapForTest((tapRunId, hooked, handler) => {
       if (hooked !== target.id) return;
       orch.__setChunkHandlerTapForTest(null);
-      setTimeout(async () => {
-        handler("status", `${HARNESS_LIMIT_STATUS_PREFIX}${JSON.stringify(signal)}`);
-        await orch.__settleChunkWorkForTest(tapRunId);
-        after?.();
+      setTimeout(() => {
+        void (async () => {
+          handler("status", `${HARNESS_LIMIT_STATUS_PREFIX}${JSON.stringify(signal)}`);
+          await orch.__settleChunkWorkForTest(tapRunId);
+          await after?.();
+        })().catch((e) => console.error("[test] deferred hook failed:", e));
       }, 150);
     });
     let sawOwn = false;
@@ -971,13 +973,15 @@ describe("finding 5: cooldown clears are conditional", () => {
     const own = makeTask(a, "plain codex work", { model: "fixture-codex-model" } as Partial<Task>);
     const newer = makeTask(a, "plain codex work", { model: "fixture-codex-model" } as Partial<Task>);
     const signal = { reason: "rate_limit", resetAtMs: null, message: "429 Too Many Requests", source: "codex-error" };
-    const feed = (target: Task, after?: () => void) => orch.__setChunkHandlerTapForTest((tapRunId, hooked, handler) => {
+    const feed = (target: Task, after?: () => void | Promise<void>) => orch.__setChunkHandlerTapForTest((tapRunId, hooked, handler) => {
       if (hooked !== target.id) return;
       orch.__setChunkHandlerTapForTest(null);
-      setTimeout(async () => {
-        handler("status", `${HARNESS_LIMIT_STATUS_PREFIX}${JSON.stringify(signal)}`);
-        await orch.__settleChunkWorkForTest(tapRunId);
-        after?.();
+      setTimeout(() => {
+        void (async () => {
+          handler("status", `${HARNESS_LIMIT_STATUS_PREFIX}${JSON.stringify(signal)}`);
+          await orch.__settleChunkWorkForTest(tapRunId);
+          await after?.();
+        })().catch((e) => console.error("[test] deferred hook failed:", e));
       }, 150);
     });
     let sawOwn = false;

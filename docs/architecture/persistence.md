@@ -9,7 +9,7 @@ WAL with `synchronous = NORMAL` (crash-consistent, but no fsync per commit — e
 
 **The database worker owns the only production connection** (`docs/plans/non-blocking-core.md`, [core-responsiveness.md](core-responsiveness.md)). The `db` role of `src/bun/core-worker.ts` opens `agetor.sqlite`, runs the migrations and serves every query; the main thread opens none. Production code imports `src/bun/db-async.ts` (same module names as `db.ts`, every method a Promise), never `db.ts` (`src/bun/db-import-guard.test.ts`). The SQL lives in `src/bun/db-core/*.ts` as factories over a connection (`makeTasks(conn)`, …), which both the worker and `db.ts` instantiate.
 
-**Pragmas** (`applyConnectionPragmas`, `src/bun/db-core/connection.ts`, one definition for both connections):
+**Pragmas** (`applyConnectionPragmas`, `src/bun/db-core/connection.ts`, one definition, no per-role split):
 
 | Pragma | Value | Why |
 |---|---|---|
@@ -18,7 +18,7 @@ WAL with `synchronous = NORMAL` (crash-consistent, but no fsync per commit — e
 | `foreign_keys` | `ON` | before `migrate()` runs |
 | `cache_size` | `-65536` (64 MB) | the board's projection and run-events reads stay in memory |
 | `mmap_size` | `268435456` (256 MB) | the same, for a multi-GB file |
-| `busy_timeout` | worker role 5000 ms; main role (the `db.ts` singleton) 100 ms | the main connection's wait would block the event loop, so a contended write there fails fast |
+| `busy_timeout` | `5000` ms, every connection | one production connection exists (the worker's), so this only covers the rare external one: the `sqlite3` CLI, a backup, or Compact's `wal_checkpoint(TRUNCATE)` waiting on a reader. It runs on the worker thread, so waiting never blocks the event loop. The `db.ts` singleton (tests, in-process mode) uses the same value |
 
 Write transactions are `BEGIN IMMEDIATE` (`.immediate()` on the transaction, and `tx: true` for a named op), so a writer takes the lock up front instead of failing on a later upgrade. The migration runner checks `_migrations` again inside its own `BEGIN IMMEDIATE`, so two cores starting at once apply each migration once.
 

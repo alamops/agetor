@@ -579,7 +579,7 @@ describe("wake", () => {
         expect(woke[0]!.sid).toBe("ses_root");
         expect(woke[0]!.input).toEqual({ items: [cancelledItem("inb_1", "ses_kid")], known: true });
       } finally {
-        server.stop(true);
+        void server.stop(true);
       }
     });
 
@@ -598,7 +598,7 @@ describe("wake", () => {
         await until(() => woke.length === 2, "second wake");
         expect(woke[1]!.input).toEqual({ items: [], known: true });
       } finally {
-        server.stop(true);
+        void server.stop(true);
       }
     });
 
@@ -621,7 +621,7 @@ describe("wake", () => {
         await marker(push, woke);
         expect(__forTest.probe(KEY)!.pending).toEqual({});
       } finally {
-        server.stop(true);
+        void server.stop(true);
       }
     });
 
@@ -642,7 +642,7 @@ describe("wake", () => {
           known: true,
         });
       } finally {
-        server.stop(true);
+        void server.stop(true);
       }
     });
 
@@ -670,7 +670,7 @@ describe("wake", () => {
           { items: [cancelledItem("ses_n_A", "ses_kidA"), cancelledItem("ses_n_B", "ses_kidB")], known: true },
         ]);
       } finally {
-        server.stop(true);
+        void server.stop(true);
       }
     });
 
@@ -695,7 +695,7 @@ describe("wake", () => {
         expect(woke).toHaveLength(1);
         expect(woke[0]!.input).toEqual({ items: [cancelledItem("inb_B", "ses_kidB")], known: true });
       } finally {
-        server.stop(true);
+        void server.stop(true);
       }
     });
 
@@ -714,7 +714,7 @@ describe("wake", () => {
           known: true,
         });
       } finally {
-        server.stop(true);
+        void server.stop(true);
       }
     });
 
@@ -747,7 +747,7 @@ describe("wake", () => {
         await until(() => woke.length === 3, "live wake");
         expect(woke[2]!.input).toEqual({ items: [], known: true });
       } finally {
-        server.stop(true);
+        void server.stop(true);
       }
     });
 
@@ -774,7 +774,7 @@ describe("wake", () => {
         expect(woke.find((w) => w.sid === "ses_a")!.input).toEqual({ items: [], known: true });
         gate.release();
       } finally {
-        server.stop(true);
+        void server.stop(true);
       }
     });
 
@@ -800,7 +800,7 @@ describe("wake", () => {
         expect(woke[0]!.input).toEqual({ items: [], known: false });
         gate.release();
       } finally {
-        server.stop(true);
+        void server.stop(true);
       }
     });
 
@@ -826,7 +826,7 @@ describe("wake", () => {
         await until(() => woke.length === 2, "second wake");
         expect(woke[1]!.input).toEqual({ items: [cancelledItem("inb_1", "kid_inb_1")], known: true });
       } finally {
-        server.stop(true);
+        void server.stop(true);
       }
     });
 
@@ -853,7 +853,7 @@ describe("wake", () => {
         await until(() => woke.length === 3, "third wake");
         expect(woke[2]!.input).toEqual({ items: [cancelledItem("x1", "kx")], known: true });
       } finally {
-        server.stop(true);
+        void server.stop(true);
       }
     });
 
@@ -885,7 +885,7 @@ describe("wake", () => {
         watchOpencodeSessionsForWake(KEY, ref, []);
         expect(__forTest.probe(KEY)).toBeNull();
       } finally {
-        server.stop(true);
+        void server.stop(true);
       }
     });
 
@@ -906,7 +906,7 @@ describe("wake", () => {
         await until(() => woke.length === 1, "wake");
         expect(woke[0]!.input).toEqual({ items: [{ inboxId: "inb_steer", synthetic: false }], known: true });
       } finally {
-        server.stop(true);
+        void server.stop(true);
       }
     });
 
@@ -929,7 +929,7 @@ describe("wake", () => {
         await until(() => woke.length === 2, "second wake");
         expect(woke[1]!.input).toEqual({ items: [{ inboxId: "inb_late", synthetic: false }], known: true });
       } finally {
-        server.stop(true);
+        void server.stop(true);
       }
     });
 
@@ -955,7 +955,7 @@ describe("wake", () => {
         await until(() => woke.length === 2, "second wake");
         expect(woke[1]!.input).toEqual({ items: [], known: true });
       } finally {
-        server.stop(true);
+        void server.stop(true);
       }
     });
 
@@ -989,7 +989,7 @@ describe("wake", () => {
         await until(() => woke.some((w) => w.sid === "ses_root"), "wake");
         expect(woke.find((w) => w.sid === "ses_root")!.input).toEqual({ items: [{ inboxId: "inb_new", synthetic: false }], known: false });
       } finally {
-        server.stop(true);
+        void server.stop(true);
       }
     });
 
@@ -1008,7 +1008,7 @@ describe("wake", () => {
         expect(woke[0]!.created!).toBeGreaterThanOrEqual(before);
         expect(woke[0]!.created!).toBeLessThanOrEqual(after);
       } finally {
-        server.stop(true);
+        void server.stop(true);
       }
     });
 
@@ -1031,7 +1031,7 @@ describe("wake", () => {
         expect(woke[0]!.created!).toBeGreaterThanOrEqual(before);
         expect(woke[0]!.created!).toBeLessThanOrEqual(after);
       } finally {
-        server.stop(true);
+        void server.stop(true);
       }
     });
 
@@ -1058,7 +1058,7 @@ describe("wake", () => {
           await marker(push, woke);
           expect(fate("ses_root", "inb_1")).toBe(true);
         } finally {
-          server.stop(true);
+          void server.stop(true);
         }
       });
 
@@ -1089,7 +1089,7 @@ describe("wake", () => {
           watchOpencodeSessionsForWake(KEY, ref, ["ses_marker"]);
           expect(fate("ses_root", "inb_p")).toBeNull();
         } finally {
-          server.stop(true);
+          void server.stop(true);
         }
       });
 
@@ -1125,7 +1125,7 @@ describe("wake", () => {
           await marker(push, woke);
           expect(fate("ses_root", "inb_new")).toBe(false);
         } finally {
-          server.stop(true);
+          void server.stop(true);
         }
       });
 
@@ -1142,7 +1142,7 @@ describe("wake", () => {
           now += 60_000;
           expect(fate("ses_root", "inb_3")).toBeNull();
         } finally {
-          server.stop(true);
+          void server.stop(true);
         }
       });
 
@@ -1163,7 +1163,7 @@ describe("wake", () => {
           await marker(push, woke);
           expect([fate("ses_a", "a1"), fate("ses_b", "b1"), fate("ses_b", "b2")]).toEqual([null, true, true]);
         } finally {
-          server.stop(true);
+          void server.stop(true);
         }
       });
     });

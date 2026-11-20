@@ -1058,8 +1058,10 @@ for (const [sig, num] of FX_REAP_SIGNALS) {
 
 function writeMessage(state: FxSessionState, msg: Record<string, unknown>): void {
   try {
-    state.proc.stdin.write(`${JSON.stringify(msg)}\n`);
-    state.proc.stdin.flush();
+    // FileSink write/flush may return a Promise; a broken pipe rejects it later,
+    // and that must not become an unhandled rejection.
+    void Promise.resolve(state.proc.stdin.write(`${JSON.stringify(msg)}\n`)).catch(() => {});
+    void Promise.resolve(state.proc.stdin.flush()).catch(() => {});
   } catch {
     // Pipe already closed — the process is dead or dying. The `exited`
     // watcher (installed in spawnFxViaAcp) settles the turn; nothing to do

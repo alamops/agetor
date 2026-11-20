@@ -19,7 +19,7 @@ process.env.AGETOR_API_PORT = "4401";
 // happens to import `BrowserWindow` / `Updater` / `ApplicationMenu` from
 // crashing on a missing export.
 const recorded: Array<{ title: string; body?: string; subtitle?: string; silent?: boolean; taskId?: string }> = [];
-mock.module("electrobun/bun", () => ({
+void mock.module("electrobun/bun", () => ({
   Utils: {
     showNotification: (opts: { title: string; body?: string; subtitle?: string; silent?: boolean; taskId?: string }) => {
       recorded.push(opts);

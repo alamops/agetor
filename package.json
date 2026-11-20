@@ -25,6 +25,7 @@
     "lint:async": "eslint --no-warn-ignored -c eslint.config.js \"src/bun/**/*.ts\" \"src/cli/**/*.{ts,tsx}\" \"src/shared/**/*.ts\"",
     "measure:core": "bun scripts/measure-core-responsiveness.ts",
     "typecheck": "tsc --noEmit",
+    "check": "bun run typecheck && bun run lint:async && bun test",
     "test": "bun test"
   },
   "devDependencies": {

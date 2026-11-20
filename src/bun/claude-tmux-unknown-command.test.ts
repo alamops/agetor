@@ -184,7 +184,7 @@ test("signalUnknownCommand: does NOT clear scrape/death timers (session stays al
   state.scrapeTimer = scrapeTimer;
   state.deathTimer = deathTimer;
   try {
-    __forTest.pushTurnSlot(state, rec.onChunk);
+    void __forTest.pushTurnSlot(state, rec.onChunk).catch(() => {});
     state.pendingSlashToken = "/skill-creator";
 
     signalUnknownCommand(state);

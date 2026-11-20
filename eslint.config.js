@@ -49,4 +49,27 @@ export default [
       "@typescript-eslint/await-thenable": "error",
     },
   },
+  {
+    // bun:test types `expect(p).resolves.*` and `.rejects.*` matchers as
+    // returning `void`, though at runtime they return a Promise. So in test files
+    // `await expect(p).rejects.toThrow()` is a false `await-thenable` positive
+    // (382 of them), and an un-awaited one is invisible to `no-floating-promises`
+    // (a test that passes without ever checking the assertion). This block turns
+    // the first rule off for tests and replaces the lost coverage with a syntax
+    // rule that fails any `.resolves` / `.rejects` matcher used as a bare
+    // statement, i.e. not awaited and not returned.
+    files: ["src/**/*.test.ts", "src/**/*.test.tsx"],
+    rules: {
+      "@typescript-eslint/await-thenable": "off",
+      "no-restricted-syntax": [
+        "error",
+        {
+          selector:
+            "ExpressionStatement > CallExpression[callee.object.property.name=/^(resolves|rejects)$/], " +
+            "ExpressionStatement > CallExpression[callee.object.object.property.name=/^(resolves|rejects)$/]",
+          message: "`expect(...).resolves/.rejects` returns a Promise: `await` it (or return it), or the assertion never runs.",
+        },
+      ],
+    },
+  },
 ];

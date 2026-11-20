@@ -30,7 +30,7 @@ import { countTerminals, terminalCountsByTask } from "./terminals.ts";
 export { dataDir, pidFilePath, credsFilePath };
 
 export const db = new Database(resolveDbPath());
-applyConnectionPragmas(db, { role: "main" });
+applyConnectionPragmas(db);
 
 const applied = migrate(db, migrations);
 if (applied.length) console.log(`[agetor] applied migrations: ${applied.join(", ")}`);

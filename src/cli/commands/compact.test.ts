@@ -20,7 +20,7 @@ const outputs: string[] = [];
 const errors: string[] = [];
 const jsonOutputs: unknown[] = [];
 
-mock.module("../context.ts", () => ({
+void mock.module("../context.ts", () => ({
   ...realContextSnapshot,
   getClient: async () => {
     throw new Error("getClient must not be called — the test injects a client");
@@ -28,7 +28,7 @@ mock.module("../context.ts", () => ({
 }));
 
 const id = (s: string) => s;
-mock.module("../output.ts", () => ({
+void mock.module("../output.ts", () => ({
   ...realOutputSnapshot,
   isTTY: false,
   c: { dim: id, bold: id, red: id, green: id, yellow: id, cyan: id, gray: id, magenta: id, blue: id },
@@ -44,8 +44,8 @@ mock.module("../output.ts", () => ({
 }));
 
 afterAll(() => {
-  mock.module("../context.ts", () => realContextSnapshot);
-  mock.module("../output.ts", () => realOutputSnapshot);
+  void mock.module("../context.ts", () => realContextSnapshot);
+  void mock.module("../output.ts", () => realOutputSnapshot);
 });
 
 const { cmdCompact, askCompact, compactStatsLines, formatBytes, interactiveCompact } = await import("./compact.ts");

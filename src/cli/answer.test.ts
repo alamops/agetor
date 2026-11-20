@@ -42,7 +42,7 @@ const cancelCalls: string[] = [];
 const CANCEL = Symbol("cancel");
 const outputs: string[] = [];
 
-mock.module("./context.ts", () => ({
+void mock.module("./context.ts", () => ({
   ...realContextSnapshot,
   getClient: async () => {
     if (!currentClient) throw new Error("no fake client set for this test");
@@ -50,7 +50,7 @@ mock.module("./context.ts", () => ({
   },
 }));
 
-mock.module("./output.ts", () => ({
+void mock.module("./output.ts", () => ({
   ...realOutputSnapshot,
   isTTY: true, // bypass cmdAnswer's "needs an interactive terminal" guard
   c: {
@@ -69,7 +69,7 @@ mock.module("./output.ts", () => ({
   },
 }));
 
-mock.module("@clack/prompts", () => ({
+void mock.module("@clack/prompts", () => ({
   ...realClackSnapshot,
   select: async (opts: { message: string; options: SelectOption[] }) => selectImpl(opts),
   text: async (opts: { message: string }) => textImpl(opts),
@@ -81,9 +81,9 @@ mock.module("@clack/prompts", () => ({
 }));
 
 afterAll(() => {
-  mock.module("./context.ts", () => realContextSnapshot);
-  mock.module("./output.ts", () => realOutputSnapshot);
-  mock.module("@clack/prompts", () => realClackSnapshot);
+  void mock.module("./context.ts", () => realContextSnapshot);
+  void mock.module("./output.ts", () => realOutputSnapshot);
+  void mock.module("@clack/prompts", () => realClackSnapshot);
 });
 
 const { cmdAnswer } = await import("./commands/answer.ts");

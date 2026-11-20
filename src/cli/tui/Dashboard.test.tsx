@@ -41,7 +41,7 @@ let onTaskEvents: ((e: RunEvent) => void) | null = null;
 // resume tests below.
 let onTaskNamed: ((event: string, data: string) => void) | undefined;
 
-mock.module("../sse.ts", () => ({
+void mock.module("../sse.ts", () => ({
   ...realSseSnapshot,
   streamSse: (
     pathname: string,
@@ -57,7 +57,7 @@ mock.module("../sse.ts", () => ({
 }));
 
 afterAll(() => {
-  mock.module("../sse.ts", () => realSseSnapshot);
+  void mock.module("../sse.ts", () => realSseSnapshot);
 });
 
 const ENTER = "\r";
@@ -1830,7 +1830,7 @@ test("selecting an expanded step row opens ITS transcript stream (the parent nev
     listTasks: async () => [parentTask(), stepTask("stepA")],
   } as unknown as AgetorClient;
   // Track every `/tasks/:id/events` subscription the dashboard opens.
-  mock.module("../sse.ts", () => ({
+  void mock.module("../sse.ts", () => ({
     ...realSseSnapshot,
     streamSse: (pathname: string, onEvent: (e: unknown) => void) => {
       const m = /^\/tasks\/([^/]+)\/events/.exec(pathname);
@@ -1854,7 +1854,7 @@ test("selecting an expanded step row opens ITS transcript stream (the parent nev
     expect(opened).toEqual(["stepA"]);
     unmount();
   } finally {
-    mock.module("../sse.ts", () => ({
+    void mock.module("../sse.ts", () => ({
       ...realSseSnapshot,
       streamSse: (pathname: string, onEvent: (e: unknown) => void) => {
         if (pathname.startsWith("/tasks/") && pathname.includes("/events")) {

@@ -122,9 +122,9 @@ test("archiveTask responds before teardown runs — the worktree is (usually) st
     // flight for this task right now).
     const stillHasDirImmediately = existsSync(worktreePath);
     let settledImmediately = false;
-    pendingTeardown(taskId).then(() => {
+    void pendingTeardown(taskId).then(() => {
       settledImmediately = true;
-    });
+    }).catch(() => {});
     // Give queued microtasks (but not the deferred job's own awaits) a chance
     // to run without letting the teardown's internal awaits resolve.
     await Promise.resolve();

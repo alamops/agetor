@@ -118,7 +118,7 @@ test("orchestrator: cancellation wins over api-error in column resolution (cance
     await new Promise((r) => setTimeout(r, 30));
     expect(tasks.get(task.id)?.column).toBe("blocked");
 
-    cancelRun(runId);
+    await cancelRun(runId);
 
     // Now wait past the resolve delay so the done handler runs.
     await new Promise((r) => setTimeout(r, 200));
@@ -289,7 +289,7 @@ test("orchestrator: cancellation wins over unknown-command (cancelled task → '
     await new Promise((r) => setTimeout(r, 30));
     expect(tasks.get(task.id)?.column).toBe("blocked");
 
-    cancelRun(runId);
+    await cancelRun(runId);
 
     await new Promise((r) => setTimeout(r, 200));
 
@@ -334,7 +334,7 @@ test("orchestrator: cancellation wins over session-death (cancelled task → 're
     await new Promise((r) => setTimeout(r, 30));
     expect(tasks.get(task.id)?.column).toBe("blocked");
 
-    cancelRun(runId);
+    await cancelRun(runId);
 
     await new Promise((r) => setTimeout(r, 200));
 

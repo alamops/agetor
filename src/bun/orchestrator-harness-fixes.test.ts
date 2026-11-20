@@ -974,10 +974,12 @@ describe("Codex limit settle and the retry timer at the orchestrator (R-S16)", (
     const prevTap = orch.__setChunkHandlerTapForTest((tapRunId, hooked, handler) => {
       if (hooked !== task.id) return;
       orch.__setChunkHandlerTapForTest(null);
-      setTimeout(async () => {
-        handler("status", `${HARNESS_LIMIT_STATUS_PREFIX}${JSON.stringify(signal)}`);
-        await orch.__settleChunkWorkForTest(tapRunId);
-        sawCooldown = await stacks.harnessStacks.getLimitState(a) !== null;
+      setTimeout(() => {
+        void (async () => {
+          handler("status", `${HARNESS_LIMIT_STATUS_PREFIX}${JSON.stringify(signal)}`);
+          await orch.__settleChunkWorkForTest(tapRunId);
+          sawCooldown = await stacks.harnessStacks.getLimitState(a) !== null;
+        })().catch((e) => console.error("[test] deferred hook failed:", e));
       }, 150);
     });
     try {
@@ -1019,11 +1021,13 @@ describe("Codex limit settle and the retry timer at the orchestrator (R-S16)", (
     const prevTap = orch.__setChunkHandlerTapForTest((tapRunId, hooked, handler) => {
       if (hooked !== task.id) return;
       orch.__setChunkHandlerTapForTest(null);
-      setTimeout(async () => {
-        handler("status", `${HARNESS_LIMIT_STATUS_PREFIX}${JSON.stringify(signal)}`);
-        await orch.__settleChunkWorkForTest(tapRunId);
-        // Another task overwrites the account-wide row after this run's own.
-        await stacks.harnessStacks.setLimitState(a, { ...signal, message: "another task" } as never, Date.now() + 5);
+      setTimeout(() => {
+        void (async () => {
+          handler("status", `${HARNESS_LIMIT_STATUS_PREFIX}${JSON.stringify(signal)}`);
+          await orch.__settleChunkWorkForTest(tapRunId);
+          // Another task overwrites the account-wide row after this run's own.
+          await stacks.harnessStacks.setLimitState(a, { ...signal, message: "another task" } as never, Date.now() + 5);
+        })().catch((e) => console.error("[test] deferred hook failed:", e));
       }, 150);
     });
     let after: Awaited<ReturnType<typeof stacks.harnessStacks.getLimitState>> = null;

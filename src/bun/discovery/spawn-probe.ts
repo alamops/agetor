@@ -63,7 +63,8 @@ export async function runJsonLineSession(opts: {
   };
   const write = (obj: unknown): void => {
     try {
-      proc.stdin.write(`${JSON.stringify(obj)}\n`);
+      // FileSink.write may return a Promise (a broken pipe rejects it later).
+      void Promise.resolve(proc.stdin.write(`${JSON.stringify(obj)}\n`)).catch(() => {});
       void proc.stdin.flush();
     } catch { /* the child closed its stdin */ }
   };

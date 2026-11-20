@@ -1,12 +1,9 @@
 import type { Database } from "bun:sqlite";
 
 /** The pragmas every Agetor SQLite connection runs with. Shared by `db.ts`
- *  (the main-thread connection) and the worker's connection so the two cannot
- *  drift. */
-export function applyConnectionPragmas(
-  conn: Database,
-  opts: { role?: "main" | "worker" } = {},
-): void {
+ *  (the test / in-process connection) and the worker's connection so the two
+ *  cannot drift. */
+export function applyConnectionPragmas(conn: Database): void {
   conn.exec("PRAGMA journal_mode = WAL;");
   // WAL + NORMAL is SQLite's documented sweet spot for a local single-writer
   // app. WAL already makes every transaction atomic and the database consistent
@@ -24,12 +21,12 @@ export function applyConnectionPragmas(
   // pages (docs/plans/non-blocking-core.md, T8).
   conn.exec("PRAGMA cache_size = -65536;");
   conn.exec("PRAGMA mmap_size = 268435456;");
-  // Transitional (docs/plans/non-blocking-core.md section 3): while `db.ts`'s
-  // connection and the worker's connection both write this WAL database, a
-  // writer must wait for the other instead of failing with SQLITE_BUSY. The
-  // worker may wait the full 5 s. The main-thread connection (`role: "main"`)
-  // waits only 100 ms: its wait blocks the event loop, so a contended write
-  // fails fast with SQLITE_BUSY rather than freezing every task for seconds.
-  // Wave 5 removes the main connection's writes and this split.
-  conn.exec(`PRAGMA busy_timeout = ${opts.role === "main" ? 100 : 5000};`);
+  // One production connection (the database worker's) owns this file, so a
+  // writer never contends with another Agetor connection. The 5 s wait covers
+  // the rare external one: the `sqlite3` CLI, a backup, or Compact's
+  // `wal_checkpoint(TRUNCATE)` waiting on a reader. It runs on the worker
+  // thread, so waiting never blocks the event loop. The `db.ts` singleton
+  // (tests and the in-process mode, which production ignores) uses the same
+  // value.
+  conn.exec("PRAGMA busy_timeout = 5000;");
 }

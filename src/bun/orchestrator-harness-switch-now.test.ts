@@ -917,12 +917,14 @@ describe("a background agent settling inside the turn-end pump (S7 race)", () =>
     // had applied the switch there, it would hold the claim (without the
     // turn-end ordering) and the turn end could not claim it.
     let claimFreeAfterRelease: boolean | null = null;
-    const prev = orch.__setTurnSettlePumpHookForTest(async (hooked) => {
+    const prev = orch.__setTurnSettlePumpHookForTest((hooked) => {
       if (hooked !== task.id) return;
       orch.__setTurnSettlePumpHookForTest(null);
-      await settleSubagentById(subagentId, "completed", "receipt");
-      claimFreeAfterRelease = await orch.claimTaskForAccountSwitch(task.id);
-      if (claimFreeAfterRelease) await orch.releaseTaskAccountSwitch(task.id);
+      void (async () => {
+        await settleSubagentById(subagentId, "completed", "receipt");
+        claimFreeAfterRelease = await orch.claimTaskForAccountSwitch(task.id);
+        if (claimFreeAfterRelease) await orch.releaseTaskAccountSwitch(task.id);
+      })().catch((e) => console.error("[test] deferred hook failed:", e));
     });
     process.env.AGETOR_FAKE_CLAUDE_TURN_MS = "500";
     try {
@@ -1337,7 +1339,7 @@ describe("only a held card or a FAILED blocked one is held by its background age
         expect({ column, status, result: result.status }).toEqual({ column, status, result: "switched" });
         expect(db.tasks.get(task.id)!.agent).toBe(b);
       } finally {
-        done();
+        await done();
       }
     }
   }, 30_000);
@@ -1353,7 +1355,7 @@ describe("only a held card or a FAILED blocked one is held by its background age
       expect(after.harnessState?.scheduledSwitch ?? null).toBeNull();
       expect((await events(stack.id)).filter((e) => e.taskId === task.id).map((e) => e.trigger)).toEqual(["scheduled"]);
     } finally {
-      done();
+      await done();
     }
   }, 20_000);
 
@@ -1366,7 +1368,7 @@ describe("only a held card or a FAILED blocked one is held by its background age
       expect(db.tasks.get(task.id)!.harnessState?.scheduledSwitch ?? null).toBeNull();
       expect((await events(stack.id)).filter((e) => e.taskId === task.id).map((e) => e.trigger)).toEqual(["scheduled"]);
     } finally {
-      done();
+      await done();
     }
   }, 20_000);
 
@@ -1387,8 +1389,8 @@ describe("only a held card or a FAILED blocked one is held by its background age
       db.tasks.update(failed.task.id, { column: "ready" });
       expect(await orch.backgroundAgentsHoldTask(failed.task.id)).toBe(false);
     } finally {
-      failed.done();
-      stopped.done();
+      await failed.done();
+      await stopped.done();
     }
   });
 
@@ -1425,7 +1427,7 @@ describe("only a held card or a FAILED blocked one is held by its background age
     } finally {
       callSpy.mockRestore();
       opSpy.mockRestore();
-      failed.done();
+      await failed.done();
     }
   });
 });
