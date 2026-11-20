@@ -1,5 +1,5 @@
 import { randomUUID } from "node:crypto";
-import { mkdtempSync } from "node:fs";
+import { chmodSync, mkdtempSync } from "node:fs";
 import { tmpdir } from "node:os";
 import path from "node:path";
 import { test, expect, type APIRequestContext, type E2EBackend, type Locator, type Page } from "./fixtures";
@@ -241,6 +241,103 @@ test.describe("sent files to user", () => {
       .locator(`[data-testid="sent-file-tile"][data-path="${pngPath}"]`);
     await expect(reopenedPngTile).toHaveAttribute("data-kind", "image");
     await expect.poll(() => reopenedPngTile.locator("img").evaluate((el) => (el as HTMLImageElement).naturalWidth)).toBeGreaterThan(0);
+  });
+
+  test("a sent image the core can't read keeps its tile, says the preview is blocked, and still opens", async ({
+    page,
+    request,
+    backend,
+  }) => {
+    test.skip(typeof process.getuid === "function" && process.getuid() === 0, "chmod 000 does not block root");
+    test.setTimeout(60_000);
+    const title = `sent-files-e2e-denied ${randomUUID()}`;
+    const { task, pngPath } = await createAndStartFakeSentFilesTask(request, backend, title);
+
+    // Let the fake turn finish (it writes chart.png), THEN block the file, and
+    // only then open the page: a webview that had already loaded the thumbnail
+    // would revalidate it with a 304 (the core can stat an unreadable file, so
+    // its ETag still matches) and hide the denial. `chmod 000` stands in for
+    // macOS's privacy block (the preview route answers 403).
+    await expect
+      .poll(
+        async () => {
+          const res = await request.get(`${backend.apiBase}/tasks/${task.id}`, {
+            headers: { authorization: `Bearer ${backend.apiToken}` },
+          });
+          return ((await res.json()) as { column?: string }).column;
+        },
+        { timeout: 20_000 },
+      )
+      .toBe("review");
+    chmodSync(pngPath, 0o000);
+    try {
+      await gotoApp(page, backend.bootBase);
+      const panel = await openTask(page, title);
+      await waitForScenarioComplete(panel);
+
+      const tile = sentFilesCards(panel).nth(0).locator(`[data-testid="sent-file-tile"][data-path="${pngPath}"]`);
+      await expect(tile).toHaveAttribute("title", /^Preview blocked by macOS privacy/, { timeout: 20_000 });
+      // The file exists, so the tile is not shown as missing, and its thumbnail
+      // is replaced by the neutral glyph instead of a broken image.
+      await expect(tile.getByText("missing", { exact: true })).toHaveCount(0);
+      await expect(tile.locator("img")).toHaveCount(0);
+
+      const openRequest = page.waitForRequest((r) => r.url().includes("/open-path"), { timeout: 20_000 });
+      await tile.click();
+      await openRequest;
+      await expect(page.locator("#attachment-open-error-title")).toBeVisible({ timeout: 20_000 });
+      await expect(page.locator("#attachment-not-found-title")).toHaveCount(0);
+    } finally {
+      chmodSync(pngPath, 0o600);
+    }
+  });
+
+  test("a thumbnail that 404s for a file the stat found says 'Preview unavailable', never 'missing', and still opens", async ({
+    page,
+    request,
+    backend,
+  }) => {
+    test.setTimeout(60_000);
+    const title = `sent-files-e2e-thumb404 ${randomUUID()}`;
+    const { pngPath } = await createAndStartFakeSentFilesTask(request, backend, title);
+
+    // The stat (`/refs/resolve`) still finds the file; only its thumbnail
+    // request 404s. Faked at the network boundary, with CORS headers so the
+    // browser hands the stubbed answer to the app.
+    const cors = {
+      "access-control-allow-origin": "*",
+      "access-control-allow-headers": "authorization, content-type, *",
+      "access-control-allow-methods": "GET, OPTIONS",
+    };
+    await page.route(
+      (url) => url.pathname === "/files/preview" && url.searchParams.get("path") === pngPath,
+      async (route) => {
+        if (route.request().method() === "OPTIONS") {
+          await route.fulfill({ status: 204, headers: cors });
+          return;
+        }
+        await route.fulfill({
+          status: 404,
+          headers: { ...cors, "content-type": "application/json" },
+          body: JSON.stringify({ error: `not found: ${pngPath}` }),
+        });
+      },
+    );
+
+    await gotoApp(page, backend.bootBase);
+    const panel = await openTask(page, title);
+    await waitForScenarioComplete(panel);
+
+    const tile = sentFilesCards(panel).nth(0).locator(`[data-testid="sent-file-tile"][data-path="${pngPath}"]`);
+    await expect(tile).toHaveAttribute("title", `Preview unavailable. Click to open.\n${pngPath}`, { timeout: 20_000 });
+    await expect(tile.getByText("missing", { exact: true })).toHaveCount(0);
+    await expect(tile.locator("img")).toHaveCount(0);
+
+    const openRequest = page.waitForRequest((r) => r.url().includes("/open-path"), { timeout: 20_000 });
+    await tile.click();
+    await openRequest;
+    await expect(page.locator("#attachment-open-error-title")).toBeVisible({ timeout: 20_000 });
+    await expect(page.locator("#attachment-not-found-title")).toHaveCount(0);
   });
 
   test("clicking a tile opens the headless 'Couldn't open' dialog", async ({ page, request, backend }) => {

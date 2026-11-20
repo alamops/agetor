@@ -28,9 +28,9 @@ import {
   X,
   type LucideIcon,
 } from "lucide-react";
-import { api, type AgentModelMap, type HarnessModelMap } from "@/lib/api";
+import { api, ApiError, type AgentModelMap, type HarnessModelMap } from "@/lib/api";
 import { Button } from "@/components/ui/button";
-import { clampFontSizePercent, COLUMNS, USAGE_SUPPORTED_KINDS, type AgentStatus, type ColumnId, type GlobalEvent, type Harness, type HarnessLimitState, type HarnessQuota, type HarnessStack, type Project, type Task, type TaskListOptions, type TaskType } from "../shared/types.ts";
+import { clampFontSizePercent, COLUMNS, describeArchiveUncommittedChanges, isArchiveUncommittedChanges, USAGE_SUPPORTED_KINDS, type AgentStatus, type ColumnId, type GlobalEvent, type Harness, type HarnessLimitState, type HarnessQuota, type HarnessStack, type Project, type Task, type TaskListOptions, type TaskType } from "../shared/types.ts";
 import { parseIssueUrl } from "../shared/issue-task.ts";
 import { AgentIcon } from "@/components/kanban/AgentIcon";
 import { Column } from "@/components/kanban/Column";
@@ -758,6 +758,9 @@ function AppInner() {
   // function's doc comment. A ref (not state) since it's pure bookkeeping
   // that must survive across polls without itself triggering a render.
   const taskReconcileCacheRef = useRef(new Map<string, { obj: Task; json: string }>());
+  // The last poll answer `refresh()` reconciled and the state it produced,
+  // so a 304 (same array back) skips the per-task compare.
+  const lastAppliedTaskListRef = useRef<{ list: Task[]; result: Task[] } | null>(null);
   // In-flight guards for the 2s `refresh()` / 15s `refreshAgents()` interval
   // pollers below (task-details-blank-while-session-restores.md §3.1/§3.4):
   // a tick is skipped while the previous poll of the same kind hasn't
@@ -790,7 +793,18 @@ function AppInner() {
       // `list` (unreconciled) is what callers get back for immediate reads
       // (e.g. re-checking a just-created task's branch); the reconciled,
       // identity-preserving version is what actually lands in state.
-      setTasks((prev) => reconcileById(prev, list, (t) => t.id, taskReconcileCacheRef.current));
+      setTasks((prev) => {
+        // An unchanged list (the conditional poll's 304) comes back as the
+        // same array; when the state is still exactly what that array was
+        // reconciled into, there is nothing to compare. An optimistic edit
+        // since then (archive, unarchive…) changed `prev`, so the server's
+        // answer is applied over it as before.
+        const last = lastAppliedTaskListRef.current;
+        if (last && last.list === list && last.result === prev) return prev;
+        const next = reconcileById(prev, list, (t) => t.id, taskReconcileCacheRef.current);
+        lastAppliedTaskListRef.current = { list, result: next };
+        return next;
+      });
       // Gates onboarding visibility (see `resolveOnboardingVisibility`'s
       // `loaded` input) — set unconditionally on every success, cheap no-op
       // once already true.
@@ -2207,11 +2221,34 @@ function AppInner() {
       });
       if (!ok) return;
     }
+    const base = active ? { force: true, stopRun: true } : {};
     const now = Date.now();
-    setTasks((cur) => cur.map((x) => (x.id === t.id ? { ...x, archivedAt: now } : x)));
+    const setArchivedAt = (archivedAt: number | null) =>
+      setTasks((cur) => cur.map((x) => (x.id === t.id ? { ...x, archivedAt } : x)));
+    setArchivedAt(now);
     try {
       setError(null);
-      await api.archiveTask(t.id, active ? { force: true, stopRun: true } : undefined);
+      try {
+        await api.archiveTask(t.id, active ? base : undefined);
+      } catch (e) {
+        // Archive removes the worktree; the core refused because that would
+        // discard uncommitted work. Nothing changed server-side, so the card
+        // comes back while the user decides.
+        if (!(e instanceof ApiError && e.status === 409 && isArchiveUncommittedChanges(e.body))) throw e;
+        setArchivedAt(t.archivedAt);
+        const ok = await confirm({
+          title: `Discard uncommitted changes in "${t.title}"?`,
+          description: describeArchiveUncommittedChanges(e.body.repositories),
+          confirmLabel: "Discard & archive",
+          variant: "destructive",
+        });
+        if (!ok) {
+          await refresh();
+          return;
+        }
+        setArchivedAt(now);
+        await api.archiveTask(t.id, { ...base, forceWorktree: true });
+      }
       dismissTaskToast(t.id);
       clearSelectedStepOf(t.id);
       await refresh();

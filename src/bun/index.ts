@@ -3,6 +3,10 @@
 // that reaches db.ts (which opens and migrates SQLite on import) would otherwise
 // open the wrong data dir (docs/plans/always-on-host.md §3.6).
 import "./channel-defaults.ts";
+// Second, right after the data dir is settled: copies every console line of
+// the desktop core to `<dataDir>/core.log` (the packaged app's stdout/stderr
+// go to /dev/null), so it must be in place before db.ts logs its migrations.
+import "./core-log-boot.ts";
 import { writeFileSync, existsSync } from "node:fs";
 import { isAbsolute } from "node:path";
 import Electrobun, { ApplicationMenu, BrowserWindow, Screen, Updater, Utils } from "electrobun/bun";
@@ -36,6 +40,7 @@ import { applyHarnessAutoEnable } from "./harness-auto-enable.ts";
 import { initPipelineRunner, reconcilePipelineRuns } from "./pipeline-runner.ts";
 import { beginLagLabel, startLagMonitor, stopLagMonitor } from "./event-loop-lag.ts";
 import { scheduleRetention, stopRetentionTimers } from "./retention.ts";
+import { requestPreviewTwinSweep } from "./preview-twins.ts";
 import { ensureDisclaimedServer } from "./tmux-resolution.ts";
 import { DISCLAIM_PREF_KEY } from "./disclaim.ts";
 import { initDisclaimSwitch } from "./disclaim-switch.ts";
@@ -583,6 +588,8 @@ void getBackgroundStatus({ fresh: true }).catch((err) => {
 // up and restore/seed work has settled), then every 24 h; each fire reads the
 // preference fresh. Also re-armed on demand by `PUT /preferences/...`.
 scheduleRetention();
+// Trim the preview-twin cache to its cap (fire-and-forget; never blocks boot).
+requestPreviewTwinSweep(dataDir);
 
 // Claude sessions started outside Agetor (docs/plans/import-claude-code-sessions.md).
 // Scheduled only now that this process owns the API port: during a handoff
