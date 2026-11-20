@@ -1,5 +1,5 @@
 import { describe, expect, test } from "bun:test";
-import { redactSecrets } from "./opencode-http.ts";
+import { __userinfoScanCountForTest, redactSecrets, safeErrorText } from "./opencode-http.ts";
 
 /** A frozen copy of `redactSecrets` as it was before the URL-userinfo scan went
  *  linear. It is the parity reference and the slow side of the timing test. */
@@ -80,46 +80,94 @@ describe("redactSecrets parity with the pre-linear implementation", () => {
 });
 
 describe("redactSecrets runs in linear time", () => {
-  const SIZE = 64 * 1024;
-  const adversarial: Record<string, string> = {
-    "one repeated char": "a".repeat(SIZE),
-    colons: ":".repeat(SIZE),
-    ats: "@".repeat(SIZE),
-    "a: pairs": "a:".repeat(SIZE / 2),
-    "=a: triples": "=a:".repeat(Math.floor(SIZE / 3)),
-    "a:b= groups": "a:b=".repeat(SIZE / 4),
-    "scheme-like runs": "a://".repeat(SIZE / 4),
+  // Every input ends in `:@`, so it holds BOTH `@` and `:` (redactUserinfo does
+  // not return early) and the tail never forms a match (a password needs a
+  // character between `:` and `@`), so the whole string is scanned for nothing.
+  // Each is a builder from a size, so the same shape is timed at n and 4n.
+  const TAIL = ":@";
+  const adversarial: Record<string, (n: number) => string> = {
+    "one repeated char": (n) => "a".repeat(n) + TAIL,
+    "a: pairs": (n) => "a:".repeat(n / 2) + TAIL,
+    "=a: triples": (n) => "=a:".repeat(Math.floor(n / 3)) + TAIL,
+    "a:b= groups": (n) => "a:b=".repeat(n / 4) + TAIL,
+    "scheme-like runs": (n) => "a://".repeat(n / 4) + TAIL,
+    "slashes then tail": (n) => "a/".repeat(n / 2) + TAIL,
   };
 
-  const median = (fn: () => void): number => {
-    const times: number[] = [];
-    for (let run = 0; run < 5; run++) {
+  /** The fastest of several runs: robust against a loaded machine, which can
+   *  only slow a run down. */
+  const best = (fn: () => void): number => {
+    let min = Number.POSITIVE_INFINITY;
+    for (let run = 0; run < 7; run++) {
       const t0 = performance.now();
       fn();
-      times.push(performance.now() - t0);
+      min = Math.min(min, performance.now() - t0);
     }
-    return times.sort((a, b) => a - b)[2] ?? Number.POSITIVE_INFINITY;
+    return min;
   };
 
-  test("every adversarial 64 KB input takes under 10 ms", () => {
-    for (const [name, input] of Object.entries(adversarial)) {
-      const ms = median(() => redactSecrets(input));
-      expect({ name, fast: ms < 10 }).toEqual({ name, fast: true });
+  /** time(4n) / time(n): about 4 for linear work, about 16 for quadratic. */
+  const scaling = (redact: (s: string) => string, build: (n: number) => string, n: number): number => {
+    const small = build(n);
+    const big = build(4 * n);
+    // Warm up so JIT compilation is not charged to the small side.
+    redact(small);
+    const tSmall = Math.max(best(() => redact(small)), 0.01);
+    const tBig = best(() => redact(big));
+    return tBig / tSmall;
+  };
+
+  const LINEAR_RATIO_LIMIT = 8;
+
+  test("every adversarial input reaches the scan, and 4x the input costs under 8x the time", () => {
+    for (const [name, build] of Object.entries(adversarial)) {
+      const before = __userinfoScanCountForTest();
+      redactSecrets(build(4096));
+      // The scan ran (it did not return at the early `@` / `:` check).
+      expect({ name, scanned: __userinfoScanCountForTest() - before }).toEqual({ name, scanned: 1 });
+      const ratio = scaling((s) => redactSecrets(s), build, 32 * 1024);
+      expect({ name, linear: ratio < LINEAR_RATIO_LIMIT }).toEqual({ name, linear: true });
     }
   });
 
-  test("the pre-linear implementation takes over 100 ms on a 16 KB one", () => {
-    // 16 KB keeps the old side to a fraction of a second (it is quadratic: 64 KB
-    // takes seconds); this proves the timing test above can tell the two apart.
-    const input = "a".repeat(16 * 1024);
-    const ms = median(() => oldRedactSecrets(input));
-    expect(ms).toBeGreaterThan(100);
-    expect(median(() => redactSecrets(input))).toBeLessThan(10);
+  test("the pre-linear implementation scales worse than 8x on at least one of them", () => {
+    // 4 KB -> 16 KB keeps the quadratic side to a fraction of a second.
+    const ratios = Object.values(adversarial).map((build) => scaling((s) => oldRedactSecrets(s), build, 4 * 1024));
+    expect(Math.max(...ratios)).toBeGreaterThan(LINEAR_RATIO_LIMIT);
   });
 
   test("adversarial inputs redact the same as before", () => {
-    for (const input of Object.values(adversarial).map((s) => s.slice(0, 2000))) {
+    for (const build of Object.values(adversarial)) {
+      const input = build(2000);
       expect(redactSecrets(input)).toBe(oldRedactSecrets(input));
     }
+  });
+});
+
+describe("safeErrorText bounds its input before redacting", () => {
+  test("a 10 MB body completes quickly, keeps its leading text and leaks no secret", () => {
+    const body = `request failed password=${PASSWORD} ${"a".repeat(10 * 1024 * 1024)}:@`;
+    let min = Number.POSITIVE_INFINITY;
+    let out = "";
+    for (let run = 0; run < 3; run++) {
+      const t0 = performance.now();
+      out = safeErrorText(body, PASSWORD);
+      min = Math.min(min, performance.now() - t0);
+    }
+    expect(min).toBeLessThan(50);
+    expect(out).not.toContain(PASSWORD);
+    expect(out.startsWith("request failed password=[redacted]")).toBe(true);
+    expect(out.length).toBeLessThanOrEqual(303);
+  });
+
+  test("a secret straddling the cut is never emitted, even as a fragment", () => {
+    const pad = "\n".repeat(16 * 1024 - 8);
+    // Control characters flatten away, so only the token at the cut could show.
+    const body = `${pad}${PASSWORD}${" tail".repeat(100)}`;
+    const out = safeErrorText(body, PASSWORD);
+    expect(out).not.toContain(PASSWORD);
+    expect(out).not.toContain(PASSWORD.slice(0, 4));
+    // Short texts are untouched by the bound.
+    expect(safeErrorText(`bad ${PASSWORD} here`, PASSWORD)).toBe("bad [redacted] here");
   });
 });

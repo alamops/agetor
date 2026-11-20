@@ -1,5 +1,5 @@
 import { afterAll, describe, expect, test } from "bun:test";
-import { closeSync, mkdirSync, mkdtempSync, readSync, rmSync, statSync, symlinkSync, writeFileSync } from "node:fs";
+import { closeSync, mkdirSync, mkdtempSync, openSync, readSync, rmSync, statSync, symlinkSync, truncateSync, writeFileSync, writeSync } from "node:fs";
 import os from "node:os";
 import path from "node:path";
 import { openReadNoFollow } from "./no-follow.ts";
@@ -349,5 +349,134 @@ describe("readMetaFile", () => {
       expect(readMetaFileSync(metaDir, id)).toEqual(defaults);
     }
     expect((await readMetaFile(metaDir, "real")).agentType).toBe("Explore");
+  });
+});
+
+describe("per-line cap", () => {
+  const CAP = 1000;
+  const big = "x".repeat(CAP + 500);
+
+  test("an oversized line is skipped, reported once, and the offset moves past it; lines under the cap keep parity", async () => {
+    const ok1 = `{"a":1}\n`;
+    const bigLine = JSON.stringify({ pad: big }) + "\n";
+    const ok2 = `{"b":2}\n`;
+    const p = fixture(ok1 + bigLine + ok2);
+    for (const read of [
+      (o: number, chunk: number) => readChunk(p, o, chunk, CAP),
+      async (o: number, chunk: number) => readChunkSync(p, o, chunk, CAP),
+    ]) {
+      for (const chunk of [64, 300, 4096]) {
+        let off = 0;
+        const seen: Array<{ raw: string; error?: string }> = [];
+        for (let i = 0; i < 50; i++) {
+          const r = await read(off, chunk);
+          if (r.tooLarge) {
+            expect(r.text).toBe("");
+            seen.push({ raw: "", error: "tooLarge" });
+          } else {
+            for (const l of splitAndParseLines(r.text)) seen.push({ raw: l.raw });
+          }
+          if (r.nextOffset === off) break;
+          off = r.nextOffset;
+        }
+        expect(seen).toEqual([{ raw: `{"a":1}` }, { raw: "", error: "tooLarge" }, { raw: `{"b":2}` }]);
+        expect(off).toBe((ok1 + bigLine + ok2).length);
+      }
+    }
+  });
+
+  test("an oversized line without a newline yet is not accumulated and not skipped; a line exactly at the cap is read", async () => {
+    const partial = fixture("a".repeat(CAP * 3)); // mid-line writer, no newline
+    const r = await readChunk(partial, 0, 200, CAP);
+    expect(r).toMatchObject({ text: "", nextOffset: 0 });
+    expect(r.tooLarge).toBeUndefined();
+    const exact = fixture("y".repeat(CAP) + "\n");
+    const e = await readChunk(exact, 0, 200, CAP);
+    expect(e.text).toBe("y".repeat(CAP) + "\n");
+    const over = fixture("y".repeat(CAP + 1) + "\n");
+    expect((await readChunk(over, 0, 200, CAP)).tooLarge).toBe(true);
+  });
+
+  test("the handler reports a line over the default 64 MB cap as a tooLarge ParsedLine and moves on", async () => {
+    const { handleTranscriptMessage } = await import("./workers/transcript-handler.ts");
+    const p = path.join(root, "huge-line.jsonl");
+    const fd = openSync(p, "w");
+    try {
+      const block = Buffer.alloc(1024 * 1024, 0x78);
+      for (let i = 0; i < 65; i++) writeSync(fd, block);
+      writeSync(fd, `\n{"z":1}\n`);
+    } finally {
+      closeSync(fd);
+    }
+    const first = await handleTranscriptMessage({ id: 1, op: "readChunk", args: { path: p, offset: 0, maxBytes: 4 * 1024 * 1024 } });
+    expect(first.ok).toBe(true);
+    const res = first.ok ? (first.result as { lines: Array<{ raw: string; parsed: unknown; error?: string }>; nextOffset: number }) : null;
+    expect(res!.lines).toEqual([{ raw: "", parsed: null, error: "tooLarge" }]);
+    expect(res!.nextOffset).toBe(65 * 1024 * 1024 + 1);
+    const second = await handleTranscriptMessage({ id: 2, op: "readChunk", args: { path: p, offset: res!.nextOffset, maxBytes: 4096 } });
+    expect(second.ok && (second.result as { lines: Array<{ raw: string }> }).lines.map((l) => l.raw)).toEqual([`{"z":1}`]);
+    rmSync(p);
+  });
+});
+
+describe("readMetaFile bounds the read, not only the open", () => {
+  test("a sidecar that grows past the cap after the open is read at most cap + 1 bytes", async () => {
+    const dir = path.join(root, "grow");
+    mkdirSync(dir);
+    const file = path.join(dir, "agent-g.meta.json");
+    writeFileSync(file, `{"agentType":"Explore"}`);
+    let total = 0;
+    const meta = await readMetaFile(dir, "g", {
+      afterOpen: () => truncateSync(file, META_MAX_BYTES * 200), // sparse: instant, 200 MB
+      onRead: (n) => { total += n; },
+    });
+    expect(meta).toEqual({ agentType: null, description: null, spawnDepth: 1, toolUseId: null });
+    expect(total).toBeLessThanOrEqual(META_MAX_BYTES + 1);
+    expect(total).toBeGreaterThan(0);
+  });
+});
+
+describe("transcript handler path validation (allowedRoot)", () => {
+  const base = path.join(root, "hroot");
+  const sub = path.join(base, "subagents");
+  mkdirSync(sub, { recursive: true });
+  writeFileSync(path.join(sub, "a.jsonl"), `{"a":1}\n`);
+  writeFileSync(path.join(sub, "agent-m.meta.json"), `{"agentType":"Plan"}`);
+  const outside = path.join(root, "outside");
+  mkdirSync(outside);
+  writeFileSync(path.join(outside, "secret.jsonl"), `{"s":1}\n`);
+  symlinkSync(outside, path.join(base, "linkdir"));
+
+  const req = async (op: "readChunk" | "readMeta", args: Record<string, unknown>) => {
+    const { handleTranscriptMessage } = await import("./workers/transcript-handler.ts");
+    return handleTranscriptMessage({ id: 7, op, args });
+  };
+  const chunk = (p: string, allowedRoot: unknown) => req("readChunk", { path: p, offset: 0, maxBytes: 4096, allowedRoot });
+
+  test("accepts a plain file directly under the root and a meta dir at or below it", async () => {
+    const r = await chunk(path.join(sub, "a.jsonl"), sub);
+    expect(r.ok).toBe(true);
+    expect(r.ok && (r.result as { lines: unknown[] }).lines).toHaveLength(1);
+    expect((await req("readMeta", { dir: sub, id: "m", allowedRoot: sub })).ok).toBe(true);
+    expect((await req("readMeta", { dir: sub, id: "m", allowedRoot: base })).ok).toBe(true);
+  });
+
+  test("refuses paths outside the root, with .., through a symlinked directory, or with a bad root", async () => {
+    const refusals = [
+      await chunk(path.join(outside, "secret.jsonl"), sub),
+      await chunk(`${sub}/../../outside/secret.jsonl`, sub),
+      await chunk(path.join(base, "linkdir", "secret.jsonl"), base),
+      await chunk(path.join(sub, "a.jsonl"), "relative/root"),
+      await chunk(path.join(sub, "a.jsonl"), `${sub}/../subagents`),
+      await chunk(path.join(sub, "a.jsonl"), 42),
+      await chunk(path.join(sub, "nested", "a.jsonl"), sub),
+      await req("readMeta", { dir: outside, id: "m", allowedRoot: sub }),
+      await req("readMeta", { dir: path.join(base, "linkdir"), id: "m", allowedRoot: base }),
+      await req("readMeta", { dir: sub, id: "..", allowedRoot: sub }),
+    ];
+    for (const r of refusals) {
+      expect(r.ok).toBe(false);
+      expect(!r.ok && r.error.code).toBe("EINVAL");
+    }
   });
 });

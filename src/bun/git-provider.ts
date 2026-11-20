@@ -40,11 +40,25 @@ const GITLAB_FETCH_TIMEOUT_MS = 5_000;
 // The ssh -G fallback is correct-by-default (worst case: today's raw-host
 // behavior). An ssh config that takes longer than this to resolve isn't
 // worth waiting on — every host-dependent request queues behind it, so this
-// budget is deliberately tight rather than generous.
-const SSH_RESOLVE_TIMEOUT_MS = 750;
+// budget is bounded. The lookup is async (it never blocks the main thread),
+// so the bound only has to tolerate a busy boot; a miss is retried after
+// SSH_FAILURE_TTL_MS rather than cached for the process lifetime.
+const SSH_RESOLVE_TIMEOUT_MS = 3_000;
 
-/** The three cloud-forge hostnames `resolveApiHost` short-circuits on
- *  before ever spawning `ssh -G` — see the WHY block in `resolveApiHost`
+/** How long a FAILED `ssh -G` lookup (timeout, non-zero exit, missing binary,
+ *  unparseable output) is remembered. Successes are cached for the process
+ *  lifetime; a failure must not pin an alias to its raw host until restart. */
+const SSH_FAILURE_TTL_MS = 30_000;
+
+let apiHostNow: () => number = () => Date.now();
+
+/** Test-only: replaces the clock the failure TTL reads (null restores it). */
+export function __setApiHostClockForTest(now: (() => number) | null): void {
+  apiHostNow = now ?? (() => Date.now());
+}
+
+/** The three cloud-forge hostnames `resolveForgeApiHost` short-circuits on
+ *  before ever spawning `ssh -G` — see the WHY block in `resolveForgeApiHost`
  *  above its cloud-host guard. */
 const CLOUD_HOSTS = new Set(["github.com", "gitlab.com", "bitbucket.org"]);
 
@@ -72,7 +86,7 @@ const SSH_TRANSPORT_ALIASES = new Map<string, string>(
  *  input rather than letting them throw or silently misparse. */
 const HOSTNAME_CHARSET_RE = /^[a-z0-9.-]+$/;
 
-/** Module-level cache for `resolveApiHost`, keyed by the NORMALIZED
+/** Module-level cache for `resolveForgeApiHost`, keyed by the NORMALIZED
  *  (trimmed + lowercased) `remoteHost` argument (NTH-6 — this is what makes
  *  two different-cased spellings of the same host share one resolution) —
  *  no TTL, unlike `remoteHostsCache` above. `remoteHostsCache` is TTL'd
@@ -81,7 +95,7 @@ const HOSTNAME_CHARSET_RE = /^[a-z0-9.-]+$/;
  *  there's nothing to expire — a user hand-editing their ssh config
  *  mid-session and expecting agetor to notice without a restart isn't a
  *  supported flow. */
-const apiHostCache = new Map<string, string>();
+const apiHostCache = new Map<string, { value: string; expiresAt: number | null }>();
 
 /** Upper bound on `apiHostCache`: hosts come from remotes the user (or an
  *  agent-planted repo) names, so the map must not grow without limit. Past the
@@ -93,12 +107,15 @@ const API_HOST_CACHE_MAX = 256;
  *  one host share a single `ssh -G`. */
 const apiHostInflight = new Map<string, Promise<string>>();
 
-function rememberApiHost(normalized: string, resolved: string): string {
-  if (!apiHostCache.has(normalized) && apiHostCache.size >= API_HOST_CACHE_MAX) {
+/** Remember a resolution. `ttlMs` null is permanent (a success or a host that
+ *  never needs ssh); a number is the lifetime of a failure fallback. */
+function rememberApiHost(normalized: string, resolved: string, ttlMs: number | null = null): string {
+  if (apiHostCache.has(normalized)) apiHostCache.delete(normalized);
+  else if (apiHostCache.size >= API_HOST_CACHE_MAX) {
     const oldest = apiHostCache.keys().next().value;
     if (oldest !== undefined) apiHostCache.delete(oldest);
   }
-  apiHostCache.set(normalized, resolved);
+  apiHostCache.set(normalized, { value: resolved, expiresAt: ttlMs === null ? null : apiHostNow() + ttlMs });
   return resolved;
 }
 
@@ -119,7 +136,7 @@ function resolveWithoutSsh(normalized: string): string | null {
   return null;
 }
 
-/** Test-only escape hatch: clears `resolveApiHost`'s cache, mirroring
+/** Test-only escape hatch: clears `resolveForgeApiHost`'s cache, mirroring
  *  `__clearRemoteHostsCacheForTest` below for the same reason (deterministic,
  *  order-independent tests). */
 export function __clearApiHostCacheForTest(): void {
@@ -156,33 +173,43 @@ export function __apiHostCacheSizeForTest(): number {
  *
  * `ssh -G` runs through the async `run` (so through `coreSpawn`, because it
  * evaluates `Match exec` clauses an agent can plant) and never holds the main
- * thread. Resolves once per host for the process lifetime (bounded cache,
- * concurrent callers share one spawn), never rejects, and falls back to the
- * normalized input on any failure (missing binary, non-zero exit, timeout,
- * unparseable output). Binary overridable via `AGETOR_SSH_BIN`.
+ * thread. A successful lookup is cached for the process lifetime (bounded
+ * cache, concurrent callers share one spawn); a failure (missing binary,
+ * non-zero exit, timeout, unparseable output) falls back to the normalized
+ * input for SSH_FAILURE_TTL_MS only, so a later call retries. Never rejects. Binary overridable via `AGETOR_SSH_BIN`.
  */
-export async function resolveApiHost(remoteHost: string): Promise<string> {
+export async function resolveForgeApiHost(remoteHost: string): Promise<string> {
   const normalized = remoteHost.trim().toLowerCase();
   const cached = apiHostCache.get(normalized);
-  if (cached !== undefined) return cached;
+  if (cached !== undefined) {
+    if (cached.expiresAt === null || apiHostNow() < cached.expiresAt) return cached.value;
+    apiHostCache.delete(normalized);
+  }
   const direct = resolveWithoutSsh(normalized);
   if (direct !== null) return rememberApiHost(normalized, direct);
   const pending = apiHostInflight.get(normalized);
   if (pending) return pending;
   const task = (async () => {
     let resolved = normalized;
+    let succeeded = false;
     try {
       const res = await run(
         [process.env.AGETOR_SSH_BIN || "ssh", "-G", "--", normalized],
         undefined,
         SSH_RESOLVE_TIMEOUT_MS,
       );
-      if (res.ok) resolved = parseSshHostname(res.stdout) ?? resolved;
+      if (res.ok) {
+        const parsed = parseSshHostname(res.stdout);
+        if (parsed) {
+          resolved = parsed;
+          succeeded = true;
+        }
+      }
     } catch {
       // Missing binary, spawn error, etc. — resolved stays normalized.
     }
     resolved = SSH_TRANSPORT_ALIASES.get(resolved) ?? resolved;
-    return rememberApiHost(normalized, resolved);
+    return rememberApiHost(normalized, resolved, succeeded ? null : SSH_FAILURE_TTL_MS);
   })();
   apiHostInflight.set(normalized, task);
   try {
@@ -197,7 +224,7 @@ export async function resolveApiHost(remoteHost: string): Promise<string> {
  *  `canonicalGitHost` collapses ANY host containing "gitlab" to `gitlab.com`,
  *  a self-hosted GitLab (`gitlab.mycompany.com`) classifies as `gitlab` here
  *  too and is fully supported — its real API host is resolved separately
- *  from `ProviderRepoInfo.remoteHost` via `resolveApiHost` (see
+ *  from `ProviderRepoInfo.remoteHost` via `resolveForgeApiHost` (see
  *  `gitlabApiBase` in gitlab.ts). Bitbucket Server / Data Center likewise
  *  classifies as `bitbucket` and is then rejected by `bitbucketServerError`
  *  (bitbucket.ts), since its REST API has a different shape. */
@@ -245,9 +272,10 @@ export async function providerRemoteForDir(
     if (!parsed) continue;
     const provider = providerForHost(parsed.host);
     if (!provider) continue;
-    // Prime the per-host cache off the main thread so the sync
-    // `resolveApiHost` readers downstream (gitlab.ts, bitbucket.ts) hit it.
-    await resolveApiHost(parsed.rawHost);
+    // No pre-warm of the ssh -G cache here: every reader (gitlab.ts,
+    // bitbucket.ts, gitlabToken, bitbucketCreds, clone.ts) awaits
+    // `resolveForgeApiHost` itself, which is async and deduplicated, so a
+    // pre-warm only added a spawn (and its latency) for GitHub aliases.
     return {
       remote: name,
       info: {
@@ -372,7 +400,7 @@ export async function remoteHostsForDirs(dirs: string[]): Promise<string[]> {
  * raw remote host is `remoteHost` (null when there's no repo in scope).
  *
  * Credential resolution is scoped to the **resolved** API host
- * (`resolveApiHost(remoteHost)`), not the raw host, and the two cases get
+ * (`resolveForgeApiHost(remoteHost)`), not the raw host, and the two cases get
  * different tiers:
  *
  *   - **Cloud** (`resolved === "gitlab.com"`, or `remoteHost === null` —
@@ -394,7 +422,7 @@ export async function remoteHostsForDirs(dirs: string[]): Promise<string[]> {
  */
 export async function gitlabToken(remoteHost: string | null): Promise<string | null> {
   if (remoteHost === null) return gitlabCloudToken(null);
-  const resolved = await resolveApiHost(remoteHost);
+  const resolved = await resolveForgeApiHost(remoteHost);
   if (resolved === "gitlab.com") return gitlabCloudToken(remoteHost);
   return gitlabSelfHostedToken(remoteHost, resolved);
 }

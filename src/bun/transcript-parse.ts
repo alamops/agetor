@@ -20,18 +20,23 @@
 //     the final component, a FIFO or any non-regular file reads as "nothing");
 //   * never throws: a missing, unreadable, non-regular or truncated file reads
 //     as "nothing (more) appended".
-// A single line is not size-capped, as in the watcher today: a writer that
-// never emits a newline grows one read until EOF. The caller owns the path
-// (validated with `isPlainDirBelow` before it reaches here).
+// A single line IS size-capped (`MAX_LINE_BYTES`, 64 MB, a deliberate
+// divergence from the watcher, which would grow one read until EOF): a line
+// longer than the cap is never accumulated. Its bytes are read and discarded,
+// the offset advances past its newline, and the chunk reports it with
+// `tooLarge: true` (`ParsedLine.error === "tooLarge"` once split). A cap-sized
+// line with no newline yet (the writer is mid-line) reads as "nothing" and is
+// re-scanned, still without accumulating, on the next call. Lines at or under
+// the cap behave exactly as before. The caller owns the path (the worker
+// handler validates it against an `allowedRoot`, see workers/transcript-handler.ts).
 
-import { closeSync, read as readCb, readFile as readFileCb, readSync, statSync } from "node:fs";
+import { closeSync, read as readCb, readSync, statSync } from "node:fs";
 import { stat as statAsync } from "node:fs/promises";
 import path from "node:path";
 import { promisify } from "node:util";
 import { openReadNoFollow } from "./no-follow.ts";
 
 const readAsync = promisify(readCb);
-const readFileAsync = promisify(readFileCb);
 
 /** One `readChunk` result. `text` holds the decoded COMPLETE lines, each
  *  terminated by its `\n` (so `""` means no complete line was available);
@@ -45,6 +50,10 @@ export interface ChunkResult {
   nextOffset: number;
   eof: boolean;
   size: number;
+  /** True when the line starting at the requested offset exceeded the line
+   *  cap and was skipped: `text` is then "" and `nextOffset` is just past that
+   *  line's newline. Absent otherwise. */
+  tooLarge?: boolean;
 }
 
 /** One line of a chunk. `parsed` is the `JSON.parse` result (null for an empty
@@ -70,6 +79,13 @@ export interface TranscriptMeta {
  *  read has no cap, so a larger one degrades to the defaults here). */
 export const META_MAX_BYTES = 1024 * 1024;
 
+/** Longest single line `readChunk` accumulates. A longer line is skipped and
+ *  reported (`tooLarge`) so one planted or runaway line cannot exhaust memory. */
+export const MAX_LINE_BYTES = 64 * 1024 * 1024;
+
+/** `ParsedLine.error` for a line skipped because it exceeded the cap. */
+export const TOO_LARGE_ERROR = "tooLarge";
+
 const META_READ_STEP = 16 * 1024;
 
 function defaultMeta(): TranscriptMeta {
@@ -78,6 +94,14 @@ function defaultMeta(): TranscriptMeta {
 
 function normalizeChunkBytes(maxBytes: number): number {
   return Number.isFinite(maxBytes) ? Math.max(1, Math.floor(maxBytes)) : 1;
+}
+
+function normalizeLineCap(cap: number | undefined): number {
+  return cap !== undefined && Number.isFinite(cap) ? Math.max(1, Math.floor(cap)) : MAX_LINE_BYTES;
+}
+
+function skipped(nextOffset: number, size: number): ChunkResult {
+  return { text: "", nextOffset, eof: nextOffset >= size, size, tooLarge: true };
 }
 
 function none(offset: number, size: number): ChunkResult {
@@ -117,8 +141,14 @@ async function readRange(fd: number, start: number, end: number): Promise<Buffer
 /** Sync variant of `readChunk`. Identical semantics; used by the in-process
  *  fallback where a synchronous read is what the caller wants, and as the
  *  reference in the parity tests. */
-export function readChunkSync(filePath: string, offset: number, maxBytes: number): ChunkResult {
-  const chunkBytes = normalizeChunkBytes(maxBytes);
+export function readChunkSync(
+  filePath: string,
+  offset: number,
+  maxBytes: number,
+  maxLineBytes?: number,
+): ChunkResult {
+  const lineCap = normalizeLineCap(maxLineBytes);
+  const chunkBytes = Math.min(normalizeChunkBytes(maxBytes), lineCap);
   let st;
   try { st = statSync(filePath); } catch { return none(offset, 0); }
   if (!st.isFile() || st.size <= offset) return none(offset, st.size);
@@ -129,15 +159,24 @@ export function readChunkSync(filePath: string, offset: number, maxBytes: number
     let end = offset;
     let lastNewline = -1;
     const parts: Buffer[] = [];
+    let skipping = false;
     while (end < size) {
       const want = Math.min(size, end + chunkBytes);
       const part = readRangeSync(fd, end, want);
       if (part.length < want - end) size = end + part.length; // shrank under us
-      const nl = part.lastIndexOf(0x0a);
-      if (nl !== -1) lastNewline = end + nl;
-      parts.push(part);
+      const first = part.indexOf(0x0a);
+      if (first !== -1) {
+        if (end + first - offset > lineCap) return skipped(end + first + 1, size); // the line at `offset` is over the cap
+        lastNewline = end + part.lastIndexOf(0x0a);
+        parts.push(part);
+        end += part.length;
+        break;
+      }
       end += part.length;
-      if (lastNewline !== -1) break;
+      if (!skipping) {
+        parts.push(part);
+        if (end - offset > lineCap) { skipping = true; parts.length = 0; } // discard, never accumulate
+      }
     }
     if (lastNewline === -1) return none(offset, size);
     return assemble(parts, offset, end, lastNewline, size);
@@ -151,8 +190,14 @@ export function readChunkSync(filePath: string, offset: number, maxBytes: number
 /** Read at most ~`maxBytes` of what was appended to `filePath` since `offset`
  *  and return its complete lines. Async: the reads go through the libuv pool,
  *  so a caller on a latency-sensitive loop is not blocked by the I/O. */
-export async function readChunk(filePath: string, offset: number, maxBytes: number): Promise<ChunkResult> {
-  const chunkBytes = normalizeChunkBytes(maxBytes);
+export async function readChunk(
+  filePath: string,
+  offset: number,
+  maxBytes: number,
+  maxLineBytes?: number,
+): Promise<ChunkResult> {
+  const lineCap = normalizeLineCap(maxLineBytes);
+  const chunkBytes = Math.min(normalizeChunkBytes(maxBytes), lineCap);
   let st;
   try { st = await statAsync(filePath); } catch { return none(offset, 0); }
   if (!st.isFile() || st.size <= offset) return none(offset, st.size);
@@ -163,15 +208,24 @@ export async function readChunk(filePath: string, offset: number, maxBytes: numb
     let end = offset;
     let lastNewline = -1;
     const parts: Buffer[] = [];
+    let skipping = false;
     while (end < size) {
       const want = Math.min(size, end + chunkBytes);
       const part = await readRange(fd, end, want);
       if (part.length < want - end) size = end + part.length;
-      const nl = part.lastIndexOf(0x0a);
-      if (nl !== -1) lastNewline = end + nl;
-      parts.push(part);
+      const first = part.indexOf(0x0a);
+      if (first !== -1) {
+        if (end + first - offset > lineCap) return skipped(end + first + 1, size); // the line at `offset` is over the cap
+        lastNewline = end + part.lastIndexOf(0x0a);
+        parts.push(part);
+        end += part.length;
+        break;
+      }
       end += part.length;
-      if (lastNewline !== -1) break;
+      if (!skipping) {
+        parts.push(part);
+        if (end - offset > lineCap) { skipping = true; parts.length = 0; } // discard, never accumulate
+      }
     }
     if (lastNewline === -1) return none(offset, size);
     return assemble(parts, offset, end, lastNewline, size);
@@ -227,7 +281,7 @@ export function readMetaFileSync(dir: string, id: string): TranscriptMeta {
       const parts: Buffer[] = [];
       let pos = 0;
       for (;;) {
-        const buf = Buffer.allocUnsafe(META_READ_STEP);
+        const buf = Buffer.allocUnsafe(Math.min(META_READ_STEP, META_MAX_BYTES + 1 - pos));
         const n = readSync(fd, buf, 0, buf.length, pos);
         if (n === 0) break;
         parts.push(buf.subarray(0, n));
@@ -244,13 +298,31 @@ export function readMetaFileSync(dir: string, id: string): TranscriptMeta {
 }
 
 /** Async equivalent of `readMeta` (same tolerance as the sync variant). */
-export async function readMetaFile(dir: string, id: string): Promise<TranscriptMeta> {
+export async function readMetaFile(
+  dir: string,
+  id: string,
+  /** Test seam only: `afterOpen` runs once the file is open (a test grows the
+   *  file there), `onRead` sees each read's byte count. */
+  hooks?: { afterOpen?: () => void; onRead?: (bytes: number) => void },
+): Promise<TranscriptMeta> {
   try {
     const fd = openReadNoFollow(metaPath(dir, id), { maxBytes: META_MAX_BYTES });
     try {
-      const buf = await readFileAsync(fd);
-      if (buf.length > META_MAX_BYTES) return defaultMeta();
-      return metaFromText(buf.toString("utf8"));
+      hooks?.afterOpen?.();
+      // Bounded while reading, not only at open: a file that grows past the cap
+      // after the open is never read beyond cap + 1 bytes.
+      const parts: Buffer[] = [];
+      let pos = 0;
+      while (pos <= META_MAX_BYTES) {
+        const buf = Buffer.allocUnsafe(Math.min(META_READ_STEP, META_MAX_BYTES + 1 - pos));
+        const { bytesRead } = await readAsync(fd, buf, 0, buf.length, pos);
+        if (bytesRead === 0) break;
+        hooks?.onRead?.(bytesRead);
+        parts.push(buf.subarray(0, bytesRead));
+        pos += bytesRead;
+      }
+      if (pos > META_MAX_BYTES) return defaultMeta();
+      return metaFromText(Buffer.concat(parts).toString("utf8"));
     } finally {
       closeSync(fd);
     }

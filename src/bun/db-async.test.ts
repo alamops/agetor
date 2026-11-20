@@ -171,7 +171,80 @@ describe("facade parity, worker vs in-process", () => {
   });
 });
 
+describe("a pipeline parent keeps its steps' pending counts on every Task-returning method", () => {
+  async function pipelineFixture() {
+    const { parent, step } = fixtures();
+    const asParent: Task = { ...parent, pipelineId: randomUUID() };
+    const asStep: Task = { ...step, pipelineParentId: asParent.id };
+    inprocIds.push(asParent.id, asStep.id);
+    for (const side of [inproc, worker]) {
+      await side.tasks.insert(asParent);
+      await side.tasks.insert(asStep);
+    }
+    pendingCounts.set(asStep.id, 5);
+    pendingCounts.set(asParent.id, 1);
+    return asParent;
+  }
+
+  test("tasks.update, tasks.markSeen and a backlog write: 6 in both modes, byte-identical", async () => {
+    const parent = await pipelineFixture();
+    try {
+      const calls: Array<[string, (s: typeof inproc) => Promise<Task | null>]> = [
+        ["tasks.update", (s) => s.tasks.update(parent.id, { title: "renamed" })],
+        ["tasks.markSeen", (s) => s.tasks.markSeen(parent.id)],
+        ["backlog.add", (s) => s.backlog.add(parent.id, { text: "note" })],
+      ];
+      for (const [label, fn] of calls) {
+        const a = await fn(inproc);
+        const b = await fn(worker);
+        expect(b?.pendingInteractionCount, label).toBe(6);
+        expect(a?.pendingInteractionCount, label).toBe(6);
+        // Bytes, modulo the fields a write stamps with the clock or a fresh id.
+        const strip = (t: Task | null) => JSON.stringify({ ...t, updatedAt: 0, backlog: (t?.backlog ?? []).map((i) => ({ ...i, id: "", createdAt: 0 })) });
+        expect(strip(b), label).toBe(strip(a));
+      }
+    } finally {
+      pendingCounts.clear();
+    }
+  });
+
+  test("an idempotent overlay: the result passed through twice is unchanged", async () => {
+    const parent = await pipelineFixture();
+    try {
+      const once = await worker.tasks.markSeen(parent.id);
+      const again = await worker.tasks.get(parent.id);
+      expect(once!.pendingInteractionCount).toBe(6);
+      expect(again!.pendingInteractionCount).toBe(6);
+    } finally {
+      pendingCounts.clear();
+    }
+  });
+});
+
 describe("facade shape", () => {
+  test("a facade module is never probed into an RPC by JSON.stringify, inspect or coercion", async () => {
+    const calls: string[] = [];
+    const spy = {
+      mode: "inprocess" as const,
+      onRevChanged: () => () => {},
+      currentRev: () => 0,
+      dbReady: async () => {},
+      closeDb: async () => {},
+      op: async () => { throw new Error("no ops here"); },
+      call: async (m: string, method: string) => { calls.push(`${m}.${method}`); return null; },
+    };
+    const facade = am.createDbAsync(() => spy as never);
+    const mod = facade.tasks as unknown as Record<PropertyKey, unknown>;
+    for (const key of ["toJSON", "then", "constructor", "inspect", Symbol.for("nodejs.util.inspect.custom"), Symbol.toPrimitive, Symbol.iterator, Symbol.toStringTag]) {
+      expect(mod[key], String(key)).toBeUndefined();
+    }
+    expect(JSON.stringify(facade.tasks)).toBe("{}");
+    expect(typeof Bun.inspect(facade.tasks)).toBe("string");
+    expect(String(`${Object.prototype.toString.call(facade.tasks)}`)).toContain("object");
+    await Promise.resolve(facade.tasks);
+    expect(calls).toEqual([]);
+  });
+
   test("types: tasks.get is Promise<Task | null>, tasks.list is Promise<Task[]>", async () => {
     const get: Promise<Task | null> = worker.tasks.get("x");
     const list: Promise<Task[]> = worker.tasks.list();

@@ -27,12 +27,12 @@ import type {
 import { GIT_HOST_TOKENS_SECTION } from "../shared/types.ts";
 import { contentTypeForPreviewPath, MAX_BLOB_PREVIEW_BYTES } from "../shared/attachments.ts";
 import { MAX_DIFF_FILES, parseGitDiff } from "./git-diff.ts";
-import { gitlabToken, resolveApiHost } from "./git-provider.ts";
+import { gitlabToken, resolveForgeApiHost } from "./git-provider.ts";
 
 /**
  * GitLab adapter (T2, docs/plans/multi-provider-git-modal.md §4) — gitlab.com
  * as well as self-hosted instances, both addressed via
- * `resolveApiHost`-derived `https://<host>/api/v4` (see
+ * `resolveForgeApiHost`-derived `https://<host>/api/v4` (see
  * docs/plans/per-host-git-api-bases.md). Mirrors `src/bun/github.ts`'s
  * conventions closely enough that the facade (`git-host.ts`, T4) can dispatch
  * to either module transparently: same `{ok:true}&Result | {ok:false,error}`
@@ -65,13 +65,13 @@ const GITLAB_DIFF_BODY_CAP_BYTES = 8_000_000;
  *  `repo.remoteHost` is the raw host from the git remote — often an
  *  `~/.ssh/config` alias used to pin a per-identity SSH key (see
  *  git-provider.ts's module doc comment), not necessarily the provider's
- *  actual hostname. `resolveApiHost` (git-provider.ts) resolves that alias
+ *  actual hostname. `resolveForgeApiHost` (git-provider.ts) resolves that alias
  *  to its configured `HostName` via `ssh -G` (falling back to the input
  *  verbatim on any failure), so a multi-identity alias whose HostName is
  *  gitlab.com round-trips to gitlab.com, while a genuine self-hosted domain
  *  (`gitlab.mycompany.com`, no matching alias) round-trips to itself. */
 async function gitlabHost(repo: ProviderRepoInfo): Promise<string> {
-  return resolveApiHost(repo.remoteHost);
+  return resolveForgeApiHost(repo.remoteHost);
 }
 
 /** `https://<host>/api/v4` for `repo`'s real GitLab host (see `gitlabHost`).
@@ -81,7 +81,7 @@ async function gitlabHost(repo: ProviderRepoInfo): Promise<string> {
  *  self-hosted domain, it targets that instance's own `/api/v4`, which is
  *  what makes self-hosted GitLab work at all. Called once per exported
  *  function (every call site has `repo` in scope) rather than memoized here —
- *  `resolveApiHost` already caches the ssh resolution itself. */
+ *  `resolveForgeApiHost` already caches the ssh resolution itself. */
 async function gitlabApiBase(repo: ProviderRepoInfo): Promise<string> {
   return `https://${await gitlabHost(repo)}/api/v4`;
 }

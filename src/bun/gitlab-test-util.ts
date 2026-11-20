@@ -54,9 +54,9 @@ export function sampleSelfHostedRepo(selfHostedHost = "gitlab.mycompany.com", ov
 const createdSshStubDirs: string[] = [];
 
 /** Writes an executable stub standing in for `ssh`, for pointing
- *  `AGETOR_SSH_BIN` (git-provider.ts's `resolveApiHost` override) at
+ *  `AGETOR_SSH_BIN` (git-provider.ts's `resolveForgeApiHost` override) at
  *  deterministic, network-free hostname resolution — mirrors
- *  git-provider.test.ts's own `writeSshStub`. `resolveApiHost` invokes it
+ *  git-provider.test.ts's own `writeSshStub`. `resolveForgeApiHost` invokes it
  *  as `<stub> -G -- <host>`, so `$3` is the (lowercased, trimmed) host
  *  argument when a stub cares to inspect it. Each call gets its own
  *  throwaway mkdtemp dir under the OS tmp root; the dir is tracked

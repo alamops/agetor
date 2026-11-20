@@ -15,7 +15,7 @@ export type { OpCtx, OpDef };
 //   2. Spread that record into `ops` below. The registry's type is the contract
 //      callers see: `op("<area>.<verb>", [...args])` is checked against it.
 //   3. Args and the result must be structured-clone safe (plain data, Set, Map).
-// `tx: true` wraps `run` in `conn.transaction(...)`, so a throw rolls back every
+// `tx: true` wraps `run` in `conn.transaction(...).immediate()` (BEGIN IMMEDIATE), so a throw rolls back every
 // write the op made. An op never imports `db.ts` or any main-thread registry.
 
 export const ops = {
@@ -41,5 +41,8 @@ export function findOp(name: string): OpDef<unknown[], unknown> | null {
 /** Run an op against a context, in a transaction when it declares one. */
 export function runOp(def: OpDef<unknown[], unknown>, ctx: OpCtx, args: unknown[]): unknown {
   if (!def.tx) return def.run(ctx, ...args);
-  return ctx.conn.transaction(() => def.run(ctx, ...args))();
+  // BEGIN IMMEDIATE: an op reads then writes, and a deferred transaction that
+  // upgrades on a stale snapshot fails with SQLITE_BUSY_SNAPSHOT at once
+  // instead of waiting on busy_timeout.
+  return ctx.conn.transaction(() => def.run(ctx, ...args)).immediate();
 }

@@ -58,7 +58,7 @@ beforeEach(() => {
     savedEnv[key] = process.env[key];
     delete process.env[key];
   }
-  // See git-provider.test.ts: resolveApiHost's cache is keyed by raw
+  // See git-provider.test.ts: resolveForgeApiHost's cache is keyed by raw
   // remoteHost, so without clearing it a host string reused across tests
   // could read a stale resolution from an earlier test's AGETOR_SSH_BIN stub.
   __clearApiHostCacheForTest();
@@ -84,7 +84,7 @@ afterAll(() => {
 /** Writes an executable ssh stub (see git-provider.test.ts's own
  *  `writeSshStub`) whose `-G -- <host>` resolution follows a small alias
  *  table, echoing any other host back unchanged (real ssh's behavior for a
- *  host with no matching `~/.ssh/config` entry). `resolveApiHost` invokes
+ *  host with no matching `~/.ssh/config` entry). `resolveForgeApiHost` invokes
  *  it as `<stub> -G -- <host>`, so `$3` is the (already lowercased) host. */
 function writeAliasSshStub(): string {
   const dir = mkdtempSync(path.join(tmpdir(), "agetor-clone-ssh-stub-"));
@@ -1220,7 +1220,7 @@ describe("cloneAuthHeader", () => {
   });
 
   test("gitlab: stored token becomes oauth2:<tok>", async () => {
-    // gitlab.com is a CLOUD_HOSTS short-circuit in resolveApiHost, so no
+    // gitlab.com is a CLOUD_HOSTS short-circuit in resolveForgeApiHost, so no
     // AGETOR_SSH_BIN stub is needed for this case.
     setGitHubToken("gitlab.com", "gl-tok-1");
     const header = await cloneAuthHeader("gitlab", "gitlab.com");
@@ -1266,7 +1266,7 @@ describe("cloneAuthHeader", () => {
     const originalPath = process.env.PATH;
     process.env.PATH = `${shadowDir}:${originalPath}`;
     try {
-      // gitlab.com short-circuits resolveApiHost before any ssh spawn, so
+      // gitlab.com short-circuits resolveForgeApiHost before any ssh spawn, so
       // no AGETOR_SSH_BIN stub is needed here either.
       const header = await cloneAuthHeader("gitlab", "gitlab.com");
       expect(header).toBeNull();

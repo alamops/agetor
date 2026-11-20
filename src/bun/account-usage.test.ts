@@ -1,4 +1,4 @@
-import { beforeAll, expect, test } from "bun:test";
+import { afterAll, beforeAll, expect, test } from "bun:test";
 import { appendFileSync, mkdirSync, mkdtempSync, rmSync, symlinkSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import path from "node:path";
@@ -7,6 +7,12 @@ import path from "node:path";
 // which opens + migrates on module load).
 const DATA_DIR = mkdtempSync(path.join(tmpdir(), "agetor-usage-data-"));
 process.env.AGETOR_DATA_DIR = DATA_DIR;
+
+// Every fixture dir (some hold 11 MB files) is removed when the file ends.
+const fixtureDirs: string[] = [];
+afterAll(() => {
+  for (const d of fixtureDirs) rmSync(d, { recursive: true, force: true });
+});
 
 let mod: typeof import("./account-usage.ts");
 beforeAll(async () => {
@@ -44,6 +50,7 @@ function assistantLine(opts: {
 
 function makeAccount(): { configDir: string; file: string } {
   const configDir = mkdtempSync(path.join(tmpdir(), "agetor-usage-acct-"));
+  fixtureDirs.push(configDir);
   const proj = path.join(configDir, "projects", "-home-u-repo");
   mkdirSync(proj, { recursive: true });
   return { configDir, file: path.join(proj, "session-1.jsonl") };
@@ -177,6 +184,7 @@ test("subdirectories (subagent transcripts) are included in the scan", async () 
 
 test("a missing projects dir is a clean no-op", async () => {
   const configDir = mkdtempSync(path.join(tmpdir(), "agetor-usage-empty-"));
+  fixtureDirs.push(configDir);
   const result = await mod.scanAccountUsage(configDir);
   expect(result).toEqual({ filesScanned: 0, eventsCounted: 0, parseErrors: 0, budgetExhausted: false });
 });
@@ -237,9 +245,38 @@ test("a budget smaller than a big file resumes across passes without gaps or dou
   expect(counted).toBe(200);
 });
 
+test("a line larger than the pass budget is skipped once, persisted across passes, and later files are still scanned", async () => {
+  const { configDir, file } = makeAccount();
+  const budget = 64 * 1024;
+  const before = [assistantLine({ id: "ov-a" }), assistantLine({ id: "ov-b" })];
+  const after = Array.from({ length: 5 }, (_, i) => assistantLine({ id: `ov-after-${i}` }));
+  // One 300 KB line with no structure, several budgets long.
+  const huge = "x".repeat(300 * 1024) + "\n";
+  writeFileSync(file, before.join("") + huge + after.join(""));
+  const second = path.join(path.dirname(file), "session-2.jsonl");
+  writeFileSync(second, assistantLine({ id: "ov-second" }));
+
+  let counted = 0;
+  let parseErrors = 0;
+  let passes = 0;
+  for (; passes < 60; passes++) {
+    const r = await mod.scanAccountUsage(configDir, budget);
+    counted += r.eventsCounted;
+    parseErrors += r.parseErrors;
+    if (!r.budgetExhausted) break;
+  }
+  expect(passes).toBeLessThan(60);
+  // 2 before + 5 after + the second file; the oversized line is one error.
+  expect(counted).toBe(8);
+  expect(parseErrors).toBe(1);
+  // Converged: nothing is re-read or re-counted.
+  expect(await mod.scanAccountUsage(configDir, budget)).toMatchObject({ eventsCounted: 0, parseErrors: 0 });
+});
+
 test("a projects/ folder swapped for a symlink is never listed", async () => {
   const configDir = mkdtempSync(path.join(tmpdir(), "agetor-usage-acct-"));
   const elsewhere = mkdtempSync(path.join(tmpdir(), "agetor-usage-target-"));
+  fixtureDirs.push(configDir, elsewhere);
   const proj = path.join(elsewhere, "-home-u-repo");
   mkdirSync(proj, { recursive: true });
   writeFileSync(path.join(proj, "session-1.jsonl"), assistantLine({ id: "linked-m1" }));

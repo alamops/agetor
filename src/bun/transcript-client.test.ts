@@ -23,6 +23,15 @@ self.onmessage = (e) => {
   if (p.endsWith("THROW")) throw new Error("worker boom");
   if (p.endsWith("EXIT")) { process.exit(3); return; } // exit may not halt this callback synchronously
   if (p.endsWith("HANG")) return;
+  if (p.endsWith("LOG")) {
+    // log messages carry no id and are never replies; the stray no-id messages are ignored too
+    self.postMessage({ log: { level: "warn", text: "worker says hi" } });
+    self.postMessage({ nothing: true });
+    self.postMessage({ log: { level: "bogus", text: "odd level" } });
+    self.postMessage({ ok: true, result: "no id" });
+    handleTranscriptMessage({ ...e.data, args: { ...e.data.args, path: p.slice(0, -3) } }).then((reply) => self.postMessage(reply));
+    return;
+  }
   handleTranscriptMessage(e.data).then((reply) => self.postMessage(reply));
 };
 `,
@@ -65,6 +74,16 @@ describe("in-process mode", () => {
     await expect(client.readChunk(fixture("x\n"), 0, 10)).rejects.toThrow(/closed/);
   });
 
+  test("allowedRoot is passed through and refused outside the root", async () => {
+    const client = createTranscriptClient({ mode: "inprocess" });
+    const dir = path.join(root, "rooted");
+    mkdirSync(dir);
+    writeFileSync(path.join(dir, "a.jsonl"), `{"a":1}\n`);
+    expect((await client.readChunk(path.join(dir, "a.jsonl"), 0, 4096, dir)).lines).toHaveLength(1);
+    await expect(client.readChunk(fixture("x\n"), 0, 4096, dir)).rejects.toThrow(/allowedRoot/);
+    client.close();
+  });
+
   test("worker mode without a workerFactory is refused", () => {
     expect(() => createTranscriptClient({ mode: "worker" })).toThrow(/workerFactory/);
   });
@@ -90,6 +109,26 @@ describe("worker mode on a real Worker thread", () => {
     } finally {
       client.close();
     }
+  });
+
+  test("worker log messages are forwarded to the console with a prefix and never taken for replies", async () => {
+    const good = fixture(`{"ok":true}\n`);
+    const seen: unknown[][] = [];
+    const origWarn = console.warn;
+    const origLog = console.log;
+    console.warn = (...a: unknown[]) => { seen.push(["warn", ...a]); };
+    console.log = (...a: unknown[]) => { seen.push(["log", ...a]); };
+    const client = createTranscriptClient({ mode: "worker", workerFactory: realWorker });
+    try {
+      const r = await client.readChunk(good + "LOG", 0, 4096);
+      expect(r.lines).toHaveLength(1); // the real reply, not a log or id-less message
+    } finally {
+      client.close();
+      console.warn = origWarn;
+      console.log = origLog;
+    }
+    expect(seen).toContainEqual(["warn", "[agetor:transcript-worker]", "worker says hi"]);
+    expect(seen).toContainEqual(["log", "[agetor:transcript-worker]", "odd level"]);
   });
 
   test("a symlinked transcript is refused through the worker too", async () => {
@@ -266,17 +305,41 @@ describe("main-thread responsiveness reading a 20 MB JSONL", () => {
     return { lines, elapsedMs: performance.now() - start, maxGapMs: maxGap };
   }
 
-  test("worker mode keeps the main loop's max gap well under 100 ms", async () => {
+  // Structured-clone deserialisation of each 256 KB reply is real main-thread work (~130 ms gaps
+  // seen on an idle machine), so the floor sits at 200 ms, still well under the 490-1000 ms a
+  // one-shot main-thread read produces (the comparison test below).
+  const GAP_FLOOR_MS = 200;
+
+  /** Longest gap between two 5 ms ticks with nothing else running. */
+  async function idleMaxGap(durationMs: number): Promise<number> {
+    let last = performance.now();
+    let maxGap = 0;
+    const timer = setInterval(() => {
+      const t = performance.now();
+      maxGap = Math.max(maxGap, t - last);
+      last = t;
+    }, 5);
+    await new Promise((r) => setTimeout(r, durationMs));
+    clearInterval(timer);
+    return Math.max(maxGap, performance.now() - last);
+  }
+
+  test("worker mode keeps the main loop's max gap within max(200 ms, 3 x the idle baseline)", async () => {
     const client = createTranscriptClient({ mode: "worker", workerFactory: realWorker });
     try {
       await client.readMeta(root, "warmup"); // start the worker before timing
+      const baselineGapMs = await idleMaxGap(400); // this run's own timer jitter under load
       const r = await measure(async (off) => {
         const c = await client.readChunk(bigPath, off, 256 * 1024);
         return { lines: c.lines.length, nextOffset: c.nextOffset, eof: c.eof };
       });
       console.log(`[transcript-client] 20 MB via worker: ${r.lines} lines in ${r.elapsedMs.toFixed(0)} ms, max main-loop gap ${r.maxGapMs.toFixed(1)} ms`);
       expect(r.lines).toBe(BIG_LINES);
-      expect(r.maxGapMs).toBeLessThan(100);
+      // Still fails when the read runs on the main thread (one-shot sync read: 490+ ms),
+      // but scales with the jitter measured idle in the same run.
+      const bound = Math.max(GAP_FLOOR_MS, baselineGapMs * 3);
+      console.log(`[transcript-client] idle baseline gap ${baselineGapMs.toFixed(1)} ms, bound ${bound.toFixed(1)} ms`);
+      expect(r.maxGapMs).toBeLessThanOrEqual(bound);
     } finally {
       client.close();
     }

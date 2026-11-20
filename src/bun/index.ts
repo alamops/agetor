@@ -9,6 +9,11 @@ import Electrobun, { ApplicationMenu, BrowserWindow, Screen, Updater, Utils } fr
 import { rehydratePath } from "./login-path.ts";
 import { startApiServer, API_PORT, API_TOKEN, type ApiNative } from "./server.ts";
 import { CLI_TOKEN, DEFAULT_API_HOST, resolveApiHost } from "./api-config.ts";
+import { installCoreLog, registerLogSecret } from "./core-log.ts";
+import { setTaskDecorations } from "./db-async.ts";
+import { awaitDbReady, createQuitSequencer, runQuitSequence } from "./boot-db.ts";
+import { countPendingForTask, pendingCountsByTask } from "./interactions.ts";
+import { countTerminals, terminalCountsByTask } from "./terminals.ts";
 import { db, harnesses, pidFilePath, tasks, dataDir, preferences } from "./db.ts";
 import {
   freezeLaunches,
@@ -84,6 +89,21 @@ import { createTaskNotifier } from "./task-notifier.ts";
 import { installNotificationRemovalHooks } from "./notification-hooks.ts";
 import { setPendingOpenTask } from "./pending-open.ts";
 import pkg from "../../package.json" with { type: "json" };
+
+// First statement of the module body (static imports have run, so the channel
+// default data dir is set): console output from here on is teed to
+// <dataDir>/logs/core.log. Both tokens are registered so no line carries them.
+installCoreLog();
+registerLogSecret(API_TOKEN);
+registerLogSecret(CLI_TOKEN);
+// Worker-mode Task results carry the same badge counts the main-thread
+// connection computes (lazy: these registries live in other modules).
+setTaskDecorations({
+  countPendingForTask: (taskId) => countPendingForTask(taskId),
+  countTerminals: (taskId) => countTerminals(taskId),
+  pendingCountsByTask: () => pendingCountsByTask(),
+  terminalCountsByTask: () => terminalCountsByTask(),
+});
 
 /** Drop a pid file in the data dir so out-of-process tools (notably
  *  `bun run wipe:dev`) can tell whether an agetor instance is using this
@@ -402,6 +422,12 @@ async function confirmKeepOff(): Promise<boolean> {
 // probes against agetor's tmux socket, and the first tmux command to touch
 // a socket auto-starts its server — un-disclaimed, if ensureDisclaimedServer()
 // didn't run first — leaving every session that server ever hosts un-disclaimed too.
+// The db worker opens the database and runs migrations while the rest of boot
+// proceeds; the gate stays shut until it is ready (awaited before
+// reconcileOrphans below). /health and /info answer meanwhile. A failure is
+// logged and retried with a capped backoff, never skipped.
+const dbBoot = awaitDbReady();
+
 /** A boot restore that throws must not leave a bound server whose routes wait
  *  forever on a ready signal that never comes. */
 function failBoot(err: unknown): never {
@@ -429,6 +455,7 @@ try {
   // adopted after the port bind (this process is the owner) and before the
   // reconcile, whose reattach of a `server=agetor` run needs the adopted server.
   await adoptOpencodeServers();
+  await dbBoot;
   await reconcileOrphans();
 
   // M16: reconcile every pipeline parent whose `pipelineRun` was left mid-flight
@@ -645,6 +672,46 @@ const quitLaunchGate = createQuitLaunchGate({
   timeoutMs: HANDOFF_LAUNCH_SETTLE_MS,
   log: (m) => console.log(m),
 });
+// The quit effects read the decision of the pass that starts the sequence, so
+// the handler records it before its first `allowQuit` call.
+let quitDecision = { completely: false, stopSupervisor: false, backgroundArmed: false };
+const quitSequencer = createQuitSequencer({
+  run: () =>
+    runQuitSequence({
+      // Every effect is synchronous today; the sequence awaits whatever one
+      // returns, so an effect that becomes async (a db-async write) is awaited
+      // here before the worker is closed.
+      effects: () => {
+        const { completely, stopSupervisor, backgroundArmed } = quitDecision;
+        // Only when a supervisor is alive to read it (`stopSupervisor`): a request
+        // written with none running would otherwise linger for the next supervisor
+        // to start (the background turned on later, or the next login).
+        // takeSupervisorStop also ignores a stale request, as a second line of
+        // defense. The supervisor would otherwise take the port back when this
+        // process dies; this asks it to stay down until the next login (D6).
+        if (stopSupervisor) {
+          try {
+            requestSupervisorStop(dataDir);
+          } catch (err) {
+            console.warn("[agetor] failed to write the supervisor stop request:", err);
+          }
+        }
+        // A real quit (the background host is not taking over) stops the OpenCode
+        // servers nothing is using; a hand-over to the background core leaves them
+        // running for it to adopt.
+        try {
+          stopOpencodeServersOnQuit({ completely, backgroundArmed });
+        } catch (err) {
+          console.warn("[agetor] stopping idle OpenCode servers on quit failed:", err);
+        }
+        removeCoreCreds(dataDir);
+      },
+    }),
+  requeue: ({ completely }) => {
+    armForceQuit({ completely });
+    Utils.quit();
+  },
+});
 Electrobun.events.on("before-quit", (event: { response?: { allow: boolean } }) => {
   // Background host armed = a live login-item supervisor is parked under this
   // app, or waiting out a grace window to start. Read synchronously from its
@@ -691,30 +758,17 @@ Electrobun.events.on("before-quit", (event: { response?: { allow: boolean } }) =
     event.response = { allow: false };
     return;
   }
-  // Only when a supervisor is alive to read it (`stopSupervisor`): a request
-  // written with none running would otherwise linger for the next supervisor
-  // to start (the background turned on later, or the next login).
-  // takeSupervisorStop also ignores a stale request, as a second line of
-  // defense. The supervisor would otherwise take the port back when this
-  // process dies; this asks it to stay down until the next login (D6).
-  if (decision.stopSupervisor) {
-    try {
-      requestSupervisorStop(dataDir);
-    } catch (err) {
-      console.warn("[agetor] failed to write the supervisor stop request:", err);
-    }
-  }
-  // A real quit (the background host is not taking over) stops the OpenCode
-  // servers nothing is using; a hand-over to the background core leaves them
-  // running for it to adopt. Synchronous on purpose: Electrobun's quit() runs a
-  // forced exit right after this hook returns, so nothing here may await.
-  try {
-    stopOpencodeServersOnQuit({ completely: decision.completely, backgroundArmed });
-  } catch (err) {
-    console.warn("[agetor] stopping idle OpenCode servers on quit failed:", err);
-  }
-  removeCoreCreds(dataDir);
-  event.response = { allow: true };
+  // This hook is synchronous (Electrobun forces the exit as soon as it
+  // returns), so the first allowed pass vetoes the quit, runs the quit effects
+  // (which may touch the database) and only then drains core.log and closes the
+  // db worker, all bounded, and re-issues the quit. The second pass finds the
+  // sequence done, allows at once and applies nothing again.
+  quitDecision = {
+    completely: decision.completely,
+    stopSupervisor: decision.stopSupervisor,
+    backgroundArmed,
+  };
+  event.response = { allow: quitSequencer.allowQuit(decision.completely) };
 });
 
 // Stop the fx auto-resume engine's in-memory timers on the way out (Phase 8

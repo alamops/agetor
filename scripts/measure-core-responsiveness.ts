@@ -28,14 +28,40 @@
 //                event loop for 1.5 s once mid-run: max /health latency must
 //                then be at least 1.4 s, which proves the probe sees a stall
 //   --cleanup    delete the bench dir afterwards (default keeps it)
-//   --data-dir   override the bench dir (must not be under ~/.agetor)
+//   --data-dir   override the bench dir (must not exist or be empty; never under, over or equal to ~/.agetor, $HOME or ~/.agetor-dev)
 //
-// Safety: nothing under the real ~/.agetor is ever read or written. The target
-// dir is checked before anything is created. The source DB is only opened
-// read-only, through `sqlite3 -readonly … .backup`, never `cp` (which would
-// break WAL consistency). A Ctrl-C mid-run still stops the child core.
+// Safety: nothing under the real ~/.agetor is ever read or written, and the
+// script never deletes or seeds anything it did not create. Every refusal below
+// happens before the first write and exits 2:
+//   - the target is inside, equal to, or CONTAINS ~/.agetor;
+//   - the target is $HOME (or an ancestor of it), ~/.agetor-dev itself, or an
+//     ancestor of it;
+//   - --data-dir points at an existing non-empty directory (or a file).
+// --cleanup removes only what this run created: the whole bench dir when the
+// script created it, otherwise just the children it added to a pre-existing
+// EMPTY --data-dir. The source DB is only opened read-only, through
+// `sqlite3 -readonly … .backup`, never `cp` (which would break WAL consistency).
+// A Ctrl-C mid-run still stops the child core.
+//
+// Isolation (the benchmark core must not touch the machine it runs on):
+//   - HOME is a sandbox dir inside the bench dir (<bench>/home), TMPDIR and the
+//     agent config homes (CLAUDE_CONFIG_DIR, CODEX_HOME, COPILOT_HOME, XDG_*)
+//     live there too, so no real credentials, OAuth tokens or sessions exist;
+//   - PATH is only <bench>/fakebin, bun's own directory, /usr/bin and /bin.
+//     fakebin holds a `security` stub (the Claude usage poller reads its OAuth
+//     token with `security find-generic-password`; the stub always fails, and
+//     the sandbox HOME has no keychain either), a `tmux` stub (has-session
+//     always fails, so nothing reattaches) and one stub per agent kind;
+//   - AGETOR_<KIND>_DRIVER=fake and AGETOR_<KIND>_BIN=<stub> for every kind,
+//     AGETOR_HARNESS_AUTO_ENABLE=0, AGETOR_COPILOT_ACP_PROBE=0;
+//   - with --source the COPY (never the source) is sanitized before boot:
+//     `running` runs become `orphaned` (tmux_session cleared, ended_at set),
+//     tasks in column `running` move to `ready`, non-builtin harnesses are
+//     disabled. The summary prints the row counts changed.
+// No production seam exists to switch the pollers off; the sandbox HOME, the
+// `security` stub and the stubbed/fake agents are what contain them.
 
-import { existsSync, mkdirSync, realpathSync, rmSync, statSync } from "node:fs";
+import { chmodSync, existsSync, mkdirSync, readdirSync, realpathSync, rmSync, statSync, writeFileSync } from "node:fs";
 import { homedir } from "node:os";
 import path from "node:path";
 import type { Subprocess } from "bun";
@@ -137,14 +163,32 @@ function realpathLoose(p: string): string {
 }
 
 const opts = parseArgs(process.argv.slice(2));
-const HOME = homedir();
+// HOME env wins so a test can stand in a temp dir for the real home.
+const HOME = realpathLoose(process.env.HOME || homedir());
 const REAL_DIR = realpathLoose(path.join(HOME, ".agetor"));
-const BENCH_BASE = path.join(HOME, ".agetor-dev");
+const BENCH_BASE = realpathLoose(path.join(HOME, ".agetor-dev"));
 const stamp = new Date().toISOString().replace(/[-:]/g, "").replace(/\..+/, "");
 const targetDir = realpathLoose(opts.dataDir ?? path.join(BENCH_BASE, `bench-${stamp}`));
 
 if (isInsideOrEqual(REAL_DIR, targetDir)) {
   fail(`refusing: ${targetDir} is inside the real data dir ${REAL_DIR}`);
+}
+if (isInsideOrEqual(targetDir, REAL_DIR)) {
+  fail(`refusing: ${targetDir} contains the real data dir ${REAL_DIR}`);
+}
+if (isInsideOrEqual(targetDir, HOME)) {
+  fail(`refusing: ${targetDir} is the home directory or an ancestor of it`);
+}
+if (isInsideOrEqual(targetDir, BENCH_BASE)) {
+  fail(`refusing: ${targetDir} is the bench base dir ${BENCH_BASE} or an ancestor of it`);
+}
+/** True when the script itself creates the target dir (it did not exist). */
+let createdTarget = true;
+if (existsSync(targetDir)) {
+  const st = statSync(targetDir);
+  if (!st.isDirectory()) fail(`refusing: ${targetDir} exists and is not a directory`);
+  if (readdirSync(targetDir).length > 0) fail(`refusing: ${targetDir} already exists and is not empty`);
+  createdTarget = false;
 }
 if (/'/.test(targetDir)) fail("refusing: the data dir path contains a single quote");
 let sourcePath: string | null = null;
@@ -162,6 +206,9 @@ if (opts.source) {
 const REPO_ROOT = path.resolve(import.meta.dir, "..");
 const TOKEN = crypto.randomUUID() + crypto.randomUUID();
 const BASE = `http://127.0.0.1:${opts.port}`;
+const SANDBOX_HOME = path.join(targetDir, "home");
+const FAKE_BIN = path.join(targetDir, "fakebin");
+const AGENT_KINDS = ["CLAUDE", "CODEX", "CURSOR", "GEMINI", "FX", "ANTIGRAVITY", "COPILOT", "OPENCODE"] as const;
 const AUTH = { Authorization: `Bearer ${TOKEN}` };
 
 interface Core {
@@ -171,29 +218,77 @@ interface Core {
 let core: Core | null = null;
 let tearingDown = false;
 
+/** Stub agent CLI: answers --version/--help well enough to pass every identity
+ *  gate (copilot wants "GitHub Copilot CLI", fx wants "coding agent"), refuses
+ *  everything else, so no model list, login probe or prompt ever succeeds. */
+const STUB_AGENT = `#!/bin/sh
+case "$1" in
+  --version|-v|version) echo "99.0.0 GitHub Copilot CLI (agetor-bench stub)"; exit 0 ;;
+  --help|-h|help) echo "agetor-bench stub: coding agent"; exit 0 ;;
+esac
+exit 1
+`;
+const STUB_TMUX = `#!/bin/sh
+# agetor-bench stub: every session lookup fails, so nothing is ever reattached.
+case "$1" in -V) echo "tmux 3.4"; exit 0 ;; esac
+exit 1
+`;
+const STUB_SECURITY = `#!/bin/sh
+# agetor-bench stub: no keychain item is ever found (exit 44 = item not found).
+exit 44
+`;
+
+function writeStub(name: string, body: string): string {
+  const f = path.join(FAKE_BIN, name);
+  writeFileSync(f, body);
+  chmodSync(f, 0o755);
+  return f;
+}
+
+function sandboxEnv(): Record<string, string> {
+  mkdirSync(SANDBOX_HOME, { recursive: true });
+  mkdirSync(path.join(targetDir, "tmp"), { recursive: true });
+  mkdirSync(FAKE_BIN, { recursive: true });
+  const env: Record<string, string> = {
+    PATH: [FAKE_BIN, path.dirname(process.execPath), "/usr/bin", "/bin"].join(":"),
+    HOME: SANDBOX_HOME,
+    TMPDIR: path.join(targetDir, "tmp"),
+    LANG: process.env.LANG ?? "en_US.UTF-8",
+    CLAUDE_CONFIG_DIR: path.join(SANDBOX_HOME, ".claude"),
+    CODEX_HOME: path.join(SANDBOX_HOME, ".codex"),
+    COPILOT_HOME: path.join(SANDBOX_HOME, ".copilot"),
+    XDG_CONFIG_HOME: path.join(SANDBOX_HOME, ".config"),
+    XDG_DATA_HOME: path.join(SANDBOX_HOME, ".local", "share"),
+    XDG_CACHE_HOME: path.join(SANDBOX_HOME, ".cache"),
+    AGETOR_COPILOT_ACP_PROBE: "0",
+    AGETOR_TMUX_BIN: writeStub("tmux", STUB_TMUX),
+  };
+  writeStub("security", STUB_SECURITY);
+  const agentStub = writeStub("agent-stub", STUB_AGENT);
+  for (const k of AGENT_KINDS) {
+    env[`AGETOR_${k}_DRIVER`] = "fake";
+    env[`AGETOR_${k}_BIN`] = agentStub;
+    env[`AGETOR_${k}_ARGS`] = "";
+  }
+  return env;
+}
+
 function startCore(): Core {
   // An explicit env: nothing of the caller's AGETOR_* (the real master token
   // included) leaks in, and the token below is random and used for this run only.
   const env: Record<string, string> = {
-    PATH: process.env.PATH ?? "/usr/bin:/bin",
-    HOME,
-    TMPDIR: process.env.TMPDIR ?? "/tmp",
-    LANG: process.env.LANG ?? "en_US.UTF-8",
+    ...sandboxEnv(),
     AGETOR_DATA_DIR: targetDir,
     AGETOR_API_PORT: String(opts.port),
     AGETOR_API_TOKEN: TOKEN,
     AGETOR_DAEMON_IDLE_MS: "0",
     AGETOR_HEADLESS_NOTIFICATIONS: "0",
     AGETOR_HARNESS_AUTO_ENABLE: "0",
-    AGETOR_CLAUDE_DRIVER: "fake",
-    AGETOR_CLAUDE_BIN: "/bin/echo",
-    AGETOR_CLAUDE_ARGS: "",
-    AGETOR_TMUX_BIN: "/bin/echo",
     AGETOR_LAG_MONITOR: "1",
     AGETOR_CORE_LOG: "1",
     ...(opts.calibrate ? { AGETOR_TEST_BLOCK_ROUTE: "1" } : {}),
   };
-  const proc = Bun.spawn(["bun", "src/bun/headless.ts"], {
+  const proc = Bun.spawn([process.execPath, "src/bun/headless.ts"], {
     cwd: REPO_ROOT,
     env,
     stdin: "ignore",
@@ -354,6 +449,40 @@ function copySource(src: string, dest: string): void {
   sqlite(["-readonly", src, `.backup '${dest}'`]);
 }
 
+/** Sanitize the COPY so booting it cannot touch the user's live work: running
+ *  runs become orphaned (no tmux session to reattach), their tasks go back to
+ *  ready, user-defined harnesses are disabled. Plain SQL on the copy only. */
+function sanitizeCopy(dbFile: string): string[] {
+  const cols = (table: string): string[] => {
+    // The copy is ours and may be in WAL mode, so no -readonly here; an error
+    // must surface, not read as "no such table" (a missing table just yields no rows).
+    return sqlite([dbFile, `select name from pragma_table_info('${table}')`]).split("\n").filter(Boolean);
+  };
+  const runs = cols("runs");
+  const tasks = cols("tasks");
+  const harnesses = cols("harnesses");
+  const stmts: { what: string; count: string; update: string }[] = [];
+  if (runs.includes("status")) {
+    const sets = ["status = 'orphaned'"];
+    if (runs.includes("ended_at")) sets.push("ended_at = COALESCE(ended_at, CAST(strftime('%s','now') AS INTEGER) * 1000)");
+    if (runs.includes("tmux_session")) sets.push("tmux_session = NULL");
+    stmts.push({ what: "running runs marked orphaned", count: "select count(*) from runs where status = 'running'", update: `update runs set ${sets.join(", ")} where status = 'running'` });
+  }
+  if (tasks.includes("column")) {
+    stmts.push({ what: "running tasks moved to ready", count: `select count(*) from tasks where "column" = 'running'`, update: `update tasks set "column" = 'ready' where "column" = 'running'` });
+  }
+  if (harnesses.includes("enabled") && harnesses.includes("is_builtin")) {
+    stmts.push({ what: "non-builtin harnesses disabled", count: "select count(*) from harnesses where is_builtin = 0 and enabled = 1", update: "update harnesses set enabled = 0 where is_builtin = 0" });
+  }
+  const lines: string[] = [];
+  for (const s of stmts) {
+    const n = Number(sqlite([dbFile, s.count]));
+    sqlite([dbFile, s.update]);
+    lines.push(`${s.what}: ${n}`);
+  }
+  return lines;
+}
+
 function countTasks(dbFile: string): number | null {
   try { return Number(sqlite(["-readonly", dbFile, "select count(*) from tasks"])); } catch { return null; }
 }
@@ -424,9 +553,6 @@ async function settleReplayTask(taskId: string): Promise<boolean> {
 
 async function main(): Promise<void> {
   // Only now, after every safety check, is anything created.
-  if (existsSync(targetDir) && statSync(targetDir).isDirectory() && !opts.dataDir) {
-    fail(`${targetDir} already exists`);
-  }
   mkdirSync(targetDir, { recursive: true });
   const workdir = path.join(targetDir, "workdir");
   mkdirSync(workdir, { recursive: true });
@@ -437,11 +563,23 @@ async function main(): Promise<void> {
     if (alive) fail(`something already answers on ${BASE}; pick another --port`);
 
     let sourceBytes: number | null = null;
+    let sanitizeLines: string[] = [];
     if (sourcePath) {
       console.log(`[measure-core] copying ${sourcePath} with SQLite's online backup…`);
       sourceBytes = statSync(sourcePath).size;
       copySource(sourcePath, dbFile);
+      sanitizeLines = sanitizeCopy(dbFile);
     }
+    console.log("[measure-core] isolation:");
+    console.log(`  HOME           ${SANDBOX_HOME} (sandbox; real HOME not passed)`);
+    console.log(`  PATH           ${FAKE_BIN}:${path.dirname(process.execPath)}:/usr/bin:/bin`);
+    console.log(`  agents         AGETOR_<KIND>_DRIVER=fake and AGETOR_<KIND>_BIN=stub for ${AGENT_KINDS.join(", ")}`);
+    console.log("  keychain       `security` stub (exit 44); usage poller finds no credentials");
+    console.log("  tmux           stub (has-session always fails)");
+    console.log("  switches       AGETOR_HARNESS_AUTO_ENABLE=0 AGETOR_COPILOT_ACP_PROBE=0");
+    console.log(sourcePath
+      ? `  source DB      copy sanitized (source untouched): ${sanitizeLines.join("; ") || "nothing to change"}`
+      : "  source DB      synthetic");
 
     core = startCore();
     await waitReady(core, 90_000);
@@ -606,7 +744,13 @@ async function main(): Promise<void> {
     tearingDown = true;
     await stopCore(core);
     if (opts.cleanup) {
-      try { rmSync(targetDir, { recursive: true, force: true }); console.log(`[measure-core] removed ${targetDir}`); }
+      // Only what this run created: the dir itself if the script made it,
+      // else just the children added to the pre-existing empty dir.
+      try {
+        if (createdTarget) rmSync(targetDir, { recursive: true, force: true });
+        else for (const name of readdirSync(targetDir)) rmSync(path.join(targetDir, name), { recursive: true, force: true });
+        console.log(`[measure-core] removed ${createdTarget ? targetDir : `the contents of ${targetDir}`}`);
+      }
       catch (e) { console.warn(`[measure-core] cleanup failed: ${e instanceof Error ? e.message : e}`); }
     } else {
       console.log(`[measure-core] bench dir kept: ${targetDir}`);

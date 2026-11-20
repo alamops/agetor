@@ -1,7 +1,7 @@
 #!/usr/bin/env bun
-// Builds vendor/daemon/ — the two plain-JS bundles the always-on background
-// host runs OUTSIDE the Electrobun main process (docs/plans/always-on-host.md
-// §3.9):
+// Builds vendor/daemon/ — the plain-JS bundles the always-on background host
+// and the core's worker thread run OUTSIDE the Electrobun main process
+// (docs/plans/always-on-host.md §3.9, docs/plans/non-blocking-core.md):
 //
 //   vendor/daemon/login-daemon.js   entry src/bun/login-daemon.ts — the tiny
 //                                   supervisor `agetor-login-item run` execs.
@@ -10,6 +10,15 @@
 //                                   core the supervisor spawns (SQLite, API,
 //                                   orchestrator), the same code `agetor
 //                                   daemon start` runs from a source checkout.
+//   vendor/daemon/core-worker.js    entry src/bun/core-worker.ts — the worker
+//                                   thread that owns the SQLite connection
+//                                   (and the transcript parser). A Worker needs
+//                                   a real file, so every host ships it next
+//                                   to its own bundle: the headless core finds
+//                                   it beside headless.js, the desktop app gets
+//                                   a copy at Resources/app/bun/ (see
+//                                   electrobun.config.ts), and src/bun/
+//                                   worker-entry.ts resolves it.
 //
 // WHY BUNDLES. The packaged .app has no src/ tree: Electrobun compiles only
 // src/bun/index.ts into Contents/Resources/app/bun/index.js. A launchd job
@@ -27,7 +36,7 @@
 // is no `electrobun/bun` import on this path (headless.ts is built to run
 // without the desktop shell), so nothing native needs externalising.
 //
-// Always rebuilds: Bun.build of both entries takes well under a second, and a
+// Always rebuilds: Bun.build of the entries takes well under a second, and a
 // stale-check would need the whole src/ import graph as inputs.
 //
 // SMOKE TESTS (no Electrobun build needed):
@@ -51,6 +60,7 @@ const OUT_DIR = path.join(REPO_ROOT, "vendor", "daemon");
 const ENTRIES = [
   path.join(REPO_ROOT, "src", "bun", "login-daemon.ts"),
   path.join(REPO_ROOT, "src", "bun", "headless.ts"),
+  path.join(REPO_ROOT, "src", "bun", "core-worker.ts"),
 ];
 
 function fail(msg: string): never {

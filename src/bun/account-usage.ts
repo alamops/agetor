@@ -50,10 +50,19 @@ const SCAN_BUDGET_BYTES = 16 * 1024 * 1024;
  *  the next is read, with the event loop free in between. */
 const MAX_READ_BYTES = 8 * 1024 * 1024;
 
-/** A single transcript line longer than this is not buffered further: the
- *  line is dropped (counted as a parse error) and scanning resumes after its
- *  newline. Real assistant lines are far below it. */
-const MAX_LINE_BYTES = 64 * 1024 * 1024;
+/** A single transcript line this long (or as long as the pass budget, when
+ *  that is smaller) is not buffered further: the line is dropped (counted as
+ *  a parse error once) and scanning resumes after its newline. The cap must
+ *  not exceed the per-pass budget, or a pass could never accumulate enough to
+ *  trigger it. Real assistant lines are far below it. */
+const MAX_LINE_BYTES = 8 * 1024 * 1024;
+
+/** Files whose cursor currently sits inside an oversized line being skipped:
+ *  filePath -> the cursor offset the skip resumes at. Lets a later pass keep
+ *  discarding up to the line's newline instead of re-reading it or counting
+ *  its tail as another parse error. In-memory: after a restart the tail of
+ *  such a line costs at most one extra parse error. */
+const skipResume = new Map<string, number>();
 
 export interface ScanResult {
   filesScanned: number;
@@ -198,7 +207,13 @@ async function readSlice(p: string, offset: number, end: number): Promise<Buffer
 }
 
 /** Scan one file's new bytes, up to `budget`. Returns bytes consumed. */
-async function scanFile(configDir: string, filePath: string, result: ScanResult, budget: number): Promise<number> {
+async function scanFile(
+  configDir: string,
+  filePath: string,
+  result: ScanResult,
+  budget: number,
+  maxLine: number,
+): Promise<number> {
   let st;
   try { st = await stat(filePath); } catch { return 0; }
   const cursor = s().getCursor.get(filePath) as { mtime_ms: number; size: number; offset: number } | null;
@@ -209,6 +224,8 @@ async function scanFile(configDir: string, filePath: string, result: ScanResult,
   // Re-reading is safe: usage_seen makes recounting a no-op.
   let offset = cursor && st.size >= cursor.offset ? cursor.offset : 0;
   const limit = Math.min(st.size, offset + budget);
+  let skipping = skipResume.get(filePath) === offset;
+  if (!skipping) skipResume.delete(filePath);
 
   // Slices of at most MAX_READ_BYTES are read one after another. Only
   // complete lines are processed and the cursor offset never advances past the
@@ -218,7 +235,6 @@ async function scanFile(configDir: string, filePath: string, result: ScanResult,
   let readPos = offset;
   let consumed = 0;
   let carry: Buffer = Buffer.alloc(0);
-  let persisted = false;
   while (readPos < limit) {
     const slice = await readSlice(filePath, readPos, limit);
     if (slice === null) {
@@ -228,7 +244,24 @@ async function scanFile(configDir: string, filePath: string, result: ScanResult,
     if (slice.length === 0) break; // file shrank under us; next scan restarts
     readPos += slice.length;
     consumed += slice.length;
-    const buf = carry.length > 0 ? Buffer.concat([carry, slice]) : slice;
+    let chunk: Buffer = slice;
+    if (skipping) {
+      // Inside an oversized line: drop bytes up to and including its newline.
+      const nl = chunk.indexOf(0x0a);
+      if (nl < 0) {
+        offset += chunk.length;
+        s().putCursor.run(filePath, configDir, st.mtimeMs, st.size, offset);
+        skipResume.set(filePath, offset);
+        continue;
+      }
+      offset += nl + 1;
+      skipping = false;
+      skipResume.delete(filePath);
+      chunk = chunk.subarray(nl + 1);
+      s().putCursor.run(filePath, configDir, st.mtimeMs, st.size, offset);
+      if (chunk.length === 0) continue;
+    }
+    const buf = carry.length > 0 ? Buffer.concat([carry, chunk]) : chunk;
     const lastNewline = buf.lastIndexOf(0x0a);
     if (lastNewline >= 0) {
       const complete = buf.subarray(0, lastNewline + 1);
@@ -250,25 +283,26 @@ async function scanFile(configDir: string, filePath: string, result: ScanResult,
         s().putCursor.run(filePath, configDir, st.mtimeMs, st.size, offset);
       });
       apply();
-      persisted = true;
       // Copy the tail so the (up to 8 MB) slice buffer can be freed.
       carry = Buffer.from(buf.subarray(lastNewline + 1));
     } else {
       carry = buf;
     }
-    if (carry.length > MAX_LINE_BYTES) {
+    if (carry.length >= maxLine) {
       // One line larger than any real transcript line: drop it rather than
-      // buffer without bound. Scanning resumes at the next newline.
+      // buffer without bound or re-read it every pass. Persist the skip so
+      // the next pass resumes after the line's newline.
       offset += carry.length;
       carry = Buffer.alloc(0);
       result.parseErrors++;
+      skipping = true;
+      skipResume.set(filePath, offset);
+      s().putCursor.run(filePath, configDir, st.mtimeMs, st.size, offset);
     }
   }
-  if (!persisted) {
-    // No complete line in the new bytes — just refresh the stat cursor so an
-    // unchanged file is skipped next time (offset untouched).
-    s().putCursor.run(filePath, configDir, st.mtimeMs, st.size, offset);
-  }
+  // Always save the cursor, even when nothing new was consumed, so an
+  // unchanged file is skipped next time and later files are reached.
+  s().putCursor.run(filePath, configDir, st.mtimeMs, st.size, offset);
   result.filesScanned++;
   return consumed;
 }
@@ -298,7 +332,7 @@ export async function scanAccountUsage(configDir: string, budgetBytes = SCAN_BUD
       result.budgetExhausted = true;
       break;
     }
-    remaining -= await scanFile(configDir, f, result, remaining);
+    remaining -= await scanFile(configDir, f, result, remaining, Math.min(MAX_LINE_BYTES, budgetBytes));
   }
   if (remaining <= 0) result.budgetExhausted = true;
   return result;

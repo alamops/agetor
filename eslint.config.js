@@ -33,7 +33,18 @@ export default [
       "@typescript-eslint/no-floating-promises": ["error", { ignoreVoid: true }],
       "@typescript-eslint/no-misused-promises": [
         "error",
-        { checksConditionals: true, checksVoidReturn: false },
+        {
+          checksConditionals: true,
+          // Catches forEach(async…), setTimeout(async…), .on(…, async…).
+          // Other void-return sites (attributes, properties, returns,
+          // variables) stay off: too noisy for the async-correctness gate.
+          checksVoidReturn: { arguments: true, attributes: false, properties: false, returns: false, variables: false },
+        },
+      ],
+      // Only object-ish values (Promises included) are flagged in templates.
+      "@typescript-eslint/restrict-template-expressions": [
+        "error",
+        { allowNumber: true, allowBoolean: true, allowNullish: true, allowAny: true, allowNever: true, allowRegExp: true },
       ],
       "@typescript-eslint/await-thenable": "error",
     },

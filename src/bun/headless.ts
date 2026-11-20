@@ -1,5 +1,5 @@
 import pkg from "../../package.json" with { type: "json" };
-import { CLI_TOKEN, formatHostForUrl, getApiPort, resolveApiHost } from "./api-config.ts";
+import { API_TOKEN, CLI_TOKEN, formatHostForUrl, getApiPort, resolveApiHost } from "./api-config.ts";
 import { db, dataDir, subagents, preferences } from "./db.ts";
 import {
   freezeLaunches,
@@ -35,6 +35,11 @@ import {
 } from "./core-creds.ts";
 import { daemonLog } from "./daemon-log.ts";
 import { bootReadySignal } from "./boot-gate.ts";
+import { installCoreLog, registerLogSecret } from "./core-log.ts";
+import { setTaskDecorations } from "./db-async.ts";
+import { awaitDbReady, drainCoreForQuit } from "./boot-db.ts";
+import { countPendingForTask, pendingCountsByTask } from "./interactions.ts";
+import { countTerminals, terminalCountsByTask } from "./terminals.ts";
 import { CORE_EXIT_PARK, HANDOFF_LAUNCH_SETTLE_MS, launchedBy, resolveIdleTimeoutMs } from "./daemon-mode.ts";
 import {
   installHeadlessNotifications,
@@ -211,10 +216,26 @@ function shutdown(reason: string, code = 0, opts: { realStop?: boolean } = {}): 
       /* best-effort */
     }
   }
-  process.exit(code);
+  // Last: drain core.log and close the db worker before the exit, bounded so a
+  // stuck worker can never hold the shutdown. `process.exit` is the only way out.
+  void drainCoreForQuit().finally(() => process.exit(code));
 }
 
 export async function runDaemon(): Promise<void> {
+  // First thing in the process body (importing this module from the CLI must
+  // not tee the console or open a log): console output from here on lands in
+  // <dataDir>/logs/core.log. The tokens are registered so no line carries them.
+  installCoreLog();
+  registerLogSecret(API_TOKEN);
+  registerLogSecret(CLI_TOKEN);
+  // Worker-mode Task results carry the same badge counts the main-thread
+  // connection computes (lazy: these registries live in other modules).
+  setTaskDecorations({
+    countPendingForTask: (taskId) => countPendingForTask(taskId),
+    countTerminals: (taskId) => countTerminals(taskId),
+    pendingCountsByTask: () => pendingCountsByTask(),
+    terminalCountsByTask: () => terminalCountsByTask(),
+  });
   process.env.AGETOR_HEADLESS = "1";
   const mode = launchedBy();
   const isLoginItem = mode === "login-item";
@@ -348,6 +369,11 @@ export async function runDaemon(): Promise<void> {
   );
   ownsCreds = true;
 
+  // The db worker opens the database and runs migrations while the rest of
+  // boot proceeds; the gate stays shut until it is ready. /health and /info
+  // answer meanwhile. A failure is logged and retried, never skipped.
+  const dbBoot = awaitDbReady({ isStopped: () => shuttingDown });
+
   // A restore that throws must not leave a bound server whose routes wait on a
   // ready signal that never comes.
   try {
@@ -374,6 +400,8 @@ export async function runDaemon(): Promise<void> {
     // Adopt the OpenCode servers a previous core left running before the
     // reconcile reattaches `server=agetor` runs to them (index.ts has the same step).
     await adoptOpencodeServers();
+    // Before the first reconcile query, and so before the gate opens.
+    if (!(await dbBoot)) return;
     await reconcileOrphans();
     // M16: same ordering as index.ts's desktop boot path — reconcile every
     // pipeline parent left mid-flight by a prior crash/restart right after

@@ -25,6 +25,25 @@
 // Calls made while the worker is starting, or between a crash and its restart,
 // wait their turn rather than fail. A transaction never spans a thread hop:
 // multi-statement work is a named op that runs whole inside the worker.
+//
+// OUTCOME UNKNOWN. A call that was in flight when the worker crashed or the
+// client closed rejects with `DbRestartingError` (or `DbUnavailableError`), but
+// the worker may already have committed it: only the reply was lost. The caller
+// cannot tell. So NO layer (this client, the facade, a route handler, an HTTP
+// client) may automatically retry a call that is not idempotent
+// (`tasks.insert`, `backlog.add`, `runs.appendEvent`, `savedPrompts.insert`, ...):
+// a retry could write twice. This client never retries a posted call. Only a
+// caller that knows its call is idempotent, or that re-reads to find out, may retry.
+//
+// Worker output. The worker's console is forwarded as `{ log: { level, text } }`
+// messages (core-worker.ts) and re-emitted here on the main-thread console with a
+// `[agetor:db-worker]` prefix, so it reaches core.log. Such a message is data for
+// the console only: it carries no id and is never answered.
+//
+// Ready timer. Only OPENING the database is timed (`readyTimeoutMs`). The worker
+// posts `{ migrating: true }` once the connection is open, and the timer stops
+// there, so a long migration is not killed. A worker that dies mid-migration is
+// still seen through its `close`/`error` event.
 
 import type { Database } from "bun:sqlite";
 import {
@@ -36,7 +55,7 @@ import {
   PipelineNameError,
 } from "./db-core/errors.ts";
 import type { DbModules } from "./db-core/modules.ts";
-import { executeDbRequest, type DbErrorPayload, type DbReply } from "./workers/db-handler.ts";
+import { executeDbRequest, serializeDbError, type DbErrorPayload, type DbReply } from "./workers/db-handler.ts";
 import { resolveDbPath } from "./db-path.ts";
 import { createCoreWorker, type CoreWorkerLike } from "./worker-entry.ts";
 import { markTasksChanged } from "./task-change-bus.ts";
@@ -44,7 +63,11 @@ import type { OpArgs, OpName, OpResult } from "./db-core/ops/index.ts";
 
 export type DbMode = "worker" | "inprocess";
 
-/** In-flight calls fail with this when the worker dies; the worker restarts. */
+/** In-flight calls fail with this when the worker dies; the worker restarts.
+ *
+ *  The outcome of a write that was in flight is UNKNOWN: the worker may have
+ *  committed it before the crash (or before `closeDb` terminated it), with only
+ *  the reply lost. No layer may auto-retry a non-idempotent call on this error. */
 export class DbRestartingError extends Error {
   constructor(reason: string) {
     super(`database worker restarting: ${reason}`);
@@ -127,6 +150,19 @@ const DEFAULT_READY_TIMEOUT_MS = 30_000;
 const DEFAULT_MAX_RESTARTS = 5;
 const DEFAULT_RESTART_WINDOW_MS = 60_000;
 const DEFAULT_CLOSE_TIMEOUT_MS = 3000;
+const CLOSE_ACK_TIMEOUT_MS = 2000;
+
+type WorkerLogLevel = "log" | "info" | "warn" | "error" | "debug";
+const LOG_LEVELS: readonly WorkerLogLevel[] = ["log", "info", "warn", "error", "debug"];
+
+/** Re-emit a worker's `{ level, text }` log message on the main-thread console. */
+function forwardWorkerLog(log: unknown): void {
+  if (typeof log !== "object" || log === null) return;
+  const { level, text } = log as { level?: unknown; text?: unknown };
+  if (typeof text !== "string") return;
+  const method: WorkerLogLevel = LOG_LEVELS.includes(level as WorkerLogLevel) ? (level as WorkerLogLevel) : "log";
+  console[method](`[agetor:db-worker] ${text}`);
+}
 
 interface Waiter {
   /** The request to post once the worker is ready; null for a `dbReady()` waiter. */
@@ -231,11 +267,27 @@ function inProcessClient(base: Base, noteRev: (rev: number) => void): DbRpc {
     return loading;
   }
 
+  // Worker mode hands the worker a structured clone of the arguments (taken when
+  // the call is posted) and the caller a structured clone of the result, and
+  // rebuilds an error from its serialised form. Do all three here too, always,
+  // so a method that returns a class instance, a function or a live object, a
+  // caller that mutates its arguments or a returned object, or code that relies
+  // on an error's identity behaves the same in both modes.
   async function run(request: Record<string, unknown>): Promise<unknown> {
+    const args = structuredClone(request.args); // synchronous: a later caller mutation cannot reach the call
     if (closed) throw new DbUnavailableError("db client is closed");
     const loaded = await load();
     try {
-      return executeDbRequest(loaded, request);
+      const result = executeDbRequest(loaded, { ...request, args });
+      try {
+        return structuredClone(result);
+      } catch (e) {
+        throw reconstructDbError({ name: "DbResultNotCloneable", message: toError(e).message });
+      }
+    } catch (e) {
+      if (e instanceof Error && e.name === "DbResultNotCloneable") throw e;
+      // Same path as a worker reply: serialise, clone, rebuild.
+      throw reconstructDbError(structuredClone(serializeDbError(e)));
     } finally {
       noteRev(loaded.readRev());
     }
@@ -276,6 +328,8 @@ function workerClient(
   const pending = new Map<number, Pending>();
   const crashes: number[] = [];
   let drainWaiters: Array<() => void> = [];
+  /** Set while `closeDb` waits for the worker's `{ closed: true }`. */
+  let closeAck: (() => void) | null = null;
 
   function crashesInWindow(): number {
     const cutoff = now() - windowMs;
@@ -338,6 +392,8 @@ function workerClient(
     const err = new DbRestartingError(reason);
     for (const p of inflight) p.reject(err);
     if (closing) {
+      closeAck?.(); // the worker is gone; nothing left to wait for
+      closeAck = null;
       failWaiting(new DbUnavailableError("db client is closed"));
       settleDrain();
       return;
@@ -358,6 +414,21 @@ function workerClient(
   function onMessage(w: CoreWorkerLike, data: unknown): void {
     if (worker !== w || typeof data !== "object" || data === null) return;
     const msg = data as Record<string, unknown>;
+    if ("log" in msg) {
+      forwardWorkerLog(msg.log);
+      return; // never a reply, never answered
+    }
+    if ("migrating" in msg) {
+      // The connection is open; migrations may legitimately take a long time.
+      if (!ready) clearReadyTimer();
+      return;
+    }
+    if ("closed" in msg) {
+      const ack = closeAck;
+      closeAck = null;
+      ack?.();
+      return;
+    }
     if ("ready" in msg) {
       if (ready) return;
       if (msg.ready === true) {
@@ -447,6 +518,22 @@ function workerClient(
       closed = true;
       clearReadyTimer();
       const w = worker;
+      // Let the worker close its connection (which checkpoints the WAL) before it
+      // is terminated; bounded, because a wedged worker must not hang the quit.
+      if (w && ready) {
+        await new Promise<void>((resolve) => {
+          const timer = setTimeout(() => { closeAck = null; resolve(); }, CLOSE_ACK_TIMEOUT_MS);
+          timer.unref?.();
+          closeAck = () => { clearTimeout(timer); resolve(); };
+          try {
+            w.postMessage({ kind: "close" });
+          } catch {
+            clearTimeout(timer);
+            closeAck = null;
+            resolve();
+          }
+        });
+      }
       worker = null;
       ready = false;
       if (w) { try { void w.terminate(); } catch { /* already gone */ } }
@@ -478,7 +565,10 @@ export function getDbRpc(): DbRpc {
 
 /** Test seam: drop the process-wide client so the next use re-reads the environment. */
 export function resetDbRpcForTests(): void {
+  const dropped = defaultRpc;
   defaultRpc = null;
+  // Close it so a worker-mode client does not leave its thread (and connection) running.
+  void dropped?.closeDb({ timeoutMs: 500 }).catch(() => {});
 }
 
 export const dbReady = (): Promise<void> => getDbRpc().dbReady();

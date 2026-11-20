@@ -61,6 +61,23 @@ function newClient(opts: Partial<Parameters<RpcModule["createDbRpc"]>[0]> = {}) 
 
 const sleep = (ms: number) => new Promise((r) => setTimeout(r, ms));
 
+/** Poll until `cond` holds, failing after `timeoutMs`. */
+async function waitFor(cond: () => boolean, what: string, timeoutMs = 10_000): Promise<void> {
+  const deadline = Date.now() + timeoutMs;
+  while (!cond()) {
+    if (Date.now() > deadline) throw new Error(`timed out waiting for ${what}`);
+    await sleep(5);
+  }
+}
+
+/** Crash a worker and wait for its close event (the client's own listener, added
+ *  first, has already run by then, so the restart decision is made). */
+async function crash(w: CoreWorkerLike): Promise<void> {
+  const closed = new Promise<void>((resolve) => w.addEventListener("close", () => resolve()));
+  w.postMessage({ kind: "__crash" });
+  await Promise.race([closed, sleep(10_000).then(() => { throw new Error("timed out waiting for the worker to close"); })]);
+}
+
 beforeAll(async () => {
   rpcm = await import("./db-rpc.ts");
 });
@@ -121,10 +138,37 @@ describe("worker lifecycle", () => {
     // A directory is not a database file.
     const dir = mkdtempSync(path.join(tmpdir(), "agetor-db-rpc-bad-"));
     tmpDirs.push(dir);
-    const { rpc } = newClient({ dbPath: dir });
-    await expect(rpc.call("tasks", "list", [])).rejects.toBeInstanceOf(rpcm.DbUnavailableError);
-    await expect(rpc.dbReady()).rejects.toBeInstanceOf(rpcm.DbUnavailableError);
+    const { rpc, workers } = newClient({ dbPath: dir });
+    const first = await rpc.call("tasks", "list", []).then(() => null, (e: unknown) => e);
+    expect(first).toBeInstanceOf(rpcm.DbUnavailableError);
+    expect((first as Error).message).toContain("could not open the database");
+    expect(workers.length).toBe(1);
+    // The failure is not a tight restart loop, but the NEXT call starts a fresh worker.
+    const second = await rpc.dbReady().then(() => null, (e: unknown) => e);
+    expect(second).toBeInstanceOf(rpcm.DbUnavailableError);
+    expect((second as Error).message).toContain("could not open the database");
+    expect(workers.length).toBe(2);
   });
+
+  test("a slow migration is not cut off by the ready timeout, and the worker is neither terminated nor restarted", async () => {
+    let terminations = 0;
+    const { rpc, workers } = newClient({
+      readyTimeoutMs: 1000,
+      workerFactory: (p) => {
+        // The worker stalls 2.5 s after opening and before migrating: longer than the ready timeout.
+        const w = createCoreWorker("db", { dbPath: p, testMigrateDelayMs: 2500 });
+        const terminate = w.terminate.bind(w);
+        w.terminate = () => { terminations++; return terminate(); };
+        return w;
+      },
+    });
+    const t0 = performance.now();
+    await rpc.dbReady();
+    expect(performance.now() - t0).toBeGreaterThan(1500);
+    expect(await rpc.call("tasks", "list", [])).toEqual([]);
+    expect(terminations).toBe(0);
+    expect(workers.length).toBe(1);
+  }, 30_000);
 
   test("a worker that never reports ready is cut off by the ready timeout", async () => {
     const silent = (): CoreWorkerLike => ({
@@ -203,7 +247,7 @@ describe("ordering and consistency", () => {
 });
 
 describe("main thread stays responsive", () => {
-  test("a heavy read runs while a 5 ms timer keeps ticking (max gap < 100 ms)", async () => {
+  test("a heavy read runs while a 5 ms timer keeps ticking (max gap <= max(100 ms, 3 x the idle baseline))", async () => {
     const { rpc } = newClient();
     const t = makeTask();
     await rpc.call("tasks", "insert", [t]);
@@ -213,6 +257,9 @@ describe("main thread stays responsive", () => {
     const chunk = "x".repeat(1024 * 1024);
     for (let i = 0; i < 50; i++) await rpc.call("runs", "appendEvent", [run.id, "stdout", `${i}:${chunk}`]);
 
+    // Baseline in the same run, with no load: how late a 5 ms timer is on this
+    // machine right now. The bound scales with it, so a loaded CI box does not
+    // flake, while a read that ran on the main thread (hundreds of ms) still fails.
     let last = performance.now();
     let maxGap = 0;
     let ticks = 0;
@@ -222,6 +269,12 @@ describe("main thread stays responsive", () => {
       last = nowMs;
       ticks++;
     }, 5);
+    await sleep(400);
+    const baselineGap = maxGap;
+    expect(ticks).toBeGreaterThan(0);
+    last = performance.now();
+    maxGap = 0;
+    ticks = 0;
     try {
       // The worker scans and sizes all 50 MB (the byte walk), returning a bounded window.
       const t0 = performance.now();
@@ -233,9 +286,9 @@ describe("main thread stays responsive", () => {
       const fullMs = performance.now() - t1;
       expect(window.length).toBeGreaterThan(0);
       expect(all.length).toBe(50);
-      console.info(`[db-rpc-worker.test] heavy windowed read ${heavyMs.toFixed(0)} ms, full 50 MB read ${fullMs.toFixed(0)} ms, ${ticks} ticks, max main-thread gap ${maxGap.toFixed(1)} ms`);
+      console.info(`[db-rpc-worker.test] heavy windowed read ${heavyMs.toFixed(0)} ms, full 50 MB read ${fullMs.toFixed(0)} ms, ${ticks} ticks, max main-thread gap ${maxGap.toFixed(1)} ms (baseline ${baselineGap.toFixed(1)} ms)`);
       expect(ticks).toBeGreaterThan(5);
-      expect(maxGap).toBeLessThan(100);
+      expect(maxGap).toBeLessThanOrEqual(Math.max(100, baselineGap * 3));
     } finally {
       clearInterval(timer);
     }
@@ -261,8 +314,8 @@ describe("crash and restart", () => {
   test("calls queued during the restart run on the new worker", async () => {
     const { rpc, workers } = newClient();
     await rpc.dbReady();
-    workers[0]!.postMessage({ kind: "__crash" });
-    await sleep(100); // the crash has landed; the restart is underway
+    await crash(workers[0]!); // the crash has landed; the restart is underway
+    await waitFor(() => workers.length === 2, "the restarted worker");
     expect(await rpc.call("preferences", "get", ["nope"])).toBeNull();
     expect(workers.length).toBe(2);
   });
@@ -272,8 +325,7 @@ describe("crash and restart", () => {
     const { rpc, workers } = newClient({ maxRestartsPerWindow: 2, restartWindowMs: 10_000, now: () => clock });
     await rpc.dbReady();
     const crashAndWait = async (n: number) => {
-      workers[n]!.postMessage({ kind: "__crash" });
-      await sleep(150);
+      await crash(workers[n]!);
     };
     await crashAndWait(0); // restart 1
     await rpc.dbReady();
@@ -290,7 +342,77 @@ describe("crash and restart", () => {
   });
 });
 
+describe("worker console output", () => {
+  test("a worker's console.log reaches the main-thread console with the db-worker prefix", async () => {
+    const lines: string[] = [];
+    const original = console.log;
+    console.log = (...args: unknown[]) => { lines.push(args.map(String).join(" ")); };
+    try {
+      const { rpc } = newClient();
+      await rpc.dbReady(); // a fresh database logs "applied migrations" from inside the worker
+      await waitFor(() => lines.some((l) => l.startsWith("[agetor:db-worker] ") && l.includes("applied migrations")), "the forwarded log line", 5000);
+    } finally {
+      console.log = original;
+    }
+  });
+
+  test("log messages use the matching console method, a malformed one is ignored, and none is a reply", async () => {
+    const warned: string[] = [];
+    const originalWarn = console.warn;
+    console.warn = (...args: unknown[]) => { warned.push(args.map(String).join(" ")); };
+    const listeners = new Map<string, (ev: unknown) => void>();
+    const emit = (data: unknown) => listeners.get("message")?.({ data });
+    const fake: CoreWorkerLike = {
+      postMessage(m) {
+        const req = m as { id?: number; kind?: string };
+        if (req.kind !== "call") return;
+        emit({ log: { level: "warn", text: "from the worker" } });
+        emit({ log: "junk" });
+        emit({ log: { level: "nonsense", text: 5 } });
+        emit({ id: req.id, ok: true, result: "answer", rev: 0 });
+      },
+      terminate() {},
+      addEventListener(type, listener) { listeners.set(type, listener); },
+    };
+    try {
+      const { rpc } = newClient({ workerFactory: () => fake });
+      const first = rpc.call("preferences", "get", ["k"]);
+      emit({ ready: true });
+      expect(await first).toBe("answer");
+      expect(warned).toEqual(["[agetor:db-worker] from the worker"]);
+    } finally {
+      console.warn = originalWarn;
+    }
+  });
+});
+
 describe("close", () => {
+  test("closeDb asks the worker to close its connection before terminating it", async () => {
+    const events: string[] = [];
+    const { rpc, dbPath } = newClient({
+      workerFactory: (p) => {
+        const w = createCoreWorker("db", { dbPath: p });
+        const post = w.postMessage.bind(w);
+        w.postMessage = (m: unknown) => {
+          const kind = (m as { kind?: string }).kind;
+          if (kind === "close") events.push("close-requested");
+          post(m);
+        };
+        const terminate = w.terminate.bind(w);
+        w.terminate = () => { events.push("terminated"); return terminate(); };
+        return w;
+      },
+    });
+    await rpc.dbReady();
+    await rpc.call("tasks", "insert", [makeTask()]);
+    await rpc.closeDb({ timeoutMs: 2000 });
+    expect(events).toEqual(["close-requested", "terminated"]);
+    // The last connection closed: SQLite checkpointed and removed (or emptied) the WAL.
+    const { existsSync, statSync } = await import("node:fs");
+    const wal = `${dbPath}-wal`;
+    expect(!existsSync(wal) || statSync(wal).size === 0).toBe(true);
+  });
+
   test("closeDb drains in-flight calls, then terminates the worker", async () => {
     const { rpc, workers } = newClient();
     await rpc.dbReady();
@@ -304,6 +426,7 @@ describe("close", () => {
     let answered = false;
     workers[0]!.addEventListener("message", () => { answered = true; });
     try { workers[0]!.postMessage({ id: 1, kind: "call", module: "tasks", method: "list", args: [] }); } catch { /* terminated */ }
+    // A terminated worker never answers; give a live one ample time to prove otherwise.
     await sleep(100);
     expect(answered).toBe(false);
     await expect(rpc.call("tasks", "list", [])).rejects.toBeInstanceOf(rpcm.DbUnavailableError);

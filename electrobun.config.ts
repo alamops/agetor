@@ -84,6 +84,14 @@ export default {
       // Lands at Contents/Resources/app/daemon/; built by
       // scripts/build-daemon-bundle.ts.
       "vendor/daemon": "daemon",
+      // The core's worker thread (src/bun/core-worker.ts) owns the SQLite
+      // connection. `new Worker(path)` needs a real file, and Electrobun
+      // compiles only src/bun/index.ts, so the desktop bundle at
+      // Resources/app/bun/index.js finds the worker next to itself
+      // (src/bun/worker-entry.ts). Same file the daemon copy above carries for
+      // headless.js; built by scripts/build-daemon-bundle.ts, which `bun run
+      // dev` also runs first: a missing source aborts the electrobun copy.
+      "vendor/daemon/core-worker.js": "bun/core-worker.js",
     },
     watchIgnore: ["dist/**", ".agetor/**", "vendor/**"],
     mac: {

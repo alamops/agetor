@@ -12,6 +12,8 @@ const {
   clearClaudeSessionLivenessCache,
   clearClaudeSessionMetaCache,
   claudeConfigDirsToScan,
+  defaultListLive,
+  readClaudeRegistry,
   findClaudeSession,
   refreshClaudeSessionLiveness,
   scanClaudeSessions,
@@ -515,4 +517,25 @@ test("claudeConfigDirsToScan finds .claude* dirs under home, de-duplicated, skip
     harnesses: [],
   });
   expect(dirs.sort()).toEqual([path.join(root, ".claude"), path.join(root, ".claude-work")]);
+});
+
+test("the registry reader refuses an oversized planted sessions/*.json instead of reading it whole", async () => {
+  const root = home();
+  const dir = path.join(root, "sessions");
+  mkdirSync(dir, { recursive: true });
+  writeFileSync(path.join(dir, "ok.json"), JSON.stringify({ sessionId: "s-ok", pid: 1 }));
+  // Valid JSON, but 2 MB: past the 64 KB cap, so it must be skipped unread.
+  writeFileSync(path.join(dir, "big.json"), JSON.stringify({ sessionId: "s-big", pad: "x".repeat(2 * 1024 * 1024) }));
+  const records = await readClaudeRegistry(root);
+  expect(records.map((r) => r.sessionId)).toEqual(["s-ok"]);
+});
+
+test("the agents stub file is capped too: an oversized one yields no agents", async () => {
+  const root = home();
+  const small = path.join(root, "small.json");
+  const big = path.join(root, "big.json");
+  writeFileSync(small, JSON.stringify({ agents: [{ sessionId: "a1" }] }));
+  writeFileSync(big, JSON.stringify({ agents: [{ sessionId: "a1" }], pad: "x".repeat(2 * 1024 * 1024) }));
+  expect(await defaultListLive(root, { AGETOR_CLAUDE_AGENTS_JSON: small })).toEqual([{ sessionId: "a1", kind: null }]);
+  expect(await defaultListLive(root, { AGETOR_CLAUDE_AGENTS_JSON: big })).toEqual([]);
 });

@@ -13,6 +13,11 @@ import type { TaskDecorationDeps } from "./db-core/tasks.ts";
 // tasks.get(...)` at module scope in interactions.ts) — under ESM live
 // bindings the unresolved cycle becomes an undefined-binding crash at
 // import time. Keep both sides lazy.
+// The same TDZ hazard covers this module's `const` exports that are bound from
+// `modules` below (the cursor-ask and hidden-session id helpers,
+// `resetOrphanStampForTests`, ...): while the interactions/terminals cycle is
+// unresolved they are uninitialized, so nothing may read or call them at module
+// top level in either direction.
 import { countPendingForTask, pendingCountsByTask } from "./interactions.ts";
 // Same lazy-cycle contract as interactions.ts above: terminals.ts imports
 // `tasks` from this module, and we call `countTerminals` only from the
@@ -25,7 +30,7 @@ import { countTerminals, terminalCountsByTask } from "./terminals.ts";
 export { dataDir, pidFilePath, credsFilePath };
 
 export const db = new Database(resolveDbPath());
-applyConnectionPragmas(db);
+applyConnectionPragmas(db, { role: "main" });
 
 const applied = migrate(db, migrations);
 if (applied.length) console.log(`[agetor] applied migrations: ${applied.join(", ")}`);

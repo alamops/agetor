@@ -107,7 +107,7 @@ export function makeClaudeSessionSeen(conn: Database) {
          )`,
           [cap],
         );
-      })();
+      }).immediate();
     },
   };
   return claudeSessionSeen;
@@ -151,7 +151,7 @@ export function makeHarnessAutoEnabled(conn: Database) {
         for (const id of harnessIds) {
           conn.run(`UPDATE harness_auto_enabled SET notified = 1 WHERE harness_id = ?`, [id]);
         }
-      })();
+      }).immediate();
     },
     all(): { harnessId: string; enabledAt: number; notified: boolean }[] {
       return conn.query<{ harness_id: string; enabled_at: number; notified: number }, []>(

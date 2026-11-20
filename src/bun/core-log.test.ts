@@ -4,10 +4,11 @@
  * restores the console and env it touched.
  */
 import { afterEach, beforeEach, describe, expect, test } from "bun:test";
-import { existsSync, mkdtempSync, readFileSync, readdirSync, rmSync, statSync } from "node:fs";
+import { appendFileSync, existsSync, mkdtempSync, readFileSync, readdirSync, renameSync, rmSync, statSync } from "node:fs";
 import { tmpdir } from "node:os";
 import path from "node:path";
 import {
+  __testing,
   flushCoreLog,
   installCoreLog,
   redactLogText,
@@ -184,5 +185,58 @@ describe("core log", () => {
     await proc.exited;
     expect(readFileSync(logFile(), "utf8")).toContain("queued at exit");
     expect(mode(logFile())).toBe(0o600);
+  });
+
+  test("a secret registered AFTER a line was queued is redacted at flush time", async () => {
+    installCoreLog({ dataDir: dir });
+    console.log("leak late-secret-xyz123 here");
+    registerLogSecret("late-secret-xyz123");
+    await flushCoreLog();
+    const text = readFileSync(logFile(), "utf8");
+    expect(text).not.toContain("late-secret-xyz123");
+    expect(text).toContain("leak [redacted] here");
+  });
+
+  test("a secret straddling the 16 KB line cap does not leak its prefix", async () => {
+    installCoreLog({ dataDir: dir });
+    registerLogSecret("STRADDLE-SECRET-VALUE");
+    // The secret starts a few chars before the cap and would be cut mid-way.
+    console.log(`${"a".repeat(16 * 1024 - 5)}STRADDLE-SECRET-VALUE tail`);
+    await flushCoreLog();
+    const text = readFileSync(logFile(), "utf8");
+    expect(text).not.toContain("STRADD");
+    expect(text).toContain("[truncated]");
+  });
+
+  test("the exit flush does not re-write a batch the async writer already wrote", async () => {
+    installCoreLog({ dataDir: dir });
+    // Exit lands right after the async write is confirmed, before the chain unwinds.
+    __testing.afterWrite = () => __testing.exitFlush();
+    try {
+      console.log("written once");
+      await flushCoreLog();
+    } finally {
+      __testing.afterWrite = null;
+    }
+    expect(readFileSync(logFile(), "utf8").match(/written once/g)).toHaveLength(1);
+  });
+
+  test("a second writer that already rotated is not rotated away: no lost lines, at most 3 files", async () => {
+    installCoreLog({ dataDir: dir, maxBytes: 2000, files: 3 });
+    for (let i = 0; i < 40; i++) console.log(`first-${i} ${"x".repeat(40)}`);
+    await flushCoreLog();
+    // The other core rotates and starts a fresh live file.
+    renameSync(logFile(), `${logFile()}.1`);
+    appendFileSync(logFile(), "other-writer line\n");
+    for (let i = 0; i < 40; i++) console.log(`second-${i} ${"x".repeat(40)}`);
+    await flushCoreLog();
+    const names = readdirSync(path.join(dir, "logs")).sort();
+    expect(names.length).toBeLessThanOrEqual(3);
+    const all = names.map((n) => readFileSync(path.join(dir, "logs", n), "utf8")).join("");
+    expect(all).toContain("other-writer line");
+    expect(all).toContain("first-0 ");
+    expect(all).toContain("first-39 ");
+    expect(all).toContain("second-0 ");
+    expect(all).toContain("second-39 ");
   });
 });

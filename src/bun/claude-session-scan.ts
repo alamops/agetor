@@ -10,7 +10,7 @@
  * cached per file until its size or mtime changes. `git` runs only for rows
  * that stay visible.
  */
-import { closeSync, createReadStream, readFileSync, readSync, realpathSync } from "node:fs";
+import { closeSync, createReadStream, readSync, realpathSync } from "node:fs";
 import { lstat, readdir, stat } from "node:fs/promises";
 import { createInterface } from "node:readline";
 import { homedir, tmpdir } from "node:os";
@@ -324,10 +324,15 @@ function parseAgentList(value: unknown): ListedClaudeAgent[] {
   return out;
 }
 
+/** Request-path JSON reads (the sessions/ registry, the agents stub) are on
+ *  agent-writable files read in-process on the shared main thread: a planted
+ *  multi-hundred-MB file is refused, never read whole. Real records are tiny. */
+const SMALL_JSON_MAX_BYTES = 64 * 1024;
+
 function agentsFromStubFile(file: string, configDir: string): ListedClaudeAgent[] {
   let parsed: unknown;
   try {
-    parsed = JSON.parse(readTextNoFollow(file));
+    parsed = JSON.parse(readTextNoFollow(file, { maxBytes: SMALL_JSON_MAX_BYTES }));
   } catch {
     return [];
   }
@@ -419,7 +424,7 @@ export async function readClaudeRegistry(configDir: string): Promise<ClaudeRegis
     if (!name.endsWith(".json")) continue;
     let parsed: unknown;
     try {
-      parsed = JSON.parse(readTextNoFollow(path.join(dir, name)));
+      parsed = JSON.parse(readTextNoFollow(path.join(dir, name), { maxBytes: SMALL_JSON_MAX_BYTES }));
     } catch {
       continue;
     }

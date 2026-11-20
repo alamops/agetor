@@ -109,8 +109,47 @@ describe("named ops", () => {
     try {
       await expect(rpc.op("__test.setPreferences", [[], null])).rejects.toThrow("unknown db op");
     } finally {
-      process.env.NODE_ENV = prev;
+      if (prev === undefined) delete process.env.NODE_ENV;
+      else process.env.NODE_ENV = prev;
     }
+  });
+});
+
+describe("in-process mode is faithful to worker mode (structured clone, serialised errors)", () => {
+  test("a caller mutating its arguments right after the call cannot affect the call", async () => {
+    const t = newTask();
+    const pending = rpc.call("tasks", "insert", [t]);
+    t.title = "mutated after the call";
+    t.references.push({ path: "/x" } as never);
+    await pending;
+    const stored = (await rpc.call("tasks", "get", [t.id])) as { title: string; references: unknown[] };
+    expect(stored.title).toBe("db-rpc");
+    expect(stored.references).toEqual([]);
+  });
+
+  test("an argument that cannot be structured-cloned rejects that call", async () => {
+    const k = `rpc-test-${randomUUID()}`;
+    await expect(rpc.call("preferences", "set", [k, () => 1])).rejects.toThrow();
+    expect(dbm.preferences.get(k)).toBeNull();
+  });
+
+  test("a result is a clone: mutating it does not reach the next read", async () => {
+    const t = newTask();
+    await rpc.call("tasks", "insert", [t]);
+    const first = (await rpc.call("tasks", "get", [t.id])) as { title: string };
+    first.title = "scribbled";
+    expect(((await rpc.call("tasks", "get", [t.id])) as { title: string }).title).toBe("db-rpc");
+  });
+
+  test("a thrown error is a rebuilt instance, never the original", async () => {
+    const { HarnessBuiltinError } = await import("./db-core/errors.ts");
+    const builtin = dbm.harnesses.list().find((h) => h.isBuiltin)!;
+    let direct: unknown;
+    try { dbm.harnesses.assertDeletable(builtin.id); } catch (e) { direct = e; }
+    const viaRpc = await rpc.call("harnesses", "assertDeletable", [builtin.id]).then(() => null, (e: unknown) => e);
+    expect(viaRpc).toBeInstanceOf(HarnessBuiltinError);
+    expect(viaRpc).not.toBe(direct);
+    expect((viaRpc as Error).message).toBe((direct as Error).message);
   });
 });
 

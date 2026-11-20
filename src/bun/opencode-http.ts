@@ -85,6 +85,9 @@ const CHILD_PAGE_LIMIT = 200;
 const CHILD_MAX_PAGES = 10;
 /** Cap on the server-supplied text that is folded into an error message. */
 const MAX_ERROR_TEXT_CHARS = 300;
+/** How much of a server-supplied error text is ever redacted: far above the
+ *  300 characters shown, so whitespace collapsing cannot starve the output. */
+const MAX_ERROR_SOURCE_CHARS = 16 * 1024;
 /** The most bytes of one request op's response body the client reads. */
 export const OPENCODE_MAX_RESPONSE_BYTES = 32 * 1024 * 1024;
 
@@ -202,9 +205,18 @@ function runEnd(text: string, from: number, test: (c: number) => boolean): numbe
  * never backtracks and each one is measured once: the run lengths after a
  * start are cached by the index they end at, which keeps the scan O(n).
  */
+let userinfoScans = 0;
+
+/** Test-only: how many times `redactUserinfo` got past its early return and
+ *  ran the scan (so a timing test can prove its input reached the scan). */
+export function __userinfoScanCountForTest(): number {
+  return userinfoScans;
+}
+
 function redactUserinfo(text: string): string {
   // Every match ends in `@` and holds a `:`.
   if (!text.includes("@") || !text.includes(":")) return text;
+  userinfoScans++;
   const n = text.length;
   // userEnd/passEnd memoize runEnd for a run start already measured; a start
   // inside a measured run is answered from the run's end without a rescan.
@@ -266,9 +278,22 @@ function redactUserinfo(text: string): string {
 /** Server-supplied text folded into an error: redacted, control characters
  *  flattened, capped. (Printing it to a terminal still goes through
  *  `escapeFreeText` at the call site.) */
-function safeErrorText(text: string, password: string): string {
+export function safeErrorText(text: string, password: string): string {
+  // Bound the input BEFORE redacting: the redactor allocates per character
+  // (the userinfo scan keeps three Int32Array(n + 1)), so a multi-megabyte
+  // server body must never reach it. The output is capped at
+  // MAX_ERROR_TEXT_CHARS anyway, so only a prefix can be shown. When the text
+  // was cut, the (possibly partial) token at the cut is dropped too, so half
+  // a secret straddling the boundary can never survive redaction.
+  let bounded = text;
+  if (text.length > MAX_ERROR_SOURCE_CHARS) {
+    bounded = text.slice(0, MAX_ERROR_SOURCE_CHARS);
+    let end = bounded.length;
+    while (end > 0 && !isSpace(bounded.charCodeAt(end - 1))) end--;
+    if (end > 0) bounded = bounded.slice(0, end);
+  }
   // eslint-disable-next-line no-control-regex
-  const flat = redactSecrets(text, password).replace(/[\u0000-\u001f\u007f]+/g, " ").trim();
+  const flat = redactSecrets(bounded, password).replace(/[\u0000-\u001f\u007f]+/g, " ").trim();
   return flat.length > MAX_ERROR_TEXT_CHARS ? `${flat.slice(0, MAX_ERROR_TEXT_CHARS)}...` : flat;
 }
 

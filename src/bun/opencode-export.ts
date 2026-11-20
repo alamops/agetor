@@ -387,7 +387,7 @@ export function exportSummary(exp: OpencodeExport): OpencodeExportSummary {
   const info = infoOf(exp);
   const messages = messagesOf(exp);
   const model = isRec(info.model) ? info.model : null;
-  const modelId = model && str(model.providerID) && str(model.id) ? `${model.providerID}/${model.id}` : null;
+  const modelId = model && str(model.providerID) && str(model.id) ? `${String(model.providerID)}/${String(model.id)}` : null;
   const time = isRec(info.time) ? info.time : {};
   let firstUserText: string | null = null;
   let lastAgent: string | null = null;

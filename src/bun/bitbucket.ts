@@ -23,7 +23,7 @@ import type {
 import { GIT_HOST_TOKENS_SECTION } from "../shared/types.ts";
 import { contentTypeForPreviewPath, MAX_BLOB_PREVIEW_BYTES } from "../shared/attachments.ts";
 import { MAX_DIFF_FILES, parseGitDiff } from "./git-diff.ts";
-import { bitbucketCreds, type BitbucketCreds, resolveApiHost } from "./git-provider.ts";
+import { bitbucketCreds, type BitbucketCreds, resolveForgeApiHost } from "./git-provider.ts";
 
 /**
  * Bitbucket Cloud (api.bitbucket.org, REST 2.0) adapter
@@ -86,7 +86,7 @@ const BITBUCKET_PAGELEN = 30;
  * found" 404 instead of an actionable "wrong product" error — exactly
  * today's failure mode.
  *
- * `resolveApiHost` (git-provider.ts) resolves `repo.remoteHost` through
+ * `resolveForgeApiHost` (git-provider.ts) resolves `repo.remoteHost` through
  * `~/.ssh/config` the same way `gitlabHost`/`gitlabApiBase` do in gitlab.ts:
  * `bitbucket.org` itself short-circuits to itself, and an alias whose
  * `HostName` is `bitbucket.org` (or one of Bitbucket's alternate SSH
@@ -127,7 +127,7 @@ const BITBUCKET_PAGELEN = 30;
  * this adapter is ever reached.
  */
 export async function bitbucketServerError(repo: ProviderRepoInfo): Promise<string | null> {
-  const resolved = (await resolveApiHost(repo.remoteHost)).toLowerCase();
+  const resolved = (await resolveForgeApiHost(repo.remoteHost)).toLowerCase();
   if (resolved === "bitbucket.org") return null;
   // Dotless: ssh has nothing to tell us (no matching config entry, no dot to
   // even suggest a domain) — cannot be a Server/DC FQDN. Fail open.

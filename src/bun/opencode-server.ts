@@ -16,6 +16,7 @@ import {
   writeSync,
 } from "node:fs";
 import { createHash, randomBytes } from "node:crypto";
+import { registerLogSecret } from "./core-log.ts";
 import path from "node:path";
 import { dataDir } from "./db.ts";
 import { resolveTmuxBin, tmuxSocketArgs, ensureDisclaimedServer, tmuxEnv } from "./tmux-resolution.ts";
@@ -443,6 +444,7 @@ function readStateFile(file: string): StateFile | null {
       return null;
     }
     if (typeof o.startedAt !== "number" || !Number.isFinite(o.startedAt)) return null;
+    registerLogSecret(o.password);
     return {
       harnessId: o.harnessId,
       url: o.url,
@@ -934,6 +936,7 @@ async function startServer(spec: OpencodeServerSpec, fingerprint: string): Promi
   removeFiles(id, { log: true });
 
   const password = randomBytes(32).toString("base64url");
+  registerLogSecret(password);
   const tmuxSession = direct ? null : sessionNameFor(id);
   const startedAt = Date.now();
   const rec: ServerRecord = {

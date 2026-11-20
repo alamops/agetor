@@ -9,7 +9,7 @@ import {
   isValidCloneHost,
   parseCloneInput,
 } from "../shared/clone-input.ts";
-import { bitbucketCreds, gitlabToken, resolveApiHost } from "./git-provider.ts";
+import { bitbucketCreds, gitlabToken, resolveForgeApiHost } from "./git-provider.ts";
 import { githubToken, run } from "./github.ts";
 import { coreSpawn } from "./core-spawn.ts";
 import { bitbucketServerError } from "./bitbucket.ts";
@@ -24,7 +24,7 @@ import { bitbucketServerError } from "./bitbucket.ts";
  * syntactic parsing (which shape was pasted, what host/path it names) lives
  * in the shared, host-resolution-free `../shared/clone-input.ts` — this
  * module is the layer on top that applies the Git integration's REAL host
- * rules (`ssh -G` alias resolution via `resolveApiHost`, Bitbucket
+ * rules (`ssh -G` alias resolution via `resolveForgeApiHost`, Bitbucket
  * Server/Data Center rejection via `bitbucketServerError`, per-provider
  * credential resolution) on top of that syntax, because none of that can run
  * in the webview. Everything here is deterministic and unit-tested. The
@@ -108,7 +108,7 @@ function rejectedCloudPort(
  * Per-provider https rules mirror the Git integration's own resolvers
  * exactly, so "what clones" and "what the Git integration dialog already
  * talks to" never drift:
- *  - **GitHub**: `resolveApiHost` must resolve to `github.com` — GitHub
+ *  - **GitHub**: `resolveForgeApiHost` must resolve to `github.com` — GitHub
  *    Enterprise Server has no https support here (the integration doesn't
  *    support it either), and a dotless unresolved alias gets the SSH hint
  *    instead (nothing to reject-with-detail, since ssh told us nothing).
@@ -198,7 +198,7 @@ export async function resolveCloneRepo(
 
   // https / http.
   const rawHost = v.rawHost!;
-  const resolved = await resolveApiHost(rawHost);
+  const resolved = await resolveForgeApiHost(rawHost);
 
   if (v.provider === "github") {
     if (resolved !== "github.com") {

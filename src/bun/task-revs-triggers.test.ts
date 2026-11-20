@@ -175,6 +175,26 @@ describe("migration 093 through the runner", () => {
     ]);
     mem.close();
   });
+
+  test("all seven triggers survive the FULL migration list (a later table rebuild must recreate them)", async () => {
+    const { migrate } = await import("./migrate.ts");
+    const { migrations } = await import("./migrations/index.ts");
+    const mem = new Database(":memory:");
+    migrate(mem, migrations);
+    const names = mem.query<{ name: string }, []>(
+      `SELECT name FROM sqlite_master WHERE type = 'trigger' AND name LIKE 'trg_task_revs_%' ORDER BY name`,
+    ).all().map((r) => r.name);
+    expect(names).toEqual([
+      "trg_task_revs_runs_insert",
+      "trg_task_revs_runs_status",
+      "trg_task_revs_subagents_insert",
+      "trg_task_revs_subagents_status",
+      "trg_task_revs_tasks_delete",
+      "trg_task_revs_tasks_insert",
+      "trg_task_revs_tasks_update",
+    ]);
+    mem.close();
+  });
 });
 
 describe("task triggers", () => {

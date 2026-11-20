@@ -24,7 +24,9 @@
 
 import {
   handleTranscriptMessage,
+  type ReadChunkArgs,
   type ReadChunkReply,
+  type ReadMetaArgs,
   type TranscriptReply,
   type TranscriptRequest,
 } from "./workers/transcript-handler.ts";
@@ -59,8 +61,11 @@ export interface TranscriptClientOptions {
 
 export interface TranscriptClient {
   readonly mode: TranscriptClientMode;
-  readChunk(path: string, offset: number, maxBytes: number): Promise<ReadChunkReply>;
-  readMeta(dir: string, id: string): Promise<TranscriptMeta>;
+  /** `allowedRoot`: the validated subagents directory the file must sit
+   *  directly in (enforced by the handler; see workers/transcript-handler.ts).
+   *  Callers must pass it. */
+  readChunk(path: string, offset: number, maxBytes: number, allowedRoot?: string): Promise<ReadChunkReply>;
+  readMeta(dir: string, id: string, allowedRoot?: string): Promise<TranscriptMeta>;
   /** Terminate the worker and reject queued and in-flight calls. The client
    *  may not be used afterwards. */
   close(): void;
@@ -92,6 +97,31 @@ function defaultMode(): TranscriptClientMode {
   return process.env.NODE_ENV === "test" ? "inprocess" : "worker";
 }
 
+function chunkArgs(path: string, offset: number, maxBytes: number, allowedRoot?: string): ReadChunkArgs {
+  return allowedRoot === undefined ? { path, offset, maxBytes } : { path, offset, maxBytes, allowedRoot };
+}
+
+function metaArgs(dir: string, id: string, allowedRoot?: string): ReadMetaArgs {
+  return allowedRoot === undefined ? { dir, id } : { dir, id, allowedRoot };
+}
+
+type LogLevel = "debug" | "info" | "log" | "warn" | "error";
+const LOG_LEVELS: readonly string[] = ["debug", "info", "log", "warn", "error"];
+
+function isLogMessage(data: unknown): data is { log: { level: string; text: string } } {
+  if (typeof data !== "object" || data === null) return false;
+  const log = (data as { log?: unknown }).log;
+  return typeof log === "object" && log !== null && typeof (log as { text?: unknown }).text === "string";
+}
+
+/** A worker thread has its own console, which never reaches core.log; the
+ *  worker entry forwards its console output as `{ log: { level, text } }` and
+ *  the main thread re-emits it on its own (patched) console. */
+function forwardWorkerLog(log: { level: string; text: string }): void {
+  const level: LogLevel = LOG_LEVELS.includes(log.level) ? (log.level as LogLevel) : "log";
+  console[level]("[agetor:transcript-worker]", log.text);
+}
+
 function unwrap<T>(reply: TranscriptReply): T {
   if (reply.ok) return reply.result as T;
   throw new TranscriptClientError(reply.error.message, reply.error.code);
@@ -119,9 +149,10 @@ export function createTranscriptClient(opts: TranscriptClientOptions = {}): Tran
     };
     return {
       mode,
-      readChunk: (path, offset, maxBytes) =>
-        call<ReadChunkReply>({ op: "readChunk", args: { path, offset, maxBytes } }),
-      readMeta: (dir, id) => call<TranscriptMeta>({ op: "readMeta", args: { dir, id } }),
+      readChunk: (path, offset, maxBytes, allowedRoot) =>
+        call<ReadChunkReply>({ op: "readChunk", args: chunkArgs(path, offset, maxBytes, allowedRoot) }),
+      readMeta: (dir, id, allowedRoot) =>
+        call<TranscriptMeta>({ op: "readMeta", args: metaArgs(dir, id, allowedRoot) }),
       close() { closed = true; },
     };
   }
@@ -150,9 +181,11 @@ export function createTranscriptClient(opts: TranscriptClientOptions = {}): Tran
   }
 
   function onReply(from: TranscriptWorkerLike, data: unknown): void {
-    if (worker !== from || !active) return;
+    if (worker !== from) return;
+    if (isLogMessage(data)) { forwardWorkerLog(data.log); return; } // never a reply
+    if (!active) return;
     const reply = data as TranscriptReply | null;
-    if (!reply || typeof reply !== "object" || reply.id !== active.id) return; // not ours: ignore
+    if (!reply || typeof reply !== "object" || typeof reply.id !== "number" || reply.id !== active.id) return; // not ours (or no id): ignore
     const cur = active;
     active = null;
     clearTimeout(cur.timer);
@@ -225,8 +258,9 @@ export function createTranscriptClient(opts: TranscriptClientOptions = {}): Tran
 
   return {
     mode,
-    readChunk: (path, offset, maxBytes) => call<ReadChunkReply>({ op: "readChunk", args: { path, offset, maxBytes } }),
-    readMeta: (dir, id) => call<TranscriptMeta>({ op: "readMeta", args: { dir, id } }),
+    readChunk: (path, offset, maxBytes, allowedRoot) =>
+      call<ReadChunkReply>({ op: "readChunk", args: chunkArgs(path, offset, maxBytes, allowedRoot) }),
+    readMeta: (dir, id, allowedRoot) => call<TranscriptMeta>({ op: "readMeta", args: metaArgs(dir, id, allowedRoot) }),
     close() {
       if (closed) return;
       closed = true;

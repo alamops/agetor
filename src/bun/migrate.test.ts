@@ -1,4 +1,7 @@
-import { test, expect } from "bun:test";
+import { test, expect, describe } from "bun:test";
+import { mkdtempSync, rmSync } from "node:fs";
+import { tmpdir } from "node:os";
+import path from "node:path";
 import { Database } from "bun:sqlite";
 import { migrate, splitSqlStatements, type Migration } from "./migrate.ts";
 import reseedBuiltins from "./migrations/024_reseed_harness_builtins.sql" with { type: "text" };
@@ -2857,4 +2860,98 @@ test("migration 093 splits into whole trigger statements and applies", () => {
   const triggers = statements.filter((s) => /^CREATE TRIGGER/.test(s));
   expect(triggers).toHaveLength(7);
   for (const t of triggers) expect(t).toMatch(/\bEND$/);
+});
+
+test("a token after a dot is a column name, not a block keyword", () => {
+  const sql = `CREATE TRIGGER t AFTER UPDATE ON x BEGIN
+    UPDATE y SET a = NEW.end, b = OLD.case WHERE id = NEW.begin;
+    INSERT INTO z VALUES (CASE WHEN NEW.end > 1 THEN 1 ELSE 0 END);
+  END;
+  SELECT 1;`;
+  const statements = splitSqlStatements(sql);
+  expect(statements).toHaveLength(2);
+  expect(statements[0]).toMatch(/^CREATE TRIGGER[\s\S]*END$/);
+  expect(statements[1]).toBe("SELECT 1");
+});
+
+describe("two connections migrating one database", () => {
+  function pair() {
+    const dir = mkdtempSync(path.join(tmpdir(), "agetor-migrate-"));
+    const file = path.join(dir, "m.sqlite");
+    const open = () => {
+      const c = new Database(file);
+      c.exec("PRAGMA journal_mode = WAL; PRAGMA busy_timeout = 5000;");
+      return c;
+    };
+    return { dir, a: open(), b: open() };
+  }
+  const list: Migration[] = [
+    { id: "001_a", sql: "CREATE TABLE a (x INTEGER);" },
+    { id: "002_b", sql: "CREATE TABLE b (x INTEGER); INSERT INTO b VALUES (1);" },
+  ];
+
+  /** Run the second connection's whole migrate() once the first has read
+   *  `_migrations` but applied nothing: the second `id` read of the racing
+   *  migration is the pending filter, after the alias loop. */
+  function interleaved(runB: () => string[]): { list: Migration[]; bRan: () => string[] } {
+    let reads = 0;
+    let bRan: string[] = [];
+    let busy = false;
+    const target = list[1]!;
+    const racing: Migration = {
+      get id() {
+        reads++;
+        if (reads === 2 && !busy) {
+          busy = true;
+          bRan = runB();
+        }
+        return target.id;
+      },
+      sql: target.sql,
+    };
+    return { list: [list[0]!, racing], bRan: () => bRan };
+  }
+
+  test("a migration the other connection applied after the read is skipped, never applied twice", () => {
+    const { dir, a, b } = pair();
+    const race = interleaved(() => migrate(b, list));
+    const ran = migrate(a, race.list);
+    expect(race.bRan()).toEqual(["001_a", "002_b"]);
+    expect(ran).toEqual([]);
+    expect(a.query(`SELECT COUNT(*) AS n FROM b`).get()).toEqual({ n: 1 });
+    expect(a.query(`SELECT COUNT(*) AS n FROM _migrations`).get()).toEqual({ n: 2 });
+    a.close();
+    b.close();
+    rmSync(dir, { recursive: true, force: true });
+  });
+
+  test("red proof: the old read-outside-the-transaction shape re-applies and throws", () => {
+    const { dir, a, b } = pair();
+    const oldMigrate = (db: Database, ms: Migration[]) => {
+      db.exec(`CREATE TABLE IF NOT EXISTS _migrations (id TEXT PRIMARY KEY, applied_at INTEGER NOT NULL)`);
+      const applied = new Set(db.query<{ id: string }, []>(`SELECT id FROM _migrations`).all().map((r) => r.id));
+      migrate(b, list); // the other connection finishes first
+      const apply = db.transaction((m: Migration) => {
+        for (const s of splitSqlStatements(m.sql)) db.run(s);
+        db.run(`INSERT INTO _migrations (id, applied_at) VALUES (?, ?)`, [m.id, Date.now()]);
+      });
+      for (const m of ms.filter((x) => !applied.has(x.id))) apply(m);
+    };
+    expect(() => oldMigrate(a, list)).toThrow(/already exists/);
+    a.close();
+    b.close();
+    rmSync(dir, { recursive: true, force: true });
+  });
+
+  test("an alias already applied by the other connection is not re-run either", () => {
+    const { dir, a, b } = pair();
+    const aliased: Migration[] = [{ id: "001_a", sql: "CREATE TABLE a (x INTEGER);", aliases: ["001_old"] }];
+    expect(migrate(a, aliased)).toEqual(["001_a"]);
+    b.run(`DELETE FROM _migrations`);
+    b.run(`INSERT INTO _migrations (id, applied_at) VALUES ('001_old', 1)`);
+    expect(migrate(b, aliased)).toEqual([]);
+    a.close();
+    b.close();
+    rmSync(dir, { recursive: true, force: true });
+  });
 });

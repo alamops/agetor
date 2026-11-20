@@ -191,27 +191,40 @@ export function makeHarnessStore(conn: Database) {
    */
   let orphanStamp: number | null = null;
 
+  /** The newest integer stamp in the table, clamped (see above). Read inside the
+   *  caller's write transaction for a stamp, so two connections on one database
+   *  agree on it. */
+  function tableOrphanStamp(): number {
+    const max = conn
+      .query<{ m: number | null }, []>(
+        `SELECT MAX(created_at) AS m FROM harness_orphaned_copies WHERE typeof(created_at) = 'integer'`,
+      )
+      .get()?.m;
+    const seed = typeof max === "number" && Number.isSafeInteger(max) ? max : 0;
+    return Math.min(seed, Date.now() + ORPHAN_STAMP_SEED_MARGIN_MS);
+  }
+
   function currentOrphanStamp(): number {
-    if (orphanStamp === null) {
-      const max = conn
-        .query<{ m: number | null }, []>(
-          `SELECT MAX(created_at) AS m FROM harness_orphaned_copies WHERE typeof(created_at) = 'integer'`,
-        )
-        .get()?.m;
-      const seed = typeof max === "number" && Number.isSafeInteger(max) ? max : 0;
-      orphanStamp = Math.min(seed, Date.now() + ORPHAN_STAMP_SEED_MARGIN_MS);
-    }
+    // Re-derive from the table every time: another connection (the database
+    // worker, or the main thread) may have stamped since this one last looked,
+    // so a per-instance value alone could repeat a stamp it never saw.
+    const fromTable = tableOrphanStamp();
+    orphanStamp = Math.max(orphanStamp ?? 0, fromTable);
     return orphanStamp;
   }
 
-  /** Test seam: forget the seeded stamp, so the next stamp re-reads the table. */
+  /** Test seam: forget the remembered stamp, so the next stamp re-reads the table. */
   function resetOrphanStampForTests(): void {
     orphanStamp = null;
   }
 
-  /** A stamp strictly after every earlier stamp and every mark. */
+  /** A stamp strictly after every earlier stamp (in the table or this instance)
+   *  and every mark. It is also at least one millisecond past the wall clock: a
+   *  mark is `max(now, newest stamp)`, so a record another connection stamps
+   *  after that mark, even in the same millisecond, is always above it. Call it
+   *  inside the write transaction that inserts the stamped rows. */
   function nextOrphanStamp(): number {
-    orphanStamp = Math.max(Date.now(), currentOrphanStamp() + 1);
+    orphanStamp = Math.max(Date.now() + 1, currentOrphanStamp() + 1);
     return orphanStamp;
   }
 
@@ -403,7 +416,7 @@ export function makeHarnessStore(conn: Database) {
           // like `harnessStacks.update`.
           conn.run(`UPDATE harness_stacks SET updated_at = MAX(?, updated_at + 1) WHERE id = ?`, [Date.now(), membership.stack_id]);
         }
-      })();
+      }).immediate();
     },
     /**
      * Soft delete / re-enable. Carve-out from `HarnessBuiltinError` — toggling
@@ -506,7 +519,7 @@ export function makeHarnessStore(conn: Database) {
             handoff.createdAt,
           ],
         );
-      })();
+      }).immediate();
     },
     deleteForHarness(harnessId: string): void {
       conn.run(`DELETE FROM harness_session_handoffs WHERE harness_id = ?`, [harnessId]);
@@ -526,7 +539,7 @@ export function makeHarnessStore(conn: Database) {
         if (!row) return;
         harnessOrphanedCopies.add(row.harnessId, row.columnName, row.sessionId, row.copiedPaths);
         this.deleteOne(taskId, harnessId, column);
-      })();
+      }).immediate();
     },
     /**
      * The boot normalization of one row (see `adoptMismatchedHandoffPaths`):
@@ -561,7 +574,7 @@ export function makeHarnessStore(conn: Database) {
           [JSON.stringify(keep), taskId, harnessId, column],
         );
         return moved;
-      })();
+      }).immediate();
     },
     listAll(): HarnessSessionHandoff[] {
       return conn
@@ -623,7 +636,7 @@ export function makeHarnessStore(conn: Database) {
             [harnessId, column, sessionId, p, now],
           );
         }
-      })();
+      }).immediate();
     },
     /**
      * A mark for a sweep, taken before it lists the records: every record listed
@@ -669,7 +682,7 @@ export function makeHarnessStore(conn: Database) {
             );
           }
         }
-      })();
+      }).immediate();
     },
     /** Drop every record (of one account, when given) whose column is not a
      *  handoff column. Nothing agetor writes has one, so such a row was planted;

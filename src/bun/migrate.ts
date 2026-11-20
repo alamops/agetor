@@ -54,7 +54,9 @@ export function splitSqlStatements(sql: string): string[] {
       if (upper === "BEGIN" || upper === "CASE" || upper === "END") {
         // A quoted identifier ("end", `end`, [end]) is not a keyword.
         const quoted = /["`\[]/.test(sql[i - 1] ?? "") && /["`\]]/.test(sql[end] ?? "");
-        if (!quoted) {
+        // A token after `.` (`NEW.end`, `OLD.case`) is a column name.
+        const member = sql[i - 1] === ".";
+        if (!quoted && !member) {
           if (isTrigger === null) {
             const bare = current.replace(/--[^\n]*/g, "").replace(/\/\*[\s\S]*?\*\//g, "");
             isTrigger = /^\s*CREATE\s+(?:TEMP(?:ORARY)?\s+)?TRIGGER\b/i.test(bare);
@@ -136,7 +138,7 @@ export function migrate(db: Database, migrations: Migration[]): string[] {
     if (applied.has(m.id)) continue;
     if (!m.aliases?.some((alias) => applied.has(alias))) continue;
     db.run(
-      `INSERT INTO _migrations (id, applied_at) VALUES (?, ?)`,
+      `INSERT OR IGNORE INTO _migrations (id, applied_at) VALUES (?, ?)`,
       [m.id, Date.now()],
     );
     applied.add(m.id);
@@ -144,11 +146,21 @@ export function migrate(db: Database, migrations: Migration[]): string[] {
 
   const pending = migrations.filter((m) => !applied.has(m.id));
 
-  const applyOne = db.transaction((m: Migration) => {
+  // Each migration is checked and applied inside one BEGIN IMMEDIATE
+  // transaction. The `applied` set above is only a hint: a second connection
+  // migrating the same file concurrently may have applied this migration since
+  // it was read, so it is re-read here after the write lock is held (the loser
+  // of the lock waits on busy_timeout, then sees the row and skips).
+  const applyOne = db.transaction((m: Migration): boolean => {
+    const isApplied = (id: string) =>
+      db.query<{ id: string }, [string]>(`SELECT id FROM _migrations WHERE id = ?`).get(id) !== null;
+    if (isApplied(m.id) || m.aliases?.some(isApplied)) return false;
     for (const statement of splitSqlStatements(m.sql)) db.run(statement);
     db.run(`INSERT INTO _migrations (id, applied_at) VALUES (?, ?)`, [m.id, Date.now()]);
+    return true;
   });
 
-  for (const m of pending) applyOne(m);
-  return pending.map((m) => m.id);
+  const ran: string[] = [];
+  for (const m of pending) if (applyOne.immediate(m)) ran.push(m.id);
+  return ran;
 }

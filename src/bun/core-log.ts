@@ -49,12 +49,15 @@ const FLUSH_EVERY_MS = 200;
 const FLUSH_BYTES = 64 * 1024;
 /** In-memory ceiling between two flushes. */
 const MAX_QUEUE_BYTES = 2 * 1024 * 1024;
-/** One line is cut here so a single huge payload can't dominate the queue. It
- *  also bounds redaction cost: the URL-userinfo pattern inside `redactSecrets`
- *  is quadratic on a long run with no whitespace (measured 85 ms at 8,000
- *  chars, 16 ms at 4,000), and a log call must stay far under the 100 ms
- *  main-thread budget. */
-const MAX_LINE_CHARS = 4096;
+/** One line is cut here (16 KB) so a single huge payload can't dominate the
+ *  queue. The cut happens AFTER redaction, so a secret straddling the cap is
+ *  already `[redacted]` and can't leak its prefix. Redaction is linear now, so
+ *  the cap no longer has to protect the main-thread budget. */
+const MAX_LINE_CHARS = 16 * 1024;
+/** Text longer than this is cut BEFORE redaction purely to bound its cost
+ *  (a console.log of a multi-MB string); the cut backs off to the last
+ *  whitespace so a token is not split by it. */
+const MAX_PRE_REDACT_CHARS = 256 * 1024;
 /** A secret shorter than this is not registered: replacing "ab" everywhere
  *  would shred the log without protecting anything. */
 const MIN_SECRET_CHARS = 6;
@@ -66,22 +69,34 @@ type Level = "log" | "info" | "warn" | "error" | "debug";
 const LEVELS: Level[] = ["log", "info", "warn", "error", "debug"];
 
 const secrets = new Set<string>();
+/** Bumped whenever a NEW secret is registered. A queued line remembers the
+ *  generation it was redacted under; at flush time the literal pass re-runs
+ *  only if a secret arrived since. */
+let secretGen = 0;
+/** The generation of the oldest line still queued. */
+let queueGen = 0;
 
 /** Register a literal secret (token, password) to be replaced everywhere it
  *  appears in a log line, including inside a longer string. */
 export function registerLogSecret(value: string | null | undefined): void {
   if (typeof value !== "string" || value.length < MIN_SECRET_CHARS) return;
+  if (secrets.has(value)) return;
   secrets.add(value);
+  secretGen++;
+}
+
+function redactLiterals(text: string): string {
+  let out = text;
+  for (const secret of secrets) {
+    if (out.includes(secret)) out = out.split(secret).join("[redacted]");
+  }
+  return out;
 }
 
 /** The one redactor for log text: registered secrets, then Bearer/Authorization
  *  and `token=` patterns, then `redactSecrets` (OpenCode password forms). */
 export function redactLogText(text: string): string {
-  let out = text;
-  for (const secret of secrets) {
-    if (out.includes(secret)) out = out.split(secret).join("[redacted]");
-  }
-  out = out
+  const out = redactLiterals(text)
     // "Bearer xyz" of any length (redactSecrets only catches 8+ chars).
     .replace(/\b(bearer)(\s+)[^\s"']+/gi, "$1$2[redacted]")
     // `token=…` / `access_token: …` in a URL, header dump or JSON.
@@ -115,6 +130,9 @@ let inFlight = "";
 let chain: Promise<void> = Promise.resolve();
 let handle: FileHandle | null = null;
 let fileSize = 0;
+/** Inode of the file our handle has open; rotation only renames the path when
+ *  it still names this inode. */
+let openedIno = -1;
 let lastErrorReportAt = Number.NEGATIVE_INFINITY;
 let inTee = false;
 
@@ -149,8 +167,17 @@ function enqueue(level: Level, args: unknown[]): void {
   } catch {
     text = "[unformattable log arguments]";
   }
-  if (text.length > MAX_LINE_CHARS) text = `${text.slice(0, MAX_LINE_CHARS)}... [truncated]`;
-  const line = `${new Date().toISOString()} ${level.toUpperCase()} ${redactLogText(text)}\n`;
+  if (text.length > MAX_PRE_REDACT_CHARS) {
+    text = text.slice(0, MAX_PRE_REDACT_CHARS);
+    const ws = Math.max(text.lastIndexOf(" "), text.lastIndexOf("\n"));
+    if (ws > MAX_PRE_REDACT_CHARS - 512) text = text.slice(0, ws);
+    text += "... [truncated]";
+  }
+  // Redact first, truncate second: a secret cut at the cap must not leak.
+  let body = redactLogText(text);
+  if (body.length > MAX_LINE_CHARS) body = `${body.slice(0, MAX_LINE_CHARS)}... [truncated]`;
+  const line = `${new Date().toISOString()} ${level.toUpperCase()} ${body}\n`;
+  if (queue.length === 0) queueGen = secretGen;
   queue.push(line);
   queueBytes += line.length;
   // Drop the OLDEST lines past the ceiling. A head index would avoid the O(n)
@@ -192,7 +219,10 @@ function takeBatch(): string {
     out += `${new Date().toISOString()} WARN [agetor] core log: ${droppedLines} lines dropped (log storm)\n`;
     droppedLines = 0;
   }
-  out += queue.join("");
+  let lines = queue.join("");
+  // A secret registered after these lines were queued: re-run the literal pass.
+  if (lines !== "" && secretGen !== queueGen) lines = redactLiterals(lines);
+  out += lines;
   queue = [];
   queueBytes = 0;
   return out;
@@ -207,9 +237,12 @@ async function openHandle(cfg: Config): Promise<FileHandle> {
   const h = await open(cfg.file, "a", 0o600);
   await chmod(cfg.file, 0o600).catch(() => {});
   try {
-    fileSize = (await stat(cfg.file)).size;
+    const st = await h.stat();
+    fileSize = st.size;
+    openedIno = st.ino;
   } catch {
     fileSize = 0;
+    openedIno = -1;
   }
   return h;
 }
@@ -220,11 +253,26 @@ async function rotate(cfg: Config): Promise<void> {
     handle = null;
     await h.close().catch(() => {});
   }
-  // Shift oldest-first: rename overwrites, so the last generation falls off.
-  for (let i = cfg.files - 2; i >= 1; i--) {
-    await rename(`${cfg.file}.${i}`, `${cfg.file}.${i + 1}`).catch(() => {});
+  // Two cores can share a data dir during an app <-> background handoff, and
+  // both see "over the limit". Re-stat first: rotate only if the path is still
+  // over the limit AND is the inode we had open. If the other core already
+  // rotated, the path now names its fresh file, which we must not shift away;
+  // the caller reopens in append mode either way. Residual race: the other core
+  // can still rotate between this stat and the rename below, costing at most
+  // one extra generation shift; there is no cross-process lock.
+  let st: Awaited<ReturnType<typeof stat>> | null = null;
+  try {
+    st = await stat(cfg.file);
+  } catch {
+    st = null;
   }
-  await rename(cfg.file, `${cfg.file}.1`).catch(() => {});
+  if (st && st.size > cfg.maxBytes && st.ino === openedIno) {
+    // Shift oldest-first: rename overwrites, so the last generation falls off.
+    for (let i = cfg.files - 2; i >= 1; i--) {
+      await rename(`${cfg.file}.${i}`, `${cfg.file}.${i + 1}`).catch(() => {});
+    }
+    await rename(cfg.file, `${cfg.file}.1`).catch(() => {});
+  }
   fileSize = 0;
 }
 
@@ -237,7 +285,10 @@ async function writeBatch(batch: string): Promise<void> {
     handle = await openHandle(cfg);
   }
   await handle.write(batch);
+  // Confirmed on disk: the exit flush must not write it again.
+  inFlight = "";
   fileSize += Buffer.byteLength(batch);
+  __testing.afterWrite?.();
 }
 
 function runFlush(): Promise<void> {
@@ -278,6 +329,12 @@ export async function flushCoreLog(): Promise<void> {
     if (queue.length === 0 && droppedLines === 0) break;
   }
 }
+
+/** Test seam. */
+export const __testing: { afterWrite: (() => void) | null; exitFlush: () => void } = {
+  afterWrite: null,
+  exitFlush: () => exitFlush(),
+};
 
 function exitFlush(): void {
   const cfg = config;
@@ -338,7 +395,13 @@ export function installCoreLog(opts: { dataDir?: string; maxBytes?: number; file
 /** Restore the console and close the file (tests, and a clean shutdown that
  *  wants the console back). Flushes first. */
 export async function uninstallCoreLog(): Promise<void> {
-  if (!installed) return;
+  if (!installed) {
+    // Registered secrets are module state; clear them even when never installed.
+    secrets.clear();
+    secretGen = 0;
+    queueGen = 0;
+    return;
+  }
   await flushCoreLog();
   for (const level of LEVELS) {
     const raw = rawConsole[level];
@@ -354,6 +417,9 @@ export async function uninstallCoreLog(): Promise<void> {
   queueBytes = 0;
   droppedLines = 0;
   secrets.clear();
+  secretGen = 0;
+  queueGen = 0;
+  inFlight = "";
   if (handle) {
     const h = handle;
     handle = null;

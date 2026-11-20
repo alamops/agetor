@@ -302,7 +302,7 @@ export function makeOpencodeStoppedChildren(conn: Database) {
            ON CONFLICT(child_session_id) DO UPDATE SET task_id = excluded.task_id, stopped_at = excluded.stopped_at`,
           [childSessionId, taskId, at],
         );
-      })();
+      }).immediate();
     },
     /** When agetor last noted this child as stopped (epoch ms), or null. */
     stoppedAt(childSessionId: string): number | null {
@@ -347,7 +347,7 @@ export function makeOpencodeWatchTombstones(conn: Database) {
            SELECT expires_at FROM opencode_watch_tombstones ORDER BY expires_at DESC LIMIT 1 OFFSET ?)`,
           [Math.max(0, max - 1)],
         );
-      })();
+      }).immediate();
     },
     /** The tombstones still in force at `now`, soonest to expire first (at most `limit`). */
     live(now: number, limit = 500): OpencodeWatchTombstone[] {

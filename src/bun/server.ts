@@ -377,7 +377,10 @@ export function attachedClientCount(): number {
   return attachedClients;
 }
 
-const json = (data: unknown, init?: ResponseInit) =>
+// `data` rejects a PromiseLike at compile time: `json(tasks.get(id))` with a
+// missed `await` would serialize `{}`. Exported for the compile-time proof.
+export type NotPromise<T> = T extends PromiseLike<unknown> ? never : T;
+const json = <T,>(data: NotPromise<T>, init?: ResponseInit) =>
   new Response(JSON.stringify(data), {
     headers: { "content-type": "application/json", ...(init?.headers ?? {}) },
     status: init?.status,

@@ -52,13 +52,23 @@ export interface WorkerDb {
   close(): void;
 }
 
+export interface OpenWorkerDbHooks {
+  /** Called after the connection is open and before `migrate` runs. The worker
+   *  posts `{ migrating: true }` from here; under NODE_ENV=test it may also
+   *  stall, standing in for a slow migration. */
+  beforeMigrate?: () => void;
+}
+
 /** Open the database, apply the pragmas, run the migrations and instantiate
  *  every db-core module (task decorations stay at their zero default: the main
  *  thread overlays them). */
-export function openWorkerDb(dbPath: string): WorkerDb {
+export function openWorkerDb(dbPath: string, hooks: OpenWorkerDbHooks = {}): WorkerDb {
   const conn = new Database(dbPath);
   try {
     applyConnectionPragmas(conn);
+    // Opening is done; what follows is the migration run, which can take minutes
+    // on a large database. The main thread stops its ready timer on this signal.
+    hooks.beforeMigrate?.();
     const applied = migrate(conn, migrations);
     if (applied.length) console.log(`[agetor] applied migrations: ${applied.join(", ")}`);
     const modules = buildDbModules(conn);

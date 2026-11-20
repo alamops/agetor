@@ -418,7 +418,7 @@ export function makeTasks(conn: Database, deps: TasksDeps) {
       conn.transaction(() => {
         harnessOrphanedCopies.adoptFromTask(id);
         conn.run(`DELETE FROM tasks WHERE id = ?`, [id]);
-      })();
+      }).immediate();
     },
     /**
      * Mark a task's unread watermark caught-up-to-date: `last_seen_event_id`
@@ -725,7 +725,7 @@ export function makeTasks(conn: Database, deps: TasksDeps) {
             [value, row.pipeline_parent_id, value],
           );
         }
-      })();
+      }).immediate();
     },
     /**
      * Replace a task's pinned repository set (migration 087, issue #291) in one
@@ -859,7 +859,7 @@ export function makeTasks(conn: Database, deps: TasksDeps) {
             .get(row.pipeline_parent_id);
           if (parent) writeRepositoryCheckout(row.pipeline_parent_id, parent.repositories, repoName, value);
         }
-      })();
+      }).immediate();
       return found ? this.get(taskId) : null;
     },
     /**

@@ -8,7 +8,7 @@ export interface OpCtx {
 }
 
 export interface OpDef<A extends unknown[], R> {
-  /** Run inside `conn.transaction(...)`. */
+  /** Run inside `conn.transaction(...).immediate()` (BEGIN IMMEDIATE). */
   readonly tx: boolean;
   run(ctx: OpCtx, ...args: A): R;
 }

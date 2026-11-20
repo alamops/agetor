@@ -88,14 +88,23 @@ async function overlayTaskResult(
       : result.map((t) => decorateTask(t, decor));
   }
   if (!isTaskLike(result)) return result;
-  if (module === "tasks" && method === "get" && result.pipelineId) {
+  // Whatever method returned it (get, update, markSeen, a backlog or draft write,
+  // ...): the synchronous path ends each of them in `tasks.get`, which folds a
+  // pipeline parent's hidden steps into its count (M17), so every single-Task
+  // result with a `pipelineId` gets the same fold. `decorateTask*` recompute from
+  // the registries, so a result that already carries the steps (in-process mode)
+  // is neither stripped nor doubled.
+  if (result.pipelineId) {
     const steps = (await rpc.call("tasks", "stepsForParent", [result.id])) as Task[];
     return decorateTaskWithSteps(result, steps, decor);
   }
   return decorateTask(result, decor);
 }
 
-const TASK_RESULT_MODULES = new Set(["tasks", "backlog", "drafts"]);
+/** String property names a runtime probes on any object; never database methods. */
+const NON_METHOD_PROPS = new Set(["then", "toJSON", "inspect", "constructor", "toString", "valueOf", "toLocaleString", "asymmetricMatch", "$$typeof", "nodeType"]);
+
+const TASK_RESULT_MODULES =new Set(["tasks", "backlog", "drafts"]);
 
 function makeAsyncModule<K extends keyof DbModules>(
   getRpc: () => DbRpc,
@@ -106,7 +115,11 @@ function makeAsyncModule<K extends keyof DbModules>(
   return new Proxy({} as AsyncModule<DbModules[K]>, {
     get(_target, prop) {
       // Never look like a thenable: `await facade.tasks` must not call a method.
-      if (typeof prop !== "string" || prop === "then") return undefined;
+      // Nor like a serialisable or inspectable one: JSON.stringify (`toJSON`),
+      // console.log / util.inspect (`inspect`, the inspect symbol, `constructor`)
+      // and string coercion probe these, and each must not fire an RPC. Symbol
+      // props (inspect.custom, toPrimitive, ...) are not strings, so they land here too.
+      if (typeof prop !== "string" || NON_METHOD_PROPS.has(prop)) return undefined;
       let fn = methods.get(prop);
       if (!fn) {
         fn = async (...args: unknown[]) => {

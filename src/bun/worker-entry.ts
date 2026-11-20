@@ -15,8 +15,10 @@ export interface CoreWorkerLike extends TranscriptWorkerLike {
 /** Candidate paths of the worker entry, best first. */
 export function coreWorkerCandidates(): string[] {
   const candidates: string[] = [];
+  // A test/e2e seam, like the repo's other seams: production ignores it, because
+  // whatever path it names is run as code in the core process.
   const fromEnv = process.env.AGETOR_CORE_WORKER_ENTRY;
-  if (fromEnv) candidates.push(fromEnv);
+  if (fromEnv && (process.env.NODE_ENV === "test" || process.env.AGETOR_E2E_HARNESS_SEAMS === "1")) candidates.push(fromEnv);
   // Next to the running bundle.
   candidates.push(path.join(import.meta.dir, "core-worker.js"));
   // The packaged app: the launcher may run our bundle from a temp file, so
