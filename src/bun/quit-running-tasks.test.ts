@@ -106,6 +106,11 @@ test("a run claimed in memory but not yet in the snapshot still produces the qui
     requeueQuit: () => {},
     timeoutMs: 8_000,
   });
+  // quit-guard's force/completely flags are module state shared across files in
+  // one bun test process: drain any an earlier quit test left pending, or a
+  // stale force-quit skips the running check and the decision is a veto.
+  guard.consumeForceQuit();
+  guard.consumeQuitCompletely();
   const decide = (runningTaskIds: () => string[]) =>
     decideBeforeQuit({
       consumeForceQuit: guard.consumeForceQuit,
