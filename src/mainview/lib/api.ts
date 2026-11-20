@@ -107,7 +107,8 @@ import type {
   WorktreeInfo,
   WorktreeTeardownResult,
 } from "../../shared/types.ts";
-import { TASK_EVENTS_REPLAY_META_EVENT, taskListPath, type TaskListOptions } from "../../shared/types.ts";
+import { TASK_EVENTS_REPLAY_META_EVENT, taskListPath, type TaskDelta, type TaskListOptions } from "../../shared/types.ts";
+import { isTaskDelta, taskDeltaPath } from "../../shared/task-delta.ts";
 import { parseReplayMeta } from "../../shared/task-stream-resume.ts";
 import type { NotificationKind } from "../../shared/os-notification.ts";
 import type { DiscoveredModel } from "../../shared/model-options.ts";
@@ -1783,6 +1784,15 @@ export const api = {
    *  keep }` so archived tasks stay server-side unless a view needs them
    *  (`TaskListArchived`, docs/architecture/core-responsiveness.md). */
   listTasks: (opts?: TaskListOptions) => j<Task[]>(taskListPath(opts)),
+  /** `GET /tasks?delta=1[&since=cursor]` - the board's delta refresh. An older
+   *  core ignores `delta=1` and answers a bare array; that comes back as is (a
+   *  full list) for the caller to treat as a snapshot with no cursor. */
+  listTaskDelta: async (opts?: TaskListOptions, since?: string | null): Promise<TaskDelta | Task[]> => {
+    const body = await j<unknown>(taskDeltaPath(opts, since));
+    if (isTaskDelta(body)) return body;
+    if (Array.isArray(body)) return body as Task[];
+    throw new Error("unexpected /tasks response");
+  },
   /** Single task by id, fresh from the server (bypasses the 2s board poll's
    *  staleness). Used to re-check a task's persisted draft right after the
    *  panel seeds from a possibly-stale polled object — see RunPanel's
@@ -2336,10 +2346,16 @@ export const api = {
    *  see events from the moment they connect. Used by the toast hook in
    *  App.tsx to surface success / error / pending-input across every task
    *  without subscribing per-task. */
-  subscribeGlobalEvents(onEvent: (e: GlobalEvent) => void): () => void {
+  subscribeGlobalEvents(
+    onEvent: (e: GlobalEvent) => void,
+    /** Connection state of this one stream (the board's poll cadence follows it). */
+    onConnection?: (connected: boolean) => void,
+  ): () => void {
     return openEventStream(
       `${BASE}/events`,
       {
+        onOpen: () => onConnection?.(true),
+        onClose: () => onConnection?.(false),
         onMessage: (data) => {
           try {
             const parsed = JSON.parse(data);
