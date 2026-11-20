@@ -93,6 +93,21 @@ db.exec("PRAGMA foreign_keys = ON;");
 // actually read, so a small database costs no more than before.
 db.exec(`PRAGMA cache_size = ${-SQLITE_CACHE_KIB};`);
 
+/** Most of the database file SQLite reads through a memory map. */
+export const DB_MMAP_SIZE_BYTES = 256 * 1024 * 1024;
+// Read-side tuning beside the page cache above (docs/architecture/persistence.md).
+// `mmap_size` serves reads from the OS file cache without the extra copy into
+// SQLite's own buffers, and macOS reclaims those pages under memory pressure;
+// the trade-off is that a disk read error surfaces as a crash (SIGBUS) rather
+// than SQLITE_IOERR. Measured on a 4.6 GB owner DB, the 3,363-row task list
+// took ~1 s at SQLite's defaults, ~0.28 s with the 64 MiB cache alone and
+// ~0.22 s with the cache and this map. `temp_store = MEMORY` keeps the list's
+// GROUP BY / ORDER BY scratch b-trees off disk. It must run before the TEMP
+// table and triggers below are created: changing `temp_store` drops every
+// TEMP object already on the connection.
+db.exec(`PRAGMA mmap_size = ${DB_MMAP_SIZE_BYTES};`);
+db.exec("PRAGMA temp_store = MEMORY;");
+
 const applied = migrate(db, migrations);
 if (applied.length) console.log(`[agetor] applied migrations: ${applied.join(", ")}`);
 
