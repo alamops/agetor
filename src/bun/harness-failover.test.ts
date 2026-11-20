@@ -1198,7 +1198,7 @@ describe("discovery first: a CLI catalog decides model availability, the frozen 
       // is not the one the CLI reports now.
       dbm.preferences.set(prefKey, JSON.stringify({ v: 1, cliVersion: "codex-cli 0.099.0", savedAt: 1, models: [{ id: "some-other-model" }] }));
       discovery.seedDiscoveryCache({ scope: "harness", kind: "codex", harnessId: id }, [{ id: "some-other-model" }]);
-      scheduler.__testing.hydrateFromStore();
+      await scheduler.__testing.hydrateFromStore();
       // Judged by neither list nor "not offered": only the frozen floor speaks.
       expect(fo.memberUnusableReason(member, { model } as never)).toBe(`CLI older than ${floor}`);
     } finally {
@@ -1228,7 +1228,7 @@ describe("a 1-member stack is inert (22a) and prepare moves record `unavailable`
       expect(res).toEqual({ ok: true });
       expect(dbm.tasks.get(taskId)!.agent).toBe(a);
       expect(dbm.tasks.get(taskId)!.harnessState ?? null).toBeNull();
-      expect(harnessSwapEvents.page(stack.id, { limit: 10 }).events).toHaveLength(0);
+      expect((await harnessSwapEvents.page(stack.id, { limit: 10 })).events).toHaveLength(0);
     } finally {
       dbm.harnesses.setEnabled(a, true);
       stacks.harnessStacks.delete(stack.id);
@@ -1245,7 +1245,7 @@ describe("a 1-member stack is inert (22a) and prepare moves record `unavailable`
       const res = await fo.prepareTaskHarness(taskId, { manual: false });
       expect(res.ok).toBe(true);
       expect(dbm.tasks.get(taskId)!.agent).toBe(b);
-      const rows = harnessSwapEvents.page(stack.id, { limit: 10 }).events.filter((e) => e.taskId === taskId);
+      const rows = (await harnessSwapEvents.page(stack.id, { limit: 10 })).events.filter((e) => e.taskId === taskId);
       expect(rows).toHaveLength(1);
       expect(rows[0]).toMatchObject({ trigger: "unavailable", fromHarnessId: a, toHarnessId: b });
     } finally {

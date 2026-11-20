@@ -61,8 +61,8 @@ afterEach(() => {
   setHarnessAutoEnableBroadcaster(null);
 });
 
-test("every auto-enable kind turns on once when available", () => {
-  const enabled = applyHarnessAutoEnable(AUTO_KINDS.map((k) => status(k, k)));
+test("every auto-enable kind turns on once when available", async () => {
+  const enabled = await applyHarnessAutoEnable(AUTO_KINDS.map((k) => status(k, k)));
   expect(enabled.sort()).toEqual([...AUTO_KINDS].sort());
   for (const k of AUTO_KINDS) {
     expect(harnesses.get(k)!.enabled).toBe(true);
@@ -70,106 +70,106 @@ test("every auto-enable kind turns on once when available", () => {
   }
   expect(refreshed.sort()).toEqual([...AUTO_KINDS].sort());
   // A second pass changes nothing.
-  expect(applyHarnessAutoEnable(AUTO_KINDS.map((k) => status(k, k)))).toEqual([]);
+  expect(await applyHarnessAutoEnable(AUTO_KINDS.map((k) => status(k, k)))).toEqual([]);
 });
 
-test("an already-on row is recorded silently, with no notice owed", () => {
+test("an already-on row is recorded silently, with no notice owed", async () => {
   harnesses.setEnabled("codex", true);
-  expect(applyHarnessAutoEnable([status("codex", "codex")])).toEqual([]);
+  expect(await applyHarnessAutoEnable([status("codex", "codex")])).toEqual([]);
   expect(harnessAutoEnabled.has("codex")).toBe(true);
   expect(harnessAutoEnabled.pending()).toEqual([]);
   expect(refreshed).toEqual([]);
   const sent: AppEvent[] = [];
-  flushPendingHarnessAutoEnableNotice((e) => sent.push(e));
+  await flushPendingHarnessAutoEnableNotice((e) => sent.push(e));
   expect(sent).toEqual([]);
 });
 
-test("a manual Off after the record sticks across later calls", () => {
-  applyHarnessAutoEnable([status("gemini", "gemini")]);
+test("a manual Off after the record sticks across later calls", async () => {
+  await applyHarnessAutoEnable([status("gemini", "gemini")]);
   harnesses.setEnabled("gemini", false);
-  expect(applyHarnessAutoEnable([status("gemini", "gemini")])).toEqual([]);
+  expect(await applyHarnessAutoEnable([status("gemini", "gemini")])).toEqual([]);
   expect(harnesses.get("gemini")!.enabled).toBe(false);
 });
 
-test("an unavailable row is not recorded and turns on once it is available", () => {
-  expect(applyHarnessAutoEnable([status("cursor", "cursor", false)])).toEqual([]);
+test("an unavailable row is not recorded and turns on once it is available", async () => {
+  expect(await applyHarnessAutoEnable([status("cursor", "cursor", false)])).toEqual([]);
   expect(harnessAutoEnabled.has("cursor")).toBe(false);
   expect(harnesses.get("cursor")!.enabled).toBe(false);
-  expect(applyHarnessAutoEnable([status("cursor", "cursor", true)])).toEqual(["cursor"]);
+  expect(await applyHarnessAutoEnable([status("cursor", "cursor", true)])).toEqual(["cursor"]);
   expect(harnesses.get("cursor")!.enabled).toBe(true);
 });
 
-test("an additional harness of an auto-enable kind is never touched", () => {
+test("an additional harness of an auto-enable kind is never touched", async () => {
   harnesses.insert({ id: "codex-work", kind: "codex", label: "Codex (work)", home: "/tmp/agetor-test-home" });
   harnesses.setEnabled("codex-work", false);
-  expect(applyHarnessAutoEnable([status("codex-work", "codex")])).toEqual([]);
+  expect(await applyHarnessAutoEnable([status("codex-work", "codex")])).toEqual([]);
   expect(harnesses.get("codex-work")!.enabled).toBe(false);
   expect(harnessAutoEnabled.has("codex-work")).toBe(false);
 });
 
-test("claude-code and antigravity rows are never touched", () => {
+test("claude-code and antigravity rows are never touched", async () => {
   harnesses.setEnabled("antigravity", false);
   harnesses.setEnabled("claude-code", false);
   expect(
-    applyHarnessAutoEnable([status("claude-code", "claude-code"), status("antigravity", "antigravity")]),
+    await applyHarnessAutoEnable([status("claude-code", "claude-code"), status("antigravity", "antigravity")]),
   ).toEqual([]);
   expect(harnesses.get("antigravity")!.enabled).toBe(false);
   expect(harnesses.get("claude-code")!.enabled).toBe(false);
   expect(harnessAutoEnabled.all()).toEqual([]);
 });
 
-test("the pending notice goes to the next flush exactly once", () => {
-  applyHarnessAutoEnable([status("fx", "fx"), status("opencode", "opencode")]);
+test("the pending notice goes to the next flush exactly once", async () => {
+  await applyHarnessAutoEnable([status("fx", "fx"), status("opencode", "opencode")]);
   expect(harnessAutoEnabled.pending().sort()).toEqual(["fx", "opencode"]);
   const sent: Notice[] = [];
-  flushPendingHarnessAutoEnableNotice((e) => sent.push(e as Notice));
+  await flushPendingHarnessAutoEnableNotice((e) => sent.push(e as Notice));
   expect(sent).toHaveLength(1);
   expect(sent[0]!.type).toBe("harnesses_auto_enabled");
   expect(sent[0]!.harnessIds.sort()).toEqual(["fx", "opencode"]);
   expect(sent[0]!.labels).toHaveLength(2);
   expect(sent[0]!.labels).toContain(harnesses.get("opencode")!.label);
   expect(typeof sent[0]!.ts).toBe("number");
-  flushPendingHarnessAutoEnableNotice((e) => sent.push(e as Notice));
+  await flushPendingHarnessAutoEnableNotice((e) => sent.push(e as Notice));
   expect(sent).toHaveLength(1);
 });
 
-test("a flush skips a row turned Off since, and still marks it notified", () => {
-  applyHarnessAutoEnable([status("fx", "fx"), status("opencode", "opencode")]);
+test("a flush skips a row turned Off since, and still marks it notified", async () => {
+  await applyHarnessAutoEnable([status("fx", "fx"), status("opencode", "opencode")]);
   harnesses.setEnabled("fx", false);
   const sent: Notice[] = [];
-  flushPendingHarnessAutoEnableNotice((e) => sent.push(e as Notice));
+  await flushPendingHarnessAutoEnableNotice((e) => sent.push(e as Notice));
   expect(sent).toHaveLength(1);
   expect(sent[0]!.harnessIds).toEqual(["opencode"]);
   expect(harnessAutoEnabled.pending()).toEqual([]);
 });
 
-test("a flush whose rows are all Off sends nothing but clears pending", () => {
-  applyHarnessAutoEnable([status("fx", "fx")]);
+test("a flush whose rows are all Off sends nothing but clears pending", async () => {
+  await applyHarnessAutoEnable([status("fx", "fx")]);
   harnesses.setEnabled("fx", false);
   const sent: AppEvent[] = [];
-  flushPendingHarnessAutoEnableNotice((e) => sent.push(e));
+  await flushPendingHarnessAutoEnableNotice((e) => sent.push(e));
   expect(sent).toEqual([]);
   expect(harnessAutoEnabled.pending()).toEqual([]);
 });
 
-test("a delivering broadcaster marks the ids notified", () => {
+test("a delivering broadcaster marks the ids notified", async () => {
   const got: Notice[] = [];
   setHarnessAutoEnableBroadcaster((e) => {
     got.push(e as Notice);
     return true;
   });
-  expect(applyHarnessAutoEnable([status("codex", "codex")])).toEqual(["codex"]);
+  expect(await applyHarnessAutoEnable([status("codex", "codex")])).toEqual(["codex"]);
   expect(got).toHaveLength(1);
   expect(got[0]!.harnessIds).toEqual(["codex"]);
   expect(harnessAutoEnabled.pending()).toEqual([]);
   const sent: AppEvent[] = [];
-  flushPendingHarnessAutoEnableNotice((e) => sent.push(e));
+  await flushPendingHarnessAutoEnableNotice((e) => sent.push(e));
   expect(sent).toEqual([]);
 });
 
-test("a non-delivering or throwing broadcaster leaves the ids pending", () => {
+test("a non-delivering or throwing broadcaster leaves the ids pending", async () => {
   setHarnessAutoEnableBroadcaster(() => false);
-  applyHarnessAutoEnable([status("codex", "codex")]);
+  await applyHarnessAutoEnable([status("codex", "codex")]);
   expect(harnessAutoEnabled.pending()).toEqual(["codex"]);
 
   setHarnessAutoEnableBroadcaster(() => {
@@ -178,23 +178,23 @@ test("a non-delivering or throwing broadcaster leaves the ids pending", () => {
   const origError = console.error;
   console.error = () => {};
   try {
-    applyHarnessAutoEnable([status("gemini", "gemini")]);
+    await applyHarnessAutoEnable([status("gemini", "gemini")]);
   } finally {
     console.error = origError;
   }
   expect(harnessAutoEnabled.pending().sort()).toEqual(["codex", "gemini"]);
 
   const sent: Notice[] = [];
-  flushPendingHarnessAutoEnableNotice((e) => sent.push(e as Notice));
+  await flushPendingHarnessAutoEnableNotice((e) => sent.push(e as Notice));
   expect(sent).toHaveLength(1);
   expect(sent[0]!.harnessIds.sort()).toEqual(["codex", "gemini"]);
 });
 
-test("the NODE_ENV=test default is off; =1 turns it on, =0 turns it off", () => {
+test("the NODE_ENV=test default is off; =1 turns it on, =0 turns it off", async () => {
   delete process.env.AGETOR_HARNESS_AUTO_ENABLE;
   expect(process.env.NODE_ENV).toBe("test");
   expect(harnessAutoEnableActive()).toBe(false);
-  expect(applyHarnessAutoEnable([status("codex", "codex")])).toEqual([]);
+  expect(await applyHarnessAutoEnable([status("codex", "codex")])).toEqual([]);
   expect(harnesses.get("codex")!.enabled).toBe(false);
   expect(harnessAutoEnabled.has("codex")).toBe(false);
 
@@ -203,7 +203,7 @@ test("the NODE_ENV=test default is off; =1 turns it on, =0 turns it off", () => 
 
   process.env.AGETOR_HARNESS_AUTO_ENABLE = "0";
   expect(harnessAutoEnableActive()).toBe(false);
-  expect(applyHarnessAutoEnable([status("codex", "codex")])).toEqual([]);
+  expect(await applyHarnessAutoEnable([status("codex", "codex")])).toEqual([]);
 
   const prev = process.env.NODE_ENV;
   process.env.NODE_ENV = "production";

@@ -1,6 +1,6 @@
 import { existsSync } from "node:fs";
 import path from "node:path";
-import { dataDir, preferences } from "./db.ts";
+import { dataDir, preferences } from "./db-async.ts";
 import { childEnv, coreSpawn } from "./core-spawn.ts";
 
 export const TMUX_SOURCE_KEY = "tmux_source";
@@ -29,22 +29,41 @@ export function bundledTmuxPath(): string {
   return packaged;
 }
 
-// Cache the resolved source between writes. Without this, every call to
-// resolveTmuxBin() — which fires from inside `tmux(...)` in claude-tmux.ts
-// for has-session checks, paste-buffer + send-keys, status probes — does a
-// synchronous SQLite read. Preferences only change when setTmuxSource()
-// runs, so the cache invalidates from a single point.
+// Cache the resolved source between writes. `resolveTmuxBin()` fires from inside
+// `tmux(...)` in claude-tmux.ts for has-session checks, paste-buffer + send-keys
+// and status probes, and must stay synchronous, so it reads this cache. The
+// preference only changes when setTmuxSource() runs, so the cache is loaded once
+// (`loadTmuxSource`, awaited by `ensureDisclaimedServer` at boot, ahead of every
+// tmux command) and updated from that single point.
 let cachedSource: TmuxSource | null = null;
+let loadingSource: Promise<TmuxSource> | null = null;
 
-export function getTmuxSource(): TmuxSource {
-  if (cachedSource !== null) return cachedSource;
-  cachedSource = preferences.get(TMUX_SOURCE_KEY) === "bundled" ? "bundled" : "system";
-  return cachedSource;
+/** Read the stored source into the cache (once; later calls return the cache). */
+export function loadTmuxSource(): Promise<TmuxSource> {
+  if (cachedSource !== null) return Promise.resolve(cachedSource);
+  loadingSource ??= preferences.get(TMUX_SOURCE_KEY).then((v) => {
+    // A set that landed while the read was in flight wins.
+    cachedSource ??= v === "bundled" ? "bundled" : "system";
+    return cachedSource;
+  }).finally(() => {
+    loadingSource = null;
+  });
+  return loadingSource;
 }
 
-export function setTmuxSource(source: TmuxSource): void {
-  preferences.set(TMUX_SOURCE_KEY, source);
+/** The current source. Before the first load completes this answers "system"
+ *  and starts the load, so the next call is right; boot awaits `loadTmuxSource`
+ *  first, so no tmux command runs on the wrong binary. */
+export function getTmuxSource(): TmuxSource {
+  if (cachedSource !== null) return cachedSource;
+  void loadTmuxSource().catch((err) => console.error("[agetor] tmux source load failed:", err));
+  return "system";
+}
+
+export async function setTmuxSource(source: TmuxSource): Promise<void> {
+  // The cache moves first so a tmux command issued meanwhile uses the new binary.
   cachedSource = source;
+  await preferences.set(TMUX_SOURCE_KEY, source);
 }
 
 /**
@@ -243,6 +262,9 @@ export function __resetTmuxServerEnvClearedForTest(): void {
  */
 export async function ensureDisclaimedServer(): Promise<void> {
   try {
+    // The stored tmux source decides the binary, so it is read before the first
+    // resolve (this runs before any other tmux command at boot).
+    await loadTmuxSource().catch((err) => console.error("[agetor] tmux source load failed:", err));
     const bin = resolveTmuxBin();
     const argv = buildEnsureServerArgv(bin);
     // Ignore stdio rather than pipe: `start-server` emits nothing and this is

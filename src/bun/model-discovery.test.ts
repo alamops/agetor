@@ -180,69 +180,69 @@ function wait(ms: number): Promise<void> {
 
 /* ── transition detector (noteHarnessStatuses) ───────────────────────────── */
 
-test("noteHarnessStatuses: first sighting of a harness is recorded but schedules no refresh (boot already discovered it)", () => {
+test("noteHarnessStatuses: first sighting of a harness is recorded but schedules no refresh (boot already discovered it)", async () => {
   resetAll();
-  scheduler.noteHarnessStatuses([makeStatus("first-sight")]);
+  await scheduler.noteHarnessStatuses([makeStatus("first-sight")]);
   expect(scheduler.__testing.pendingRefreshCount()).toBe(0);
 });
 
-test("noteHarnessStatuses: an unchanged status on a second sighting schedules no refresh", () => {
+test("noteHarnessStatuses: an unchanged status on a second sighting schedules no refresh", async () => {
   resetAll();
-  scheduler.noteHarnessStatuses([makeStatus("steady")]);
-  scheduler.noteHarnessStatuses([makeStatus("steady")]);
+  await scheduler.noteHarnessStatuses([makeStatus("steady")]);
+  await scheduler.noteHarnessStatuses([makeStatus("steady")]);
   expect(scheduler.__testing.pendingRefreshCount()).toBe(0);
 });
 
-test("noteHarnessStatuses: loggedIn false -> true schedules a debounced refresh", () => {
+test("noteHarnessStatuses: loggedIn false -> true schedules a debounced refresh", async () => {
   resetAll();
-  scheduler.noteHarnessStatuses([makeStatus("login-flip", { loggedIn: false })]);
+  await scheduler.noteHarnessStatuses([makeStatus("login-flip", { loggedIn: false })]);
   expect(scheduler.__testing.pendingRefreshCount()).toBe(0);
-  scheduler.noteHarnessStatuses([makeStatus("login-flip", { loggedIn: true })]);
+  await scheduler.noteHarnessStatuses([makeStatus("login-flip", { loggedIn: true })]);
   expect(scheduler.__testing.pendingRefreshCount()).toBe(1);
 });
 
-test("noteHarnessStatuses: available false -> true schedules a debounced refresh", () => {
+test("noteHarnessStatuses: available false -> true schedules a debounced refresh", async () => {
   resetAll();
-  scheduler.noteHarnessStatuses([makeStatus("avail-flip", { available: false, path: null, version: null, loggedIn: null })]);
+  await scheduler.noteHarnessStatuses([makeStatus("avail-flip", { available: false, path: null, version: null, loggedIn: null })]);
   expect(scheduler.__testing.pendingRefreshCount()).toBe(0);
-  scheduler.noteHarnessStatuses([makeStatus("avail-flip", { available: true })]);
+  await scheduler.noteHarnessStatuses([makeStatus("avail-flip", { available: true })]);
   expect(scheduler.__testing.pendingRefreshCount()).toBe(1);
 });
 
-test("noteHarnessStatuses: a --version probe that times out (version null on an available CLI) is no transition; a real version change still is", () => {
+test("noteHarnessStatuses: a --version probe that times out (version null on an available CLI) is no transition; a real version change still is", async () => {
   resetAll();
-  scheduler.noteHarnessStatuses([makeStatus("version-flap", { version: "0.0.6" })]);
+  await scheduler.noteHarnessStatuses([makeStatus("version-flap", { version: "0.0.6" })]);
   // Under load `--version` times out: same CLI, no version this poll.
-  scheduler.noteHarnessStatuses([makeStatus("version-flap", { version: null })]);
+  await scheduler.noteHarnessStatuses([makeStatus("version-flap", { version: null })]);
   expect(scheduler.__testing.pendingRefreshCount()).toBe(0);
-  scheduler.noteHarnessStatuses([makeStatus("version-flap", { version: "0.0.6" })]);
+  await scheduler.noteHarnessStatuses([makeStatus("version-flap", { version: "0.0.6" })]);
   expect(scheduler.__testing.pendingRefreshCount()).toBe(0);
-  scheduler.noteHarnessStatuses([makeStatus("version-flap", { version: null })]);
-  scheduler.noteHarnessStatuses([makeStatus("version-flap", { version: "0.0.7" })]);
+  await scheduler.noteHarnessStatuses([makeStatus("version-flap", { version: null })]);
+  await scheduler.noteHarnessStatuses([makeStatus("version-flap", { version: "0.0.7" })]);
   expect(scheduler.__testing.pendingRefreshCount()).toBe(1);
 });
 
-test("noteHarnessStatuses: a path change (binary swap) schedules a debounced refresh", () => {
+test("noteHarnessStatuses: a path change (binary swap) schedules a debounced refresh", async () => {
   resetAll();
-  scheduler.noteHarnessStatuses([makeStatus("path-flip", { path: "/opt/homebrew/bin/fx" })]);
+  await scheduler.noteHarnessStatuses([makeStatus("path-flip", { path: "/opt/homebrew/bin/fx" })]);
   expect(scheduler.__testing.pendingRefreshCount()).toBe(0);
-  scheduler.noteHarnessStatuses([makeStatus("path-flip", { path: "/usr/local/bin/fx-v2" })]);
+  await scheduler.noteHarnessStatuses([makeStatus("path-flip", { path: "/usr/local/bin/fx-v2" })]);
   expect(scheduler.__testing.pendingRefreshCount()).toBe(1);
 });
 
-test("noteHarnessStatuses: rapid repeated transitions for the same harness collapse into one pending refresh (debounced, not queued)", () => {
+test("noteHarnessStatuses: rapid repeated transitions for the same harness collapse into one pending refresh (debounced, not queued)", async () => {
   resetAll();
-  scheduler.noteHarnessStatuses([makeStatus("flappy", { available: false })]);
-  scheduler.noteHarnessStatuses([makeStatus("flappy", { available: true })]);
-  scheduler.noteHarnessStatuses([makeStatus("flappy", { available: false })]);
-  scheduler.noteHarnessStatuses([makeStatus("flappy", { available: true })]);
+  await scheduler.noteHarnessStatuses([makeStatus("flappy", { available: false })]);
+  await scheduler.noteHarnessStatuses([makeStatus("flappy", { available: true })]);
+  await scheduler.noteHarnessStatuses([makeStatus("flappy", { available: false })]);
+  await scheduler.noteHarnessStatuses([makeStatus("flappy", { available: true })]);
   expect(scheduler.__testing.pendingRefreshCount()).toBe(1);
 });
 
-test("noteHarnessStatuses: two different harnesses transitioning at once each get their own pending refresh", () => {
+test("noteHarnessStatuses: two different harnesses transitioning at once each get their own pending refresh", async () => {
   resetAll();
-  scheduler.noteHarnessStatuses([makeStatus("multi-a", { available: false }), makeStatus("multi-b", { available: false })]);
-  scheduler.noteHarnessStatuses([makeStatus("multi-a", { available: true }), makeStatus("multi-b", { available: true })]);
+  await scheduler.noteHarnessStatuses([makeStatus("multi-a", { available: false }), makeStatus("multi-b", { available: false })]);
+  await scheduler.noteHarnessStatuses([makeStatus("multi-a", { available: true }), makeStatus("multi-b", { available: true })]);
   expect(scheduler.__testing.pendingRefreshCount()).toBe(2);
 });
 
@@ -251,9 +251,9 @@ test("noteHarnessStatuses: a scheduled refresh actually fires after the debounce
   const homeA = mkdtempSync(path.join(tmpdir(), "agetor-model-discovery-home-a-"));
   await withFxBin(plantHomeBranchingFxBin(homeA), async () => {
     const created = insertFxHarness({ id: "fx-transition-live", home: homeA });
-    scheduler.noteHarnessStatuses([makeStatus(created.id)]);
+    await scheduler.noteHarnessStatuses([makeStatus(created.id)]);
     expect(discovery.getHarnessDiscoveredModels(created.id)).toEqual([]);
-    scheduler.noteHarnessStatuses([makeStatus(created.id, { loggedIn: false })]);
+    await scheduler.noteHarnessStatuses([makeStatus(created.id, { loggedIn: false })]);
     expect(scheduler.__testing.pendingRefreshCount()).toBe(1);
 
     // pendingRefreshCount() drops to 0 the instant the 500ms debounce timer
@@ -506,17 +506,17 @@ test("refreshHarnessModels: an fx flag-only change (same id, label and efforts; 
 
 test("getHarnessModelMap: ready mirrors isDiscoveryReady() — false before any refresh, true after", async () => {
   resetAll();
-  expect(scheduler.getHarnessModelMap().ready).toBe(false);
-  expect(scheduler.getHarnessModelMap().ready).toBe(discovery.isDiscoveryReady());
+  expect((await scheduler.getHarnessModelMap()).ready).toBe(false);
+  expect((await scheduler.getHarnessModelMap()).ready).toBe(discovery.isDiscoveryReady());
   await scheduler.refreshAllModels();
-  expect(scheduler.getHarnessModelMap().ready).toBe(true);
-  expect(scheduler.getHarnessModelMap().ready).toBe(discovery.isDiscoveryReady());
+  expect((await scheduler.getHarnessModelMap()).ready).toBe(true);
+  expect((await scheduler.getHarnessModelMap()).ready).toBe(discovery.isDiscoveryReady());
 });
 
 test("getHarnessModelMap: includes the built-in claude-code harness (enabled by default) mapped to the kind-level list", async () => {
   resetAll();
   await scheduler.refreshAllModels();
-  const map = scheduler.getHarnessModelMap();
+  const map = await scheduler.getHarnessModelMap();
   expect(map.byHarness["claude-code"]).toEqual(discovery.getDiscoveredModels("claude-code"));
 });
 
@@ -527,7 +527,7 @@ test("getHarnessModelMap: an enabled fx harness is keyed by its own per-harness 
     const created = insertFxHarness({ id: "fx-map-live", home: homeA });
     await scheduler.refreshAllModels();
 
-    const map = scheduler.getHarnessModelMap();
+    const map = await scheduler.getHarnessModelMap();
     expect(map.byHarness[created.id]).toEqual([{ id: "a/one" }]);
     // The harness-keyed entry must come from the per-harness cache, not the
     // shared kind-level "fx" list (which — probed under agetor's own
@@ -535,7 +535,7 @@ test("getHarnessModelMap: an enabled fx harness is keyed by its own per-harness 
     expect(map.byHarness[created.id]).not.toEqual(discovery.getDiscoveredModels("fx"));
 
     harnesses.setEnabled(created.id, false);
-    const mapAfterDisable = scheduler.getHarnessModelMap();
+    const mapAfterDisable = await scheduler.getHarnessModelMap();
     expect(mapAfterDisable.byHarness[created.id]).toBeUndefined();
   });
 });
@@ -563,7 +563,7 @@ test("refreshAllModels: a full sweep probes each enabled codex harness under its
 
       await scheduler.refreshAllModels();
 
-      const map = scheduler.getHarnessModelMap();
+      const map = await scheduler.getHarnessModelMap();
       expect(map.byHarness["codex"]).toEqual([{ id: "codex-sweep-a", label: "codex-sweep-a" }]);
       expect(map.byHarness[created.id]).toEqual([{ id: "codex-sweep-b", label: "codex-sweep-b" }]);
 
@@ -640,7 +640,7 @@ test("getHarnessModelMap: an additional codex harness is keyed by its own per-ha
       const created = insertCodexHarness({ id: "codex-2-map", home: homeB, bin: binB });
       await scheduler.refreshAllModels();
 
-      const map = scheduler.getHarnessModelMap();
+      const map = await scheduler.getHarnessModelMap();
       expect(map.byHarness[created.id]).toEqual([{ id: "codex-map-b", label: "codex-map-b" }]);
       // Must come from the per-harness cache, not the shared kind-level
       // "codex" list (which — probed under agetor's own process env/bin,
@@ -664,7 +664,7 @@ test("noteHarnessRemoved: prunes the harness's discovered-models cache entry (mi
     expect(discovery.getHarnessDiscoveredModels(created.id)).toEqual([{ id: "m1" }]);
 
     harnesses.delete(created.id);
-    scheduler.noteHarnessRemoved(created.id);
+    await scheduler.noteHarnessRemoved(created.id);
   });
   expect(discovery.getHarnessDiscoveredModels("fx-remove-cache-test")).toEqual([]);
 });
@@ -679,76 +679,76 @@ test("noteHarnessRemoved: prunes an additional codex harness's per-harness disco
   expect(discovery.getHarnessDiscoveredModels(created.id)).toEqual([{ id: "codex-prune-model", label: "codex-prune-model" }]);
 
   harnesses.delete(created.id);
-  scheduler.noteHarnessRemoved(created.id);
+  await scheduler.noteHarnessRemoved(created.id);
 
   expect(discovery.getHarnessDiscoveredModels(created.id)).toEqual([]);
   // The harness is gone from the DB and pruned from the cache, so a fresh
   // map built after the prune + publish must not carry its id either.
-  expect(scheduler.getHarnessModelMap().byHarness[created.id]).toBeUndefined();
+  expect((await scheduler.getHarnessModelMap()).byHarness[created.id]).toBeUndefined();
 });
 
-test("noteHarnessRemoved: clears the harness's transition-detector bookkeeping — lastStatusKey and any pending debounce timer", () => {
+test("noteHarnessRemoved: clears the harness's transition-detector bookkeeping — lastStatusKey and any pending debounce timer", async () => {
   resetAll();
-  scheduler.noteHarnessStatuses([makeStatus("remove-bookkeeping", { available: false })]);
-  scheduler.noteHarnessStatuses([makeStatus("remove-bookkeeping", { available: true })]); // schedules a debounce
+  await scheduler.noteHarnessStatuses([makeStatus("remove-bookkeeping", { available: false })]);
+  await scheduler.noteHarnessStatuses([makeStatus("remove-bookkeeping", { available: true })]); // schedules a debounce
   expect(scheduler.__testing.pendingRefreshCount()).toBe(1);
   expect(scheduler.__testing.hasLastStatusKey("remove-bookkeeping")).toBe(true);
 
-  scheduler.noteHarnessRemoved("remove-bookkeeping");
+  await scheduler.noteHarnessRemoved("remove-bookkeeping");
 
   expect(scheduler.__testing.pendingRefreshCount()).toBe(0);
   expect(scheduler.__testing.hasLastStatusKey("remove-bookkeeping")).toBe(false);
 });
 
-test("noteHarnessRemoved: never throws, even for a harness id that was never tracked", () => {
+test("noteHarnessRemoved: never throws, even for a harness id that was never tracked", async () => {
   resetAll();
-  expect(() => scheduler.noteHarnessRemoved("never-existed")).not.toThrow();
+  await scheduler.noteHarnessRemoved("never-existed");
 });
 
 /* ── noteHarnessStatuses pruning + unref (code-review finding #8:
  * lastStatusKey/pendingDebounce never pruned a departed harness id, and the
  * debounce timer itself was never unref'd) ──────────────────────────────── */
 
-test("noteHarnessStatuses: a harness absent from a later statuses list is pruned from lastStatusKey — reappearing later is treated as a first sighting again (no refresh scheduled)", () => {
+test("noteHarnessStatuses: a harness absent from a later statuses list is pruned from lastStatusKey — reappearing later is treated as a first sighting again (no refresh scheduled)", async () => {
   resetAll();
-  scheduler.noteHarnessStatuses([makeStatus("pruned-a", { available: true })]);
+  await scheduler.noteHarnessStatuses([makeStatus("pruned-a", { available: true })]);
   expect(scheduler.__testing.hasLastStatusKey("pruned-a")).toBe(true);
 
-  scheduler.noteHarnessStatuses([]); // "pruned-a" no longer reported -> pruned
+  await scheduler.noteHarnessStatuses([]); // "pruned-a" no longer reported -> pruned
 
   expect(scheduler.__testing.hasLastStatusKey("pruned-a")).toBe(false);
 
   // Reappears with a status that would read as a transition had the prior
   // key survived — since it was pruned, this is a fresh first sighting, so
   // no refresh is scheduled.
-  scheduler.noteHarnessStatuses([makeStatus("pruned-a", { available: false, path: null, version: null, loggedIn: null })]);
+  await scheduler.noteHarnessStatuses([makeStatus("pruned-a", { available: false, path: null, version: null, loggedIn: null })]);
   expect(scheduler.__testing.pendingRefreshCount()).toBe(0);
 });
 
-test("noteHarnessStatuses: pruning a harness absent from a later statuses list also clears its pending debounce timer", () => {
+test("noteHarnessStatuses: pruning a harness absent from a later statuses list also clears its pending debounce timer", async () => {
   resetAll();
-  scheduler.noteHarnessStatuses([makeStatus("pruned-timer", { available: false })]);
-  scheduler.noteHarnessStatuses([makeStatus("pruned-timer", { available: true })]); // transition -> schedules a debounce
+  await scheduler.noteHarnessStatuses([makeStatus("pruned-timer", { available: false })]);
+  await scheduler.noteHarnessStatuses([makeStatus("pruned-timer", { available: true })]); // transition -> schedules a debounce
   expect(scheduler.__testing.pendingRefreshCount()).toBe(1);
 
-  scheduler.noteHarnessStatuses([]); // no longer reported -> pruned + timer cleared
+  await scheduler.noteHarnessStatuses([]); // no longer reported -> pruned + timer cleared
 
   expect(scheduler.__testing.pendingRefreshCount()).toBe(0);
 });
 
-test("noteHarnessStatuses: a harness still present in a later statuses list is not pruned, even when a sibling harness is absent", () => {
+test("noteHarnessStatuses: a harness still present in a later statuses list is not pruned, even when a sibling harness is absent", async () => {
   resetAll();
-  scheduler.noteHarnessStatuses([makeStatus("keep-a"), makeStatus("keep-b")]);
-  scheduler.noteHarnessStatuses([makeStatus("keep-a")]); // "keep-b" no longer reported
+  await scheduler.noteHarnessStatuses([makeStatus("keep-a"), makeStatus("keep-b")]);
+  await scheduler.noteHarnessStatuses([makeStatus("keep-a")]); // "keep-b" no longer reported
 
   expect(scheduler.__testing.hasLastStatusKey("keep-a")).toBe(true);
   expect(scheduler.__testing.hasLastStatusKey("keep-b")).toBe(false);
 });
 
-test("noteHarnessStatuses: the scheduled debounce timer is unref'd (never itself keeps the process alive)", () => {
+test("noteHarnessStatuses: the scheduled debounce timer is unref'd (never itself keeps the process alive)", async () => {
   resetAll();
-  scheduler.noteHarnessStatuses([makeStatus("unref-check", { available: false })]);
-  scheduler.noteHarnessStatuses([makeStatus("unref-check", { available: true })]);
+  await scheduler.noteHarnessStatuses([makeStatus("unref-check", { available: false })]);
+  await scheduler.noteHarnessStatuses([makeStatus("unref-check", { available: true })]);
   const timer = scheduler.__testing.debounceTimerFor("unref-check");
   expect(timer).toBeDefined();
   expect((timer as unknown as { hasRef: () => boolean }).hasRef()).toBe(false);
@@ -808,7 +808,7 @@ test("refreshAllModels: an enabled opencode harness is a per-harness target, pro
     { id: "opencode/b", efforts: [] },
   ];
   expect(discovery.getHarnessDiscoveredModels(created.id)).toEqual(expected);
-  expect(scheduler.getHarnessModelMap().byHarness[created.id]).toEqual(expected);
+  expect((await scheduler.getHarnessModelMap()).byHarness[created.id]).toEqual(expected);
   // The kind-level list (the missing built-in binary) is untouched by it.
   expect(discovery.getDiscoveredModels("opencode")).toEqual([]);
 }, 30_000);
@@ -843,7 +843,7 @@ test("refreshAllModels: a disabled opencode harness is not probed", async () => 
   harnesses.setEnabled(created.id, false);
   await scheduler.refreshAllModels();
   expect(discovery.getHarnessDiscoveredModels(created.id)).toEqual([]);
-  expect(scheduler.getHarnessModelMap().byHarness[created.id]).toBeUndefined();
+  expect((await scheduler.getHarnessModelMap()).byHarness[created.id]).toBeUndefined();
 }, 30_000);
 
 
@@ -911,7 +911,8 @@ test("refreshAllModels: the persisted catalog is served before any probe finishe
   let pending: Promise<void> | null = null;
   await withClaudeBin("/nonexistent/agetor-offline-claude", async () => {
     pending = scheduler.refreshAllModels();
-    // Synchronously after the call: hydrated, nothing has been probed yet.
+    // Hydrated (the sweep awaits the same read) before any probe has settled.
+    await scheduler.__testing.hydrateFromStore();
     expect(discovery.getDiscoveredModels("claude-code")).toEqual([{ id: "opus-6", label: "Opus 6", efforts: ["low", "turbo"] }]);
     await pending;
   });
@@ -920,30 +921,34 @@ test("refreshAllModels: the persisted catalog is served before any probe finishe
   expect(preferences.get(CLAUDE_KEY)).not.toBeNull();
 });
 
-test("settle: a new CLI version or an unavailable harness drops the stale catalog; the same version keeps it", () => {
+test("settle: a new CLI version or an unavailable harness drops the stale catalog; the same version keeps it", async () => {
   resetAll();
   const rows = [{ id: "opus-6" }];
   const key = { scope: "kind", kind: "claude-code" } as const;
   preferences.set(CLAUDE_KEY, JSON.stringify({ v: 1, cliVersion: "1.0.0", savedAt: 1, models: rows }));
-  scheduler.__testing.hydrateFromStore();
+  await scheduler.__testing.hydrateFromStore();
   // Same version, transient empty: kept.
-  scheduler.noteHarnessStatuses([makeStatus("claude-code", { kind: "claude-code", version: "1.0.0" })]);
+  await scheduler.noteHarnessStatuses([makeStatus("claude-code", { kind: "claude-code", version: "1.0.0" })]);
   expect(scheduler.__testing.settleCatalog(key, [], rows)).toEqual(rows);
   expect(preferences.get(CLAUDE_KEY)).not.toBeNull();
   // The CLI was upgraded: an empty probe drops it, stored row included.
-  scheduler.noteHarnessStatuses([makeStatus("claude-code", { kind: "claude-code", version: "2.0.0" })]);
+  await scheduler.noteHarnessStatuses([makeStatus("claude-code", { kind: "claude-code", version: "2.0.0" })]);
   expect(scheduler.__testing.settleCatalog(key, [], rows)).toEqual([]);
+  // The drop is posted to the database worker, not awaited (the settle hook is sync).
+  await new Promise((r) => setTimeout(r, 30));
   expect(preferences.get(CLAUDE_KEY)).toBeNull();
   // Unavailable: dropped too.
   preferences.set(CLAUDE_KEY, JSON.stringify({ v: 1, cliVersion: "2.0.0", savedAt: 1, models: rows }));
   resetAll();
-  scheduler.__testing.hydrateFromStore();
-  scheduler.noteHarnessStatuses([makeStatus("claude-code", { kind: "claude-code", version: "2.0.0", available: false })]);
+  await scheduler.__testing.hydrateFromStore();
+  await scheduler.noteHarnessStatuses([makeStatus("claude-code", { kind: "claude-code", version: "2.0.0", available: false })]);
   expect(scheduler.__testing.settleCatalog(key, [], rows)).toEqual([]);
+  // The drop is posted to the database worker, not awaited (the settle hook is sync).
+  await new Promise((r) => setTimeout(r, 30));
   expect(preferences.get(CLAUDE_KEY)).toBeNull();
 });
 
-test("hydrate: malformed rows, unknown kinds, per-harness kinds under a kind key and ghost harnesses are ignored", () => {
+test("hydrate: malformed rows, unknown kinds, per-harness kinds under a kind key and ghost harnesses are ignored", async () => {
   resetAll();
   preferences.set("modelCatalog:kind:claude-code", "not json");
   preferences.set("modelCatalog:kind:bogus", JSON.stringify({ v: 1, cliVersion: null, savedAt: 1, models: [{ id: "x" }] }));
@@ -951,7 +956,7 @@ test("hydrate: malformed rows, unknown kinds, per-harness kinds under a kind key
   preferences.set("modelCatalog:harness:ghost", JSON.stringify({ v: 1, cliVersion: null, savedAt: 1, models: [{ id: "x" }] }));
   preferences.set("modelCatalog:kind:gemini", JSON.stringify({ v: 2, cliVersion: null, savedAt: 1, models: [{ id: "x" }] }));
   preferences.set("modelCatalog:kind:antigravity", JSON.stringify({ v: 1, cliVersion: null, savedAt: 1, models: "nope" }));
-  scheduler.__testing.hydrateFromStore();
+  await scheduler.__testing.hydrateFromStore();
   for (const kind of ["claude-code", "codex", "gemini", "antigravity"] as const) {
     expect(discovery.getDiscoveredModels(kind), kind).toEqual([]);
   }
@@ -973,11 +978,11 @@ test("a per-harness catalog is persisted under its harness key and hydrated back
     expect(stored).not.toBeNull();
     expect(preferences.get("modelCatalog:kind:codex")).toBeNull();
     resetAll();
-    scheduler.__testing.hydrateFromStore();
+    await scheduler.__testing.hydrateFromStore();
     expect(discovery.getHarnessDiscoveredModels("codex").map((m) => m.id)).toEqual(["m1"]);
     expect(discovery.getDiscoveredModels("codex").map((m) => m.id)).toEqual(["m1"]);
     // Removing a harness drops its stored catalog.
-    scheduler.noteHarnessRemoved("codex");
+    await scheduler.noteHarnessRemoved("codex");
     expect(preferences.get("modelCatalog:harness:codex")).toBeNull();
   } finally {
     harnesses.setEnabled("codex", wasEnabled);
@@ -1047,7 +1052,7 @@ test("refreshAllModels: a held copilot catalog stored under no CLI version, or u
     // Saved before the CLI version was known (a slow first `--version`):
     // re-probed, replaced, and stamped with the installed version...
     store(null);
-    scheduler.__testing.hydrateFromStore();
+    await scheduler.__testing.hydrateFromStore();
     expect(discovery.getDiscoveredModels("copilot").map((m) => m.id)).toEqual(["gpt-6.1-sol"]);
     await scheduler.refreshAllModels();
     expect(probes().length).toBeGreaterThan(0);
@@ -1061,7 +1066,7 @@ test("refreshAllModels: a held copilot catalog stored under no CLI version, or u
     // Saved under the installed version: the sweep leaves it alone.
     fresh();
     store(version);
-    scheduler.__testing.hydrateFromStore();
+    await scheduler.__testing.hydrateFromStore();
     await scheduler.refreshAllModels();
     expect(probes()).toEqual([]);
     expect(discovery.getDiscoveredModels("copilot").map((m) => m.id)).toEqual(["gpt-6.1-sol"]);
@@ -1069,7 +1074,7 @@ test("refreshAllModels: a held copilot catalog stored under no CLI version, or u
     // Saved under an older build (upgraded while the app was closed).
     fresh();
     store("GitHub Copilot CLI 1.0.100");
-    scheduler.__testing.hydrateFromStore();
+    await scheduler.__testing.hydrateFromStore();
     await scheduler.refreshAllModels();
     expect(probes().length).toBeGreaterThan(0);
     expect(discovery.getDiscoveredModels("copilot").map((m) => m.id)).toEqual(["gpt-6.2-sol"]);
@@ -1149,7 +1154,7 @@ test("preflightCatalogFor: a catalog probed under another CLI version judges not
     const wasEnabled = codexHarness.enabled;
     harnesses.setEnabled("codex", true);
     scheduler.__testing.resetForTests();
-    scheduler.__testing.hydrateFromStore();
+    await scheduler.__testing.hydrateFromStore();
     try {
       expect(scheduler.preflightCatalogFor(codexHarness, "codex-cli 0.166.0").map((m) => m.id)).toEqual(["m1"]);
       expect(scheduler.preflightCatalogFor(codexHarness, null).map((m) => m.id)).toEqual(["m1"]);

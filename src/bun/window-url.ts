@@ -1,4 +1,4 @@
-import { preferences } from "./db.ts";
+import { preferences } from "./db-async.ts";
 import type { ThemePreference } from "../shared/types.ts";
 import { clampFontSizePercent, FONT_SIZE_DEFAULT } from "../shared/types.ts";
 
@@ -17,10 +17,10 @@ import { clampFontSizePercent, FONT_SIZE_DEFAULT } from "../shared/types.ts";
  * ever opening, so a throw is swallowed and treated the same as "nothing
  * stored": fall back to "auto".
  */
-export function resolveThemePreference(): ThemePreference {
+export async function resolveThemePreference(): Promise<ThemePreference> {
   let stored: string | null;
   try {
-    stored = preferences.get("theme");
+    stored = await preferences.get("theme");
   } catch {
     return "auto";
   }
@@ -29,7 +29,7 @@ export function resolveThemePreference(): ThemePreference {
 
 /**
  * Resolve the persisted font-size preference for the boot payload, mirroring
- * `resolveThemePreference` exactly: a synchronous DB read run through the
+ * `resolveThemePreference` exactly: a DB read run through the
  * shared clamp, with any throw (locked/corrupt SQLite file) swallowed and
  * treated as "nothing stored" — falls back to FONT_SIZE_DEFAULT rather than
  * rejecting the caller's promise and blocking the main window from ever
@@ -37,10 +37,10 @@ export function resolveThemePreference(): ThemePreference {
  * value to FONT_SIZE_DEFAULT, so the try/catch only needs to guard the read
  * itself.
  */
-export function resolveFontSizePreference(): number {
+export async function resolveFontSizePreference(): Promise<number> {
   let stored: string | null;
   try {
-    stored = preferences.get("fontSize");
+    stored = await preferences.get("fontSize");
   } catch {
     return FONT_SIZE_DEFAULT;
   }

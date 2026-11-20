@@ -38,7 +38,7 @@ import { bootReadySignal } from "./boot-gate.ts";
 import { installCoreLog, registerLogSecret } from "./core-log.ts";
 import { setTaskDecorations } from "./db-async.ts";
 import { awaitDbReady, drainCoreForQuit } from "./boot-db.ts";
-import { countPendingForTask, pendingCountsByTask } from "./interactions.ts";
+import { countPendingForTask, pendingCountsByTask, preloadPipelineParents } from "./interactions.ts";
 import { countTerminals, terminalCountsByTask } from "./terminals.ts";
 import { CORE_EXIT_PARK, HANDOFF_LAUNCH_SETTLE_MS, launchedBy, resolveIdleTimeoutMs } from "./daemon-mode.ts";
 import {
@@ -402,6 +402,7 @@ export async function runDaemon(): Promise<void> {
     await adoptOpencodeServers();
     // Before the first reconcile query, and so before the gate opens.
     if (!(await dbBoot)) return;
+    await preloadPipelineParents();
     await reconcileOrphans();
     // M16: same ordering as index.ts's desktop boot path — reconcile every
     // pipeline parent left mid-flight by a prior crash/restart right after

@@ -24,18 +24,18 @@ const base = {
 };
 
 describe("harnessSwapEvents", () => {
-  test("pages newest first with a stable cursor across equal timestamps; bad cursor = first page", () => {
-    for (let i = 0; i < 5; i++) harnessSwapEvents.insert({ ...base, at: 1000 + (i < 3 ? 0 : i) });
-    expect(harnessSwapEvents.countForStack(stackId)).toBe(5);
-    const p1 = harnessSwapEvents.page(stackId, { limit: 2 });
+  test("pages newest first with a stable cursor across equal timestamps; bad cursor = first page", async () => {
+    for (let i = 0; i < 5; i++) await harnessSwapEvents.insert({ ...base, at: 1000 + (i < 3 ? 0 : i) });
+    expect(await harnessSwapEvents.countForStack(stackId)).toBe(5);
+    const p1 = await harnessSwapEvents.page(stackId, { limit: 2 });
     expect(p1.events.map((e) => e.at)).toEqual([1004, 1003]);
-    const p2 = harnessSwapEvents.page(stackId, { limit: 2, before: p1.nextCursor });
-    const p3 = harnessSwapEvents.page(stackId, { limit: 2, before: p2.nextCursor });
+    const p2 = await harnessSwapEvents.page(stackId, { limit: 2, before: p1.nextCursor });
+    const p3 = await harnessSwapEvents.page(stackId, { limit: 2, before: p2.nextCursor });
     const all = [...p1.events, ...p2.events, ...p3.events];
     expect(new Set(all.map((e) => e.id)).size).toBe(5);
     expect(p3.nextCursor).toBeNull();
-    expect(harnessSwapEvents.page(stackId, { limit: 2, before: "%%garbage" }).events).toEqual(p1.events);
-    expect(harnessSwapEvents.page(stackId, { limit: 9999 }).events).toHaveLength(5);
+    expect((await harnessSwapEvents.page(stackId, { limit: 2, before: "%%garbage" })).events).toEqual(p1.events);
+    expect((await harnessSwapEvents.page(stackId, { limit: 9999 })).events).toHaveLength(5);
   });
 
   test("the page query searches the index", () => {
@@ -59,16 +59,16 @@ describe("harnessSwapEvents", () => {
 });
 
 describe("validation", () => {
-  test("insert refuses unknown values; reads drop unknown triggers and null unknown fields", () => {
-    expect(() => harnessSwapEvents.insert({ ...base, trigger: "bogus" as never })).toThrow();
-    expect(() => harnessSwapEvents.insert({ ...base, reason: "x" as never })).toThrow();
-    expect(() => harnessSwapEvents.insert({ ...base, source: "x" as never })).toThrow();
-    expect(() => harnessSwapEvents.insert({ ...base, continuation: "x" as never })).toThrow();
+  test("insert refuses unknown values; reads drop unknown triggers and null unknown fields", async () => {
+    await expect(harnessSwapEvents.insert({ ...base, trigger: "bogus" as never })).rejects.toThrow();
+    await expect(harnessSwapEvents.insert({ ...base, reason: "x" as never })).rejects.toThrow();
+    await expect(harnessSwapEvents.insert({ ...base, source: "x" as never })).rejects.toThrow();
+    await expect(harnessSwapEvents.insert({ ...base, continuation: "x" as never })).rejects.toThrow();
     const sid = `st-${randomUUID()}`;
     db.run(`INSERT INTO harness_stacks (id, label, kind, created_at, updated_at) VALUES (?, 'V', 'claude-code', 1, 1)`, [sid]);
     db.run(`INSERT INTO harness_swap_events (id, stack_id, trigger, at) VALUES ('bad', ?, 'evil', 9)`, [sid]);
     db.run(`INSERT INTO harness_swap_events (id, stack_id, trigger, reason, source, at) VALUES ('odd', ?, 'limit', 'r', 's', 8)`, [sid]);
-    const page = harnessSwapEvents.page(sid);
+    const page = await harnessSwapEvents.page(sid);
     expect(page.events.map((e) => e.id)).toEqual(["odd"]);
     expect(page.events[0]).toMatchObject({ reason: null, source: null, continuation: null, trigger: "limit" });
     db.run(`DELETE FROM harness_stacks WHERE id = ?`, [sid]);
@@ -76,25 +76,25 @@ describe("validation", () => {
 });
 
 describe("mirrorProvenance", () => {
-  test("upsert/get/list/remove round-trip", () => {
+  test("upsert/get/list/remove round-trip", async () => {
     const row = {
       harnessId: "prov-1", stackId: null, scope: "key" as const, path: "/a/settings.json", key: "env.X",
       valueHash: "h", srcMtimeMs: 5, srcSize: 6, preexisted: true, backupRef: null, updatedAt: 1,
     };
-    mirrorProvenance.upsert(row);
-    mirrorProvenance.upsert({ ...row, key: "", scope: "file", preexisted: false });
-    mirrorProvenance.upsert({ ...row, valueHash: "h2" });
-    expect(mirrorProvenance.get("prov-1", "/a/settings.json", "env.X")?.valueHash).toBe("h2");
-    expect(mirrorProvenance.get("prov-1", "/a/settings.json")?.preexisted).toBe(false);
-    expect(mirrorProvenance.list("prov-1")).toHaveLength(2);
-    expect(mirrorProvenance.listForPath("prov-1", "/a/settings.json")).toHaveLength(2);
-    mirrorProvenance.remove("prov-1", "/a/settings.json", "env.X");
-    expect(mirrorProvenance.list("prov-1")).toHaveLength(1);
-    mirrorProvenance.removeForPath("prov-1", "/a/settings.json");
-    expect(mirrorProvenance.list("prov-1")).toEqual([]);
-    mirrorProvenance.upsert(row);
-    mirrorProvenance.deleteForHarness("prov-1");
-    expect(mirrorProvenance.list("prov-1")).toEqual([]);
+    await mirrorProvenance.upsert(row);
+    await mirrorProvenance.upsert({ ...row, key: "", scope: "file", preexisted: false });
+    await mirrorProvenance.upsert({ ...row, valueHash: "h2" });
+    expect((await mirrorProvenance.get("prov-1", "/a/settings.json", "env.X"))?.valueHash).toBe("h2");
+    expect((await mirrorProvenance.get("prov-1", "/a/settings.json"))?.preexisted).toBe(false);
+    expect(await mirrorProvenance.list("prov-1")).toHaveLength(2);
+    expect(await mirrorProvenance.listForPath("prov-1", "/a/settings.json")).toHaveLength(2);
+    await mirrorProvenance.remove("prov-1", "/a/settings.json", "env.X");
+    expect(await mirrorProvenance.list("prov-1")).toHaveLength(1);
+    await mirrorProvenance.removeForPath("prov-1", "/a/settings.json");
+    expect(await mirrorProvenance.list("prov-1")).toEqual([]);
+    await mirrorProvenance.upsert(row);
+    await mirrorProvenance.deleteForHarness("prov-1");
+    expect(await mirrorProvenance.list("prov-1")).toEqual([]);
   });
 });
 
@@ -105,9 +105,9 @@ describe("TT-B: the real page queries, validation without side effects, planted 
     return id;
   };
 
-  test("EXPLAIN of the SQL page() actually runs: first page and cursor page are SEARCHes with the row-value range", () => {
+  test("EXPLAIN of the SQL page() actually runs: first page and cursor page are SEARCHes with the row-value range", async () => {
     const sid = mkStack("plan");
-    for (let i = 0; i < 4; i++) harnessSwapEvents.insert({ ...base, stackId: sid, at: 50 + i });
+    for (let i = 0; i < 4; i++) await harnessSwapEvents.insert({ ...base, stackId: sid, at: 50 + i });
     // Capture the statements page() prepares instead of re-typing them here.
     const seen: string[] = [];
     const realQuery = db.query.bind(db);
@@ -117,9 +117,9 @@ describe("TT-B: the real page queries, validation without side effects, planted 
     };
     let cursor: string | null;
     try {
-      cursor = harnessSwapEvents.page(sid, { limit: 2 }).nextCursor;
+      cursor = (await harnessSwapEvents.page(sid, { limit: 2 })).nextCursor;
       expect(cursor).not.toBeNull();
-      harnessSwapEvents.page(sid, { limit: 2, before: cursor });
+      await harnessSwapEvents.page(sid, { limit: 2, before: cursor });
     } finally {
       (db as unknown as { query: unknown }).query = realQuery;
     }
@@ -142,7 +142,7 @@ describe("TT-B: the real page queries, validation without side effects, planted 
     db.run(`DELETE FROM harness_stacks WHERE id = ?`, [sid]);
   });
 
-  test("each bad field is refused and nothing is written; null optional fields are accepted", () => {
+  test("each bad field is refused and nothing is written; null optional fields are accepted", async () => {
     const sid = mkStack("val");
     const bad: Array<Partial<typeof base>> = [
       { trigger: "evil" as never },
@@ -151,16 +151,16 @@ describe("TT-B: the real page queries, validation without side effects, planted 
       { continuation: "bogus" as never },
     ];
     for (const patch of bad) {
-      expect(() => harnessSwapEvents.insert({ ...base, stackId: sid, ...patch })).toThrow(/invalid swap-history/);
+      await expect(harnessSwapEvents.insert({ ...base, stackId: sid, ...patch })).rejects.toThrow(/invalid swap-history/);
     }
-    expect(harnessSwapEvents.countForStack(sid)).toBe(0);
-    const ok = harnessSwapEvents.insert({ ...base, stackId: sid, reason: null, source: null, continuation: null });
-    expect(harnessSwapEvents.countForStack(sid)).toBe(1);
-    expect(harnessSwapEvents.page(sid).events[0]).toMatchObject({ id: ok.id, reason: null, source: null });
+    expect(await harnessSwapEvents.countForStack(sid)).toBe(0);
+    const ok = await harnessSwapEvents.insert({ ...base, stackId: sid, reason: null, source: null, continuation: null });
+    expect(await harnessSwapEvents.countForStack(sid)).toBe(1);
+    expect((await harnessSwapEvents.page(sid)).events[0]).toMatchObject({ id: ok.id, reason: null, source: null });
     db.run(`DELETE FROM harness_stacks WHERE id = ?`, [sid]);
   });
 
-  test("a planted bad row at a page boundary does not stall paging or leak; every valid row is seen once", () => {
+  test("a planted bad row at a page boundary does not stall paging or leak; every valid row is seen once", async () => {
     const sid = mkStack("plant");
     // 5 rows, newest first by (at,id): the invalid trigger sits at the end of page 1.
     for (const [id, at, trigger] of [["p5", 50, "limit"], ["p4", 40, "limit"], ["p3", 30, "evil"], ["p2", 20, "manual"], ["p1", 10, "retry"]] as const) {
@@ -170,19 +170,19 @@ describe("TT-B: the real page queries, validation without side effects, planted 
     const seen: string[] = [];
     let before: string | null = null;
     for (let guard = 0; guard < 10; guard++) {
-      const page = harnessSwapEvents.page(sid, { limit: 3, before });
+      const page = await harnessSwapEvents.page(sid, { limit: 3, before });
       seen.push(...page.events.map((e) => e.id));
       if (!page.nextCursor) break;
       before = page.nextCursor;
     }
     expect(seen).toEqual(["p5", "p4", "p2", "p1"]);
-    expect(harnessSwapEvents.page(sid).events.find((e) => e.id === "p4")).toMatchObject({ reason: null, source: null });
+    expect((await harnessSwapEvents.page(sid)).events.find((e) => e.id === "p4")).toMatchObject({ reason: null, source: null });
     // countForStack counts raw rows, the dropped one included.
-    expect(harnessSwapEvents.countForStack(sid)).toBe(5);
+    expect(await harnessSwapEvents.countForStack(sid)).toBe(5);
     db.run(`DELETE FROM harness_stacks WHERE id = ?`, [sid]);
   });
 
-  test("ties on the same timestamp break by id descending with no duplicate or gap across pages of one", () => {
+  test("ties on the same timestamp break by id descending with no duplicate or gap across pages of one", async () => {
     const sid = mkStack("tie");
     for (const id of ["a", "b", "c", "d", "e"]) {
       db.run(`INSERT INTO harness_swap_events (id, stack_id, trigger, at) VALUES (?, ?, 'limit', 7)`, [id, sid]);
@@ -190,7 +190,7 @@ describe("TT-B: the real page queries, validation without side effects, planted 
     const ids: string[] = [];
     let before: string | null = null;
     for (let guard = 0; guard < 10; guard++) {
-      const page = harnessSwapEvents.page(sid, { limit: 1, before });
+      const page = await harnessSwapEvents.page(sid, { limit: 1, before });
       ids.push(...page.events.map((e) => e.id));
       if (!page.nextCursor) break;
       before = page.nextCursor;

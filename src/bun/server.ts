@@ -62,7 +62,8 @@ import { checkAllHarnesses } from "./agent-status.ts";
 import { claudeJsonDirFor, effectiveHome, expandHomePath, harnessStacks, StackChangedError, StackInputError, validateInput as validateStackInput } from "./harness-stacks.ts";
 import { claudeConfigDirFor } from "./harness-config-root.ts";
 import { clearFailoverState, failoverTaskIdsForStack, repointTaskStatesAwayFromStack } from "./harness-failover.ts";
-import { harnessIdsWithProvenance } from "./harness-mirror-provenance.ts";
+import { harnessIdsWithProvenance, mirrorProvenance } from "./harness-mirror-provenance.ts";
+import { op as dbOp } from "./db-async.ts";
 import {
   deleteMirrorStateForHarness,
   describeMirrorEditDrop,
@@ -4426,7 +4427,7 @@ export function startApiServer(
                 { status: 403, headers: corsHeaders(req) },
               );
             }
-            setRemoteAccessOff();
+            await setRemoteAccessOff();
             return new Response(null, { status: 204, headers: corsHeaders(req) });
           }
           if (req.params.key === TMUX_SOURCE_KEY) {
@@ -4442,7 +4443,7 @@ export function startApiServer(
             if (body.value === "bundled" && !bundledTmuxAvailable()) {
               return json({ error: "bundled tmux is not available in this build" }, { status: 409, headers: corsHeaders(req) });
             }
-            setTmuxSource(body.value);
+            await setTmuxSource(body.value);
             return new Response(null, { status: 204, headers: corsHeaders(req) });
           }
           preferences.set(req.params.key, body.value);
@@ -4657,7 +4658,7 @@ export function startApiServer(
               { status: 409, headers: corsHeaders(req) },
             );
           }
-          setTmuxSource(body.source as TmuxSource);
+          await setTmuxSource(body.source as TmuxSource);
           return json({ ok: true, source: body.source }, { headers: corsHeaders(req) });
         }),
       },
@@ -4685,9 +4686,9 @@ export function startApiServer(
           // D-14: turn on a disabled built-in harness the first time its CLI
           // shows up installed, BEFORE the response is built, so the
           // `harnesses.list()` read below already shows the flipped rows.
-          // Synchronous db writes; off under `bun test` unless the seam is on.
+          // Off under `bun test` unless the seam is on.
           try {
-            applyHarnessAutoEnable(statuses);
+            await applyHarnessAutoEnable(statuses);
           } catch (err) {
             console.error("[agetor] harness auto-enable failed:", err);
           }
@@ -4697,14 +4698,14 @@ export function startApiServer(
           // bump) schedules a debounced model-catalog refresh without this
           // request waiting on it — never throws, so it can't affect the
           // response below either way.
-          noteHarnessStatuses(statuses);
+          void noteHarnessStatuses(statuses);
           return json(
             {
               harnesses: harnesses.list(),
               statuses,
               stacks: harnessStacks.list(),
               limitStates: harnessStacks.listLimitStates(),
-              mirrorRestorable: harnessIdsWithProvenance(),
+              mirrorRestorable: await harnessIdsWithProvenance(),
             },
             { headers: corsHeaders(req) },
           );
@@ -4913,7 +4914,7 @@ export function startApiServer(
 
       // Newest-first swap history of one stack, paged by an opaque cursor.
       "/harness-stacks/:id/history": {
-        GET: authed((req) => {
+        GET: authed(async (req) => {
           if (!harnessStacks.get(req.params.id)) {
             return json({ error: "not found" }, { status: 404, headers: corsHeaders(req) });
           }
@@ -4923,7 +4924,7 @@ export function startApiServer(
           const before = params.get("before");
           // The store clamps the limit to its own bounds and treats a
           // malformed cursor as "first page".
-          const page: HarnessSwapHistoryPage = harnessSwapEvents.page(req.params.id, {
+          const page: HarnessSwapHistoryPage = await harnessSwapEvents.page(req.params.id, {
             ...(limit !== undefined && Number.isFinite(limit) ? { limit } : {}),
             before: before || null,
           });
@@ -5154,10 +5155,16 @@ export function startApiServer(
           // keeps records and saved originals for makes the next mirror into
           // it drop them (they describe the old folder), so the edit is
           // refused until the caller confirms, like a stack save whose
-          // preview overwrites (docs/architecture/harness-stacks.md). Checked
-          // synchronously right before the write, so nothing lands between.
+          // preview overwrites (docs/architecture/harness-stacks.md). The check
+          // reads the account's mirror records, and the write below is one op
+          // that re-verifies a fingerprint of them taken BEFORE the check, in
+          // the same transaction as the update: a mirror run that lands in
+          // between fails the save (409 `mirror-changed`) instead of slipping
+          // past the confirmation.
+          let mirrorSignature: string | null = null;
           if ((patch.home !== undefined || patch.env !== undefined) && body.confirmMirrorDrop !== true) {
-            const drops = mirrorRecordsAffectedByEdit(current, {
+            mirrorSignature = await mirrorProvenance.signature(req.params.id);
+            const drops = await mirrorRecordsAffectedByEdit(current, {
               ...current,
               home: patch.home !== undefined ? patch.home : current.home,
               env: patch.env ?? current.env,
@@ -5173,7 +5180,14 @@ export function startApiServer(
           }
           applyEnabled();
           try {
-            const updated = harnesses.update(req.params.id, patch);
+            const saved = await dbOp("harnesses.updateGuarded", [req.params.id, patch, mirrorSignature]);
+            if (!saved.ok) {
+              return json(
+                { error: "this account's mirror records changed while saving; review and save again", code: "mirror-changed" },
+                { status: 409, headers: corsHeaders(req) },
+              );
+            }
+            const updated = saved.harness;
             // A changed config root may bring orphaned handoff copies kept
             // because they were outside the old one back in reach (or put
             // them out of reach, which the sweep just keeps). Not awaited.
@@ -5221,7 +5235,7 @@ export function startApiServer(
             // pruning-by-absence logic in agent-discovery.ts's runRefresh;
             // that path still exists as a backstop for any harness removal
             // that doesn't route through this DELETE handler).
-            noteHarnessRemoved(req.params.id);
+            await noteHarnessRemoved(req.params.id);
             return new Response(null, { status: 204, headers: corsHeaders(req) });
           } catch (e) {
             if (e instanceof HarnessInUseError) {
@@ -5726,7 +5740,7 @@ export function startApiServer(
         POST: authed(async (req) => {
           const sel = parseBundleSelection(await req.json().catch(() => null));
           if ("error" in sel) return json({ error: sel.error }, { status: 400, headers: corsHeaders(req) });
-          const built = exportBundleFor(sel.selection);
+          const built = await exportBundleFor(sel.selection);
           if (!built.ok) return json({ error: built.error }, { status: 400, headers: corsHeaders(req) });
           return json(
             { text: built.text, filename: built.filename, warnings: built.warnings, counts: built.counts },
@@ -5748,7 +5762,7 @@ export function startApiServer(
           }
           // Built up front so a selection that can't export fails before any
           // panel opens; Choose folder builds again after the pick (below).
-          let built = exportBundleFor(sel.selection);
+          let built = await exportBundleFor(sel.selection);
           if (!built.ok) return json({ error: built.error }, { status: 400, headers: corsHeaders(req) });
 
           let dir: string;
@@ -5776,7 +5790,7 @@ export function startApiServer(
               dir = picked;
               // The panel can stay up for minutes: write what the Agents and
               // Pipelines hold now, not what they held when it opened.
-              built = exportBundleFor(sel.selection);
+              built = await exportBundleFor(sel.selection);
               if (!built.ok) return json({ error: built.error }, { status: 400, headers: corsHeaders(req) });
             }
           }
@@ -6098,7 +6112,7 @@ export function startApiServer(
       // itself stays byte-compatible (kind-keyed) for the CLI and existing
       // tests — this is strictly additive.
       "/agent-models/harnesses": {
-        GET: authed((req) => json(getHarnessModelMap(), { headers: corsHeaders(req) })),
+        GET: authed(async (req) => json(await getHarnessModelMap(), { headers: corsHeaders(req) })),
       },
 
       // Slash commands/skills (for the `/…` autocomplete) and MCP/skill/plugin
@@ -8549,12 +8563,12 @@ export function startApiServer(
       // a task mutation, and the archived board view still needs to be able
       // to set/clear a dot (plan §3/§4).
       "/tasks/:id/seen": {
-        POST: authed((req) => {
+        POST: authed(async (req) => {
           const updated = tasks.markSeen(req.params.id);
           // Opening the task (panel open/switch, "Mark as read") removes its
           // OS notification (D6a). A step's entry belongs to its pipeline
           // parent (D16).
-          if (updated) removeTaskNotification(notificationTargetTaskId(req.params.id));
+          if (updated) removeTaskNotification(await notificationTargetTaskId(req.params.id));
           return updated
             ? json(updated, { headers: corsHeaders(req) })
             : json({ error: "not found" }, { status: 404, headers: corsHeaders(req) });
@@ -9301,10 +9315,10 @@ export function startApiServer(
         }),
       },
       "/remote-access": {
-        GET: authed((req) => json(getRemoteAccess(), { headers: corsHeaders(req) })),
-        DELETE: authed((req) => {
-          setRemoteAccessOff();
-          return json(getRemoteAccess(), { headers: corsHeaders(req) });
+        GET: authed(async (req) => json(await getRemoteAccess(), { headers: corsHeaders(req) })),
+        DELETE: authed(async (req) => {
+          await setRemoteAccessOff();
+          return json(await getRemoteAccess(), { headers: corsHeaders(req) });
         }),
       },
 
@@ -9369,13 +9383,13 @@ export function startApiServer(
       // task open (D6d), and an event arriving while the window is focused
       // (D7). A step id maps to its pipeline parent, which owns the entry.
       "/notifications/:taskId": {
-        DELETE: authed((req) => {
+        DELETE: authed(async (req) => {
           if (!native) return notAvailableHeadless(req);
           const taskId = req.params.taskId;
           if (!taskId || taskId.length > 512) {
             return json({ error: "invalid task id" }, { status: 400, headers: corsHeaders(req) });
           }
-          removeTaskNotification(notificationTargetTaskId(taskId));
+          removeTaskNotification(await notificationTargetTaskId(taskId));
           return json({ ok: true }, { headers: corsHeaders(req) });
         }),
       },
@@ -9423,20 +9437,19 @@ export function startApiServer(
             }
             // Same for the boot-time "Claude Code sessions found" notice: the
             // launch scan usually finishes before the webview connects.
-            try {
-              flushPendingClaudeSessionsNotice(send);
-            } catch {
-              // Never let a db hiccup stop `start` before the abort handler below
-              // is registered — see `send` above for why that leaks.
-            }
+            // Async now, so `start` stays synchronous and the abort handler below is
+            // registered at once (see `send` above for why a throw here leaks).
+            void flushPendingClaudeSessionsNotice(send).catch(() => {
+              // A db hiccup only skips the notice.
+            });
             // And the "harnesses turned on" notice (D-14): rows auto-enabled
             // while no client was connected (boot, or a poll before the
             // webview attached) are announced to the next one.
-            try {
-              flushPendingHarnessAutoEnableNotice(send);
-            } catch {
+            // `start` stays synchronous so the abort handler below is registered
+            // at once; the flush finishes later and `send` swallows a closed client.
+            void flushPendingHarnessAutoEnableNotice(send).catch(() => {
               // Same reason as above.
-            }
+            });
             req.signal.addEventListener("abort", () => {
               clearInterval(ping);
               unsubscribe();

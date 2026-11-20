@@ -34,9 +34,9 @@ export type ShowMessageBox = (opts: MessageBoxOptions) => Promise<{ response: nu
 export interface RemoteAccessBackground {
   getBackgroundStatus(opts?: { fresh?: boolean }): Promise<BackgroundStatus>;
   turnOnBackground(): Promise<BackgroundStatus>;
-  getRemoteAccess(): RemoteAccessStatus;
-  setRemoteAccessOff(): void;
-  setRemoteAccessOnFromNativeBox(): void;
+  getRemoteAccess(): Promise<RemoteAccessStatus>;
+  setRemoteAccessOff(): Promise<void>;
+  setRemoteAccessOnFromNativeBox(): Promise<void>;
   /**
    * Boots the supervisor of an enabled-but-`stopped` item (background.ts's
    * `startBackgroundNow`). Optional: when the caller doesn't inject one, the
@@ -91,7 +91,7 @@ function unavailableText(status: BackgroundStatus): string {
 export async function runRemoteAccessBox(deps: RemoteAccessBoxDeps): Promise<void> {
   const { showMessageBox, background } = deps;
   try {
-    const remote = background.getRemoteAccess();
+    const remote = await background.getRemoteAccess();
     if (remote.enabled) {
       const { response } = await showMessageBox({
         type: "question",
@@ -103,7 +103,7 @@ export async function runRemoteAccessBox(deps: RemoteAccessBoxDeps): Promise<voi
         defaultId: 1,
         cancelId: 1,
       });
-      if (response === 0) background.setRemoteAccessOff();
+      if (response === 0) await background.setRemoteAccessOff();
       return;
     }
 
@@ -151,7 +151,7 @@ export async function runRemoteAccessBox(deps: RemoteAccessBoxDeps): Promise<voi
       result = await waitForHost(deps, result);
     }
     if (result.registration === "enabled" && hostIsUp(result)) {
-      background.setRemoteAccessOnFromNativeBox();
+      await background.setRemoteAccessOnFromNativeBox();
       return;
     }
 

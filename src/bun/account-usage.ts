@@ -3,7 +3,8 @@ import { readdir, stat } from "node:fs/promises";
 import { promisify } from "node:util";
 import * as path from "node:path";
 import type { AccountUsageSummary, TokenTotals } from "../shared/types.ts";
-import { db } from "./db.ts";
+import { op } from "./db-async.ts";
+import type { UsageEventInput } from "./db-core/ops/usage-ops.ts";
 import { isPlainDirBelow, openReadNoFollow } from "./no-follow.ts";
 
 const readFdAsync = promisify(readFd);
@@ -73,55 +74,6 @@ export interface ScanResult {
   /** True when the pass stopped early on the byte budget — the next scan
    *  continues from the persisted cursors. */
   budgetExhausted: boolean;
-}
-
-// Lazy statements — db.ts has already migrated by the time this module is
-// imported (both live behind the same module graph), but preparing lazily
-// keeps import order irrelevant.
-let stmts: {
-  getCursor: ReturnType<typeof db.prepare>;
-  putCursor: ReturnType<typeof db.prepare>;
-  markSeen: ReturnType<typeof db.prepare>;
-  addDaily: ReturnType<typeof db.prepare>;
-  sumSince: ReturnType<typeof db.prepare>;
-  daysSince: ReturnType<typeof db.prepare>;
-} | null = null;
-
-function s() {
-  if (stmts) return stmts;
-  stmts = {
-    getCursor: db.prepare("SELECT mtime_ms, size, offset FROM usage_files WHERE path = ?"),
-    putCursor: db.prepare(
-      `INSERT INTO usage_files (path, config_dir, mtime_ms, size, offset) VALUES (?, ?, ?, ?, ?)
-       ON CONFLICT(path) DO UPDATE SET config_dir = excluded.config_dir,
-         mtime_ms = excluded.mtime_ms, size = excluded.size, offset = excluded.offset`,
-    ),
-    markSeen: db.prepare("INSERT OR IGNORE INTO usage_seen (config_dir, key) VALUES (?, ?)"),
-    addDaily: db.prepare(
-      `INSERT INTO usage_daily (config_dir, day, model, input_tokens, output_tokens, cache_write_tokens, cache_read_tokens, message_count)
-       VALUES (?, ?, ?, ?, ?, ?, ?, 1)
-       ON CONFLICT(config_dir, day, model) DO UPDATE SET
-         input_tokens = input_tokens + excluded.input_tokens,
-         output_tokens = output_tokens + excluded.output_tokens,
-         cache_write_tokens = cache_write_tokens + excluded.cache_write_tokens,
-         cache_read_tokens = cache_read_tokens + excluded.cache_read_tokens,
-         message_count = message_count + 1`,
-    ),
-    sumSince: db.prepare(
-      `SELECT COALESCE(SUM(input_tokens), 0) AS input, COALESCE(SUM(output_tokens), 0) AS output,
-              COALESCE(SUM(cache_write_tokens), 0) AS cacheWrite, COALESCE(SUM(cache_read_tokens), 0) AS cacheRead,
-              COALESCE(SUM(message_count), 0) AS messages
-       FROM usage_daily WHERE config_dir = ? AND day >= ?`,
-    ),
-    daysSince: db.prepare(
-      `SELECT day, model, input_tokens AS inputTokens, output_tokens AS outputTokens,
-              cache_write_tokens AS cacheWriteTokens, cache_read_tokens AS cacheReadTokens,
-              message_count AS messageCount
-       FROM usage_daily WHERE config_dir = ? AND day >= ?
-       ORDER BY day DESC, model ASC`,
-    ),
-  };
-  return stmts;
 }
 
 /** One parsed usage event, exported shape for the pure parser below. */
@@ -216,7 +168,7 @@ async function scanFile(
 ): Promise<number> {
   let st;
   try { st = await stat(filePath); } catch { return 0; }
-  const cursor = s().getCursor.get(filePath) as { mtime_ms: number; size: number; offset: number } | null;
+  const cursor = await op("usage.getCursor", [filePath]);
   // Skip only when the file is unchanged AND fully consumed — a budget-
   // truncated pass leaves offset < size with matching stat, and must resume.
   if (cursor && cursor.mtime_ms === st.mtimeMs && cursor.size === st.size && cursor.offset >= st.size) return 0;
@@ -250,7 +202,7 @@ async function scanFile(
       const nl = chunk.indexOf(0x0a);
       if (nl < 0) {
         offset += chunk.length;
-        s().putCursor.run(filePath, configDir, st.mtimeMs, st.size, offset);
+        await op("usage.putCursor", [filePath, configDir, st.mtimeMs, st.size, offset]);
         skipResume.set(filePath, offset);
         continue;
       }
@@ -258,7 +210,7 @@ async function scanFile(
       skipping = false;
       skipResume.delete(filePath);
       chunk = chunk.subarray(nl + 1);
-      s().putCursor.run(filePath, configDir, st.mtimeMs, st.size, offset);
+      await op("usage.putCursor", [filePath, configDir, st.mtimeMs, st.size, offset]);
       if (chunk.length === 0) continue;
     }
     const buf = carry.length > 0 ? Buffer.concat([carry, chunk]) : chunk;
@@ -266,23 +218,17 @@ async function scanFile(
     if (lastNewline >= 0) {
       const complete = buf.subarray(0, lastNewline + 1);
       const advance = lastNewline + 1;
-      const apply = db.transaction(() => {
-        for (const lineBuf of splitLines(complete)) {
-          const parsed = parseUsageLine(lineBuf.toString("utf8"));
-          if (!parsed) continue;
-          if ("error" in parsed) { result.parseErrors++; continue; }
-          const inserted = s().markSeen.run(configDir, parsed.key);
-          if (inserted.changes === 0) continue; // already counted
-          s().addDaily.run(
-            configDir, parsed.day, parsed.model,
-            parsed.inputTokens, parsed.outputTokens, parsed.cacheWriteTokens, parsed.cacheReadTokens,
-          );
-          result.eventsCounted++;
-        }
-        offset += advance;
-        s().putCursor.run(filePath, configDir, st.mtimeMs, st.size, offset);
-      });
-      apply();
+      // Parse here, apply the events and the cursor together in one named op
+      // (a single transaction inside the database worker).
+      const events: UsageEventInput[] = [];
+      for (const lineBuf of splitLines(complete)) {
+        const parsed = parseUsageLine(lineBuf.toString("utf8"));
+        if (!parsed) continue;
+        if ("error" in parsed) { result.parseErrors++; continue; }
+        events.push(parsed);
+      }
+      offset += advance;
+      result.eventsCounted += await op("usage.applyChunk", [configDir, filePath, st.mtimeMs, st.size, offset, events]);
       // Copy the tail so the (up to 8 MB) slice buffer can be freed.
       carry = Buffer.from(buf.subarray(lastNewline + 1));
     } else {
@@ -297,12 +243,12 @@ async function scanFile(
       result.parseErrors++;
       skipping = true;
       skipResume.set(filePath, offset);
-      s().putCursor.run(filePath, configDir, st.mtimeMs, st.size, offset);
+      await op("usage.putCursor", [filePath, configDir, st.mtimeMs, st.size, offset]);
     }
   }
   // Always save the cursor, even when nothing new was consumed, so an
   // unchanged file is skipped next time and later files are reached.
-  s().putCursor.run(filePath, configDir, st.mtimeMs, st.size, offset);
+  await op("usage.putCursor", [filePath, configDir, st.mtimeMs, st.size, offset]);
   result.filesScanned++;
   return consumed;
 }
@@ -370,10 +316,8 @@ function utcDay(daysAgo: number): string {
   return d.toISOString().slice(0, 10);
 }
 
-function totalsSince(configDir: string, day: string): TokenTotals {
-  const row = s().sumSince.get(configDir, day) as {
-    input: number; output: number; cacheWrite: number; cacheRead: number; messages: number;
-  };
+async function totalsSince(configDir: string, day: string): Promise<TokenTotals> {
+  const row = await op("usage.totalsSince", [configDir, day]);
   return {
     inputTokens: row.input,
     outputTokens: row.output,
@@ -394,8 +338,8 @@ export async function accountUsageSummary(configDir: string): Promise<AccountUsa
   await scanThrottled(configDir);
   return {
     configDir,
-    today: totalsSince(configDir, utcDay(0)),
-    last7d: totalsSince(configDir, utcDay(6)),
+    today: await totalsSince(configDir, utcDay(0)),
+    last7d: await totalsSince(configDir, utcDay(6)),
   };
 }
 
@@ -412,5 +356,5 @@ export interface UsageDayRow {
 /** Daily per-model rows for the Settings drill-down (default: last 30 days). */
 export async function accountUsageDays(configDir: string, days = 30): Promise<UsageDayRow[]> {
   await scanThrottled(configDir);
-  return s().daysSince.all(configDir, utcDay(days - 1)) as UsageDayRow[];
+  return op("usage.daysSince", [configDir, utcDay(days - 1)]);
 }

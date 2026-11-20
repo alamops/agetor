@@ -163,8 +163,8 @@ const sortedRuns = (taskId: string) => [...db.runs.listForTask(taskId)].sort((a,
 const statusLines = (runId: string) => db.runs.events(runId).filter((e) => e.stream === "status").map((e) => e.data);
 const userRows = (runId: string) => db.runs.events(runId).filter((e) => e.stream === "user").map((e) => e.data);
 const backlogTexts = (taskId: string) => db.tasks.get(taskId)!.backlog.map((i) => i.text);
-const histRows = (stackId: string, taskId: string) =>
-  history.harnessSwapEvents.page(stackId, { limit: 100 }).events.filter((e) => e.taskId === taskId);
+const histRows = async (stackId: string, taskId: string) =>
+  (await history.harnessSwapEvents.page(stackId, { limit: 100 })).events.filter((e) => e.taskId === taskId);
 const limitChunk = (extra: Record<string, unknown> = {}) =>
   `${HARNESS_LIMIT_STATUS_PREFIX}${JSON.stringify({
     reason: "quota", resetAtMs: Date.now() + 3_600_000, message: "usage limit", source: "claude-api-error", ...extra,
@@ -252,7 +252,7 @@ describe("finding 1: a successor limit while a claim is held is deferred, then s
     expect(rows[2]!.origin).toBe("harness-swap");
     expect(rows.some((r) => r.status === "running")).toBe(false);
     expect(db.tasks.get(task.id)!.agent).toBe(c);
-    expect(histRows(stack.id, task.id).map((r) => r.trigger).sort()).toEqual(["limit", "limit"]);
+    expect((await histRows(stack.id, task.id)).map((r) => r.trigger).sort()).toEqual(["limit", "limit"]);
     // The held message was still waiting for its delivery when the successor
     // it was meant for hit the limit: it never reached an account (no run
     // echoes it, so it is not duplicated) and lands in the tray exactly once.
@@ -410,7 +410,7 @@ describe("finding 1: a successor limit while a claim is held is deferred, then s
     expect(rows[0]!.status).toBe("failed");
     expect(statusLines(rows[0]!.id).some((l) => l.includes("switching once the current switch settles"))).toBe(false);
     expect(db.tasks.get(task.id)!.column).toBe("ready");
-    expect(histRows(stack.id, task.id)).toHaveLength(0);
+    expect(await histRows(stack.id, task.id)).toHaveLength(0);
     stacks.harnessStacks.clearLimitState(a);
     stacks.harnessStacks.delete(stack.id);
   }, 30_000);
@@ -495,7 +495,7 @@ describe("S8: a live successor's deferred limit during the boot swap claim", () 
     expect(rows[1]!.origin).toBe("harness-swap");
     // Decided once, by the deferred settlement: no blocked row, no "run the
     // task to continue" line the swap then contradicts.
-    expect(histRows(stack.id, task.id).map((r) => r.trigger)).toEqual(["limit"]);
+    expect((await histRows(stack.id, task.id)).map((r) => r.trigger)).toEqual(["limit"]);
     expect(sortedRuns(task.id).some((r) => statusLines(r.id).some((l) => l.includes("the core restarted during the account switch")))).toBe(false);
     expect(db.tasks.get(task.id)!.agent).toBe(c);
     expect(db.tasks.get(task.id)!.column).not.toBe("blocked");
@@ -548,7 +548,7 @@ describe("finding 2: a crash mid-swap resumes instead of orphaning", () => {
     // The old run was only ever reported as a harness-swap failure; a step
     // runner settles on any other terminal status, so none was emitted for it.
     expect(seen.filter((e) => e.kind === "run-status" && e.runId === oldRun).every((e) => (e as { reason?: string }).reason === "harness-swap")).toBe(true);
-    expect(histRows(stack.id, task.id).map((r) => r.trigger)).toEqual(["boot-resume"]);
+    expect((await histRows(stack.id, task.id)).map((r) => r.trigger)).toEqual(["boot-resume"]);
     stacks.harnessStacks.delete(stack.id);
   }, 30_000);
 
@@ -575,7 +575,7 @@ describe("finding 2: a crash mid-swap resumes instead of orphaning", () => {
     expect(after.column).toBe("blocked");
     expect(after.harnessState?.pendingSwap ?? null).toBeNull();
     expect(db.runs.get(oldRun)!.status).toBe("failed");
-    expect(histRows(stack.id, task.id).map((r) => r.trigger)).toEqual(["blocked"]);
+    expect((await histRows(stack.id, task.id)).map((r) => r.trigger)).toEqual(["blocked"]);
     stacks.harnessStacks.delete(stack.id);
   }, 20_000);
 });
@@ -1019,7 +1019,7 @@ describe("swap history: one row per move, per trigger", () => {
     const task = makeTask(a, `work ${FAKE_CLAUDE_LIMIT_PROMPT_MARKER}`);
     expect(await orch.startTask(task.id)).toHaveProperty("runId");
     await waitFor(settledRuns(task.id, 2));
-    const rows = histRows(stack.id, task.id);
+    const rows = await histRows(stack.id, task.id);
     expect(rows).toHaveLength(1);
     expect(rows[0]).toMatchObject({ trigger: "limit", fromHarnessId: a, toHarnessId: b, continuation: "transferred" });
     expect(rows[0]!.reason).not.toBeNull();
@@ -1038,7 +1038,7 @@ describe("swap history: one row per move, per trigger", () => {
     const task = makeTask(a, `ask ${FAKE_CLAUDE_LIMIT_CLEAN_PROMPT_MARKER}`);
     expect(await orch.startTask(task.id)).toHaveProperty("runId");
     await waitFor(settledRuns(task.id, 2));
-    const rows = histRows(stack.id, task.id);
+    const rows = await histRows(stack.id, task.id);
     expect(rows).toHaveLength(1);
     expect(rows[0]).toMatchObject({ trigger: "limit", continuation: "restarted" });
     stacks.harnessStacks.clearLimitState(a);
@@ -1061,7 +1061,7 @@ describe("swap history: one row per move, per trigger", () => {
     });
     failover.armAutoRetry(toB.id, at);
     await waitFor(settledRuns(toB.id, 2), 10_000);
-    const rowsB = histRows(stack.id, toB.id);
+    const rowsB = await histRows(stack.id, toB.id);
     expect(rowsB).toHaveLength(1);
     expect(rowsB[0]).toMatchObject({ trigger: "retry", fromHarnessId: a, toHarnessId: b });
     // (2) The reset passed: the retry resumes on the SAME account, still one row.
@@ -1075,7 +1075,7 @@ describe("swap history: one row per move, per trigger", () => {
     });
     failover.armAutoRetry(same.id, at);
     await waitFor(settledRuns(same.id, 2), 10_000);
-    const rowsSame = histRows(stack.id, same.id);
+    const rowsSame = await histRows(stack.id, same.id);
     expect(rowsSame).toHaveLength(1);
     expect(rowsSame[0]).toMatchObject({ trigger: "retry", fromHarnessId: a, toHarnessId: a });
     stacks.harnessStacks.delete(stack.id);
@@ -1089,7 +1089,7 @@ describe("swap history: one row per move, per trigger", () => {
     const before = db.tasks.get(task.id)!;
     db.tasks.update(task.id, { agent: b });
     await orch.reconcileTaskSession(task.id, before, db.tasks.get(task.id)!);
-    const rows = histRows(stack.id, task.id);
+    const rows = await histRows(stack.id, task.id);
     expect(rows).toHaveLength(1);
     expect(rows[0]).toMatchObject({ trigger: "manual", reason: "user", fromHarnessId: a, toHarnessId: b });
     stacks.harnessStacks.delete(stack.id);
@@ -1108,7 +1108,7 @@ describe("swap history: one row per move, per trigger", () => {
       db.harnesses.setEnabled(a, true);
     }
     expect(db.tasks.get(task.id)!.agent).toBe(b);
-    const rows = histRows(stack.id, task.id);
+    const rows = await histRows(stack.id, task.id);
     expect(rows).toHaveLength(1);
     expect(rows[0]).toMatchObject({ trigger: "unavailable", fromHarnessId: a, toHarnessId: b });
     stacks.harnessStacks.delete(stack.id);
@@ -1126,7 +1126,7 @@ describe("swap history: one row per move, per trigger", () => {
     } finally {
       failover.cancelAutoRetry(task.id);
     }
-    const rows = histRows(stack.id, task.id);
+    const rows = await histRows(stack.id, task.id);
     expect(rows.map((r) => r.trigger)).toEqual(["blocked"]);
     // The limit's own reason and source, not the generic no-usable-member.
     expect(rows[0]!.reason).toBe("quota");
@@ -1152,7 +1152,7 @@ describe("swap history: one row per move, per trigger", () => {
     } finally {
       orch.__setHarnessSwapSettleHookForTest(prev);
     }
-    expect(histRows(stack.id, task.id)).toHaveLength(0);
+    expect(await histRows(stack.id, task.id)).toHaveLength(0);
     stacks.harnessStacks.clearLimitState(a);
     stacks.harnessStacks.delete(stack.id);
   }, 20_000);
@@ -1186,7 +1186,7 @@ describe("a 1-member stack is inert at Run (22a)", () => {
     expect(failover.hasArmedAutoRetry(task.id)).toBe(false);
     expect(db.tasks.get(task.id)!.harnessState ?? null).toBeNull();
     expect(db.tasks.get(task.id)!.agent).toBe(a);
-    expect(histRows(stack.id, task.id)).toHaveLength(0);
+    expect(await histRows(stack.id, task.id)).toHaveLength(0);
     stacks.harnessStacks.delete(stack.id);
   }, 20_000);
 });

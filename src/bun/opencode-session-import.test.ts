@@ -448,7 +448,7 @@ test("the launch scan holds an OpenCode notice until a client connects, sends it
   expect(seenIds().has(fresh.id)).toBe(false);
 
   const sent: AppEvent[] = [];
-  flushPendingClaudeSessionsNotice((e) => sent.push(e));
+  await flushPendingClaudeSessionsNotice((e) => sent.push(e));
   const notices = sent.filter((e) => e.type === "opencode_sessions_found");
   expect(notices.length).toBe(1);
   const notice = notices[0] as Extract<AppEvent, { type: "opencode_sessions_found" }>;
@@ -459,7 +459,7 @@ test("the launch scan holds an OpenCode notice until a client connects, sends it
 
   // Sent once: the next client gets nothing, and the next launch skips seen ids.
   const again: AppEvent[] = [];
-  flushPendingClaudeSessionsNotice((e) => again.push(e));
+  await flushPendingClaudeSessionsNotice((e) => again.push(e));
   expect(again).toEqual([]);
   clearOpencodeSessionScanCache();
   const live: AppEvent[] = [];
@@ -494,7 +494,7 @@ test("a connected client gets the OpenCode notice live; a held id imported meanw
   await withEmptyClaudeHome(() => startClaudeSessionLaunchScan());
   await importOne(held.id);
   const sent: AppEvent[] = [];
-  flushPendingClaudeSessionsNotice((e) => sent.push(e));
+  await flushPendingClaudeSessionsNotice((e) => sent.push(e));
   expect(sent.filter((e) => e.type === "opencode_sessions_found")).toEqual([]);
   expect(seenIds().has(held.id)).toBe(false);
 });
@@ -507,7 +507,7 @@ test("the scan preference off skips the OpenCode scan too", async () => {
   try {
     await withEmptyClaudeHome(() => startClaudeSessionLaunchScan());
     const sent: AppEvent[] = [];
-    flushPendingClaudeSessionsNotice((e) => sent.push(e));
+    await flushPendingClaudeSessionsNotice((e) => sent.push(e));
     expect(sent).toEqual([]);
     expect(seenIds().size).toBe(0);
   } finally {

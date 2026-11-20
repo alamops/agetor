@@ -5,7 +5,7 @@ import { opencodeMajor } from "../shared/opencode.ts";
 import { cliVersionSatisfies } from "../shared/cli-version.ts";
 import { resolveBin, harnessEnv } from "./agents.ts";
 import { accountUsageSummary } from "./account-usage.ts";
-import { harnesses } from "./db.ts";
+import { harnesses } from "./db-async.ts";
 import { readClaudeAccount } from "./harness-discovery.ts";
 import { claudeRootFor } from "./harness-config-root.ts";
 import { resolveTmuxBin } from "./tmux-resolution.ts";
@@ -876,8 +876,8 @@ export async function checkHarness(harness: Harness, opts?: { freshAuth?: boolea
  * `/agents` (legacy) and `/harnesses` (preferred) endpoints. Concurrent;
  * each probe times out independently after VERSION_PROBE_TIMEOUT_MS.
  */
-export function checkAllHarnesses(): Promise<HarnessStatus[]> {
-  return Promise.all(harnesses.list().map((h) => checkHarness(h)));
+export async function checkAllHarnesses(): Promise<HarnessStatus[]> {
+  return Promise.all((await harnesses.list()).map((h) => checkHarness(h)));
 }
 
 // Exposed for tests: clears the fx auth-status memoization (see

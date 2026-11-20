@@ -748,7 +748,7 @@ test("rebuildOpenCursorAsks re-registers open rows as restart follow-ups without
     },
   });
   expect(listOpenCursorAsks()).toHaveLength(1);
-  rebuildOpenCursorAsks();
+  await rebuildOpenCursorAsks();
   expect(listOpenCursorAsks()).toHaveLength(1);
   const pending = listPendingForTask("task-rebuild");
   expect(pending).toHaveLength(1);
@@ -758,7 +758,7 @@ test("rebuildOpenCursorAsks re-registers open rows as restart follow-ups without
   expect(card.followupCause).toBe("restart");
   expect(card.source).toBe("cursor");
   expect(card.questions[0]?.question).toBe("Which option?");
-  rebuildOpenCursorAsks();
+  await rebuildOpenCursorAsks();
   expect(listPendingForTask("task-rebuild")).toHaveLength(1);
   expect(listOpenCursorAsks()).toHaveLength(1);
 });

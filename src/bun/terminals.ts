@@ -11,7 +11,7 @@
 // rationale as `interactions.ts`). The open-tab count is surfaced on the Task
 // payload via `countTerminals`, mirroring `pendingInteractionCount`.
 //
-// Import-cycle note: this module imports `tasks` from db.ts, and db.ts imports
+// Import-cycle note: db.ts imports
 // `countTerminals` from here. That is safe ONLY because every cross-module
 // access happens inside a function body (never at module top level) — keep it
 // that way, exactly like the db.ts ↔ interactions.ts cycle.
@@ -21,7 +21,7 @@ import { existsSync } from "node:fs";
 import type { ServerWebSocket } from "bun";
 import type { Task, TerminalTab } from "../shared/types.ts";
 import { isMultiRepoTask } from "../shared/multi-repo.ts";
-import { tasks } from "./db.ts";
+import { tasks } from "./db-async.ts";
 import { childEnv } from "./core-spawn.ts";
 // NOTE: worktree.ts is imported *dynamically* inside createTerminal, not at
 // the top level. worktree.ts reads db.ts's `dataDir` at module init; importing
@@ -161,7 +161,7 @@ export async function createTerminal(
   taskId: string,
   opts?: { repo?: string | null },
 ): Promise<TerminalTab | { error: string; notFound?: boolean }> {
-  if (!tasks.get(taskId)) return { error: "task not found", notFound: true };
+  if (!(await tasks.get(taskId))) return { error: "task not found", notFound: true };
 
   const pending = inFlight.get(taskId) ?? 0;
   if (countTerminals(taskId) + pending >= MAX_TERMINALS_PER_TASK) {
@@ -182,8 +182,8 @@ export async function createTerminal(
       pendingTeardown,
     } = await import("./orchestrator.ts");
     /** The task as it stands right now, or why a terminal can't open on it. */
-    const current = (): { task: Task } | { error: string; notFound?: boolean } => {
-      const t = tasks.get(taskId);
+    const current = async (): Promise<{ task: Task } | { error: string; notFound?: boolean }> => {
+      const t = await tasks.get(taskId);
       if (!t) return { error: "task not found", notFound: true };
       if (t.archivedAt != null) return { error: ARCHIVED_TERMINAL_ERROR };
       if (isTaskTearingDown(taskId)) return { error: TEARDOWN_TERMINAL_ERROR };
@@ -192,7 +192,7 @@ export async function createTerminal(
     // Serialize against a deferred archive/delete teardown before touching
     // the worktree, then judge the task as it stands once that settled.
     await pendingTeardown(taskId);
-    const before = current();
+    const before = await current();
     if ("error" in before) return before;
     const { task } = before;
 
@@ -243,7 +243,7 @@ export async function createTerminal(
     // own repository before persisting the materialized set.
     if (!multiRepo && !task.baseRef && prepared.worktreePath) {
       const sha = await resolveRef(task.workdir, "HEAD");
-      if (sha) tasks.update(taskId, { baseRef: sha });
+      if (sha) await tasks.update(taskId, { baseRef: sha });
     }
     if (multiRepo && prepared.repositories) {
       prepared.repositories = await pinMissingRepositoryBaseRefs(prepared.repositories);
@@ -252,10 +252,10 @@ export async function createTerminal(
       prepared.worktreePath
       && (task.worktreePath !== prepared.worktreePath || task.branch !== prepared.branch)
     ) {
-      tasks.update(taskId, { branch: prepared.branch, worktreePath: prepared.worktreePath });
+      await tasks.update(taskId, { branch: prepared.branch, worktreePath: prepared.worktreePath });
     }
     if (multiRepo && prepared.repositories) {
-      tasks.setRepositories(taskId, prepared.repositories);
+      await tasks.setRepositories(taskId, prepared.repositories);
     }
 
     // Default cwd is the workspace root; `repo` opens the shell inside one
@@ -280,7 +280,7 @@ export async function createTerminal(
     // teardown re-reads the row and removes whatever path it finds. If the
     // prepare materialized the worktree, it may also have done so after that
     // teardown already ran, so queue a cleanup behind it as well.
-    const after = current();
+    const after = await current();
     if ("error" in after) {
       if (!hadWorktree && prepared.worktreePath) {
         void discardRefusedWorktree(task, {

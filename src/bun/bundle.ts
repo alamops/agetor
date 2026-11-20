@@ -18,10 +18,15 @@ import {
   AgentProfileNameError,
   PipelineNameError,
   agentProfiles,
-  db,
   harnesses,
+  op,
   pipelines,
-} from "./db.ts";
+} from "./db-async.ts";
+import {
+  buildLocalState,
+  type KnownModels,
+  type ProbeData,
+} from "./db-core/ops/bundle-ops.ts";
 import { checkHarness } from "./agent-status.ts";
 import { getDiscoveredModels, getHarnessDiscoveredModels } from "./agent-discovery.ts";
 import { knownModelIds } from "../shared/model-catalog.ts";
@@ -46,7 +51,7 @@ import {
   type BundleLocalState,
 } from "../shared/bundle-import.ts";
 import { AGENT_OPTIONS } from "../shared/types.ts";
-import type { AgentKind, AgentProfile, Harness, HarnessStatus, Pipeline, PipelineGraph } from "../shared/types.ts";
+import type { AgentKind, Harness, HarnessStatus } from "../shared/types.ts";
 
 const AGENT_KINDS = Object.keys(AGENT_OPTIONS) as AgentKind[];
 
@@ -62,14 +67,12 @@ const MAX_FILE_NUMBER = 999;
 /** Every harness this machine can bind to, including a built-in that has no
  *  database row (read as enabled, the way `harnesses.getByIdOrKind`
  *  synthesizes it). */
-export function allLocalHarnesses(): Harness[] {
-  const rows = harnesses.list();
+export async function allLocalHarnesses(): Promise<Harness[]> {
+  const rows = await harnesses.list();
   const ids = new Set(rows.map((h) => h.id));
-  for (const kind of AGENT_KINDS) {
-    if (ids.has(kind)) continue;
-    const synthetic = harnesses.getByIdOrKind(kind);
-    if (synthetic) rows.push(synthetic);
-  }
+  const missing = AGENT_KINDS.filter((kind) => !ids.has(kind));
+  const synthetic = await Promise.all(missing.map((kind) => harnesses.getByIdOrKind(kind)));
+  for (const h of synthetic) if (h) rows.push(h);
   return rows;
 }
 
@@ -150,15 +153,15 @@ export function parseBundleImportOptions(raw: unknown): { options: BundleImportO
 // ── Export ─────────────────────────────────────────────────────────────────
 
 /** Build the export for a selection from the live database. */
-export function exportBundleFor(
+export async function exportBundleFor(
   selection: BundleSelection,
   now: Date = new Date(),
-): ({ ok: true } & BundleExportResponse) | { ok: false; error: string } {
+): Promise<({ ok: true } & BundleExportResponse) | { ok: false; error: string }> {
   const built = buildBundle({
     selection,
-    profiles: agentProfiles.list(),
-    pipelines: pipelines.list(),
-    harnesses: allLocalHarnesses(),
+    profiles: await agentProfiles.list(),
+    pipelines: await pipelines.list(),
+    harnesses: await allLocalHarnesses(),
     agetorVersion: pkg.version,
     now,
   });
@@ -382,50 +385,37 @@ function relevantHarnesses(rows: Harness[], parsed: ParsedBundle): Harness[] {
 type ProbeMap = Map<string, HarnessProbe>;
 
 async function probeRelevant(parsed: ParsedBundle): Promise<ProbeMap> {
-  const relevant = relevantHarnesses(allLocalHarnesses(), parsed);
+  const relevant = relevantHarnesses(await allLocalHarnesses(), parsed);
   const probes = await Promise.all(relevant.map((h) => probeHarness(h)));
   return new Map(relevant.map((h, i) => [h.id, probes[i]!] as const));
 }
 
-/** The synchronous half of the local state, read fresh from the database —
- *  run again inside the import transaction. */
-export function localStateFrom(probes: ProbeMap): BundleLocalState {
-  const rows = allLocalHarnesses();
-  const local: BundleLocalHarness[] = rows.map((h) => {
-    const status = probes.get(h.id)?.status ?? null;
-    return {
-      id: h.id,
-      kind: h.kind,
-      label: h.label,
-      isBuiltin: h.isBuiltin,
-      enabled: h.enabled,
-      available: status ? status.available : null,
-      loggedIn: status ? status.loggedIn : null,
-      reason: status?.reason ?? null,
-      installHint: status?.installHint ?? null,
-    };
-  });
-  const profiles = agentProfiles.list();
-  const knownModels: Record<string, string[] | null> = {};
-  const knownSkills: Record<string, string[] | null> = {};
-  for (const h of rows) {
-    knownModels[h.id] = knownModelsFor(h, probes.get(h.id)?.status?.loggedIn ?? null);
-    knownSkills[h.id] = probes.get(h.id)?.skills ?? null;
-  }
-  return {
-    harnesses: local,
-    knownKinds: [...AGENT_KINDS],
-    agentNames: profiles.map((p) => p.name),
-    pipelineNames: pipelines.list().map((p) => p.name),
-    profiles: profiles.map((p) => ({ id: p.id, name: p.name })),
-    knownModels,
-    knownSkills,
-  };
+/** The probe data the planner reads, as plain data (also what the commit op takes). */
+function probeData(probes: ProbeMap): ProbeData {
+  const out: ProbeData = {};
+  for (const [id, probe] of probes) out[id] = probe;
+  return out;
+}
+
+/** Model ids per harness id, from this thread's discovery caches. */
+function knownModelsFor_(rows: Harness[], probes: ProbeMap): KnownModels {
+  const out: KnownModels = {};
+  for (const h of rows) out[h.id] = knownModelsFor(h, probes.get(h.id)?.status?.loggedIn ?? null);
+  return out;
+}
+
+/** The local state, read fresh from the database. The commit runs the same
+ *  build again inside its transaction (`bundle.commitImport`). */
+export async function localStateFrom(probes: ProbeMap): Promise<BundleLocalState> {
+  const rows = await allLocalHarnesses();
+  const profiles = await agentProfiles.list();
+  const pipelineNames = (await pipelines.list()).map((p) => p.name);
+  return buildLocalState(rows, profiles, pipelineNames, probeData(probes), knownModelsFor_(rows, probes));
 }
 
 /** Everything the planner needs about this machine (K5/K14). */
 export async function gatherBundleLocalState(parsed: ParsedBundle): Promise<BundleLocalState> {
-  return localStateFrom(await probeRelevant(parsed));
+  return await localStateFrom(await probeRelevant(parsed));
 }
 
 // ── Preview and commit ─────────────────────────────────────────────────────
@@ -445,46 +435,18 @@ export async function previewBundleImport(
   return { ok: true, plan: planBundleImport(parsed.bundle, local, options) };
 }
 
-class BundleImportBlocked extends Error {
-  constructor(readonly plan: BundleImportPlan) {
-    super(plan.blocking[0]?.message ?? "the import has blocking issues");
-  }
-}
-
-class BundleImportChanged extends Error {
-  constructor(readonly plan: BundleImportPlan) {
-    super("the import changed since the preview — review the new preview and import again");
-  }
-}
-
-/** Swap a bundle graph's Agent keys for the ids the import just created. */
-function graphWithIds(graph: PipelineGraph, idByKey: Map<string, string>): PipelineGraph {
-  return {
-    ...graph,
-    steps: graph.steps.map((step) => ({
-      ...step,
-      agentProfileId: step.agentProfileId === null ? null : (idByKey.get(step.agentProfileId) ?? null),
-      subagents: {
-        ...step.subagents,
-        profileIds: step.subagents.profileIds
-          .map((key) => idByKey.get(key))
-          .filter((id): id is string => typeof id === "string"),
-      },
-    })),
-  };
-}
-
 /**
  * Commit an import (K13). The async state (harness status, skills) is
- * gathered first; then, inside one database transaction, names and harness
- * rows are re-read, the plan is rebuilt, and — only if nothing is blocking —
- * harnesses are enabled, Agents inserted, graphs rewritten to the new ids and
- * Pipelines inserted. Any throw rolls everything back. A name clash that
- * slipped past the plan surfaces as a 409 with a fresh plan, and so does a
- * re-plan whose fingerprint differs from `expectedFingerprint` (the one the
- * client previewed and the user confirmed) — this machine changed in
- * between, so the import would create something other than what was shown.
- * Without `expectedFingerprint` (an older client) the re-plan is trusted.
+ * gathered first; then ONE named op runs inside the database worker, in one
+ * transaction: names and harness rows are re-read, the plan is rebuilt, and —
+ * only if nothing is blocking — harnesses are enabled, Agents inserted, graphs
+ * rewritten to the new ids and Pipelines inserted (`bundle-ops.ts`). Any throw
+ * rolls everything back. A name clash that slipped past the plan surfaces as a
+ * 409 with a fresh plan, and so does a re-plan whose fingerprint differs from
+ * `expectedFingerprint` (the one the client previewed and the user confirmed) —
+ * this machine changed in between, so the import would create something other
+ * than what was shown. Without `expectedFingerprint` (an older client) the
+ * re-plan is trusted.
  */
 export async function commitBundleImport(
   text: string,
@@ -494,68 +456,36 @@ export async function commitBundleImport(
   const parsed = parseBundleText(text);
   if (!parsed.ok) return { ok: false, status: 400, error: parsed.error, code: parsed.code };
   const probes = await probeRelevant(parsed.bundle);
+  const rows = await allLocalHarnesses();
 
-  const run = db.transaction((): BundleImportResponse => {
-    const plan = planBundleImport(parsed.bundle, localStateFrom(probes), options);
-    if (!plan.canImport) throw new BundleImportBlocked(plan);
-    if (expectedFingerprint !== undefined && plan.fingerprint !== expectedFingerprint) {
-      throw new BundleImportChanged(plan);
-    }
-
-    const enabledHarnesses: string[] = [];
-    for (const h of plan.harnesses) {
-      if (!h.willEnable || !harnesses.get(h.id)) continue;
-      harnesses.setEnabled(h.id, true);
-      enabledHarnesses.push(h.id);
-    }
-
-    const created: AgentProfile[] = [];
-    const idByKey = new Map<string, string>();
-    for (const a of plan.agents) {
-      const profile = agentProfiles.insert({
-        name: a.name,
-        harness: a.harnessId!,
-        model: a.model,
-        effort: a.effort,
-        mode: a.mode,
-        speed: a.speed,
-        maxMode: a.maxMode,
-        opencodeServer: a.opencodeServer,
-        instructions: a.instructions,
-        skills: a.skills,
-      });
-      idByKey.set(a.key, profile.id);
-      created.push(profile);
-    }
-
-    const createdPipelines: Pipeline[] = [];
-    for (const p of plan.pipelines) {
-      createdPipelines.push(
-        pipelines.insert({
-          name: p.name,
-          description: p.description,
-          graph: plan.legacy ? p.graph : graphWithIds(p.graph, idByKey),
-          ...(p.maxSteps !== undefined ? { maxSteps: p.maxSteps } : {}),
-        }),
-      );
-    }
-
-    return { agents: created, pipelines: createdPipelines, enabledHarnesses, warnings: plan.warnings, plan };
-  });
-
-  let result: BundleImportResponse;
+  let outcome;
   try {
-    result = run();
+    outcome = await op("bundle.commitImport", [
+      parsed.bundle,
+      options,
+      expectedFingerprint ?? null,
+      probeData(probes),
+      knownModelsFor_(rows, probes),
+    ]);
   } catch (err) {
-    if (err instanceof BundleImportBlocked || err instanceof BundleImportChanged) {
-      return { ok: false, status: 409, error: err.message, plan: err.plan };
-    }
     if (err instanceof AgentProfileNameError || err instanceof PipelineNameError) {
-      const plan = planBundleImport(parsed.bundle, localStateFrom(probes), options);
+      const plan = planBundleImport(parsed.bundle, await localStateFrom(probes), options);
       return { ok: false, status: 409, error: `${err.message} — preview the import again`, plan };
     }
     throw err;
   }
+  if (outcome.kind === "blocked") {
+    return { ok: false, status: 409, error: outcome.plan.blocking[0]?.message ?? "the import has blocking issues", plan: outcome.plan };
+  }
+  if (outcome.kind === "changed") {
+    return {
+      ok: false,
+      status: 409,
+      error: "the import changed since the preview — review the new preview and import again",
+      plan: outcome.plan,
+    };
+  }
+  const result = outcome.result;
 
   // Same post-enable catalog refresh `PATCH /harnesses/:id` triggers.
   for (const id of result.enabledHarnesses) void refreshHarnessModels(id).catch(() => {});

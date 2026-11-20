@@ -132,6 +132,8 @@ test("Cursor ask result broadcasts the persisted event id and timestamp", async 
   const args = { taskId, runId, toolCallId: `ask-${randomUUID()}`, content: "cancelled" };
   recordCursorAskToolResult(args);
   recordCursorAskToolResult(args);
+  // Fire-and-forget (the registry is synchronous): wait for the second insert (a no-op) to land.
+  await new Promise((r) => setTimeout(r, 100));
   const matching = storedRows(runId).filter((row) => row.stream === "tool_result" && row.data.includes(args.toolCallId));
   const sent = framesOf(runId).filter((frame) => frame.stream === "tool_result" && frame.data.includes(args.toolCallId));
   expect(matching).toHaveLength(1);

@@ -1,5 +1,10 @@
 import { defineOp, type OpCtx, type OpDef } from "./define.ts";
 import { testOps } from "./test-ops.ts";
+import { usageOps } from "./usage-ops.ts";
+import { harnessMirrorOps } from "./harness-mirror-ops.ts";
+import { bundleOps } from "./bundle-ops.ts";
+import { harnessStacksOps } from "./harness-stacks-ops.ts";
+import { pipelineOps } from "./pipeline-ops.ts";
 
 export { defineOp };
 export type { OpCtx, OpDef };
@@ -20,6 +25,11 @@ export type { OpCtx, OpDef };
 
 export const ops = {
   ...testOps,
+  ...usageOps,
+  ...harnessMirrorOps,
+  ...bundleOps,
+  ...harnessStacksOps,
+  ...pipelineOps,
 };
 
 export type OpRegistry = typeof ops;

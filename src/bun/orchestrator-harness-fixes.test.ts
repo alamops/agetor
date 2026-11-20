@@ -1295,7 +1295,7 @@ describe("blocked history after a failed move (review S5)", () => {
       orch.__setHarnessLimitObservedHookForTest(prev);
     }
     const history = await import("./harness-swap-history.ts");
-    const rows = history.harnessSwapEvents.page(stack.id, { limit: 20 }).events.filter((e) => e.taskId === task.id);
+    const rows = (await history.harnessSwapEvents.page(stack.id, { limit: 20 })).events.filter((e) => e.taskId === task.id);
     expect(rows).toHaveLength(1);
     expect(rows[0]!.trigger).toBe("blocked");
     expect(rows[0]!.reason).not.toBe("no-usable-member");

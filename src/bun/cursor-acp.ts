@@ -33,7 +33,7 @@ import { childEnv, coreSpawn } from "./core-spawn.ts";
 import { CURSOR_ASK_RESUME } from "../shared/cursor-ask-verdict.ts";
 import { FX_USAGE_STATUS_PREFIX } from "../shared/types.ts";
 import type { ChunkHandler, SpawnedAgent } from "./claude-tmux.ts";
-import { listOpenCursorAsks, runs } from "./db.ts";
+import { listOpenCursorAsks, runs } from "./db-async.ts";
 import {
   cancelPendingForTask,
   registerCursorAskQuestions,
@@ -226,9 +226,9 @@ function emitUsage(runId: string, result: unknown, emit: ChunkHandler): void {
  * and does not scan `run_events`. `follow-up` (the recorded verdict) delivers
  * the answer as the next user message.
  */
-export function rebuildOpenCursorAsks(): void {
+export async function rebuildOpenCursorAsks(): Promise<void> {
   const delivery = CURSOR_ASK_RESUME === "restores-request" ? "live" : "restart-followup";
-  for (const row of listOpenCursorAsks()) {
+  for (const row of await listOpenCursorAsks()) {
     const questions: CursorAskQuestionInput[] = [];
     for (const raw of row.payload.questions) {
       if (!isRecord(raw) || typeof raw.id !== "string") continue;
@@ -395,10 +395,10 @@ export function spawnCursorViaAcp(opts: CursorAcpLaunch): SpawnedAgent {
   }) as Subprocess<"pipe", "pipe", "pipe">;
 
   function writeLine(msg: unknown): void {
-    proc.stdin.write(`${JSON.stringify(msg)}\n`);
+    void proc.stdin.write(`${JSON.stringify(msg)}\n`);
     const sink = proc.stdin as { flush?: () => void | Promise<unknown> };
     try {
-      sink.flush?.();
+      void sink.flush?.();
     } catch {
       /* a closed stdin flush is the same as a failed write */
     }
@@ -458,6 +458,12 @@ export function spawnCursorViaAcp(opts: CursorAcpLaunch): SpawnedAgent {
     });
   }
 
+  function replaceStartedRow(uuid: string, data: string): void {
+    void runs.replaceMainEventDataByLineUuid(opts.runId, uuid, data).catch((err) => {
+      console.error("[agetor] cursor tool row rewrite failed:", err);
+    });
+  }
+
   function emitPinned(toolCallId: string, kind: "ask" | "plan", data: string): void {
     if (!toolCallId) return;
     const current = toolKind.get(toolCallId);
@@ -471,7 +477,9 @@ export function spawnCursorViaAcp(opts: CursorAcpLaunch): SpawnedAgent {
     // A partial tool_call can arrive before `_toolName` says this is an ask
     // or a plan, and a later partial of the same kind can carry a longer
     // body. Replace that row instead of leaving the first payload in place.
-    if (emittedTools.has(toolCallId)) runs.replaceMainEventDataByLineUuid(opts.runId, uuid, data);
+    // Posted, not awaited (this path is synchronous): the worker applies it in call
+    // order, ahead of any later write from this run.
+    if (emittedTools.has(toolCallId)) replaceStartedRow(uuid, data);
     emittedTools.add(toolCallId);
     toolKind.set(toolCallId, kind);
     toolPayload.set(toolCallId, data);
@@ -503,7 +511,7 @@ export function spawnCursorViaAcp(opts: CursorAcpLaunch): SpawnedAgent {
     const uuid = `tool_call:${toolCallId}:started`;
     // Rewrite the started row. A second insert would become lastToolUseData
     // and hide a later createPlanToolCall from detectCursorPlan.
-    if (prev !== undefined) runs.replaceMainEventDataByLineUuid(opts.runId, uuid, data);
+    if (prev !== undefined) replaceStartedRow(uuid, data);
     toolPayload.set(toolCallId, data);
     toolKind.set(toolCallId, "generic");
     emittedTools.add(toolCallId);

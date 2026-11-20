@@ -758,7 +758,7 @@ export async function moveTaskToMember(args: MoveTaskToMemberArgs): Promise<Move
   if (args.history) {
     const row = tasks.get(taskId);
     if (row) {
-      recordHarnessSwapEvent({
+      await recordHarnessSwapEvent({
         ...args.history,
         task: row,
         stackId: stack.id,
@@ -987,7 +987,7 @@ export function planManualSwitchTarget(
  * from `signal`. NEVER throws: a history write must not break a swap, so a
  * failure is logged and null returned.
  */
-export function recordHarnessSwapEvent(args: {
+export async function recordHarnessSwapEvent(args: {
   task: Task;
   stackId: string;
   trigger: HarnessSwapTrigger;
@@ -998,11 +998,11 @@ export function recordHarnessSwapEvent(args: {
   fromRunId?: string | null;
   toRunId?: string | null;
   continuation?: HarnessSwapEvent["continuation"];
-}): HarnessSwapEvent | null {
+}): Promise<HarnessSwapEvent | null> {
   try {
     const label = (id: string | null) => (id === null ? null : harnesses.getByIdOrKind(id)?.label ?? id);
     const signal = args.signal ?? null;
-    return harnessSwapEvents.insert({
+    return await harnessSwapEvents.insert({
       stackId: args.stackId,
       taskId: args.task.id,
       taskTitle: args.task.title ?? null,

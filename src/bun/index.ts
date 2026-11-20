@@ -12,7 +12,7 @@ import { CLI_TOKEN, DEFAULT_API_HOST, resolveApiHost } from "./api-config.ts";
 import { installCoreLog, registerLogSecret } from "./core-log.ts";
 import { setTaskDecorations } from "./db-async.ts";
 import { awaitDbReady, createQuitSequencer, runQuitSequence } from "./boot-db.ts";
-import { countPendingForTask, pendingCountsByTask } from "./interactions.ts";
+import { countPendingForTask, pendingCountsByTask, preloadPipelineParents } from "./interactions.ts";
 import { countTerminals, terminalCountsByTask } from "./terminals.ts";
 import { db, harnesses, pidFilePath, tasks, dataDir, preferences } from "./db.ts";
 import {
@@ -456,6 +456,8 @@ try {
   // reconcile, whose reattach of a `server=agetor` run needs the adopted server.
   await adoptOpencodeServers();
   await dbBoot;
+  // Before the gate opens: every live step's parent is known when its first card registers.
+  await preloadPipelineParents();
   await reconcileOrphans();
 
   // M16: reconcile every pipeline parent whose `pipelineRun` was left mid-flight
@@ -819,8 +821,8 @@ const windowLifecycle = makeWindowLifecycle({
   setMainWindow,
   buildWindow: async (frame: Frame) => {
     const url = await getMainViewUrl();
-    const theme = resolveThemePreference();
-    const fontSize = resolveFontSizePreference();
+    const theme = await resolveThemePreference();
+    const fontSize = await resolveFontSizePreference();
     // The native views:// scheme handler refuses URLs that carry a fragment
     // or query — it treats the part after the scheme as a literal file path,
     // so `views://mainview/index.html#api=…` resolves to a non-existent file

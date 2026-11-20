@@ -1491,12 +1491,12 @@ describe("TT-E: fix-round routes (shapes, gates, 22b, finding 19)", () => {
     const stack = await makeStack([a, b], "history");
     const { harnessSwapEvents, SWAP_HISTORY_MAX_LIMIT, SWAP_HISTORY_DEFAULT_LIMIT } = await import("./harness-swap-history.ts");
     const t0 = Date.now() - 10_000;
-    const mk = (i: number) => harnessSwapEvents.insert({
+    const mk = async (i: number) => await harnessSwapEvents.insert({
       stackId: stack, taskId: null, taskTitle: `t${i}`, fromHarnessId: a, fromLabel: "A", toHarnessId: b, toLabel: "B",
       trigger: "manual", reason: "user", source: null, message: null, model: null, resetsAtMs: null,
       fromRunId: null, toRunId: null, continuation: null, at: t0 + i,
     });
-    for (let i = 0; i < 5; i++) mk(i);
+    for (let i = 0; i < 5; i++) await mk(i);
 
     const p1 = await call("GET", `/harness-stacks/${stack}/history?limit=2`);
     expect(p1.status).toBe(200);
@@ -1520,7 +1520,7 @@ describe("TT-E: fix-round routes (shapes, gates, 22b, finding 19)", () => {
     expect((await call("GET", `/harness-stacks/${stack}/history?limit=abc`)).body.events).toHaveLength(5);
     expect((await call("GET", `/harness-stacks/${stack}/history?limit=`)).body.events).toHaveLength(5);
 
-    for (let i = 5; i < SWAP_HISTORY_MAX_LIMIT + 5; i++) mk(i);
+    for (let i = 5; i < SWAP_HISTORY_MAX_LIMIT + 5; i++) await mk(i);
     const big = await call("GET", `/harness-stacks/${stack}/history?limit=999999`);
     expect(big.body.events).toHaveLength(SWAP_HISTORY_MAX_LIMIT);
     expect(big.body.nextCursor).not.toBeNull();
@@ -1584,12 +1584,12 @@ describe("TT-E: fix-round routes (shapes, gates, 22b, finding 19)", () => {
     db.tasks.update(scheduled, { runId: schedRun });
     db.tasks.setHarnessState(scheduled, { ...baseState(stack), scheduledSwitch: { requestedAt: Date.now() } } as never);
 
-    harnessSwapEvents.insert({
+    await harnessSwapEvents.insert({
       stackId: stack, taskId: retrying, taskTitle: "x", fromHarnessId: a, fromLabel: "A", toHarnessId: b, toLabel: "B",
       trigger: "limit", reason: "quota", source: null, message: null, model: null, resetsAtMs: null,
       fromRunId: null, toRunId: null, continuation: null,
     });
-    expect(harnessSwapEvents.countForStack(stack)).toBe(1);
+    expect(await harnessSwapEvents.countForStack(stack)).toBe(1);
     try {
       expect(failover.hasArmedAutoRetry(retrying)).toBe(true);
       expect((await call("DELETE", `/harness-stacks/${stack}`)).status).toBe(200);
@@ -1599,7 +1599,7 @@ describe("TT-E: fix-round routes (shapes, gates, 22b, finding 19)", () => {
       expect(statusLines(retryRun).some((l) => l.includes("automatic account retry cancelled — the stack was deleted"))).toBe(true);
       expect(statusLines(schedRun).some((l) => l.includes("scheduled account switch cancelled — the stack was deleted"))).toBe(true);
       // The history cascades with the stack, and the route is a 404 now.
-      expect(harnessSwapEvents.countForStack(stack)).toBe(0);
+      expect(await harnessSwapEvents.countForStack(stack)).toBe(0);
       expect((await call("GET", `/harness-stacks/${stack}/history`)).status).toBe(404);
     } finally {
       failover.cancelAutoRetry(retrying);

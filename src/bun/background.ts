@@ -22,7 +22,7 @@ import {
   type BackgroundStatus,
   type RemoteAccessStatus,
 } from "../shared/types.ts";
-import { dataDir, preferences } from "./db.ts";
+import { dataDir, preferences } from "./db-async.ts";
 import { launchedBy } from "./daemon-mode.ts";
 import { liveSupervisor } from "./login-daemon-state.ts";
 import { loginItemHelper, type HelperInfo, type LoginItemHelper } from "./login-item-helper.ts";
@@ -71,32 +71,33 @@ export class BackgroundStartError extends Error {
  *  without driving the native box. */
 let fakeRemoteSeeded = false;
 
-function remoteIsOn(): boolean {
+async function remoteIsOn(): Promise<boolean> {
   if (
     !fakeRemoteSeeded &&
     process.env.AGETOR_FAKE_LOGIN_ITEM === "1" &&
     process.env.AGETOR_FAKE_REMOTE_ACCESS === "on"
   ) {
+    // Set before the await: a second caller must not seed again.
     fakeRemoteSeeded = true;
-    preferences.set(REMOTE_ACCESS_PREF_KEY, "on");
+    await preferences.set(REMOTE_ACCESS_PREF_KEY, "on");
   }
-  return preferences.get(REMOTE_ACCESS_PREF_KEY) === "on";
+  return (await preferences.get(REMOTE_ACCESS_PREF_KEY)) === "on";
 }
 
-export function getRemoteAccess(): RemoteAccessStatus {
-  return { enabled: remoteIsOn(), preview: true };
+export async function getRemoteAccess(): Promise<RemoteAccessStatus> {
+  return { enabled: await remoteIsOn(), preview: true };
 }
 
 /** Writes "off" when the switch is currently on. Returns whether it changed. */
-function writeRemoteOff(): boolean {
-  if (!remoteIsOn()) return false;
-  preferences.set(REMOTE_ACCESS_PREF_KEY, "off");
+async function writeRemoteOff(): Promise<boolean> {
+  if (!(await remoteIsOn())) return false;
+  await preferences.set(REMOTE_ACCESS_PREF_KEY, "off");
   return true;
 }
 
 /** Turn remote access off (no-op when it already is) and tell listeners. */
-export function setRemoteAccessOff(): void {
-  if (writeRemoteOff()) void notifyChanged();
+export async function setRemoteAccessOff(): Promise<void> {
+  if (await writeRemoteOff()) void notifyChanged();
 }
 
 /**
@@ -104,9 +105,9 @@ export function setRemoteAccessOff(): void {
  * may call this, and only after the background host is `enabled` (C5). No
  * route may ever reach it — see the module comment.
  */
-export function setRemoteAccessOnFromNativeBox(): void {
-  remoteIsOn(); // let the one-time fake seed run before this explicit write
-  preferences.set(REMOTE_ACCESS_PREF_KEY, "on");
+export async function setRemoteAccessOnFromNativeBox(): Promise<void> {
+  await remoteIsOn(); // let the one-time fake seed run before this explicit write
+  await preferences.set(REMOTE_ACCESS_PREF_KEY, "on");
   void notifyChanged();
 }
 
@@ -185,7 +186,7 @@ async function probe(): Promise<BackgroundStatus> {
   }
 
   const isLoginItemCore = launchedBy() === "login-item";
-  const remoteAccess = remoteIsOn();
+  const remoteAccess = await remoteIsOn();
   const supervisor = liveSupervisor(dataDir);
   // A supervisor that has reported ends the grace; one that never does lets it lapse.
   if (supervisor) startGraceUntil = 0;
@@ -227,7 +228,7 @@ async function probe(): Promise<BackgroundStatus> {
     status.state !== "parked" &&
     status.state !== "starting"
   ) {
-    writeRemoteOff();
+    await writeRemoteOff();
     console.warn(
       `[agetor] remote access turned off: background host is ${status.state}`,
     );
@@ -311,7 +312,7 @@ export async function turnOnBackground(): Promise<BackgroundStatus> {
  * tick, after the caller has its reply.
  */
 export async function turnOffBackground(): Promise<BackgroundStatus> {
-  writeRemoteOff();
+  await writeRemoteOff();
   startGraceUntil = 0;
   const before = await getBackgroundStatus({ fresh: true });
   if (before.state === "unavailable") {

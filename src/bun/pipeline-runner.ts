@@ -64,7 +64,7 @@ import {
   startTask,
   subscribeGlobal,
 } from "./orchestrator.ts";
-import { cancelPendingForTask, listPendingForTask } from "./interactions.ts";
+import { cancelPendingForTask, listPendingForTask, notePipelineParent } from "./interactions.ts";
 import { prepareTaskWorkdir, recordableCheckout, repoRoot } from "./worktree.ts";
 import { snapshotFromProfile } from "../shared/agent-profile.ts";
 import {
@@ -1426,6 +1426,8 @@ async function launchStep(
 
   const now = Date.now();
   const childId = randomUUID();
+  // Before the row exists: no card can register for this step without its parent known.
+  notePipelineParent(childId, parent.id);
   tasks.insert({
     id: childId,
     title: `${run.pipelineName} · ${step.name}`,

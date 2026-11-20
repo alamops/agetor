@@ -479,23 +479,23 @@ test("a stored catalog judges a start only under the CLI version it was probed w
   harnesses.setEnabled("codex", true);
   const prefKey = "modelCatalog:harness:codex";
   // The catalog persisted by an earlier run, hydrated the way a boot does.
-  const restoreCatalog = (cliVersion: string) => {
+  const restoreCatalog = async (cliVersion: string) => {
     discovery.__testing.resetForTests();
     scheduler.__testing.resetForTests();
     preferences.set(prefKey, JSON.stringify({ v: 1, cliVersion, savedAt: 1, models: [{ id: "gpt-6.2-sol" }] }));
-    scheduler.__testing.hydrateFromStore();
+    await scheduler.__testing.hydrateFromStore();
     expect(discovery.getHarnessDiscoveredModels("codex").map((m) => m.id)).toEqual(["gpt-6.2-sol"]);
   };
   try {
     // Probed under the CLI installed now: it lacks gpt-5.6-sol, which is refused.
-    restoreCatalog("codex-cli 0.166.0");
+    await restoreCatalog("codex-cli 0.166.0");
     const refused = await startTask(await createCodexTask("gpt-5.6-sol"));
     expect("error" in refused).toBe(true);
     if ("error" in refused) expect(refused.error).toContain("isn't in Codex's model list");
 
     // Probed under the CLI before an upgrade (its refresh hasn't landed): the
     // same list says nothing, and gpt-5.6-sol (no table floor) starts.
-    restoreCatalog("codex-cli 0.160.0");
+    await restoreCatalog("codex-cli 0.160.0");
     const taskId = await createCodexTask("gpt-5.6-sol");
     const started = await startTask(taskId);
     expect("error" in started).toBe(false);

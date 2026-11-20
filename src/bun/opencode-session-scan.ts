@@ -27,7 +27,7 @@ import { statSync } from "node:fs";
 import { coreSpawn } from "./core-spawn.ts";
 import type { Harness, OpencodeSessionListItem } from "../shared/types.ts";
 import { OPENCODE_SESSION_ID_RE, opencodeMajor } from "../shared/opencode.ts";
-import { harnesses, hiddenOpencodeSessionIds, projects } from "./db.ts";
+import { harnesses, hiddenOpencodeSessionIds, projects } from "./db-async.ts";
 import { harnessEnv, resolveBin } from "./agents.ts";
 import { cachedCliVersion } from "./agent-status.ts";
 import { exportIsComplete, exportSummary, runOpencodeExport } from "./opencode-export.ts";
@@ -250,9 +250,9 @@ async function listTarget(
  * import-only fields. `force` bypasses the 10 s cache.
  */
 export async function scanOpencodeSessionRecords(opts?: { force?: boolean }): Promise<OpencodeSessionRecord[]> {
-  const enabled = harnesses.list().filter((h) => h.kind === "opencode" && h.enabled);
+  const enabled = (await harnesses.list()).filter((h) => h.kind === "opencode" && h.enabled);
   if (enabled.length === 0) return [];
-  const dirs = [...new Set(projects.list().map((p) => p.path))].filter(isDirectory);
+  const dirs = [...new Set((await projects.list()).map((p) => p.path))].filter(isDirectory);
   if (dirs.length === 0) return [];
   const versions = new Map<string, string | null>();
   await Promise.all(enabled.map(async (h) => {
@@ -267,7 +267,7 @@ export async function scanOpencodeSessionRecords(opts?: { force?: boolean }): Pr
     targets.map((t) => () => listTarget(t, versions.get(t.harness.id) ?? null, opts?.force === true).catch(() => null)),
     SCAN_CONCURRENCY,
   );
-  const owned = hiddenOpencodeSessionIds();
+  const owned = await hiddenOpencodeSessionIds();
   const seen = new Set<string>();
   const out: OpencodeSessionRecord[] = [];
   lists.forEach((list, i) => {

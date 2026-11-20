@@ -1292,3 +1292,34 @@ test("opencodeAskAnswerFromBody maps ids, labels and typed text, and refuses eve
   const r = opencodeAskAnswerFromBody(proto, [{ custom: "v" }]);
   expect(r.ok && Object.keys(r.answer)).toEqual(["__proto__"]);
 });
+
+test("a step's FIRST card carries pipelineParentId synchronously once its parent is noted", async () => {
+  const { notePipelineParent, forgetPipelineParent, clearPipelineParentCacheForTests, cancelPendingForTask } = await import("./interactions.ts");
+  clearPipelineParentCacheForTests();
+  notePipelineParent("step-noted", "parent-noted");
+  const { req } = await makePrompt("step-noted", "r1", "fp-noted");
+  expect(req.pipelineParentId).toBe("parent-noted");
+  cancelPendingForTask("step-noted", "done");
+  forgetPipelineParent("step-noted");
+  const plain = await makePrompt("step-noted", "r2", "fp-noted-2");
+  expect("pipelineParentId" in plain.req).toBe(false);
+  cancelPendingForTask("step-noted", "done");
+});
+
+test("the boot preload loads stored step parents, so the first card carries its parent synchronously", async () => {
+  const { preloadPipelineParents, clearPipelineParentCacheForTests, cancelPendingForTask } = await import("./interactions.ts");
+  const { db } = await import("./db.ts");
+  await makeTaskWithCwd("pre-parent");
+  await makeTaskWithCwd("pre-step");
+  await makeTaskWithCwd("pre-archived");
+  db.run(`UPDATE tasks SET pipeline_parent_id = 'pre-parent' WHERE id IN ('pre-step', 'pre-archived')`);
+  db.run(`UPDATE tasks SET archived_at = 1 WHERE id = 'pre-archived'`);
+  clearPipelineParentCacheForTests();
+  expect(await preloadPipelineParents()).toBeGreaterThanOrEqual(1);
+  const step = await makePrompt("pre-step", "r1", "fp-pre-step");
+  expect(step.req.pipelineParentId).toBe("pre-parent");
+  const archived = await makePrompt("pre-archived", "r1", "fp-pre-archived");
+  expect(archived.req.pipelineParentId).toBeUndefined();
+  cancelPendingForTask("pre-step", "done");
+  cancelPendingForTask("pre-archived", "done");
+});

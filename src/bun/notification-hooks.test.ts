@@ -56,7 +56,7 @@ const pipeline = (taskId: string, status: "review" | "running" | "done" | "block
 describe("removalForEvent", () => {
   test("an answered question with nothing else pending removes the waiting entry", async () => {
     const { removalForEvent } = await import("./notification-hooks.ts");
-    expect(removalForEvent(resolved("t1"), { pendingFor: () => 0 })).toEqual({
+    expect(await removalForEvent(resolved("t1"), { pendingFor: () => 0 })).toEqual({
       taskId: "t1",
       ifKinds: ["waiting"],
     });
@@ -64,13 +64,13 @@ describe("removalForEvent", () => {
 
   test("an answered question with another still pending removes nothing", async () => {
     const { removalForEvent } = await import("./notification-hooks.ts");
-    expect(removalForEvent(resolved("t1"), { pendingFor: () => 1 })).toBeNull();
+    expect(await removalForEvent(resolved("t1"), { pendingFor: () => 1 })).toBeNull();
   });
 
   test("a step's answered question targets the pipeline parent", async () => {
     const { removalForEvent } = await import("./notification-hooks.ts");
     const asked: string[] = [];
-    const r = removalForEvent(resolved("step-1", "parent-1"), {
+    const r = await removalForEvent(resolved("step-1", "parent-1"), {
       pendingFor: (id) => {
         asked.push(id);
         return 0;
@@ -82,7 +82,7 @@ describe("removalForEvent", () => {
 
   test("leaving blocked removes the reason family", async () => {
     const { removalForEvent } = await import("./notification-hooks.ts");
-    expect(removalForEvent(column("t1", "blocked", "running"))).toEqual({
+    expect(await removalForEvent(column("t1", "blocked", "running"))).toEqual({
       taskId: "t1",
       ifKinds: ["waiting", "blocked", "api-error", "session-ended", "unknown-command"],
     });
@@ -90,28 +90,28 @@ describe("removalForEvent", () => {
 
   test("a step's own column event never removes", async () => {
     const { removalForEvent } = await import("./notification-hooks.ts");
-    expect(removalForEvent(column("step-1", "blocked", "review", "parent-1"))).toBeNull();
+    expect(await removalForEvent(column("step-1", "blocked", "review", "parent-1"))).toBeNull();
   });
 
   test("a decided human gate removes the review notification as the run leaves review", async () => {
     const { removalForEvent } = await import("./notification-hooks.ts");
-    expect(removalForEvent(pipeline("t1", "review"))).toBeNull();
-    expect(removalForEvent(pipeline("t1", "blocked"))).toBeNull();
-    expect(removalForEvent(pipeline("t1", "running"))).toEqual({ taskId: "t1", ifKinds: ["blocked"] });
-    expect(removalForEvent(pipeline("t1", "done"))).toEqual({ taskId: "t1", ifKinds: ["blocked"] });
-    expect(removalForEvent(pipeline("t1", "cancelled"))).toEqual({ taskId: "t1", ifKinds: ["blocked"] });
+    expect(await removalForEvent(pipeline("t1", "review"))).toBeNull();
+    expect(await removalForEvent(pipeline("t1", "blocked"))).toBeNull();
+    expect(await removalForEvent(pipeline("t1", "running"))).toEqual({ taskId: "t1", ifKinds: ["blocked"] });
+    expect(await removalForEvent(pipeline("t1", "done"))).toEqual({ taskId: "t1", ifKinds: ["blocked"] });
+    expect(await removalForEvent(pipeline("t1", "cancelled"))).toEqual({ taskId: "t1", ifKinds: ["blocked"] });
   });
 
   test("other column moves, pending questions and other kinds remove nothing", async () => {
     const { removalForEvent } = await import("./notification-hooks.ts");
-    expect(removalForEvent(column("t1", "running", "review"))).toBeNull();
-    expect(removalForEvent(column("t1", "running", "blocked"))).toBeNull();
-    expect(removalForEvent(column("t1", null, "running"))).toBeNull();
+    expect(await removalForEvent(column("t1", "running", "review"))).toBeNull();
+    expect(await removalForEvent(column("t1", "running", "blocked"))).toBeNull();
+    expect(await removalForEvent(column("t1", null, "running"))).toBeNull();
     expect(
-      removalForEvent({ ...resolved("t1"), state: "pending" } as GlobalEvent, { pendingFor: () => 0 }),
+      await removalForEvent({ ...resolved("t1"), state: "pending" } as GlobalEvent, { pendingFor: () => 0 }),
     ).toBeNull();
     expect(
-      removalForEvent({ kind: "run-status", taskId: "t1", runId: "r1", status: "succeeded", ts: 1 }),
+      await removalForEvent({ kind: "run-status", taskId: "t1", runId: "r1", status: "succeeded", ts: 1 }),
     ).toBeNull();
   });
 });
@@ -144,10 +144,10 @@ describe("task lookups", () => {
     const { notificationTargetTaskId } = await import("./notification-hooks.ts");
     const { baseId, parentId, stepId, cleanup } = await makeParentWithStep();
     try {
-      expect(notificationTargetTaskId(stepId)).toBe(parentId);
-      expect(notificationTargetTaskId(parentId)).toBe(parentId);
-      expect(notificationTargetTaskId(baseId)).toBe(baseId);
-      expect(notificationTargetTaskId("no-such-task")).toBe("no-such-task");
+      expect(await notificationTargetTaskId(stepId)).toBe(parentId);
+      expect(await notificationTargetTaskId(parentId)).toBe(parentId);
+      expect(await notificationTargetTaskId(baseId)).toBe(baseId);
+      expect(await notificationTargetTaskId("no-such-task")).toBe("no-such-task");
     } finally {
       cleanup();
     }
@@ -158,7 +158,7 @@ describe("task lookups", () => {
     const { registerTmuxPrompt, cancelPendingForTask } = await import("./interactions.ts");
     const { parentId, stepId, cleanup } = await makeParentWithStep();
     try {
-      expect(pendingInteractionsFor(parentId)).toBe(0);
+      expect(await pendingInteractionsFor(parentId)).toBe(0);
       registerTmuxPrompt({
         taskId: stepId,
         runId: "r1",
@@ -166,15 +166,18 @@ describe("task lookups", () => {
         choices: [{ key: "1", label: "Yes" }],
         fingerprint: "fp-hooks-step",
       });
-      expect(pendingInteractionsFor(parentId)).toBe(1);
-      expect(pendingInteractionsFor(stepId)).toBe(1);
+      expect(await pendingInteractionsFor(parentId)).toBe(1);
+      expect(await pendingInteractionsFor(stepId)).toBe(1);
       cancelPendingForTask(stepId, "test");
-      expect(pendingInteractionsFor(parentId)).toBe(0);
+      expect(await pendingInteractionsFor(parentId)).toBe(0);
     } finally {
       cleanup();
     }
   });
 });
+
+/** The hook's removal decision reads the database, so it lands a moment after the event. */
+const settleHooks = () => new Promise<void>((r) => setTimeout(r, 40));
 
 describe("installNotificationRemovalHooks (real interaction bus)", () => {
   test("a cancelled prompt records exactly one waiting removal", async () => {
@@ -193,8 +196,10 @@ describe("installNotificationRemovalHooks (real interaction bus)", () => {
         choices: [{ key: "1", label: "Yes" }],
         fingerprint: "fp-hooks-one",
       });
+      await settleHooks();
       expect(removals).toEqual([]);
       cancelPendingForTask(taskId, "test");
+      await settleHooks();
       expect(removals).toEqual([{ taskId, ifKinds: ["waiting"] }]);
     } finally {
       unsub();
@@ -225,8 +230,10 @@ describe("installNotificationRemovalHooks (real interaction bus)", () => {
         fingerprint: "fp-hooks-b",
       });
       expect(answerTmuxPrompt(first.id, { key: "__external__" })).toBe(true);
-      expect(removals).toEqual([]);
+      // The hook decides from the counts at the moment of each event, however
+      // late its database reads land: the first answer leaves one prompt pending.
       cancelPendingForTask(taskId, "test");
+      await settleHooks();
       expect(removals).toEqual([{ taskId, ifKinds: ["waiting"] }]);
     } finally {
       unsub();
@@ -250,6 +257,7 @@ describe("installNotificationRemovalHooks (real interaction bus)", () => {
       fingerprint: "fp-hooks-unsub",
     });
     cancelPendingForTask(taskId, "test");
+    await settleHooks();
     expect(removals).toEqual([]);
   });
 });

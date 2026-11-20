@@ -1700,7 +1700,7 @@ describe("fix round: provenance, propagation, backups, preview, restore (T3)", (
     await mirror.mirrorStack(stack, {});
     expect(readFileSync(path.join(backup, "CLAUDE.md"), "utf8")).toBe("primary rules\n");
     expect(JSON.parse(readFileSync(path.join(backup, "settings.json"), "utf8")).model).toBe("opus");
-    const rows = (await import("./harness-mirror-provenance.ts")).mirrorProvenance.list(b);
+    const rows = await (await import("./harness-mirror-provenance.ts")).mirrorProvenance.list(b);
     expect(rows.find((r) => r.path === "CLAUDE.md")?.preexisted).toBe(true);
     expect(rows.find((r) => r.path === "settings.json" && r.key === "env.FOO")?.preexisted).toBe(false);
 
@@ -1711,7 +1711,7 @@ describe("fix round: provenance, propagation, backups, preview, restore (T3)", (
     expect(settings.env.FOO).toBeUndefined();
     expect(result.restored).toContain("CLAUDE.md");
     expect(result.removed).toContain("settings.json:env.FOO");
-    expect((await import("./harness-mirror-provenance.ts")).mirrorProvenance.list(b)).toEqual([]);
+    expect(await (await import("./harness-mirror-provenance.ts")).mirrorProvenance.list(b)).toEqual([]);
   });
 
   test("a primary deletion removes the unedited mirrored skill and keeps an edited one", async () => {
@@ -1744,7 +1744,7 @@ describe("fix round: provenance, propagation, backups, preview, restore (T3)", (
     write(path.join(backup, "projects", "enc", "s.jsonl"), "transcript");
     const { mirrorProvenance } = await import("./harness-mirror-provenance.ts");
     const crypto = await import("node:crypto");
-    mirrorProvenance.upsert({
+    await mirrorProvenance.upsert({
       harnessId: b, stackId: stack.id, scope: "file", path: "projects/enc/s.jsonl", key: "",
       valueHash: crypto.createHash("sha256").update("transcript").digest("hex"),
       srcMtimeMs: null, srcSize: null, preexisted: false, backupRef: null, updatedAt: 1,
@@ -1773,10 +1773,10 @@ describe("fix round: provenance, propagation, backups, preview, restore (T3)", (
     write(path.join(primary, "settings.json"), JSON.stringify({ hooks: { Stop: [] }, model: "opus" }));
     await mirror.mirrorStack(stack, {});
     const { mirrorProvenance } = await import("./harness-mirror-provenance.ts");
-    expect(mirrorProvenance.get(b, "settings.json", "hooks")).not.toBeNull();
+    expect(await mirrorProvenance.get(b, "settings.json", "hooks")).not.toBeNull();
     const safeStack = { ...stack, mirrorMode: "safe" as const };
     await mirror.mirrorStack(safeStack, {});
-    expect(mirrorProvenance.get(b, "settings.json", "hooks")).toBeNull();
+    expect(await mirrorProvenance.get(b, "settings.json", "hooks")).toBeNull();
     expect(JSON.parse(readFileSync(path.join(backup, "settings.json"), "utf8")).hooks).toEqual({ Stop: [] });
   });
 });
@@ -1822,7 +1822,7 @@ describe("fix round: wave 2 review fixes (T3)", () => {
     write(path.join(backup, "settings.json"), JSON.stringify(s));
     const r1 = await mirror.restoreMirror(b);
     expect(r1.kept).toContain("settings.json:effortLevel");
-    const left = (await prov()).list(b);
+    const left = await (await prov()).list(b);
     expect(left.map((r) => r.key)).toEqual(["effortLevel"]);
     // The account sets a new model by hand; the next mirror backs THAT up.
     const s2 = JSON.parse(readFileSync(path.join(backup, "settings.json"), "utf8"));
@@ -1875,8 +1875,8 @@ describe("fix round: wave 2 review fixes (T3)", () => {
     write(path.join(backup, "CLAUDE.md"), "mine\n");
     await mirror.mirrorStack(stack, {});
     const p = await prov();
-    const row = p.get(b, "CLAUDE.md")!;
-    p.upsert({ ...row, valueHash: "stale", srcMtimeMs: null, srcSize: null });
+    const row = (await p.get(b, "CLAUDE.md"))!;
+    await p.upsert({ ...row, valueHash: "stale", srcMtimeMs: null, srcSize: null });
     await mirror.mirrorStack(stack, {});
     const result = await mirror.restoreMirror(b);
     expect(result.restored).toContain("CLAUDE.md");
@@ -1970,7 +1970,7 @@ describe("fix round F-B: backup store trust, link restore, deleted originals, ac
     expect(readlinkSync(path.join(backup, "skills", "swapped"))).toBe(path.join(shared, "old"));
     expect(result.removed).toContain("skills/added");
     expect(result.restored).toContain("skills/swapped");
-    expect((await provs()).list(b)).toEqual([]);
+    expect(await (await provs()).list(b)).toEqual([]);
   });
 
   test("S1: Restore puts back a preexisted file the account deleted", async () => {
@@ -1999,21 +1999,21 @@ describe("fix round F-B: backup store trust, link restore, deleted originals, ac
     await hold.reached;
     const p = await provs();
     // The copy phase has written rows: the delete provably lands mid-mirror.
-    expect(p.list(b).length).toBeGreaterThan(0);
+    expect((await p.list(b)).length).toBeGreaterThan(0);
     dbm.harnesses.delete(b);
-    expect(p.list(b)).toEqual([]);
+    expect(await p.list(b)).toEqual([]);
     hold.release();
     const result = await running;
     expect(result.warnings.some((w) => w.includes("deleted during the mirror"))).toBe(true);
     // Nothing after the delete was recorded: no key rows, no source, no key originals.
-    expect(p.list(b)).toEqual([]);
-    expect((await import("./harness-mirror-provenance.ts")).mirrorSources.get(b)).toBeNull();
+    expect(await p.list(b)).toEqual([]);
+    expect(await (await import("./harness-mirror-provenance.ts")).mirrorSources.get(b)).toBeNull();
     expect(existsSync(path.join(backupsOf(b), "keys"))).toBe(false);
     expect(JSON.parse(readFileSync(path.join(backup, "settings.json"), "utf8"))).toEqual({ model: "mine" });
     // The route then drops what the copy phase saved before the delete.
     await mirror.deleteMirrorStateForHarness(b);
     expect(existsSync(backupsOf(b))).toBe(false);
-    expect((await import("./harness-mirror-provenance.ts")).harnessIdsWithProvenance()).not.toContain(b);
+    expect(await (await import("./harness-mirror-provenance.ts")).harnessIdsWithProvenance()).not.toContain(b);
   });
 
   test("harnessIdsWithProvenance lists the accounts that have rows", async () => {
@@ -2021,7 +2021,7 @@ describe("fix round F-B: backup store trust, link restore, deleted originals, ac
     write(path.join(primary, "CLAUDE.md"), "primary rules\n");
     write(path.join(backup, "CLAUDE.md"), "mine\n");
     await mirror.mirrorStack(stack, {});
-    const ids = (await import("./harness-mirror-provenance.ts")).harnessIdsWithProvenance();
+    const ids = await (await import("./harness-mirror-provenance.ts")).harnessIdsWithProvenance();
     expect(ids).toContain(b);
     expect(new Set(ids).size).toBe(ids.length);
   });
@@ -2037,7 +2037,7 @@ describe("fix round F-B: backup store trust, link restore, deleted originals, ac
     // Propagation keeps the file (it was the account's own)...
     expect(readFileSync(path.join(backup, "skills", "s", "SKILL.md"), "utf8")).toBe("primary");
     // ...but the row and the saved original remain as an un-owned restore pointer.
-    const row = (await provs()).get(b, "skills/s/SKILL.md");
+    const row = await (await provs()).get(b, "skills/s/SKILL.md");
     expect(row?.preexisted).toBe(true);
     expect(row?.backupRef).toBeTruthy();
     // A later mirror that writes the item again re-adopts it without re-backing-up over "mine".
@@ -2419,7 +2419,7 @@ describe("TT-C: provenance, preview and propagation", () => {
     symlinkSync(path.join(shared, "linked"), path.join(primary, "skills", "linked"));
     write(path.join(primary, "settings.json"), JSON.stringify({ model: "opus", env: { FOO: "1" } }));
     await mirror.mirrorStack(stack, {});
-    const rows = (await provs()).list(b);
+    const rows = await (await provs()).list(b);
     const has = (scope: string, p: string, key = "") => rows.some((r) => r.scope === scope && r.path === p && r.key === key);
     expect(has("file", "CLAUDE.md")).toBe(true);
     expect(has("file", "skills/s/SKILL.md")).toBe(true);
@@ -2432,7 +2432,7 @@ describe("TT-C: provenance, preview and propagation", () => {
     const cx = codexPair("ttc-rows-cx");
     write(path.join(cx.pRoot, "config.toml"), 'model = "gpt-5"\n[mcp_servers.foo]\ncommand = "x"\n');
     await mirror.mirrorStack(cx.stack, {});
-    const cxRows = (await provs()).list(cx.b);
+    const cxRows = await (await provs()).list(cx.b);
     expect(cxRows.some((r) => r.scope === "key" && r.path === "config.toml" && r.key === "model")).toBe(true);
     expect(cxRows.some((r) => r.scope === "key" && r.path === "config.toml" && r.key === "mcp_servers.foo")).toBe(true);
   });
@@ -2458,7 +2458,7 @@ describe("TT-C: provenance, preview and propagation", () => {
     expect(preview.plans[0]!.keys.some((k) => k.key === "env.SAFE_VAR")).toBe(true);
     // A preview writes nothing and records nothing.
     expect(readFileSync(path.join(backup, "CLAUDE.md"), "utf8")).toBe("mine\n");
-    expect((await provs()).list(b)).toEqual([]);
+    expect(await (await provs()).list(b)).toEqual([]);
   });
 
   test("the preview equals the real run: same files and keys, then the real run writes exactly those", async () => {
@@ -2471,7 +2471,7 @@ describe("TT-C: provenance, preview and propagation", () => {
     await mirror.mirrorStack(stack, {});
     const again = await mirror.previewMirror(draft, { stackId: stack.id });
     const plan = preview.plans[0]!;
-    const rows = (await provs()).list(b);
+    const rows = await (await provs()).list(b);
     const written = new Set(rows.map((r) => r.path)); // merged files record per-key rows
     for (const f of [...plan.files.add, ...plan.files.update]) expect(written.has(f), f).toBe(true);
     const keyRows = new Set(rows.filter((r) => r.scope === "key").map((r) => `${r.path}:${r.key}`));
@@ -2518,7 +2518,7 @@ describe("TT-C: provenance, preview and propagation", () => {
     expect(after.env.B).toBe("edited");
     expect(after.env.OWN).toBe("o");
     expect(result.warnings.some((w) => w.includes("env.B") && w.includes("edited"))).toBe(true);
-    expect((await provs()).get(b, "settings.json", "env.B")).toBeNull();
+    expect(await (await provs()).get(b, "settings.json", "env.B")).toBeNull();
   });
 
   test("a planted provenance row for a settings key or a path outside the allowlist cannot remove anything", async () => {
@@ -2531,9 +2531,9 @@ describe("TT-C: provenance, preview and propagation", () => {
     write(path.join(backup, "settings.json"), JSON.stringify({ forceLoginMethod: "console", model: "own" }));
     const crypto = await import("node:crypto");
     const p = await provs();
-    p.upsert({ harnessId: b, stackId: stack.id, scope: "file", path: ".credentials.json", key: "", valueHash: crypto.createHash("sha256").update('{"claudeAiOauth":"SENTINEL-login"}').digest("hex"), srcMtimeMs: null, srcSize: null, preexisted: false, backupRef: null, updatedAt: 1 });
-    p.upsert({ harnessId: b, stackId: stack.id, scope: "file", path: "skills/.git/config", key: "", valueHash: crypto.createHash("sha256").update("[remote]").digest("hex"), srcMtimeMs: null, srcSize: null, preexisted: false, backupRef: null, updatedAt: 1 });
-    p.upsert({ harnessId: b, stackId: stack.id, scope: "file", path: "../outside.md", key: "", valueHash: "x", srcMtimeMs: null, srcSize: null, preexisted: false, backupRef: null, updatedAt: 1 });
+    await p.upsert({ harnessId: b, stackId: stack.id, scope: "file", path: ".credentials.json", key: "", valueHash: crypto.createHash("sha256").update('{"claudeAiOauth":"SENTINEL-login"}').digest("hex"), srcMtimeMs: null, srcSize: null, preexisted: false, backupRef: null, updatedAt: 1 });
+    await p.upsert({ harnessId: b, stackId: stack.id, scope: "file", path: "skills/.git/config", key: "", valueHash: crypto.createHash("sha256").update("[remote]").digest("hex"), srcMtimeMs: null, srcSize: null, preexisted: false, backupRef: null, updatedAt: 1 });
+    await p.upsert({ harnessId: b, stackId: stack.id, scope: "file", path: "../outside.md", key: "", valueHash: "x", srcMtimeMs: null, srcSize: null, preexisted: false, backupRef: null, updatedAt: 1 });
     await mirror.mirrorStack(stack, {});
     await mirror.restoreMirror(b);
     expect(existsSync(path.join(backup, ".credentials.json"))).toBe(true);
@@ -2597,7 +2597,7 @@ describe("TT-C: backups and Restore", () => {
     const first = await mirror.restoreMirror(b);
     expect(first.kept).toContain("skills/s/SKILL.md");
     expect(readFileSync(path.join(backup, "skills", "s", "SKILL.md"), "utf8")).toBe("# edited by the account");
-    expect((await provs()).get(b, "skills/s/SKILL.md")).not.toBeNull();
+    expect(await (await provs()).get(b, "skills/s/SKILL.md")).not.toBeNull();
     // The account's original CLAUDE.md came back; the retry still has rows, so the store stays.
     expect(readFileSync(path.join(backup, "CLAUDE.md"), "utf8")).toBe("mine\n");
     expect(existsSync(backupsOf(b))).toBe(true);
@@ -2605,7 +2605,7 @@ describe("TT-C: backups and Restore", () => {
     writeFileSync(path.join(backup, "skills", "s", "SKILL.md"), "# s");
     const second = await mirror.restoreMirror(b);
     expect(second.kept).toEqual([]);
-    expect((await provs()).list(b)).toEqual([]);
+    expect(await (await provs()).list(b)).toEqual([]);
     expect(existsSync(backupsOf(b))).toBe(false);
   });
 
@@ -2669,7 +2669,7 @@ describe("TT-C: backups and Restore", () => {
     // Kept (it was the account's own to begin with)...
     expect(JSON.parse(readFileSync(path.join(backup, "settings.json"), "utf8")).model).toBe("primary");
     // ...and still restorable.
-    const row = (await provs()).get(b, "settings.json", "model");
+    const row = await (await provs()).get(b, "settings.json", "model");
     expect(row?.preexisted).toBe(true);
     await mirror.restoreMirror(b);
     expect(JSON.parse(readFileSync(path.join(backup, "settings.json"), "utf8")).model).toBe("mine");
@@ -2740,7 +2740,7 @@ describe("TT-C: backups and Restore", () => {
     const running = mirror.mirrorStack(stack, {});
     await hold.reached;
     const p = await provs();
-    expect(p.list(b).length).toBeGreaterThan(0);
+    expect((await p.list(b)).length).toBeGreaterThan(0);
     // Requested mid-mirror (the account row stays, so only the queue protects
     // it): it must wait for the run, which still has the merge phase to write.
     let deleted = false;
@@ -2750,8 +2750,8 @@ describe("TT-C: backups and Restore", () => {
     hold.release();
     await running;
     await deleting;
-    expect(p.list(b)).toEqual([]);
-    expect((await import("./harness-mirror-provenance.ts")).mirrorSources.get(b)).toBeNull();
+    expect(await p.list(b)).toEqual([]);
+    expect(await (await import("./harness-mirror-provenance.ts")).mirrorSources.get(b)).toBeNull();
     expect(existsSync(backupsOf(b))).toBe(false);
   });
 });
@@ -2914,12 +2914,12 @@ describe("a primary whose folder comes from the core's environment", () => {
       // A run against a missing folder records nothing.
       process.env.CLAUDE_CONFIG_DIR = missing;
       await mirror.mirrorStack(stack, {});
-      expect(mirrorSources.get(b)).toBeNull();
+      expect(await mirrorSources.get(b)).toBeNull();
       // The first real folder becomes the reference.
       write(path.join(dirA, "skills", "s", "SKILL.md"), "# s");
       process.env.CLAUDE_CONFIG_DIR = dirA;
       await mirror.mirrorStack(stack, {});
-      expect(mirrorSources.get(b)?.primaryRoot.split("\n")[0]).toBe(path.resolve(dirA));
+      expect((await mirrorSources.get(b))?.primaryRoot.split("\n")[0]).toBe(path.resolve(dirA));
       // The reference folder is gone: it no longer blocks the new one.
       rmSync(dirA, { recursive: true });
       write(path.join(dirB, "skills", "t", "SKILL.md"), "# t");
@@ -2927,10 +2927,10 @@ describe("a primary whose folder comes from the core's environment", () => {
       const result = await mirror.mirrorStack(stack, {});
       expect(result.warnings.some((w) => w.includes("config folder is now"))).toBe(false);
       expect(existsSync(path.join(backup, "skills", "t", "SKILL.md"))).toBe(true);
-      expect(mirrorSources.get(b)?.primaryRoot.split("\n")[0]).toBe(path.resolve(dirB));
+      expect((await mirrorSources.get(b))?.primaryRoot.split("\n")[0]).toBe(path.resolve(dirB));
       // A Restore back to the backup's own originals clears the record.
       await mirror.restoreMirror(b);
-      expect(mirrorSources.get(b)).toBeNull();
+      expect(await mirrorSources.get(b)).toBeNull();
     } finally {
       if (saved === undefined) delete process.env.CLAUDE_CONFIG_DIR;
       else process.env.CLAUDE_CONFIG_DIR = saved;
@@ -2942,10 +2942,10 @@ describe("a primary whose folder comes from the core's environment", () => {
     const { b, stack } = claudePair("envroot-delete");
     await mirror.mirrorStack(stack, {});
     const { mirrorSources } = await import("./harness-mirror-provenance.ts");
-    expect(mirrorSources.get(b)).not.toBeNull();
+    expect(await mirrorSources.get(b)).not.toBeNull();
     stacks.harnessStacks.delete(stack.id);
     dbm.harnesses.delete(b);
-    expect(mirrorSources.get(b)).toBeNull();
+    expect(await mirrorSources.get(b)).toBeNull();
   });
 });
 
@@ -2974,7 +2974,7 @@ describe("review fix round: mirror correctness (R-M1, R-M2, S1-S4, S14, N1-N3)",
     write(path.join(pRoot, "config.toml"), ['model = "gpt-5"', 'approval_policy = "never"', ""].join("\n"));
     await mirror.mirrorStack(stack, {});
     const p = await provs();
-    expect(p.listForPath(b, "config.toml").filter((r) => r.scope === "key").map((r) => r.key).sort()).toEqual(["approval_policy", "model"]);
+    expect((await p.listForPath(b, "config.toml")).filter((r) => r.scope === "key").map((r) => r.key).sort()).toEqual(["approval_policy", "model"]);
 
     const { rmSync } = await import("node:fs");
     rmSync(path.join(pRoot, "config.toml"));
@@ -2986,7 +2986,7 @@ describe("review fix round: mirror correctness (R-M1, R-M2, S1-S4, S14, N1-N3)",
     const after = Bun.TOML.parse(readFileSync(path.join(bRoot, "config.toml"), "utf8")) as Record<string, unknown>;
     expect(after.model).toBeUndefined();
     expect(after.approval_policy).toBeUndefined();
-    expect(p.listForPath(b, "config.toml")).toEqual([]);
+    expect(await p.listForPath(b, "config.toml")).toEqual([]);
   });
 
   test("R-M1: a primary that drops its last top-level key (keeping a table) removes the mirrored keys and keeps the table", async () => {
@@ -2998,7 +2998,7 @@ describe("review fix round: mirror correctness (R-M1, R-M2, S1-S4, S14, N1-N3)",
     const after = Bun.TOML.parse(readFileSync(path.join(bRoot, "config.toml"), "utf8")) as Record<string, unknown>;
     expect(after.model).toBeUndefined();
     expect((after.mcp_servers as Record<string, Record<string, unknown>>).docs!.command).toBe("docs-mcp");
-    expect((await provs()).get(b, "config.toml", "model")).toBeNull();
+    expect(await (await provs()).get(b, "config.toml", "model")).toBeNull();
   });
 
   test("R-M2: a backup whose folder comes from the environment is skipped when it resolves elsewhere; Restore refuses there", async () => {
@@ -3017,7 +3017,7 @@ describe("review fix round: mirror correctness (R-M1, R-M2, S1-S4, S14, N1-N3)",
         set("CLAUDE_CONFIG_DIR", dirX);
         await mirror.mirrorStack(stack, {});
         expect(readFileSync(path.join(dirX, "CLAUDE.md"), "utf8")).toBe("primary\n");
-        expect((await sources()).get(b)?.backupRoot.split("\n")[0]).toBe(path.resolve(dirX));
+        expect((await (await sources()).get(b))?.backupRoot.split("\n")[0]).toBe(path.resolve(dirX));
 
         // Another core environment: the same account now resolves to dirY.
         set("CLAUDE_CONFIG_DIR", dirY);
@@ -3033,7 +3033,7 @@ describe("review fix round: mirror correctness (R-M1, R-M2, S1-S4, S14, N1-N3)",
         expect(refused.warnings.some((w) => w.startsWith("restore refused: this account's config folder is now"))).toBe(true);
         expect(refused.restored).toEqual([]);
         expect(readFileSync(path.join(dirY, "CLAUDE.md"), "utf8")).toBe("another folder\n");
-        expect((await provs()).list(b).length).toBeGreaterThan(0);
+        expect((await (await provs()).list(b)).length).toBeGreaterThan(0);
 
         // Back to the recorded folder: Restore puts the real original back there.
         set("CLAUDE_CONFIG_DIR", dirX);
@@ -3065,7 +3065,7 @@ describe("review fix round: mirror correctness (R-M1, R-M2, S1-S4, S14, N1-N3)",
         const result = await mirror.mirrorStack(stack, {});
         expect(result.warnings.some((w) => w.includes("config folder is now"))).toBe(false);
         expect(existsSync(path.join(dirY, "skills", "s", "SKILL.md"))).toBe(true);
-        expect((await sources()).get(b)?.backupRoot.split("\n")[0]).toBe(path.resolve(dirY));
+        expect((await (await sources()).get(b))?.backupRoot.split("\n")[0]).toBe(path.resolve(dirY));
         // The user gives the account its own folder: a changed fingerprint is never skipped.
         const own = mkdtempSync(path.join(tmpdir(), "agetor-rm2s-own-"));
         dbm.harnesses.update(b, { home: own });
@@ -3097,13 +3097,13 @@ describe("review fix round: mirror correctness (R-M1, R-M2, S1-S4, S14, N1-N3)",
         set("CLAUDE_CONFIG_DIR", undefined);
         await mirror.mirrorStack(stack, {});
         const p = await provs();
-        expect(p.get(b, ".claude.json", "mcpServers.docs")?.backupRef).toBeTruthy();
+        expect((await p.get(b, ".claude.json", "mcpServers.docs"))?.backupRef).toBeTruthy();
         rmSync(path.join(home, ".claude"), { recursive: true });
         set("CLAUDE_CONFIG_DIR", elsewhere);
         const result = await mirror.mirrorStack(stack, {});
         expect(result.warnings.some((w) => w.includes("skipped: this account's .claude.json folder is now"))).toBe(true);
         expect(result.warnings.some((w) => w.includes("are dropped"))).toBe(false);
-        expect(p.get(b, ".claude.json", "mcpServers.docs")?.backupRef).toBeTruthy();
+        expect((await p.get(b, ".claude.json", "mcpServers.docs"))?.backupRef).toBeTruthy();
         // Back where it was, the original still comes back.
         set("CLAUDE_CONFIG_DIR", undefined);
         mkdirSync(path.join(home, ".claude"));
@@ -3126,10 +3126,10 @@ describe("review fix round: mirror correctness (R-M1, R-M2, S1-S4, S14, N1-N3)",
       write(path.join(primary, "CLAUDE.md"), "primary\n");
       await mirror.mirrorStack(stack, {});
       const src = await sources();
-      const row = src.get(b)!;
+      const row = (await src.get(b))!;
       // The planted folder does not exist: a stat would call it stale and the
       // run would go ahead. Locked, any stat below Documents fails anyway.
-      src.set({ ...row, backupRoot: `${path.join(documents, "planted")}\n${path.join(documents, "planted")}` });
+      await src.set({ ...row, backupRoot: `${path.join(documents, "planted")}\n${path.join(documents, "planted")}` });
       chmodSync(documents, 0o000);
       write(path.join(primary, "CLAUDE.md"), "primary v2\n");
       const result = await mirror.mirrorStack(stack, {});
@@ -3150,7 +3150,7 @@ describe("review fix round: mirror correctness (R-M1, R-M2, S1-S4, S14, N1-N3)",
     write(path.join(backup, "CLAUDE.md"), "mine\n");
     await mirror.mirrorStack(stack, {});
     const p = await provs();
-    expect(p.get(b, "skills/s/SKILL.md")).not.toBeNull();
+    expect(await p.get(b, "skills/s/SKILL.md")).not.toBeNull();
     // The user re-points the backup at a folder that has its own copy of the
     // same skill (identical bytes), and the primary then drops the skill.
     const moved = mkdtempSync(path.join(tmpdir(), "agetor-rm2-repoint-new-"));
@@ -3171,8 +3171,8 @@ describe("review fix round: mirror correctness (R-M1, R-M2, S1-S4, S14, N1-N3)",
     // The new folder's own skill is not removed on the strength of a record
     // written in the old folder.
     expect(readFileSync(path.join(moved, "skills", "s", "SKILL.md"), "utf8")).toBe("# shared skill");
-    expect(p.get(b, "skills/s/SKILL.md")).toBeNull();
-    expect((await sources()).get(b)?.backupRoot.split("\n")[0]).toBe(path.resolve(moved));
+    expect(await p.get(b, "skills/s/SKILL.md")).toBeNull();
+    expect((await (await sources()).get(b))?.backupRoot.split("\n")[0]).toBe(path.resolve(moved));
     // Restore now puts back the new folder's own original, never the old one's.
     const restored = await mirror.restoreMirror(b);
     expect(restored.restored).toContain("CLAUDE.md");
@@ -3202,8 +3202,8 @@ describe("review fix round: mirror correctness (R-M1, R-M2, S1-S4, S14, N1-N3)",
         expect(dropped.warnings.some((w) => w.startsWith(`the mirror's record is for ${path.resolve(dirX)}, which no longer exists`) && w.includes("were dropped"))).toBe(true);
         expect(dropped.restored).toEqual([]);
         expect(readFileSync(path.join(dirY, "CLAUDE.md"), "utf8")).toBe("dirY's own\n");
-        expect((await provs()).list(b)).toEqual([]);
-        expect((await sources()).get(b)).toBeNull();
+        expect(await (await provs()).list(b)).toEqual([]);
+        expect(await (await sources()).get(b)).toBeNull();
         await mirror.mirrorStack(stack, {});
         // Mirrored as new: dirY's own file is the original now.
         const restored = await mirror.restoreMirror(b);
@@ -3331,16 +3331,16 @@ describe("review fix round: mirror correctness (R-M1, R-M2, S1-S4, S14, N1-N3)",
     await hold.reached;
     // The file is in place; this is where a crash would stop the run.
     expect(readFileSync(path.join(backup, "skills", "s", "SKILL.md"), "utf8")).toBe("# s");
-    const intent = p.get(b, "skills/s/SKILL.md");
+    const intent = await p.get(b, "skills/s/SKILL.md");
     expect(intent).not.toBeNull();
     expect(intent!.srcMtimeMs).toBeNull();
     hold.release();
     await running;
     // Put the database back to the crash state and run again: the equal-stamp
     // file is adopted, so a later primary deletion removes it.
-    p.upsert(intent!);
+    await p.upsert(intent!);
     await mirror.mirrorStack(stack, {});
-    expect(p.get(b, "skills/s/SKILL.md")!.srcMtimeMs).not.toBeNull();
+    expect((await p.get(b, "skills/s/SKILL.md"))!.srcMtimeMs).not.toBeNull();
     const { rmSync } = await import("node:fs");
     rmSync(path.join(primary, "skills", "s"), { recursive: true });
     await mirror.mirrorStack(stack, {});
@@ -3361,7 +3361,7 @@ describe("review fix round: mirror correctness (R-M1, R-M2, S1-S4, S14, N1-N3)",
     hold.release();
     await running;
     expect(JSON.parse(readFileSync(path.join(backup, "settings.json"), "utf8")).env.FOO).toBe("1");
-    expect((await provs()).get(b, "settings.json", "env.FOO")).not.toBeNull();
+    expect(await (await provs()).get(b, "settings.json", "env.FOO")).not.toBeNull();
   });
 
   test("S14: a primary whose CODEX_HOME comes from the environment is skipped when it resolves elsewhere", async () => {
@@ -3580,7 +3580,7 @@ describe("review rounds 3 and 4: mirror folders, crash windows and Restore (M1, 
       await mirror.mirrorStack(stack, {});
       expect(readFileSync(path.join(H, ".claude", "CLAUDE.md"), "utf8")).toBe("primary\n");
       const p = await provenance();
-      expect(p.get(b, ".claude.json", "mcpServers.docs")?.backupRef).toBeTruthy();
+      expect((await p.get(b, ".claude.json", "mcpServers.docs"))?.backupRef).toBeTruthy();
 
       // The user pins the account to the config folder it already used: only
       // the `.claude.json` folder moves (from H to H/.claude).
@@ -3595,9 +3595,9 @@ describe("review rounds 3 and 4: mirror folders, crash windows and Restore (M1, 
       expect(result.warnings.some((w) => w.includes("this account's .claude.json folder changed") && w.includes("are dropped"))).toBe(true);
       // The old folder's .claude.json record and saved original are gone; the
       // new folder had no .claude.json, so what the mirror wrote there is an add.
-      expect(p.get(b, ".claude.json", "mcpServers.docs")?.preexisted).toBe(false);
-      expect(p.get(b, ".claude.json", "mcpServers.docs")?.backupRef).toBeNull();
-      expect(p.get(b, "CLAUDE.md")?.backupRef).toBeTruthy();
+      expect((await p.get(b, ".claude.json", "mcpServers.docs"))?.preexisted).toBe(false);
+      expect((await p.get(b, ".claude.json", "mcpServers.docs"))?.backupRef).toBeNull();
+      expect((await p.get(b, "CLAUDE.md"))?.backupRef).toBeTruthy();
 
       const restored = await mirror.restoreMirror(b);
       expect(restored.restored).toContain("CLAUDE.md");
@@ -3630,7 +3630,7 @@ describe("review rounds 3 and 4: mirror folders, crash windows and Restore (M1, 
     const { primary, a, b, stack } = pairR2("s2-confirm");
     write(path.join(primary, "skills", "s", "SKILL.md"), "# s");
     await mirror.mirrorStack(stack, {});
-    expect((await provenance()).get(b, "skills/s/SKILL.md")).not.toBeNull();
+    expect(await (await provenance()).get(b, "skills/s/SKILL.md")).not.toBeNull();
     const moved = tmp("s2-confirm-new");
     dbm.harnesses.update(b, { home: moved });
     const preview = await mirror.previewMirror({ kind: "claude-code", members: [a, b], mirrorMode: "full" });
@@ -3645,8 +3645,8 @@ describe("review rounds 3 and 4: mirror folders, crash windows and Restore (M1, 
     const { primary: p2, a: a2, b: b2, stack: stack2 } = pairR2("s2-norecords");
     mkdirSync(path.join(p2, "skills"), { recursive: true });
     await mirror.mirrorStack(stack2, {});
-    expect((await provenance()).list(b2)).toEqual([]);
-    expect((await sources()).get(b2)).not.toBeNull();
+    expect(await (await provenance()).list(b2)).toEqual([]);
+    expect(await (await sources()).get(b2)).not.toBeNull();
     dbm.harnesses.update(b2, { home: tmp("s2-norecords-new") });
     const quiet = await mirror.previewMirror({ kind: "claude-code", members: [a2, b2], mirrorMode: "full" });
     expect(quiet.plans[0]!.warnings.some((w) => w.includes("changed from"))).toBe(true);
@@ -3662,7 +3662,7 @@ describe("review rounds 3 and 4: mirror folders, crash windows and Restore (M1, 
     try {
       // The skill is in place; a crash here must not leave rows with no folder pinned.
       expect(existsSync(path.join(backup, "skills", "s", "SKILL.md"))).toBe(true);
-      expect((await sources()).get(b)?.backupRoot.split("\n")[0]).toBe(path.resolve(backup));
+      expect((await (await sources()).get(b))?.backupRoot.split("\n")[0]).toBe(path.resolve(backup));
     } finally {
       hold.release();
       await running;
@@ -3683,16 +3683,16 @@ describe("review rounds 3 and 4: mirror folders, crash windows and Restore (M1, 
     const running = mirror.mirrorStack(stack, {});
     await hold.reached;
     // The crash point: the new folder's original is saved and overwritten.
-    const crashRows = p.list(b);
-    const crashSources = src.get(b);
+    const crashRows = await p.list(b);
+    const crashSources = await src.get(b);
     hold.release();
     await running;
     expect(crashSources?.backupRoot.split("\n")[0]).toBe(path.resolve(moved));
     expect(readFileSync(path.join(moved, "CLAUDE.md"), "utf8")).toBe("primary\n");
     // Put the database back to how the crash left it and run again.
-    p.deleteForHarness(b);
-    for (const row of crashRows) p.upsert(row);
-    src.set(crashSources!);
+    await p.deleteForHarness(b);
+    for (const row of crashRows) await p.upsert(row);
+    await src.set(crashSources!);
     const rerun = await mirror.mirrorStack(stack, {});
     expect(rerun.warnings.some((w) => w.includes("changed from"))).toBe(false);
     const restored = await mirror.restoreMirror(b);
@@ -3719,12 +3719,12 @@ describe("review rounds 3 and 4: mirror folders, crash windows and Restore (M1, 
       const own = JSON.stringify({ mcpServers: { docs: { command: "mine" } } });
       write(path.join(moved, ".claude.json"), own);
       dbm.harnesses.update(b, { home: moved });
-      const rowsBefore = (await provenance()).list(b).length;
+      const rowsBefore = (await (await provenance()).list(b)).length;
       const result = await mirror.mirrorStack(stack, {});
       expect(result.warnings.some((w) => w.includes("skipped: this account's config folder changed from") && w.includes("is not a directory"))).toBe(true);
       expect(readFileSync(path.join(moved, ".claude.json"), "utf8")).toBe(own);
-      expect((await provenance()).list(b).length).toBe(rowsBefore);
-      expect((await sources()).get(b)?.backupRoot.split("\n")[0]).toBe(path.resolve(backup));
+      expect((await (await provenance()).list(b)).length).toBe(rowsBefore);
+      expect((await (await sources()).get(b))?.backupRoot.split("\n")[0]).toBe(path.resolve(backup));
     });
   });
 
@@ -3749,7 +3749,7 @@ describe("review rounds 3 and 4: mirror folders, crash windows and Restore (M1, 
         const refused = await mirror.restoreMirror(b);
         expect(refused.warnings.some((w) => w.startsWith("restore refused: this account's config folder is now") && w.includes("restore again"))).toBe(true);
         expect(refused.restored).toEqual([]);
-        expect((await provenance()).list(b).length).toBeGreaterThan(0);
+        expect((await (await provenance()).list(b)).length).toBeGreaterThan(0);
         expect(readFileSync(path.join(dirY, "CLAUDE.md"), "utf8")).toBe("dirY's own\n");
       });
     });
@@ -3762,18 +3762,18 @@ describe("review rounds 3 and 4: mirror folders, crash windows and Restore (M1, 
     const hold = mirror.holdMirrorForTests(b, "file-copied");
     const running = mirror.mirrorStack(stack, {});
     await hold.reached;
-    const intent = p.get(b, "skills/s/SKILL.md");
+    const intent = await p.get(b, "skills/s/SKILL.md");
     hold.release();
     await running;
     expect(intent?.srcMtimeMs).toBeNull();
     expect(intent?.valueHash).toBeTruthy();
-    p.upsert(intent!);
+    await p.upsert(intent!);
     const { rmSync } = await import("node:fs");
     rmSync(path.join(primary, "skills", "s"), { recursive: true });
     const result = await mirror.mirrorStack(stack, {});
     expect(result.warnings.some((w) => w.includes("edited on this account"))).toBe(false);
     expect(existsSync(path.join(backup, "skills", "s", "SKILL.md"))).toBe(false);
-    expect(p.get(b, "skills/s/SKILL.md")).toBeNull();
+    expect(await p.get(b, "skills/s/SKILL.md")).toBeNull();
   });
 
   test("S7: Restore right after such a crash removes the added file", async () => {
@@ -3783,10 +3783,10 @@ describe("review rounds 3 and 4: mirror folders, crash windows and Restore (M1, 
     const hold = mirror.holdMirrorForTests(b, "file-copied");
     const running = mirror.mirrorStack(stack, {});
     await hold.reached;
-    const intent = p.get(b, "skills/s/SKILL.md");
+    const intent = await p.get(b, "skills/s/SKILL.md");
     hold.release();
     await running;
-    p.upsert(intent!);
+    await p.upsert(intent!);
     const restored = await mirror.restoreMirror(b);
     expect(restored.removed).toContain("skills/s/SKILL.md");
     expect(existsSync(path.join(backup, "skills", "s", "SKILL.md"))).toBe(false);
@@ -3947,7 +3947,7 @@ describe("review rounds 3 and 4: mirror folders, crash windows and Restore (M1, 
     write(path.join(pRoot, "config.toml"), 'model = "gpt-5"\n');
     await mirror.mirrorStack(stack, {});
     expect(readFileSync(path.join(bRoot, "config.toml"), "utf8")).toBe('# my codex notes\n\nmodel = "gpt-5"\n');
-    expect((await provenance()).get(b, "config.toml", await createdKey())).toBeNull();
+    expect(await (await provenance()).get(b, "config.toml", await createdKey())).toBeNull();
     const restored = await mirror.restoreMirror(b);
     expect(restored.removed).toEqual(["config.toml:model"]);
     expect(readFileSync(path.join(bRoot, "config.toml"), "utf8")).toBe("# my codex notes\n");
@@ -3971,7 +3971,7 @@ describe("review rounds 3 and 4: mirror folders, crash windows and Restore (M1, 
     write(path.join(backup, "CLAUDE.md"), "mine\n");
     await mirror.mirrorStack(stack, {});
     const p = await provenance();
-    const marker = p.get(b, "settings.json", await createdKey());
+    const marker = await p.get(b, "settings.json", await createdKey());
     expect(marker?.scope).toBe("file");
     expect(marker?.preexisted).toBe(false);
     const text = readFileSync(path.join(backup, "settings.json"), "utf8");
@@ -3986,21 +3986,21 @@ describe("review rounds 3 and 4: mirror folders, crash windows and Restore (M1, 
     expect(again.copied).toEqual([]);
     expect(again.warnings).toEqual([]);
     expect(readFileSync(path.join(backup, "settings.json"), "utf8")).toBe(text);
-    expect(p.get(b, "settings.json", await createdKey())).not.toBeNull();
+    expect(await p.get(b, "settings.json", await createdKey())).not.toBeNull();
 
     // An edit that drops the config folder's records counts real records only.
     const current = dbm.harnesses.get(b)!;
-    const drops = mirror.mirrorRecordsAffectedByEdit(current, { ...current, home: tmp("b1-marker-new") });
-    expect(drops?.[0]?.records).toBe(p.list(b).filter((r) => r.scope === "key" || r.key === "").length);
+    const drops = await mirror.mirrorRecordsAffectedByEdit(current, { ...current, home: tmp("b1-marker-new") });
+    expect(drops?.[0]?.records).toBe((await p.list(b)).filter((r) => r.scope === "key" || r.key === "").length);
     expect(drops?.[0]?.records).toBe(2);
 
     const restored = await mirror.restoreMirror(b);
     expect(restored.removed).toEqual(expect.arrayContaining(["settings.json:model", "settings.json"]));
     expect(restored.restored).toContain("CLAUDE.md");
     expect(existsSync(path.join(backup, "settings.json"))).toBe(false);
-    expect(p.list(b)).toEqual([]);
+    expect(await p.list(b)).toEqual([]);
     const { harnessIdsWithProvenance } = await import("./harness-mirror-provenance.ts");
-    expect(harnessIdsWithProvenance()).not.toContain(b);
+    expect(await harnessIdsWithProvenance()).not.toContain(b);
   });
 
   test("B1: no marker (a row from before it), or a file the account rewrote, is never removed by Restore", async () => {
@@ -4010,7 +4010,7 @@ describe("review rounds 3 and 4: mirror folders, crash windows and Restore (M1, 
     const legacy = pairR2("b1-legacy");
     write(path.join(legacy.primary, "settings.json"), JSON.stringify({ model: "opus" }));
     await mirror.mirrorStack(legacy.stack, {});
-    p.remove(legacy.b, "settings.json", KEY);
+    await p.remove(legacy.b, "settings.json", KEY);
     const r1 = await mirror.restoreMirror(legacy.b);
     expect(r1.removed).toEqual(["settings.json:model"]);
     expect(JSON.parse(readFileSync(path.join(legacy.backup, "settings.json"), "utf8"))).toEqual({});
@@ -4031,8 +4031,8 @@ describe("review rounds 3 and 4: mirror folders, crash windows and Restore (M1, 
     await mirror.mirrorStack(rerun.stack, {});
     writeFileSync(path.join(rerun.backup, "settings.json"), '{"model":"opus"}');
     await mirror.mirrorStack(rerun.stack, {});
-    expect(p.get(rerun.b, "settings.json", KEY)).toBeNull();
-    expect(p.get(rerun.b, "settings.json", "model")).not.toBeNull();
+    expect(await p.get(rerun.b, "settings.json", KEY)).toBeNull();
+    expect(await p.get(rerun.b, "settings.json", "model")).not.toBeNull();
   });
 
   test("B1: the marker goes once the mirror owns no key of its file", async () => {
@@ -4043,7 +4043,7 @@ describe("review rounds 3 and 4: mirror folders, crash windows and Restore (M1, 
     rmSync(path.join(primary, "settings.json"));
     await mirror.mirrorStack(stack, {});
     expect(JSON.parse(readFileSync(path.join(backup, "settings.json"), "utf8"))).toEqual({});
-    expect((await provenance()).listForPath(b, "settings.json")).toEqual([]);
+    expect(await (await provenance()).listForPath(b, "settings.json")).toEqual([]);
   });
 
   test("B2: the backup's header comment survives the primary setting its first key; a second run changes nothing; Restore puts the key back under it", async () => {
@@ -4104,11 +4104,11 @@ describe("review rounds 3 and 4: mirror folders, crash windows and Restore (M1, 
     const hold = mirror.holdMirrorForTests(b, "file-copied");
     const running = mirror.mirrorStack(stack, {});
     await hold.reached;
-    const rows = p.list(b);
+    const rows = await p.list(b);
     hold.release();
     await running;
-    p.deleteForHarness(b);
-    for (const row of rows) p.upsert(row);
+    await p.deleteForHarness(b);
+    for (const row of rows) await p.upsert(row);
     return rows;
   }
 
@@ -4220,7 +4220,7 @@ describe("an account edit that would drop its mirror records (mirrorRecordsAffec
     await mirror.mirrorStack(stack, {});
     const moved = tmp("moved-new");
     const { current, patched } = edited(b, { home: moved });
-    const drops = mirror.mirrorRecordsAffectedByEdit(current, patched);
+    const drops = await mirror.mirrorRecordsAffectedByEdit(current, patched);
     expect(drops).not.toBeNull();
     expect(drops!.map((d) => d.what)).toContain("config folder");
     const config = drops!.find((d) => d.what === "config folder")!;
@@ -4242,23 +4242,23 @@ describe("an account edit that would drop its mirror records (mirrorRecordsAffec
     write(path.join(backup, "CLAUDE.md"), "mine\n");
     await mirror.mirrorStack(stack, {});
     const same = edited(b, {});
-    expect(mirror.mirrorRecordsAffectedByEdit(same.current, same.patched)).toBeNull();
+    expect(await mirror.mirrorRecordsAffectedByEdit(same.current, same.patched)).toBeNull();
     const unrelatedEnv = edited(b, { env: { FOO: "bar" } });
-    expect(mirror.mirrorRecordsAffectedByEdit(unrelatedEnv.current, unrelatedEnv.patched)).toBeNull();
+    expect(await mirror.mirrorRecordsAffectedByEdit(unrelatedEnv.current, unrelatedEnv.patched)).toBeNull();
     const linkParent = tmp("kept-alias");
     const spelled = path.join(linkParent, "same");
     symlinkSync(backup, spelled);
     const viaLink = edited(b, { home: spelled });
-    expect(mirror.mirrorRecordsAffectedByEdit(viaLink.current, viaLink.patched)).toBeNull();
+    expect(await mirror.mirrorRecordsAffectedByEdit(viaLink.current, viaLink.patched)).toBeNull();
   });
 
   test("an account with no mirror records is never asked", async () => {
     const { primary, b, stack } = pair("none");
     mkdirSync(path.join(primary, "skills"), { recursive: true });
     await mirror.mirrorStack(stack, {});
-    expect((await import("./harness-mirror-provenance.ts")).mirrorProvenance.list(b)).toEqual([]);
+    expect(await (await import("./harness-mirror-provenance.ts")).mirrorProvenance.list(b)).toEqual([]);
     const { current, patched } = edited(b, { home: tmp("none-new") });
-    expect(mirror.mirrorRecordsAffectedByEdit(current, patched)).toBeNull();
+    expect(await mirror.mirrorRecordsAffectedByEdit(current, patched)).toBeNull();
   });
 
   test("a recorded folder the account already disagrees with (the core's environment moved it) is listed once an edit changes the root settings: the next run drops it too", async () => {
@@ -4275,30 +4275,30 @@ describe("an account edit that would drop its mirror records (mirrorRecordsAffec
       // The record names another (existing) config folder under the same
       // settings: the next run skips the account, it drops nothing.
       const { mirrorSources } = await import("./harness-mirror-provenance.ts");
-      const row = mirrorSources.get(b)!;
+      const row = (await mirrorSources.get(b))!;
       const elsewhere = tmp("env-elsewhere");
-      mirrorSources.set({ ...row, backupRoot: [path.resolve(elsewhere), row.backupRoot.split("\n")[1]!].join("\n") });
+      await mirrorSources.set({ ...row, backupRoot: [path.resolve(elsewhere), row.backupRoot.split("\n")[1]!].join("\n") });
       const relabel = edited(b, {});
-      expect(mirror.mirrorRecordsAffectedByEdit(relabel.current, { ...relabel.patched, label: "renamed" })).toBeNull();
+      expect(await mirror.mirrorRecordsAffectedByEdit(relabel.current, { ...relabel.patched, label: "renamed" })).toBeNull();
       const unrelated = edited(b, { env: { HOME: H, FOO: "bar" } });
-      expect(mirror.mirrorRecordsAffectedByEdit(unrelated.current, unrelated.patched)).toBeNull();
+      expect(await mirror.mirrorRecordsAffectedByEdit(unrelated.current, unrelated.patched)).toBeNull();
       // Pinning the config folder it already uses moves the .claude.json
       // folder, and with the root settings changed the next run no longer
       // skips: it drops the config line's records as well (mirrorOne compares
       // the recorded folders with the edited account's), so both are listed.
       const pin = edited(b, { home: path.join(H, ".claude"), env: {} });
-      const drops = mirror.mirrorRecordsAffectedByEdit(pin.current, pin.patched);
+      const drops = await mirror.mirrorRecordsAffectedByEdit(pin.current, pin.patched);
       expect(drops?.map((d) => d.what).sort()).toEqual([".claude.json folder", "config folder"]);
       expect(drops!.find((d) => d.what === "config folder")!.was).toBe(path.resolve(elsewhere));
       // Which is what the run after that save does.
       dbm.harnesses.update(b, { home: path.join(H, ".claude"), env: {} });
       const p = (await import("./harness-mirror-provenance.ts")).mirrorProvenance;
-      expect(p.get(b, "CLAUDE.md")?.backupRef).toBeTruthy();
+      expect((await p.get(b, "CLAUDE.md"))?.backupRef).toBeTruthy();
       const result = await mirror.mirrorStack(stack, {});
       expect(result.warnings.some((w) => w.includes(`this account's config folder changed from ${path.resolve(elsewhere)}`))).toBe(true);
       expect(result.warnings.some((w) => w.includes("this account's .claude.json folder changed from"))).toBe(true);
       // The config root's record and saved original went with the drop.
-      expect(p.get(b, "CLAUDE.md")?.backupRef ?? null).toBeNull();
+      expect((await p.get(b, "CLAUDE.md"))?.backupRef ?? null).toBeNull();
     } finally {
       if (saved === undefined) delete process.env.CLAUDE_CONFIG_DIR;
       else process.env.CLAUDE_CONFIG_DIR = saved;
@@ -4321,7 +4321,7 @@ describe("an account edit that would drop its mirror records (mirrorRecordsAffec
       dbm.harnesses.update(b, { home: Z });
       process.env.CLAUDE_CONFIG_DIR = Y;
       const back = edited(b, { home: null });
-      expect(mirror.mirrorRecordsAffectedByEdit(back.current, back.patched)).toBeNull();
+      expect(await mirror.mirrorRecordsAffectedByEdit(back.current, back.patched)).toBeNull();
       // Which is what the mirror then does: it skips the account.
       dbm.harnesses.update(b, { home: null });
       const preview = await mirror.previewMirror({ kind: "claude-code", members: [a, b], mirrorMode: "full" });
@@ -4344,7 +4344,7 @@ describe("an account edit that would drop its mirror records (mirrorRecordsAffec
       write(path.join(H, ".claude.json"), JSON.stringify({ mcpServers: { docs: { command: "mine" } } }));
       await mirror.mirrorStack(stack, {});
       const { current, patched } = edited(b, { home: path.join(H, ".claude"), env: {} });
-      const drops = mirror.mirrorRecordsAffectedByEdit(current, patched);
+      const drops = await mirror.mirrorRecordsAffectedByEdit(current, patched);
       expect(drops?.map((d) => d.what)).toEqual([".claude.json folder"]);
       expect(drops![0]!.savedOriginals).toBe(1);
     } finally {

@@ -171,39 +171,39 @@ test("resolveFontSizePreference falls back to 100 when nothing is stored", async
   // verify the fallback contract precisely: anything that isn't a valid
   // in-range value resolves to FONT_SIZE_DEFAULT (100).
   preferences.set("fontSize", "not-a-real-size");
-  expect(resolveFontSizePreference()).toBe(100);
+  expect(await resolveFontSizePreference()).toBe(100);
 });
 
-test("resolveFontSizePreference clamps an out-of-range stored value to the nearer bound", () => {
+test("resolveFontSizePreference clamps an out-of-range stored value to the nearer bound", async () => {
   preferences.set("fontSize", "300");
-  expect(resolveFontSizePreference()).toBe(170);
+  expect(await resolveFontSizePreference()).toBe(170);
 
   preferences.set("fontSize", "1");
-  expect(resolveFontSizePreference()).toBe(100);
+  expect(await resolveFontSizePreference()).toBe(100);
 });
 
-test("resolveFontSizePreference falls back to 100 for a non-numeric stored value", () => {
+test("resolveFontSizePreference falls back to 100 for a non-numeric stored value", async () => {
   preferences.set("fontSize", "abc");
-  expect(resolveFontSizePreference()).toBe(100);
+  expect(await resolveFontSizePreference()).toBe(100);
 });
 
-test("resolveFontSizePreference passes an in-range stored value through unchanged", () => {
+test("resolveFontSizePreference passes an in-range stored value through unchanged", async () => {
   preferences.set("fontSize", "140");
-  expect(resolveFontSizePreference()).toBe(140);
+  expect(await resolveFontSizePreference()).toBe(140);
 
   preferences.set("fontSize", "100");
-  expect(resolveFontSizePreference()).toBe(100);
+  expect(await resolveFontSizePreference()).toBe(100);
 
   preferences.set("fontSize", "170");
-  expect(resolveFontSizePreference()).toBe(170);
+  expect(await resolveFontSizePreference()).toBe(170);
 });
 
-test("resolveFontSizePreference rounds a fractional stored value", () => {
+test("resolveFontSizePreference rounds a fractional stored value", async () => {
   preferences.set("fontSize", "133.6");
-  expect(resolveFontSizePreference()).toBe(134);
+  expect(await resolveFontSizePreference()).toBe(134);
 });
 
-test("resolveFontSizePreference falls back to 100 (instead of throwing) when the DB read itself throws", () => {
+test("resolveFontSizePreference falls back to 100 (instead of throwing) when the DB read itself throws", async () => {
   // Regression coverage for the window-build path: buildWindow in
   // src/bun/index.ts awaits resolveFontSizePreference() before constructing
   // the BrowserWindow — an uncaught throw here (e.g. a locked/corrupt
@@ -216,13 +216,13 @@ test("resolveFontSizePreference falls back to 100 (instead of throwing) when the
     throw new Error("simulated: database disk image is malformed");
   };
   try {
-    expect(resolveFontSizePreference()).toBe(100);
+    expect(await resolveFontSizePreference()).toBe(100);
   } finally {
     preferences.get = realGet;
   }
   // The store itself is unaffected — restoring the stub didn't lose data.
   preferences.set("fontSize", "140");
-  expect(resolveFontSizePreference()).toBe(140);
+  expect(await resolveFontSizePreference()).toBe(140);
 });
 
 test("buildWindowHash omits &fontSize= entirely when fontSize is exactly the 100 default", () => {

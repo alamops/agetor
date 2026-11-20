@@ -1097,7 +1097,7 @@ describe("known model ids for the bundle planner (dynamic model catalog)", () =>
       [{ id: "gpt-7", efforts: ["high"], cursor: { effortIds: { high: "gpt-7-high" }, fastEfforts: ["high"] } }],
     );
     try {
-      const state = localStateFrom(new Map());
+      const state = await localStateFrom(new Map());
       expect(state.knownModels["claude-code"]).toContain("opus-6");
       expect(state.knownModels["claude-code"]).toContain("opus-5.5");
       const oc = state.knownModels["opencode"];

@@ -163,6 +163,7 @@ import {
   setRunEventEmitter,
   type AnyRequest,
   type InteractionResolved,
+  forgetPipelineParent,
 } from "./interactions.ts";
 import {
   CLAUDE_API_ERROR_STATUS_PREFIX,
@@ -1544,7 +1545,7 @@ export async function reconcileOrphans(): Promise<number> {
   // after the orphan writes, so a card's follow-up
   // addresses a task that is no longer `running`.
   try {
-    rebuildOpenCursorAsks();
+    await rebuildOpenCursorAsks();
   } catch (err) {
     console.warn("[agetor] could not rebuild open cursor questions:", err);
   }
@@ -4828,7 +4829,7 @@ function recordBlockedHistory(
   const from = (runId ? runs.get(runId)?.agent : null) ?? task.agent;
   const stackId = historyStackIdOf(task, from);
   if (!stackId) return;
-  recordHarnessSwapEvent({
+  void recordHarnessSwapEvent({
     task,
     stackId,
     trigger: "blocked",
@@ -5787,7 +5788,7 @@ async function spawnSwapContinuation(args: {
     const moved = tasks.get(taskId);
     const stackId = moved ? historyStackIdOf(moved, to) : null;
     if (moved && stackId) {
-      recordHarnessSwapEvent({
+      await recordHarnessSwapEvent({
         task: moved,
         stackId,
         trigger: args.historyTrigger,
@@ -6640,7 +6641,7 @@ export async function reconcileTaskSession(
         // its history row; nothing was transferred.
         const rowNow = tasks.get(taskId);
         if (rowNow && rowNow.agent === after.agent) {
-          recordHarnessSwapEvent({
+          await recordHarnessSwapEvent({
             task: rowNow,
             stackId: sameStack.id,
             trigger: opts.switchNow ?? "manual",
@@ -7572,7 +7573,7 @@ async function reconcileManualAccountSwitch(task: Task, pending: PendingSwapStat
     clearWithScheduled();
     const rowNow = tasks.get(taskId);
     if (rowNow) {
-      recordHarnessSwapEvent({
+      await recordHarnessSwapEvent({
         task: rowNow,
         stackId: stack.id,
         trigger: "boot-resume",
@@ -13946,6 +13947,7 @@ export async function deleteTask(taskId: string, opts?: { fromPipeline?: boolean
   // children blocked on agetor unblock immediately. Done before dropSession
   // so the curl / fetch awaiters return before tmux kills them.
   cancelPendingForTask(taskId, "task deleted");
+  forgetPipelineParent(taskId);
   // Kill the task's tmux session before tearing down the worktree so we don't
   // leave an orphaned session behind. For claude it outlives individual runs;
   // for codex/cursor/gemini it only exists during an in-flight turn —

@@ -100,7 +100,7 @@ async function waitFor(fn: () => boolean, ms = 8000): Promise<void> {
   }
 }
 
-const events = (stackId: string) => history.harnessSwapEvents.page(stackId, { limit: 50 }).events;
+const events = async (stackId: string) => (await history.harnessSwapEvents.page(stackId, { limit: 50 })).events;
 
 describe("switchTaskAccountNow", () => {
   test("a lone account is refused up front", async () => {
@@ -143,7 +143,7 @@ describe("switchTaskAccountNow", () => {
     expect(after.harnessState?.tried ?? []).toEqual([]);
     expect(after.harnessState?.scheduledSwitch ?? null).toBeNull();
     expect(stacks.harnessStacks.getLimitState(a)).toBeNull();
-    const rows = events(stack.id).filter((e) => e.taskId === task.id);
+    const rows = (await events(stack.id)).filter((e) => e.taskId === task.id);
     expect(rows).toHaveLength(1);
     expect(rows[0]!.trigger).toBe("manual");
     expect(rows[0]!.reason).toBe("user");
@@ -193,7 +193,7 @@ describe("switchTaskAccountNow", () => {
     expect(after.agent).toBe(b);
     expect(after.harnessState?.scheduledSwitch ?? null).toBeNull();
     expect(after.harnessState?.lastMove?.reason).toBe("switch-now");
-    const rows = events(stack.id).filter((e) => e.taskId === task.id);
+    const rows = (await events(stack.id)).filter((e) => e.taskId === task.id);
     expect(rows).toHaveLength(1);
     expect(rows[0]!.trigger).toBe("scheduled");
     expect(stacks.harnessStacks.getLimitState(a)).toBeNull();
@@ -218,7 +218,7 @@ describe("switchTaskAccountNow", () => {
     const after = db.tasks.get(task.id)!;
     expect(after.agent).toBe(a);
     expect(after.harnessState?.scheduledSwitch ?? null).toBeNull();
-    expect(events(stack.id).filter((e) => e.taskId === task.id)).toHaveLength(0);
+    expect((await events(stack.id)).filter((e) => e.taskId === task.id)).toHaveLength(0);
     stacks.harnessStacks.delete(stack.id);
   }, 20_000);
 
@@ -242,7 +242,7 @@ describe("switchTaskAccountNow", () => {
     const after = db.tasks.get(task.id)!;
     expect(after.agent).toBe(b);
     expect(after.harnessState?.scheduledSwitch ?? null).toBeNull();
-    const rows = events(stack.id).filter((e) => e.taskId === task.id);
+    const rows = (await events(stack.id)).filter((e) => e.taskId === task.id);
     expect(rows.map((r) => r.trigger)).toEqual(["limit"]);
     stacks.harnessStacks.delete(stack.id);
   }, 20_000);
@@ -326,7 +326,7 @@ describe("boot", () => {
     const after = db.tasks.get(task.id)!;
     expect(after.agent).toBe(b);
     expect(after.harnessState?.scheduledSwitch ?? null).toBeNull();
-    expect(events(stack.id).filter((e) => e.taskId === task.id).map((e) => e.trigger)).toEqual(["scheduled"]);
+    expect((await events(stack.id)).filter((e) => e.taskId === task.id).map((e) => e.trigger)).toEqual(["scheduled"]);
     stacks.harnessStacks.delete(stack.id);
   });
 
@@ -357,7 +357,7 @@ describe("boot", () => {
     expect(rows[1]!.agent).toBe(b);
     expect(rows[1]!.origin).toBe("harness-swap");
     expect(db.tasks.get(task.id)!.agent).toBe(b);
-    expect(events(stack.id).filter((e) => e.taskId === task.id).map((e) => e.trigger)).toEqual(["boot-resume"]);
+    expect((await events(stack.id)).filter((e) => e.taskId === task.id).map((e) => e.trigger)).toEqual(["boot-resume"]);
     stacks.harnessStacks.delete(stack.id);
   }, 20_000);
 });
@@ -397,7 +397,7 @@ describe("clean retry follow-ups", () => {
     expect(orch.cancelHarnessRetryForTask(task.id)).toBe(false);
     expect(db.tasks.get(task.id)!.backlog).toHaveLength(1);
     // The blocked outcome wrote exactly one history row.
-    expect(events(stack.id).filter((e) => e.taskId === task.id).map((e) => e.trigger)).toEqual(["blocked"]);
+    expect((await events(stack.id)).filter((e) => e.taskId === task.id).map((e) => e.trigger)).toEqual(["blocked"]);
     stacks.harnessStacks.clearLimitState(b);
     stacks.harnessStacks.delete(stack.id);
   }, 20_000);
@@ -429,7 +429,7 @@ describe("wave 3 review fixes", () => {
     expect(after.column).toBe("blocked");
     expect(after.harnessState?.pendingSwap ?? null).toBeNull();
     expect(db.runs.get(oldRun)!.status).toBe("failed");
-    expect(events(stack.id).filter((e) => e.taskId === task.id).map((e) => e.trigger)).toEqual(["blocked"]);
+    expect((await events(stack.id)).filter((e) => e.taskId === task.id).map((e) => e.trigger)).toEqual(["blocked"]);
     stacks.harnessStacks.delete(stack.id);
   });
 
@@ -548,7 +548,7 @@ describe("refusals with per-member reasons and in-memory windows (TT-D)", () => 
       // Refused up front: nothing scheduled, nothing moved, no history.
       expect(db.tasks.get(task.id)!.agent).toBe(a);
       expect(db.tasks.get(task.id)!.harnessState?.scheduledSwitch ?? null).toBeNull();
-      expect(events(stack.id).filter((e) => e.taskId === task.id)).toHaveLength(0);
+      expect((await events(stack.id)).filter((e) => e.taskId === task.id)).toHaveLength(0);
     } finally {
       db.harnesses.setEnabled(b, true);
     }
@@ -635,7 +635,7 @@ describe("a scheduled switch is performed when the turn FAILS (TT-D)", () => {
     const after = db.tasks.get(task.id)!;
     expect(after.agent).toBe(b);
     expect(after.harnessState?.scheduledSwitch ?? null).toBeNull();
-    const rows = events(stack.id).filter((e) => e.taskId === task.id);
+    const rows = (await events(stack.id)).filter((e) => e.taskId === task.id);
     expect(rows.map((r) => r.trigger)).toEqual(["scheduled"]);
     // Not a limit: no cooldown, nothing marked tried.
     expect(stacks.harnessStacks.getLimitState(a)).toBeNull();
@@ -681,7 +681,7 @@ describe("an account removed from its stack (S6)", () => {
     const after = db.tasks.get(task.id)!;
     expect(after.agent).toBe(a);
     expect(after.harnessState?.pendingSwap ?? null).toBeNull();
-    expect(events(stack.id).filter((e) => e.taskId === task.id)).toHaveLength(0);
+    expect((await events(stack.id)).filter((e) => e.taskId === task.id)).toHaveLength(0);
     stacks.harnessStacks.delete(stack.id);
   });
 
@@ -695,7 +695,7 @@ describe("an account removed from its stack (S6)", () => {
     expect(after.agent).toBe(a);
     expect(after.harnessState?.scheduledSwitch ?? null).toBeNull();
     expect(db.runs.events(prior).some((e) => e.stream === "status" && e.data.includes("no longer in a stack with a backup account"))).toBe(true);
-    expect(events(stack.id).filter((e) => e.taskId === task.id)).toHaveLength(0);
+    expect((await events(stack.id)).filter((e) => e.taskId === task.id)).toHaveLength(0);
     stacks.harnessStacks.delete(stack.id);
   });
 });
@@ -728,7 +728,7 @@ describe("a scheduled switch left waiting after its turn ended (S7)", () => {
     const after = db.tasks.get(task.id)!;
     expect(after.agent).toBe(b);
     expect(after.harnessState?.scheduledSwitch ?? null).toBeNull();
-    expect(events(stack.id).filter((e) => e.taskId === task.id).map((e) => e.trigger)).toEqual(["scheduled"]);
+    expect((await events(stack.id)).filter((e) => e.taskId === task.id).map((e) => e.trigger)).toEqual(["scheduled"]);
     stacks.harnessStacks.delete(stack.id);
   }, 20_000);
 
@@ -777,7 +777,7 @@ describe("a scheduled switch left waiting after its turn ended (S7)", () => {
     expect(after.agent).toBe(b);
     expect(after.harnessState?.scheduledSwitch ?? null).toBeNull();
     expect(after.harnessState?.lastMove?.reason).toBe("switch-now");
-    expect(events(stack.id).filter((e) => e.taskId === task.id).map((e) => e.trigger)).toEqual(["scheduled"]);
+    expect((await events(stack.id)).filter((e) => e.taskId === task.id).map((e) => e.trigger)).toEqual(["scheduled"]);
     stacks.harnessStacks.delete(stack.id);
   }, 20_000);
 
@@ -805,11 +805,11 @@ describe("a scheduled switch left waiting after its turn ended (S7)", () => {
         await waitFor(() => db.tasks.get(task.id)?.harnessState?.scheduledSwitch == null);
         expect(db.tasks.get(task.id)!.agent).toBe(a);
         expect(statusOf(runId).some((l) => l.includes("scheduled account switch cancelled (stopped)"))).toBe(true);
-        expect(events(stack.id).filter((e) => e.taskId === task.id && e.trigger === "scheduled")).toHaveLength(0);
+        expect((await events(stack.id)).filter((e) => e.taskId === task.id && e.trigger === "scheduled")).toHaveLength(0);
       } else {
         await waitFor(() => db.tasks.get(task.id)?.agent === b && !orch.isTaskRunLive(task.id));
         expect(db.tasks.get(task.id)!.agent).toBe(b);
-        expect(events(stack.id).filter((e) => e.taskId === task.id && e.trigger === "scheduled")).toHaveLength(1);
+        expect((await events(stack.id)).filter((e) => e.taskId === task.id && e.trigger === "scheduled")).toHaveLength(1);
       }
       expect(db.tasks.get(task.id)!.harnessState?.scheduledSwitch ?? null).toBeNull();
       stacks.harnessStacks.delete(stack.id);
@@ -842,7 +842,7 @@ describe("boot completion of an interrupted switch-now (label)", () => {
         from: a, to: b, reason: switchNow ? "switch-now" : "manual-switch",
       });
       expect(after.harnessState?.tried ?? []).toEqual([]);
-      expect(events(stack.id).filter((e) => e.taskId === task.id).map((e) => e.trigger)).toEqual(["boot-resume"]);
+      expect((await events(stack.id)).filter((e) => e.taskId === task.id).map((e) => e.trigger)).toEqual(["boot-resume"]);
       expect(stacks.harnessStacks.getLimitState(a)).toBeNull();
       stacks.harnessStacks.delete(stack.id);
     }
@@ -921,7 +921,7 @@ describe("a background agent settling inside the turn-end pump (S7 race)", () =>
     const after = db.tasks.get(task.id)!;
     expect(after.agent).toBe(b);
     expect(after.harnessState?.scheduledSwitch ?? null).toBeNull();
-    expect(events(stack.id).filter((e) => e.taskId === task.id).map((e) => e.trigger)).toEqual(["scheduled"]);
+    expect((await events(stack.id)).filter((e) => e.taskId === task.id).map((e) => e.trigger)).toEqual(["scheduled"]);
     stacks.harnessStacks.delete(stack.id);
   }, 20_000);
 });
@@ -951,7 +951,7 @@ describe("a FAILED turn's background agents hold a scheduled switch at boot (M2,
     await Bun.sleep(50);
     expect(db.tasks.get(task.id)!.agent).toBe(a);
     expect(db.tasks.get(task.id)!.harnessState?.scheduledSwitch).toBeTruthy();
-    expect(events(stack.id).filter((e) => e.taskId === task.id)).toHaveLength(0);
+    expect((await events(stack.id)).filter((e) => e.taskId === task.id)).toHaveLength(0);
     // Every other path treats it the same: no claim, no switch-now.
     expect(orch.backgroundAgentsHoldTask(task.id)).toBe(true);
     expect(orch.claimTaskForAccountSwitch(task.id)).toBe(false);
@@ -968,7 +968,7 @@ describe("a FAILED turn's background agents hold a scheduled switch at boot (M2,
     const after = db.tasks.get(task.id)!;
     expect(after.agent).toBe(b);
     expect(after.harnessState?.scheduledSwitch ?? null).toBeNull();
-    expect(events(stack.id).filter((e) => e.taskId === task.id).map((e) => e.trigger)).toEqual(["scheduled"]);
+    expect((await events(stack.id)).filter((e) => e.taskId === task.id).map((e) => e.trigger)).toEqual(["scheduled"]);
     stacks.harnessStacks.delete(stack.id);
   }, 20_000);
 });
@@ -1043,7 +1043,7 @@ describe("a scheduled switch survives until its move succeeds (S5)", () => {
     const lines = statusOf(runId);
     expect(lines).toContain("the core restarted before the scheduled account switch started — it stays scheduled");
     expect(lines.some((l) => l.includes("run the task to switch"))).toBe(false);
-    expect(events(stack.id).filter((e) => e.taskId === task.id).map((e) => e.trigger)).toEqual(["scheduled"]);
+    expect((await events(stack.id)).filter((e) => e.taskId === task.id).map((e) => e.trigger)).toEqual(["scheduled"]);
     stacks.harnessStacks.delete(stack.id);
   });
 
@@ -1070,7 +1070,7 @@ describe("a scheduled switch survives until its move succeeds (S5)", () => {
       const after = db.tasks.get(task.id)!;
       expect(after.agent).toBe(b);
       expect(after.harnessState?.scheduledSwitch ?? null).toBeNull();
-      const rows = events(stack.id).filter((e) => e.taskId === task.id);
+      const rows = (await events(stack.id)).filter((e) => e.taskId === task.id);
       expect(rows.map((e) => e.trigger)).toEqual(["boot-resume"]);
       if (copyFails) {
         expect(rows[0]!.continuation).toBe("restarted");
@@ -1154,7 +1154,7 @@ describe("waiting-switch settle edges (N1, N6)", () => {
     const after = db.tasks.get(task.id)!;
     expect(after.agent).toBe(b);
     expect(after.harnessState?.scheduledSwitch ?? null).toBeNull();
-    expect(events(stack.id).filter((e) => e.taskId === task.id).map((e) => e.trigger)).toEqual(["scheduled"]);
+    expect((await events(stack.id)).filter((e) => e.taskId === task.id).map((e) => e.trigger)).toEqual(["scheduled"]);
     stacks.harnessStacks.delete(stack.id);
   }, 20_000);
 });
@@ -1201,7 +1201,7 @@ describe("a FAILED turn's background agents are stopped and respected like a hel
     // Nothing applies the dropped request once the agents are gone.
     await Bun.sleep(50);
     expect(db.tasks.get(task.id)!.agent).toBe(a);
-    expect(events(stack.id).filter((e) => e.taskId === task.id)).toHaveLength(0);
+    expect((await events(stack.id)).filter((e) => e.taskId === task.id)).toHaveLength(0);
     stacks.harnessStacks.delete(stack.id);
   });
 
@@ -1330,7 +1330,7 @@ describe("only a held card or a FAILED blocked one is held by its background age
       const after = db.tasks.get(task.id)!;
       expect(after.agent).toBe(b);
       expect(after.harnessState?.scheduledSwitch ?? null).toBeNull();
-      expect(events(stack.id).filter((e) => e.taskId === task.id).map((e) => e.trigger)).toEqual(["scheduled"]);
+      expect((await events(stack.id)).filter((e) => e.taskId === task.id).map((e) => e.trigger)).toEqual(["scheduled"]);
     } finally {
       done();
     }
@@ -1343,7 +1343,7 @@ describe("only a held card or a FAILED blocked one is held by its background age
       await waitFor(() => db.tasks.get(task.id)?.agent === b && !orch.isAccountSwitchUnderway(task.id));
       expect(db.tasks.get(task.id)!.agent).toBe(b);
       expect(db.tasks.get(task.id)!.harnessState?.scheduledSwitch ?? null).toBeNull();
-      expect(events(stack.id).filter((e) => e.taskId === task.id).map((e) => e.trigger)).toEqual(["scheduled"]);
+      expect((await events(stack.id)).filter((e) => e.taskId === task.id).map((e) => e.trigger)).toEqual(["scheduled"]);
     } finally {
       done();
     }

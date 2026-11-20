@@ -19,7 +19,8 @@
  * No side effects at module load.
  */
 
-import { tasks } from "./db.ts";
+import { tasks } from "./db-async.ts";
+
 import { resolveNotifier } from "./notifier.ts";
 import { installNotificationRemovalHooks } from "./notification-hooks.ts";
 import { subscribeGlobal } from "./orchestrator.ts";
@@ -27,7 +28,7 @@ import type { ApiNative } from "./server.ts";
 import { createTaskNotifier, type TaskNotification } from "./task-notifier.ts";
 import type { TaskNotificationRemoval } from "../shared/os-notification.ts";
 import { humanReviewSubtitle, newHumanGateSeqs } from "../shared/pipeline.ts";
-import type { GlobalEvent, PipelineRunState, PipelineRunStatus } from "../shared/types.ts";
+import type { GlobalEvent, PipelineRunState, PipelineRunStatus, Task } from "../shared/types.ts";
 
 /** What the installer hands to the core's notifier; the same shape `startApiServer` takes. */
 export type HeadlessNotificationSink = {
@@ -293,14 +294,23 @@ export function shouldPostHeadlessNotifications(
   return isHeadlessNotificationsEnabled(env) && resolve() !== null;
 }
 
-function lookupTask(taskId: string): HeadlessTaskInfo | null {
-  try {
-    const t = tasks.get(taskId);
-    if (!t) return null;
-    return { title: t.title, agent: t.agent, pipelineName: t.pipelineRun?.pipelineName ?? null };
-  } catch {
-    return null;
-  }
+function lookupTaskIn(rows: ReadonlyMap<string, Task | null>, taskId: string): HeadlessTaskInfo | null {
+  const t = rows.get(taskId);
+  if (!t) return null;
+  return { title: t.title, agent: t.agent, pipelineName: t.pipelineRun?.pipelineName ?? null };
+}
+
+/** Task rows for `ids`, read together; an id that cannot be read maps to null. */
+async function fetchTaskRows(ids: readonly string[]): Promise<Map<string, Task | null>> {
+  const unique = [...new Set(ids)].filter((id) => id.length > 0);
+  const rows = await Promise.all(unique.map(async (id) => {
+    try {
+      return [id, (await tasks.get(id)) ?? null] as const;
+    } catch {
+      return [id, null] as const;
+    }
+  }));
+  return new Map(rows);
 }
 
 /** Bound on remembered pipeline statuses; a core runs for days, pipelines accumulate. */
@@ -318,12 +328,18 @@ export interface HeadlessHandlerDeps {
   post(n: TaskNotification): void;
 }
 
+/** The per-event handler, plus the task ids it may read for an event, so an
+ *  async caller can load exactly those rows before the (synchronous) handler runs. */
+export type HeadlessEventHandler = ((ev: GlobalEvent) => void) & {
+  taskIdsFor(ev: GlobalEvent): string[];
+};
+
 /**
  * The stateful half of the policy: the once-per-task rule for stacked prompts,
  * the done-transition memory and the owed "Pipeline needs you" alerts, on top
  * of the pure {@link headlessNotificationFor}. Returns the per-event handler.
  */
-export function createHeadlessNotificationHandler(deps: HeadlessHandlerDeps): (ev: GlobalEvent) => void {
+export function createHeadlessNotificationHandler(deps: HeadlessHandlerDeps): HeadlessEventHandler {
   const { lookup: lookupTask, readTask } = deps;
   const notifier = { post: deps.post };
 
@@ -444,7 +460,20 @@ export function createHeadlessNotificationHandler(deps: HeadlessHandlerDeps): (e
     }
   };
 
-  return handle;
+  /** Every task id `handle(ev)` can read: the event's task, its pipeline parent,
+   *  and the owed-alert parents with the steps answered since. */
+  const taskIdsFor = (ev: GlobalEvent): string[] => {
+    const ids: string[] = [];
+    if ("taskId" in ev) ids.push(ev.taskId);
+    const parent = stepParentIdOf(ev);
+    if (parent) ids.push(parent);
+    for (const [parentId, answered] of owed) {
+      ids.push(parentId, ...answered);
+    }
+    return ids;
+  };
+
+  return Object.assign(handle, { taskIdsFor });
 }
 
 /**
@@ -461,24 +490,27 @@ export function installHeadlessNotifications(): { sink: HeadlessNotificationSink
   void notifier.seed().catch(() => { /* a failed seed only skips removal pruning */ });
   const unhook = installNotificationRemovalHooks((r) => notifier.remove(r));
 
+  // The policy reads task rows synchronously. Each event first loads the rows it
+  // can read (`taskIdsFor`) into `rows`, then runs the sync handler over them.
+  let rows: ReadonlyMap<string, Task | null> = new Map();
   const handle = createHeadlessNotificationHandler({
-    lookup: lookupTask,
-    readTask: (taskId) => {
-      try {
-        return tasks.get(taskId) ?? null;
-      } catch {
-        return null;
-      }
-    },
+    lookup: (taskId) => lookupTaskIn(rows, taskId),
+    readTask: (taskId) => rows.get(taskId) ?? null,
     post: (n) => notifier.post(n),
   });
 
+  // Events are handled one at a time, in arrival order: the handler's state
+  // (pending prompts, owed alerts) depends on it, and `rows` is per event.
+  let chain: Promise<void> = Promise.resolve();
   const unsubscribe = subscribeGlobal((ev) => {
-    try {
-      handle(ev);
-    } catch (err) {
-      console.error("[agetor] headless notification failed:", err);
-    }
+    chain = chain.then(async () => {
+      try {
+        rows = await fetchTaskRows(handle.taskIdsFor(ev));
+        handle(ev);
+      } catch (err) {
+        console.error("[agetor] headless notification failed:", err);
+      }
+    });
   });
 
   return {
