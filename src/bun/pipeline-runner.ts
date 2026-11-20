@@ -329,7 +329,7 @@ async function persist(parentId: string, run: PipelineRunState, opts?: { preserv
   if (parent?.archivedAt != null) return; // m8
   const nextColumn = COLUMN_FOR_RUN_STATUS[run.status];
   if (nextColumn && parent && parent.column !== nextColumn && previousStatus !== run.status) {
-    pipelineUpdateColumn(parentId, null, nextColumn);
+    await pipelineUpdateColumn(parentId, null, nextColumn);
   }
   publishGlobalEvent({
     kind: "pipeline",
@@ -358,7 +358,7 @@ export async function restorePipelineGateColumn(taskId: string): Promise<void> {
   const run = task?.pipelineRun;
   if (!task || !run || task.archivedAt != null) return;
   if (run.status !== "review" || task.column === "review") return;
-  pipelineUpdateColumn(taskId, null, "review");
+  await pipelineUpdateColumn(taskId, null, "review");
 }
 
 /**
@@ -406,10 +406,14 @@ async function finalizeCancelled(parentId: string, run: PipelineRunState): Promi
  * with a bad/ambiguous handoff while the whole run is being torn down must
  * not have its one automatic reminder revive the run back into `running`.
  */
-function isDeliberateWholeRunStop(run: PipelineRunState, excludeTaskId: string): boolean {
+async function isDeliberateWholeRunStop(run: PipelineRunState, excludeTaskId: string): Promise<boolean> {
   if (run.stopRequestedAt != null) return true;
-  const working = workingSiblings(run, excludeTaskId);
-  return working.length > 0 && working.every((a) => isTaskRunCancelling(a.taskId));
+  const working = await workingSiblings(run, excludeTaskId);
+  if (working.length === 0) return false;
+  for (const a of working) {
+    if (!(await isTaskRunCancelling(a.taskId))) return false;
+  }
+  return true;
 }
 
 /** The active executions other than `excludeTaskId`'s that the pipeline is
@@ -418,22 +422,26 @@ function isDeliberateWholeRunStop(run: PipelineRunState, excludeTaskId: string):
  *  grace, a wait or busy recheck, a reminder mid-send, a Resume Return's send
  *  mid-flight). A Stop on one step must not end the run out from under such a
  *  sibling (M5). */
-function workingSiblings(run: PipelineRunState, excludeTaskId: string): PipelineActiveStep[] {
-  return run.active.filter(
-    (a) => a.taskId !== excludeTaskId && (isAnyRunOfTaskLive(a.taskId) || hasPendingStepDecision(a.taskId)),
-  );
+async function workingSiblings(run: PipelineRunState, excludeTaskId: string): Promise<PipelineActiveStep[]> {
+  // One liveness read per active execution (a pipeline has a handful).
+  const working: PipelineActiveStep[] = [];
+  for (const a of run.active) {
+    if (a.taskId === excludeTaskId) continue;
+    if (await isAnyRunOfTaskLive(a.taskId) || hasPendingStepDecision(a.taskId)) working.push(a);
+  }
+  return working;
 }
 
 /** Whether a settle of this execution must treat it as stopped: the whole
  *  run was stopped ({@link isDeliberateWholeRunStop}) or this execution was
  *  stopped on its own (`stoppedAt`). Such a settle gets no release grace,
  *  no automatic reminder and no block of its own. */
-function isStopApplied(
+async function isStopApplied(
   run: PipelineRunState,
   taskId: string,
   historyEntry: PipelineStepRecord | undefined,
-): boolean {
-  return historyEntry?.stoppedAt != null || isDeliberateWholeRunStop(run, taskId);
+): Promise<boolean> {
+  return historyEntry?.stoppedAt != null || await isDeliberateWholeRunStop(run, taskId);
 }
 
 /** Re-read a FRESH copy of the parent's run from the DB and record a
@@ -665,7 +673,7 @@ async function recordHandoffSource(
   historyEntry.handoffFromOtherRun = fromOtherRun;
   if (fromOtherRun && !alreadyRecorded) {
     try {
-      appendRunStatusLine(taskId, supplier.runId, handoffSourceStatusLine(newerRun));
+      await appendRunStatusLine(taskId, supplier.runId, handoffSourceStatusLine(newerRun));
     } catch (err) {
       console.warn(`[agetor] pipeline runner failed writing the handoff-source status line for run ${supplier.runId}:`, err);
     }
@@ -796,13 +804,20 @@ function scheduleWaitRecheck(taskId: string): void {
   // still-live run just waits again), so a few extra probes cost nothing.
   const probe = (attempt: number): void => {
     const timer = setTimeout(() => {
-      if (waitRechecks.get(taskId) !== timer) return;
-      if (isAnyRunOfTaskLive(taskId)) {
-        if (attempt + 1 < WAIT_RECHECK_DELAYS_MS.length) probe(attempt + 1);
-        else waitRechecks.delete(taskId);
-        return;
-      }
-      resettleFromTimer(waitRechecks, taskId, timer, "a wait");
+      void (async () => {
+        if (waitRechecks.get(taskId) !== timer) return;
+        const live = await isAnyRunOfTaskLive(taskId);
+        // The liveness read yielded: a cancel or a newer probe may own the slot now.
+        if (waitRechecks.get(taskId) !== timer) return;
+        if (live) {
+          if (attempt + 1 < WAIT_RECHECK_DELAYS_MS.length) probe(attempt + 1);
+          else waitRechecks.delete(taskId);
+          return;
+        }
+        resettleFromTimer(waitRechecks, taskId, timer, "a wait");
+      })().catch((err: unknown) => {
+        console.warn(`[agetor] pipeline runner wait recheck failed for task ${taskId}:`, err);
+      });
     }, WAIT_RECHECK_DELAYS_MS[attempt]);
     timer.unref?.();
     waitRechecks.set(taskId, timer);
@@ -851,10 +866,10 @@ function clearStepTimers(taskId: string): void {
  * `blocked` instead of `running` with nothing behind it. `skipTaskIds` are
  * the executions this resume handles itself.
  */
-function resumeFromStop(run: PipelineRunState, skipTaskIds: ReadonlySet<string> = new Set()): void {
+async function resumeFromStop(run: PipelineRunState, skipTaskIds: ReadonlySet<string> = new Set()): Promise<void> {
   if (run.stopRequestedAt == null) return;
   clearStopMarker(run);
-  blockStoppedLeftovers(run, skipTaskIds);
+  await blockStoppedLeftovers(run, skipTaskIds);
 }
 
 /** Drop the stop marker, and the stored `cancelled` status with it —
@@ -867,10 +882,10 @@ function clearStopMarker(run: PipelineRunState): void {
 }
 
 /** The block half of {@link resumeFromStop}. */
-function blockStoppedLeftovers(run: PipelineRunState, skipTaskIds: ReadonlySet<string>): void {
+async function blockStoppedLeftovers(run: PipelineRunState, skipTaskIds: ReadonlySet<string>): Promise<void> {
   const graph = run.snapshot?.graph;
   for (const a of run.active) {
-    if (skipTaskIds.has(a.taskId) || isAnyRunOfTaskLive(a.taskId)) continue;
+    if (skipTaskIds.has(a.taskId) || await isAnyRunOfTaskLive(a.taskId)) continue;
     if (run.blocked.some((b) => b.taskId === a.taskId)) continue;
     const h = run.history.find((r) => r.taskId === a.taskId && r.seq === a.seq);
     if (h?.outcome !== "cancelled") continue;
@@ -986,7 +1001,13 @@ async function refreshParentWorktree(parent: Task, run: PipelineRunState): Promi
   // agent is actively writing to. Only VERIFY the worktree is still on disk
   // in that case; the full (re-)materialization is reserved for a run with
   // nothing live.
-  const anyLive = run.active.some((a) => isAnyRunOfTaskLive(a.taskId));
+  let anyLive = false;
+  for (const a of run.active) {
+    if (await isAnyRunOfTaskLive(a.taskId)) {
+      anyLive = true;
+      break;
+    }
+  }
   if (anyLive) {
     const repos = parent.repositories ?? [];
     const multi = isMultiRepoTask(parent);
@@ -1016,7 +1037,7 @@ async function refreshParentWorktree(parent: Task, run: PipelineRunState): Promi
     // write wins over this snapshot); the live reads from THIS prepare are
     // authoritative for the parent row, which is the pipeline's last-seen
     // checkout (D14).
-    recordPreparedRepositoryCheckouts(parent.id, prepared.repositories, prepared.unknownCheckouts);
+    await recordPreparedRepositoryCheckouts(parent.id, prepared.repositories, prepared.unknownCheckouts);
   }
   // The parent carries the pipeline's last-seen checkout (D14); steps mirror
   // it. `setCheckoutBranch` is compare-then-write, so an unchanged value
@@ -1049,7 +1070,7 @@ async function noteParentWorktreeWarning(parentId: string, warning: string): Pro
       latest = { taskId: step.id, runId: run.id, startedAt: run.startedAt };
     }
   }
-  if (latest) appendRunStatusLine(latest.taskId, latest.runId, warning);
+  if (latest) await appendRunStatusLine(latest.taskId, latest.runId, warning);
   else console.warn(`[agetor] pipeline task ${parentId}: ${warning}`);
 }
 
@@ -1078,7 +1099,7 @@ async function propagateWorktreeToActiveSteps(parent: Task, run: PipelineRunStat
       if (stepNames !== parentNames) await tasks.setRepositories(a.taskId, withoutPrs(parent.repositories));
       // The step shares the parent's checkouts; mirror the parent's last-seen
       // values too (setRepositories alone keeps the step's older stored value).
-      recordPreparedRepositoryCheckouts(a.taskId, parent.repositories);
+      await recordPreparedRepositoryCheckouts(a.taskId, parent.repositories);
     }
     // Mirror the parent's last-seen checkout too (compare-then-write; the
     // step→parent mirror inside `setCheckoutBranch` writes the same value
@@ -1590,6 +1611,11 @@ async function retryActiveExecutions(
   run: PipelineRunState,
   onlyTaskId?: string,
 ): Promise<{ runId: string; pending?: true } | { error: string }> {
+  // One liveness read per active execution (a pipeline has a handful).
+  const live = new Set<string>();
+  for (const a of run.active) {
+    if (await isAnyRunOfTaskLive(a.taskId)) live.add(a.taskId);
+  }
   const targets = run.active.filter((a) => {
     // M5: never re-`startTask` an execution whose task is genuinely still
     // live (a fan-out with one branch blocked and another still mid-turn,
@@ -1598,7 +1624,7 @@ async function retryActiveExecutions(
     // which can lag a beat behind a just-started/just-settled spawn. It also
     // sees a displaced run (an older run of the step task that is no longer
     // `task.runId` but is still writing into the shared worktree).
-    if (isAnyRunOfTaskLive(a.taskId)) return false;
+    if (live.has(a.taskId)) return false;
     if (onlyTaskId) return a.taskId === onlyTaskId;
     // Minor 9: an un-targeted, RUN-LEVEL retry (no `onlyTaskId`) only
     // touches an execution that's actually stuck — one carrying its own
@@ -1783,7 +1809,7 @@ async function performPipelineRetry(
         .filter((h) => (h.attemptStartedAt ?? 0) >= retryStartedAt && h.taskId !== null)
         .map((h) => h.taskId as string),
     );
-    blockStoppedLeftovers(run, restarted);
+    await blockStoppedLeftovers(run, restarted);
     checkJoinIncomplete(run);
     await persist(parentRow.id, run);
   }
@@ -2058,13 +2084,18 @@ export async function advancePipeline(
       // the block just hasn't been cleared yet), and hand-picking a next
       // step for THAT would race the same turn `advancePipeline`'s own M4
       // check below refuses for an explicit `fromTaskId`.
+      // The step-failed blocks' liveness, read first (one per block).
+      const liveFailed = new Set<string>();
+      for (const b of run.blocked) {
+        if (b.taskId !== null && b.kind === "step-failed" && await isAnyRunOfTaskLive(b.taskId)) liveFailed.add(b.taskId);
+      }
       const handoffBlocks = run.blocked.filter(
         (b) =>
           b.taskId !== null &&
           (b.kind === "handoff-missing" ||
             b.kind === "handoff-invalid" ||
             b.kind === "step-blocked" ||
-            (b.kind === "step-failed" && !isAnyRunOfTaskLive(b.taskId))),
+            (b.kind === "step-failed" && !liveFailed.has(b.taskId))),
       );
       const joinBlocks = run.blocked.filter((b) => b.taskId === null && b.kind === "join-incomplete");
       if (handoffBlocks.length === 1 && joinBlocks.length === 0) {
@@ -2099,7 +2130,7 @@ export async function advancePipeline(
         }
       }
       // An Advance resumes a stopped run (see `resumeFromStop`).
-      resumeFromStop(run);
+      await resumeFromStop(run);
       const arrivals = run.joins[joinStepId]?.arrivals ?? [];
       delete run.joins[joinStepId];
       run.blocked = run.blocked.filter((b) => !(b.stepId === joinStepId && b.kind === "join-incomplete"));
@@ -2133,7 +2164,7 @@ export async function advancePipeline(
     // M4: refuse to hand-pick a next step for a turn that's still actually
     // in flight — `isAnyRunOfTaskLive`, not the (laggier) task column; a
     // displaced run still writing into the shared worktree counts too.
-    if (isAnyRunOfTaskLive(targetTaskId)) {
+    if (await isAnyRunOfTaskLive(targetTaskId)) {
       return { error: "step is still running — stop it before advancing", status: 409 as const };
     }
 
@@ -2158,7 +2189,7 @@ export async function advancePipeline(
 
     // An Advance resumes a stopped run (see `resumeFromStop`); the target
     // execution itself is resolved right here.
-    resumeFromStop(run, new Set([targetTaskId]));
+    await resumeFromStop(run, new Set([targetTaskId]));
     const historyEntry = run.history.find((h) => h.taskId === targetTaskId && h.seq === activeEntry.seq);
     run.active = run.active.filter((a) => a.taskId !== targetTaskId);
     removeBlockedFor(run, targetTaskId);
@@ -2171,7 +2202,7 @@ export async function advancePipeline(
       historyEntry.handoffRunId = null;
       historyEntry.handoffFromOtherRun = false;
     }
-    pipelineUpdateColumn(targetTaskId, (await tasks.get(targetTaskId))?.runId ?? null, "done");
+    await pipelineUpdateColumn(targetTaskId, (await tasks.get(targetTaskId))?.runId ?? null, "done");
 
     // m9: every target launched in THIS batch counts as a parallel sibling
     // of every other one — computed up front so the first step launched
@@ -2262,11 +2293,14 @@ export async function cancelPipelineRun(parentId: string): Promise<{ task: Task 
 
     // Any live run of a step counts, a displaced one included: while the
     // runner waits on it (D5) the pipeline is running, and Stop must stop it.
-    const runningTargets = run.active.filter((a) => isAnyRunOfTaskLive(a.taskId));
-    const decidingTargets = run.active.filter(
-      (a) => !isAnyRunOfTaskLive(a.taskId)
-        && (hasPendingStepDecision(a.taskId) || hasPendingHarnessRetry(a.taskId)),
-    );
+    // One liveness read (and, for an idle one, one retry read) per active
+    // execution; a pipeline has a handful.
+    const runningTargets: PipelineActiveStep[] = [];
+    const decidingTargets: PipelineActiveStep[] = [];
+    for (const a of run.active) {
+      if (await isAnyRunOfTaskLive(a.taskId)) runningTargets.push(a);
+      else if (hasPendingStepDecision(a.taskId) || await hasPendingHarnessRetry(a.taskId)) decidingTargets.push(a);
+    }
     // A pending human gate is something to stop too: there is no live work,
     // but the run is parked in Review waiting for the owner.
     const gates = run.humanSteps ?? [];
@@ -2303,7 +2337,7 @@ export async function cancelPipelineRun(parentId: string): Promise<{ task: Task 
       // on its behalf: an fx step whose run paused on a provider limit holds
       // a pending auto-resume timer. Nothing may run on a stopped run's
       // behalf, so drop it (a no-op for every other step).
-      cancelFxAutoResume(a.taskId, "stopped");
+      await cancelFxAutoResume(a.taskId, "stopped");
       // Same for a harness-stack retry: nothing may spawn on a stopped run's
       // behalf. `cancelLiveRunOfTask` above already stops an in-flight retry
       // spawn; this clears the armed timer and the exhausted state.
@@ -2631,7 +2665,7 @@ export async function reviewHumanStep(
     if (!previousTaskId) {
       return { error: "resume is unavailable for this step — run it fresh instead", status: 409 as const };
     }
-    if (isAnyRunOfTaskLive(previousTaskId)) {
+    if (await isAnyRunOfTaskLive(previousTaskId)) {
       return { error: "the previous step is still running — wait, or run it fresh", status: 409 as const };
     }
     // Two gates can name the same source step (a fan-out to two gates), and a
@@ -3166,7 +3200,7 @@ async function recheckReminder(p: PendingReminder, ignoreRunId?: string): Promis
       }
       return "send";
     }
-    if (isStopApplied(run, p.taskId, historyEntry)) {
+    if (await isStopApplied(run, p.taskId, historyEntry)) {
       await releaseReminderOwnership(p);
       return "stopped";
     }
@@ -3248,7 +3282,7 @@ async function deliverHandoffReminder(p: PendingReminder): Promise<void> {
     // With no live run there is no settle coming (claude's session can
     // still track turn activity — a queued slot, a continuation awaiting
     // content — that never becomes a run): back off and decide again.
-    if (!isAnyRunOfTaskLive(p.taskId)) scheduleBusyRecheck(p);
+    if (!await isAnyRunOfTaskLive(p.taskId)) scheduleBusyRecheck(p);
     return;
   }
   busyRefusals.delete(p.taskId);
@@ -3263,7 +3297,7 @@ async function deliverHandoffReminder(p: PendingReminder): Promise<void> {
     // Stopped while the reminder was being sent. A delivered reminder started
     // a turn the Stop never saw: cancel it, and its own settle records the
     // stop. Otherwise re-settle the queued run, which records it.
-    if (sent.delivered && isAnyRunOfTaskLive(p.taskId)) await cancelLiveRunOfTask(p.taskId);
+    if (sent.delivered && await isAnyRunOfTaskLive(p.taskId)) await cancelLiveRunOfTask(p.taskId);
     else await handleRunStatus(p.taskId, p.runId, "succeeded");
     return;
   }
@@ -3313,7 +3347,7 @@ async function deliverHandoffReminder(p: PendingReminder): Promise<void> {
             delivered: true,
           };
         }
-        appendRunStatusLine(p.taskId, p.runId, reminderSentStatusLine(p.reason));
+        await appendRunStatusLine(p.taskId, p.runId, reminderSentStatusLine(p.reason));
         checkJoinIncomplete(run);
         await persist(p.parentId, run);
         const reminderRun = sent.runId !== p.runId ? (await runs.get(sent.runId)) : null;
@@ -3395,9 +3429,9 @@ function scheduleBusyRecheck(p: PendingReminder): void {
     void runExclusive(p.parentId, async () => {
       const run = (await tasks.get(p.parentId))?.pipelineRun;
       if (!run || !run.active.some((a) => a.taskId === p.taskId && a.seq === p.seq)) return;
-      if (isAnyRunOfTaskLive(p.taskId) || remindersInFlight.has(p.taskId)) return;
+      if (await isAnyRunOfTaskLive(p.taskId) || remindersInFlight.has(p.taskId)) return;
       const historyEntry = run.history.find((h) => h.taskId === p.taskId && h.seq === p.seq);
-      if (isStopApplied(run, p.taskId, historyEntry)) {
+      if (await isStopApplied(run, p.taskId, historyEntry)) {
         await settleStoppedExecution(p.parentId, run, p.taskId, historyEntry);
         return;
       }
@@ -3423,14 +3457,21 @@ function scheduleBusyRecheck(p: PendingReminder): void {
   const previous = busyRecheckTimers.get(p.taskId);
   if (previous !== undefined) clearTimeout(previous);
   const timer = setTimeout(() => {
-    if (busyRecheckTimers.get(p.taskId) !== timer) return;
-    // A run went live meanwhile: its own settle decides the step.
-    if (isAnyRunOfTaskLive(p.taskId)) {
-      busyRecheckTimers.delete(p.taskId);
-      busyRefusals.delete(p.taskId);
-      return;
-    }
-    resettleFromTimer(busyRecheckTimers, p.taskId, timer, "a busy refusal");
+    void (async () => {
+      if (busyRecheckTimers.get(p.taskId) !== timer) return;
+      const live = await isAnyRunOfTaskLive(p.taskId);
+      // The liveness read yielded: a cancel or a newer recheck may own the slot now.
+      if (busyRecheckTimers.get(p.taskId) !== timer) return;
+      // A run went live meanwhile: its own settle decides the step.
+      if (live) {
+        busyRecheckTimers.delete(p.taskId);
+        busyRefusals.delete(p.taskId);
+        return;
+      }
+      resettleFromTimer(busyRecheckTimers, p.taskId, timer, "a busy refusal");
+    })().catch((err: unknown) => {
+      console.warn(`[agetor] pipeline runner busy recheck failed for task ${p.taskId}:`, err);
+    });
   }, busyRecheckDelaysMs[attempts]);
   timer.unref?.();
   busyRecheckTimers.set(p.taskId, timer);
@@ -3486,7 +3527,7 @@ async function advanceOnHandoff(input: {
   // answer is the same either way, but the stop marker on entry is the
   // load-bearing half: `cancelPipelineRun` records it before any sibling's
   // own settle can land here.
-  const wholeRunStop = isDeliberateWholeRunStop(run, taskId);
+  const wholeRunStop = await isDeliberateWholeRunStop(run, taskId);
 
   // Resolved (terminal or a real set of next steps) — this execution is
   // done. Remove it, mark history, move the step task to `done`.
@@ -3499,7 +3540,7 @@ async function advanceOnHandoff(input: {
     historyEntry.handoff = handoff;
     historyEntry.nextStepIds = nextStepIds;
   }
-  pipelineUpdateColumn(taskId, runId, "done");
+  await pipelineUpdateColumn(taskId, runId, "done");
 
   if (wholeRunStop) {
     // M-R2: a step that finished cleanly AFTER the user stopped the
@@ -3656,7 +3697,7 @@ async function settleStoppedExecution(
  */
 async function closeStoppedExecution(parentId: string, run: PipelineRunState, taskId: string): Promise<void> {
   const activeEntry = run.active.find((a) => a.taskId === taskId);
-  if (activeEntry && workingSiblings(run, taskId).length > 0 && !isDeliberateWholeRunStop(run, taskId)) {
+  if (activeEntry && (await workingSiblings(run, taskId)).length > 0 && !(await isDeliberateWholeRunStop(run, taskId))) {
     const stepName = run.snapshot ? stepNameById(run.snapshot.graph, activeEntry.stepId) : activeEntry.stepId;
     upsertBlocked(run, {
       taskId,
@@ -3754,7 +3795,7 @@ async function settleStepRun(
     // `maybeReleaseHeldTask`'s release (column → `review`) re-enters this
     // body through `handleColumnChange`'s `review` branch once the last
     // helper finishes, and THAT settle advances the graph.
-    if (status === "succeeded" && isHeldByBackgroundAgents(taskId)) {
+    if (status === "succeeded" && await isHeldByBackgroundAgents(taskId)) {
       if (historyEntry) historyEntry.responseKind = (await classifyRunResponse(taskId, runId, responses)).kind;
       await persist(parentId, run);
       return null;
@@ -3765,7 +3806,7 @@ async function settleStepRun(
     // usually carries the `<handoff>` this settle doesn't have yet; its own
     // settle (or the displaced-run report, if it is no longer `task.runId`)
     // re-enters here and decides. A Stop never waits.
-    if (status !== "cancelled" && isAnyRunOfTaskLive(taskId)) {
+    if (status !== "cancelled" && await isAnyRunOfTaskLive(taskId)) {
       if (historyEntry && historyEntry.outcome === null) historyEntry.responseKind = null;
       await persist(parentId, run);
       scheduleWaitRecheck(taskId);
@@ -3815,7 +3856,7 @@ async function settleStepRun(
     const mayLookBack =
       status === "succeeded" ||
       status === "failed" ||
-      (status === "orphaned" && !isDeliberateWholeRunStop(run, taskId));
+      (status === "orphaned" && !(await isDeliberateWholeRunStop(run, taskId)));
     const supplier = mayLookBack
       ? await findHandoffSupplier(taskId, historyEntry, responses, status === "succeeded" ? runId : undefined)
       : null;
@@ -3876,7 +3917,7 @@ async function settleStepRun(
           historyEntry.handoffRunId = null;
           historyEntry.handoffFromOtherRun = false;
         }
-        if (isStopApplied(run, taskId, historyEntry)) {
+        if (await isStopApplied(run, taskId, historyEntry)) {
           await settleStoppedExecution(parentId, run, taskId, historyEntry);
           return null;
         }
@@ -3928,7 +3969,7 @@ async function settleStepRun(
       if (classified.kind === "handoff-missing" || classified.kind === "handoff-invalid") {
         // The user stopped the run, or this step: no grace, no reminder —
         // see `settleStoppedExecution`.
-        if (isStopApplied(run, taskId, historyEntry)) {
+        if (await isStopApplied(run, taskId, historyEntry)) {
           await settleStoppedExecution(parentId, run, taskId, historyEntry);
           return null;
         }
@@ -4099,7 +4140,7 @@ async function handleColumnChange(
           // The Stop is still landing: every live run of the step is already
           // flagged cancelled, even if a row still reads `running`. Nothing
           // here resumes anything.
-          if (isTaskRunCancelling(taskId)) return;
+          if (await isTaskRunCancelling(taskId)) return;
           // A Resume Return's own out-of-lock send may have started this
           // turn: the runner owns it, not the user. The post-send confirm
           // sees the Stop and cancels it; this event must never resume.
@@ -4135,7 +4176,7 @@ async function handleColumnChange(
           // A turn the user started — possibly already finished by now (the
           // per-parent lock can be held a while); its settle follows this
           // event and is handled as an ordinary settle of a resumed step.
-          if (run.stopRequestedAt != null) resumeFromStop(run, new Set([taskId]));
+          if (run.stopRequestedAt != null) await resumeFromStop(run, new Set([taskId]));
           if (historyEntry) {
             historyEntry.stoppedAt = null;
             historyEntry.stoppedRunId = null;
@@ -4188,7 +4229,7 @@ async function handleColumnChange(
         // and deliberately left it active). The step's current run row is
         // the ground truth ({@link currentRunRow}); the settle body itself is
         // idempotent against the same outcome arriving twice.
-        if (isTaskRunLive(taskId)) return;
+        if (await isTaskRunLive(taskId)) return;
         const historyEntry = run.history.find((h) => h.taskId === taskId && h.seq === activeEntry.seq);
         if (historyEntry && historyEntry.outcome !== null) return;
         const latest = await currentRunRow(taskId);
@@ -4276,7 +4317,7 @@ export async function reconcilePipelineRuns(): Promise<number> {
   for (const parent of parents) {
     const activeSnapshot = parent.pipelineRun!.active.slice();
     for (const a of activeSnapshot) {
-      if (isAnyRunOfTaskLive(a.taskId)) continue;
+      if (await isAnyRunOfTaskLive(a.taskId)) continue;
       try {
         const latest = await currentRunRow(a.taskId);
         if (!latest) {
@@ -4364,7 +4405,7 @@ async function handleHeldStepStopped(taskId: string, stoppedRunId: string | null
     // that NEW turn's own `running` event would then never be cancelled.
     historyEntry.stoppedRunId = stoppedRunId;
     clearStepTimers(taskId);
-    if (!isAnyRunOfTaskLive(taskId) && remindersInFlight.get(taskId) == null) {
+    if (!await isAnyRunOfTaskLive(taskId) && remindersInFlight.get(taskId) == null) {
       const row = await currentRunRow(taskId);
       const status = row ? terminalRunStatus(row.status) : null;
       if (row && status) return settleStepRun(parentId, taskId, row.id, status);

@@ -209,11 +209,11 @@ test("spawnCursorTurnNow does not register a child deleted during the handshake"
     expect(tasks.get(taskId)).toBeNull();
     await sent;
     expect(runs.get(followUpId)).toBeNull();
-    expect(isAnyRunOfTaskLive(taskId)).toBe(false);
+    expect(await isAnyRunOfTaskLive(taskId)).toBe(false);
     // A registered child would still be in `active` until its turn timer
     // fired, and that timer would append against the cascade-deleted run.
     await settle(80);
-    expect(isAnyRunOfTaskLive(taskId)).toBe(false);
+    expect(await isAnyRunOfTaskLive(taskId)).toBe(false);
   } finally {
     delete process.env.AGETOR_FAKE_CURSOR_SPAWN_DELAY_MS;
   }
@@ -250,12 +250,12 @@ test("spawnCursorTurnNow does not register a child force-archived during the han
     expect(
       runs.events(followUpId).some((event) => event.stream === "status" && event.data === "task archived before the agent launched"),
     ).toBe(true);
-    expect(isAnyRunOfTaskLive(taskId)).toBe(false);
+    expect(await isAnyRunOfTaskLive(taskId)).toBe(false);
     const restored = await unarchiveTask(taskId);
     expect("error" in restored).toBe(false);
     expect(tasks.get(taskId)?.archivedAt).toBeNull();
     expect(tasks.get(taskId)?.column).toBe("ready");
-    expect(isAnyRunOfTaskLive(taskId)).toBe(false);
+    expect(await isAnyRunOfTaskLive(taskId)).toBe(false);
   } finally {
     delete process.env.AGETOR_FAKE_CURSOR_SPAWN_DELAY_MS;
   }

@@ -115,6 +115,10 @@ async function heldTask(): Promise<HeldFixture> {
     codexSessionId: null, cursorSessionId: null, geminiSessionId: null, fxSessionId: null,
   });
   tasks.update(taskId, { column: "running", runId });
+  // The continuation factory adopts only for a task whose run registered in
+  // this process, as the run this seeded row stands for did when it spawned.
+  const { __noteRegisteredRunTaskForTest } = await import("./orchestrator.ts");
+  __noteRegisteredRunTaskForTest(taskId, { agent: "claude-code", mode: null });
 
   const subagentId = `agent-${randomUUID()}`;
   subagents.insertIfAbsent({

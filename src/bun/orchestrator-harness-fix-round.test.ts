@@ -396,13 +396,13 @@ describe("finding 1: a successor limit while a claim is held is deferred, then s
         }
         expect(await stacks.harnessStacks.getLimitState(a)).not.toBeNull();
         // Not the swap window: an ordinary account-switch claim.
-        expect(orch.claimTaskForAccountSwitch(task.id)).toBe(true);
+        expect(await orch.claimTaskForAccountSwitch(task.id)).toBe(true);
         await waitFor(() => db.runs.listForTask(task.id).every((r) => r.status !== "running"), 8000);
-        orch.releaseTaskAccountSwitch(task.id);
+        await orch.releaseTaskAccountSwitch(task.id);
       });
     } finally {
       orch.__setChunkHandlerTapForTest(prevTap);
-      orch.releaseTaskAccountSwitch(task.id);
+      await orch.releaseTaskAccountSwitch(task.id);
     }
     const rows = sortedRuns(task.id);
     // Settled normally in place: no deferral, no successor next to the claim holder.
@@ -701,7 +701,7 @@ describe("finding 3: Codex queued follow-ups are stashed on every ending without
     const prev = orch.__setHarnessSwapSettleHookForTest(async (hooked, _runId, phase) => {
       if (hooked !== task.id || phase !== "after-transfer") return;
       orch.__setHarnessSwapSettleHookForTest(null);
-      orch.freezeLaunches();
+      await orch.freezeLaunches();
     });
     try {
       await withEnv(CODEX_ENV, async () => {

@@ -408,14 +408,14 @@ test("force-archive during the first-turn spawn settles the task to ready", asyn
       ).toBe(true);
       expect(sawCancelled).toBe(true);
       expect(sawReady).toBe(true);
-      expect(isAnyRunOfTaskLive(taskId)).toBe(false);
+      expect(await isAnyRunOfTaskLive(taskId)).toBe(false);
 
       const restored = await unarchiveTask(taskId);
       expect("error" in restored).toBe(false);
       expect(tasks.get(taskId)?.archivedAt).toBeNull();
       expect(tasks.get(taskId)?.column).toBe("ready");
       expect(runs.get(runId)?.status).toBe("cancelled");
-      expect(isAnyRunOfTaskLive(taskId)).toBe(false);
+      expect(await isAnyRunOfTaskLive(taskId)).toBe(false);
     } finally {
       unsub();
     }
@@ -467,14 +467,14 @@ test("force-archive during a Claude resume spawn settles the task to ready", asy
       ).toBe(true);
       expect(sawCancelled).toBe(true);
       expect(sawReady).toBe(true);
-      expect(isAnyRunOfTaskLive(taskId)).toBe(false);
+      expect(await isAnyRunOfTaskLive(taskId)).toBe(false);
 
       const restored = await unarchiveTask(taskId);
       expect("error" in restored).toBe(false);
       expect(tasks.get(taskId)?.archivedAt).toBeNull();
       expect(tasks.get(taskId)?.column).toBe("ready");
       expect(runs.get(runId)?.status).toBe("cancelled");
-      expect(isAnyRunOfTaskLive(taskId)).toBe(false);
+      expect(await isAnyRunOfTaskLive(taskId)).toBe(false);
     } finally {
       unsub();
     }

@@ -92,10 +92,20 @@ function insertRun(taskId: string, agent: string, patch: Record<string, unknown>
   return id;
 }
 
-async function waitFor(fn: () => boolean, ms = 8000): Promise<void> {
+/** The death watch's held-session probe answers from its last completed read
+ *  and starts the next one: ask, let that read land, and ask again. */
+async function probeNow(probe: ((taskId: string) => boolean) | null, taskId: string): Promise<boolean | undefined> {
+  // A read started before the state the test just wrote must not answer.
+  await orch.__heldProbeSettledForTest(taskId);
+  probe?.(taskId);
+  await orch.__heldProbeSettledForTest(taskId);
+  return probe?.(taskId);
+}
+
+async function waitFor(fn: () => boolean | Promise<boolean>, ms = 8000): Promise<void> {
   const deadline = Date.now() + ms;
   while (Date.now() < deadline) {
-    if (fn()) return;
+    if (await fn()) return;
     await Bun.sleep(15);
   }
 }
@@ -289,16 +299,16 @@ describe("refusals during a swap, retry or launch freeze (review S1, S3)", () =>
     const b = alias("frozen-b");
     const stack = await stacks.harnessStacks.create({ label: "frozen", kind: "claude-code", members: [a, b] });
     const task = makeTask(a, "work", { column: "review" });
-    orch.freezeLaunches();
+    await orch.freezeLaunches();
     try {
       expect(await refusalCode(task.id)).toBe("launches-frozen");
-      expect(orch.claimTaskForAccountSwitch(task.id)).toBe(false);
+      expect(await orch.claimTaskForAccountSwitch(task.id)).toBe(false);
       expect(db.tasks.get(task.id)!.agent).toBe(a);
     } finally {
       orch.__resetLaunchFreezeForTest();
     }
-    expect(orch.claimTaskForAccountSwitch(task.id)).toBe(true);
-    orch.releaseTaskAccountSwitch(task.id);
+    expect(await orch.claimTaskForAccountSwitch(task.id)).toBe(true);
+    await orch.releaseTaskAccountSwitch(task.id);
     await stacks.harnessStacks.delete(stack.id);
   });
 
@@ -440,9 +450,9 @@ describe("wave 3 review fixes", () => {
     const task = makeTask(a, `work ${FAKE_CLAUDE_LIMIT_PROMPT_MARKER}`, { column: "review" });
     const prior = insertRun(task.id, a);
     db.tasks.update(task.id, { runId: prior });
-    expect(orch.claimTaskForAccountSwitch(task.id)).toBe(true);
+    expect(await orch.claimTaskForAccountSwitch(task.id)).toBe(true);
     expect(await orch.cancelRun(prior)).toBe(true);
-    orch.releaseTaskAccountSwitch(task.id);
+    await orch.releaseTaskAccountSwitch(task.id);
     process.env.AGETOR_FAKE_CLAUDE_TURN_MS = "100";
     try {
       expect(await orch.startTask(task.id)).toHaveProperty("runId");
@@ -489,7 +499,7 @@ describe("wave 3 review fixes", () => {
       scheduledSwitch: { requestedAt: Date.now() },
     });
     expect(await settleSubagentById(subagentId, "completed", "receipt")).toBe(true);
-    await waitFor(() => db.tasks.get(task.id)?.agent === b && !orch.isTaskRunLive(task.id));
+    await waitFor(async () => db.tasks.get(task.id)?.agent === b && !await orch.isTaskRunLive(task.id));
     expect(db.tasks.get(task.id)!.agent).toBe(b);
     expect(db.tasks.get(task.id)!.harnessState?.scheduledSwitch ?? null).toBeNull();
     await stacks.harnessStacks.delete(stack.id);
@@ -724,7 +734,7 @@ describe("a scheduled switch left waiting after its turn ended (S7)", () => {
       scheduledSwitch: { requestedAt: Date.now() },
     });
     expect(await settleSubagentById(subagentId, "completed", "receipt")).toBe(true);
-    await waitFor(() => db.tasks.get(task.id)?.agent === b && !orch.isTaskRunLive(task.id));
+    await waitFor(async () => db.tasks.get(task.id)?.agent === b && !await orch.isTaskRunLive(task.id));
     const after = db.tasks.get(task.id)!;
     expect(after.agent).toBe(b);
     expect(after.harnessState?.scheduledSwitch ?? null).toBeNull();
@@ -750,7 +760,7 @@ describe("a scheduled switch left waiting after its turn ended (S7)", () => {
       let claimed = false;
       const deadline = Date.now() + 5000;
       while (!claimed && Date.now() < deadline) {
-        claimed = orch.claimTaskForAccountSwitch(task.id);
+        claimed = await orch.claimTaskForAccountSwitch(task.id);
         if (!claimed) await Bun.sleep(5);
       }
       expect(claimed).toBe(true);
@@ -771,8 +781,8 @@ describe("a scheduled switch left waiting after its turn ended (S7)", () => {
 
   test("the start holding the task at the turn end ends without a run: the switch is applied then", async () => {
     const { b, stack, task } = await turnEndsUnderClaim("s7claim");
-    orch.releaseTaskAccountSwitch(task.id);
-    await waitFor(() => db.tasks.get(task.id)?.agent === b && !orch.isTaskRunLive(task.id));
+    await orch.releaseTaskAccountSwitch(task.id);
+    await waitFor(async () => db.tasks.get(task.id)?.agent === b && !await orch.isTaskRunLive(task.id));
     const after = db.tasks.get(task.id)!;
     expect(after.agent).toBe(b);
     expect(after.harnessState?.scheduledSwitch ?? null).toBeNull();
@@ -792,7 +802,7 @@ describe("a scheduled switch left waiting after its turn ended (S7)", () => {
       // Worktree isolation on a folder that is no git repo: the start fails
       // its workdir pre-flight, after the claim and before any run exists.
       db.tasks.update(task.id, { isolation: "worktree" });
-      orch.releaseTaskAccountSwitch(task.id);
+      await orch.releaseTaskAccountSwitch(task.id);
       const starting = orch.startTask(task.id);
       // Nothing is live, so a Stop lands on the start's claim.
       if (stop) expect(await orch.cancelLiveRunOfTask(task.id)).toBe(true);
@@ -807,7 +817,7 @@ describe("a scheduled switch left waiting after its turn ended (S7)", () => {
         expect(statusOf(runId).some((l) => l.includes("scheduled account switch cancelled (stopped)"))).toBe(true);
         expect((await events(stack.id)).filter((e) => e.taskId === task.id && e.trigger === "scheduled")).toHaveLength(0);
       } else {
-        await waitFor(() => db.tasks.get(task.id)?.agent === b && !orch.isTaskRunLive(task.id));
+        await waitFor(async () => db.tasks.get(task.id)?.agent === b && !await orch.isTaskRunLive(task.id));
         expect(db.tasks.get(task.id)!.agent).toBe(b);
         expect((await events(stack.id)).filter((e) => e.taskId === task.id && e.trigger === "scheduled")).toHaveLength(1);
       }
@@ -900,8 +910,8 @@ describe("a background agent settling inside the turn-end pump (S7 race)", () =>
       if (hooked !== task.id) return;
       orch.__setTurnSettlePumpHookForTest(null);
       await settleSubagentById(subagentId, "completed", "receipt");
-      claimFreeAfterRelease = orch.claimTaskForAccountSwitch(task.id);
-      if (claimFreeAfterRelease) orch.releaseTaskAccountSwitch(task.id);
+      claimFreeAfterRelease = await orch.claimTaskForAccountSwitch(task.id);
+      if (claimFreeAfterRelease) await orch.releaseTaskAccountSwitch(task.id);
     });
     process.env.AGETOR_FAKE_CLAUDE_TURN_MS = "500";
     try {
@@ -912,7 +922,7 @@ describe("a background agent settling inside the turn-end pump (S7 race)", () =>
         status: "running", startedAt: Date.now(), endedAt: null,
       } as never);
       expect((await orch.switchTaskAccountNow(task.id)).status).toBe("scheduled");
-      await waitFor(() => db.tasks.get(task.id)?.agent === b && !orch.isTaskRunLive(task.id));
+      await waitFor(async () => db.tasks.get(task.id)?.agent === b && !await orch.isTaskRunLive(task.id));
     } finally {
       delete process.env.AGETOR_FAKE_CLAUDE_TURN_MS;
       orch.__setTurnSettlePumpHookForTest(prev);
@@ -953,8 +963,8 @@ describe("a FAILED turn's background agents hold a scheduled switch at boot (M2,
     expect(db.tasks.get(task.id)!.harnessState?.scheduledSwitch).toBeTruthy();
     expect((await events(stack.id)).filter((e) => e.taskId === task.id)).toHaveLength(0);
     // Every other path treats it the same: no claim, no switch-now.
-    expect(orch.backgroundAgentsHoldTask(task.id)).toBe(true);
-    expect(orch.claimTaskForAccountSwitch(task.id)).toBe(false);
+    expect(await orch.backgroundAgentsHoldTask(task.id)).toBe(true);
+    expect(await orch.claimTaskForAccountSwitch(task.id)).toBe(false);
     let refusal: unknown = null;
     try {
       await orch.switchTaskAccountNow(task.id);
@@ -964,7 +974,7 @@ describe("a FAILED turn's background agents hold a scheduled switch at boot (M2,
     expect((refusal as InstanceType<typeof orch.SwitchAccountRefusedError>).body.code).toBe("background-agents");
 
     expect(await settleSubagentById(subagentId, "completed", "receipt")).toBe(true);
-    await waitFor(() => db.tasks.get(task.id)?.agent === b && !orch.isTaskRunLive(task.id));
+    await waitFor(async () => db.tasks.get(task.id)?.agent === b && !await orch.isTaskRunLive(task.id));
     const after = db.tasks.get(task.id)!;
     expect(after.agent).toBe(b);
     expect(after.harnessState?.scheduledSwitch ?? null).toBeNull();
@@ -1034,7 +1044,7 @@ describe("a scheduled switch survives until its move succeeds (S5)", () => {
     db.tasks.update(task.id, { agent: a });
     db.tasks.setHarnessState(task.id, leftOnDisk);
     await orch.reconcilePendingHarnessSwaps();
-    await waitFor(() => db.tasks.get(task.id)?.agent === b && !orch.isTaskRunLive(task.id));
+    await waitFor(async () => db.tasks.get(task.id)?.agent === b && !await orch.isTaskRunLive(task.id));
     const after = db.tasks.get(task.id)!;
     expect(after.agent).toBe(b);
     expect(after.harnessState?.scheduledSwitch ?? null).toBeNull();
@@ -1101,8 +1111,8 @@ describe("waiting-switch settle edges (N1, N6)", () => {
       },
     });
     try {
-      expect(orch.claimTaskForAccountSwitch(task.id)).toBe(true);
-      orch.releaseTaskAccountSwitch(task.id);
+      expect(await orch.claimTaskForAccountSwitch(task.id)).toBe(true);
+      await orch.releaseTaskAccountSwitch(task.id);
       await Bun.sleep(20);
     } finally {
       orch.__setScheduledSwitchHooksForTest(prev);
@@ -1145,7 +1155,7 @@ describe("waiting-switch settle edges (N1, N6)", () => {
         status: "running", startedAt: Date.now(), endedAt: null,
       } as never);
       expect((await orch.switchTaskAccountNow(task.id)).status).toBe("scheduled");
-      await waitFor(() => db.tasks.get(task.id)?.agent === b && !orch.isTaskRunLive(task.id));
+      await waitFor(async () => db.tasks.get(task.id)?.agent === b && !await orch.isTaskRunLive(task.id));
     } finally {
       delete process.env.AGETOR_FAKE_CLAUDE_TURN_MS;
       orch.__setScheduledSwitchHooksForTest(prev);
@@ -1207,10 +1217,10 @@ describe("a FAILED turn's background agents are stopped and respected like a hel
 
   test("Stop also cancels an armed all-exhausted retry the failed turn left", async () => {
     const { stack, task, runId, agentRunning } = await failedWithAgent("q1stopretry", { exhaustedAt: Date.now() + 600_000 });
-    expect(orch.hasPendingHarnessRetry(task.id)).toBe(true);
+    expect(await orch.hasPendingHarnessRetry(task.id)).toBe(true);
     expect(await orch.cancelRun(runId)).toBe(true);
     expect(agentRunning()).toBe(false);
-    expect(orch.hasPendingHarnessRetry(task.id)).toBe(false);
+    expect(await orch.hasPendingHarnessRetry(task.id)).toBe(false);
     await stacks.harnessStacks.delete(stack.id);
   });
 
@@ -1227,9 +1237,9 @@ describe("a FAILED turn's background agents are stopped and respected like a hel
     const { stack, task, subagentId } = await failedWithAgent("q1probe");
     const probe = setHeldSessionProbe(null);
     setHeldSessionProbe(probe);
-    expect(probe?.(task.id)).toBe(true);
+    expect(await probeNow(probe, task.id)).toBe(true);
     db.subagents.setStatus(subagentId, "completed", Date.now());
-    expect(probe?.(task.id)).toBe(false);
+    expect(await probeNow(probe, task.id)).toBe(false);
     await stacks.harnessStacks.delete(stack.id);
   });
 
@@ -1241,11 +1251,11 @@ describe("a FAILED turn's background agents are stopped and respected like a hel
       await Bun.sleep(300);
       expect(db.runs.listForTask(task.id)).toHaveLength(1);
       expect(db.tasks.get(task.id)!.agent).toBe(a);
-      expect(orch.hasPendingHarnessRetry(task.id)).toBe(true);
+      expect(await orch.hasPendingHarnessRetry(task.id)).toBe(true);
     } finally {
       failover.cancelAutoRetry(task.id);
       db.subagents.setStatus(subagentId, "completed", Date.now());
-      await waitFor(() => !orch.isTaskRunLive(task.id), 3000);
+      await waitFor(async () => !await orch.isTaskRunLive(task.id), 3000);
       await stacks.harnessStacks.delete(stack.id);
     }
   });
@@ -1311,7 +1321,7 @@ describe("only a held card or a FAILED blocked one is held by its background age
     for (const [column, status] of NOT_HELD) {
       const { b, task, done } = await cardWithAgent(`a1now-${column}-${status}`, column, status);
       try {
-        expect({ column, status, held: orch.backgroundAgentsHoldTask(task.id) }).toEqual({ column, status, held: false });
+        expect({ column, status, held: await orch.backgroundAgentsHoldTask(task.id) }).toEqual({ column, status, held: false });
         const result = await orch.switchTaskAccountNow(task.id);
         expect({ column, status, result: result.status }).toEqual({ column, status, result: "switched" });
         expect(db.tasks.get(task.id)!.agent).toBe(b);
@@ -1324,8 +1334,8 @@ describe("only a held card or a FAILED blocked one is held by its background age
   test("a scheduled switch on a stopped card is applied when a claim on it is released", async () => {
     const { b, stack, task, done } = await cardWithAgent("a1claim", "ready", "cancelled", { scheduled: true });
     try {
-      expect(orch.claimTaskForAccountSwitch(task.id)).toBe(true);
-      orch.releaseTaskAccountSwitch(task.id);
+      expect(await orch.claimTaskForAccountSwitch(task.id)).toBe(true);
+      await orch.releaseTaskAccountSwitch(task.id);
       await waitFor(() => db.tasks.get(task.id)?.agent === b && !orch.isAccountSwitchUnderway(task.id));
       const after = db.tasks.get(task.id)!;
       expect(after.agent).toBe(b);
@@ -1356,15 +1366,15 @@ describe("only a held card or a FAILED blocked one is held by its background age
     const failed = await cardWithAgent("a1failed", "blocked", "failed");
     const stopped = await cardWithAgent("a1stopped", "ready", "cancelled");
     try {
-      expect(orch.backgroundAgentsHoldTask(failed.task.id)).toBe(true);
-      expect(probe?.(failed.task.id)).toBe(true);
-      expect(orch.claimTaskForAccountSwitch(failed.task.id)).toBe(false);
-      expect(orch.backgroundAgentsHoldTask(stopped.task.id)).toBe(false);
-      expect(probe?.(stopped.task.id)).toBe(false);
+      expect(await orch.backgroundAgentsHoldTask(failed.task.id)).toBe(true);
+      expect(await probeNow(probe, failed.task.id)).toBe(true);
+      expect(await orch.claimTaskForAccountSwitch(failed.task.id)).toBe(false);
+      expect(await orch.backgroundAgentsHoldTask(stopped.task.id)).toBe(false);
+      expect(await probeNow(probe, stopped.task.id)).toBe(false);
       // The user drags the failed card on: nothing on it offers a Stop any
       // more, so it no longer holds either.
       db.tasks.update(failed.task.id, { column: "ready" });
-      expect(orch.backgroundAgentsHoldTask(failed.task.id)).toBe(false);
+      expect(await orch.backgroundAgentsHoldTask(failed.task.id)).toBe(false);
     } finally {
       failed.done();
       stopped.done();

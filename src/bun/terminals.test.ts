@@ -181,12 +181,14 @@ test("archiving a task closes its terminals", async () => {
   await createTerminal(task.id);
   expect(countTerminals(task.id)).toBe(2);
 
-  const { archiveTask } = await import("./orchestrator.ts");
+  const { archiveTask, pendingTeardown } = await import("./orchestrator.ts");
   const res = await archiveTask(task.id);
   expect("task" in res).toBe(true);
 
-  // archiveTask awaits killTerminalsForTask (a live shell would block the
-  // worktree detach), so the tabs are gone once it resolves.
+  // The archive teardown (deferred onto the task's teardown queue) kills the
+  // terminals before the worktree detach (a live shell would block it), so
+  // the tabs are gone once that teardown has run.
+  await pendingTeardown(task.id);
   expect(countTerminals(task.id)).toBe(0);
   expect(tasks.get(task.id)!.openTerminalCount).toBe(0);
 });

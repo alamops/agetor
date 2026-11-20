@@ -211,7 +211,7 @@ test("cascade: settling the container settles both running workflow_agent rows, 
       hookCallsForTask++;
       hookSawFullySettled = !subagents.hasRunning(taskId);
     }
-    prevHook?.(tid);
+    return prevHook?.(tid);
   });
   try {
     const changed = await settleSubagentById(containerId, "completed");
@@ -267,7 +267,7 @@ test("parked-discovery: a container registered while the card is parked in revie
   setParkedDiscoveryHandler(real);
   if (!real) throw new Error("expected orchestrator.ts to have installed a real parked-discovery handler");
 
-  real(taskId);
+  await real(taskId);
 
   expect(tasks.get(taskId)?.column).toBe("running");
   expect(subagents.hasRunning(taskId)).toBe(true);

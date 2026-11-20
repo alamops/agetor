@@ -145,7 +145,21 @@ async function seedPriorClaudeRun(taskId: string): Promise<string> {
     codexSessionId: null, cursorSessionId: null, geminiSessionId: null, fxSessionId: null,
   });
   tasks.update(taskId, { column: "review", runId });
+  // The continuation factory adopts only for a task whose run registered in
+  // this process (as the spawn this seeded row stands for would have).
+  const { __noteRegisteredRunTaskForTest } = await import("./orchestrator.ts");
+  __noteRegisteredRunTaskForTest(taskId, { agent: "claude-code", mode: null });
   return runId;
+}
+
+/** Call the factory and wait until the continuation run it opened is written. */
+async function openFactory(taskId: string): Promise<ContinuationHooks | null> {
+  const hooks = realFactory!(taskId);
+  if (hooks) {
+    const { __continuationOpenedForTest } = await import("./orchestrator.ts");
+    await __continuationOpenedForTest(taskId);
+  }
+  return hooks;
 }
 
 async function installSession(taskId: string) {
@@ -181,7 +195,7 @@ test("claude: onlyIfIdle while a continuation run is live is refused busy with n
   const { sendInput } = await import("./orchestrator.ts");
 
   // A live continuation (the real factory), registered in `active`.
-  const hooks = realFactory!(taskId)!;
+  const hooks = (await openFactory(taskId))!;
   const contRunId = tasks.get(taskId)!.runId!;
   adoptLive(hooks);
   const state = await installSession(taskId);
@@ -421,12 +435,12 @@ test("isAnyRunOfTaskLive counts a run displaced as task.runId, which isTaskRunLi
   const { isAnyRunOfTaskLive, isTaskRunLive, cancelRun } = await import("./orchestrator.ts");
   const { tasks } = await import("./db.ts");
 
-  expect(isAnyRunOfTaskLive(taskId)).toBe(false);
+  expect(await isAnyRunOfTaskLive(taskId)).toBe(false);
 
-  const first = realFactory!(taskId)!;
+  const first = (await openFactory(taskId))!;
   const firstRunId = tasks.get(taskId)!.runId!;
   adoptLive(first);
-  const second = realFactory!(taskId)!;
+  const second = (await openFactory(taskId))!;
   const secondRunId = tasks.get(taskId)!.runId!;
   adoptLive(second);
   expect(secondRunId).not.toBe(firstRunId);
@@ -434,10 +448,10 @@ test("isAnyRunOfTaskLive counts a run displaced as task.runId, which isTaskRunLi
   // Stop the CURRENT run: the displaced first run is still registered.
   await cancelRun(secondRunId);
   await wait(50);
-  expect(isTaskRunLive(taskId)).toBe(false);
-  expect(isAnyRunOfTaskLive(taskId)).toBe(true);
+  expect(await isTaskRunLive(taskId)).toBe(false);
+  expect(await isAnyRunOfTaskLive(taskId)).toBe(true);
 
   await cancelRun(firstRunId);
   await wait(50);
-  expect(isAnyRunOfTaskLive(taskId)).toBe(false);
+  expect(await isAnyRunOfTaskLive(taskId)).toBe(false);
 });

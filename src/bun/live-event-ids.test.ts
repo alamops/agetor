@@ -153,7 +153,7 @@ test("a dispatched chunk is sent with the stored id and ts", async () => {
   const { taskId, runId } = await settledRun();
   const before = framesOf(runId).length;
 
-  orch.__dispatchChunkForTest(runId, taskId, "claude-code", "assistant", "hello ids", "uuid-hello");
+  await orch.__dispatchChunkForTest(runId, taskId, "claude-code", "assistant", "hello ids", "uuid-hello");
 
   const sent = framesOf(runId).slice(before);
   expect(sent.length).toBe(1);
@@ -166,8 +166,8 @@ test("a repeated lineUuid is saved and sent once", async () => {
   const { taskId, runId } = await settledRun();
   const before = framesOf(runId).length;
 
-  orch.__dispatchChunkForTest(runId, taskId, "claude-code", "assistant", "same line", "uuid-dup");
-  orch.__dispatchChunkForTest(runId, taskId, "claude-code", "assistant", "same line", "uuid-dup");
+  await orch.__dispatchChunkForTest(runId, taskId, "claude-code", "assistant", "same line", "uuid-dup");
+  await orch.__dispatchChunkForTest(runId, taskId, "claude-code", "assistant", "same line", "uuid-dup");
 
   expect(framesOf(runId).slice(before).filter((f) => f.data === "same line").length).toBe(1);
   expect(storedRows(runId).filter((r) => r.data === "same line").length).toBe(1);
@@ -177,7 +177,7 @@ test("appendRunStatusLine is sent with the stored id and ts", async () => {
   const { taskId, runId } = await settledRun();
   const before = framesOf(runId).length;
 
-  orch.appendRunStatusLine(taskId, runId, "a status breadcrumb");
+  await orch.appendRunStatusLine(taskId, runId, "a status breadcrumb");
 
   const sent = framesOf(runId).slice(before);
   expect(sent.length).toBe(1);
@@ -192,8 +192,8 @@ test("ids strictly increase in send order across an interleaved burst", async ()
 
   for (let i = 0; i < 20; i++) {
     const run = i % 2 === 0 ? a : b;
-    if (i % 3 === 0) orch.appendRunStatusLine(run.taskId, run.runId, `burst status ${i}`);
-    else orch.__dispatchChunkForTest(run.runId, run.taskId, "claude-code", "assistant", `burst ${i}`, `burst-${i}`);
+    if (i % 3 === 0) await orch.appendRunStatusLine(run.taskId, run.runId, `burst status ${i}`);
+    else await orch.__dispatchChunkForTest(run.runId, run.taskId, "claude-code", "assistant", `burst ${i}`, `burst-${i}`);
   }
 
   const sent = frames.slice(before).filter((f) => f.data.startsWith("burst"));

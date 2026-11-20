@@ -271,7 +271,7 @@ test("settleSubagentById on an agentId matching no subagent row is a clean no-op
  *  `setSubagentSettleHook`): swap in a throwaway, read back the previous
  *  value (the real handler), then immediately put it back so no other test
  *  file in this shared process ever observes the wiring changed. */
-async function getRealParkedDiscoveryHandler(): Promise<(taskId: string) => void> {
+async function getRealParkedDiscoveryHandler(): Promise<(taskId: string) => unknown> {
   const { setParkedDiscoveryHandler } = await import("./claude-subagents.ts");
   const real = setParkedDiscoveryHandler(() => {});
   setParkedDiscoveryHandler(real);
@@ -284,7 +284,7 @@ test("pullBackParkedTask: a review card whose latest run succeeded is pulled bac
   const { taskId, runId } = await seedTask({ column: "review", runStatus: "succeeded" });
   const pullBackParkedTask = await getRealParkedDiscoveryHandler();
 
-  pullBackParkedTask(taskId);
+  await pullBackParkedTask(taskId);
 
   expect(tasks.get(taskId)!.column).toBe("running");
   const events = runs.events(runId);
@@ -299,7 +299,7 @@ for (const column of ["done", "blocked", "ready", "backlog"] as const) {
     const { taskId } = await seedTask({ column, runStatus: "succeeded" });
     const pullBackParkedTask = await getRealParkedDiscoveryHandler();
 
-    pullBackParkedTask(taskId);
+    await pullBackParkedTask(taskId);
 
     expect(tasks.get(taskId)!.column).toBe(column);
   });
@@ -310,7 +310,7 @@ test("pullBackParkedTask: a review card whose latest run FAILED is left untouche
   const { taskId } = await seedTask({ column: "review", runStatus: "failed" });
   const pullBackParkedTask = await getRealParkedDiscoveryHandler();
 
-  pullBackParkedTask(taskId);
+  await pullBackParkedTask(taskId);
 
   expect(tasks.get(taskId)!.column).toBe("review");
 });

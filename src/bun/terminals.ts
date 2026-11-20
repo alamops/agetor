@@ -298,7 +298,7 @@ export async function createTerminal(
     // transient git failure can't erase the recorded drifted branch) and
     // surface a re-attach `warning` — a terminal open may be the first thing
     // to restore a missing worktree, and later prepares take the reuse path.
-    noteRestoredCheckout(taskId, prepared);
+    await noteRestoredCheckout(taskId, prepared);
 
     const id = randomUUID();
     const shell = process.env.SHELL || "/bin/zsh";

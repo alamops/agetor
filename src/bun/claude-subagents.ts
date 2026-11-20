@@ -624,13 +624,17 @@ export function setSubagentEmitter(
  * above). The predicate itself lives on the orchestrator side — this module
  * only signals "something changed for taskId," never decides what to do.
  */
-let settleFn: ((taskId: string) => void) | null = null;
+/** The hook may be async (the orchestrator's release reads and writes the
+ *  database); every caller here awaits it, so a release lands before the
+ *  settle that triggered it is over. */
+type SubagentSettleHook = (taskId: string) => unknown;
+let settleFn: SubagentSettleHook | null = null;
 /** Returns the previously-registered hook, for the same save/restore reason as
  *  `setSubagentEmitter`: nulling this in a test's `afterEach` strands every
  *  later test file with no release path, so a held task never reaches `review`. */
 export function setSubagentSettleHook(
-  fn: ((taskId: string) => void) | null,
-): ((taskId: string) => void) | null {
+  fn: SubagentSettleHook | null,
+): SubagentSettleHook | null {
   const prev = settleFn;
   settleFn = fn;
   return prev;
@@ -639,9 +643,9 @@ export function setSubagentSettleHook(
 /** Call the settle hook, never letting a throwing hook reach the poll timer
  *  (or any other caller in this file) — the hook runs orchestrator logic we
  *  don't control, and a bad release predicate must not take the tail down. */
-function fireSettle(taskId: string): void {
+async function fireSettle(taskId: string): Promise<void> {
   try {
-    settleFn?.(taskId);
+    await settleFn?.(taskId);
   } catch (e) {
     console.error(`[claude-subagents] settle hook threw for task ${taskId}:`, e);
   }
@@ -659,14 +663,17 @@ function fireSettle(taskId: string): void {
  * `done`/`blocked`/`ready`) lives on the orchestrator side. This module only
  * signals "a subagent is running for taskId," never decides what to do.
  */
-let parkedDiscoveryFn: ((taskId: string) => void) | null = null;
+/** May be async (the orchestrator's pull-back reads and writes the database);
+ *  every caller here awaits it. */
+type ParkedDiscoveryHandler = (taskId: string) => unknown;
+let parkedDiscoveryFn: ParkedDiscoveryHandler | null = null;
 /** Returns the previously-registered hook, for the same save/restore reason as
  *  `setSubagentEmitter`/`setSubagentSettleHook`: a test that installs a spy
  *  here must put the real one back in `afterEach`, or every later test file
  *  loses the pull-back wiring. */
 export function setParkedDiscoveryHandler(
-  fn: ((taskId: string) => void) | null,
-): ((taskId: string) => void) | null {
+  fn: ParkedDiscoveryHandler | null,
+): ParkedDiscoveryHandler | null {
   const prev = parkedDiscoveryFn;
   parkedDiscoveryFn = fn;
   return prev;
@@ -674,9 +681,9 @@ export function setParkedDiscoveryHandler(
 
 /** Call the parked-discovery hook, never letting a throwing hook reach the
  *  poll timer / dir watcher callback — mirrors `fireSettle`'s posture. */
-function fireParkedDiscovery(taskId: string): void {
+async function fireParkedDiscovery(taskId: string): Promise<void> {
   try {
-    parkedDiscoveryFn?.(taskId);
+    await parkedDiscoveryFn?.(taskId);
   } catch (e) {
     console.error(`[claude-subagents] parked-discovery hook threw for task ${taskId}:`, e);
   }
@@ -1730,7 +1737,7 @@ async function applyMonitorNotificationForRow(row: Subagent, body: string, lineT
 
   await subagentsDb.setStatus(row.id, "running", null);
   emitLifecycleForRow({ ...row, status: "running", endedAt: null }, "started");
-  fireParkedDiscovery(row.taskId);
+  await fireParkedDiscovery(row.taskId);
 }
 
 /** Same lifecycle-event shape `emitLifecycle` builds from a live `FileState`,
@@ -1814,7 +1821,7 @@ export async function orphanRunningSubagents(taskId: string): Promise<void> {
       console.error(`[claude-subagents] orphan sync failed for subagent ${row.id}:`, e);
     }
   }
-  fireSettle(taskId);
+  await fireSettle(taskId);
 }
 
 /**
@@ -2456,7 +2463,7 @@ export function attachSubagentWatcher(opts: {
       // rewind for one full rescan rather than strand the row until reboot.
       if (fs.toolUseId) mainOffset = 0;
       emitLifecycle(fs, "started");
-      fireParkedDiscovery(taskId);
+      await fireParkedDiscovery(taskId);
     }
   }
 
@@ -2598,7 +2605,7 @@ export function attachSubagentWatcher(opts: {
     emitLifecycleForRow(toWorkflowShape(w, taskId), "started");
     // A workflow launched on a follow-up turn must pull a parked (`review`)
     // card back to `running`, exactly like a freshly-discovered subagent.
-    fireParkedDiscovery(taskId);
+    await fireParkedDiscovery(taskId);
   }
 
   /** Pick up workflow transcript dirs and the `agent-*.jsonl` files inside
@@ -2709,7 +2716,7 @@ export function attachSubagentWatcher(opts: {
           // Only a genuinely-running discovery should be able to pull a
           // parked task back — a row born settled has no hold implications
           // (W7's whole point).
-          fireParkedDiscovery(taskId);
+          await fireParkedDiscovery(taskId);
         }
       }
       // W6 — journal cursor rewind. A `result` receipt naming an agent
@@ -3079,7 +3086,7 @@ export function attachSubagentWatcher(opts: {
         await flushChunks();
         await subagentsDb.setStatus(fs.subagentId, "running", null);
         emitLifecycle(fs, "started");
-        fireParkedDiscovery(taskId);
+        await fireParkedDiscovery(taskId);
       }
       const { endOfTurn } = mapTailedLine(
         pl,
@@ -3124,7 +3131,7 @@ export function attachSubagentWatcher(opts: {
         await flushChunks();
         await subagentsDb.setStatus(fs.subagentId, "failed", fs.endedAt);
         emitLifecycle(fs, "finished");
-        fireSettle(taskId);
+        await fireSettle(taskId);
         fireApiError({ subagentId: fs.subagentId, detail: apiErrorInfo.detail, runId: fs.runId });
       }
     }
@@ -3143,7 +3150,7 @@ export function attachSubagentWatcher(opts: {
         emitLifecycle(fs, "finished");
         // The DB write above must land before the orchestrator's release
         // predicate (which reads subagentsDb.hasRunning) can see it as done.
-        fireSettle(taskId);
+        await fireSettle(taskId);
       }
     }
   }
@@ -3193,7 +3200,7 @@ export function attachSubagentWatcher(opts: {
         fs.staleSettled = true;
         await subagentsDb.setStatus(fs.subagentId, "completed", now);
         emitLifecycle(fs, "finished");
-        fireSettle(taskId);
+        await fireSettle(taskId);
       }
     }
   }
@@ -3252,7 +3259,7 @@ export function attachSubagentWatcher(opts: {
           b.settleFloor = b.offset;
           await subagentsDb.setStatus(b.id, "completed", now);
           emitLifecycleForRow(toBgShellShape(b, taskId), "finished");
-          fireSettle(taskId);
+          await fireSettle(taskId);
         }
         continue;
       }
@@ -3286,7 +3293,7 @@ export function attachSubagentWatcher(opts: {
         b.lastAppendAt = now;
         await subagentsDb.setStatus(b.id, "running", null);
         emitLifecycleForRow(toBgShellShape(b, taskId), "started");
-        fireParkedDiscovery(taskId);
+        await fireParkedDiscovery(taskId);
       }
     }
   }
@@ -3783,7 +3790,7 @@ export function attachSubagentWatcher(opts: {
     lastChangeAt = Date.now();
     await subagentsDb.insertIfAbsent(toBgShellShape(b, taskId));
     emitLifecycleForRow(toBgShellShape(b, taskId), "started");
-    fireParkedDiscovery(taskId);
+    await fireParkedDiscovery(taskId);
   }
 
   /**
@@ -3950,7 +3957,7 @@ export function attachSubagentWatcher(opts: {
     lastChangeAt = Date.now();
     await subagentsDb.insertIfAbsent(toMonitorShape(m, taskId));
     emitLifecycleForRow(toMonitorShape(m, taskId), "started");
-    fireParkedDiscovery(taskId);
+    await fireParkedDiscovery(taskId);
   }
 
   /**
@@ -4018,7 +4025,7 @@ export function attachSubagentWatcher(opts: {
       m.persistent = null;
       await subagentsDb.setStatus(id, "running", null);
       emitLifecycleForRow(toMonitorShape(m, taskId), "started");
-      fireParkedDiscovery(taskId);
+      await fireParkedDiscovery(taskId);
     }
     return false;
   }
@@ -4077,7 +4084,7 @@ export function attachSubagentWatcher(opts: {
       m.ceilingSettled = true;
       await subagentsDb.setStatus(m.id, "completed", now);
       emitLifecycleForRow(toMonitorShape(m, taskId), "finished");
-      fireSettle(taskId);
+      await fireSettle(taskId);
     }
   }
 
@@ -4855,6 +4862,6 @@ async function settleSubagent(
   // orchestrator's release predicate (`subagents.hasRunning`) runs exactly once
   // per settle event, against a workflow that is settled in full.
   if (row?.parentKind === "workflow" && depth < 1) await cascadeWorkflowAgents(taskId, row, depth);
-  if (depth === 0) fireSettle(taskId);
+  if (depth === 0) await fireSettle(taskId);
   return true;
 }

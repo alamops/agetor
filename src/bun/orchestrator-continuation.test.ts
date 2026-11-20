@@ -134,7 +134,24 @@ async function seedPriorRun(
     codexSessionId: opts.codexSessionId ?? null, cursorSessionId: null, geminiSessionId: null, fxSessionId: null,
   });
   tasks.update(taskId, { column: opts.column ?? "review", runId });
+  // The factory adopts a turn only for a task whose run registered in this
+  // process (the session it tails is that run's): record it, as the spawn the
+  // seeded row stands for would have.
+  const { __noteRegisteredRunTaskForTest } = await import("./orchestrator.ts");
+  __noteRegisteredRunTaskForTest(taskId, { agent: opts.agent ?? "claude-code", mode: null });
   return runId;
+}
+
+/** Call the factory and, when it adopted, wait until the continuation run's
+ *  row, column move and opening line are written (they ride the run's queue
+ *  now that the database is on another thread). */
+async function openFactory(taskId: string, trigger?: ContinuationTrigger): Promise<ContinuationHooks | null> {
+  const hooks = trigger === undefined ? realFactory!(taskId) : realFactory!(taskId, trigger);
+  if (hooks) {
+    const { __continuationOpenedForTest } = await import("./orchestrator.ts");
+    await __continuationOpenedForTest(taskId);
+  }
+  return hooks;
 }
 
 async function insertRunningSubagent(taskId: string): Promise<string> {
@@ -177,12 +194,26 @@ test("factory returns null for the synthetic __rebuild__ taskId", () => {
   expect(realFactory!("__rebuild__")).toBeNull();
 });
 
-test("factory returns null for an archived task", async () => {
+test("an archived task gets no continuation run (checked when the run row is written)", async () => {
   const taskId = await createTaskWithAgent("continuation-archived", "claude-code");
-  await seedPriorRun(taskId, { claudeSessionId: `sess-${randomUUID()}` });
-  const { tasks } = await import("./db.ts");
+  const priorRunId = await seedPriorRun(taskId, { claudeSessionId: `sess-${randomUUID()}` });
+  const { tasks, runs } = await import("./db.ts");
   tasks.update(taskId, { archivedAt: Date.now() });
 
+  // The decision that needs the row is made where the row is written: the
+  // factory answers claude-tmux synchronously, then declines the write.
+  await openFactory(taskId);
+  expect(tasks.get(taskId)?.runId).toBe(priorRunId);
+  expect(tasks.get(taskId)?.column).toBe("review");
+  expect(runs.listForTask(taskId).some((r) => r.origin === "continuation")).toBe(false);
+});
+
+test("archiving a task through archiveTask stops the factory adopting for it at once", async () => {
+  const taskId = await createTaskWithAgent("continuation-archived-api", "claude-code");
+  await seedPriorRun(taskId, { claudeSessionId: `sess-${randomUUID()}`, column: "done" });
+  const { archiveTask } = await import("./orchestrator.ts");
+  const archived = await archiveTask(taskId);
+  expect("error" in archived).toBe(false);
   expect(realFactory!(taskId)).toBeNull();
 });
 
@@ -193,7 +224,7 @@ test("happy path: new run row (origin continuation, inherited session, running) 
   const priorSessionId = `sess-${randomUUID()}`;
   const priorRunId = await seedPriorRun(taskId, { claudeSessionId: priorSessionId, column: "review" });
 
-  const hooks = realFactory!(taskId);
+  const hooks = await openFactory(taskId);
   expect(hooks).not.toBeNull();
 
   const { tasks, runs } = await import("./db.ts");
@@ -227,7 +258,7 @@ test("trigger wording: each trigger opens the run with a status line saying what
     const taskId = await createTaskWithAgent(`continuation-trigger-${trigger}`, "claude-code");
     await seedPriorRun(taskId, { claudeSessionId: `sess-${randomUUID()}`, column: "review" });
 
-    expect(realFactory!(taskId, trigger)).not.toBeNull();
+    expect(await openFactory(taskId, trigger)).not.toBeNull();
 
     const task = tasks.get(taskId);
     expect(task?.column).toBe("running");
@@ -251,7 +282,7 @@ test("happy path: pulls back from an arbitrary non-running column too (continuat
   const taskId = await createTaskWithAgent("continuation-happy-blocked", "claude-code");
   await seedPriorRun(taskId, { claudeSessionId: `sess-${randomUUID()}`, column: "blocked" });
 
-  const hooks = realFactory!(taskId);
+  const hooks = await openFactory(taskId);
   expect(hooks).not.toBeNull();
 
   const { tasks } = await import("./db.ts");
@@ -264,7 +295,7 @@ test("onAdopted registers the continuation run as active (cancelRun succeeds aga
   const taskId = await createTaskWithAgent("continuation-adopt-active", "claude-code");
   await seedPriorRun(taskId, { claudeSessionId: `sess-${randomUUID()}` });
 
-  const hooks = realFactory!(taskId)!;
+  const hooks = (await openFactory(taskId))!;
   const { tasks } = await import("./db.ts");
   const newRunId = tasks.get(taskId)!.runId!;
 
@@ -290,7 +321,7 @@ test("attachDoneHandler resolves the run: exit 0 -> succeeded, column -> review 
   const taskId = await createTaskWithAgent("continuation-done-review", "claude-code");
   await seedPriorRun(taskId, { claudeSessionId: `sess-${randomUUID()}` });
 
-  const hooks = realFactory!(taskId)!;
+  const hooks = (await openFactory(taskId))!;
   const { tasks, runs } = await import("./db.ts");
   const newRunId = tasks.get(taskId)!.runId!;
 
@@ -310,7 +341,7 @@ test("attachDoneHandler + a running subagent: the #92 hold applies to continuati
   await seedPriorRun(taskId, { claudeSessionId: `sess-${randomUUID()}` });
   await insertRunningSubagent(taskId);
 
-  const hooks = realFactory!(taskId)!;
+  const hooks = (await openFactory(taskId))!;
   const { tasks, runs, subagents } = await import("./db.ts");
   const newRunId = tasks.get(taskId)!.runId!;
 
@@ -342,7 +373,7 @@ test("a follow-up sent while the continuation run is in flight folds into it (bu
   const taskId = await createTaskWithAgent("continuation-fold", "claude-code");
   await seedPriorRun(taskId, { claudeSessionId: `sess-${randomUUID()}` });
 
-  const hooks = realFactory!(taskId)!;
+  const hooks = (await openFactory(taskId))!;
   const { tasks, runs } = await import("./db.ts");
   const newRunId = tasks.get(taskId)!.runId!;
 
@@ -378,7 +409,7 @@ test("a follow-up sent while the continuation run is in flight folds into it (bu
 
 // ── 5. Codex — is the factory actually agent-kind-guarded? ─────────────────
 
-test("codex task → factory returns null (agent-kind guard)", async () => {
+test("codex task → no continuation run is adopted (agent-kind guard)", async () => {
   // In production this factory is only ever invoked from claude-tmux.ts's
   // `dispatchLine` — codex-tmux.ts never references
   // `continuationRunFactory`/`setContinuationRunFactory` at all (grepped;
@@ -400,8 +431,9 @@ test("codex task → factory returns null (agent-kind guard)", async () => {
     column: "review",
   });
 
-  const hooks = realFactory!(taskId);
-  expect(hooks).toBeNull();
+  // The kind needs the row, so the guard runs where the run row is written:
+  // the factory answers claude-tmux synchronously and the write declines.
+  await openFactory(taskId);
 
   const { tasks, runs } = await import("./db.ts");
   const task = tasks.get(taskId);
@@ -434,8 +466,8 @@ test("D12: the factory declines while a startTask spawn holds the startingTaskId
     // The claim is taken synchronously-ish inside startTask; the fake spawn
     // then sits on its 400 ms delay with the claim held.
     const deadline = Date.now() + 2000;
-    while (!isTaskRunLive(taskId) && Date.now() < deadline) await wait(10);
-    expect(isTaskRunLive(taskId)).toBe(true);
+    while (!await isTaskRunLive(taskId) && Date.now() < deadline) await wait(10);
+    expect(await isTaskRunLive(taskId)).toBe(true);
 
     // Mid-spawn: a continuation must not be adopted over the run being started.
     const before = tasks.get(taskId)!.runId;
@@ -451,7 +483,7 @@ test("D12: the factory declines while a startTask spawn holds the startingTaskId
 
     // Control: with the claim released the same call adopts, so the decline
     // above was the claim and nothing else (task is not archived, is claude).
-    const hooks = realFactory!(taskId, "notification");
+    const hooks = await openFactory(taskId, "notification");
     expect(hooks).not.toBeNull();
     expect(runs.get(tasks.get(taskId)!.runId!)?.origin).toBe("continuation");
   } finally {
@@ -474,7 +506,7 @@ async function openContinuation(taskId: string): Promise<{
   finish: (code: number) => void;
   fail: (err: Error) => void;
 }> {
-  const hooks = realFactory!(taskId)!;
+  const hooks = (await openFactory(taskId))!;
   expect(hooks).not.toBeNull();
   const { tasks } = await import("./db.ts");
   const runId = tasks.get(taskId)!.runId!;

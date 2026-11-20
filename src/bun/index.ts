@@ -497,7 +497,7 @@ try {
 // detach) that was deferred to the in-memory teardown queue but never ran
 // because agetor quit or crashed before the job fired. Fire-and-forget — it
 // only enqueues jobs onto that queue, keyed to this instance's own task ids.
-sweepArchivedTeardowns();
+await sweepArchivedTeardowns();
 
 // Idle-session reaper (docs/plans/reduce-cpu-and-memory.md §3.1, T4): kills
 // claude REPL tmux sessions that have sat idle (no turn in flight, nothing
@@ -663,10 +663,20 @@ setTimeout(() => {
 // for agent launches this process is in the middle of — a claude session that
 // hasn't taken its first prompt yet would otherwise die with the app, which
 // breaks "they'll keep running in the background" (quit-launch-gate.ts).
+// `freezeLaunches` stops taking work at the call; the follow-ups it moves to
+// their backlog trays are database writes, which the quit sequence awaits
+// before the database worker is closed.
+let launchesFreezing: Promise<void> = Promise.resolve();
+const freezeLaunchesForQuit = (): void => {
+  const freezing = freezeLaunches().catch((err: unknown) => {
+    console.warn("[agetor] freezing launches failed:", err);
+  });
+  launchesFreezing = Promise.all([launchesFreezing, freezing]).then(() => undefined);
+};
 const quitLaunchGate = createQuitLaunchGate({
   launchesInFlight,
   waitForLaunchesToSettle,
-  freezeLaunches,
+  freezeLaunches: freezeLaunchesForQuit,
   requeueQuit: ({ completely }) => {
     armForceQuit({ completely });
     Utils.quit();
@@ -683,7 +693,9 @@ const quitSequencer = createQuitSequencer({
       // Every effect is synchronous today; the sequence awaits whatever one
       // returns, so an effect that becomes async (a db-async write) is awaited
       // here before the worker is closed.
-      effects: () => {
+      effects: async () => {
+        // The follow-ups a freeze moved to the backlog land before the worker closes.
+        await launchesFreezing;
         const { completely, stopSupervisor, backgroundArmed } = quitDecision;
         // Only when a supervisor is alive to read it (`stopSupervisor`): a request
         // written with none running would otherwise linger for the next supervisor

@@ -141,7 +141,7 @@ test("a dropped stream reconnects with last-event-id and gets only the gap, noth
 
   expect(await drop(taskId, 400)).toBe(1);
   // Lands while the reconnect is parked: the gap.
-  orchestrator.appendRunStatusLine(taskId, runId, "while you were away");
+  await orchestrator.appendRunStatusLine(taskId, runId, "while you were away");
 
   await waitUntil(() => s.metas.length === 2 && s.rows.length === 4);
   expect(s.reconnects()).toBeGreaterThanOrEqual(1);
@@ -150,7 +150,7 @@ test("a dropped stream reconnects with last-event-id and gets only the gap, noth
   expect(s.rows[3]!.id).toBeGreaterThan(ids[2]!);
 
   // Live rows keep flowing on the resumed connection, still each once.
-  orchestrator.appendRunStatusLine(taskId, runId, "live again");
+  await orchestrator.appendRunStatusLine(taskId, runId, "live again");
   await waitUntil(() => s.rows.length === 5);
   await new Promise((r) => setTimeout(r, 100));
   const seen = s.rows.map((e) => e.id);

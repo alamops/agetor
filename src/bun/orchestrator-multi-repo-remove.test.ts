@@ -545,23 +545,23 @@ test("withTaskRepositoryRoots names only checkouts that exist; a single task get
     id = task.id;
     const [present, missing] = task.repositories!;
     const opts = { mode: null };
-    expect(withTaskRepositoryRoots(id, opts)).toMatchObject({
+    expect(await withTaskRepositoryRoots(id, opts)).toMatchObject({
       extraDirectories: [present!.worktreePath, missing!.worktreePath],
     });
     rmSync(missing!.worktreePath!, { recursive: true, force: true });
-    const pruned = withTaskRepositoryRoots(id, opts)!;
+    const pruned = (await withTaskRepositoryRoots(id, opts))!;
     expect(pruned.extraDirectories).toEqual([present!.worktreePath!]);
     expect(pruned.codexWorkspaceRepos).toEqual([{ worktreePath: present!.worktreePath!, repoPath: a }]);
     // Nothing on disk at all: no flags.
     rmSync(present!.worktreePath!, { recursive: true, force: true });
-    expect(withTaskRepositoryRoots(id, opts)).toBe(opts);
+    expect(await withTaskRepositoryRoots(id, opts)).toBe(opts);
 
     const single = await createTask({ title: "roots single", prompt: "p", agent: "claude-code", workdir: solo, isolation: "worktree" });
     if ("error" in single) throw new Error(single.error);
     singleId = single.task.id;
     mkdirSync(await workspaceOf(singleId), { recursive: true });
     tasks.update(singleId, { worktreePath: await workspaceOf(singleId) });
-    expect(withTaskRepositoryRoots(singleId, opts)).toBe(opts);
+    expect(await withTaskRepositoryRoots(singleId, opts)).toBe(opts);
   } finally {
     cleanup(id ? await workspaceOf(id) : undefined, singleId ? await workspaceOf(singleId) : undefined, a, b, solo);
   }

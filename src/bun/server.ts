@@ -6512,7 +6512,7 @@ export function startApiServer(
           // live too, whether the turn that left them succeeded (held in
           // `running`) or failed: the switch drops the old session, which
           // would kill the REPL hosting those agents.
-          if (sameStackAccountSwitch && backgroundAgentsHoldTask(before.id)) {
+          if (sameStackAccountSwitch && await backgroundAgentsHoldTask(before.id)) {
             return json(
               { error: "stop the background agents before switching accounts", code: "background-agents" },
               { status: 409, headers: corsHeaders(req) },
@@ -6590,7 +6590,7 @@ export function startApiServer(
           // task is starting) instead of being pasted into the old account's
           // still-live REPL / minting a session the handoff then displaces
           // (review S3). The claim is released in the `finally` below.
-          if (sameStackAccountSwitch && !claimTaskForAccountSwitch(before.id)) {
+          if (sameStackAccountSwitch && !await claimTaskForAccountSwitch(before.id)) {
             return json(
               { error: "task is busy starting a turn — try again in a moment" },
               { status: 409, headers: corsHeaders(req) },
@@ -6667,7 +6667,7 @@ export function startApiServer(
               : updated;
             return json(withRunningSubagents(responseTask), { headers: corsHeaders(req) });
           } finally {
-            if (sameStackAccountSwitch) releaseTaskAccountSwitch(before.id);
+            if (sameStackAccountSwitch) await releaseTaskAccountSwitch(before.id);
           }
         }),
         DELETE: authed(async (req) => {
@@ -6680,7 +6680,7 @@ export function startApiServer(
           // there is no pipeline task left to redirect to, so refusing here
           // would leave the row permanently undeletable (orphan cleanup).
           const existing = tasks.get(req.params.id);
-          if (existing && isPipelineStepTask(existing) && !isOrphanedPipelineStep(existing)) {
+          if (existing && isPipelineStepTask(existing) && !await isOrphanedPipelineStep(existing)) {
             return json(
               { error: "step task belongs to a pipeline — act on the pipeline task" },
               { status: 409, headers: corsHeaders(req) },
@@ -6744,7 +6744,7 @@ export function startApiServer(
           // counts: another switch holding the claim, such as a same-stack
           // PATCH, may be refused and leave the request behind, so the
           // Cancel drops it as usual.
-          if (isScheduledSwitchUnderway(req.params.id)) {
+          if (await isScheduledSwitchUnderway(req.params.id)) {
             return json(
               { error: "the switch is already under way", code: "busy" } satisfies SwitchAccountRefusal,
               { status: 409, headers: corsHeaders(req) },
@@ -6768,7 +6768,7 @@ export function startApiServer(
           // asked for. Same orphan exemption as DELETE/archive: a step
           // whose parent row is gone has no pipeline left to redirect to.
           const existing = tasks.get(req.params.id);
-          if (existing && isPipelineStepTask(existing) && !isOrphanedPipelineStep(existing)) {
+          if (existing && isPipelineStepTask(existing) && !await isOrphanedPipelineStep(existing)) {
             return json(
               { error: "step task is managed by its pipeline — retry the pipeline task instead" },
               { status: 409, headers: corsHeaders(req) },
@@ -6926,7 +6926,7 @@ export function startApiServer(
           // parent (D9, docs/plans/pipelines.md). M7: same orphan exemption
           // too.
           const existing = tasks.get(req.params.id);
-          if (existing && isPipelineStepTask(existing) && !isOrphanedPipelineStep(existing)) {
+          if (existing && isPipelineStepTask(existing) && !await isOrphanedPipelineStep(existing)) {
             return json(
               { error: "step task belongs to a pipeline — act on the pipeline task" },
               { status: 409, headers: corsHeaders(req) },
@@ -6981,7 +6981,7 @@ export function startApiServer(
           // archive/unarchive lifecycle belongs to its pipeline parent, and
           // an orphaned step (parent row gone) is the one exemption.
           const existing = tasks.get(req.params.id);
-          if (existing && isPipelineStepTask(existing) && !isOrphanedPipelineStep(existing)) {
+          if (existing && isPipelineStepTask(existing) && !await isOrphanedPipelineStep(existing)) {
             return json(
               { error: "step task belongs to a pipeline — act on the pipeline task" },
               { status: 409, headers: corsHeaders(req) },
@@ -7225,7 +7225,7 @@ export function startApiServer(
       // Every agetor-managed git worktree materialized on disk, with staleness
       // classification — backs the Worktrees list page.
       "/worktrees": {
-        GET: authed((req) => json(listWorktrees(), { headers: corsHeaders(req) })),
+        GET: authed(async (req) => json(await listWorktrees(), { headers: corsHeaders(req) })),
       },
 
       // Delete an orphaned worktree directory (no owning task row — see
@@ -8809,7 +8809,7 @@ export function startApiServer(
             // a failed send never leaves a line claiming the plan was
             // approved.
             if (flipToAuto) {
-              appendRunStatusLine(
+              await appendRunStatusLine(
                 task.id,
                 task.runId,
                 isCopilot
@@ -8817,7 +8817,7 @@ export function startApiServer(
                   : "plan approved — switched this task to Auto (force) so cursor can implement it",
               );
             } else if (boundPlanWarning !== null) {
-              appendRunStatusLine(task.id, task.runId, boundPlanWarning);
+              await appendRunStatusLine(task.id, task.runId, boundPlanWarning);
             }
 
             // The message is now delivered and cannot be un-sent — every
@@ -8893,12 +8893,12 @@ export function startApiServer(
       // line, the `fx-auto-resume` event) lives in `cancelFxAutoResume`
       // itself; this route just maps its boolean onto HTTP.
       "/tasks/:id/fx-auto-resume": {
-        DELETE: authed((req) => {
+        DELETE: authed(async (req) => {
           const taskId = req.params.id;
           if (!tasks.get(taskId)) {
             return json({ error: "not found" }, { status: 404, headers: corsHeaders(req) });
           }
-          const cancelled = cancelFxAutoResume(taskId, "cancelled");
+          const cancelled = await cancelFxAutoResume(taskId, "cancelled");
           if (!cancelled) {
             return json({ error: "no auto-resume pending" }, { status: 400, headers: corsHeaders(req) });
           }

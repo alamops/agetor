@@ -125,6 +125,8 @@ export function hasRunningWork(): boolean {
 
 let shuttingDown = false;
 let handingOff = false;
+/** Upper bound on waiting for `freezeLaunches`' backlog writes at shutdown. */
+const SHUTDOWN_FREEZE_WAIT_MS = 3_000;
 
 /**
  * The app asked for the port (`/daemon/shutdown {mode:"handoff"}`). Exiting
@@ -140,7 +142,7 @@ let handingOff = false;
 async function handOffPort(reason: string, code: number): Promise<void> {
   if (handingOff || shuttingDown) return;
   handingOff = true;
-  freezeLaunches();
+  await freezeLaunches();
   const pending = launchesInFlight();
   if (pending > 0) {
     daemonLog(`handoff requested — waiting for ${pending} agent launch(es) to settle`);
@@ -163,12 +165,12 @@ function shutdown(reason: string, code = 0, opts: { realStop?: boolean } = {}): 
   daemonLog(`shutting down (${reason})`);
   // Take no new work, and keep the follow-ups queued in memory (they would die
   // with the process) in their tasks' backlog trays. Idempotent: a handoff
-  // already froze before its launch wait.
-  try {
-    freezeLaunches();
-  } catch (err) {
+  // already froze before its launch wait. The freeze stops taking work at the
+  // call; its backlog writes are database hops, awaited (bounded) below before
+  // the database worker is closed.
+  const freezing = freezeLaunches().catch((err: unknown) => {
     daemonLog(`freezing launches failed: ${String(err)}`);
-  }
+  });
   // fx-acp.ts's own SIGINT/SIGTERM/SIGHUP handlers always reap `fx acp`
   // children but only call `process.exit` themselves when they're the sole
   // listener for that signal — since this module registers its own
@@ -218,7 +220,10 @@ function shutdown(reason: string, code = 0, opts: { realStop?: boolean } = {}): 
   }
   // Last: drain core.log and close the db worker before the exit, bounded so a
   // stuck worker can never hold the shutdown. `process.exit` is the only way out.
-  void drainCoreForQuit().finally(() => process.exit(code));
+  // The freeze's backlog writes land first (bounded too).
+  void Promise.race([freezing, Bun.sleep(SHUTDOWN_FREEZE_WAIT_MS)])
+    .then(() => drainCoreForQuit())
+    .finally(() => process.exit(code));
 }
 
 export async function runDaemon(): Promise<void> {

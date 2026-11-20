@@ -71,20 +71,23 @@ export function setOpencodeSubagentEmitter(fn: ((e: RunEvent) => void) | null): 
   return prev;
 }
 
-let settleFn: ((taskId: string) => void) | null = null;
+/** May be async (the orchestrator's release reads and writes the database);
+ *  every caller here awaits it. */
+type OpencodeSettleHook = (taskId: string) => unknown;
+let settleFn: OpencodeSettleHook | null = null;
 
 /** Held-task release hook (the orchestrator registers `maybeReleaseHeldTask`,
  *  same as Claude's `setSubagentSettleHook`). Fired after a row leaves
  *  `running`. Returns the previous hook (tests restore it). */
-export function setOpencodeSubagentSettleHook(fn: ((taskId: string) => void) | null): ((taskId: string) => void) | null {
+export function setOpencodeSubagentSettleHook(fn: OpencodeSettleHook | null): OpencodeSettleHook | null {
   const prev = settleFn;
   settleFn = fn;
   return prev;
 }
 
-function fireSettle(taskId: string): void {
+async function fireSettle(taskId: string): Promise<void> {
   try {
-    settleFn?.(taskId);
+    await settleFn?.(taskId);
   } catch (e) {
     console.error(`[opencode-subagents] settle hook failed for task ${taskId}:`, e);
   }
@@ -388,7 +391,7 @@ async function settleRow(row: Subagent, status: SubagentStatus): Promise<void> {
   const endedAt = Date.now();
   await subagents.setStatus(row.id, status, endedAt);
   emitLifecycle({ ...row, status, endedAt }, "finished");
-  fireSettle(row.taskId);
+  await fireSettle(row.taskId);
 }
 
 type RefreshArgs = { bin: string; env: Record<string, string>; cwd: string; major: 1 | 2; standalone: boolean; final: boolean };
@@ -496,7 +499,7 @@ async function orphanRunningOpencodeSubagentsRaw(taskId: string, reason: string)
   }
   let flipped = 0;
   for (const row of rows) if (await orphanRow(row, reason)) flipped++;
-  if (flipped > 0) fireSettle(taskId);
+  if (flipped > 0) await fireSettle(taskId);
   return flipped;
 }
 
@@ -562,7 +565,7 @@ export function orphanOpencodeChild(taskId: string, childSessionId: string): Pro
     }
     if (!row || row.taskId !== taskId || !isOpencodeSubagentRow(row) || row.status !== "running") return false;
     if (!(await orphanRow(row, "the OpenCode server stopped"))) return false;
-    fireSettle(taskId);
+    await fireSettle(taskId);
     return true;
   });
 }

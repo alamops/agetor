@@ -1759,13 +1759,13 @@ describe("TT-E: fix-round routes (shapes, gates, 22b, finding 19)", () => {
     db.subagents.setStatus(subId, "completed", Date.now());
 
     // Another switch already holds the claim.
-    expect(orch.claimTaskForAccountSwitch(t)).toBe(true);
+    expect(await orch.claimTaskForAccountSwitch(t)).toBe(true);
     try {
       const busy = await call("POST", `/tasks/${t}/switch-account`);
       expect(busy.status).toBe(409);
       expect(busy.body.code).toBe("busy");
     } finally {
-      orch.releaseTaskAccountSwitch(t);
+      await orch.releaseTaskAccountSwitch(t);
     }
     for (const id of [lone, t, held]) db.tasks.delete(id);
     expect(stack).toBeTruthy();
@@ -1824,12 +1824,12 @@ describe("TT-E: fix-round routes (shapes, gates, 22b, finding 19)", () => {
     });
     try {
       // A claim release is one of the edges that applies a waiting request.
-      expect(orch.claimTaskForAccountSwitch(t)).toBe(true);
-      orch.releaseTaskAccountSwitch(t);
+      expect(await orch.claimTaskForAccountSwitch(t)).toBe(true);
+      await orch.releaseTaskAccountSwitch(t);
       const deadline = Date.now() + 8000;
       while (Date.now() < deadline && !reached) await Bun.sleep(10);
       expect(reached).toBe(true);
-      expect(orch.isScheduledSwitchUnderway(t)).toBe(true);
+      expect(await orch.isScheduledSwitchUnderway(t)).toBe(true);
 
       const busy = await call("DELETE", `/tasks/${t}/switch-account`);
       expect(busy.status).toBe(409);
@@ -1860,17 +1860,17 @@ describe("TT-E: fix-round routes (shapes, gates, 22b, finding 19)", () => {
     db.tasks.setHarnessState(t, { ...baseState(stackId), scheduledSwitch: { requestedAt: Date.now() } });
     // The claim the PATCH route takes for a same-stack agent change. That
     // PATCH may still be refused, which would leave the request behind.
-    expect(orch.claimTaskForAccountSwitch(t)).toBe(true);
+    expect(await orch.claimTaskForAccountSwitch(t)).toBe(true);
     try {
       expect(orch.isAccountSwitchUnderway(t)).toBe(true);
-      expect(orch.isScheduledSwitchUnderway(t)).toBe(false);
+      expect(await orch.isScheduledSwitchUnderway(t)).toBe(false);
       const cancel = await call("DELETE", `/tasks/${t}/switch-account`);
       expect(cancel.status).toBe(200);
       expect(cancel.body.cancelled).toBe(true);
       expect(db.tasks.get(t)!.harnessState?.scheduledSwitch ?? null).toBeNull();
       expect(statusLines(runId)).toContain("scheduled account switch cancelled");
     } finally {
-      orch.releaseTaskAccountSwitch(t);
+      await orch.releaseTaskAccountSwitch(t);
     }
     // The claim ends (the PATCH refused) with nothing left to apply.
     await Bun.sleep(50);

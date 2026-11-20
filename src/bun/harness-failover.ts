@@ -62,11 +62,11 @@ export interface FailoverHooks {
    *  run succeeded, so there is no `running` run row, but its REPL is still
    *  live). A manual prepare must leave such a task alone exactly like a live
    *  run (review Q6). Omitted ⇒ never held. */
-  isTaskHeld?(taskId: string): boolean;
+  isTaskHeld?(taskId: string): boolean | Promise<boolean>;
   /** A requested "switch to next account" was dropped by the engine (the
    *  stack was cut to a single account); the orchestrator says why on the
    *  task's latest run. Omitted ⇒ no status line. */
-  onScheduledSwitchDropped?(taskId: string, line: string): void;
+  onScheduledSwitchDropped?(taskId: string, line: string): void | Promise<void>;
 }
 
 let hooks: FailoverHooks | null = null;
@@ -953,7 +953,7 @@ export async function prepareTaskHarness(
   if (!task) return { ok: false, error: "task not found" };
   const resolved = await harnessStacks.resolveForTask(task);
   if (!resolved) return { ok: true };
-  if ((await runs.hasRunning(taskId)) || hooks?.isTaskHeld?.(taskId)) return { ok: true };
+  if ((await runs.hasRunning(taskId)) || (await hooks?.isTaskHeld?.(taskId))) return { ok: true };
   const { stack, current } = resolved;
   // A stack of fewer than two accounts behaves exactly like a lone account:
   // no failover state, and the normal pre-flight error (with its login help)
@@ -964,7 +964,7 @@ export async function prepareTaskHarness(
     const hadScheduledSwitch = Boolean(task.harnessState?.scheduledSwitch);
     if (task.harnessState) await clearFailoverState(taskId);
     if (hadScheduledSwitch) {
-      hooks?.onScheduledSwitchDropped?.(taskId, "scheduled account switch dropped — the stack has fewer than two accounts");
+      await hooks?.onScheduledSwitchDropped?.(taskId, "scheduled account switch dropped — the stack has fewer than two accounts");
     }
     return { ok: true };
   }

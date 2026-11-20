@@ -69,10 +69,10 @@ afterAll(async () => {
   rmTestDataDir(DATA_DIR);
 });
 
-async function waitFor(fn: () => boolean, ms = 8000): Promise<boolean> {
+async function waitFor(fn: () => boolean | Promise<boolean>, ms = 8000): Promise<boolean> {
   const deadline = Date.now() + ms;
   while (Date.now() < deadline) {
-    if (fn()) return true;
+    if (await fn()) return true;
     await Bun.sleep(10);
   }
   return fn();
@@ -102,13 +102,13 @@ test("Stop on a failed card with running background agents, while a Run holds th
     description: "background review", spawnDepth: 1, sourcePath: path.join(DATA_DIR, `${subagentId}.jsonl`),
     status: "running", startedAt: Date.now() - 1000, endedAt: null,
   } as never);
-  expect(orch.backgroundAgentsHoldTask(taskId)).toBe(true);
+  expect(await orch.backgroundAgentsHoldTask(taskId)).toBe(true);
 
   // Retry on the blocked card: the start holds the claim through the floor
   // probe, before any run row exists.
   const started = orch.startTask(taskId);
-  expect(await waitFor(() => orch.isTaskRunLive(taskId) && db.runs.listForTask(taskId).length === 1)).toBe(true);
-  expect(orch.backgroundAgentsHoldTask(taskId)).toBe(true);
+  expect(await waitFor(async () => await orch.isTaskRunLive(taskId) && db.runs.listForTask(taskId).length === 1)).toBe(true);
+  expect(await orch.backgroundAgentsHoldTask(taskId)).toBe(true);
 
   // The UI's Stop names the card's current (failed) run.
   expect(await orch.cancelRun(failedRunId)).toBe(true);

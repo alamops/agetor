@@ -166,13 +166,13 @@ test("findLastSessionIdForHarness picks the newest id the given harness recorded
   seedRun(taskId, "codex", null, null, { startedAt: 4_000 }); // no id stamped
   seedRun(taskId, "gone-harness", "codexSessionId", "thread-dangling", { startedAt: 5_000 });
 
-  expect(orch.findLastSessionIdForHarness(taskId, "codex_session_id", "codex")).toBe("thread-builtin-new");
-  expect(orch.findLastSessionIdForHarness(taskId, "codex_session_id", "codex-unit-alt")).toBe("thread-alt");
+  expect(await orch.findLastSessionIdForHarness(taskId, "codex_session_id", "codex")).toBe("thread-builtin-new");
+  expect(await orch.findLastSessionIdForHarness(taskId, "codex_session_id", "codex-unit-alt")).toBe("thread-alt");
   // A row whose harness no longer resolves matches only its raw stored id.
-  expect(orch.findLastSessionIdForHarness(taskId, "codex_session_id", "gone-harness")).toBe("thread-dangling");
-  expect(orch.findLastSessionIdForHarness(taskId, "codex_session_id", "codex-never-ran")).toBeNull();
+  expect(await orch.findLastSessionIdForHarness(taskId, "codex_session_id", "gone-harness")).toBe("thread-dangling");
+  expect(await orch.findLastSessionIdForHarness(taskId, "codex_session_id", "codex-never-ran")).toBeNull();
   // Another column is independent.
-  expect(orch.findLastSessionIdForHarness(taskId, "cursor_session_id", "codex")).toBeNull();
+  expect(await orch.findLastSessionIdForHarness(taskId, "cursor_session_id", "codex")).toBeNull();
 });
 
 for (const c of KINDS) {
@@ -185,8 +185,8 @@ for (const c of KINDS) {
     const seed = seedRun(taskId, c.kind, c.field, orig);
     db.tasks.update(taskId, { runId: seed.id });
 
-    expect(orch.findLastSessionIdForHarness(taskId, c.column, c.kind)).toBe(orig);
-    expect(orch.findLastSessionIdForHarness(taskId, c.column, altId)).toBeNull();
+    expect(await orch.findLastSessionIdForHarness(taskId, c.column, c.kind)).toBe(orig);
+    expect(await orch.findLastSessionIdForHarness(taskId, c.column, altId)).toBeNull();
 
     // Built-in → additional harness of the same kind: never the other account's session.
     db.tasks.update(taskId, { agent: altId });
@@ -195,7 +195,7 @@ for (const c of KINDS) {
     expect(db.runs.get(altRunId)?.[c.field]).not.toBe(orig);
     expect(db.runs.get(altRunId)?.agent).toBe(altId);
     // The built-in's own history is untouched.
-    expect(orch.findLastSessionIdForHarness(taskId, c.column, c.kind)).toBe(orig);
+    expect(await orch.findLastSessionIdForHarness(taskId, c.column, c.kind)).toBe(orig);
 
     // Back to the built-in: the original session resumes.
     db.tasks.update(taskId, { agent: c.kind });
@@ -211,11 +211,11 @@ test("a stacked account resumes its own session, or the conversation a swap copi
   db.tasks.insert(makeTask(taskId, "stack-b", null));
   // The primary's conversation must never be resumed by the backup...
   seedRun(taskId, "stack-a", "claudeSessionId", "sess-primary", { startedAt: 1_000 });
-  expect(orch.findLastSessionIdForHarness(taskId, "claude_session_id", "stack-b")).toBeNull();
+  expect(await orch.findLastSessionIdForHarness(taskId, "claude_session_id", "stack-b")).toBeNull();
   // ...unless a swap explicitly copied one onto the backup and recorded it
   // as a handoff (the one exception to per-account session scoping).
   const own = seedRun(taskId, "stack-b", "claudeSessionId", "sess-backup-own", { startedAt: 2_000 });
-  expect(orch.findLastSessionIdForHarness(taskId, "claude_session_id", "stack-b")).toBe("sess-backup-own");
+  expect(await orch.findLastSessionIdForHarness(taskId, "claude_session_id", "stack-b")).toBe("sess-backup-own");
   db.harnessSessionHandoffs.upsert({
     taskId,
     harnessId: "stack-b",
@@ -224,9 +224,9 @@ test("a stacked account resumes its own session, or the conversation a swap copi
     copiedPaths: [],
     createdAt: own.startedAt + 1_000,
   });
-  expect(orch.findLastSessionIdForHarness(taskId, "claude_session_id", "stack-b")).toBe("sess-transferred");
+  expect(await orch.findLastSessionIdForHarness(taskId, "claude_session_id", "stack-b")).toBe("sess-transferred");
   // The handoff is scoped to the destination account.
-  expect(orch.findLastSessionIdForHarness(taskId, "claude_session_id", "stack-a")).toBe("sess-primary");
+  expect(await orch.findLastSessionIdForHarness(taskId, "claude_session_id", "stack-a")).toBe("sess-primary");
 });
 
 test("an imported Claude task resumes its imported session (the seed run carries the importing harness id)", async () => {

@@ -57,7 +57,7 @@ test("listWorktrees classifies a linked worktree as fresh", async () => {
     if ("error" in prepared) throw new Error(prepared.error);
     tasks.update(taskId, { branch: prepared.branch, worktreePath: prepared.worktreePath });
 
-    const entries = listWorktrees();
+    const entries = await listWorktrees();
     const entry = entries.find((e) => e.id === taskId);
     expect(entry).toBeDefined();
     expect(entry?.taskId).toBe(taskId);
@@ -100,7 +100,7 @@ test("listWorktrees flags an archived worktree as stale \"archived\"", async () 
     tasks.update(taskId, { archivedAt: Date.now() });
     expect(existsSync(prepared.worktreePath!)).toBe(true);
 
-    const entries = listWorktrees();
+    const entries = await listWorktrees();
     const entry = entries.find((e) => e.id === taskId);
     expect(entry).toBeDefined();
     expect(entry?.stale).toBe(true);
@@ -144,7 +144,7 @@ test("listWorktrees flags an idle worktree as \"inactive\"", async () => {
     const oldTs = Date.now() - WORKTREE_STALE_AFTER_MS - 1000;
     db.run(`UPDATE tasks SET updated_at = ? WHERE id = ?`, [oldTs, taskId]);
 
-    const entries = listWorktrees();
+    const entries = await listWorktrees();
     const entry = entries.find((e) => e.id === taskId);
     expect(entry).toBeDefined();
     expect(entry?.stale).toBe(true);
@@ -197,7 +197,7 @@ test("does not flag a worktree inactive while a background agent is still runnin
       endedAt: null,
     });
 
-    const held = listWorktrees().find((e) => e.id === taskId);
+    const held = (await listWorktrees()).find((e) => e.id === taskId);
     expect(held).toBeDefined();
     expect(held?.staleReasons).not.toContain("inactive");
     expect(held?.heldByBackgroundAgents).toBe(true);
@@ -206,7 +206,7 @@ test("does not flag a worktree inactive while a background agent is still runnin
     // next listWorktrees() call should now report "inactive".
     subagents.setStatus(agentId, "completed", Date.now());
 
-    const settled = listWorktrees().find((e) => e.id === taskId);
+    const settled = (await listWorktrees()).find((e) => e.id === taskId);
     expect(settled).toBeDefined();
     expect(settled?.staleReasons).toContain("inactive");
     expect(settled?.heldByBackgroundAgents).toBe(false);
@@ -258,7 +258,7 @@ test("does not flag a worktree inactive while a workflow container row is runnin
       endedAt: null,
     });
 
-    const held = listWorktrees().find((e) => e.id === taskId);
+    const held = (await listWorktrees()).find((e) => e.id === taskId);
     expect(held).toBeDefined();
     expect(held?.staleReasons).not.toContain("inactive");
     expect(held?.heldByBackgroundAgents).toBe(true);
@@ -277,7 +277,7 @@ test("listWorktrees flags an orphan dir (no task row) as \"orphaned\"", async ()
   mkdirSync(orphanDir, { recursive: true });
 
   try {
-    const entries = listWorktrees();
+    const entries = await listWorktrees();
     const entry = entries.find((e) => e.id === orphanId);
     expect(entry).toBeDefined();
     expect(entry?.taskId).toBeNull();
@@ -314,7 +314,7 @@ test("a legacy orphan worktree with a submodule is not split into repository row
   );
 
   try {
-    const rows = listWorktrees().filter((e) => e.id === orphanId || e.id.startsWith(`${orphanId}__`));
+    const rows = (await listWorktrees()).filter((e) => e.id === orphanId || e.id.startsWith(`${orphanId}__`));
     expect(rows.map((r) => r.id)).toEqual([orphanId]);
     expect(rows[0]?.repoName).toBeUndefined();
     expect(rows[0]?.workdir).toBe("/tmp/source-repo");
@@ -508,12 +508,12 @@ test("listWorktrees emits one row per repository and skips the workspace root", 
     tasks.update(taskId, { worktreePath: prepared.worktreePath });
     tasks.setRepositories(taskId, prepared.repositories!);
     const names = uniqueRepoSlugs([a, b]);
-    const rows = listWorktrees().filter((e) => e.taskId === taskId);
+    const rows = (await listWorktrees()).filter((e) => e.taskId === taskId);
     expect(rows.map((r) => r.id)).toEqual(names.map((n) => `${taskId}__${n}`));
     expect(rows.map((r) => r.repoName)).toEqual(names);
     expect(rows.map((r) => r.workdir)).toEqual([a, b]);
     expect(rows.every((r) => r.branch && r.path.includes(r.repoName!))).toBe(true);
-    expect(listWorktrees().some((e) => e.id === taskId)).toBe(false);
+    expect((await listWorktrees()).some((e) => e.id === taskId)).toBe(false);
   } finally {
     db.run(`DELETE FROM tasks WHERE id = ?`, [taskId]);
     rmSync((await import("./worktree.ts")).worktreePath(created.task), { recursive: true, force: true });
@@ -556,7 +556,7 @@ test("listWorktrees surfaces a retained workspace root with no repository checko
     writeFileSync(path.join(workspace, "notes.md"), "keep me\n");
     tasks.update(taskId, { archivedAt: Date.now() });
 
-    const rows = listWorktrees().filter((e) => e.taskId === taskId);
+    const rows = (await listWorktrees()).filter((e) => e.taskId === taskId);
     expect(rows).toHaveLength(1);
     const row = rows[0]!;
     expect(row.id).toBe(taskId);

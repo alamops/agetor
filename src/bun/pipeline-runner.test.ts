@@ -599,6 +599,12 @@ test("cancel mid-step then retry restarts the same step task", async () => {
     expect(afterCancel.pipelineRun!.active.length).toBe(1);
     const stepsBeforeRetry = tasks.stepsForParent(parentId);
     expect(stepsBeforeRetry.length).toBe(1);
+    // The stopped step's own settle records its outcome a few database hops
+    // after the Stop marks the run cancelled; Retry acts on that record.
+    await waitFor(() => {
+      const h = tasks.get(parentId)?.pipelineRun?.history.find((r) => r.taskId === stepsBeforeRetry[0]!.id);
+      return h?.outcome === "cancelled" ? h : undefined;
+    });
 
     const retried = await retryPipelineStep(parentId);
     if ("error" in retried) throw new Error(retried.error);
@@ -744,7 +750,7 @@ test("effectiveAgentProfile returns the frozen snapshot (never \"live\") for a s
   if ("error" in started) throw new Error(started.error);
 
   const stepTask = await waitFor(() => tasks.stepsForParent(parentId)[0]);
-  const resolved = effectiveAgentProfile(stepTask);
+  const resolved = await effectiveAgentProfile(stepTask);
   expect(resolved).not.toBeNull();
   expect(resolved!.source).toBe("snapshot");
   expect(resolved!.profile.id).toBe(profile.id);
@@ -3165,7 +3171,7 @@ test("H1: a step stopped during the bounded-spawn pending window settles the pip
     expect(started.pending).toBe(true);
     const step = tasks.stepsForParent(parentId)[0]!;
     expect(step.runId).toBe(started.runId);
-    expect(isTaskRunLive(step.id)).toBe(true);
+    expect(await isTaskRunLive(step.id)).toBe(true);
     expect(tasks.get(parentId)!.pipelineRun!.status).toBe("running");
 
     // Stop mid-window: there's no `active` handle yet — `cancelRun` records
@@ -3321,7 +3327,7 @@ test("M-R3: a step held by background subagents stays active (not advanced) unti
     expect(held.pipelineRun!.history.find((x) => x.taskId === step.id)?.outcome).toBeNull();
     expect(tasks.stepsForParent(parentId).length).toBe(1);
     // Honest liveness: Retry/Advance/Stop all read the held step as busy.
-    expect(isTaskRunLive(step.id)).toBe(true);
+    expect(await isTaskRunLive(step.id)).toBe(true);
     const refused = await advancePipeline(parentId, { fromTaskId: step.id, nextStepIds: null });
     expect("error" in refused ? refused.status : null).toBe(409);
 
@@ -3805,6 +3811,10 @@ async function openLiveRun(taskId: string, reply: string | null, trigger: "notif
   let resolveDone!: (code: number) => void;
   const done = new Promise<number>((res) => { resolveDone = res; });
   hooks.onAdopted({ kill: () => resolveDone(0), writeInput: () => true, done });
+  // The adoption writes its run row (and points `task.runId` at it) through
+  // the run's queue.
+  const { __continuationOpenedForTest } = await import("./orchestrator.ts");
+  await __continuationOpenedForTest(taskId);
   const runId = tasks.get(taskId)!.runId!;
   if (reply) hooks.onChunk("assistant", reply);
   return {
@@ -4679,14 +4689,14 @@ test("L2: Stop on a pipeline whose step is only live through a DISPLACED run sto
     await tick();
     const C = await openLiveRun(s.stepTaskId, "a reply", "user");
     await C.finish();
-    expect(isTaskRunLive(s.stepTaskId)).toBe(false);
-    expect(isAnyRunOfTaskLive(s.stepTaskId)).toBe(true);
+    expect(await isTaskRunLive(s.stepTaskId)).toBe(false);
+    expect(await isAnyRunOfTaskLive(s.stepTaskId)).toBe(true);
 
     const result = await cancelPipelineRun(s.parentId);
     if ("error" in result) throw new Error(result.error);
     expect(result.task.pipelineRun!.status).toBe("cancelled");
     await waitFor(() => (runs.get(B.runId)!.status !== "running" ? true : undefined), 4000);
-    expect(isAnyRunOfTaskLive(s.stepTaskId)).toBe(false);
+    expect(await isAnyRunOfTaskLive(s.stepTaskId)).toBe(false);
     expect(tasks.get(s.parentId)!.pipelineRun!.status).toBe("cancelled");
   } finally {
     __forTest.setListenerEnabled(true);
@@ -4891,8 +4901,8 @@ test("Stop on a step live only through a DISPLACED run stays cancelled — the d
     await C.finish();
     __forTest.setListenerEnabled(true);
     await __forTest.handleRunStatus(s.stepTaskId, C.runId, "succeeded");
-    expect(isTaskRunLive(s.stepTaskId)).toBe(false);
-    expect(isAnyRunOfTaskLive(s.stepTaskId)).toBe(true);
+    expect(await isTaskRunLive(s.stepTaskId)).toBe(false);
+    expect(await isAnyRunOfTaskLive(s.stepTaskId)).toBe(true);
 
     const result = await cancelPipelineRun(s.parentId);
     if ("error" in result) throw new Error(result.error);

@@ -347,6 +347,8 @@ test("withheld idle send: the fresh run ends failed, the task returns to ready, 
 
     await claudeTmux.__forTest.pasteChains.get(taskId);
     await waitFor(() => runs.listForTask(taskId).some((r) => r.id !== r1 && r.status === "failed"));
+    // The settle records the run, then moves the column (a database hop later).
+    await waitFor(() => tasks.get(taskId)?.column !== "running");
 
     // A genuinely new run row was created for the idle send (not folded).
     const newRun = runs.listForTask(taskId).find((r) => r.id !== r1);

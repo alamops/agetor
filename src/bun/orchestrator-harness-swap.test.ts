@@ -535,7 +535,7 @@ describe("harness-stack swap", () => {
     // A hard block is a manual fix: the stale all-exhausted marker must be
     // cleared, or the card/badge/CLI would claim "Retrying…" with no timer.
     expect(after.harnessState?.allExhausted ?? null).toBeNull();
-    expect(orch.hasPendingHarnessRetry(task.id)).toBe(false);
+    expect(await orch.hasPendingHarnessRetry(task.id)).toBe(false);
     const { harnessStackBannerMode } = await import("../shared/harness-stack.ts");
     expect(harnessStackBannerMode(after.harnessState)).not.toBe("exhausted");
     await stacks.harnessStacks.clearLimitState(idA);
@@ -682,7 +682,7 @@ describe("harness-stack swap", () => {
       }, 8000);
       runs = [...db.runs.listForTask(task.id)].sort((a, b) => a.startedAt - b.startedAt);
       allExhausted = db.tasks.get(task.id)!.harnessState?.allExhausted ?? null;
-      pendingRetry = orch.hasPendingHarnessRetry(task.id);
+      pendingRetry = await orch.hasPendingHarnessRetry(task.id);
     } finally {
       delete process.env.AGETOR_FAKE_CLAUDE_API_ERROR;
       await stacks.harnessStacks.clearLimitState(idA);
@@ -818,7 +818,7 @@ describe("harness-stack swap", () => {
       }, 8000);
       after = db.tasks.get(task.id)!.harnessState;
       runCount = db.runs.listForTask(task.id).length;
-      pending = orch.hasPendingHarnessRetry(task.id);
+      pending = await orch.hasPendingHarnessRetry(task.id);
     } finally {
       orch.__setHarnessSwapSpawnHookForTest(prevHook);
       failover.cancelAutoRetry(task.id);
@@ -1200,9 +1200,9 @@ describe("harness-stack swap", () => {
     });
     failover.armAutoRetry(task.id, now + 60);
 
-    expect(orch.hasPendingHarnessRetry(task.id)).toBe(true);
+    expect(await orch.hasPendingHarnessRetry(task.id)).toBe(true);
     expect(await orch.cancelHarnessRetryForTask(task.id)).toBe(true);
-    expect(orch.hasPendingHarnessRetry(task.id)).toBe(false);
+    expect(await orch.hasPendingHarnessRetry(task.id)).toBe(false);
     expect(db.tasks.get(task.id)!.harnessState!.allExhausted).toBeNull();
     expect(await orch.cancelHarnessRetryForTask(task.id)).toBe(false);
     // The handle itself is gone, not merely a state the callback would ignore.
@@ -1420,7 +1420,7 @@ describe("harness-stack swap", () => {
       lastMove: null,
     });
     failover.armAutoRetry(task.id, now + 60_000);
-    expect(orch.hasPendingHarnessRetry(task.id)).toBe(true);
+    expect(await orch.hasPendingHarnessRetry(task.id)).toBe(true);
 
     // The card is not in Done, so the archive is refused — and a refused
     // archive must not cancel the retry or drop the exhausted countdown.
@@ -1428,7 +1428,7 @@ describe("harness-stack swap", () => {
     expect("error" in result).toBe(true);
     expect(db.tasks.get(task.id)!.archivedAt).toBeNull();
     expect(db.tasks.get(task.id)!.harnessState?.allExhausted).not.toBeNull();
-    expect(orch.hasPendingHarnessRetry(task.id)).toBe(true);
+    expect(await orch.hasPendingHarnessRetry(task.id)).toBe(true);
 
     expect(await orch.cancelHarnessRetryForTask(task.id)).toBe(true);
     await stacks.harnessStacks.delete(stack.id);
@@ -1556,19 +1556,19 @@ describe("manual same-stack account switch", () => {
     } as never);
     db.tasks.update(task.id, { runId, column: "review" });
 
-    expect(orch.claimTaskForAccountSwitch(task.id)).toBe(true);
+    expect(await orch.claimTaskForAccountSwitch(task.id)).toBe(true);
     // A second switch cannot steal the claim.
-    expect(orch.claimTaskForAccountSwitch(task.id)).toBe(false);
+    expect(await orch.claimTaskForAccountSwitch(task.id)).toBe(false);
     const started = await orch.startTask(task.id);
     expect("error" in started && started.error).toContain("switching accounts");
     const sent = await orch.sendInput(runId, "hello during the copy", { bounded: false });
     expect(sent.delivered).toBe(false);
     if (!sent.delivered) expect(sent.reason).toContain("switching accounts");
 
-    orch.releaseTaskAccountSwitch(task.id);
+    await orch.releaseTaskAccountSwitch(task.id);
     // After release the claim is free again; nothing is left gate-closed.
-    expect(orch.claimTaskForAccountSwitch(task.id)).toBe(true);
-    orch.releaseTaskAccountSwitch(task.id);
+    expect(await orch.claimTaskForAccountSwitch(task.id)).toBe(true);
+    await orch.releaseTaskAccountSwitch(task.id);
     await stacks.harnessStacks.delete(stack.id);
   }, 15_000);
 });

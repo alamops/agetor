@@ -337,7 +337,7 @@ describe("resume", () => {
     expect(s.meta().data).toEqual({ earliestId: null, hasMore: false, resumedAfter: ids[2] });
     expect(s.rows()).toHaveLength(0);
 
-    orchestrator.appendRunStatusLine(taskId, runId, "live line");
+    await orchestrator.appendRunStatusLine(taskId, runId, "live line");
     await s.waitFor((x) => x.rows().length === 1);
     const stored = db
       .query<{ id: number; ts: number }, [string]>(`SELECT id, ts FROM run_events WHERE run_id = ? ORDER BY id DESC LIMIT 1`)
@@ -444,7 +444,7 @@ describe("snapshot", () => {
     const s = await openAndRead(`/tasks/${taskId}/events`, 2, { "last-event-id": "9999999999" });
     expect(s.meta().data.snapshotRequired).toBe(true);
 
-    orchestrator.appendRunStatusLine(taskId, runId, "after the snapshot");
+    await orchestrator.appendRunStatusLine(taskId, runId, "after the snapshot");
     await s.waitFor((x) => x.rows().length === 3);
     const live = s.rows()[2]!;
     expect(live.data.data).toBe("after the snapshot");
@@ -545,7 +545,7 @@ describe("POST /test/drop-task-streams", () => {
     await s1.waitFor((s) => s.ended);
 
     // Lands during the hold — the gap the reconnect has to cover.
-    orchestrator.appendRunStatusLine(taskId, runId, "during the hold");
+    await orchestrator.appendRunStatusLine(taskId, runId, "during the hold");
 
     let settled = false;
     const reconnect = Sse.open(ON, `/tasks/${taskId}/events`, { "last-event-id": lastId }).then((s) => {

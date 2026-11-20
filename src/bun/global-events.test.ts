@@ -35,6 +35,7 @@ test("startTask emits column → running and run-status → succeeded", async ()
   expect("runId" in res).toBe(true);
 
   await new Promise((r) => setTimeout(r, 250));
+  await (await import("./orchestrator.ts")).__globalEventsSettledForTest();
   unsub();
 
   // Expect at least: column → running (prev backlog) AND run-status terminal.
@@ -95,6 +96,7 @@ test("registering and resolving an interaction emits global interaction events",
   });
 
   cancelPendingForTask(taskId, "test");
+  await (await import("./orchestrator.ts")).__globalEventsSettledForTest();
   unsub();
 
   const pending = events.find((e) => e.kind === "interaction" && e.state === "pending");
@@ -135,6 +137,7 @@ test("retargeting a live Cursor ask republishes the card without a second pendin
   });
   retargetLiveCursorAsksForRun(runId);
   answerCursorAsk(card.id, { outcome: "cancelled" });
+  await (await import("./orchestrator.ts")).__globalEventsSettledForTest();
   unsub();
   unsubGlobal();
 
@@ -190,6 +193,7 @@ test("reconcileOrphans emits run-status → orphaned + column → ready", async 
   // session probes before it flips the stale runs, so an unawaited call has
   // emitted nothing yet when the next line runs.
   await reconcileOrphans();
+  await (await import("./orchestrator.ts")).__globalEventsSettledForTest();
   unsub();
 
   const orphan = events.find(
@@ -237,6 +241,7 @@ test("a step task's event is stamped with its pipeline parent's id and title", a
     ts: Date.now(),
     pipelineParentId: parent.task.id,
   });
+  await (await import("./orchestrator.ts")).__globalEventsSettledForTest();
   unsub();
 
   expect(events.length).toBe(2);

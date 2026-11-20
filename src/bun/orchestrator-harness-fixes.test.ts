@@ -178,13 +178,13 @@ describe("agent switches keep copied conversations (M3, S27)", () => {
     // No manual-switch note and no failover state: an outside switch resets.
     expect(db.tasks.get(task.id)!.harnessState ?? null).toBeNull();
     // C has nothing to resume: its first turn starts fresh.
-    expect(orch.findLastSessionIdForHarness(task.id, "claude_session_id", c)).toBeNull();
+    expect(await orch.findLastSessionIdForHarness(task.id, "claude_session_id", c)).toBeNull();
 
     // C → B: the task resumes the transcript B still holds.
     const back = db.tasks.get(task.id)!;
     db.tasks.update(task.id, { agent: b });
     await orch.reconcileTaskSession(task.id, back, db.tasks.get(task.id)!);
-    expect(orch.findLastSessionIdForHarness(task.id, "claude_session_id", b)).toBe(sid);
+    expect(await orch.findLastSessionIdForHarness(task.id, "claude_session_id", b)).toBe(sid);
     expect(existsSync(copied)).toBe(true);
     await stacks.harnessStacks.delete(stack.id);
   }, 20_000);
@@ -259,7 +259,7 @@ describe("an armed retry respects the user (M5)", () => {
     expect(await orch.cancelRun(runId)).toBe(true);
     expect(db.tasks.get(task.id)!.harnessState?.allExhausted ?? null).toBeNull();
     expect(failover.hasArmedAutoRetry(task.id)).toBe(false);
-    expect(orch.hasPendingHarnessRetry(task.id)).toBe(false);
+    expect(await orch.hasPendingHarnessRetry(task.id)).toBe(false);
     await stacks.harnessStacks.delete(stack.id);
   }, 15_000);
 
@@ -332,7 +332,7 @@ describe("held follow-ups and the launch freeze (M6, S7)", () => {
       if (hooked !== task.id || phase !== "settle") return;
       orch.__setHarnessSwapSettleHookForTest(null);
       expect((await orch.sendInput(runId, "held before the handoff")).delivered).toBe(true);
-      orch.freezeLaunches();
+      await orch.freezeLaunches();
     });
     try {
       await orch.startTask(task.id);
@@ -615,9 +615,13 @@ describe("manual prepare holds the start claim (S8)", () => {
     db.tasks.update(task.id, { runId, column: "review" });
 
     const claimedDuringCopy: boolean[] = [];
+    const liveChecks: Promise<void>[] = [];
     const originalUpsert = db.harnessSessionHandoffs.upsert;
     db.harnessSessionHandoffs.upsert = function (this: typeof db.harnessSessionHandoffs, ...args: Parameters<typeof originalUpsert>) {
-      if (args[0].taskId === task.id) claimedDuringCopy.push(orch.isTaskRunLive(task.id));
+      // The fixture hook is synchronous: the in-memory claim is what is live
+      // during the copy (`startingTaskIds`), and `isTaskRunLive` reports it
+      // before any read, so the answer is ready one microtask later.
+      if (args[0].taskId === task.id) liveChecks.push(orch.isTaskRunLive(task.id).then((live) => { claimedDuringCopy.push(live); }));
       return originalUpsert.apply(this, args);
     };
     try {
@@ -628,6 +632,7 @@ describe("manual prepare holds the start claim (S8)", () => {
       db.harnessSessionHandoffs.upsert = originalUpsert;
       db.harnesses.setEnabled(a, true);
     }
+    await Promise.all(liveChecks);
     // The move really happened, and the claim covered the copy: a retry timer
     // firing then defers instead of minting a competing successor.
     expect(db.tasks.get(task.id)!.agent).toBe(b);
@@ -636,7 +641,7 @@ describe("manual prepare holds the start claim (S8)", () => {
     expect(claimedDuringCopy.length).toBeGreaterThan(0);
     expect(claimedDuringCopy.every(Boolean)).toBe(true);
     // The claim is released afterwards.
-    expect(orch.isTaskRunLive(task.id)).toBe(false);
+    expect(await orch.isTaskRunLive(task.id)).toBe(false);
     await stacks.harnessStacks.delete(stack.id);
   }, 20_000);
 });
@@ -777,7 +782,7 @@ describe("unread mid-turn follow-ups on the other settlement endings (R-S12)", (
     const prevSettle = orch.__setHarnessSwapSettleHookForTest(async (hooked, _runId, phase) => {
       if (hooked !== task.id || phase !== "settle") return;
       orch.__setHarnessSwapSettleHookForTest(null);
-      orch.freezeLaunches();
+      await orch.freezeLaunches();
     });
     try {
       await orch.startTask(task.id);
@@ -1091,7 +1096,7 @@ describe("Stop while a frozen process left the swap for the next owner (N1)", ()
     const prev = orch.__setHarnessSwapSettleHookForTest(async (hooked, _runId, phase) => {
       if (hooked !== task.id || phase !== "settle") return;
       orch.__setHarnessSwapSettleHookForTest(null);
-      orch.freezeLaunches();
+      await orch.freezeLaunches();
     });
     let oldRunId = "";
     try {
@@ -1197,8 +1202,8 @@ describe("a same-stack switch on a held task (N3)", () => {
       status: "running", startedAt: Date.now() - 1000, endedAt: null,
     } as never);
     try {
-      expect(orch.isHeldByBackgroundAgents(task.id)).toBe(true);
-      expect(orch.claimTaskForAccountSwitch(task.id)).toBe(false);
+      expect(await orch.isHeldByBackgroundAgents(task.id)).toBe(true);
+      expect(await orch.claimTaskForAccountSwitch(task.id)).toBe(false);
 
       const before = db.tasks.get(task.id)!;
       db.tasks.update(task.id, { agent: b });
@@ -1209,7 +1214,7 @@ describe("a same-stack switch on a held task (N3)", () => {
       expect(statusLines(runId).some((l) => l.includes("account switch refused"))).toBe(true);
       // The background agent was not abandoned.
       expect(db.subagents.hasRunning(task.id)).toBe(true);
-      expect(orch.isHeldByBackgroundAgents(task.id)).toBe(true);
+      expect(await orch.isHeldByBackgroundAgents(task.id)).toBe(true);
     } finally {
       db.tasks.update(task.id, { column: "review" });
     }

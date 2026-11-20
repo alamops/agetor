@@ -61,7 +61,7 @@ test("a chunk for a run whose task was deleted is dropped without throwing", asy
 test("a chunk for a live run is still recorded", async () => {
   const { taskId, runId } = await startedClaudeTask();
   await waitSettled(taskId);
-  orch.__dispatchChunkForTest(runId, taskId, "claude-code", "stderr", "late stderr line");
+  await orch.__dispatchChunkForTest(runId, taskId, "claude-code", "stderr", "late stderr line");
   expect(db.runs.events(runId).some((e) => e.stream === "stderr" && e.data === "late stderr line")).toBe(true);
   await orch.deleteTask(taskId);
 });

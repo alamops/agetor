@@ -69,17 +69,22 @@ export interface OpencodeServerOrchestratorDeps {
   active: ReadonlyMap<string, OpencodeActiveRun>;
   /** Tasks with a start or send in flight (`startingTaskIds`); a wake claims it too. */
   startingTaskIds: Set<string>;
-  releaseStartingClaim(taskId: string): void;
+  releaseStartingClaim(taskId: string): Promise<void>;
   /** True once this process is exiting (`freezeLaunches`). */
   launchesFrozen(): boolean;
   isTaskTearingDown(taskId: string): boolean;
   /** A `deleteTask` of the task is in progress (its row is about to go). */
   isTaskBeingDeleted(taskId: string): boolean;
-  resolveHarness(harnessId: string): Harness | null;
+  /** The run left `active` but its done handler has not drained the task's
+   *  follow-up queues yet: a line queued now is still routed by that drain. */
+  followUpDrainPending(runId: string): boolean;
+  resolveHarness(harnessId: string): Promise<Harness | null>;
+  /** Several harness ids resolved in one hop, in the order asked. */
+  resolveHarnesses(harnessIds: string[]): Promise<(Harness | null)[]>;
   taskHarnessId(task: Pick<Task, "agent">): string;
   findLastSessionIdForHarness(taskId: string, column: "opencode_session_id", harnessId: string): string | null | Promise<string | null>;
   makeChunkHandler(runId: string, taskId: string, kind: AgentKind, mode: Task["mode"]): ChunkHandler;
-  registerActiveRun(runId: string, taskId: string, task: Task, agent: SpawnedAgent): void;
+  registerActiveRun(runId: string, taskId: string, task: Pick<Task, "agent" | "mode">, agent: SpawnedAgent): void;
   attachDoneHandler(runId: string, taskId: string, agent: SpawnedAgent): void;
   consumePendingCancel(
     runId: string,
@@ -90,9 +95,12 @@ export interface OpencodeServerOrchestratorDeps {
   ): Promise<boolean>;
   adoptPendingTaskCancel(taskId: string, runId: string): boolean;
   emit(e: RunEvent): void;
-  emitGlobal(e: GlobalEvent): void;
-  saveAndEmit(args: { runId: string; taskId: string; stream: RunEvent["stream"]; data: string }): AppendedEvent | null;
-  saveStatusLineQuietly(runId: string, taskId: string, data: string): AppendedEvent | null;
+  /** Resolves once every subscriber has the event; never rejects. */
+  emitGlobal(e: GlobalEvent): Promise<void>;
+  /** Takes the row's place in the run's emit queue at the call. */
+  saveAndEmit(args: { runId: string; taskId: string; stream: RunEvent["stream"]; data: string }): Promise<AppendedEvent | null>;
+  /** Never rejects. */
+  saveStatusLineQuietly(runId: string, taskId: string, data: string): Promise<AppendedEvent | null>;
   normalizeUserText(s: string): string;
   /** `spawnOpencodeTurnNow`: a new resume turn for `line` (`alreadyEchoed`: its bubble is on another run). */
   spawnFollowUpTurn(task: Task, taskId: string, line: string, alreadyEchoed: boolean): Promise<string | null>;
@@ -100,8 +108,8 @@ export interface OpencodeServerOrchestratorDeps {
   followUpQueue: Map<string, string[]>;
   /** `drainOpencodeQueue`: start the next queued follow-up of the task, if any. */
   drainFollowUpQueue(taskId: string): Promise<void>;
-  isPipelineStepTaskId(taskId: string): boolean;
-  stashQueuedFollowUpsOfStoppedStep(taskId: string, runId: string): void;
+  isPipelineStepTaskId(taskId: string): Promise<boolean>;
+  stashQueuedFollowUpsOfStoppedStep(taskId: string, runId: string): Promise<void>;
   opencodeTurnBreadcrumb(harness: Harness, task: Task, cliVersion: string | null, transport?: OpencodeTransport): string;
 }
 
@@ -143,7 +151,7 @@ async function stashOpencodeTextsInBacklog(taskId: string, runId: string | null,
     if (texts.length === 0) return;
     // One transaction on the database worker: the duplicate check and the writes cannot interleave.
     const saved = await op("backlog.stashTexts", [taskId, texts]);
-    if (saved && runId !== null) deps.saveAndEmit({ runId, taskId, stream: "status", data: line });
+    if (saved && runId !== null) await deps.saveAndEmit({ runId, taskId, stream: "status", data: line });
   } catch (err) {
     console.warn(`[agetor] opencode: couldn't save the undelivered messages of task ${taskId} to its backlog:`, err);
   }
@@ -202,8 +210,8 @@ async function requeueUndeliveredOpencodeSteersAsync(a: { taskId: string; runId:
     if (proven.length === 0) return;
     deps.followUpQueue.set(a.taskId, [...proven, ...(deps.followUpQueue.get(a.taskId) ?? [])]);
     if (deps.active.has(a.runId) || deps.startingTaskIds.has(a.taskId) || hasHandleOfTask(a.taskId)) return;
-    if (deps.isPipelineStepTaskId(a.taskId) && (await runs.get(a.runId))?.status === "cancelled") {
-      deps.stashQueuedFollowUpsOfStoppedStep(a.taskId, a.runId);
+    if (await deps.isPipelineStepTaskId(a.taskId) && (await runs.get(a.runId))?.status === "cancelled") {
+      await deps.stashQueuedFollowUpsOfStoppedStep(a.taskId, a.runId);
       return;
     }
     trackWakeHandler(deps.drainFollowUpQueue(a.taskId).catch((err) =>
@@ -284,7 +292,7 @@ function loadHarnessOfCardTask(taskId: string): void {
   });
 }
 
-export function trackOpencodeServerTurn(runId: string, taskId: string, task: Task, agent: SpawnedAgent): void {
+export function trackOpencodeServerTurn(runId: string, taskId: string, task: Pick<Task, "agent">, agent: SpawnedAgent): void {
   const turn = opencodeServerTurnOf(agent);
   if (!turn) return;
   // Registered at once (the caller is synchronous and a later check must see the
@@ -478,7 +486,7 @@ export function opencodeTurnHooksFor(
 /** A task whose last turn ran on the agetor-owned server (breadcrumb `server=agetor`). */
 export async function isOpencodeServerTask(taskId: string): Promise<boolean> {
   const task = await tasks.get(taskId);
-  if (!task || deps.resolveHarness(task.agent)?.kind !== "opencode") return false;
+  if (!task || (await deps.resolveHarness(task.agent))?.kind !== "opencode") return false;
   return (await opencodeTurnOfRun(task.runId))?.server === "agetor";
 }
 
@@ -499,7 +507,11 @@ export async function steerOpencodeServerTurn(
 ): Promise<string | null> {
   const queueEmpty = (deps.followUpQueue.get(taskId)?.length ?? 0) === 0;
   const stopping = deps.active.get(runId)?.cancelled === true;
-  deps.saveAndEmit({ runId, taskId, stream: "user", data: deps.normalizeUserText(line) });
+  // The bubble takes its place in the run's queue now, ahead of anything the
+  // steer below makes the turn write.
+  // A failed insert is carried to the `await` below, never left unhandled.
+  const echoed = deps.saveAndEmit({ runId, taskId, stream: "user", data: deps.normalizeUserText(line) })
+    .then(() => null, (err: unknown) => ({ err }));
   let outcome: "accepted" | "unavailable" = "unavailable";
   const attempted = queueEmpty && !stopping;
   if (attempted) {
@@ -509,8 +521,10 @@ export async function steerOpencodeServerTurn(
       console.warn(`[agetor] opencode steer failed for task ${taskId}:`, err);
     }
   }
+  const echoFailure = await echoed;
+  if (echoFailure) throw echoFailure.err;
   if (outcome === "accepted") return runId;
-  if (attempted) deps.saveStatusLineQuietly(runId, taskId, OPENCODE_STEER_QUEUED_STATUS);
+  if (attempted) await deps.saveStatusLineQuietly(runId, taskId, OPENCODE_STEER_QUEUED_STATUS);
   const queue = (): void => {
     const q = deps.followUpQueue.get(taskId) ?? [];
     q.push(line);
@@ -518,9 +532,10 @@ export async function steerOpencodeServerTurn(
   };
   const task = await tasks.get(taskId);
   if (!task) return runId;
-  // Still live (a Stop may be settling it): its done handler routes the queue —
-  // into the backlog on a stopped pipeline step, else into the next turn.
-  if (deps.active.has(runId)) {
+  // Still live (a Stop may be settling it), or settling with its queue not
+  // drained yet: its done handler routes the queue — into the backlog on a
+  // stopped pipeline step, else into the next turn.
+  if (deps.active.has(runId) || deps.followUpDrainPending(runId)) {
     queue();
     return runId;
   }
@@ -529,10 +544,10 @@ export async function steerOpencodeServerTurn(
   // it would have. The Stop is read afresh: one that landed during the wait
   // counts as much as one already in progress.
   const stoppedNow = stopping || (await runs.get(runId))?.status === "cancelled";
-  if (stoppedNow && deps.isPipelineStepTaskId(taskId)) {
+  if (stoppedNow && await deps.isPipelineStepTaskId(taskId)) {
     // Nothing may run on a stopped step's behalf (`drainFollowUpQueues`).
     queue();
-    deps.stashQueuedFollowUpsOfStoppedStep(taskId, runId);
+    await deps.stashQueuedFollowUpsOfStoppedStep(taskId, runId);
     return runId;
   }
   // Nothing would drain a queue for this line: start it as its own turn,
@@ -589,8 +604,10 @@ export function reattachOpencodeServerRun(
   task: Task,
   onChunk: ChunkHandler,
   probe: SessionProbe,
+  harness: Harness | null,
 ): SpawnedAgent | null {
-  const harness = deps.resolveHarness(row.agent);
+  // `harness` is the row's agent resolved (`deps.resolveHarness`), read by the
+  // caller before this synchronous step.
   if (!harness || harness.kind !== "opencode") return null;
   if (!getOpencodeServer(harness.id) || probe === "gone") return null;
   return attachOpencodeServerAgent({
@@ -664,7 +681,7 @@ export async function opencodeLingerCandidates(
     if (live.has(taskId)) continue;
     if ((await listOpenOpencodeChildSessions(taskId, now)).length === 0) continue;
     const task = await tasks.get(taskId);
-    const harness = task && task.archivedAt == null ? deps.resolveHarness(task.agent) : null;
+    const harness = task && task.archivedAt == null ? await deps.resolveHarness(task.agent) : null;
     if (!task || !harness || harness.kind !== "opencode") continue;
     const last = await runs.latestForTask(taskId);
     if (!last?.opencodeSessionId || (await opencodeTurnOfRun(last.id))?.server !== "agetor") continue;
@@ -705,8 +722,12 @@ export interface OpencodeServerReconcile {
  * under one budget, then the per-row reattach and the boot linger.
  */
 export async function reconcileOpencodeServerRuns(stale: OpencodeBootRunRow[]): Promise<OpencodeServerReconcile> {
+  // Every row's harness in one hop; the reattach below reads it synchronously.
+  const rowHarnesses = new Map<string, Harness | null>();
+  (await deps.resolveHarnesses(stale.map((r) => r.agent))).forEach((h, i) => rowHarnesses.set(stale[i]!.id, h));
+  const harnessOfRow = (r: OpencodeBootRunRow): Harness | null => rowHarnesses.get(r.id) ?? null;
   // The rows that might be server runs (an OpenCode harness and a session id), looked up in one call.
-  const maybeServerRuns = stale.filter((r) => deps.resolveHarness(r.agent)?.kind === "opencode" && !!r.opencode_session_id);
+  const maybeServerRuns = stale.filter((r) => harnessOfRow(r)?.kind === "opencode" && !!r.opencode_session_id);
   const serverRunIds = new Set<string>();
   (await opencodeTurnsOfRuns(maybeServerRuns.map((r) => r.id))).forEach((turn, i) => {
     if (turn?.server === "agetor") serverRunIds.add(maybeServerRuns[i]!.id);
@@ -715,7 +736,7 @@ export async function reconcileOpencodeServerRuns(stale: OpencodeBootRunRow[]): 
   const lingerCandidates = await opencodeLingerCandidates(stale.map((r) => r.task_id));
   const sessionProbes = await probeOpencodeSessionsAtBoot([
     ...stale.flatMap((r) => {
-      const harness = deps.resolveHarness(r.agent);
+      const harness = harnessOfRow(r);
       return harness && isServerRun(r) ? [{ key: r.id, harnessId: harness.id, sessionId: r.opencode_session_id! }] : [];
     }),
     ...lingerCandidates.map((c) => ({ key: `task:${c.taskId}`, harnessId: c.harnessId, sessionId: c.sessionId })),
@@ -735,6 +756,7 @@ export async function reconcileOpencodeServerRuns(stale: OpencodeBootRunRow[]): 
           task,
           onChunk,
           sessionProbes.get(row.id) ?? "unknown",
+          harnessOfRow(row),
         );
         if (!spawned) return false;
         deps.registerActiveRun(row.id, row.task_id, task, spawned);
@@ -750,7 +772,7 @@ export async function reconcileOpencodeServerRuns(stale: OpencodeBootRunRow[]): 
       for (const c of lingerCandidates) {
         if (reattachedTaskIds.has(c.taskId) || sessionProbes.get(`task:${c.taskId}`) !== "ok") continue;
         const task = await tasks.get(c.taskId);
-        const harness = task ? deps.resolveHarness(task.agent) : null;
+        const harness = task ? await deps.resolveHarness(task.agent) : null;
         if (!task || !harness || harness.id !== c.harnessId) continue;
         try {
           const turn = lingerOpencodeServerAgent({
@@ -900,7 +922,11 @@ async function refreshOpencodeWatchesOnce(): Promise<void> {
   if (!opencodeDriverStarted) return;
   // Only the rows of OpenCode harnesses are asked about their turn, all in one
   // call rather than one round trip per task.
-  const rows = allRows.filter((row) => deps.resolveHarness(row.agent)?.kind === "opencode");
+  const allHarnesses = await deps.resolveHarnesses(allRows.map((row) => row.agent));
+  const rows = allRows.flatMap((row, i) => {
+    const harness = allHarnesses[i];
+    return harness?.kind === "opencode" ? [{ ...row, harness }] : [];
+  });
   const turns = await opencodeTurnsOfRuns(rows.map((row) => row.runId));
   const next = new Map<string, Map<string, string>>();
   let sliceStart = Date.now();
@@ -910,8 +936,7 @@ async function refreshOpencodeWatchesOnce(): Promise<void> {
       sliceStart = Date.now();
       if (!opencodeDriverStarted) return;
     }
-    const harness = deps.resolveHarness(row.agent);
-    if (!harness || harness.kind !== "opencode") continue;
+    const harness = row.harness;
     if (turns[i]?.server !== "agetor") continue;
     let sessions = next.get(harness.id);
     if (!sessions) next.set(harness.id, (sessions = new Map()));
@@ -951,7 +976,7 @@ async function opencodeServerSessionsOfTask(taskId: string, max = 4): Promise<{ 
   const out: { harnessId: string; sessionId: string }[] = [];
   const seen = new Set<string>();
   for (const r of await runs.sessionIdsForTask(taskId, "opencode_session_id")) {
-    const harness = deps.resolveHarness(r.agent);
+    const harness = await deps.resolveHarness(r.agent);
     if (!harness || harness.kind !== "opencode") continue;
     const key = `${harness.id}\u0000${r.sessionId}`;
     if (seen.has(key)) continue;
@@ -1063,6 +1088,8 @@ const OPENCODE_WAKE_INTERRUPT_MS = 5_000;
  */
 interface WakeSnapshot {
   task: Task | null;
+  /** The task's agent resolved (`deps.resolveHarness`), for the synchronous gates. */
+  harness: Harness | null;
   /** The task's newest session on the harness its agent resolves to. */
   lastSessionId: string | null;
   latestRun: Run | null;
@@ -1071,9 +1098,9 @@ interface WakeSnapshot {
 /** The database reads a wake decision needs, taken before any of its (synchronous) gates and the claim. */
 async function readWakeSnapshot(taskId: string): Promise<WakeSnapshot> {
   const task = await tasks.get(taskId);
-  const harness = task ? deps.resolveHarness(task.agent) : null;
+  const harness = task ? await deps.resolveHarness(task.agent) : null;
   const lastSessionId = harness ? await deps.findLastSessionIdForHarness(taskId, "opencode_session_id", harness.id) : null;
-  return { task, lastSessionId, latestRun: await runs.latestForTask(taskId) };
+  return { task, harness, lastSessionId, latestRun: await runs.latestForTask(taskId) };
 }
 
 function opencodeWakeBlocker(
@@ -1084,7 +1111,7 @@ function opencodeWakeBlocker(
 ): { task: Task; harness: Harness } | "interrupt" {
   const task = snap.task;
   if (!task || task.archivedAt != null || deps.isTaskTearingDown(taskId)) return "interrupt";
-  const harness = deps.resolveHarness(task.agent);
+  const harness = snap.harness;
   if (!harness || harness.kind !== "opencode" || harness.id !== serverKey || !harness.enabled) return "interrupt";
   // The transport the harness's turns take now (an unknown version reads as
   // the server: only a known 1.x CLI or the kill switch says otherwise).
@@ -1486,7 +1513,9 @@ async function handleOpencodeWake(
         .catch((err) => console.warn(`[agetor] opencode: wake of task ${claimed} failed:`, err))
         .finally(() => {
           mintingOpencodeWakes.delete(claimed);
-          deps.releaseStartingClaim(claimed);
+          void deps.releaseStartingClaim(claimed).catch((err: unknown) => {
+            console.warn(`[agetor] opencode: releasing the wake claim of task ${claimed} failed:`, err);
+          });
         });
     });
   } catch (err) {
@@ -1585,7 +1614,7 @@ async function mintOpencodeWakeRun(
   await tasks.update(taskId, { column: "running", runId: newRunId });
   deps.adoptPendingTaskCancel(taskId, newRunId);
   if (prevColumn !== "running") {
-    deps.emitGlobal({ kind: "column", taskId, runId: newRunId, column: "running", prev: prevColumn, ts: now });
+    await deps.emitGlobal({ kind: "column", taskId, runId: newRunId, column: "running", prev: prevColumn, ts: now });
   }
   const onChunk = deps.makeChunkHandler(newRunId, taskId, "opencode", task.mode);
   onChunk("status", deps.opencodeTurnBreadcrumb(harness, task, null, "server"));

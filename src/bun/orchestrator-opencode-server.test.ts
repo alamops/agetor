@@ -1145,7 +1145,7 @@ test("a Stop's undelivered messages: proven ones become the next turn and uncert
 
     // The process is exiting: the tray, never a turn that would be cut off.
     const frozen = await finishedTask("opencode-k3");
-    orch.freezeLaunches();
+    await orch.freezeLaunches();
     try {
       await requeue({ taskId: frozen.task.id, runId: frozen.runId, texts: ["FROZEN-P"], uncertain: [] });
     } finally {

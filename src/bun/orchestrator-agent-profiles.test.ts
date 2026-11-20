@@ -408,7 +408,7 @@ test("effectiveAgentProfile: null for a plain task; live before any run; snapsho
   });
   if ("error" in plain) throw new Error(plain.error);
   try {
-    expect(effectiveAgentProfile(plain.task)).toBeNull();
+    expect(await effectiveAgentProfile(plain.task)).toBeNull();
   } finally {
     db.run(`DELETE FROM tasks WHERE id = ?`, [plain.task.id]);
   }
@@ -437,7 +437,7 @@ test("effectiveAgentProfile: null for a plain task; live before any run; snapsho
     agentProfiles.update(liveProfile.id, { model: "model-v2", instructions: "v2" });
     const freshTask = tasks.get(liveTaskId);
     if (!freshTask) throw new Error("task vanished");
-    const resolved = effectiveAgentProfile(freshTask);
+    const resolved = await effectiveAgentProfile(freshTask);
     expect(resolved).not.toBeNull();
     if (resolved) {
       expect(resolved.source).toBe("live");
@@ -468,7 +468,7 @@ test("effectiveAgentProfile: null for a plain task; live before any run; snapsho
 
     const afterRunTask = tasks.get(liveTaskId);
     if (!afterRunTask) throw new Error("task vanished");
-    const afterRun = effectiveAgentProfile(afterRunTask);
+    const afterRun = await effectiveAgentProfile(afterRunTask);
     expect(afterRun).not.toBeNull();
     if (afterRun) {
       expect(afterRun.source).toBe("snapshot");
@@ -502,7 +502,7 @@ test("effectiveAgentProfile: null for a plain task; live before any run; snapsho
     agentProfiles.delete(deletedProfile.id);
     const freshTask = tasks.get(deletedTaskId);
     if (!freshTask) throw new Error("task vanished");
-    const resolved = effectiveAgentProfile(freshTask);
+    const resolved = await effectiveAgentProfile(freshTask);
     expect(resolved).not.toBeNull();
     if (resolved) {
       expect(resolved.source).toBe("snapshot");
@@ -538,7 +538,7 @@ test("effectiveAgentProfile: null for a plain task; live before any run; snapsho
     agentProfiles.update(orphanHarnessProfile.id, { harness: "not-a-real-harness-id" });
     const freshTask = tasks.get(orphanTaskId);
     if (!freshTask) throw new Error("task vanished");
-    const resolved = effectiveAgentProfile(freshTask);
+    const resolved = await effectiveAgentProfile(freshTask);
     expect(resolved).not.toBeNull();
     if (resolved) {
       expect(resolved.source).toBe("snapshot");

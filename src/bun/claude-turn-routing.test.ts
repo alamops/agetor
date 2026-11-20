@@ -1296,6 +1296,10 @@ async function seedIdleClaudeTask(prefix: string) {
     codexSessionId: null,
     cursorSessionId: null, geminiSessionId: null, fxSessionId: null,
   });
+  // The continuation factory adopts only for a task whose run registered in
+  // this process, as the run this seeded row stands for did when it spawned.
+  const { __noteRegisteredRunTaskForTest } = await import("./orchestrator.ts");
+  __noteRegisteredRunTaskForTest(taskId, { agent: "claude-code", mode: null });
   return { taskId, priorRunId, jsonlPath, state };
 }
 
@@ -1374,6 +1378,9 @@ test("RC2(b): a continuation adopted DURING sendClaudeTurn's has-session await i
     // The tailer picks the notification up in the gap: continuation adopted.
     appendFileSync(f.jsonlPath, notificationLine("rc2b"));
     __forTest.flushSync(f.state);
+    // The adoption writes its run row through the run's queue.
+    const { __continuationOpenedForTest } = await import("./orchestrator.ts");
+    await __continuationOpenedForTest(f.taskId);
     const adopted = tasks.get(f.taskId)!.runId!;
     expect(adopted).not.toBe(f.priorRunId);
     expect(runs.get(adopted)?.origin).toBe("continuation");
@@ -1420,7 +1427,7 @@ test("a freeze that lands during sendClaudeTurn's has-session await refuses the 
   try {
     const sending = sendInput(f.priorRunId, "typed just before the quit");
     await waitForLog(logPath, "has-session");
-    freezeLaunches();
+    await freezeLaunches();
 
     expect(await sending).toEqual({ delivered: false, reason: LAUNCHES_FROZEN_REASON });
     expect(runs.listForTask(f.taskId)).toHaveLength(1);
@@ -1447,7 +1454,7 @@ test("an idle-only claude send frozen during the has-session await reads busy, l
   try {
     const sending = sendInput(f.priorRunId, "reminder", { onlyIfIdle: true });
     await waitForLog(logPath, "has-session");
-    freezeLaunches();
+    await freezeLaunches();
 
     const result = await sending;
     expect(result.delivered).toBe(false);

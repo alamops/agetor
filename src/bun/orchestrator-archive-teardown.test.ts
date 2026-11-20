@@ -275,7 +275,7 @@ test("sweepArchivedTeardowns enqueues teardown for a task stranded archived-with
     tasks.update(taskId, { archivedAt: Date.now() });
     expect(existsSync(worktreePath)).toBe(true);
 
-    const enqueued = sweepArchivedTeardowns();
+    const enqueued = await sweepArchivedTeardowns();
     expect(enqueued).toBeGreaterThanOrEqual(1);
 
     await pendingTeardown(taskId);
@@ -559,7 +559,7 @@ test("steady-state regression: a dirty archived worktree survives every unattend
     // fail again, every time, exactly like the reported "stuck forever,
     // retried and failed every boot" cycle.
     for (let i = 0; i < 2; i++) {
-      const enqueued = sweepArchivedTeardowns();
+      const enqueued = await sweepArchivedTeardowns();
       expect(enqueued).toBeGreaterThanOrEqual(1);
       await pendingTeardown(taskId);
       expect(existsSync(worktreePath)).toBe(true);

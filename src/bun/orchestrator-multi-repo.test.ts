@@ -887,7 +887,7 @@ test("a retained multi workspace is listed and can be cleaned by a repeat archiv
     expect(archived.teardown?.removed).toBe(false);
     expect(archived.teardown?.reason).toBe("workspace-not-empty");
 
-    const row = listWorktrees().find((entry) => entry.id === id);
+    const row = (await listWorktrees()).find((entry) => entry.id === id);
     expect(row).toBeDefined();
     expect(row?.taskId).toBe(id);
     expect(row?.path).toBe(workspace);
@@ -900,7 +900,7 @@ test("a retained multi workspace is listed and can be cleaned by a repeat archiv
     if ("error" in retried) throw new Error(retried.error);
     expect(retried.teardown?.removed).toBe(true);
     expect(existsSync(workspace)).toBe(false);
-    expect(listWorktrees().some((entry) => entry.id === id)).toBe(false);
+    expect((await listWorktrees()).some((entry) => entry.id === id)).toBe(false);
   } finally {
     cleanup(workspace, a, b);
   }

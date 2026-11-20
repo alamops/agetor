@@ -833,7 +833,7 @@ test("applyClaudeLocalSetting syncs task.model from a typed alias and advances u
   // Give Date.now() room to tick so "updatedAt advanced" is unambiguous.
   await new Promise((r) => setTimeout(r, 5));
 
-  const changed = applyClaudeLocalSetting(task.id, {
+  const changed = await applyClaudeLocalSetting(task.id, {
     setting: "model",
     args: "sonnet",
     stdout: "Set model to Sonnet 5 and saved as your default for new sessions",
@@ -851,7 +851,7 @@ test("applyClaudeLocalSetting syncs task.model from a typed alias and advances u
 test("applyClaudeLocalSetting is a no-op when the parsed model already matches the row", async () => {
   const task = await makeClaudeTask("sonnet-5", "xhigh");
 
-  const changed = applyClaudeLocalSetting(task.id, {
+  const changed = await applyClaudeLocalSetting(task.id, {
     setting: "model",
     args: "sonnet",
     stdout: "Set model to Sonnet 5 and saved as your default for new sessions",
@@ -874,7 +874,7 @@ test("applyClaudeLocalSetting does not flip an already-equivalent model id repor
   // alias check is what pins "the row keeps its original id" rather than
   // flipping to whichever id happened to round-trip through the flag.
   const task = await makeClaudeTask("opus-5", "xhigh");
-  const changed = applyClaudeLocalSetting(task.id, {
+  const changed = await applyClaudeLocalSetting(task.id, {
     setting: "model",
     args: "claude-opus-5",
     stdout: "Set model to Opus 5 and saved as your default for new sessions",
@@ -892,7 +892,7 @@ test("applyClaudeLocalSetting 'Kept model as' corrects a row that already drifte
   // back to what claude actually kept, not left pointing at what was asked
   // for.
   const task = await makeClaudeTaskWithRun("sonnet-5.5", "xhigh");
-  const changed = applyClaudeLocalSetting(task.id, {
+  const changed = await applyClaudeLocalSetting(task.id, {
     setting: "model",
     args: "",
     stdout: "Kept model as Opus 4.8",
@@ -914,7 +914,7 @@ test("applyClaudeLocalSetting 'Kept model as' with viaMirror: false leaves a dri
   // model the installed picker can't even select) — that choice must survive
   // untouched, and the split is explained via `describeKeptModelNotSynced`.
   const task = await makeClaudeTaskWithRun("opus-4.8", "xhigh");
-  const changed = applyClaudeLocalSetting(task.id, {
+  const changed = await applyClaudeLocalSetting(task.id, {
     setting: "model",
     args: "",
     stdout: "Kept model as Sonnet 5",
@@ -936,7 +936,7 @@ test("applyClaudeLocalSetting 'Kept model as' with viaMirror: false is a silent 
   // no breadcrumb should be emitted (a status line on every ordinary
   // open-and-dismiss would be pure noise).
   const task = await makeClaudeTaskWithRun("sonnet-5", "xhigh");
-  const changed = applyClaudeLocalSetting(task.id, {
+  const changed = await applyClaudeLocalSetting(task.id, {
     setting: "model",
     args: "",
     stdout: "Kept model as Sonnet 5",
@@ -954,7 +954,7 @@ test("applyClaudeLocalSetting 'Set model to' with viaMirror: false still syncs �
   // could have typed `/model sonnet` directly in the terminal, with no
   // agetor mirror involved at all, and the row must still follow it.
   const task = await makeClaudeTaskWithRun("opus-4.8", "xhigh");
-  const changed = applyClaudeLocalSetting(task.id, {
+  const changed = await applyClaudeLocalSetting(task.id, {
     setting: "model",
     args: "",
     stdout: "Set model to Sonnet 5 and saved as your default for new sessions",
@@ -993,7 +993,7 @@ test("applyClaudeLocalSetting: 'Kept model as <default>' on a null-model task is
     (m) => m.id === DEFAULT_MODEL["claude-code"],
   )!.label;
 
-  const changed = applyClaudeLocalSetting(task.id, {
+  const changed = await applyClaudeLocalSetting(task.id, {
     setting: "model",
     args: "",
     stdout: `Kept model as ${defaultLabel}`,
@@ -1007,7 +1007,7 @@ test("applyClaudeLocalSetting: 'Kept model as <default>' on a null-model task is
 test("applyClaudeLocalSetting: a genuine model change on a null-model task still pins the explicit id", async () => {
   const task = await makeNullModelClaudeTask();
 
-  const changed = applyClaudeLocalSetting(task.id, {
+  const changed = await applyClaudeLocalSetting(task.id, {
     setting: "model",
     args: "",
     stdout: "Set model to Sonnet 5 and saved as your default for new sessions",
@@ -1021,7 +1021,7 @@ test("applyClaudeLocalSetting: a genuine model change on a null-model task still
 test("applyClaudeLocalSetting syncs task.effort; an unsupported claude id and a cancel are no-ops", async () => {
   const task = await makeClaudeTaskWithRun("opus-4.8", "medium");
 
-  const changed = applyClaudeLocalSetting(task.id, {
+  const changed = await applyClaudeLocalSetting(task.id, {
     setting: "effort",
     args: "high",
     stdout: "Set effort level to high (saved as your default for new sessions): …",
@@ -1030,7 +1030,7 @@ test("applyClaudeLocalSetting syncs task.effort; an unsupported claude id and a 
   expect(changed).toBe(true);
   expect(tasks.get(task.id)?.effort).toBe("high");
 
-  const afterUnrepresentable = applyClaudeLocalSetting(task.id, {
+  const afterUnrepresentable = await applyClaudeLocalSetting(task.id, {
     setting: "effort",
     args: "",
     stdout: "Set effort level to ultracode (saved as your default for new sessions): …",
@@ -1042,7 +1042,7 @@ test("applyClaudeLocalSetting syncs task.effort; an unsupported claude id and a 
     latestStatus(task.id).some((d) => d === `claude is now on "ultracode", which agetor can't store — task effort left as high`),
   ).toBe(true);
 
-  const afterCancel = applyClaudeLocalSetting(task.id, {
+  const afterCancel = await applyClaudeLocalSetting(task.id, {
     setting: "effort",
     args: "",
     stdout: "Cancelled",
@@ -1060,7 +1060,7 @@ test("applyClaudeLocalSetting rejects an effort claude reports that isn't suppor
   // instead of silently widening the row past what the UI permits.
   const task = await makeClaudeTaskWithRun("sonnet-4.6", "medium");
 
-  const changed = applyClaudeLocalSetting(task.id, {
+  const changed = await applyClaudeLocalSetting(task.id, {
     setting: "effort",
     args: "",
     stdout: "Set effort level to xhigh (saved as your default for new sessions): …",
@@ -1081,7 +1081,7 @@ test("applyClaudeLocalSetting adjusts an unsupported effort in the SAME update w
   // than leaving an impossible (model, effort) pair on the row.
   const task = await makeClaudeTaskWithRun("sonnet-5", "xhigh");
 
-  const changed = applyClaudeLocalSetting(task.id, {
+  const changed = await applyClaudeLocalSetting(task.id, {
     setting: "model",
     args: "",
     stdout: "Set model to Sonnet 4.6 and saved as your default for new sessions",
@@ -1104,7 +1104,7 @@ test("applyClaudeLocalSetting clears the effort in the SAME update when the new 
   // valid for it, so the fallback is null (cleared), not a substitute id.
   const task = await makeClaudeTaskWithRun("opus-4.8", "xhigh");
 
-  const changed = applyClaudeLocalSetting(task.id, {
+  const changed = await applyClaudeLocalSetting(task.id, {
     setting: "model",
     args: "",
     stdout: "Set model to Haiku 4.5 and saved as your default for new sessions",
@@ -1123,7 +1123,7 @@ test("applyClaudeLocalSetting clears the effort in the SAME update when the new 
 test("applyClaudeLocalSetting: an unrepresentable model (unknown display name) is false + breadcrumb, row untouched", async () => {
   const task = await makeClaudeTaskWithRun("opus-4.8", "xhigh");
 
-  const changed = applyClaudeLocalSetting(task.id, {
+  const changed = await applyClaudeLocalSetting(task.id, {
     setting: "model",
     args: "",
     stdout: "Set model to Opus 6 and saved as your default for new sessions",
@@ -1152,7 +1152,7 @@ test("applyClaudeLocalSetting no-ops for a non-claude-code task and leaves the r
   if ("error" in created) throw new Error(created.error);
   const task = created.task;
 
-  const changed = applyClaudeLocalSetting(task.id, {
+  const changed = await applyClaudeLocalSetting(task.id, {
     setting: "model",
     args: "sonnet",
     stdout: "Set model to Sonnet 5 and saved as your default for new sessions",
@@ -1166,8 +1166,8 @@ test("applyClaudeLocalSetting no-ops for a non-claude-code task and leaves the r
   expect(after?.updatedAt).toBe(task.updatedAt);
 });
 
-test("applyClaudeLocalSetting returns false for an unknown task id", () => {
-  const changed = applyClaudeLocalSetting("no-such-task-id", {
+test("applyClaudeLocalSetting returns false for an unknown task id", async () => {
+  const changed = await applyClaudeLocalSetting("no-such-task-id", {
     setting: "model",
     args: "sonnet",
     stdout: "Set model to Sonnet 5 and saved as your default for new sessions",
@@ -1198,7 +1198,7 @@ test("applyClaudeLocalSetting appends a 'synced from claude' status breadcrumb t
     fxSessionId: null,
   });
 
-  const changed = applyClaudeLocalSetting(task.id, {
+  const changed = await applyClaudeLocalSetting(task.id, {
     setting: "model",
     args: "sonnet",
     stdout: "Set model to Sonnet 5 and saved as your default for new sessions",
@@ -1215,15 +1215,12 @@ test("applyClaudeLocalSetting still returns true and updates the row (without th
   const task = await makeClaudeTask("opus-4.8", "xhigh");
   expect(runs.listForTask(task.id)).toHaveLength(0);
 
-  let changed: boolean | undefined;
-  expect(() => {
-    changed = applyClaudeLocalSetting(task.id, {
-      setting: "model",
-      args: "sonnet",
-      stdout: "Set model to Sonnet 5 and saved as your default for new sessions",
-      viaMirror: false,
-    });
-  }).not.toThrow();
+  const changed = await applyClaudeLocalSetting(task.id, {
+    setting: "model",
+    args: "sonnet",
+    stdout: "Set model to Sonnet 5 and saved as your default for new sessions",
+    viaMirror: false,
+  });
 
   expect(changed).toBe(true);
   expect(tasks.get(task.id)?.model).toBe("sonnet-5");
@@ -1242,7 +1239,7 @@ test("applyClaudeLocalSetting never re-mirrors the change back into a live claud
   // (server.ts), after the DB row is updated — never from
   // applyClaudeLocalSetting.
   //
-  // applyClaudeLocalSetting is a plain (non-async) function that only calls
+  // applyClaudeLocalSetting is a plain function that only calls
   // tasks.get/tasks.update/runs.listForTask/runs.appendEvent/emit — reading
   // its body confirms there is no tmux call site to spy on. As a runtime
   // regression guard: no in-memory SessionState exists for this task (we
@@ -1253,14 +1250,13 @@ test("applyClaudeLocalSetting never re-mirrors the change back into a live claud
   const task = await makeClaudeTask("opus-4.8", "xhigh");
   expect(hasSessionState(task.id)).toBe(false);
 
-  expect(() => {
-    applyClaudeLocalSetting(task.id, {
-      setting: "effort",
-      args: "high",
-      stdout: "Set effort level to high (saved as your default for new sessions): …",
-      viaMirror: false,
-    });
-  }).not.toThrow();
+  // Resolves (a rejection would fail the test here).
+  await applyClaudeLocalSetting(task.id, {
+    setting: "effort",
+    args: "high",
+    stdout: "Set effort level to high (saved as your default for new sessions): …",
+    viaMirror: false,
+  });
 
   expect(hasSessionState(task.id)).toBe(false);
 });
@@ -1276,7 +1272,7 @@ test("handlePasteWithheld: 'pre-paste' re-stashes the text into the backlog with
   const task = await makeClaudeTaskWithRun("opus-4.8", "xhigh");
   const run = runs.listForTask(task.id)[0]!;
 
-  __handlePasteWithheldForTest(task.id, run.id, "hello claude", {
+  await __handlePasteWithheldForTest(task.id, run.id, "hello claude", {
     ok: false,
     op: "modal-guard",
     phase: "pre-paste",
@@ -1297,13 +1293,13 @@ test("handlePasteWithheld: two 'pre-paste' withholds with identical text dedupe 
   const task = await makeClaudeTaskWithRun("opus-4.8", "xhigh");
   const run = runs.listForTask(task.id)[0]!;
 
-  __handlePasteWithheldForTest(task.id, run.id, "same text", {
+  await __handlePasteWithheldForTest(task.id, run.id, "same text", {
     ok: false,
     op: "modal-guard",
     phase: "pre-paste",
     stderr: "",
   });
-  __handlePasteWithheldForTest(task.id, run.id, "same text", {
+  await __handlePasteWithheldForTest(task.id, run.id, "same text", {
     ok: false,
     op: "modal-guard",
     phase: "pre-paste",
@@ -1326,7 +1322,7 @@ test("handlePasteWithheld: 'pre-enter' IS re-stashed too — the composer-clear 
   const task = await makeClaudeTaskWithRun("opus-4.8", "xhigh");
   const run = runs.listForTask(task.id)[0]!;
 
-  __handlePasteWithheldForTest(task.id, run.id, "hello claude", {
+  await __handlePasteWithheldForTest(task.id, run.id, "hello claude", {
     ok: false,
     op: "modal-guard",
     phase: "pre-enter",
@@ -1349,13 +1345,13 @@ test("handlePasteWithheld: two 'pre-enter' withholds with identical text dedupe 
   const task = await makeClaudeTaskWithRun("opus-4.8", "xhigh");
   const run = runs.listForTask(task.id)[0]!;
 
-  __handlePasteWithheldForTest(task.id, run.id, "same text", {
+  await __handlePasteWithheldForTest(task.id, run.id, "same text", {
     ok: false,
     op: "modal-guard",
     phase: "pre-enter",
     stderr: "",
   });
-  __handlePasteWithheldForTest(task.id, run.id, "same text", {
+  await __handlePasteWithheldForTest(task.id, run.id, "same text", {
     ok: false,
     op: "modal-guard",
     phase: "pre-enter",
@@ -1377,7 +1373,7 @@ test("handlePasteWithheld: a genuine tmux subprocess failure (op !== 'modal-guar
   const task = await makeClaudeTaskWithRun("opus-4.8", "xhigh");
   const run = runs.listForTask(task.id)[0]!;
 
-  __handlePasteWithheldForTest(task.id, run.id, "hello claude", {
+  await __handlePasteWithheldForTest(task.id, run.id, "hello claude", {
     ok: false,
     op: "send-keys",
     stderr: "no server running on socket",
@@ -1397,12 +1393,12 @@ test("handlePasteWithheld: tmux-failure outcomes with 'load-buffer' or 'paste-bu
   const task = await makeClaudeTaskWithRun("opus-4.8", "xhigh");
   const run = runs.listForTask(task.id)[0]!;
 
-  __handlePasteWithheldForTest(task.id, run.id, "load-buffer failure", {
+  await __handlePasteWithheldForTest(task.id, run.id, "load-buffer failure", {
     ok: false,
     op: "load-buffer",
     stderr: "boom",
   });
-  __handlePasteWithheldForTest(task.id, run.id, "paste-buffer failure", {
+  await __handlePasteWithheldForTest(task.id, run.id, "paste-buffer failure", {
     ok: false,
     op: "paste-buffer",
     stderr: "boom",
@@ -1421,7 +1417,7 @@ test("handlePasteWithheld: a tmux-failure outcome with an EMPTY stderr falls bac
   const task = await makeClaudeTaskWithRun("opus-4.8", "xhigh");
   const run = runs.listForTask(task.id)[0]!;
 
-  __handlePasteWithheldForTest(task.id, run.id, "hello claude", {
+  await __handlePasteWithheldForTest(task.id, run.id, "hello claude", {
     ok: false,
     op: "send-keys",
     stderr: "",
@@ -1440,7 +1436,7 @@ test("handlePasteWithheld: 'composer-dirty' re-stashes the NEW text with its own
   const task = await makeClaudeTaskWithRun("opus-4.8", "xhigh");
   const run = runs.listForTask(task.id)[0]!;
 
-  __handlePasteWithheldForTest(task.id, run.id, "second message", {
+  await __handlePasteWithheldForTest(task.id, run.id, "second message", {
     ok: false,
     op: "modal-guard",
     phase: "composer-dirty",
@@ -1462,7 +1458,7 @@ test("handlePasteWithheld: an archived task is never re-stashed", async () => {
   const run = runs.listForTask(task.id)[0]!;
   tasks.update(task.id, { archivedAt: Date.now() });
 
-  __handlePasteWithheldForTest(task.id, run.id, "hello claude", {
+  await __handlePasteWithheldForTest(task.id, run.id, "hello claude", {
     ok: false,
     op: "modal-guard",
     phase: "pre-paste",

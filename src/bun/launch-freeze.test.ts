@@ -172,7 +172,7 @@ test("a step that settles during the freeze stays active; the next owner's recon
   });
   const runA = stepA.runId!;
 
-  freezeLaunches();
+  await freezeLaunches();
   await waitFor(() => runs.get(runA)?.status === "succeeded");
   // Every settle path the runner listens on (run-status, the review column)
   // has had time to run.
@@ -227,7 +227,7 @@ test("a frozen runner refuses restart, advance and retry of a blocked pipeline a
   const stepRows = tasks.stepsForParent(parentId).length;
   expect(blocked.pipelineRun!.blocked.some((b) => b.kind === "handoff-missing")).toBe(true);
 
-  freezeLaunches();
+  await freezeLaunches();
   expect(await startPipelineRun(tasks.get(parentId)!)).toEqual({ error: LAUNCHES_FROZEN_REASON });
   expect(await startPipelineRun(tasks.get(parentId)!, { restart: true })).toEqual({ error: LAUNCHES_FROZEN_REASON });
   expect(await advancePipeline(parentId, { nextStepIds: null })).toEqual({ error: LAUNCHES_FROZEN_REASON, status: 409 });
@@ -276,7 +276,7 @@ test("an fx steer dropped after the freeze goes to the backlog instead of runnin
 
   // The steer is still with fx (not queued yet), so the freeze itself has
   // nothing to stash; fx drops it when the turn ends.
-  freezeLaunches();
+  await freezeLaunches();
   expect(tasks.get(taskId)!.backlog).toEqual([]);
 
   await waitFor(() => runs.get(started.runId)?.status !== "running", 5000);
@@ -326,7 +326,7 @@ test("a freeze that lands while a send waits on a teardown refuses it before any
   void __enqueueTeardownForTest(taskId, `launch-freeze-${taskId}`, () => gate);
   const sending = sendInput(started.runId, "after the teardown wait");
   await tick(30);
-  freezeLaunches();
+  await freezeLaunches();
   release();
 
   expect(await sending).toEqual({ delivered: false, reason: LAUNCHES_FROZEN_REASON });
@@ -350,6 +350,6 @@ test("a freeze that lands during resumeFxRecovery's version probe refuses it bef
   // Passes the entry check, then parks on the fx version probe; the freeze
   // lands there. Un-fixed, it carries on to "no paused fx response to resume".
   const resuming = resumeFxRecovery(created.task.id);
-  freezeLaunches();
+  await freezeLaunches();
   expect(await resuming).toEqual({ ok: false, status: 409, error: LAUNCHES_FROZEN_REASON });
 });
