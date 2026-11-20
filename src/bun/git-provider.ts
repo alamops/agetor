@@ -1,4 +1,3 @@
-import { coreSpawnSync } from "./core-spawn.ts";
 import { existsSync } from "node:fs";
 import type { GitProvider, ProviderRepoInfo } from "../shared/types.ts";
 import { canonicalGitHost, parseGitRemote, run } from "./github.ts";
@@ -40,13 +39,12 @@ import { tokenForHost } from "./github-tokens.ts";
 const GITLAB_FETCH_TIMEOUT_MS = 5_000;
 // The ssh -G fallback is correct-by-default (worst case: today's raw-host
 // behavior). An ssh config that takes longer than this to resolve isn't
-// worth blocking on — spawnSync is synchronous and blocks Bun's single event
-// loop for its entire duration, so this budget is deliberately tight rather
-// than generous.
+// worth waiting on — every host-dependent request queues behind it, so this
+// budget is deliberately tight rather than generous.
 const SSH_RESOLVE_TIMEOUT_MS = 750;
 
-/** The three cloud-forge hostnames `apiHostForRemote` short-circuits on
- *  before ever spawning `ssh -G` — see the WHY block in `apiHostForRemote`
+/** The three cloud-forge hostnames `resolveApiHost` short-circuits on
+ *  before ever spawning `ssh -G` — see the WHY block in `resolveApiHost`
  *  above its cloud-host guard. */
 const CLOUD_HOSTS = new Set(["github.com", "gitlab.com", "bitbucket.org"]);
 
@@ -74,7 +72,7 @@ const SSH_TRANSPORT_ALIASES = new Map<string, string>(
  *  input rather than letting them throw or silently misparse. */
 const HOSTNAME_CHARSET_RE = /^[a-z0-9.-]+$/;
 
-/** Module-level cache for `apiHostForRemote`, keyed by the NORMALIZED
+/** Module-level cache for `resolveApiHost`, keyed by the NORMALIZED
  *  (trimmed + lowercased) `remoteHost` argument (NTH-6 — this is what makes
  *  two different-cased spellings of the same host share one resolution) —
  *  no TTL, unlike `remoteHostsCache` above. `remoteHostsCache` is TTL'd
@@ -121,7 +119,7 @@ function resolveWithoutSsh(normalized: string): string | null {
   return null;
 }
 
-/** Test-only escape hatch: clears `apiHostForRemote`'s cache, mirroring
+/** Test-only escape hatch: clears `resolveApiHost`'s cache, mirroring
  *  `__clearRemoteHostsCacheForTest` below for the same reason (deterministic,
  *  order-independent tests). */
 export function __clearApiHostCacheForTest(): void {
@@ -135,11 +133,33 @@ export function __apiHostCacheSizeForTest(): number {
 }
 
 /**
- * Non-blocking twin of {@link apiHostForRemote}: same normalization, guards,
- * cloud short-circuit, transport-alias mapping and fallbacks, but `ssh -G` runs
- * through the async `run` (so through `coreSpawn`) and never holds the main
+ * Resolve the hostname API calls to a git-forge remote should target, given
+ * that remote's RAW host (`ProviderRepoInfo.remoteHost` /
+ * `parseGitRemote(...).rawHost`).
+ *
+ * WHY: a raw remote host is ambiguous. It's either a genuine self-hosted
+ * domain (`gitlab.mycompany.com`, used verbatim as the API host) or an
+ * `~/.ssh/config` multi-identity alias (docs/plans/github-remote-host-aliases.md)
+ * whose `HostName` is the provider's real cloud domain, e.g. `Host gitlab-work`
+ * / `HostName gitlab.com`. `ssh -G <host>` is the only local authority that can
+ * tell: it performs the same Include/Match/Host-pattern resolution a real ssh
+ * would, without a network connection. The `hostname <value>` line is parsed;
+ * a plain domain with no config entry is echoed back lowercased.
+ *
+ * Cloud short-circuit, BEFORE any ssh spawn: a host that already is one of the
+ * three cloud domains is unambiguous. Resolving it through a config that
+ * carries the vendor-documented ssh-over-443 workaround (`altssh.gitlab.com`,
+ * `ssh.github.com`) would redirect API calls to a host with no REST API, so a
+ * resolved SSH transport alias is also mapped back to its cloud domain.
+ * Empty hosts, a leading "-" and any charset violation are returned
+ * normalized without spawning (the `--` passed to ssh is belt and braces).
+ *
+ * `ssh -G` runs through the async `run` (so through `coreSpawn`, because it
+ * evaluates `Match exec` clauses an agent can plant) and never holds the main
  * thread. Resolves once per host for the process lifetime (bounded cache,
- * concurrent callers share one spawn) and never rejects.
+ * concurrent callers share one spawn), never rejects, and falls back to the
+ * normalized input on any failure (missing binary, non-zero exit, timeout,
+ * unparseable output). Binary overridable via `AGETOR_SSH_BIN`.
  */
 export async function resolveApiHost(remoteHost: string): Promise<string> {
   const normalized = remoteHost.trim().toLowerCase();
@@ -172,119 +192,12 @@ export async function resolveApiHost(remoteHost: string): Promise<string> {
   }
 }
 
-/**
- * Resolve the hostname API calls to a git-forge remote should target, given
- * that remote's RAW host (`ProviderRepoInfo.remoteHost` /
- * `parseGitRemote(...).rawHost` — see the module doc comment above).
- *
- * WHY this exists: a raw remote host is ambiguous. It's either a genuine
- * self-hosted domain (`gitlab.mycompany.com`, used verbatim as the API host)
- * or an `~/.ssh/config` multi-identity alias
- * (docs/plans/github-remote-host-aliases.md) whose `HostName` is the
- * provider's real cloud domain — e.g. `Host gitlab-work` / `HostName
- * gitlab.com`, so the remote URL says `gitlab-work` but the API lives at
- * `gitlab.com/api/v4`, not the nonexistent `gitlab-work/api/v4`. Nothing in
- * the remote URL itself distinguishes the two cases: `ssh -G <host>` is the
- * only local authority that can, because it performs the exact same
- * Include/Match/Host-pattern resolution a real `ssh` invocation for that
- * remote would, without opening a network connection (`-G` just prints the
- * fully-resolved client configuration and exits).
- *
- * Parses the `hostname <value>` line `ssh -G` always emits: for an alias
- * this is the resolved `HostName` (e.g. `gitlab.com`); for a plain domain
- * with no matching config entry, ssh's default behavior is to echo the
- * input back (lowercased — ssh lowercases hostnames during config
- * resolution, which is harmless here since DNS/HTTP hostnames are
- * case-insensitive).
- *
- * Never throws and never blocks longer than `SSH_RESOLVE_TIMEOUT_MS`: any
- * failure (missing `ssh` binary, non-zero exit, timeout, unparseable
- * output, empty resolved hostname) falls back to returning `remoteHost`
- * unchanged — today's behavior. Synchronous and cached (see `apiHostCache`
- * above) because this feeds `gitlabApiBase` (H2, gitlab.ts) and
- * `bitbucketServerError`, which are called inline from ~55 sites. A cache miss
- * still spawns `ssh -G` synchronously (<= SSH_RESOLVE_TIMEOUT_MS, once per
- * host): every async entry that can learn a host first primes the cache through
- * {@link resolveApiHost} (`providerRemoteForDir`, `gitlabToken`), so on those
- * paths this is a cache hit. New async code should call `resolveApiHost`.
- *
- * Binary overridable via `AGETOR_SSH_BIN` (house pattern — `AGETOR_TMUX_BIN`
- * in tmux-resolution.ts, `AGETOR_CLAUDE_BIN`/`AGETOR_CODEX_BIN`/… in
- * agents.ts) so tests can point at a stub script instead of the real `ssh`.
- */
-export function apiHostForRemote(remoteHost: string): string {
-  const normalized = remoteHost.trim().toLowerCase();
-
-  // Cache (and every guard/failure path below) is keyed by `normalized`, not
-  // the raw `remoteHost` argument — this is what makes two different-cased
-  // spellings of the same host share one resolution/cache slot, and what
-  // guarantees every return value (success or fallback) is consistently the
-  // normalized form rather than leaking raw casing/whitespace back out to a
-  // caller that may feed it straight into a `new URL(...)`.
-  const cached = apiHostCache.get(normalized);
-  if (cached !== undefined) return cached;
-
-  // Cloud-host short-circuit, BEFORE any ssh -G spawn. WHY: several forges
-  // document an "ssh-over-443" transport workaround for users behind a
-  // firewall that blocks port 22 — e.g. GitLab's `Host gitlab.com` /
-  // `HostName altssh.gitlab.com`, GitHub's `ssh.github.com`. That's an SSH
-  // TRANSPORT override: it exists so `git clone git@gitlab.com:...`
-  // succeeds over port 443, and has nothing to do with which host serves
-  // the REST API. If we resolved a plain `gitlab.com` remote through the
-  // user's `~/.ssh/config` and that config happens to carry this (common,
-  // vendor-recommended) workaround, `ssh -G` would report `hostname
-  // altssh.gitlab.com` — and using that as the API host would redirect
-  // every API call to a host with no REST API at all. A raw remote host
-  // that already IS exactly one of the three cloud domains is unambiguous
-  // (there's no legitimate alias resolution that could improve on it), so
-  // short-circuit before ever spawning ssh.
-  if (CLOUD_HOSTS.has(normalized)) return rememberApiHost(normalized, normalized);
-
-  // Guard rather than spawn: an empty host is nothing to resolve, a leading
-  // "-" could otherwise be misread by ssh as an option, and a hostname
-  // charset violation (anything outside `[a-z0-9.-]` post-lowercase — e.g.
-  // embedded whitespace or a newline) can never be a real hostname and
-  // would otherwise reach a downstream `new URL(...)` call unguarded. The
-  // `--` passed to ssh below is belt-and-suspenders for every other input;
-  // this guard is the cheap first line of defense that also sidesteps ever
-  // spawning a process for garbage input.
-  if (!normalized || normalized.startsWith("-") || !HOSTNAME_CHARSET_RE.test(normalized)) {
-    return rememberApiHost(normalized, normalized);
-  }
-
-  const sshBin = process.env.AGETOR_SSH_BIN || "ssh";
-  let resolved = normalized;
-  try {
-    // No shell involved (argv array, not a command string) and `--` marks
-    // the end of options, so `normalized` can't be reinterpreted as an ssh
-    // flag even if the leading-dash guard above were somehow bypassed.
-    // coreSpawnSync: `ssh -G` evaluates `Match exec` clauses from the user's
-    // ssh config, which an agent can plant (P2/P3).
-    const res = coreSpawnSync(sshBin, ["-G", "--", normalized], {
-      encoding: "utf8",
-      timeout: SSH_RESOLVE_TIMEOUT_MS,
-    });
-    if (res.status === 0 && typeof res.stdout === "string") {
-      resolved = parseSshHostname(res.stdout) ?? resolved;
-    }
-  } catch {
-    // Missing binary, spawn error, etc. — resolved stays normalized.
-  }
-
-  // An ssh alias can resolve to an SSH-over-443 transport endpoint rather
-  // than a real API host (see the cloud short-circuit's WHY above) — map it
-  // back to the cloud domain it's a transport stand-in for.
-  resolved = SSH_TRANSPORT_ALIASES.get(resolved) ?? resolved;
-
-  return rememberApiHost(normalized, resolved);
-}
-
 /** Map a canonical provider host (as produced by `canonicalGitHost`) to the
  *  `GitProvider` it identifies, or null for an unrelated host. Because
  *  `canonicalGitHost` collapses ANY host containing "gitlab" to `gitlab.com`,
  *  a self-hosted GitLab (`gitlab.mycompany.com`) classifies as `gitlab` here
  *  too and is fully supported — its real API host is resolved separately
- *  from `ProviderRepoInfo.remoteHost` via `apiHostForRemote` (see
+ *  from `ProviderRepoInfo.remoteHost` via `resolveApiHost` (see
  *  `gitlabApiBase` in gitlab.ts). Bitbucket Server / Data Center likewise
  *  classifies as `bitbucket` and is then rejected by `bitbucketServerError`
  *  (bitbucket.ts), since its REST API has a different shape. */
@@ -333,7 +246,7 @@ export async function providerRemoteForDir(
     const provider = providerForHost(parsed.host);
     if (!provider) continue;
     // Prime the per-host cache off the main thread so the sync
-    // `apiHostForRemote` readers downstream (gitlab.ts, bitbucket.ts) hit it.
+    // `resolveApiHost` readers downstream (gitlab.ts, bitbucket.ts) hit it.
     await resolveApiHost(parsed.rawHost);
     return {
       remote: name,
@@ -459,7 +372,7 @@ export async function remoteHostsForDirs(dirs: string[]): Promise<string[]> {
  * raw remote host is `remoteHost` (null when there's no repo in scope).
  *
  * Credential resolution is scoped to the **resolved** API host
- * (`apiHostForRemote(remoteHost)`), not the raw host, and the two cases get
+ * (`resolveApiHost(remoteHost)`), not the raw host, and the two cases get
  * different tiers:
  *
  *   - **Cloud** (`resolved === "gitlab.com"`, or `remoteHost === null` —

@@ -77,7 +77,7 @@ beforeAll(async () => {
 
   // Deterministic host resolution for the multi-provider tests below (GHES /
   // dotless-alias / Bitbucket-Server rejection): point AGETOR_SSH_BIN at a
-  // throwaway identity stub instead of letting `apiHostForRemote` shell out
+  // throwaway identity stub instead of letting `resolveApiHost` shell out
   // to the real `ssh` and this machine's actual ~/.ssh/config — same idiom
   // as `git-provider.test.ts`. An identity stub (`ssh -G -- <host>` just
   // echoes `<host>` back as `hostname <host>`) is enough for every case

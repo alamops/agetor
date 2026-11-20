@@ -10,7 +10,6 @@ import {
   __clearRemoteHostsCacheForTest,
   gitlabToken,
   bitbucketCreds,
-  apiHostForRemote,
   resolveApiHost,
   __apiHostCacheSizeForTest,
   __clearApiHostCacheForTest,
@@ -25,7 +24,7 @@ import { rmTestDataDir } from "./test-data-dir.ts";
 // store dir; GITLAB_TOKEN/BITBUCKET_TOKEN/BITBUCKET_EMAIL/AGETOR_SSH_BIN are
 // saved/cleared before every test and restored after so no test can leak env
 // into another, and so gitlabToken/bitbucketCreds's env-fallback tier and
-// apiHostForRemote's binary override only ever see what a given test
+// resolveApiHost's binary override only ever see what a given test
 // explicitly sets.
 const ORIGINAL_DATA_DIR = process.env.AGETOR_DATA_DIR;
 const ENV_KEYS = ["GITLAB_TOKEN", "BITBUCKET_TOKEN", "BITBUCKET_EMAIL", "AGETOR_SSH_BIN"] as const;
@@ -46,7 +45,7 @@ beforeEach(() => {
   // clearing up front keeps every test's cache behavior self-contained and
   // independent of suite run order.
   __clearRemoteHostsCacheForTest();
-  // Same reasoning for apiHostForRemote's cache, keyed by raw remoteHost —
+  // Same reasoning for resolveApiHost's cache, keyed by raw remoteHost —
   // without this, a host string reused across tests (unlikely but not
   // guaranteed unique) could read a stale resolution from an earlier test's
   // stub instead of exercising the current test's.
@@ -275,14 +274,14 @@ test("remoteHostsForDirs processes every dir even when the dir count exceeds the
 // ---------------------------------------------------------------------------
 // gitlabToken
 //
-// gitlabToken now resolves credentials against `apiHostForRemote(remoteHost)`
+// gitlabToken now resolves credentials against `await resolveApiHost(remoteHost)`
 // (MF-2, docs/plans/per-host-git-api-bases.md §8.1b) rather than the raw
 // host, and scopes the resolution tiers differently for cloud vs
 // self-hosted. Every test below installs a deterministic `AGETOR_SSH_BIN`
 // stub (an identity stub unless the test specifically wants an
 // alias-resolves-to-gitlab.com scenario) so results never depend on the real
 // `ssh` binary or the machine's actual ~/.ssh/config — without this,
-// `apiHostForRemote`'s internal ssh spawn would make these tests
+// `resolveApiHost`'s internal ssh spawn would make these tests
 // nondeterministic across machines the way they weren't before MF-2.
 // ---------------------------------------------------------------------------
 
@@ -450,7 +449,7 @@ test("bitbucketCreds: null when nothing is stored and no env is set", async () =
 });
 
 // ---------------------------------------------------------------------------
-// apiHostForRemote — ssh-config-aware hostname resolution
+// resolveApiHost — ssh-config-aware hostname resolution
 // (docs/plans/per-host-git-api-bases.md). Every test below points
 // AGETOR_SSH_BIN at a throwaway stub script instead of touching the real
 // `ssh` or any real ~/.ssh/config, so these are deterministic regardless of
@@ -458,7 +457,7 @@ test("bitbucketCreds: null when nothing is stored and no env is set", async () =
 // ---------------------------------------------------------------------------
 
 /** Writes an executable stub standing in for `ssh` and returns its path.
- *  `apiHostForRemote` invokes it as `<stub> -G -- <host>`, so `$3` is the
+ *  `resolveApiHost` invokes it as `<stub> -G -- <host>`, so `$3` is the
  *  (lowercase-trimmed) host argument when a stub cares to inspect it. */
 function writeSshStub(script: string): string {
   const dir = mkdtempSync(path.join(tmpdir(), "agetor-git-provider-ssh-stub-"));
@@ -481,42 +480,42 @@ function writeSshSpawnMarkerStub(body: string): { bin: string; marker: string } 
   return { bin, marker };
 }
 
-test("apiHostForRemote: a host with no ssh-config alias echoes the input (identity)", () => {
+test("resolveApiHost: a host with no ssh-config alias echoes the input (identity)", async () => {
   process.env.AGETOR_SSH_BIN = writeSshStub('#!/bin/sh\necho "hostname $3"\n');
-  expect(apiHostForRemote("gitlab.mycompany.com")).toBe("gitlab.mycompany.com");
+  expect(await resolveApiHost("gitlab.mycompany.com")).toBe("gitlab.mycompany.com");
 });
 
-test("apiHostForRemote: an ssh-config alias resolves to the aliased HostName, regardless of the raw input", () => {
+test("resolveApiHost: an ssh-config alias resolves to the aliased HostName, regardless of the raw input", async () => {
   process.env.AGETOR_SSH_BIN = writeSshStub("#!/bin/sh\necho 'hostname gitlab.com'\n");
-  expect(apiHostForRemote("gitlab-work")).toBe("gitlab.com");
-  expect(apiHostForRemote("some-other-alias.example")).toBe("gitlab.com");
+  expect(await resolveApiHost("gitlab-work")).toBe("gitlab.com");
+  expect(await resolveApiHost("some-other-alias.example")).toBe("gitlab.com");
 });
 
-test("apiHostForRemote: falls back to the input on ssh failure (non-zero exit)", () => {
+test("resolveApiHost: falls back to the input on ssh failure (non-zero exit)", async () => {
   process.env.AGETOR_SSH_BIN = writeSshStub("#!/bin/sh\nexit 1\n");
-  expect(apiHostForRemote("gitlab-work.io")).toBe("gitlab-work.io");
+  expect(await resolveApiHost("gitlab-work.io")).toBe("gitlab-work.io");
 });
 
-test("apiHostForRemote: falls back to the input when the ssh binary itself can't be spawned", () => {
+test("resolveApiHost: falls back to the input when the ssh binary itself can't be spawned", async () => {
   process.env.AGETOR_SSH_BIN = path.join(tmpdir(), "agetor-does-not-exist-ssh-binary-xyz");
-  expect(apiHostForRemote("gitlab-work.io")).toBe("gitlab-work.io");
+  expect(await resolveApiHost("gitlab-work.io")).toBe("gitlab-work.io");
 });
 
-test("apiHostForRemote: falls back to the input when ssh's output has no parseable hostname line", () => {
+test("resolveApiHost: falls back to the input when ssh's output has no parseable hostname line", async () => {
   process.env.AGETOR_SSH_BIN = writeSshStub("#!/bin/sh\necho 'user someone'\n");
-  expect(apiHostForRemote("gitlab-work.io")).toBe("gitlab-work.io");
+  expect(await resolveApiHost("gitlab-work.io")).toBe("gitlab-work.io");
 });
 
-test("apiHostForRemote: normalizes mixed-case input to lowercase, including on ssh failure (NTH-6)", () => {
+test("resolveApiHost: normalizes mixed-case input to lowercase, including on ssh failure (NTH-6)", async () => {
   process.env.AGETOR_SSH_BIN = writeSshStub("#!/bin/sh\nexit 1\n");
-  expect(apiHostForRemote("GitLab-Work.IO")).toBe("gitlab-work.io");
+  expect(await resolveApiHost("GitLab-Work.IO")).toBe("gitlab-work.io");
 });
 
-test("apiHostForRemote caches by normalized input: a second call for the same host, OR a different-case spelling of it, reuses the first resolution even after the stub changes, and __clearApiHostCacheForTest() bypasses it (NTH-6)", () => {
+test("resolveApiHost caches by normalized input: a second call for the same host, OR a different-case spelling of it, reuses the first resolution even after the stub changes, and __clearApiHostCacheForTest() bypasses it (NTH-6)", async () => {
   const stub = writeSshStub("#!/bin/sh\necho 'hostname first-resolved.example'\n");
   process.env.AGETOR_SSH_BIN = stub;
 
-  const first = apiHostForRemote("gitlab-cache-test.example");
+  const first = await resolveApiHost("gitlab-cache-test.example");
   expect(first).toBe("first-resolved.example");
 
   // Flip the stub's resolution after the first call. Within the cache, a
@@ -524,40 +523,40 @@ test("apiHostForRemote caches by normalized input: a second call for the same ho
   // rather than re-spawning ssh — and so must a *different-case spelling*
   // of the same host, since the cache is keyed by the normalized form.
   writeFileSync(stub, "#!/bin/sh\necho 'hostname second-resolved.example'\n", { mode: 0o755 });
-  const second = apiHostForRemote("gitlab-cache-test.example");
+  const second = await resolveApiHost("gitlab-cache-test.example");
   expect(second).toBe("first-resolved.example");
-  const secondMixedCase = apiHostForRemote("Gitlab-Cache-Test.EXAMPLE");
+  const secondMixedCase = await resolveApiHost("Gitlab-Cache-Test.EXAMPLE");
   expect(secondMixedCase).toBe("first-resolved.example");
 
   // Bypassing the cache observes the stub's new resolution immediately.
   __clearApiHostCacheForTest();
-  const third = apiHostForRemote("gitlab-cache-test.example");
+  const third = await resolveApiHost("gitlab-cache-test.example");
   expect(third).toBe("second-resolved.example");
 });
 
-test("apiHostForRemote: empty, whitespace-only, or option-injecting (leading '-') input returns the normalized (trimmed+lowercased) form without ever spawning ssh (NTH-6)", () => {
+test("resolveApiHost: empty, whitespace-only, or option-injecting (leading '-') input returns the normalized (trimmed+lowercased) form without ever spawning ssh (NTH-6)", async () => {
   const { bin, marker } = writeSshSpawnMarkerStub("echo 'hostname should-not-be-used.example'\n");
   process.env.AGETOR_SSH_BIN = bin;
 
-  expect(apiHostForRemote("")).toBe("");
+  expect(await resolveApiHost("")).toBe("");
   // The guard fires on the *normalized* (trimmed) form, so a whitespace-only
   // raw input is NOT echoed back verbatim — it comes back as "".
-  expect(apiHostForRemote("   ")).toBe("");
+  expect(await resolveApiHost("   ")).toBe("");
   // Likewise, a leading-dash input comes back lowercased, not raw-cased.
-  expect(apiHostForRemote("-oProxyCommand=touch /tmp/pwned")).toBe("-oproxycommand=touch /tmp/pwned");
+  expect(await resolveApiHost("-oProxyCommand=touch /tmp/pwned")).toBe("-oproxycommand=touch /tmp/pwned");
   expect(existsSync(marker)).toBe(false);
 });
 
-test("apiHostForRemote: a hostname charset violation (embedded whitespace or a newline) returns the normalized form without ever spawning ssh (NTH-6)", () => {
+test("resolveApiHost: a hostname charset violation (embedded whitespace or a newline) returns the normalized form without ever spawning ssh (NTH-6)", async () => {
   const { bin, marker } = writeSshSpawnMarkerStub("echo 'hostname should-not-be-used.example'\n");
   process.env.AGETOR_SSH_BIN = bin;
 
-  expect(apiHostForRemote("gitlab .com")).toBe("gitlab .com");
-  expect(apiHostForRemote("gitlab.com\nx")).toBe("gitlab.com\nx");
+  expect(await resolveApiHost("gitlab .com")).toBe("gitlab .com");
+  expect(await resolveApiHost("gitlab.com\nx")).toBe("gitlab.com\nx");
   expect(existsSync(marker)).toBe(false);
 });
 
-test("apiHostForRemote: the three cloud hosts (github.com/gitlab.com/bitbucket.org) short-circuit to themselves before ever spawning ssh (MF-1)", () => {
+test("resolveApiHost: the three cloud hosts (github.com/gitlab.com/bitbucket.org) short-circuit to themselves before ever spawning ssh (MF-1)", async () => {
   // Stub would resolve EVERY input to a made-up host — if the short-circuit
   // didn't fire before the spawn, a cloud host would come back wrong. This
   // is exactly the altssh-workaround scenario MF-1 exists for: a user's real
@@ -566,22 +565,22 @@ test("apiHostForRemote: the three cloud hosts (github.com/gitlab.com/bitbucket.o
   const { bin, marker } = writeSshSpawnMarkerStub("echo 'hostname altssh.gitlab.com'\n");
   process.env.AGETOR_SSH_BIN = bin;
 
-  expect(apiHostForRemote("github.com")).toBe("github.com");
-  expect(apiHostForRemote("gitlab.com")).toBe("gitlab.com");
-  expect(apiHostForRemote("bitbucket.org")).toBe("bitbucket.org");
+  expect(await resolveApiHost("github.com")).toBe("github.com");
+  expect(await resolveApiHost("gitlab.com")).toBe("gitlab.com");
+  expect(await resolveApiHost("bitbucket.org")).toBe("bitbucket.org");
   // Mixed-case cloud host input still short-circuits (post-normalization).
-  expect(apiHostForRemote("GitLab.COM")).toBe("gitlab.com");
+  expect(await resolveApiHost("GitLab.COM")).toBe("gitlab.com");
   expect(existsSync(marker)).toBe(false);
 });
 
-test("apiHostForRemote: an ssh alias resolving to the altssh.<cloud> SSH-over-443 transport endpoint maps to the real cloud API host (MF-1)", () => {
+test("resolveApiHost: an ssh alias resolving to the altssh.<cloud> SSH-over-443 transport endpoint maps to the real cloud API host (MF-1)", async () => {
   process.env.AGETOR_SSH_BIN = writeSshStub("#!/bin/sh\necho 'hostname altssh.gitlab.com'\n");
-  expect(apiHostForRemote("gitlab-work")).toBe("gitlab.com");
+  expect(await resolveApiHost("gitlab-work")).toBe("gitlab.com");
 });
 
-test("apiHostForRemote: an ssh alias resolving to the ssh.<cloud> transport endpoint also maps to the real cloud API host (MF-1)", () => {
+test("resolveApiHost: an ssh alias resolving to the ssh.<cloud> transport endpoint also maps to the real cloud API host (MF-1)", async () => {
   process.env.AGETOR_SSH_BIN = writeSshStub("#!/bin/sh\necho 'hostname ssh.github.com'\n");
-  expect(apiHostForRemote("github-work")).toBe("github.com");
+  expect(await resolveApiHost("github-work")).toBe("github.com");
 });
 
 // ---------------------------------------------------------------------------
@@ -611,8 +610,6 @@ test("resolveApiHost: resolves an alias through the async ssh -G and spawns ssh 
   expect(a).toBe("gitlab.com");
   expect(b).toBe("gitlab.com");
   expect(await resolveApiHost("gitlab-async")).toBe("gitlab.com");
-  // The sync reader hits the same cache, so it does not spawn either.
-  expect(apiHostForRemote("gitlab-async")).toBe("gitlab.com");
   expect(readFileSync(counter, "utf8").trim().split("\n")).toHaveLength(1);
 });
 

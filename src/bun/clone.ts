@@ -9,7 +9,7 @@ import {
   isValidCloneHost,
   parseCloneInput,
 } from "../shared/clone-input.ts";
-import { apiHostForRemote, bitbucketCreds, gitlabToken } from "./git-provider.ts";
+import { bitbucketCreds, gitlabToken, resolveApiHost } from "./git-provider.ts";
 import { githubToken, run } from "./github.ts";
 import { coreSpawn } from "./core-spawn.ts";
 import { bitbucketServerError } from "./bitbucket.ts";
@@ -24,7 +24,7 @@ import { bitbucketServerError } from "./bitbucket.ts";
  * syntactic parsing (which shape was pasted, what host/path it names) lives
  * in the shared, host-resolution-free `../shared/clone-input.ts` — this
  * module is the layer on top that applies the Git integration's REAL host
- * rules (`ssh -G` alias resolution via `apiHostForRemote`, Bitbucket
+ * rules (`ssh -G` alias resolution via `resolveApiHost`, Bitbucket
  * Server/Data Center rejection via `bitbucketServerError`, per-provider
  * credential resolution) on top of that syntax, because none of that can run
  * in the webview. Everything here is deterministic and unit-tested. The
@@ -108,7 +108,7 @@ function rejectedCloudPort(
  * Per-provider https rules mirror the Git integration's own resolvers
  * exactly, so "what clones" and "what the Git integration dialog already
  * talks to" never drift:
- *  - **GitHub**: `apiHostForRemote` must resolve to `github.com` — GitHub
+ *  - **GitHub**: `resolveApiHost` must resolve to `github.com` — GitHub
  *    Enterprise Server has no https support here (the integration doesn't
  *    support it either), and a dotless unresolved alias gets the SSH hint
  *    instead (nothing to reject-with-detail, since ssh told us nothing).
@@ -142,10 +142,10 @@ function rejectedCloudPort(
  * rejected up front via the same `bitbucketServerError` guard, since Server/DC
  * speaks neither this module's REST adapter nor (obviously) this clone flow.
  */
-export function resolveCloneRepo(
+export async function resolveCloneRepo(
   input: string,
   shorthandProvider: GitProvider = "github",
-): ResolveCloneResult {
+): Promise<ResolveCloneResult> {
   const parsed = parseCloneInput(input, shorthandProvider);
   if (!parsed.ok) return { ok: false, error: parsed.error };
   const v = parsed.value;
@@ -169,7 +169,7 @@ export function resolveCloneRepo(
   if (v.transport === "ssh") {
     const rawHost = v.rawHost!;
     if (v.provider === "bitbucket") {
-      const serverError = bitbucketServerError({
+      const serverError = await bitbucketServerError({
         provider: "bitbucket",
         host: "bitbucket.org",
         remoteHost: rawHost,
@@ -198,7 +198,7 @@ export function resolveCloneRepo(
 
   // https / http.
   const rawHost = v.rawHost!;
-  const resolved = apiHostForRemote(rawHost);
+  const resolved = await resolveApiHost(rawHost);
 
   if (v.provider === "github") {
     if (resolved !== "github.com") {
@@ -297,7 +297,7 @@ export function resolveCloneRepo(
   }
 
   // Bitbucket.
-  const serverError = bitbucketServerError({
+  const serverError = await bitbucketServerError({
     provider: "bitbucket",
     host: "bitbucket.org",
     remoteHost: rawHost,

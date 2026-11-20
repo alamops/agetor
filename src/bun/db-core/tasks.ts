@@ -4,6 +4,7 @@ import { mergeSentFiles as mergeSentFilesShared } from "../../shared/sent-files.
 import { parseTaskFxRecovery } from "../../shared/fx-recovery.ts";
 import { isMultiRepoTask } from "../../shared/multi-repo.ts";
 import { appendTaskPr, firstPrUrl, legacyTaskPrs, parseTaskPrs } from "../../shared/task-prs.ts";
+import { foldPipelineStepCounts } from "./task-decoration.ts";
 import { ImportedClaudeSessionTaken, ImportedOpencodeSessionTaken, isUniqueConstraintError } from "./errors.ts";
 import { OPENABLE_STATUSES_SQL, type TaskCounts, type TaskRow, derivedRepositories, parseAgentProfileSnapshot, parseBacklog, parseDraft, parseImportedClaude, parseImportedOpencode, parsePipelineRunState, parsePlans, parseRefs, parseSentFiles, parseTaskRepositories, parseTodoProgress, readOpencodeServer, serializeRepositories, speedFields } from "./task-parsers.ts";
 
@@ -181,19 +182,11 @@ export function makeTasks(conn: Database, deps: TasksDeps) {
          GROUP BY tasks.id
          ORDER BY tasks.created_at DESC`,
       ).all(...params);
-      const pending = pendingCountsByTask();
-      // D11: a pipeline parent task never has interactions registered against
-      // its own (hidden, agent-less) id — every interaction happens on the
-      // currently-active hidden step task. Fold each step's pending count into
-      // its parent's here, in the same O(n) pass, so the parent card's
-      // "waiting on you" glow is honest without every consumer (board, CLI,
-      // TUI) having to know about the parent/step split.
-      for (const r of rows) {
-        if (!r.pipeline_parent_id) continue;
-        const stepCount = pending.get(r.id);
-        if (!stepCount) continue;
-        pending.set(r.pipeline_parent_id, (pending.get(r.pipeline_parent_id) ?? 0) + stepCount);
-      }
+      // D11: fold each hidden step's pending count into its pipeline parent's.
+      const pending = foldPipelineStepCounts(
+        pendingCountsByTask(),
+        rows.map((r) => ({ id: r.id, pipelineParentId: r.pipeline_parent_id })),
+      );
       const counts: TaskCounts = { pending, terminals: terminalCountsByTask() };
       return rows.map((r) => toTask(r, counts));
     },

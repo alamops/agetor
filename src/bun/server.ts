@@ -2005,7 +2005,7 @@ export function startApiServer(
           }
 
           const shorthandProvider = isGitProvider(body.provider) ? body.provider : "github";
-          const resolvedInput = resolveCloneRepo(url, shorthandProvider);
+          const resolvedInput = await resolveCloneRepo(url, shorthandProvider);
           if (!resolvedInput.ok) {
             return json({ error: resolvedInput.error, cloneId }, { status: 400, headers: corsHeaders(req) });
           }

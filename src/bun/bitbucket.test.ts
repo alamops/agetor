@@ -604,7 +604,7 @@ afterAll(() => {
 
 // Every exported entry point opens with a `bitbucketServerError` guard
 // (docs/plans/per-host-git-api-bases.md) that resolves `repo.remoteHost`
-// through `apiHostForRemote` (git-provider.ts, `ssh -G` under the hood) —
+// through `resolveApiHost` (git-provider.ts, `ssh -G` under the hood) —
 // reset the cache + AGETOR_SSH_BIN after every test in this section, mirroring
 // bitbucket-network.test.ts's own hygiene.
 afterEach(() => {
@@ -616,7 +616,7 @@ afterEach(() => {
 });
 
 /** Writes an executable stub standing in for `ssh`, mirroring
- *  bitbucket-network.test.ts's own `writeSshStub` — `apiHostForRemote` invokes
+ *  bitbucket-network.test.ts's own `writeSshStub` — `resolveApiHost` invokes
  *  it as `<stub> -G -- <host>`, so `$3` is the (lowercased) host argument. */
 function writeSshStub(script: string): string {
   const dir = mkdtempSync(path.join(tmpdir(), "agetor-bb-issue-thread-ssh-stub-"));

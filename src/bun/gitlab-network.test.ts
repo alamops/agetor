@@ -46,7 +46,7 @@ const REPO = sampleRepo();
 // distinct from git-host.test.ts's #1 as defense in depth.
 //
 // gitlabApiBase (docs/plans/per-host-git-api-bases.md) resolves every call's
-// host via apiHostForRemote (git-provider.ts), which spawns `ssh -G` unless
+// host via resolveApiHost (git-provider.ts), which spawns `ssh -G` unless
 // AGETOR_SSH_BIN points elsewhere and caches by raw remoteHost — same
 // process-sharing hazard as pullBlobDetailCache, plus a second one: an
 // un-stubbed `ssh -G -- gitlab.com` would depend on whatever real

@@ -186,15 +186,15 @@ test("normalizeLabels drops malformed entries and non-array input", () => {
 // noteHtmlUrl / normalizeComment
 // ---------------------------------------------------------------------------
 
-test("noteHtmlUrl anchors into the merge_requests page for pulls, issues page for issues", () => {
-  expect(noteHtmlUrl(REPO, "pulls", 42, 100)).toBe(
+test("noteHtmlUrl anchors into the merge_requests page for pulls, issues page for issues", async () => {
+  expect(await noteHtmlUrl(REPO, "pulls", 42, 100)).toBe(
     "https://gitlab.com/acme/app/-/merge_requests/42#note_100",
   );
-  expect(noteHtmlUrl(REPO, "issues", 7, 55)).toBe("https://gitlab.com/acme/app/-/issues/7#note_55");
+  expect(await noteHtmlUrl(REPO, "issues", 7, 55)).toBe("https://gitlab.com/acme/app/-/issues/7#note_55");
 });
 
-test("normalizeComment maps a note onto GitHubComment, deriving htmlUrl from noteHtmlUrl", () => {
-  const comment = normalizeComment(
+test("normalizeComment maps a note onto GitHubComment, deriving htmlUrl from noteHtmlUrl", async () => {
+  const comment = await normalizeComment(
     { id: 100, body: "hi", author: { username: "bob" }, created_at: "2026-01-01T00:00:00Z", updated_at: "2026-01-01T00:00:00Z" },
     REPO,
     "pulls",
@@ -210,17 +210,17 @@ test("normalizeComment maps a note onto GitHubComment, deriving htmlUrl from not
   });
 });
 
-test("normalizeComment rejects a non-numeric/missing id", () => {
-  expect(normalizeComment({ body: "hi" }, REPO, "pulls", 1)).toBeNull();
-  expect(normalizeComment(null, REPO, "pulls", 1)).toBeNull();
+test("normalizeComment rejects a non-numeric/missing id", async () => {
+  expect(await normalizeComment({ body: "hi" }, REPO, "pulls", 1)).toBeNull();
+  expect(await normalizeComment(null, REPO, "pulls", 1)).toBeNull();
 });
 
 // ---------------------------------------------------------------------------
 // normalizeLineComment — DiffNote position mapping
 // ---------------------------------------------------------------------------
 
-test("normalizeLineComment maps new_line to side:RIGHT", () => {
-  const c = normalizeLineComment(
+test("normalizeLineComment maps new_line to side:RIGHT", async () => {
+  const c = await normalizeLineComment(
     {
       id: 1,
       body: "nit",
@@ -235,8 +235,8 @@ test("normalizeLineComment maps new_line to side:RIGHT", () => {
   expect(c).toMatchObject({ side: "RIGHT", line: 12, path: "src/foo.ts" });
 });
 
-test("normalizeLineComment maps old_line to side:LEFT when new_line is absent", () => {
-  const c = normalizeLineComment(
+test("normalizeLineComment maps old_line to side:LEFT when new_line is absent", async () => {
+  const c = await normalizeLineComment(
     {
       id: 2,
       body: "nit",
@@ -248,8 +248,8 @@ test("normalizeLineComment maps old_line to side:LEFT when new_line is absent", 
   expect(c).toMatchObject({ side: "LEFT", line: 9, path: "src/foo.ts" });
 });
 
-test("normalizeLineComment prefers new_line over old_line when both are present", () => {
-  const c = normalizeLineComment(
+test("normalizeLineComment prefers new_line over old_line when both are present", async () => {
+  const c = await normalizeLineComment(
     { id: 3, body: "x", position: { new_path: "a.ts", old_path: "a.ts", new_line: 5, old_line: 4 } },
     REPO,
     1,
@@ -257,8 +257,8 @@ test("normalizeLineComment prefers new_line over old_line when both are present"
   expect(c).toMatchObject({ side: "RIGHT", line: 5 });
 });
 
-test("normalizeLineComment falls back to old_path when new_path is absent (delete-side comment)", () => {
-  const c = normalizeLineComment(
+test("normalizeLineComment falls back to old_path when new_path is absent (delete-side comment)", async () => {
+  const c = await normalizeLineComment(
     { id: 4, body: "x", position: { new_path: null, old_path: "deleted.ts", new_line: null, old_line: 3 } },
     REPO,
     1,
@@ -266,21 +266,21 @@ test("normalizeLineComment falls back to old_path when new_path is absent (delet
   expect(c).toMatchObject({ path: "deleted.ts", side: "LEFT", line: 3 });
 });
 
-test("normalizeLineComment rejects a note with neither new_line nor old_line", () => {
+test("normalizeLineComment rejects a note with neither new_line nor old_line", async () => {
   expect(
-    normalizeLineComment({ id: 5, body: "x", position: { new_path: "a.ts", old_path: "a.ts" } }, REPO, 1),
+    await normalizeLineComment({ id: 5, body: "x", position: { new_path: "a.ts", old_path: "a.ts" } }, REPO, 1),
   ).toBeNull();
 });
 
-test("normalizeLineComment rejects missing position or missing id", () => {
-  expect(normalizeLineComment({ id: 6, body: "x" }, REPO, 1)).toBeNull();
-  expect(normalizeLineComment({ body: "x", position: { new_line: 1 } }, REPO, 1)).toBeNull();
-  expect(normalizeLineComment(null, REPO, 1)).toBeNull();
+test("normalizeLineComment rejects missing position or missing id", async () => {
+  expect(await normalizeLineComment({ id: 6, body: "x" }, REPO, 1)).toBeNull();
+  expect(await normalizeLineComment({ body: "x", position: { new_line: 1 } }, REPO, 1)).toBeNull();
+  expect(await normalizeLineComment(null, REPO, 1)).toBeNull();
 });
 
-test("normalizeLineComment rejects a position with no resolvable path", () => {
+test("normalizeLineComment rejects a position with no resolvable path", async () => {
   expect(
-    normalizeLineComment({ id: 7, body: "x", position: { new_line: 1 } }, REPO, 1),
+    await normalizeLineComment({ id: 7, body: "x", position: { new_line: 1 } }, REPO, 1),
   ).toBeNull();
 });
 
