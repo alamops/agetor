@@ -264,6 +264,7 @@ import {
   parseArchivedHistoryRetentionDays,
   supportedEfforts,
   validateBranchConfig,
+  isArchiveUncommittedChanges,
 } from "../shared/types.ts";
 import type {
   AgentKind,
@@ -6908,7 +6909,11 @@ export function startApiServer(
             awaitTeardown: body.awaitTeardown === true,
           });
           if ("error" in result) {
-            return json(result, { status: 400, headers: corsHeaders(req) });
+            // Uncommitted work would be discarded: 409 with the affected
+            // repositories, so the client can confirm and retry with
+            // `forceWorktree` (`ArchiveUncommittedChanges`).
+            const status = isArchiveUncommittedChanges(result) ? 409 : 400;
+            return json(result, { status, headers: corsHeaders(req) });
           }
           // Archived from any client → its notification goes (D6c). Own id
           // only: a pipeline Restart's internal step archives never reach this

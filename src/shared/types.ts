@@ -2709,6 +2709,35 @@ export interface WorktreeInfo {
 }
 
 /**
+ * `POST /tasks/:id/archive` answers 409 with this body when archiving would
+ * discard uncommitted work: a checkout has uncommitted changes or its status
+ * can't be read. Archive removes the task's worktree, so the caller confirms
+ * with the user and retries with `forceWorktree: true`. `repositories` names
+ * each affected repository of a multi-repository task; it is empty for a
+ * single one. Nothing about the task changed when this is returned.
+ */
+export const ARCHIVE_UNCOMMITTED_CHANGES_CODE = "uncommitted-changes";
+export interface ArchiveUncommittedChanges {
+  error: string;
+  code: typeof ARCHIVE_UNCOMMITTED_CHANGES_CODE;
+  repositories: string[];
+}
+/** The confirmation text every client shows before retrying an archive with
+ *  `forceWorktree` (board, CLI). */
+export function describeArchiveUncommittedChanges(repositories: readonly string[]): string {
+  const where = repositories.length === 0
+    ? "This task's worktree has uncommitted changes (or they couldn't be checked)."
+    : `${repositories.length === 1 ? "Repository" : "Repositories"} ${repositories.join(", ")} ${repositories.length === 1 ? "has" : "have"} uncommitted changes (or they couldn't be checked).`;
+  return `${where} Archiving removes the worktree, so they will be permanently discarded. Committed work stays on the task's branch.`;
+}
+/** Whether an API error body is {@link ArchiveUncommittedChanges}. */
+export function isArchiveUncommittedChanges(body: unknown): body is ArchiveUncommittedChanges {
+  return !!body && typeof body === "object"
+    && (body as { code?: unknown }).code === ARCHIVE_UNCOMMITTED_CHANGES_CODE
+    && Array.isArray((body as { repositories?: unknown }).repositories);
+}
+
+/**
  * Outcome of the worktree teardown an archive triggered, as surfaced by
  * `POST /tasks/:id/archive` when the caller passes `awaitTeardown: true`.
  *
