@@ -49,7 +49,24 @@ function isTaskListGet(req: Request): boolean {
 /** Resolves with the next board-poll response's body and its query. */
 async function nextTaskList(page: Page): Promise<{ params: URLSearchParams; tasks: TaskRow[] }> {
   const res = await page.waitForResponse((r) => isTaskListGet(r.request()) && r.ok());
-  return { params: new URL(res.url()).searchParams, tasks: (await res.json()) as TaskRow[] };
+  // The board asks for `?delta=1` now: a delta answer carries the changed rows
+  // (all of them on a snapshot); a bare array is the legacy full list.
+  const body = (await res.json()) as TaskRow[] | { tasks: TaskRow[] };
+  return { params: new URL(res.url()).searchParams, tasks: Array.isArray(body) ? body : body.tasks };
+}
+
+/** Records every board-poll response from now on. A switch or a close now
+ *  refetches at once, so a wait registered AFTER the action can miss the
+ *  response; start the watch before the action and poll the recorded list. */
+function watchTaskLists(page: Page): Array<{ params: URLSearchParams; tasks: TaskRow[] }> {
+  const seen: Array<{ params: URLSearchParams; tasks: TaskRow[] }> = [];
+  page.on("response", (r) => {
+    if (!isTaskListGet(r.request()) || !r.ok()) return;
+    void r.json().then((body: TaskRow[] | { tasks: TaskRow[] }) => {
+      seen.push({ params: new URL(r.url()).searchParams, tasks: Array.isArray(body) ? body : body.tasks });
+    }, () => {});
+  });
+  return seen;
 }
 
 /** The board card for a task id. By `data-task-id`, not `.cursor-grab`: an
@@ -104,9 +121,10 @@ test.describe("board poll archive filter", () => {
     await expect(taskCard(page, liveId)).toBeVisible();
 
     // Back to Active: the poll drops the archive again.
+    const afterActive = watchTaskLists(page);
     await page.getByTitle("Filter by archive state").selectOption("active");
     await expect(taskCard(page, archivedId)).toHaveCount(0);
-    await expect.poll(async () => (await nextTaskList(page)).params.get("archived")).toBe("exclude");
+    await expect.poll(() => afterActive.at(-1)?.params.get("archived")).toBe("exclude");
   });
 
   test("the open task is kept while it is archived, and leaves the list once the panel closes", async ({
@@ -125,19 +143,19 @@ test.describe("board poll archive filter", () => {
 
     // Another client archives the open task. The Active view's poll names it
     // in `keep`, so it is still listed and the panel stays open on it.
+    const seen = watchTaskLists(page);
     await archiveTask(request, backend, id);
-    await expect.poll(async () => {
-      const { params, tasks } = await nextTaskList(page);
-      return params.get("archived") === "exclude"
+    await expect.poll(() => seen.some(({ params, tasks }) =>
+      params.get("archived") === "exclude"
         && (params.get("keep") ?? "").split(",").includes(id)
-        && tasks.some((t) => t.id === id && t.archivedAt != null);
-    }, { timeout: 15_000 }).toBe(true);
+        && tasks.some((t) => t.id === id && t.archivedAt != null)), { timeout: 15_000 }).toBe(true);
     await expect(panel).toHaveClass(/translate-x-0/);
     await expect(panel.getByText(title, { exact: true }).first()).toBeVisible();
 
     // Closed (via its own button, not Escape: RunPanel's Escape listener is
     // rAF-gated on `open`): the next polls stop keeping it and it is gone.
     const backdrop = page.getByRole("button", { name: "Close task panel" });
+    const closedFrom = seen.length;
     await panel.getByRole("button", { name: "Close task details" }).click();
     await expect
       .poll(
@@ -146,10 +164,8 @@ test.describe("board poll archive filter", () => {
         { timeout: 10_000, message: "task panel did not close" },
       )
       .toBe(true);
-    await expect.poll(async () => {
-      const { params, tasks } = await nextTaskList(page);
-      return !(params.get("keep") ?? "").split(",").includes(id) && !tasks.some((t) => t.id === id);
-    }, { timeout: 15_000 }).toBe(true);
+    await expect.poll(() => seen.slice(closedFrom).some(({ params, tasks }) =>
+      !(params.get("keep") ?? "").split(",").includes(id) && !tasks.some((t) => t.id === id)), { timeout: 15_000 }).toBe(true);
     await expect(taskCard(page, id)).toHaveCount(0);
   });
 

@@ -138,8 +138,8 @@ test.describe("board delta + push", () => {
     await connected;
 
     expect(seen.length, "the board asked for a delta").toBeGreaterThan(0);
-    expect(seen[0].since, "the first request has no cursor (snapshot)").toBeNull();
-    expect(new URL(seen[0].url).searchParams.get("archived")).toBe("exclude");
+    expect(seen[0]!.since, "the first request has no cursor (snapshot)").toBeNull();
+    expect(new URL(seen[0]!.url).searchParams.get("archived")).toBe("exclude");
 
     // Rapid mutations: pushes arrive faster than responses; the client must
     // queue one re-run, never overlap.
@@ -160,7 +160,7 @@ test.describe("board delta + push", () => {
     const sorted = [...seen].sort((a, b) => a.start - b.start);
     for (let i = 1; i < sorted.length; i++) {
       expect(
-        sorted[i].start >= (sorted[i - 1].end ?? Infinity),
+        sorted[i]!.start >= (sorted[i - 1]!.end ?? Infinity),
         `delta request ${i} started before the previous one finished`,
       ).toBe(true);
     }
@@ -171,8 +171,8 @@ test.describe("board delta + push", () => {
     await expect
       .poll(() => seen.length > idleStart, { timeout: 25_000, message: "no idle safety-poll request in 25 s" })
       .toBe(true);
-    expect(seen[idleStart].since, "the idle poll sends since=").not.toBeNull();
-    expect(new URL(seen[idleStart].url).searchParams.get("delta")).toBe("1");
+    expect(seen[idleStart]!.since, "the idle poll sends since=").not.toBeNull();
+    expect(new URL(seen[idleStart]!.url).searchParams.get("delta")).toBe("1");
   });
 
   test("archiving removes the card; deleting the open task closes its panel", async ({ page, request, backend }) => {
@@ -225,7 +225,7 @@ test.describe("board delta + push", () => {
     let mark = urls.length;
     await filter.selectOption("all");
     await expect(taskCard(page, archId)).toBeVisible({ timeout: 15_000 });
-    const allReq = new URL(urls[mark]);
+    const allReq = new URL(urls[mark]!);
     expect(allReq.searchParams.has("since"), "All view's first request is a snapshot").toBe(false);
     expect(allReq.searchParams.has("archived")).toBe(false);
 
@@ -237,11 +237,10 @@ test.describe("board delta + push", () => {
     await expect(panel).toHaveClass(/translate-x-0/);
     mark = urls.length;
     await filter.selectOption("active");
-    // Going back to Active does not fetch at once (only a view that NEEDS the
-    // archive does); the next push or the 15 s safety poll carries the new
-    // filter, as a snapshot.
-    await expect.poll(() => urls.length > mark, { timeout: 30_000 }).toBe(true);
-    const activeReq = new URL(urls[mark]);
+    // Going back to Active changes the filter key, so it fetches at once
+    // (task-delta-client filterChanged), as a snapshot.
+    await expect.poll(() => urls.length > mark, { timeout: 5_000 }).toBe(true);
+    const activeReq = new URL(urls[mark]!);
     expect(activeReq.searchParams.has("since"), "switching view drops the cursor").toBe(false);
     expect(activeReq.searchParams.get("archived")).toBe("exclude");
     expect((activeReq.searchParams.get("keep") ?? "").split(",")).toContain(archId);

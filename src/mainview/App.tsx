@@ -2497,6 +2497,14 @@ function AppInner() {
       ? { archived: "include" }
       : { archived: "exclude", keep: keepTaskIdsKey ? keepTaskIdsKey.split(",") : [] };
   }, [needsArchivedTasks, keepTaskIdsKey]);
+  // Any change of the filter key (back to Active, a kept archived task opening
+  // or closing) refetches at once instead of waiting for a push or the safety
+  // poll. An ACTIVE task opening or closing leaves the key unchanged, so the
+  // controller does nothing then. `tasks` is a dep because the key depends on
+  // the held list (a kept task turning archived changes it).
+  useEffect(() => {
+    taskDeltaRef.current!.filterChanged();
+  }, [needsArchivedTasks, keepTaskIdsKey, tasks]);
   // Fetch right away when archived tasks become needed, so switching the
   // board to All/Archived or opening Worktrees doesn't wait for the next
   // tick (declared after the effect above, so the ref is already updated).

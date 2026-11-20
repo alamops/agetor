@@ -287,3 +287,40 @@ test("N3: archivedIds lists every archived row held, not only the fetched ones",
   await p2;
   expect(h.applied[1]!.archivedIds).toEqual(["b"]);
 });
+
+test("filterChanged: a filter-key change fetches at once; an unchanged key and an active keep do not", async () => {
+  const h = harness({ archived: "include" });
+  h.client.filterChanged(); // nothing fetched yet: the boot fetch is the caller's
+  expect(h.calls.length).toBe(0);
+  const p1 = h.client.refresh();
+  h.calls[0]!.resolve(delta({ cursor: "c1", snapshot: true, tasks: [task("a", 20), task("b", 10, { archivedAt: 5 })] }));
+  await p1;
+
+  h.client.filterChanged(); // same key
+  expect(h.calls.length).toBe(1);
+
+  h.setOpts({ archived: "exclude", keep: [] });
+  h.client.filterChanged(); // include -> exclude: changed
+  expect(h.calls.length).toBe(2);
+  h.calls[1]!.resolve(delta({ cursor: "c2", snapshot: true, tasks: [task("a", 20)] }));
+  await tick();
+
+  // S1: opening an ACTIVE task leaves the key unchanged, so no fetch.
+  h.setOpts({ archived: "exclude", keep: ["a"] });
+  h.client.filterChanged();
+  expect(h.calls.length).toBe(2);
+
+  // Back to the full list, with no push and no poll interval elapsed.
+  h.setOpts({ archived: "include" });
+  h.client.filterChanged();
+  expect(h.calls.length).toBe(3);
+  expect(h.calls[2]!.opts.archived).toBe("include");
+  // A second change during the fetch is picked up by that fetch, never parallel.
+  h.setOpts({ archived: "exclude", keep: [] });
+  h.client.filterChanged();
+  expect(h.calls.length).toBe(3);
+  h.calls[2]!.resolve(delta({ cursor: "c3", snapshot: true, tasks: [task("a", 20)] }));
+  await tick();
+  expect(h.calls.length).toBe(4);
+  expect(h.calls[3]!.opts.archived).toBe("exclude");
+});

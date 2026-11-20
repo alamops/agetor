@@ -8703,7 +8703,11 @@ function TaskDetails({
 
   return (
     <>
-      <details className="border-b border-border/60 px-3 py-2 text-xs">
+      {/* Keyed on task id: the <details> is uncontrolled and RunPanel is one
+          long-lived instance (a re-open inside the exit-animation window, or a
+          task switch, never remounts it), so without the key the previous
+          task's open state would carry over. */}
+      <details key={task.id} className="border-b border-border/60 px-3 py-2 text-xs">
         <summary className="cursor-pointer text-muted-foreground">
           <span className="text-[10px] uppercase tracking-wide">Task details</span>
         </summary>

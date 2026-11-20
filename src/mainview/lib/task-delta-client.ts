@@ -82,6 +82,9 @@ export interface TaskDeltaClient {
   poll(): void;
   setConnected(connected: boolean): void;
   readonly connected: boolean;
+  /** Call when the filter inputs may have changed: fetches at once (through
+   *  `refresh()`) if the filter key differs from the last fetch's, else nothing. */
+  filterChanged(): void;
   readonly cursor: string | null;
   readonly list: Task[];
 }
@@ -94,6 +97,7 @@ export function createTaskDeltaClient(deps: TaskDeltaClientDeps): TaskDeltaClien
   const keyOf = (): string => taskFilterKey(deps.getOpts(), held);
   let cursor: string | null = null;
   let cursorKey: string | null = null;
+  let lastFetchKey: string | null = null;
   let prevIds: Set<string> | null = null;
   let connected = false;
   let lastStart = Number.NEGATIVE_INFINITY;
@@ -103,6 +107,7 @@ export function createTaskDeltaClient(deps: TaskDeltaClientDeps): TaskDeltaClien
   async function fetchOnce(): Promise<Task[] | null> {
     const opts = deps.getOpts();
     const key = taskFilterKey(opts, held);
+    lastFetchKey = key;
     if (cursorKey !== key) cursor = null;
     if (cursor !== null && now() - snapshotAt >= TASK_FULL_RESYNC_MS) cursor = null;
     const since = cursor;
@@ -174,6 +179,12 @@ export function createTaskDeltaClient(deps: TaskDeltaClientDeps): TaskDeltaClien
       const interval = connected ? TASK_POLL_CONNECTED_MS : TASK_POLL_DISCONNECTED_MS;
       if (now() - lastStart < interval - POLL_SLACK_MS) return;
       void refresh();
+    },
+    filterChanged() {
+      // Nothing fetched yet: the boot fetch is the caller's. A fetch in flight
+      // re-checks the key itself when it lands.
+      if (lastFetchKey === null || current) return;
+      if (keyOf() !== lastFetchKey) void refresh();
     },
     setConnected(c) { connected = c; },
     get connected() { return connected; },
