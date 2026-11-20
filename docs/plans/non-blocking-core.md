@@ -7,7 +7,7 @@
 | Config | AGENTS_CONFIG.yml (balanced, schema v1; host claude_code) |
 | Flags | none |
 | Gates | grilled via decision form (round-1 + round-2 answers.json, both `complete: true`); owner overrode two recommendations (full async DB worker, all of it in this run; one PR); plan approved by owner in chat ("approved", 2026-11-19) |
-| Status | waves 0–5 landed: W1 e686cc14, W2 515feaa5 + dc5e31f1, W3 7a6a68c0 · ba33fa22 · 6a45a89c · aa69a966 · a7d8751a · d519bc27 · debb6402 (+ review fixes b0119b77, 9e1d635f), W4 682de003 · 36991bf0 · 7a41ea81, W5 34cf96e8 · fc1abbe5; Phase 5 review, Phase 6 e2e and Phase 7 runs/benchmark in progress |
+| Status | done, awaiting the owner's PR go-ahead. Waves 0–5 landed (W1 e686cc14, W2 515feaa5 + dc5e31f1, W3 7a6a68c0 · ba33fa22 · 6a45a89c · aa69a966 · a7d8751a · d519bc27 · debb6402, W4 682de003 · 36991bf0 · 7a41ea81, W5 34cf96e8 · fc1abbe5); review fixes b0119b77 · 9e1d635f · 34e09cda · d93914b5 · d6c9f8ee; e2e 1ca81d64; full-suite fixes 523aef1b · bb239435 · 3e31b6f8 · 8e2d312a · 742f5e5d. Results in §10 |
 | Branch | perf/non-blocking-core (worktree `.claude/worktrees/perf-non-blocking-core`) |
 | Base SHA | 26b0069c (main, includes #305) |
 
@@ -241,3 +241,23 @@ Risks:
 | Compact (VACUUM) off the main thread | out of scope: owner confirmed (it still locks writers) |
 | `/projects` 2 s poll, `/harnesses` 15 s poll | out of scope: they're cheap reads that become async worker reads in W3 anyway; changing their cadence is a different ticket |
 | Pruning `task_revs` tombstones | out of scope (§8) |
+
+## 10. Results (Phase 7)
+
+**Benchmark (X13).** `bun run measure:core -- --source <copy> --duration-s 60`, run back to back on 2026-11-20 against the same read-only `.backup` of the real 4.4 GB database (3,371 tasks) in `~/.agetor-dev/bench-source`, with the same 39 × 5 MB transcript replay and a machine load of about 5.5. "Before" is the base commit 26b0069c; "after" is 523aef1b.
+
+| Metric | Before | After |
+|---|---|---|
+| `/health` p50 / p95 / p99 | 0.3 / 1.1 / 13.2 ms | 0.4 / 1.7 / 3.9 ms |
+| `/health` max | 3,669 ms | 15.1 ms |
+| `/health` probes over 1 s / over 3 s | 1 / 1 | 0 / 0 |
+| Board poll (`GET /tasks?archived=exclude`) p50 / p95 | 39.8 / 1,238 ms | 43.4 / 65.1 ms |
+| Transcript replay p50 / p95 | 209 / 3,727 ms | 36.6 / 1,247 ms |
+| Stalls the core logged | 1 (2.5 s) | 0 |
+
+Criterion 2 (no main-thread block over 100 ms, `/health` p95 ≤ 100 ms) holds. The benchmark polls the legacy full list, so the bytes are identical (5.2 MB per 30 polls); the delta poll the board now uses is on top of these numbers.
+
+**e2e (X10–X12).** `core-busy-banner` (500 tasks + a 60 × 512 KB watcher replay: board changes in 159–362 ms, banner never shown) and the new `board-delta-push` (6 tests, 1 skipped: no core-restart fixture) pass. The full Playwright suite on the worker-mode backend: 505 / 523 on the first run; every failure was a test that assumed the old bare-array `/tasks` body, a flake, or the OpenCode steer test that also fails on the base commit; the affected specs were fixed and re-run green.
+
+**Unit suite.** Full `bun test --timeout 60000` runs found and fixed two branch regressions (the fake OpenCode server's stop order after a lint rewrite; bun's `.changes` counting migration 093's trigger rows) and a product corner in the OpenCode busy gate (a card for a deleted task held every server busy), plus test-isolation leaks and failures that also fail on the base commit (GitHub credentials leaking from the machine's `gh` login, a 3 PM-window Codex fixture, a codex env leak, a teardown that deleted other files' tasks, a wall-clock perf test). The base commit's own full run fails 18. The last full run here, at a machine load of about 600 from other work: 14,202 pass, 3 fail and 10 "Cannot find module 'react/jsx-dev-runtime'" errors. The module errors did not recur when the same tail of files was re-run in order (374 pass); the quit-running-tasks failure was a quit-guard flag leak, fixed in 742f5e5d; the opencode-server direct-host health test and pipeline-runner R7 pass 3 of 3 alone (load-sensitive timing in code this branch did not change).
+
