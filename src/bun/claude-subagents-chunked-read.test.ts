@@ -309,3 +309,34 @@ test("production mode: the main-JSONL scan reads chunk by chunk — it settles t
   expect(subagents.get(ids.b)!.status).toBe("completed");
   w.detach();
 });
+
+test("a rehydrated row whose stored path is outside the watcher's dirs is logged once and settles orphaned (review S5)", async () => {
+  const { attachSubagentWatcher } = await import("./claude-subagents.ts");
+  const { subagents } = await import("./db.ts");
+  const { taskId, runId, jsonlPath, now } = await seed();
+  const agentId = "s5dddddddddd";
+  const outside = path.join(FIXTURE_DIR, "elsewhere", `agent-${agentId}.jsonl`);
+  mkdirSync(path.dirname(outside), { recursive: true });
+  writeFileSync(outside, sidechainLines("s5", 3));
+  subagents.insertIfAbsent({
+    id: agentId, taskId, runId, parentKind: "subagent", agentType: "general-purpose", description: "stale",
+    spawnDepth: 1, sourcePath: outside, status: "running", startedAt: now - 1000, endedAt: null,
+  } as never);
+  const { spyOn } = await import("bun:test");
+  const warn = spyOn(console, "warn").mockImplementation(() => {});
+  try {
+    const w = attachSubagentWatcher({ taskId, jsonlPath, manual: true });
+    await w.ready;
+    await w.pump(Date.now());
+    await w.pump(Date.now());
+    await w.pump(Date.now());
+    const refused = warn.mock.calls.filter((c) => String(c[0]).includes("transcript path refused"));
+    expect(refused).toHaveLength(1);
+    expect(String(refused[0]![0])).toContain(agentId);
+    expect(String(refused[0]![0])).not.toContain(FIXTURE_DIR);
+    expect(subagents.get(agentId)?.status).toBe("orphaned");
+    w.detach();
+  } finally {
+    warn.mockRestore();
+  }
+});

@@ -283,12 +283,18 @@ function pruneOpencodeHarnessOfTask(): void {
   }
 }
 
-/** Cards registered while their task's harness is still being read: counted busy by {@link opencodeHarnessBusy} until it is known. */
+/** Cards registered while their task's harness is still being read: counted busy by {@link opencodeHarnessBusy} until it is known.
+ *  A failed read is retried once. If the retry fails too, the harness stays
+ *  unknown (nothing synchronous knows the task's agent here), so the card keeps
+ *  counting busy, conservatively; that is logged once, and the next card
+ *  registration or turn for the task records the harness. */
 function loadHarnessOfCardTask(taskId: string): void {
-  void tasks.get(taskId).then((task) => {
+  const read = async (): Promise<void> => {
+    const task = await tasks.get(taskId);
     if (task) noteOpencodeHarnessOfTask(taskId, deps.taskHarnessId(task));
-  }).catch((err: unknown) => {
-    console.warn(`[agetor] opencode: couldn't read the harness of task ${taskId}:`, err);
+  };
+  void read().catch(() => read()).catch((err: unknown) => {
+    console.warn(`[agetor] opencode: couldn't read the harness of task ${taskId} (retried once); its open card keeps counting as busy:`, err);
   });
 }
 

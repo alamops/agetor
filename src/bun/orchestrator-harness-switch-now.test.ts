@@ -312,6 +312,23 @@ describe("refusals during a swap, retry or launch freeze (review S1, S3)", () =>
     await stacks.harnessStacks.delete(stack.id);
   });
 
+  test("a run that registers after the route's running check makes the claim refuse (review S3)", async () => {
+    const a = alias("live-a");
+    const b = alias("live-b");
+    const stack = await stacks.harnessStacks.create({ label: "live", kind: "claude-code", members: [a, b] });
+    const task = makeTask(a, "work", { column: "review" });
+    orch.__testing.registerActiveRunForTest("s3-live-run", task.id);
+    try {
+      expect(await orch.claimTaskForAccountSwitch(task.id)).toBe(false);
+      expect(orch.isAccountSwitchUnderway(task.id)).toBe(false);
+    } finally {
+      orch.__testing.dropActiveRunForTest("s3-live-run");
+    }
+    expect(await orch.claimTaskForAccountSwitch(task.id)).toBe(true);
+    await orch.releaseTaskAccountSwitch(task.id);
+    await stacks.harnessStacks.delete(stack.id);
+  });
+
   test("an archived task is refused with code archived", async () => {
     const a = alias("arch-a");
     const b = alias("arch-b");
@@ -755,15 +772,9 @@ describe("a scheduled switch left waiting after its turn ended (S7)", () => {
       const started = await orch.startTask(task.id);
       runId = (started as { runId: string }).runId;
       expect((await orch.switchTaskAccountNow(task.id)).status).toBe("scheduled");
-      // The start's own claim is released once its spawn returns; take one as
-      // soon as it is free (the turn is still running).
-      let claimed = false;
-      const deadline = Date.now() + 5000;
-      while (!claimed && Date.now() < deadline) {
-        claimed = await orch.claimTaskForAccountSwitch(task.id);
-        if (!claimed) await Bun.sleep(5);
-      }
-      expect(claimed).toBe(true);
+      // The real claim refuses while the run is live (review S3), so stand in
+      // for the claim holder with a seam taken while the turn is running.
+      expect(orch.__testing.holdSwitchClaimForTest(task.id)).toBe(true);
       expect(db.runs.get(runId)!.status).toBe("running");
       await waitFor(() => db.runs.get(runId)?.status !== "running");
     } finally {
@@ -1378,6 +1389,43 @@ describe("only a held card or a FAILED blocked one is held by its background age
     } finally {
       failed.done();
       stopped.done();
+    }
+  });
+
+  test("the held-session probe is one worker call per tick and returns no Task row (review S4)", async () => {
+    const { setHeldSessionProbe } = await import("./claude-tmux.ts");
+    const probe = setHeldSessionProbe(null);
+    setHeldSessionProbe(probe);
+    const { spyOn } = await import("bun:test");
+    const rpc = (await import("./db-rpc.ts")).getDbRpc();
+    const failed = await cardWithAgent("s4probe", "blocked", "failed");
+    const seen: string[] = [];
+    const results: unknown[] = [];
+    const realCall = rpc.call.bind(rpc);
+    const realOp = rpc.op.bind(rpc);
+    const callSpy = spyOn(rpc, "call").mockImplementation(((m: string, meth: string, a: unknown[]) => {
+      seen.push(`${m}.${meth}`);
+      return realCall(m, meth, a);
+    }) as never);
+    const opSpy = spyOn(rpc, "op").mockImplementation((async (name: string, a: unknown[]) => {
+      seen.push(name);
+      const r = await realOp(name as never, a as never);
+      results.push(r);
+      return r;
+    }) as never);
+    try {
+      // Two ticks: the first starts the read, the second sees its answer.
+      probe!(failed.task.id);
+      await orch.__heldProbeSettledForTest(failed.task.id);
+      expect(probe!(failed.task.id)).toBe(true);
+      await orch.__heldProbeSettledForTest(failed.task.id);
+      // Exactly one DB call per tick, and it is the boolean-sized op.
+      expect(seen).toEqual(["orchestrator.backgroundHold", "orchestrator.backgroundHold"]);
+      for (const r of results) expect(Object.keys(r as object).sort()).toEqual(["failedRunId", "held"]);
+    } finally {
+      callSpy.mockRestore();
+      opSpy.mockRestore();
+      failed.done();
     }
   });
 });

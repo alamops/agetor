@@ -134,7 +134,7 @@ export const PIN_ROOT_CONCURRENCY = 4;
  */
 export async function branchesPinnedByOtherTasks(
   taskId: string,
-  tasks: { id: string; branch: string | null; workdir: string; repositories?: TaskRepository[] }[],
+  tasks: { id: string; branch: string | null; workdir: string; repositories?: Pick<TaskRepository, "path" | "branch">[] }[],
   opts: { resolveRoot?: (dir: string) => Promise<string | null> } = {},
 ): Promise<Map<string, Set<string>>> {
   const byKey = new Map<string, Set<string>>();

@@ -882,6 +882,28 @@ export function makeTasks(conn: Database, deps: TasksDeps) {
       return this.get(taskId);
     },
     /**
+     * Only what `branchesPinnedByOtherTasks` reads, for every task that pins a
+     * branch: `{id, branch, workdir, repositories: [{path, branch}]}`. Replaces
+     * a full `list()` (every Task row, with its prompt, plans and harness state,
+     * structured-cloned off the worker) on each start. A single-repository row's
+     * `repositories` is the one entry derived from its own `workdir`/`branch`,
+     * which the caller already pins from those fields, so only a stored
+     * (multi-repository) set is returned. `tasks` is small and has no index on
+     * `branch`; the scan is the whole table's two narrow columns, not its rows.
+     */
+    pinnedBranches(): { id: string; branch: string | null; workdir: string; repositories: { path: string; branch: string | null }[] }[] {
+      const rows = conn.query<{ id: string; branch: string | null; workdir: string; repositories: string | null }, []>(
+        `SELECT id, branch, workdir, repositories FROM tasks
+          WHERE branch IS NOT NULL OR (repositories IS NOT NULL AND repositories != '[]' AND repositories != '')`,
+      ).all();
+      return rows.map((r) => ({
+        id: r.id,
+        branch: r.branch,
+        workdir: r.workdir,
+        repositories: parseTaskRepositories(r.repositories).map((repo) => ({ path: repo.path, branch: repo.branch })),
+      }));
+    },
+    /**
      * Overwrite a pipeline PARENT task's `pipeline_run` state (`PipelineRunState`
      * JSON, migration 058) in one targeted `UPDATE` — same pattern as
      * `setAgentProfile`/`setFxRecovery` above: no `updated_at` bump (this is

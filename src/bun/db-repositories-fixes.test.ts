@@ -202,3 +202,29 @@ describe("N8: a pipeline step's argv budget includes the Repositories: block", (
     expect(stepLaunchPromptOverage(claude, "x".repeat(100_000), [], { multiRepo: true, repositories: repos })).toBeNull();
   });
 });
+
+describe("N5: pinnedBranches feeds branchesPinnedByOtherTasks the same answer as a full list", () => {
+  test("single and multi-repository pins, no pin, and the excluded task all match tasks.list()", async () => {
+    const { branchesPinnedByOtherTasks } = await import("./task-repos.ts");
+    const single = makeTask({ workdir: "/tmp/pin-single", branch: "agetor/pin-single" });
+    const multi = makeTask({
+      workdir: "/tmp/pin-multi", branch: null, multiRepo: true,
+      repositories: [repo("a", { path: "/tmp/pin-a", branch: "agetor/pin-a" }), repo("b", { path: "/tmp/pin-b", branch: null })],
+    });
+    const unpinned = makeTask({ workdir: "/tmp/pin-none", branch: null });
+    const me = makeTask({ workdir: "/tmp/pin-single", branch: "agetor/pin-me" });
+    for (const t of [single, multi, unpinned, me]) tasks.insert(t);
+    const { tasks: asyncTasks } = await import("./db-async.ts");
+    const targeted = await asyncTasks.pinnedBranches();
+    // Narrow rows only: no prompt, no plans.
+    for (const row of targeted) expect(Object.keys(row).sort()).toEqual(["branch", "id", "repositories", "workdir"]);
+    const viaList = await branchesPinnedByOtherTasks(me.id, tasks.list());
+    const viaTargeted = await branchesPinnedByOtherTasks(me.id, targeted);
+    const flat = (m: Map<string, Set<string>>) => [...m].map(([k, v]) => [k, [...v].sort()] as const).sort((x, y) => x[0].localeCompare(y[0]));
+    expect(flat(viaTargeted)).toEqual(flat(viaList));
+    expect(viaTargeted.get("/tmp/pin-single")).toEqual(new Set(["agetor/pin-single"]));
+    expect(viaTargeted.get("/tmp/pin-a")).toEqual(new Set(["agetor/pin-a"]));
+    expect(viaTargeted.has("/tmp/pin-none")).toBe(false);
+    expect(viaTargeted.get("/tmp/pin-single")?.has("agetor/pin-me")).toBe(false);
+  });
+});

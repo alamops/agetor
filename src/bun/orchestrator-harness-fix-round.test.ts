@@ -395,8 +395,9 @@ describe("finding 1: a successor limit while a claim is held is deferred, then s
           await Bun.sleep(5);
         }
         expect(await stacks.harnessStacks.getLimitState(a)).not.toBeNull();
-        // Not the swap window: an ordinary account-switch claim.
-        expect(await orch.claimTaskForAccountSwitch(task.id)).toBe(true);
+        // Not the swap window: an ordinary account-switch claim holder. (The
+        // real claim refuses a live run, review S3, so stand in for it.)
+        expect(orch.__testing.holdSwitchClaimForTest(task.id)).toBe(true);
         await waitFor(() => db.runs.listForTask(task.id).every((r) => r.status !== "running"), 8000);
         await orch.releaseTaskAccountSwitch(task.id);
       });

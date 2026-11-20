@@ -1256,15 +1256,11 @@ export async function isHeldByBackgroundAgents(taskId: string): Promise<boolean>
  * the switch would wait for them forever.
  */
 export async function backgroundAgentsHoldTask(taskId: string): Promise<boolean> {
-  // Polled by the claude death watch on every tick of an idle session, so the
-  // common "no background agent" answer costs one indexed lookup.
-  const task = await tasks.get(taskId);
-  if (!task) return false;
-  if (await isTaskHeldByBackgroundAgents(task)) return true;
-  if (task.column !== "blocked" || task.runId == null) return false;
-  if (!await subagents.hasRunning(taskId)) return false;
-  if ((await runs.get(task.runId))?.status !== "failed") return false;
-  return !(active.has(task.runId) || await runs.hasRunning(taskId));
+  // Polled by the claude death watch on every tick of an idle session: one
+  // worker op, a boolean-sized reply, never a Task row.
+  const { held, failedRunId } = await op("orchestrator.backgroundHold", [taskId]);
+  if (held) return true;
+  return failedRunId != null && !active.has(failedRunId);
 }
 
 /**
@@ -2726,7 +2722,10 @@ async function startTaskInner(
       task.maxMode !== profile.maxMode ||
       agentProfileSnapshotDrifted(task.agentProfile ?? null, profile);
     if (driftedFromRow) {
-      task = await tasks.update(taskId, {
+      // A guarded write: a Detach that landed since `effectiveAgentProfile`
+      // read the binding must not be undone by this copy-down (it returns
+      // null and writes nothing); the task is then re-read as it now stands.
+      await op("orchestrator.copyDownProfile", [taskId, {
         agent: profile.harness,
         model: profile.model,
         effort: resolvedEffort,
@@ -2734,8 +2733,9 @@ async function startTaskInner(
         speed: profile.speed,
         maxMode: profile.maxMode,
         opencodeServer: profileOpencodeServer,
-      }) ?? task;
-      task = await tasks.setAgentProfile(taskId, profile.id, profile) ?? task;
+      }, profile]);
+      // (Read through the facade, which carries the badge counts an op result lacks.)
+      task = await tasks.get(taskId) ?? task;
     }
   }
   const effective: AgentProfileSnapshot | null = resolvedProfile?.profile ?? null;
@@ -2881,7 +2881,7 @@ async function startTaskInner(
   const prepared = await prepareTaskWorkdir(task, {
     takenBranches: await branchesPinnedByOtherTasks(
       taskId,
-      await tasks.list(),
+      await tasks.pinnedBranches(),
       multiRepo ? { resolveRoot: repoRoot } : {},
     ),
   });
@@ -4419,6 +4419,10 @@ export async function claimTaskForAccountSwitch(taskId: string): Promise<boolean
   // The hold read yielded: check again and claim in one synchronous step, so
   // a start (or another switch) that claimed meanwhile is never shared.
   if (startingTaskIds.has(taskId) || launchesFrozenFlag) return false;
+  // A run that registered since the caller's `hasRunning` read (its spawn
+  // finished and released its start claim during the awaits above) is live
+  // now: switching under it would drop the session mid-turn.
+  for (const run of active.values()) if (run.taskId === taskId) return false;
   startingTaskIds.add(taskId);
   accountSwitchTaskIds.add(taskId);
   return true;
@@ -15403,4 +15407,21 @@ export async function worktreeGitStatus(id: string): Promise<WorktreeGitStatus |
 function pendingFxAutoResume(taskId: string): boolean {
   return fxAutoResumeTimers.has(taskId);
 }
-export const __testing = { spawnFxRun, pendingFxAutoResume, noteFxRunSettled };
+/** Test seams for the account-switch claim's live-run refusal: register / drop
+ *  an `active` handle for a task without driving a real spawn. */
+function registerActiveRunForTest(runId: string, taskId: string): void {
+  active.set(runId, { taskId, agent: "claude-code", kill: () => {}, cancelled: false, apiError: false, limitHit: null, limitRecorded: null, sessionDied: false, unknownCommand: false } as unknown as ActiveRun);
+}
+function dropActiveRunForTest(runId: string): void {
+  active.delete(runId);
+}
+/** Stand-in for a claim holder that already owns the task while a turn ends
+ *  (the real claim now refuses a live run): takes the switch claim with no
+ *  live-run check. */
+function holdSwitchClaimForTest(taskId: string): boolean {
+  if (startingTaskIds.has(taskId)) return false;
+  startingTaskIds.add(taskId);
+  accountSwitchTaskIds.add(taskId);
+  return true;
+}
+export const __testing = { spawnFxRun, pendingFxAutoResume, noteFxRunSettled, registerActiveRunForTest, dropActiveRunForTest, holdSwitchClaimForTest };

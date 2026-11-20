@@ -1,4 +1,4 @@
-import type { ColumnId, Harness, Run, RunStatus, Task, TaskRepository } from "../../../shared/types.ts";
+import type { AgentProfileSnapshot, ColumnId, Harness, Run, RunStatus, Task, TaskRepository } from "../../../shared/types.ts";
 import { isMultiRepoTask } from "../../../shared/multi-repo.ts";
 import { resolveClaudePlan, upsertClaudePlanFromExitPlanMode, upsertDetectedPlan } from "../../task-plans.ts";
 import { defineOp, type OpCtx } from "./define.ts";
@@ -47,6 +47,26 @@ export interface TaskSnapshot {
   held: boolean;
   /** Any subagent row of the task still `running`, whatever the column. */
   runningSubagents: boolean;
+}
+
+/** The answer of `orchestrator.backgroundHold`. */
+export interface BackgroundHold {
+  /** The #92 hold: `running`, current run `succeeded`, a subagent still `running`. */
+  held: boolean;
+  /** Set when a failed turn's background agents may hold the task; the caller
+   *  holds it unless that run is live in its own `active` map. */
+  failedRunId: string | null;
+}
+
+/** The hold predicate shared by `orchestrator.taskSnapshot` and
+ *  `orchestrator.backgroundHold`, so the two never drift. */
+function holdFacts(ctx: OpCtx, taskId: string, column: string, runId: string | null): { held: boolean; runningSubagents: boolean } {
+  const runningSubagents = ctx.modules.subagents.hasRunning(taskId);
+  const held = runningSubagents
+    && column === "running"
+    && runId != null
+    && ctx.modules.runs.get(runId)?.status === "succeeded";
+  return { held, runningSubagents };
 }
 
 /** One plan-history change (see `orchestrator.applyPlanChange`). */
@@ -186,12 +206,54 @@ export const orchestratorOps = {
       const task = ctx.modules.tasks.get(taskId);
       if (!task) return { task: null, harness: null, held: false, runningSubagents: false };
       const harness = ctx.modules.harnesses.getByIdOrKind(task.agent);
-      const runningSubagents = ctx.modules.subagents.hasRunning(task.id);
-      const held = runningSubagents
-        && task.column === "running"
-        && task.runId != null
-        && ctx.modules.runs.get(task.runId)?.status === "succeeded";
+      const { held, runningSubagents } = holdFacts(ctx, task.id, task.column, task.runId ?? null);
       return { task, harness, held, runningSubagents };
+    },
+  }),
+
+  /**
+   * The held-session probe's whole question, with a tiny reply: whether
+   * background agents hold the task (the #92 hold) and, for the failed-turn
+   * case, the run id of a `blocked` card whose current run `failed` while a
+   * subagent still runs and no run is `running` (the caller finishes that case
+   * against its in-memory `active` map). Reads two columns, never a Task row:
+   * the death watch asks this on every tick of every idle session.
+   */
+  "orchestrator.backgroundHold": defineOp({
+    tx: false,
+    run: (ctx, taskId: string): BackgroundHold => {
+      const row = ctx.conn.query<{ column: string; run_id: string | null }, [string]>(
+        `SELECT "column" AS "column", run_id FROM tasks WHERE id = ?`,
+      ).get(taskId);
+      if (!row) return { held: false, failedRunId: null };
+      const { held, runningSubagents } = holdFacts(ctx, taskId, row.column, row.run_id);
+      if (held) return { held: true, failedRunId: null };
+      if (row.column !== "blocked" || row.run_id == null || !runningSubagents) return { held: false, failedRunId: null };
+      if (ctx.modules.runs.get(row.run_id)?.status !== "failed") return { held: false, failedRunId: null };
+      if (ctx.modules.runs.hasRunning(taskId)) return { held: false, failedRunId: null };
+      return { held: false, failedRunId: row.run_id };
+    },
+  }),
+
+  /**
+   * The first-start copy-down of a bound profile onto its task row, as a
+   * guarded write: applies only while the task is still bound to
+   * `profile.id` (a Detach that landed after the caller decided must not be
+   * undone). Returns the updated task, or null when the guard failed (the
+   * task is gone or no longer bound to that profile) and nothing was written.
+   */
+  "orchestrator.copyDownProfile": defineOp({
+    tx: true,
+    run: (
+      ctx,
+      taskId: string,
+      fields: { agent: string; model: string | null; effort: string | null; mode: string | null; speed: Task["speed"]; maxMode: boolean; opencodeServer: Task["opencodeServer"] },
+      profile: AgentProfileSnapshot,
+    ): Task | null => {
+      const current = ctx.modules.tasks.get(taskId);
+      if (!current || (current.agentProfileId ?? null) !== profile.id) return null;
+      ctx.modules.tasks.update(taskId, fields as Partial<Task>);
+      return ctx.modules.tasks.setAgentProfile(taskId, profile.id, profile);
     },
   }),
 

@@ -715,7 +715,10 @@ const quitSequencer = createQuitSequencer({
       // here before the worker is closed.
       effects: async () => {
         // The follow-ups a freeze moved to the backlog land before the worker closes.
-        await launchesFreezing;
+        // Bounded like headless's SHUTDOWN_FREEZE_WAIT_MS, so a wedged database
+        // worker can't hold this past the sequence cap with the creds file still
+        // on disk (removeCoreCreds below must always run).
+        await Promise.race([launchesFreezing, Bun.sleep(3_000)]);
         const { completely, stopSupervisor, backgroundArmed } = quitDecision;
         // Only when a supervisor is alive to read it (`stopSupervisor`): a request
         // written with none running would otherwise linger for the next supervisor

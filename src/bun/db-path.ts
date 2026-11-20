@@ -30,6 +30,12 @@ const DATA_DIR = process.env.AGETOR_DATA_DIR
   ?? path.join(homedir(), ".agetor");
 mkdirSync(DATA_DIR, { recursive: true });
 
+// The data dir is frozen at first import. `bun test` runs every file in one
+// process, so a file that imports this module (directly or through any module
+// that needs `dataDir`) pins the dir every later `db.ts` import opens. Record
+// it so `rmTestDataDir` (test-data-dir.ts) never deletes the pinned dir.
+(globalThis as { __agetorPinnedDataDir?: string }).__agetorPinnedDataDir = path.resolve(DATA_DIR);
+
 export const dataDir = DATA_DIR;
 
 /** Pidfile path. Written at boot by `index.ts`, read by `wipe-dev.ts` for

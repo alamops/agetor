@@ -44,6 +44,8 @@ const FIXTURE_DIR = mkdtempSync(path.join(tmpdir(), "agetor-drift-fixture-"));
 /** The bar: no loop gap over 100 ms, or 3x the idle-loop gap measured in the
  *  same run when the machine itself is that slow (`budgetFor`). */
 const MAX_GAP_MS = 100;
+/** Upper bound of the load-scaled budget (`budgetFor`). */
+const HARD_CEILING_MS = 250;
 const SAMPLE_MS = 5;
 
 const TASK_ID = `task-drift-${randomUUID()}`;
@@ -118,14 +120,16 @@ function startGapSampler() {
 }
 
 /** Longest gap of an idle loop right now, so a heavily loaded machine does not
- *  turn its own jitter into a failure: the budget is `max(100, 3 x baseline)`. */
+ *  turn its own jitter into a failure: the budget is `max(100, 3 x baseline)`, capped at 250 ms. */
 async function measureBaselineGap(): Promise<number> {
   const s = startGapSampler();
   await Bun.sleep(400);
   return s.stop();
 }
 function budgetFor(baseline: number): number {
-  return Math.max(MAX_GAP_MS, 3 * baseline);
+  // Hard ceiling: a noisy baseline can't stretch the budget so far that a real
+  // regression hides inside it.
+  return Math.min(HARD_CEILING_MS, Math.max(MAX_GAP_MS, 3 * baseline));
 }
 
 async function waitFor(pred: () => boolean, timeoutMs: number, what: string): Promise<void> {

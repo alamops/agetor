@@ -1577,3 +1577,39 @@ test("busy gate: an open card with no tracked turn keeps its harness busy until 
   interactions.cancelPendingForTask(task.id, "test");
   expect(orch.__opencodeServerForTest.harnessBusy("opencode-busy1")).toBe(false);
 });
+
+test("busy gate: a failed harness read for a new card is retried once, so the card stops blocking other harnesses (review N2)", async () => {
+  addHarness("opencode-retry1");
+  addHarness("opencode-retry2");
+  const task = await newTask({ prompt: "idle", agent: "opencode-retry1" });
+  const { spyOn } = await import("bun:test");
+  const rpc = (await import("./db-rpc.ts")).getDbRpc();
+  const realCall = rpc.call.bind(rpc);
+  let failed = 0;
+  const spy = spyOn(rpc, "call").mockImplementation(((m: string, meth: string, a: unknown[]) => {
+    if (m === "tasks" && meth === "get" && failed < 1 && String(new Error().stack).includes("orchestrator-opencode-server.ts")) {
+      failed++;
+      return Promise.reject(new Error("transient read failure"));
+    }
+    return realCall(m, meth, a);
+  }) as never);
+  const warn = spyOn(console, "warn").mockImplementation(() => {});
+  try {
+    const card = interactions.registerFxPermission({
+      taskId: task.id,
+      runId: "run-none",
+      toolCall: { toolCallId: "tc", title: "t", kind: "execute" } as never,
+      options: [{ optionId: "once", name: "Once", kind: "allow_once" }] as never,
+      mode: "ask",
+    });
+    await waitFor(() => !orch.__opencodeServerForTest.harnessBusy("opencode-retry2"), 5_000, "the retried read to resolve the harness");
+    expect(failed).toBe(1);
+    expect(orch.__opencodeServerForTest.harnessBusy("opencode-retry1")).toBe(true);
+    expect(warn.mock.calls.filter((c) => String(c[0]).includes("retried once"))).toHaveLength(0);
+    interactions.cancelPendingForTask(task.id, "test");
+    await card.answer.catch(() => undefined);
+  } finally {
+    spy.mockRestore();
+    warn.mockRestore();
+  }
+});

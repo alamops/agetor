@@ -348,8 +348,8 @@
  * isolated to that file's tail.
  * ────────────────────────────────────────────────────────────────────────── */
 
+import { lstat } from "node:fs/promises";
 import {
-  existsSync,
   statSync,
   readSync,
   closeSync,
@@ -2153,7 +2153,7 @@ export function attachSubagentWatcher(opts: {
         // more to tail" rather than crashing rehydration.
         let offset = 0;
         if (row.sourcePath) {
-          try { offset = statSync(row.sourcePath).size; } catch { /* offset stays 0 */ }
+          try { offset = (await lstat(row.sourcePath)).size; } catch { /* offset stays 0 */ }
         }
         bgShells.set(row.id, {
           id: row.id,
@@ -2267,12 +2267,13 @@ export function attachSubagentWatcher(opts: {
     // `Number.MAX_SAFE_INTEGER` makes every batch from this row read as
     // replay until a later `statSync` succeeds and the real size is used.
     let replayFloor = 0;
-    if (existsSync(row.sourcePath)) {
-      try {
-        replayFloor = statSync(row.sourcePath).size;
-      } catch {
-        replayFloor = Number.MAX_SAFE_INTEGER;
-      }
+    // One async `lstat` (off the main thread, no-follow: the file is agent
+    // writable) replaces the old `existsSync` + `statSync` pair: ENOENT is "no
+    // file", any other failure is "exists but unmeasurable".
+    try {
+      replayFloor = (await lstat(row.sourcePath)).size;
+    } catch (e) {
+      if ((e as NodeJS.ErrnoException).code !== "ENOENT") replayFloor = Number.MAX_SAFE_INTEGER;
     }
     const seen = await runs.seenLineUuidsForSubagent(taskId, row.id);
     files.set(row.id, {
@@ -2854,6 +2855,22 @@ export function attachSubagentWatcher(opts: {
    *  is judged against the drain's starting offset, so chunking (and a
    *  drain spread over several slices) never changes which bytes count as
    *  replay. */
+  /** Rows whose stored path the transcript worker refused (outside the dirs
+   *  this watcher may read): logged once each, then settled `orphaned` so a row
+   *  that can never be tailed stops holding its task. `allowedRoot` stays as is. */
+  const refusedPathRows = new Set<string>();
+  function noteRefusedTranscriptPath(fs: FileState): void {
+    if (refusedPathRows.has(fs.subagentId)) return;
+    refusedPathRows.add(fs.subagentId);
+    console.warn(
+      `[claude-subagents] transcript path refused for subagent ${fs.subagentId} of task ${taskId}: not under this session's ${fs.parentKind === "workflow_agent" ? "workflows" : "subagents"} directory; settling it as orphaned`,
+    );
+    if (fs.status !== "running") return;
+    settleSubagentById(fs.subagentId, "orphaned").catch((e: unknown) => {
+      console.error(`[claude-subagents] settling refused subagent ${fs.subagentId} failed:`, e);
+    });
+  }
+
   async function tailFile(fs: FileState, deadlineMs = Infinity, batchStart = fs.offset): Promise<boolean> {
     // The directory the transcript worker validates the path against: the
     // subagents dir, or the workflows tree for a workflow agent.
@@ -2866,7 +2883,9 @@ export function attachSubagentWatcher(opts: {
         // The worker refused the path (not a plain location under `root`: the
         // old read treated that as "nothing here") or failed. Either way the
         // cursor stays put and a later pass retries.
-        if (!(e instanceof TranscriptClientError && e.code === "EINVAL")) {
+        if (e instanceof TranscriptClientError && e.code === "EINVAL") {
+          noteRefusedTranscriptPath(fs);
+        } else {
           console.error(`[claude-subagents] transcript read failed for ${fs.subagentId}:`, e);
         }
         return true;
