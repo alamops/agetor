@@ -14036,6 +14036,10 @@ export async function archiveTask(
   // An archived task's session is torn down below: nothing is tailed for it
   // any more, so nothing may adopt a continuation for it.
   registeredRunTasks.delete(taskId);
+  // An archived step's cards are cancelled above, so drop its cached parent
+  // (interactions.ts); an unarchived step re-learns it through the fallback
+  // lookup, which also nudges the parent's badge.
+  forgetPipelineParent(taskId);
   // Pipeline parent (D9, docs/plans/pipelines.md): archive every non-archived
   // step task first — `cascadePipelineArchive` is best-effort per step (a
   // step that fails to archive is logged, not thrown), so one stuck step

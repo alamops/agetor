@@ -550,7 +550,9 @@ function fanoutResolved(req: AnyRequest): void {
  *  step: the pipeline runner notes each step as it creates it
  *  (`notePipelineParent`), boot preloads every stored one
  *  (`preloadPipelineParents`), and a deleted step is dropped
- *  (`forgetPipelineParent`). Not bounded: an entry per live step. */
+ *  (`forgetPipelineParent`). Entries of archived steps stay until delete (the
+ *  orchestrator's archive path would have to call `forgetPipelineParent`; an
+ *  unarchive then re-learns the parent by the fallback lookup below). */
 const pipelineParentCache = new Map<string, string>();
 let warnedParentFallback = false;
 
@@ -604,6 +606,9 @@ function pipelineParentFor(taskId: string, cardId: string): { pipelineParentId?:
       console.warn("[interactions] a pipeline step registered a card before its parent was noted; stamped by lookup");
     }
     pipelineParentCache.set(taskId, parentId);
+    // The card was registered while the parent was unknown, so the pending-count
+    // hook above marked only the step: the parent's folded badge needs a nudge.
+    noteDecorationChanged(taskId, parentId);
     const live = askQuestions.get(cardId)?.req ?? tmuxPrompts.get(cardId)?.req ?? fxPermissions.get(cardId)?.req;
     if (!live || live.pipelineParentId !== undefined) return;
     live.pipelineParentId = parentId;

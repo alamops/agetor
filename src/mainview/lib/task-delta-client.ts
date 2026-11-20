@@ -27,6 +27,9 @@ import { reconcileById } from "./reconcile.ts";
 
 export const TASK_POLL_CONNECTED_MS = 15_000;
 export const TASK_POLL_DISCONNECTED_MS = 2_000;
+/** A held cursor older than this is dropped at the next fetch, so a full
+ *  snapshot heals any revision or decoration the delta path missed. */
+export const TASK_FULL_RESYNC_MS = 5 * 60_000;
 /** Timer jitter allowance: a 2 s interval tick may land a few ms early. */
 const POLL_SLACK_MS = 250;
 
@@ -36,7 +39,8 @@ export interface TaskDeltaApplied {
   /** Ids the previous successful fetch listed that this one no longer does
    *  (empty on the first fetch: a task never polled is never swept). */
   vanishedIds: readonly string[];
-  /** Fetched rows that are archived. */
+  /** Every archived row the list now holds (the whole held list, not just
+   *  this fetch's rows, so the toast sweep matches the old per-poll one). */
   archivedIds: readonly string[];
   /** The filter this answer was fetched under. */
   opts: TaskListOptions;
@@ -55,10 +59,20 @@ export interface TaskDeltaClientDeps {
 
 /** Stable identity of what a cursor is valid for. `keep` only matters when the
  *  request carries it (`taskDeltaPath` drops it for `include`). */
-export function taskFilterKey(opts: TaskListOptions): string {
+export function taskFilterKey(opts: TaskListOptions, held?: ReadonlyMap<string, Task>): string {
   const archived = opts.archived ?? "include";
   if (archived === "include") return "include";
-  const keep = [...new Set((opts.keep ?? []).filter((id) => id.length > 0))].slice(0, TASK_LIST_KEEP_MAX).sort();
+  let keep = [...new Set((opts.keep ?? []).filter((id) => id.length > 0))].slice(0, TASK_LIST_KEEP_MAX).sort();
+  // With the held list known, a kept id only changes the answer when it needs
+  // keeping: archived (an `exclude` view would drop it) or not held at all. An
+  // active task is already in an `exclude` view's results, so opening, closing
+  // or right-clicking it must not drop the cursor.
+  if (held && archived === "exclude") {
+    keep = keep.filter((id) => {
+      const t = held.get(id);
+      return !t || t.archivedAt != null;
+    });
+  }
   return `${archived}:${keep.join(",")}`;
 }
 
@@ -75,6 +89,9 @@ export interface TaskDeltaClient {
 export function createTaskDeltaClient(deps: TaskDeltaClientDeps): TaskDeltaClient {
   const now = deps.now ?? (() => Date.now());
   let list: Task[] = [];
+  let held = new Map<string, Task>();
+  let snapshotAt = Number.NEGATIVE_INFINITY;
+  const keyOf = (): string => taskFilterKey(deps.getOpts(), held);
   let cursor: string | null = null;
   let cursorKey: string | null = null;
   let prevIds: Set<string> | null = null;
@@ -85,8 +102,9 @@ export function createTaskDeltaClient(deps: TaskDeltaClientDeps): TaskDeltaClien
 
   async function fetchOnce(): Promise<Task[] | null> {
     const opts = deps.getOpts();
-    const key = taskFilterKey(opts);
+    const key = taskFilterKey(opts, held);
     if (cursorKey !== key) cursor = null;
+    if (cursor !== null && now() - snapshotAt >= TASK_FULL_RESYNC_MS) cursor = null;
     const since = cursor;
     lastStart = now();
     let body: TaskDelta | Task[];
@@ -97,24 +115,25 @@ export function createTaskDeltaClient(deps: TaskDeltaClientDeps): TaskDeltaClien
     }
     // The view changed what the board carries while this was in flight: this
     // answer is for another filter. Drop it and ask again under the new one.
-    if (taskFilterKey(deps.getOpts()) !== key) return fetchOnce();
+    if (keyOf() !== key) return fetchOnce();
 
-    let archivedIds: string[];
     if (isTaskDelta(body)) {
       list = applyTaskDelta(list, body, { cache: deps.cache });
       cursor = body.cursor;
-      cursorKey = key;
-      archivedIds = body.tasks.filter((t) => t.archivedAt != null).map((t) => t.id);
+      if (body.snapshot) snapshotAt = now();
     } else if (Array.isArray(body)) {
       // An older core ignoring `delta=1`: a full list, no cursor to hold.
       list = reconcileById(list, body, (t) => t.id, deps.cache);
       cursor = null;
       cursorKey = null;
-      archivedIds = body.filter((t) => t.archivedAt != null).map((t) => t.id);
     } else {
       return null;
     }
-    const nextIds = new Set(list.map((t) => t.id));
+    held = new Map(list.map((t) => [t.id, t]));
+    // Stored against the post-apply held list, so the next fetch's key matches.
+    if (cursor !== null) cursorKey = taskFilterKey(opts, held);
+    const nextIds = new Set(held.keys());
+    const archivedIds = list.filter((t) => t.archivedAt != null).map((t) => t.id);
     const vanishedIds = prevIds ? [...prevIds].filter((id) => !nextIds.has(id)) : [];
     prevIds = nextIds;
     deps.commit(list);
@@ -133,10 +152,13 @@ export function createTaskDeltaClient(deps: TaskDeltaClientDeps): TaskDeltaClien
   function refresh(): Promise<Task[] | null> {
     if (!current) return start();
     if (!queued) {
-      queued = current.then(() => {
+      // `finally` semantics: a rejected in-flight fetch must never leave
+      // `queued` set, or every later refresh() would share a dead promise.
+      const run = (): Promise<Task[] | null> => {
         queued = null;
         return start();
-      });
+      };
+      queued = current.then(run, run);
     }
     return queued;
   }
@@ -144,7 +166,7 @@ export function createTaskDeltaClient(deps: TaskDeltaClientDeps): TaskDeltaClien
   return {
     refresh,
     notify(c) {
-      if (cursor !== null && c === cursor && cursorKey === taskFilterKey(deps.getOpts())) return;
+      if (cursor !== null && c === cursor && cursorKey === keyOf()) return;
       void refresh();
     },
     poll() {

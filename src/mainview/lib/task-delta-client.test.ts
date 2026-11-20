@@ -1,6 +1,7 @@
 import { expect, test } from "bun:test";
 import type { Task, TaskDelta, TaskListOptions } from "../../shared/types.ts";
 import {
+  TASK_FULL_RESYNC_MS,
   TASK_POLL_CONNECTED_MS,
   TASK_POLL_DISCONNECTED_MS,
   createTaskDeltaClient,
@@ -83,7 +84,7 @@ test("the cursor is dropped when the filter changes, and a stale answer is re-fe
   h.calls[0]!.resolve(delta({ cursor: "c1", snapshot: true, tasks: [task("a", 20)] }));
   await p1;
 
-  h.setOpts({ archived: "exclude", keep: ["a"] });
+  h.setOpts({ archived: "exclude", keep: ["x"] }); // not held: needs keeping
   const p2 = h.client.refresh();
   expect(h.calls[1]!.since).toBeNull(); // new keep set: no cursor sent
   // The filter changes again while that is in flight: its answer is discarded.
@@ -201,4 +202,88 @@ test("the safety poll runs every 15 s while connected and every 2 s while not", 
   h.client.poll();
   h.client.poll();
   expect(h.calls.length).toBe(4);
+});
+
+test("S1: keeping an ACTIVE task keeps the cursor; keeping an archived one drops it", async () => {
+  const h = harness({ archived: "exclude", keep: [] });
+  const p1 = h.client.refresh();
+  h.calls[0]!.resolve(delta({ cursor: "c1", snapshot: true, tasks: [task("a", 20), task("b", 10, { archivedAt: 5 })] }));
+  await p1;
+
+  h.setOpts({ archived: "exclude", keep: ["a"] }); // open an active task
+  const p2 = h.client.refresh();
+  expect(h.calls[1]!.since).toBe("c1");
+  expect(h.calls[1]!.opts.keep).toEqual(["a"]); // the server still gets the full set
+  h.calls[1]!.resolve(delta({ cursor: "c2" }));
+  await p2;
+
+  h.setOpts({ archived: "exclude", keep: ["a", "b"] }); // an archived one needs keeping
+  const p3 = h.client.refresh();
+  expect(h.calls[2]!.since).toBeNull();
+  h.calls[2]!.resolve(delta({ cursor: "c3", snapshot: true, tasks: [task("a", 20), task("b", 10, { archivedAt: 5 })] }));
+  await p3;
+  h.setOpts({ archived: "exclude", keep: ["b"] }); // closing the active one: no change
+  void h.client.refresh();
+  expect(h.calls[3]!.since).toBe("c3");
+});
+
+test("S2: a held cursor is dropped for a full snapshot after the resync interval", async () => {
+  const h = harness();
+  const p1 = h.client.refresh();
+  h.calls[0]!.resolve(delta({ cursor: "c1", snapshot: true, tasks: [task("a", 20)] }));
+  await p1;
+  h.advance(TASK_FULL_RESYNC_MS - 1);
+  const p2 = h.client.refresh();
+  expect(h.calls[1]!.since).toBe("c1");
+  h.calls[1]!.resolve(delta({ cursor: "c2" }));
+  await p2;
+  h.advance(2);
+  const p3 = h.client.refresh();
+  expect(h.calls[2]!.since).toBeNull();
+  const a = h.client.list[0]!;
+  h.calls[2]!.resolve(delta({ cursor: "c3", snapshot: true, tasks: [task("a", 20)] }));
+  await p3;
+  expect(h.client.list[0]).toBe(a); // identity preserved across the resync
+  const p4 = h.client.refresh();
+  expect(h.calls[3]!.since).toBe("c3"); // clock restarted at the snapshot
+  h.calls[3]!.resolve(delta({ cursor: "c4" }));
+  await p4;
+});
+
+test("N2: a rejecting in-flight fetch never wedges refresh coalescing", async () => {
+  const resolvers: Array<(v: TaskDelta) => void> = [];
+  let commits = 0;
+  const client = createTaskDeltaClient({
+    fetch: () => new Promise<TaskDelta>((res) => resolvers.push(res)),
+    getOpts: () => ({ archived: "include" }),
+    commit: () => { commits += 1; if (commits === 1) throw new Error("commit boom"); },
+    now: () => 0,
+  });
+  const p1 = client.refresh();
+  const q1 = client.refresh(); // queued behind p1
+  resolvers[0]!(delta({ cursor: "c1", snapshot: true, tasks: [task("a", 1)] }));
+  await p1.catch(() => {});
+  await tick();
+  expect(resolvers.length).toBe(2); // the follow-up ran although p1 rejected
+  resolvers[1]!(delta({ cursor: "c2", snapshot: true, tasks: [task("a", 1)] }));
+  expect((await q1)?.length).toBe(1);
+
+  const r2 = client.refresh();
+  const r3 = client.refresh();
+  resolvers[2]!(delta({ cursor: "c3", snapshot: true, tasks: [task("a", 1)] }));
+  await tick();
+  resolvers[3]!(delta({ cursor: "c4", snapshot: true, tasks: [task("a", 1)] }));
+  expect((await r2)?.length).toBe(1);
+  expect((await r3)?.length).toBe(1);
+});
+
+test("N3: archivedIds lists every archived row held, not only the fetched ones", async () => {
+  const h = harness({ archived: "include" });
+  const p1 = h.client.refresh();
+  h.calls[0]!.resolve(delta({ cursor: "c1", snapshot: true, tasks: [task("a", 20), task("b", 10, { archivedAt: 5 })] }));
+  await p1;
+  const p2 = h.client.refresh();
+  h.calls[1]!.resolve(delta({ cursor: "c2", tasks: [task("a", 20, { title: "x" })] }));
+  await p2;
+  expect(h.applied[1]!.archivedIds).toEqual(["b"]);
 });

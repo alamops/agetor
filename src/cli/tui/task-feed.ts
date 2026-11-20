@@ -20,7 +20,13 @@ export interface TaskFeedOptions {
   fetch: (filter: TaskListOptions, since: string | null) => Promise<TaskDelta | Task[]>;
   filter: TaskListOptions;
   onChange: (tasks: Task[]) => void;
+  /** Injected clock (ms), for the full-resync interval. */
+  now?: () => number;
 }
+
+/** A held cursor older than this is dropped at the next fetch, so a full
+ *  snapshot heals any revision or decoration the delta path missed. */
+export const TASK_FEED_FULL_RESYNC_MS = 5 * 60_000;
 
 export interface TaskFeed {
   /** Poll tick: fetch unless one is already in flight. */
@@ -38,6 +44,8 @@ export function createTaskFeed(opts: TaskFeedOptions): TaskFeed {
   let filter = opts.filter;
   let tasks: Task[] = [];
   let cursor: string | null = null;
+  const now = opts.now ?? (() => Date.now());
+  let snapshotAt = 0;
   let generation = 0;
   let inflight: Promise<void> | null = null;
   let rerun = false;
@@ -47,12 +55,14 @@ export function createTaskFeed(opts: TaskFeedOptions): TaskFeed {
   async function fetchOnce(): Promise<void> {
     const gen = generation;
     try {
+      if (cursor !== null && now() - snapshotAt >= TASK_FEED_FULL_RESYNC_MS) cursor = null;
       const body = await opts.fetch(filter, cursor);
       if (stopped || gen !== generation) return;
       let delta: TaskDelta;
       if (isTaskDelta(body)) {
         delta = body;
         cursor = body.cursor;
+        if (body.snapshot) snapshotAt = now();
       } else if (Array.isArray(body)) {
         cursor = null;
         delta = { format: "delta", cursor: "", snapshot: true, tasks: body, removedIds: [], decorations: {} };

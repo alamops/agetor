@@ -1,5 +1,5 @@
 import { test, expect } from "bun:test";
-import { createTaskFeed } from "./task-feed.ts";
+import { createTaskFeed, TASK_FEED_FULL_RESYNC_MS } from "./task-feed.ts";
 import type { Task, TaskDelta, TaskListOptions } from "../../shared/types.ts";
 
 const t = (id: string, createdAt: number, title = id): Task =>
@@ -170,4 +170,25 @@ test("a failed fetch keeps the last list and cursor", async () => {
   await feed.poll();
   expect(calls.map((c) => c.since)).toEqual([null, "c1", "c1"]);
   expect(feed.current().map((x) => x.id)).toEqual(["a"]);
+});
+
+test("a held cursor is dropped for a full snapshot after the resync interval", async () => {
+  let clock = 0;
+  const calls: Array<string | null> = [];
+  const feed = createTaskFeed({
+    filter: { archived: "exclude" },
+    now: () => clock,
+    fetch: async (_f, since) => {
+      calls.push(since);
+      return delta({ snapshot: since === null, cursor: "c" + calls.length, tasks: since === null ? [t("a", 1)] : [] });
+    },
+    onChange: () => {},
+  });
+  await feed.poll();
+  clock = TASK_FEED_FULL_RESYNC_MS - 1;
+  await feed.poll();
+  clock = TASK_FEED_FULL_RESYNC_MS + 1;
+  await feed.poll(); // resync: no cursor
+  await feed.poll(); // clock restarted at the snapshot
+  expect(calls).toEqual([null, "c1", null, "c3"]);
 });

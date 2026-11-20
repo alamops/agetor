@@ -1329,3 +1329,24 @@ test("the boot preload loads stored step parents, so the first card carries its 
     db.run(`DELETE FROM tasks WHERE id IN ('pre-parent', 'pre-step', 'pre-archived')`);
   }
 });
+
+test("the fallback parent lookup nudges the PARENT's decoration so its folded badge updates", async () => {
+  const { clearPipelineParentCacheForTests, cancelPendingForTask } = await import("./interactions.ts");
+  const { db } = await import("./db.ts");
+  const { currentDecorationRev, decorationChangedSince } = await import("./task-decoration-rev.ts");
+  await makeTaskWithCwd("fb-parent");
+  await makeTaskWithCwd("fb-step");
+  db.run(`UPDATE tasks SET pipeline_parent_id = 'fb-parent' WHERE id = 'fb-step'`);
+  try {
+    clearPipelineParentCacheForTests(); // the cache does not know the step
+    const before = currentDecorationRev();
+    await makePrompt("fb-step", "r1", "fp-fb-step");
+    // The registration itself marks only the step; the lookup settles later.
+    for (let i = 0; i < 50 && !(decorationChangedSince(before) ?? []).includes("fb-parent"); i++) await Bun.sleep(10);
+    expect(decorationChangedSince(before)).toContain("fb-parent");
+  } finally {
+    cancelPendingForTask("fb-step", "done");
+    clearPipelineParentCacheForTests();
+    db.run(`DELETE FROM tasks WHERE id IN ('fb-parent', 'fb-step')`);
+  }
+});
