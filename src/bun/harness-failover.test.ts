@@ -1254,3 +1254,112 @@ describe("a 1-member stack is inert (22a) and prepare moves record `unavailable`
     }
   });
 });
+
+// ── Claude accounts that are logged out are skipped like exhausted ones ────────
+// (docs/plans/claude-enter-to-confirm-prompts.md T8, owner decision D7.) The
+// probe is `claude auth status`; a stub `claude` reads a LOGGED_OUT marker in the
+// account's CLAUDE_CONFIG_DIR so each account's answer is scripted.
+describe("logged-out Claude accounts (claude auth status)", () => {
+  let savedBin: string | undefined;
+  let stubDir: string;
+  beforeAll(() => {
+    savedBin = process.env.AGETOR_CLAUDE_BIN;
+    stubDir = mkdtempSync(path.join(tmpdir(), "agetor-failover-claude-"));
+    const bin = path.join(stubDir, "claude");
+    writeFileSync(
+      bin,
+      `#!/bin/sh\n`
+        + `if [ "$1" = "--version" ]; then echo "2.1.326 (Claude Code)"; exit 0; fi\n`
+        + `if [ "$1" = "auth" ] && [ "$2" = "status" ]; then\n`
+        + `  if [ -f "$CLAUDE_CONFIG_DIR/LOGGED_OUT" ]; then echo '{"loggedIn": false}'; exit 1; fi\n`
+        + `  echo '{"loggedIn": true}'; exit 0\n`
+        + `fi\nexit 1\n`,
+      { mode: 0o755 },
+    );
+    process.env.AGETOR_CLAUDE_BIN = bin;
+  });
+  afterAll(() => {
+    if (savedBin === undefined) delete process.env.AGETOR_CLAUDE_BIN;
+    else process.env.AGETOR_CLAUDE_BIN = savedBin;
+    rmSync(stubDir, { recursive: true, force: true });
+  });
+
+  async function probedAccount(loggedOut: boolean): Promise<string> {
+    const id = account();
+    const home = path.join(process.env.AGETOR_DATA_DIR!, "homes", id);
+    writeFileSync(path.join(home, ".claude.json"), "{}");
+    if (loggedOut) writeFileSync(path.join(home, "LOGGED_OUT"), "");
+    return id;
+  }
+  const clearProbeCache = async () => (await import("./agent-status.ts")).__testing.clearStatusCache();
+
+  test("a logged-out middle member is skipped at a swap, with the status line", async () => {
+    await clearProbeCache();
+    const a = await probedAccount(false);
+    const b = await probedAccount(true);
+    const c = await probedAccount(false);
+    const stack = stacks.harnessStacks.create({ label: "lo-skip", kind: "claude-code", members: [a, b, c] });
+    const task = dbm.tasks.get(makeTask(a))!;
+    await fo.warmStackLogins(task);
+    const plan = fo.planNextMember(task);
+    expect(plan.kind).toBe("next");
+    if (plan.kind !== "next") return;
+    expect(plan.member.harnessId).toBe(c);
+    expect(plan.skipped.map((s) => s.reason)).toContain("not logged in");
+    expect(fo.loggedOutSkipLines(plan.skipped)).toEqual([`skipped ${b}: not logged in`]);
+    stacks.harnessStacks.delete(stack.id);
+  });
+
+  test("an unknown login state (no probe answer yet) is used: fail-open", async () => {
+    await clearProbeCache();
+    const a = await probedAccount(false);
+    const b = await probedAccount(true);
+    const stack = stacks.harnessStacks.create({ label: "lo-open", kind: "claude-code", members: [a, b] });
+    const task = dbm.tasks.get(makeTask(a))!;
+    // No warm-up: nothing is cached, so b cannot be told apart and is NOT skipped.
+    const plan = fo.planNextMember(task);
+    expect(plan.kind).toBe("next");
+    if (plan.kind === "next") expect(plan.member.harnessId).toBe(b);
+    stacks.harnessStacks.delete(stack.id);
+  });
+
+  test("memberUnusableReason reads the warmed probe", async () => {
+    await clearProbeCache();
+    const a = await probedAccount(false);
+    const b = await probedAccount(true);
+    const stack = stacks.harnessStacks.create({ label: "lo-reason", kind: "claude-code", members: [a, b] });
+    const task = dbm.tasks.get(makeTask(a))!;
+    await fo.warmStackLogins(task);
+    expect(fo.memberUnusableReason({ harnessId: b, enabled: true, label: b }, task)).toBe("not logged in");
+    expect(fo.memberUnusableReason({ harnessId: a, enabled: true, label: a }, task)).toBeNull();
+    stacks.harnessStacks.delete(stack.id);
+  });
+
+  test("every account logged out: the start is refused with the login hint", async () => {
+    await clearProbeCache();
+    const a = await probedAccount(true);
+    const b = await probedAccount(true);
+    const stack = stacks.harnessStacks.create({ label: "lo-all", kind: "claude-code", members: [a, b] });
+    const taskId = makeTask(a);
+    const result = await fo.prepareTaskHarness(taskId, { manual: true });
+    expect(result.ok).toBe(false);
+    expect(result.ok === false && result.error).toContain("not logged in");
+    expect(result.ok === false && result.error).toContain("claude auth login");
+    stacks.harnessStacks.delete(stack.id);
+  });
+
+  test("a logged-out CURRENT account moves the task to a logged-in backup at start", async () => {
+    await clearProbeCache();
+    const a = await probedAccount(true);
+    const b = await probedAccount(false);
+    const stack = stacks.harnessStacks.create({ label: "lo-move", kind: "claude-code", members: [a, b] });
+    const taskId = makeTask(a);
+    const result = await fo.prepareTaskHarness(taskId, { manual: true });
+    expect(result.ok).toBe(true);
+    expect(result.ok && result.moved?.to).toBe(b);
+    // The current account is named too: the walk starts after it, so
+    // `plan.skipped` alone would leave the move unexplained.
+    expect(result.ok && result.warnings).toContain(`skipped ${a}: not logged in`);
+    stacks.harnessStacks.delete(stack.id);
+  });
+});

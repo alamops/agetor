@@ -102,6 +102,7 @@ import type {
   TaskReference,
   TaskType,
   TerminalTab,
+  TmuxPromptAnswerBody,
   UpdateStatus,
   WorktreeGitStatus,
   WorktreeInfo,
@@ -301,7 +302,17 @@ export interface PendingTmuxPrompt {
    *  Chrome startup prompt). Display-only: `choices[].key` is still what the
    *  answer route validates. See `tmuxChoiceLabel`. */
   hideKeys?: boolean;
+  /** What the card asks of the user (absent ≡ `"choice"`): `"enter"` is an
+   *  Enter-only screen (a Continue button), `"code"` the OAuth code prompt (a
+   *  one-line text box). Both carry empty `choices`. */
+  answerKind?: "choice" | "enter" | "code";
+  /** True when the dialog refused the first confirm and the card was
+   *  re-registered: the first click did not take, choose again. */
+  held?: boolean;
 }
+
+/** Body of `POST /tmux-prompts/:id/answer` (the shared exact-one type). */
+export type { TmuxPromptAnswerBody };
 
 /** The ACP tool call an fx permission request is asking about — mirrors
  *  `FxPermissionToolCall` on the server (`src/bun/interactions.ts`). Only
@@ -2342,11 +2353,13 @@ export const api = {
   /** Answer a tmux-pane-scraped REPL prompt. `key` must be one of the
    *  keys advertised on the request — the server validates against the
    *  recorded set before injecting keystrokes via `tmux send-keys`. */
-  answerTmuxPrompt: (id: string, body: { key: string } | { reject: true }) =>
-    j<{ ok: boolean }>(`/tmux-prompts/${id}/answer`, {
+  answerTmuxPrompt: (id: string, body: TmuxPromptAnswerBody) =>
+    // `retry: false`: a replayed answer would type the keys (an Enter, an OAuth
+    // code) into the pane a second time.
+    j<{ ok: boolean; error?: string; held?: boolean }>(`/tmux-prompts/${id}/answer`, {
       method: "POST",
       body: JSON.stringify(body),
-    }),
+    }, { retry: false }),
   /** Answer an fx ACP permission request. `{ optionId }` must be one of the
    *  option ids the request advertised — the server validates against the
    *  recorded set before echoing it back into the ACP RPC reply.

@@ -1,4 +1,5 @@
 import { useEffect, useMemo, useRef, useState } from "react";
+import type { ReactNode } from "react";
 import { createPortal } from "react-dom";
 import { ChevronLeft, Loader2, Minus, Monitor, Moon, Plus, Sun, X } from "lucide-react";
 import { toast } from "sonner";
@@ -26,7 +27,6 @@ import { useTheme } from "@/components/theme-provider";
 import { isMacPlatform } from "@/lib/platform";
 import { IDENTIFIER_INPUT_PROPS } from "@/lib/identifier-input";
 import { ONBOARDING_DISMISSED_PREF } from "@/lib/onboarding";
-import { FX_AUTO_RESUME_MAX, parseFxAutoResumeDelayInput } from "@/lib/fx-auto-resume-prefs";
 import {
   ARCHIVED_HISTORY_RETENTION_PREF,
   formatBytes,
@@ -62,8 +62,6 @@ import {
   FONT_SIZE_DEFAULT,
   FONT_SIZE_MAX,
   FONT_SIZE_MIN,
-  FX_AUTO_RESUME_MAX_DELAY_SEC,
-  FX_AUTO_RESUME_MIN_DELAY_SEC,
   HARNESS_TEMPLATES,
   THEME_PREFERENCES,
   type AgentKind,
@@ -75,7 +73,6 @@ import {
   type HarnessStack,
   type HarnessTemplate,
   type ThemePreference,
-  CLAUDE_SESSIONS_LAUNCH_SCAN_PREF,
 } from "../../../shared/types.ts";
 
 // Computed once at module load, same convention as `isMacPlatform()` in
@@ -831,11 +828,6 @@ export function SettingsDialog({ open, onClose, stickyUserMessages, onStickyUser
                       onPickDefault={onPickDefault}
                       stickyUserMessages={stickyUserMessages}
                       onStickyUserMessagesChange={onStickyUserMessagesChange}
-                      fxAutoResume={fxAutoResume}
-                      onFxAutoResumeChange={onFxAutoResumeChange}
-                      tmuxSource={tmuxSource}
-                      bundledTmuxAvailable={bundledTmuxAvailable}
-                      onPickTmuxSource={onPickTmuxSource}
                       disclaimSpawnedAgents={disclaimSpawnedAgents}
                       onDisclaimSpawnedAgentsChange={onDisclaimSpawnedAgentsChange}
                       onClose={closeModal}
@@ -875,6 +867,13 @@ export function SettingsDialog({ open, onClose, stickyUserMessages, onStickyUser
                       pendingProfileMcp={pendingProfileMcp}
                       onClearCooldown={onClearCooldown}
                       onRestore={onRestoreMirror}
+                      behaviour={{
+                        tmuxSource,
+                        bundledTmuxAvailable,
+                        onPickTmuxSource,
+                        fxAutoResume,
+                        onFxAutoResumeChange,
+                      }}
                     />
                   );
                 case "agents":
@@ -1281,17 +1280,24 @@ function ArchivedHistorySection() {
   );
 }
 
+/** A General-page group heading. Groups: Appearance, Tasks, Privacy & security,
+ *  Background, Getting started. Harness-specific rows live on the Harnesses
+ *  page, under Behaviour. */
+function SettingsGroup({ title, children }: { title: string; children: ReactNode }) {
+  return (
+    <section className="space-y-3" aria-label={title} data-testid={`settings-group-${title.toLowerCase().replace(/[^a-z]+/g, "-")}`}>
+      <h3 className="border-b pb-1 text-[11px] font-medium uppercase tracking-wide text-muted-foreground">{title}</h3>
+      {children}
+    </section>
+  );
+}
+
 function GeneralSection({
   payload,
   defaultHarness,
   onPickDefault,
   stickyUserMessages,
   onStickyUserMessagesChange,
-  fxAutoResume,
-  onFxAutoResumeChange,
-  tmuxSource,
-  bundledTmuxAvailable,
-  onPickTmuxSource,
   disclaimSpawnedAgents,
   onDisclaimSpawnedAgentsChange,
   onClose,
@@ -1301,11 +1307,6 @@ function GeneralSection({
   onPickDefault: (id: string) => void;
   stickyUserMessages: boolean;
   onStickyUserMessagesChange: (sticky: boolean) => void;
-  fxAutoResume: { enabled: boolean; delaySec: number };
-  onFxAutoResumeChange: (next: { enabled: boolean; delaySec: number }) => void;
-  tmuxSource: "system" | "bundled";
-  bundledTmuxAvailable: boolean;
-  onPickTmuxSource: (source: "system" | "bundled") => void;
   disclaimSpawnedAgents: boolean;
   onDisclaimSpawnedAgentsChange: (enabled: boolean) => void;
   /** Closes the Settings dialog — used by "Show getting started guide" so the
@@ -1316,295 +1317,179 @@ function GeneralSection({
   // soft-deleted harness can't silently become the default for new tasks.
   const enabledHarnesses = payload.harnesses.filter((h) => h.enabled);
   const { preference: themePreference, setPreference: setThemePreference } = useTheme();
-  const [launchScan, setLaunchScan] = useState(true);
-  const launchScanTouchedRef = useRef(false);
-  const launchScanDesiredRef = useRef<boolean | null>(null);
-  const launchScanWriteRef = useRef(Promise.resolve());
-  useEffect(() => {
-    let cancelled = false;
-    void api.listPreferences().then((prefs) => {
-      if (cancelled || launchScanTouchedRef.current) return;
-      setLaunchScan(prefs[CLAUDE_SESSIONS_LAUNCH_SCAN_PREF] !== "0");
-    }).catch(() => { /* default stays on */ });
-    return () => { cancelled = true; };
-  }, []);
-  const setLaunchScanPref = (on: boolean) => {
-    launchScanTouchedRef.current = true;
-    launchScanDesiredRef.current = on;
-    setLaunchScan(on);
-    // Writes run one at a time. A toggle that lands while an older request
-    // is queued skips that request, so the stored value is the last switch.
-    launchScanWriteRef.current = launchScanWriteRef.current.then(async () => {
-      if (launchScanDesiredRef.current !== on) return;
-      try {
-        await api.setPreference(CLAUDE_SESSIONS_LAUNCH_SCAN_PREF, on ? "1" : "0");
-      } catch {
-        if (launchScanDesiredRef.current !== on) return;
-        launchScanDesiredRef.current = !on;
-        setLaunchScan(!on);
-      }
-    });
-  };
   const { percent: fontSizePercent, increase: increaseFontSize, decrease: decreaseFontSize, reset: resetFontSize } = useFontSize();
   const canDecreaseFontSize = fontSizePercent > FONT_SIZE_MIN;
   const canIncreaseFontSize = fontSizePercent < FONT_SIZE_MAX;
   const canResetFontSize = fontSizePercent !== FONT_SIZE_DEFAULT;
   const [replayingOnboarding, setReplayingOnboarding] = useState(false);
-  // Local text mirror of `fxAutoResume.delaySec` so the field can hold an
-  // in-progress keystroke (e.g. a momentarily-empty box while retyping)
-  // without that draft round-tripping through the parent/preferences store
-  // on every keystroke. Committed (clamped) on blur or Enter; resynced
-  // whenever the prop changes from outside (e.g. another Settings instance,
-  // or a revert on write failure).
-  const [fxDelayInput, setFxDelayInput] = useState(String(fxAutoResume.delaySec));
-  useEffect(() => {
-    setFxDelayInput(String(fxAutoResume.delaySec));
-  }, [fxAutoResume.delaySec]);
-  const commitFxDelay = () => {
-    const clamped = parseFxAutoResumeDelayInput(fxDelayInput);
-    setFxDelayInput(String(clamped));
-    if (clamped !== fxAutoResume.delaySec) {
-      onFxAutoResumeChange({ ...fxAutoResume, delaySec: clamped });
-    }
-  };
   return (
-    <div className="space-y-4 pt-3 text-sm">
-      <section className="space-y-1">
-        <label className="text-xs text-muted-foreground">Default harness for new tasks</label>
-        <Select value={defaultHarness} onChange={(e) => onPickDefault(e.target.value)}>
-          {enabledHarnesses.map((h) => (
-            <option key={h.id} value={h.id}>
-              {h.label}{" "}
-              {h.label.toLowerCase() !== h.kind ? `(${h.kind})` : ""}
-            </option>
-          ))}
-        </Select>
-      </section>
+    <div className="space-y-6 pt-3 text-sm">
+      <SettingsGroup title="Appearance">
+        <section className="space-y-1">
+          <label className="text-xs text-muted-foreground">Theme</label>
+          <div className="grid grid-cols-3 gap-1">
+            {THEME_PREFERENCES.map((t) => {
+              const Icon = THEME_PREFERENCE_ICON[t.id];
+              return (
+                <Button
+                  key={t.id}
+                  size="sm"
+                  variant={themePreference === t.id ? "default" : "outline"}
+                  onClick={() => setThemePreference(t.id)}
+                  className="justify-start"
+                >
+                  <Icon className="mr-1.5 size-3.5" />
+                  {t.label}
+                </Button>
+              );
+            })}
+          </div>
+          <p className="text-[11px] text-muted-foreground">
+            Auto follows your system's appearance and switches live if it changes.
+          </p>
+        </section>
 
-      <section className="space-y-1">
-        <label className="text-xs text-muted-foreground">tmux for Claude Code</label>
-        <Select
-          value={tmuxSource}
-          onChange={(e) => onPickTmuxSource(e.target.value as "system" | "bundled")}
-        >
-          <option value="system">System tmux (from PATH)</option>
-          <option value="bundled" disabled={!bundledTmuxAvailable}>
-            {bundledTmuxAvailable
-              ? "Bundled tmux (shipped with Agetor)"
-              : "Bundled tmux — not available in this build"}
-          </option>
-        </Select>
-        <p className="text-[11px] text-muted-foreground">
-          Claude Code runs through a tmux session per task. Switch to the bundled
-          binary if you don't want to install tmux system-wide.
-        </p>
-      </section>
+        <section className="space-y-1">
+          <label className="text-xs text-muted-foreground">Font size</label>
+          <div role="group" aria-label="Font size" className="flex items-center gap-1.5">
+            <Button
+              size="sm"
+              variant="outline"
+              className="w-8 px-0 aria-disabled:cursor-default aria-disabled:opacity-50"
+              aria-label="Decrease font size"
+              aria-disabled={!canDecreaseFontSize}
+              onClick={() => {
+                if (!canDecreaseFontSize) return;
+                decreaseFontSize({ silent: true });
+              }}
+            >
+              <Minus className="size-3.5" />
+            </Button>
+            <span role="status" aria-live="polite" className="w-10 text-center text-xs tabular-nums">
+              {fontSizePercent}%
+            </span>
+            <Button
+              size="sm"
+              variant="outline"
+              className="w-8 px-0 aria-disabled:cursor-default aria-disabled:opacity-50"
+              aria-label="Increase font size"
+              aria-disabled={!canIncreaseFontSize}
+              onClick={() => {
+                if (!canIncreaseFontSize) return;
+                increaseFontSize({ silent: true });
+              }}
+            >
+              <Plus className="size-3.5" />
+            </Button>
+            <Button
+              size="sm"
+              variant="ghost"
+              className="aria-disabled:cursor-default aria-disabled:opacity-50"
+              aria-label="Reset font size"
+              aria-disabled={!canResetFontSize}
+              onClick={() => {
+                if (!canResetFontSize) return;
+                resetFontSize({ silent: true });
+              }}
+            >
+              Reset
+            </Button>
+          </div>
+          <p className="text-[11px] text-muted-foreground">{FONT_SIZE_HINT}</p>
+        </section>
 
-      <section className="space-y-1">
-        <label className="text-xs text-muted-foreground">Theme</label>
-        <div className="grid grid-cols-3 gap-1">
-          {THEME_PREFERENCES.map((t) => {
-            const Icon = THEME_PREFERENCE_ICON[t.id];
-            return (
-              <Button
-                key={t.id}
-                size="sm"
-                variant={themePreference === t.id ? "default" : "outline"}
-                onClick={() => setThemePreference(t.id)}
-                className="justify-start"
-              >
-                <Icon className="mr-1.5 size-3.5" />
-                {t.label}
-              </Button>
-            );
-          })}
-        </div>
-        <p className="text-[11px] text-muted-foreground">
-          Auto follows your system's appearance and switches live if it changes.
-        </p>
-      </section>
+        <section className="space-y-1">
+          <div className="flex items-center justify-between gap-4">
+            <label htmlFor="sticky-user-messages" className="text-xs text-muted-foreground">
+              Sticky user messages
+            </label>
+            <Switch
+              id="sticky-user-messages"
+              checked={stickyUserMessages}
+              onCheckedChange={onStickyUserMessagesChange}
+              aria-label="Sticky user messages"
+            />
+          </div>
+          <p className="text-[11px] text-muted-foreground">
+            Keep your latest sent message visible while its response scrolls. Turn this off for a standard chat list.
+          </p>
+        </section>
+      </SettingsGroup>
 
-      <section className="space-y-1">
-        <label className="text-xs text-muted-foreground">Font size</label>
-        <div role="group" aria-label="Font size" className="flex items-center gap-1.5">
-          <Button
-            size="sm"
-            variant="outline"
-            className="w-8 px-0 aria-disabled:cursor-default aria-disabled:opacity-50"
-            aria-label="Decrease font size"
-            aria-disabled={!canDecreaseFontSize}
-            onClick={() => {
-              if (!canDecreaseFontSize) return;
-              decreaseFontSize({ silent: true });
-            }}
-          >
-            <Minus className="size-3.5" />
-          </Button>
-          <span role="status" aria-live="polite" className="w-10 text-center text-xs tabular-nums">
-            {fontSizePercent}%
-          </span>
-          <Button
-            size="sm"
-            variant="outline"
-            className="w-8 px-0 aria-disabled:cursor-default aria-disabled:opacity-50"
-            aria-label="Increase font size"
-            aria-disabled={!canIncreaseFontSize}
-            onClick={() => {
-              if (!canIncreaseFontSize) return;
-              increaseFontSize({ silent: true });
-            }}
-          >
-            <Plus className="size-3.5" />
-          </Button>
-          <Button
-            size="sm"
-            variant="ghost"
-            className="aria-disabled:cursor-default aria-disabled:opacity-50"
-            aria-label="Reset font size"
-            aria-disabled={!canResetFontSize}
-            onClick={() => {
-              if (!canResetFontSize) return;
-              resetFontSize({ silent: true });
-            }}
-          >
-            Reset
-          </Button>
-        </div>
-        <p className="text-[11px] text-muted-foreground">{FONT_SIZE_HINT}</p>
-      </section>
+      <SettingsGroup title="Tasks">
+        <section className="space-y-1">
+          <label className="text-xs text-muted-foreground">Default harness for new tasks</label>
+          <Select value={defaultHarness} onChange={(e) => onPickDefault(e.target.value)}>
+            {enabledHarnesses.map((h) => (
+              <option key={h.id} value={h.id}>
+                {h.label}{" "}
+                {h.label.toLowerCase() !== h.kind ? `(${h.kind})` : ""}
+              </option>
+            ))}
+          </Select>
+        </section>
 
-      <BackgroundSection />
+        <ArchivedHistorySection />
+      </SettingsGroup>
 
-      <section className="space-y-1">
-        <div className="flex items-center justify-between gap-4">
-          <label htmlFor="claude-sessions-launch-scan" className="text-xs text-muted-foreground">
-            Look for Claude Code and OpenCode sessions on launch
-          </label>
-          <Switch
-            id="claude-sessions-launch-scan"
-            data-testid="claude-sessions-launch-scan"
-            checked={launchScan}
-            onCheckedChange={setLaunchScanPref}
-            aria-label="Look for Claude Code and OpenCode sessions on launch"
-          />
-        </div>
-        <p className="text-[11px] text-muted-foreground">
-          On startup, notice Claude Code and OpenCode sessions that were started outside Agetor so you can import them.
-        </p>
-      </section>
+      <SettingsGroup title="Privacy & security">
+        <section className="space-y-1">
+          <div className="flex items-center justify-between gap-4">
+            <label htmlFor="disclaim-spawned-agents" className="text-xs text-muted-foreground">
+              Keep Agetor's macOS permissions away from agents (macOS)
+            </label>
+            <Switch
+              id="disclaim-spawned-agents"
+              checked={disclaimSpawnedAgents}
+              // keep in sync with DISCLAIM_PREF_KEY in src/bun/disclaim.ts
+              onCheckedChange={onDisclaimSpawnedAgentsChange}
+              aria-label="Keep Agetor's macOS permissions away from agents (macOS)"
+            />
+          </div>
+          <p className="text-[11px] text-muted-foreground">
+            Agents and the programs Agetor runs in the background, such as git and harness checks, ask for macOS
+            permissions under their own name instead of Agetor's, so a grant sticks after you allow it once. Only this
+            switch can turn it off, and Agetor asks again at the next launch.
+          </p>
+        </section>
+      </SettingsGroup>
 
-      <section className="space-y-1">
-        <div className="flex items-center justify-between gap-4">
-          <label htmlFor="sticky-user-messages" className="text-xs text-muted-foreground">
-            Sticky user messages
-          </label>
-          <Switch
-            id="sticky-user-messages"
-            checked={stickyUserMessages}
-            onCheckedChange={onStickyUserMessagesChange}
-            aria-label="Sticky user messages"
-          />
-        </div>
-        <p className="text-[11px] text-muted-foreground">
-          Keep your latest sent message visible while its response scrolls. Turn this off for a standard chat list.
-        </p>
-      </section>
+      <SettingsGroup title="Background">
+        <BackgroundSection />
+      </SettingsGroup>
 
-      <section className="space-y-1">
-        <div className="flex items-center justify-between gap-4">
-          <label htmlFor="disclaim-spawned-agents" className="text-xs text-muted-foreground">
-            Keep Agetor's macOS permissions away from agents (macOS)
-          </label>
-          <Switch
-            id="disclaim-spawned-agents"
-            checked={disclaimSpawnedAgents}
-            // keep in sync with DISCLAIM_PREF_KEY in src/bun/disclaim.ts
-            onCheckedChange={onDisclaimSpawnedAgentsChange}
-            aria-label="Keep Agetor's macOS permissions away from agents (macOS)"
-          />
-        </div>
-        <p className="text-[11px] text-muted-foreground">
-          Agents and the programs Agetor runs in the background, such as git and harness checks, ask for macOS
-          permissions under their own name instead of Agetor's, so a grant sticks after you allow it once. Only this
-          switch can turn it off, and Agetor asks again at the next launch.
-        </p>
-      </section>
-
-      <section className="space-y-1">
-        <div className="flex items-center justify-between gap-4">
-          <label htmlFor="fx-auto-resume" className="text-xs text-muted-foreground">
-            Auto-resume fx after a rate limit
-          </label>
-          <Switch
-            id="fx-auto-resume"
-            data-testid="settings-fx-auto-resume"
-            checked={fxAutoResume.enabled}
-            onCheckedChange={(enabled) => onFxAutoResumeChange({ ...fxAutoResume, enabled })}
-            aria-label="Auto-resume fx after a rate limit"
-          />
-        </div>
-        <p className="text-[11px] text-muted-foreground">
-          When fx pauses after repeated Gateway 429s, Agetor resumes the response automatically, up to {FX_AUTO_RESUME_MAX} times per pause.
-        </p>
-        <div className="flex items-center justify-between gap-4 pt-1">
-          <label htmlFor="fx-auto-resume-delay" className="text-xs text-muted-foreground">
-            Auto-resume delay (seconds)
-          </label>
-          <Input
-            id="fx-auto-resume-delay"
-            data-testid="settings-fx-auto-resume-delay"
-            type="number"
-            min={FX_AUTO_RESUME_MIN_DELAY_SEC}
-            max={FX_AUTO_RESUME_MAX_DELAY_SEC}
-            step={10}
-            className="w-24"
-            disabled={!fxAutoResume.enabled}
-            value={fxDelayInput}
-            onChange={(e) => setFxDelayInput(e.target.value)}
-            onBlur={commitFxDelay}
-            onKeyDown={(e) => {
-              if (e.key !== "Enter") return;
-              e.preventDefault();
-              commitFxDelay();
-              e.currentTarget.blur();
-            }}
-          />
-        </div>
-      </section>
-
-      <ArchivedHistorySection />
-
-      <section className="space-y-1">
-        <label className="text-xs text-muted-foreground">Getting started</label>
-        <div>
-          <Button
-            variant="outline"
-            size="sm"
-            data-testid="settings-replay-onboarding"
-            disabled={replayingOnboarding}
-            onClick={async () => {
-              if (replayingOnboarding) return;
-              setReplayingOnboarding(true);
-              // Await the write before closing — App re-reads preferences on
-              // close, so a fire-and-forget PUT can lose the race against
-              // that GET and silently discard the replay.
-              await api.setPreference(ONBOARDING_DISMISSED_PREF, "false").catch(() => {
-                // Best-effort, matching the theme/defaultHarness write idiom
-                // above — the checklist will simply not reappear if this
-                // silently fails, which is a minor papercut, not a hard
-                // error worth surfacing.
-              });
-              setReplayingOnboarding(false);
-              onClose();
-            }}
-          >
-            Show getting started guide
-          </Button>
-        </div>
-        <p className="text-[11px] text-muted-foreground">
-          Bring back the onboarding checklist.
-        </p>
-      </section>
+      <SettingsGroup title="Getting started">
+        <section className="space-y-1">
+          <div>
+            <Button
+              variant="outline"
+              size="sm"
+              data-testid="settings-replay-onboarding"
+              disabled={replayingOnboarding}
+              onClick={async () => {
+                if (replayingOnboarding) return;
+                setReplayingOnboarding(true);
+                // Await the write before closing — App re-reads preferences on
+                // close, so a fire-and-forget PUT can lose the race against
+                // that GET and silently discard the replay.
+                await api.setPreference(ONBOARDING_DISMISSED_PREF, "false").catch(() => {
+                  // Best-effort, matching the theme/defaultHarness write idiom
+                  // above — the checklist will simply not reappear if this
+                  // silently fails, which is a minor papercut, not a hard
+                  // error worth surfacing.
+                });
+                setReplayingOnboarding(false);
+                onClose();
+              }}
+            >
+              Show getting started guide
+            </Button>
+          </div>
+          <p className="text-[11px] text-muted-foreground">
+            Bring back the onboarding checklist.
+          </p>
+        </section>
+      </SettingsGroup>
     </div>
   );
 }

@@ -7467,3 +7467,15 @@ export function clampFontSizePercent(raw: unknown): number {
   const rounded = Math.round(n);
   return Math.min(FONT_SIZE_MAX, Math.max(FONT_SIZE_MIN, rounded));
 }
+
+/**
+ * Body of `POST /tmux-prompts/:id/answer`: EXACTLY one member, which the type
+ * enforces (the others are `never`) and the route re-checks for untyped
+ * callers. `enter` only on an `answerKind: "enter"` card, `code` only on an
+ * `answerKind: "code"` card (one line, at most 512 characters).
+ */
+export type TmuxPromptAnswerBody =
+  | { key: string; reject?: never; enter?: never; code?: never }
+  | { reject: true; key?: never; enter?: never; code?: never }
+  | { enter: true; key?: never; reject?: never; code?: never }
+  | { code: string; key?: never; reject?: never; enter?: never };

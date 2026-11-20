@@ -719,6 +719,104 @@ async function withScrapeTask(
   }
 }
 
+test("scrapeOnce masks a typed OAuth code before cutting a card window: a wrapped code whose prompt line is above the window never reaches a card", async () => {
+  const codeRows = Array.from({ length: 6 }, (_, i) => `SECRETCODE${i}`.padEnd(80, "x"));
+  const pane = [
+    " Browser didn't open? Use the url below to sign in",
+    " Paste code here if prompted > SECRETCODEhead",
+    ...codeRows,
+    "",
+    " Login failed: the code was not accepted.",
+    " Check that you copied the whole code.",
+    " Codes expire after a few minutes.",
+    " Open the sign-in page again to get a new one.",
+    " The browser window can be closed.",
+    " Press Enter to retry.",
+  ].join("\n");
+  await withScrapeTask(pane, async ({ pending, tick }) => {
+    for (let i = 0; i < 4; i++) await tick();
+    const cards = pending();
+    expect(cards.length).toBeGreaterThan(0);
+    for (const card of cards) expect(card.paneText).not.toContain("SECRETCODE");
+  });
+});
+
+test("scrapeOnce: a second numbered question with the same choices and cursor replaces the first one's card", async () => {
+  const quiet = { paneWorking: false, paneIdle: false, watchdogArmed: false };
+  const ask = (command: string) => [
+    "⏺ Bash(" + command + ")",
+    "",
+    " Bash command",
+    "",
+    "   " + command,
+    "",
+    " Do you want to proceed?",
+    " ❯ 1. Yes",
+    "   2. No",
+    "",
+    " Esc to cancel",
+  ].join("\n");
+  // Identical choices and cursor, different questions: two dialogs.
+  const first = pickScrapeMatch(ask("rm -rf build"), quiet)!;
+  const second = pickScrapeMatch(ask("git push --force"), quiet)!;
+  expect(first.fingerprint).not.toBe(second.fingerprint);
+  // A cursor move on the same question is still a new fingerprint (navigation),
+  // and the same frame again is the same one (suppression and stability hold).
+  const moved = pickScrapeMatch(ask("rm -rf build").replace(" ❯ 1. Yes\n   2. No", "   1. Yes\n ❯ 2. No"), quiet)!;
+  expect(moved.fingerprint).not.toBe(first.fingerprint);
+  expect(pickScrapeMatch(ask("rm -rf build"), quiet)!.fingerprint).toBe(first.fingerprint);
+
+  await withScrapeTask(ask("rm -rf build"), async ({ pending, tick, setPane }) => {
+    await tick();
+    await tick();
+    const [card] = pending();
+    expect(card!.paneText).toContain("rm -rf build");
+    // Answered in the terminal; claude asks about the next command.
+    setPane(ask("git push --force"));
+    await tick();
+    await tick();
+    const cards = pending();
+    expect(cards).toHaveLength(1);
+    expect(cards[0]!.id).not.toBe(card!.id);
+    expect(cards[0]!.paneText).toContain("git push --force");
+  });
+});
+
+test("scrapeOnce: a second unnumbered question with the same labels and cursor replaces the first one's card", async () => {
+  const quiet = { paneWorking: false, paneIdle: false, watchdogArmed: false };
+  const ask = (what: string) => [
+    " Use " + what + " for this session?",
+    "",
+    " Claude will read and change files through it.",
+    "",
+    " ❯ Yes, use it",
+    "   No, skip it",
+    "",
+    " Enter to confirm · Esc to cancel",
+  ].join("\n");
+  const first = pickScrapeMatch(ask("the docs server"), quiet)!;
+  const second = pickScrapeMatch(ask("the deploy server"), quiet)!;
+  expect(first.choices.map((c) => c.label)).toEqual(["Yes, use it", "No, skip it"]);
+  expect(first.fingerprint).not.toBe(second.fingerprint);
+  // The same frame again keeps its fingerprint (stability and suppression hold).
+  expect(pickScrapeMatch(ask("the docs server"), quiet)!.fingerprint).toBe(first.fingerprint);
+
+  await withScrapeTask(ask("the docs server"), async ({ pending, tick, setPane }) => {
+    await tick();
+    await tick();
+    const [card] = pending();
+    expect(card!.paneText).toContain("the docs server");
+    // Answered in the terminal; claude asks the same thing about another server.
+    setPane(ask("the deploy server"));
+    await tick();
+    await tick();
+    const cards = pending();
+    expect(cards).toHaveLength(1);
+    expect(cards[0]!.id).not.toBe(card!.id);
+    expect(cards[0]!.paneText).toContain("the deploy server");
+  });
+});
+
 test("scrapeOnce → registerTmuxPrompt — two stable ticks on the reconstructed Chrome prompt register one answerable card, hideKeys included", async () => {
   await withScrapeTask(CHROME_UNNUMBERED_PANE, async ({ taskId, runId, pending, tick }) => {
     // The unnumbered matcher is NOT high-confidence, so the first sighting only
@@ -3697,5 +3795,239 @@ describe("Claude's background-sessions view", () => {
       "  ⏵⏵ auto mode on (shift+tab to cycle)",
     ].join("\n");
     expect(__forTest.paneShowsBackgroundSessionsView(tail)).toBe(false);
+  });
+});
+
+/* ── claude 2.1.326 Enter-to-confirm family (docs/plans/claude-enter-to-confirm-prompts.md TT2) ──
+ * Every shape goes through the REAL chain: `matchStartupConsentDialog`,
+ * `pickScrapeMatch` (the runtime scraper's and the boot poller's shared chain)
+ * and `paneShowsBlockingPrompt` (the paste guard). Fixtures are the version-
+ * tagged captures under fixtures/claude-prompts/2.1.326. */
+describe("claude 2.1.326 Enter-to-confirm family through the real chain", () => {
+  const FIX = path.join(import.meta.dir, "fixtures", "claude-prompts", "2.1.326");
+  const fixture = (name: string): string => readFileSync(path.join(FIX, `${name}.txt`), "utf8").split("\n").slice(1).join("\n");
+  const WT = "/Users/me/.agetor/worktrees/4c34cf8f-a6fd-4f75-865c-92d7dbafa101";
+  const dirs = [
+    { name: "repo-e", paths: [`${WT}/repo-e`] },
+    { name: "repo-f", paths: [`${WT}/repo-f`] },
+  ];
+  const quiet = { paneWorking: false, paneIdle: false, watchdogArmed: false };
+
+  test("startup add-dir: auto-confirm match with the spawn's directories, a card without them", () => {
+    const pane = fixture("add-dir-startup-armed");
+    const m = matchStartupConsentDialog(pane, { autoTrustDirectories: dirs })!;
+    expect(m.name).toBe("add-dir:repo-e");
+    expect(m.acceptIndex).toBe(1);
+    expect(m.cursorIndex).toBe(0);
+    expect(m.addDir?.footer).toBe("armed");
+    expect(matchStartupConsentDialog(pane)).toBeNull();
+    expect(matchStartupConsentDialog(pane, { autoTrustDirectories: [] })).toBeNull();
+    const card = pickScrapeMatch(pane, quiet)!;
+    expect(card.choices.map((c) => c.label)).toEqual(["No, exit", "Yes, add it"]);
+    expect(card.cursorIndex).toBe(0);
+    expect(card.hideKeys).toBe(true);
+    expect(card.unparsable).toBeUndefined();
+  });
+
+  test("a path agetor did not pass is carded, not auto-confirmed", () => {
+    const pane = fixture("add-dir-startup-armed");
+    expect(matchStartupConsentDialog(pane, { autoTrustDirectories: [{ name: "x", paths: ["/Users/me/elsewhere"] }] })).toBeNull();
+    expect(pickScrapeMatch(pane, quiet)).not.toBeNull();
+  });
+
+  test("two repositories → two card fingerprints (the old choices+cursor fingerprint was identical)", () => {
+    const a = pickScrapeMatch(fixture("add-dir-startup-armed"), quiet)!;
+    const b = pickScrapeMatch(fixture("add-dir-startup-armed-repo-f"), quiet)!;
+    expect(a.fingerprint).not.toBe(b.fingerprint);
+    expect(a.identity).not.toBe(b.identity);
+  });
+
+  test("the card fingerprint and identity survive the cursor moving and the footer turning held", () => {
+    const armed = pickScrapeMatch(fixture("add-dir-startup-armed"), quiet)!;
+    const moved = pickScrapeMatch(fixture("add-dir-startup-cursor-yes"), quiet)!;
+    const held = pickScrapeMatch(fixture("add-dir-startup-held"), quiet)!;
+    expect(moved.fingerprint).toBe(armed.fingerprint);
+    expect(held.fingerprint).toBe(armed.fingerprint);
+    expect(held.identity).toBe(armed.identity);
+    expect(moved.cursorIndex).toBe(1);
+  });
+
+  test("held and cut-off dialogs are cards, and withhold a paste", () => {
+    for (const name of ["add-dir-startup-held", "add-dir-startup-cutoff"]) {
+      const pane = fixture(name);
+      const card = pickScrapeMatch(pane, quiet);
+      expect(card, name).not.toBeNull();
+      expect(card!.choices).toHaveLength(2);
+      expect(paneShowsBlockingPrompt(pane), name).toBe(true);
+    }
+  });
+
+  test("a held dialog still matches the consent matcher (counted as PRESENT by the tracker)", () => {
+    const m = matchStartupConsentDialog(fixture("add-dir-startup-held"), { autoTrustDirectories: dirs })!;
+    expect(m.addDir?.footer).toBe("held");
+    expect(m.cursorIndex).toBe(0);
+  });
+
+  test("mid-session /add-dir, /cd and the apply dialog are cards (never auto-confirmed)", () => {
+    for (const name of ["add-dir-later", "cd-move", "add-dir-apply"]) {
+      const pane = fixture(name);
+      expect(matchStartupConsentDialog(pane, { autoTrustDirectories: dirs }), name).toBeNull();
+      const card = pickScrapeMatch(pane, quiet);
+      expect(card, name).not.toBeNull();
+      expect(card!.choices).toHaveLength(2);
+    }
+  });
+
+  test("a dialog with no readable cursor degrades to the unparsable 'Open in Terminal' card", () => {
+    const pane = fixture("add-dir-startup-armed").replace(" ❯ No, exit", "   No, exit");
+    const card = pickScrapeMatch(pane, quiet)!;
+    expect(card.unparsable).toBe(true);
+    expect(card.choices).toEqual([]);
+  });
+
+  test("enter-only screens → an enter card, never choices", () => {
+    for (const name of ["login-successful", "security-notes", "press-enter-retry"]) {
+      const card = pickScrapeMatch(fixture(name), quiet)!;
+      expect(card.answerKind, name).toBe("enter");
+      expect(card.choices, name).toEqual([]);
+      expect(card.unparsable, name).toBeUndefined();
+      expect(paneShowsBlockingPrompt(fixture(name)), name).toBe(true);
+    }
+  });
+
+  test("an Enter-only screen under a numbered menu left higher up the pane is the Enter card, not the stale menu", () => {
+    // The login-method select scrolled up out of the Enter-only screen's window
+    // (no cursor row in its last twelve lines), and claude now waits on Enter.
+    const filler = Array.from({ length: 14 }, (_, i) => ` Step ${i + 1} of the sign-in finished.`);
+    const pane = [
+      " Select login method:",
+      " ❯ 1. Claude account with subscription",
+      "   2. Anthropic Console account",
+      "   3. 3rd-party platform",
+      ...filler,
+      " Login successful. Press Enter to continue…",
+    ].join("\n");
+    const card = pickScrapeMatch(pane, quiet)!;
+    expect(card.answerKind).toBe("enter");
+    expect(card.choices).toEqual([]);
+  });
+
+  test("the OAuth code prompt → a code card, with the typed code masked", () => {
+    const card = pickScrapeMatch(fixture("paste-code"), quiet)!;
+    expect(card.answerKind).toBe("code");
+    expect(card.choices).toEqual([]);
+    const typed = pickScrapeMatch(fixture("paste-code-typed"), quiet)!;
+    expect(typed.paneText).not.toContain("abc123");
+    expect(typed.fingerprint).toBe(card.fingerprint);
+    expect(paneShowsBlockingPrompt(fixture("paste-code-typed"))).toBe(true);
+  });
+
+  test("the theme picker is a boot-only card", () => {
+    const pane = fixture("theme-picker");
+    expect(pickScrapeMatch(pane, quiet)).toBeNull();
+    const card = pickScrapeMatch(pane, { ...quiet, boot: true })!;
+    expect(card.choices.map((c) => c.label)).toEqual(["Auto (match terminal)", "Dark mode", "Light mode"]);
+    expect(card.cursorIndex).toBe(0);
+  });
+
+  test("the numbered login-method screen is still a numbered card", () => {
+    const card = pickScrapeMatch(fixture("login-method"), quiet)!;
+    expect(card.choices).toHaveLength(3);
+    expect(card.cursorIndex).toBe(0);
+  });
+
+  test("chrome hints and quoted dialogs never card or withhold a paste", () => {
+    for (const name of ["chrome-background-sessions-bar", "chrome-press-enter-quoted-above-composer", "add-dir-quoted-in-transcript"]) {
+      const pane = fixture(name);
+      const idle = paneShowsIdleInputBox(pane);
+      expect(pickScrapeMatch(pane, { paneWorking: false, paneIdle: idle, watchdogArmed: false }), name).toBeNull();
+      expect(matchStartupConsentDialog(pane, { autoTrustDirectories: dirs }), name).toBeNull();
+    }
+  });
+
+  test("every card carries a cursor-free identity; an unparsable card's is its fingerprint", () => {
+    const { identityOf } = __forTest;
+    const numbered = pickScrapeMatch("Do you want to proceed?\n❯ 1. Yes\n  2. No\n", quiet)!;
+    expect(identityOf(numbered)).toBeTruthy();
+    const moved = pickScrapeMatch("Do you want to proceed?\n  1. Yes\n❯ 2. No\n", quiet)!;
+    expect(identityOf(moved)).toBe(identityOf(numbered));
+    expect(identityOf(pickScrapeMatch(fixture("login-successful"), quiet)!)).toBeTruthy();
+  });
+
+  test("two Yes/No dialogs with different questions have different identities", () => {
+    const { identityOf } = __forTest;
+    const bash = pickScrapeMatch(" Bash command\n   rm -rf build\n Do you want to proceed?\n ❯ 1. Yes\n   2. No\n", quiet)!;
+    const edit = pickScrapeMatch(" Edit file\n   src/app.ts\n Do you want to proceed?\n ❯ 1. Yes\n   2. No\n", quiet)!;
+    expect(bash.choices.map((c) => c.label)).toEqual(edit.choices.map((c) => c.label));
+    expect(identityOf(bash)).not.toBe(identityOf(edit));
+    const bashMoved = pickScrapeMatch(" Bash command\n   rm -rf build\n Do you want to proceed?\n   1. Yes\n ❯ 2. No\n", quiet)!;
+    expect(identityOf(bashMoved)).toBe(identityOf(bash));
+  });
+});
+
+describe("createStartupConfirmTracker — add-dir dialogs", () => {
+  const { createStartupConfirmTracker, startupDialogIdentity } = __forTest;
+  const dlg = (repo: string, cursor: number, footer: "armed" | "held" = "armed") => ({
+    name: `add-dir:${repo}`,
+    choices: [{ key: "1", label: "No, exit" }, { key: "2", label: "Yes, add it" }],
+    cursorIndex: cursor,
+    acceptIndex: 1,
+    fingerprint: `fp-${repo}-${cursor}-${footer}`,
+    addDir: { identity: `startup|Adding a new directory:|/p/${repo}|No, exit/Yes, add it`, footer },
+  });
+
+  test("one status line per repository, in the owner's wording, after the dialog was absent for two polls", () => {
+    const t = createStartupConfirmTracker();
+    let now = 1000;
+    expect(t.observe(dlg("repo-e", 0), now).attempt).toBeNull();
+    const second = t.observe(dlg("repo-e", 0), (now += 350));
+    expect(second.attempt?.name).toBe("add-dir:repo-e");
+    expect(t.observe(null, (now += 350)).statuses).toEqual([]);
+    expect(t.observe(null, (now += 350)).statuses).toEqual([
+      `auto-confirmed Claude's "Adding a new directory" prompt for repo-e`,
+    ]);
+  });
+
+  test("a second repository's dialog is tracked under its own name and reports the first as gone", () => {
+    const t = createStartupConfirmTracker();
+    let now = 1000;
+    t.observe(dlg("repo-e", 0), now);
+    t.observe(dlg("repo-e", 0), (now += 350));
+    const step = t.observe(dlg("repo-f", 0), (now += 350));
+    expect(step.statuses).toEqual([`auto-confirmed Claude's "Adding a new directory" prompt for repo-e`]);
+    expect(step.attempt).toBeNull(); // the new dialog needs its own two sightings
+    expect(t.observe(dlg("repo-f", 0), (now += 350)).attempt?.name).toBe("add-dir:repo-f");
+  });
+
+  test("a held dialog counts as PRESENT: no false 'auto-confirmed', retried only after the window", () => {
+    const t = createStartupConfirmTracker();
+    let now = 1000;
+    t.observe(dlg("repo-e", 0), now);
+    expect(t.observe(dlg("repo-e", 0), (now += 350)).attempt).not.toBeNull();
+    // claude refused: the footer flipped to held. Present on every poll.
+    for (let i = 0; i < 3; i++) {
+      const step = t.observe(dlg("repo-e", 0, "held"), (now += 350));
+      expect(step.statuses).toEqual([]);
+    }
+    // Past the retry window, an identical held fingerprint twice → another attempt.
+    now += 1500;
+    t.observe(dlg("repo-e", 0, "held"), now);
+    expect(t.observe(dlg("repo-e", 0, "held"), (now += 350)).attempt).not.toBeNull();
+  });
+
+  test("gives up after 4 attempts and hands the dialog to the card path", () => {
+    const t = createStartupConfirmTracker();
+    let now = 1000;
+    let attempts = 0;
+    for (let i = 0; i < 40 && !t.hasGivenUp("add-dir:repo-e"); i++) {
+      if (t.observe(dlg("repo-e", 0, "held"), (now += 800)).attempt) attempts++;
+    }
+    expect(attempts).toBe(4);
+    expect(t.hasGivenUp("add-dir:repo-e")).toBe(true);
+  });
+
+  test("startupDialogIdentity ignores the cursor and footer", () => {
+    expect(startupDialogIdentity(dlg("repo-e", 0))).toBe(startupDialogIdentity(dlg("repo-e", 1, "held")));
+    expect(startupDialogIdentity(dlg("repo-e", 0))).not.toBe(startupDialogIdentity(dlg("repo-f", 0)));
   });
 });

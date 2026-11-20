@@ -38,6 +38,10 @@ type TextImpl = (opts: { message: string }) => Promise<unknown>;
 let textImpl: TextImpl = async () => {
   throw new Error("text() not stubbed for this test");
 };
+type PasswordImpl = (opts: { message: string; validate?: (v: string) => string | undefined }) => Promise<unknown>;
+let passwordImpl: PasswordImpl = async () => {
+  throw new Error("password() not stubbed for this test");
+};
 const cancelCalls: string[] = [];
 const CANCEL = Symbol("cancel");
 const outputs: string[] = [];
@@ -73,6 +77,7 @@ mock.module("@clack/prompts", () => ({
   ...realClackSnapshot,
   select: async (opts: { message: string; options: SelectOption[] }) => selectImpl(opts),
   text: async (opts: { message: string }) => textImpl(opts),
+  password: async (opts: { message: string; validate?: (v: string) => string | undefined }) => passwordImpl(opts),
   isCancel: (v: unknown) => v === CANCEL,
   cancel: (msg?: string) => {
     cancelCalls.push(msg ?? "");
@@ -477,4 +482,169 @@ test("opencode permission: --reason with two permission cards pending answers ne
   };
   await expect(cmdAnswer(["t1", "--reason", "no"], flags)).rejects.toThrow("several are pending");
   expect(calls).toEqual([]);
+});
+
+// ── tmux cards: Enter-only and the OAuth code box (T12) ────────────────────
+
+function tmuxReq(overrides: Record<string, unknown> = {}): unknown {
+  return {
+    kind: "tmux_prompt", id: "tp1", taskId: "t1", runId: "r1", createdAt: 0,
+    paneText: "Login successful. Press Enter to continue…", choices: [], fingerprint: "fp",
+    ...overrides,
+  };
+}
+
+function makeTmuxClient(
+  req: unknown,
+  respond: (id: string, body: unknown) => { ok: boolean; error?: string } = () => ({ ok: true }),
+): { client: AgetorClient; calls: Array<{ id: string; body: unknown }> } {
+  const calls: Array<{ id: string; body: unknown }> = [];
+  const client = {
+    listTasks: async () => [{ id: "t1", title: "T" }],
+    pendingInteractions: async () => [req],
+    answerTmuxPrompt: async (id: string, body: unknown) => {
+      calls.push({ id, body });
+      return respond(id, body);
+    },
+  } as unknown as AgetorClient;
+  return { client, calls };
+}
+
+test("tmux enter card: the rows are Continue (press Enter) and Reject / Esc, and Continue posts { enter: true }", async () => {
+  outputs.length = 0;
+  const { client, calls } = makeTmuxClient(tmuxReq({ answerKind: "enter" }));
+  currentClient = client;
+  let labels: string[] = [];
+  selectImpl = async (opts) => {
+    labels = opts.options.map((o) => o.label);
+    return opts.options.find((o) => o.label === "Continue (press Enter)")!.value;
+  };
+  await cmdAnswer(["t1"], flags);
+  expect(labels).toEqual(["Continue (press Enter)", "Reject / Esc"]);
+  expect(calls).toEqual([{ id: "tp1", body: { enter: true } }]);
+  expect(outputs.some((l) => l.includes("answered"))).toBe(true);
+});
+
+test("tmux enter card: Reject / Esc posts { reject: true }", async () => {
+  outputs.length = 0;
+  const { client, calls } = makeTmuxClient(tmuxReq({ answerKind: "enter" }));
+  currentClient = client;
+  selectImpl = pickLabel("Reject / Esc");
+  await cmdAnswer(["t1"], flags);
+  expect(calls).toEqual([{ id: "tp1", body: { reject: true } }]);
+});
+
+test("tmux choice card is unchanged: a choice posts { key }, Reject posts { reject: true }", async () => {
+  outputs.length = 0;
+  const req = tmuxReq({ choices: [{ key: "1", label: "No, exit" }, { key: "2", label: "Yes, add it" }], paneText: "Adding a new directory" });
+  const { client, calls } = makeTmuxClient(req);
+  currentClient = client;
+  selectImpl = pickLabel("Yes, add it");
+  await cmdAnswer(["t1"], flags);
+  expect(calls).toEqual([{ id: "tp1", body: { key: "2" } }]);
+});
+
+test("tmux code card: a masked password prompt, validated locally, posts { code } and never prints it", async () => {
+  outputs.length = 0;
+  const { client, calls } = makeTmuxClient(tmuxReq({ answerKind: "code", paneText: "Paste code here if prompted > ••••" }));
+  currentClient = client;
+  let validate: ((v: string) => string | undefined) | undefined;
+  passwordImpl = async (opts) => {
+    validate = opts.validate;
+    return "  test-code-123  ";
+  };
+  selectImpl = async () => {
+    throw new Error("a code card has no pick list");
+  };
+  await cmdAnswer(["t1"], flags);
+  expect(calls).toEqual([{ id: "tp1", body: { code: "test-code-123" } }]);
+  expect(outputs.join("\n")).not.toContain("test-code-123");
+  // The local validation uses the shared rules and never quotes the input.
+  expect(validate!("")).toBe("Paste the code first.");
+  expect(validate!("a\nb")).toBe("The code must be a single line.");
+  expect(validate!("x".repeat(513))).toBe("The code is longer than 512 characters.");
+  expect(validate!("ok-code")).toBeUndefined();
+});
+
+test("tmux code card: cancelling the prompt posts nothing", async () => {
+  outputs.length = 0;
+  cancelCalls.length = 0;
+  const { client, calls } = makeTmuxClient(tmuxReq({ answerKind: "code" }));
+  currentClient = client;
+  passwordImpl = async () => CANCEL;
+  await cmdAnswer(["t1"], flags);
+  expect(calls).toEqual([]);
+  expect(cancelCalls.length).toBeGreaterThan(0);
+});
+
+test("tmux card: a refusal exits nonzero and stops before the next card; an in-flight 409 says so", async () => {
+  outputs.length = 0;
+  const savedExit = process.exitCode;
+  let posts = 0;
+  currentClient = {
+    listTasks: async () => [{ id: "t1", title: "T" }],
+    pendingInteractions: async () => [tmuxReq({ id: "p1", answerKind: "enter" }), tmuxReq({ id: "p2", answerKind: "enter" })],
+    answerTmuxPrompt: async () => {
+      posts++;
+      throw new ApiError(
+        409,
+        { ok: false, error: "this prompt is already being answered", code: "answer-in-flight" },
+        "this prompt is already being answered",
+      );
+    },
+  } as unknown as AgetorClient;
+  selectImpl = pickLabel("Continue (press Enter)");
+  try {
+    await cmdAnswer(["t1"], flags);
+    expect(posts).toBe(1); // the second card is never answered after a refusal
+    expect(process.exitCode).toBe(1);
+    expect(outputs.some((l) => l.includes("already being answered elsewhere"))).toBe(true);
+    expect(outputs.some((l) => l.includes("the prompt changed"))).toBe(false);
+  } finally {
+    process.exitCode = savedExit;
+  }
+});
+
+test("tmux card: a 409 says the prompt changed and a 400 on a code never echoes it", async () => {
+  outputs.length = 0;
+  const savedExit = process.exitCode;
+  const req = tmuxReq({ answerKind: "enter" });
+  currentClient = {
+    listTasks: async () => [{ id: "t1", title: "T" }],
+    pendingInteractions: async () => [req],
+    answerTmuxPrompt: async () => {
+      throw new ApiError(409, { error: "the prompt changed on screen — the card will refresh" }, "the prompt changed on screen — the card will refresh");
+    },
+  } as unknown as AgetorClient;
+  selectImpl = pickLabel("Continue (press Enter)");
+  await cmdAnswer(["t1"], flags);
+  expect(outputs.some((l) => l.includes("the prompt changed — run `agetor answer` again"))).toBe(true);
+
+  outputs.length = 0;
+  const codeReq = tmuxReq({ answerKind: "code" });
+  currentClient = {
+    listTasks: async () => [{ id: "t1", title: "T" }],
+    pendingInteractions: async () => [codeReq],
+    answerTmuxPrompt: async () => {
+      throw new ApiError(400, { error: "the code must be a single line" }, "the code must be a single line");
+    },
+  } as unknown as AgetorClient;
+  passwordImpl = async () => "secret-value";
+  await cmdAnswer(["t1"], flags);
+  expect(outputs.some((l) => l.includes("the code must be a single line"))).toBe(true);
+  expect(outputs.join("\n")).not.toContain("secret-value");
+  expect(process.exitCode).toBe(1);
+  process.exitCode = savedExit;
+});
+
+test("tmux card: pane text is printed through the terminal-text escaper and a held card says so", async () => {
+  outputs.length = 0;
+  const { client } = makeTmuxClient(tmuxReq({ answerKind: "enter", held: true, paneText: "evil \u001b[2J pane \u0007" }));
+  currentClient = client;
+  selectImpl = pickLabel("Continue (press Enter)");
+  await cmdAnswer(["t1"], flags);
+  const joined = outputs.join("\n");
+  expect(joined).not.toContain("\u001b");
+  expect(joined).not.toContain("\u0007");
+  expect(joined).toContain("Claude didn't take the first keypress");
 });

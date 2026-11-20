@@ -93,6 +93,15 @@ export async function openSettingsGeneral(page: Page): Promise<Locator> {
   return dialog;
 }
 
+/** Opens Settings → Harnesses (a sidebar click away from General) and waits
+ *  for the page, including its per-kind Behaviour block, to render. */
+export async function openSettingsHarnesses(page: Page): Promise<Locator> {
+  const dialog = await openSettingsGeneral(page);
+  await dialog.getByRole("button", { name: "Harnesses", exact: true }).click();
+  await expect(dialog.getByTestId("harness-behaviour-section")).toBeVisible();
+  return dialog;
+}
+
 /** Arrange-only helper: seeds a persisted preference directly through the
  *  API so a test starts from a known state, without that setup step itself
  *  being the thing under test. */

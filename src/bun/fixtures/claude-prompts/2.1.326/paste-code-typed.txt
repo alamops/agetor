@@ -1,0 +1,7 @@
+# claude 2.1.326 · binary (the same prompt after the user typed a code in the terminal)
+
+ Browser didn't open? Use the url below to sign in
+
+ https://claude.ai/oauth/authorize?code=true&client_id=00000000-0000-0000-0000-000000000000
+
+ Paste code here if prompted > abc123-synthetic-code#xyz

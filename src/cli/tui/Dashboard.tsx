@@ -135,6 +135,11 @@ export function Dashboard({
   const events = useCoalescedStream(selected && !selected.pipelineId ? selected.id : null, dataDir);
   const [status, setStatus] = useState("");
   const [mode, setMode] = useState<Mode>("nav");
+  // One number per opened answer overlay. An overlay closed with Esc while its
+  // POST is in flight still reports its result, but only the overlay that is
+  // open now may close the answer mode (a late result must not yank a newer
+  // overlay, or the compose box, back to the board).
+  const answerSessionRef = useRef(0);
   // The compose/answer target is PINNED by id when the mode opens — the 1.5s
   // poll re-sorts the board, so following `sorted[sel]` could redirect a send
   // or answer to whatever task slid into that slot. Resolve by id each render
@@ -425,6 +430,14 @@ export function Dashboard({
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [composeTruncated, composeScopeKey, composeMulti, client]);
 
+  /** The answer overlay's `onDone`, bound to the overlay it was rendered for:
+   *  the result always reaches the status line, and the mode goes back to the
+   *  board only while that same overlay is still the open one. */
+  const answerDoneFor = (session: number) => (msg: string) => {
+    setStatus(msg);
+    setMode((m) => (m === "answer" && answerSessionRef.current === session ? "nav" : m));
+  };
+
   const sendMessage = (task: Task, text: string, okLabel = "→ sent") => {
     if (task.pendingInteractionCount > 0) {
       setStatus("answer the pending question first (g)");
@@ -473,6 +486,7 @@ export function Dashboard({
     }
     if (input === "g" && selected) {
       if (selected.pendingInteractionCount > 0) {
+        answerSessionRef.current += 1;
         setTargetId(selected.id);
         return setMode("answer");
       }
@@ -701,10 +715,7 @@ export function Dashboard({
           <AnswerOverlay
             client={client}
             taskId={target.id}
-            onDone={(msg) => {
-              setStatus(msg);
-              setMode("nav");
-            }}
+            onDone={answerDoneFor(answerSessionRef.current)}
             onCancel={() => setMode("nav")}
           />
         </Box>

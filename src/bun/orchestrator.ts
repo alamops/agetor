@@ -1,7 +1,7 @@
 import { randomUUID } from "node:crypto";
-import { existsSync, mkdirSync, readdirSync, rmSync, statSync, writeFileSync } from "node:fs";
+import { existsSync, mkdirSync, readdirSync, realpathSync, rmSync, statSync, writeFileSync } from "node:fs";
 import { rm } from "node:fs/promises";
-import { basename, isAbsolute, join, resolve } from "node:path";
+import { basename, isAbsolute, join, relative, resolve } from "node:path";
 import {
   db,
   tasks,
@@ -114,6 +114,7 @@ import {
   clearFailoverState,
   cooldownModelFor,
   deferAutoRetryNow,
+  loggedOutSkipLines,
   memberReasonsFor,
   memberUnusableReason,
   moveTaskToMember,
@@ -133,6 +134,7 @@ import {
   setHarnessFailoverHooks,
   stopAllAutoRetryTimers,
   updateTaskState,
+  warmStackLogins,
 } from "./harness-failover.ts";
 import {
   cascadePipelineArchive,
@@ -347,6 +349,8 @@ import type {
   ArchiveUncommittedChanges,
 } from "../shared/types.ts";
 import { ARCHIVE_UNCOMMITTED_CHANGES_CODE, CONTINUATION_STATUS_TEXT, WORKTREE_STALE_AFTER_MS } from "../shared/types.ts";
+import { CLAUDE_AUTO_TRUST_PREF, isClaudeAutoTrustOn } from "../shared/claude-auto-trust.ts";
+import type { AutoTrustDirectory } from "./claude-prompt-screens.ts";
 import {
   SENT_FILES_DELIVERED_RE,
   parseSentFilesToolResult,
@@ -1755,11 +1759,47 @@ export function withTaskRepositoryRoots(
     (r): r is TaskRepository & { worktreePath: string } => Boolean(r.worktreePath) && existsSync(r.worktreePath!),
   );
   if (materialized.length === 0) return opts;
+  const autoTrust = isClaudeAutoTrustOn(preferences.get(CLAUDE_AUTO_TRUST_PREF))
+    ? autoTrustDirectoriesFor(materialized)
+    : undefined;
   return {
     ...opts,
     extraDirectories: materialized.map((r) => r.worktreePath),
     codexWorkspaceRepos: materialized.map((r) => ({ worktreePath: r.worktreePath, repoPath: r.path })),
+    ...(autoTrust ? { autoTrustDirectories: autoTrust } : {}),
   };
+}
+
+/**
+ * The directories claude's startup `Adding a new directory:` dialog may be
+ * auto-confirmed for: the task's own checkouts, exactly as `--add-dir` passes
+ * them, plus the same path under the REAL path of agetor's worktrees root (the
+ * dialog prints the path claude resolved, so a symlinked data dir — `/tmp` is
+ * `/private/tmp` on macOS — must not defeat the equality). Only the
+ * agetor-owned root is resolved; nothing inside a checkout is stat-ed here.
+ * Pure data, so every spawn path (start, follow-up, swap, retry) gets the same
+ * list through `withTaskRepositoryRoots`.
+ */
+function autoTrustDirectoriesFor(
+  materialized: Array<TaskRepository & { worktreePath: string }>,
+): AutoTrustDirectory[] {
+  let realRoot: string | null = null;
+  try {
+    realRoot = realpathSync(WORKTREES_DIR);
+  } catch {
+    /* the root is missing: only the as-passed spelling can match */
+  }
+  return materialized.map((r) => {
+    const paths = [r.worktreePath];
+    if (realRoot) {
+      const rel = relative(WORKTREES_DIR, r.worktreePath);
+      if (rel !== "" && !rel.startsWith("..") && !isAbsolute(rel)) {
+        const real = join(realRoot, rel);
+        if (!paths.includes(real)) paths.push(real);
+      }
+    }
+    return { name: r.name, paths };
+  });
 }
 
 /**
@@ -2506,7 +2546,7 @@ async function startTaskInner(
 
   // Harness pre-flight. A fresh-auth probe and the per-model CLI floor can
   // fail on the current account even when the cached stack snapshot said it
-  // was usable (the status cache is up to 15 s / one poll old). When this task
+  // was usable (the status cache is up to 60 s old). When this task
   // is on a real stack, move to a usable backup once instead of refusing the
   // Run — the whole point of the train. A non-stack task keeps the exact same
   // error it always had.
@@ -2575,7 +2615,8 @@ async function startTaskInner(
     if (!moved.ok || !moved.moved) return { error: moved.error ?? failure };
     await dropSessionAfterAccountMove(taskId, moved.moved.from);
     task = tasks.get(taskId) ?? task;
-    accountMoveNotes.push(...(moved.warnings ?? []));
+    // Say why the account was left: the failure that forced the move.
+    accountMoveNotes.push(failure, ...(moved.warnings ?? []));
     harness = resolveHarness(task.agent);
   }
   if (!harness || !status) {
@@ -4206,6 +4247,11 @@ async function finishSwitchNow(taskId: string, behindQueue = false): Promise<voi
 export async function switchTaskAccountNow(taskId: string): Promise<SwitchAccountResult> {
   const task = tasks.get(taskId);
   if (!task) throw new Error(`task not found: ${taskId}`);
+  // Not awaited: this function checks the task's state and takes its claim in one
+  // synchronous run, and an await here would let a start slip in between. The
+  // `/harnesses` poll keeps the login cache warm in the app; this refresh only
+  // helps the next plan, and a cold cache fails open.
+  void warmStackLogins(task).catch(() => {});
   const plan = planManualSwitchTarget(task);
   if (plan.kind === "refused") {
     throw new SwitchAccountRefusedError({
@@ -4322,6 +4368,9 @@ async function applyScheduledSwitch(taskId: string, behindQueue = false): Promis
   // turn ends. `reconcileTaskSession` must never see a live run, or it would
   // take its "start fresh" branch.
   if (backgroundAgentsHoldTask(taskId) || runs.hasRunning(taskId)) return;
+  // Not awaited, for the reason `switchTaskAccountNow` gives: the checks above and
+  // the claim below must stay one synchronous run.
+  void warmStackLogins(task).catch(() => {});
   const plan = planManualSwitchTarget(task);
   if (plan.kind === "refused") {
     dropScheduledSwitch(
@@ -4493,12 +4542,13 @@ const harnessRetriesInFlight = new Set<string>();
  * fires on the no-swap-target passthrough branches), `"after-transfer"` runs
  * after the mirror/transfer awaits and before the spawn decision, and
  * `"before-block"` runs just before the all-exhausted branch writes its
- * blocked column / arms a retry. `"retry-before-commit"` runs inside the
+ * blocked column / arms a retry. `"retry-after-warm"` runs right after the
+ * all-exhausted retry's login warm-up, before it plans. `"retry-before-commit"` runs inside the
  * all-exhausted retry's `beforeCommit`, after its mirror/transfer and before
  * the move is committed. The hook receives the task and old run id,
  * so a test can Stop or archive at exactly that point.
  */
-type HarnessSwapSettlePhase = "settle" | "after-transfer" | "before-block" | "retry-before-commit";
+type HarnessSwapSettlePhase = "settle" | "after-transfer" | "before-block" | "retry-after-warm" | "retry-before-commit";
 let harnessSwapSettleHook:
   | ((taskId: string, runId: string, phase: HarnessSwapSettlePhase) => void | Promise<void>)
   | null = null;
@@ -5290,8 +5340,11 @@ async function settleHarnessLimitInClaim(
     return "handled";
   }
 
+  await warmStackLogins(fetched);
   const plan = planNextMember(tasks.get(taskId) ?? fetched, { currentId: current });
   if (plan.kind === "next") {
+    // A logged-out backup is skipped like an exhausted one; say so on the run.
+    for (const line of loggedOutSkipLines(plan.skipped)) saveStatusLineQuietly(runId, taskId, line);
     const toHarness = resolveHarness(plan.member.harnessId);
     if (!toHarness) {
       await blockStackTask(taskId, runId, "harness-swap-failed", "the backup account no longer exists", signal);
@@ -5766,6 +5819,13 @@ async function spawnSwapContinuation(args: {
       endedAt: null,
       exitCode: null,
       tmuxSession: kind === "opencode" ? null : sessionNameFor(taskId),
+      // Keeps its pre-stamp (docs/plans/claude-enter-to-confirm-prompts.md T7/P-3):
+      // `resumeSessionId` is the destination account's TRANSFERRED session, whose
+      // file was copied before this insert, so it names a real session; boot
+      // reconcile's reattach key and `lastSessionIdForTask` need it from the start.
+      // An id an older build stamped without a file heals in `spawnAgent`
+      // (`resolveClaudeResume`: fresh under the same id) and is re-stamped by
+      // `onSessionFileReady`.
       claudeSessionId: kind === "claude-code" ? resumeSessionId : null,
       codexSessionId: kind === "codex" ? resumeSessionId : null,
       cursorSessionId: null,
@@ -7730,9 +7790,36 @@ async function fireHarnessAutoRetryInner(taskId: string): Promise<void> {
     patchTaskState(taskId, { allExhausted: null });
     return;
   }
-  const { stack, current } = resolved;
+  await warmStackLogins(task);
+  await harnessSwapSettleHook?.(taskId, task.runId ?? "", "retry-after-warm");
+  // A plain Stop during the probe is recorded on this retry's window
+  // (`swapCancelRequested`) and nothing else clears the countdown, so planning
+  // on would re-arm it (a wait or none-usable plan). Settle it like the Stop
+  // `beforeCommit` catches: the countdown ends, the card stays blocked.
+  if (swapCancelRequested.delete(taskId)) {
+    cancelHarnessRetryForTask(taskId);
+    const stoppedRun = runs.latestForTask(taskId);
+    if (stoppedRun) saveStatusLineQuietly(stoppedRun.id, taskId, "cancelled by user during the account retry");
+    return;
+  }
+  // The login probe awaited: a Stop, a column move, an archive or a manual
+  // start may have cleared the countdown meanwhile. Plan from the live row, and
+  // never re-arm a retry the user already ended.
+  const live = tasks.get(taskId);
+  if (!live || live.archivedAt != null || live.column !== "blocked" || !live.harnessState?.allExhausted) return;
+  if (runs.hasRunning(taskId) || backgroundAgentsHoldTask(taskId)) {
+    deferAutoRetryNow(taskId);
+    return;
+  }
+  const liveResolved = harnessStacks.resolveForTask(live);
+  if (!liveResolved) {
+    endCleanRetry(taskId);
+    patchTaskState(taskId, { allExhausted: null });
+    return;
+  }
+  const { stack, current } = liveResolved;
   const now = Date.now();
-  const plan = planRetryMember(task, { now });
+  const plan = planRetryMember(live, { now });
   if (plan.kind !== "next") {
     planExhaustedTracked(taskId, plan, now, { startedThisAttempt: false });
     return;
@@ -7771,7 +7858,7 @@ async function fireHarnessAutoRetryInner(taskId: string): Promise<void> {
     from: current,
     to: toHarness.id,
     sessionId,
-    cwd: task.worktreePath ?? task.workdir,
+    cwd: live.worktreePath ?? live.workdir,
     // A pipeline Stop, an archive or a column move during the mirror/transfer
     // awaits clears the exhausted state. Do not resurrect it: no retry may
     // start on a stopped run's behalf. A plain Stop in that window is
@@ -7875,7 +7962,7 @@ async function fireHarnessAutoRetryInner(taskId: string): Promise<void> {
     transferredSessionId,
     hasToolUse: preserveConversation && transferredSessionId !== null,
     notes: moved.warnings,
-    cleanRetryText: retryParts.length > 0 ? retryParts.join("\n\n") : task.prompt,
+    cleanRetryText: retryParts.length > 0 ? retryParts.join("\n\n") : live.prompt,
     cleanRetryParts: retryParts,
     position: position + 1,
     count: stack.members.length,
@@ -11846,6 +11933,10 @@ async function sendTurnInExistingSession(
       endedAt: null,
       exitCode: null,
       tmuxSession: sessionNameFor(taskId),
+      // Keeps its pre-stamp (T7/P-3): the inherited id was recorded only once its
+      // session file existed (`onSessionFileReady`), so it names a real session, and
+      // the reattach key / `lastSessionIdForTask` read it from the start. A legacy id
+      // with no file heals in `spawnAgent` (`resolveClaudeResume`).
       claudeSessionId: inheritedSessionId,
       codexSessionId: null,
       cursorSessionId: null,
@@ -12138,6 +12229,8 @@ function startContinuationRun(
     endedAt: null,
     exitCode: null,
     tmuxSession: sessionNameFor(taskId),
+    // Keeps its pre-stamp (T7/P-3): see the sibling insert above (a real, recorded
+    // session id; a legacy one heals in `spawnAgent`).
     claudeSessionId: inheritedSessionId,
     codexSessionId: null,
     cursorSessionId: null,
@@ -12242,6 +12335,9 @@ async function spawnResumedSessionInner(
     endedAt: null,
     exitCode: null,
     tmuxSession: sessionNameFor(taskId),
+    // Keeps its pre-stamp (T7/P-3): `priorSessionId` was recorded only once its file
+    // existed. If it names none (a row an older build stamped before the file),
+    // `spawnAgent` starts fresh under the same id and `onSessionFileReady` re-stamps.
     claudeSessionId: priorSessionId,
     codexSessionId: null,
     cursorSessionId: null,

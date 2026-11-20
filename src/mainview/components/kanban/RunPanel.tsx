@@ -97,7 +97,8 @@ import { Select } from "@/components/ui/select";
 import { Switch } from "@/components/ui/switch";
 import { Textarea } from "@/components/ui/textarea";
 import { abbreviateHome, cn } from "@/lib/utils";
-import { tmuxChoiceLabel } from "@/lib/tmux-prompt";
+import { tmuxChoiceLabel, tmuxPromptAnswerKind } from "@/lib/tmux-prompt";
+import { TmuxPromptAnswerControls } from "@/components/kanban/TmuxPromptAnswerControls";
 import {
   formatHarnessSwapNotice,
   isHarnessStackContinuation,
@@ -9678,6 +9679,11 @@ function TmuxPromptCard({
   // would swap the card to the plan layout, whose button filter keeps only
   // `Yes …` rows and would drop the Chrome prompt's "No, keep browser tools
   // off" choice.
+  // Enter-only screens and the OAuth code prompt are not menus: they have
+  // their own card (T11, docs/plans/claude-enter-to-confirm-prompts.md).
+  if (tmuxPromptAnswerKind(req) !== "choice") {
+    return <TmuxPromptAnswerControls req={req} onResolved={onResolved} />;
+  }
   const isPlan = req.unparsable !== true && !req.hideKeys && CLAUDE_PLAN_PROMPT_RE.test(req.paneText);
   if (isPlan) {
     const planLabel = (label: string): string => {
@@ -9805,6 +9811,11 @@ function TmuxPromptCard({
       <pre className="max-h-96 overflow-auto whitespace-pre-wrap break-words rounded-md border border-border/40 bg-muted/40 p-2 font-mono text-[11px] leading-snug">
         {cleanPromptPane(req.paneText)}
       </pre>
+      {req.held === true && (
+        <p className="mt-2 text-[11px] text-warning" data-testid="tmux-prompt-held-hint">
+          Claude didn’t take the first keypress — choose again.
+        </p>
+      )}
       <div className="mt-3 flex flex-wrap items-center justify-end gap-2">
         {req.choices.map((c) => {
           // Visual hint only: dim out the "negative" choice so it doesn't

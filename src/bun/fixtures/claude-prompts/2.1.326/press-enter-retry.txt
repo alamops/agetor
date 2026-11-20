@@ -1,0 +1,5 @@
+# claude 2.1.326 · binary (sessionAuth !== "fresh" ? "Press Enter to retry." ; layout reconstructed — plan A4)
+
+ OAuth error: the login window was closed before it finished
+
+ Press Enter to retry.

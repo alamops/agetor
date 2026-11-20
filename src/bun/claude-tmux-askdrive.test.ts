@@ -8,7 +8,7 @@ import path from "node:path";
 // claude-tmux-scraper.test.ts.
 process.env.AGETOR_DATA_DIR = mkdtempSync(path.join(tmpdir(), "agetor-askdrive-"));
 
-import { __forTest, dismissAskModalForMessage, driveAskAnswers } from "./claude-tmux.ts";
+import { __forTest, dismissAskModalForMessage, driveAskAnswers, matchStartupConsentDialog } from "./claude-tmux.ts";
 import type { AskModalKind, DriveStep } from "./claude-questions.ts";
 
 const {
@@ -298,7 +298,7 @@ function makeFakeTmux(opts: { emptyPaneOnEnter: boolean; paneAfterText?: string 
 
 async function withDrive<T>(
   fake: FakeTmux,
-  fn: (ctx: { taskId: string; sessionName: string; chunks: Array<{ stream: string; data: string }> }) => Promise<T>,
+  fn: (ctx: { taskId: string; sessionName: string; chunks: Array<{ stream: string; data: string }>; state: ReturnType<typeof __forTest.installSession> }) => Promise<T>,
 ): Promise<T> {
   const prevBin = process.env.AGETOR_TMUX_BIN;
   process.env.AGETOR_TMUX_BIN = path.join(path.dirname(fake.logPath), "tmux");
@@ -307,7 +307,7 @@ async function withDrive<T>(
   const chunks: Array<{ stream: string; data: string }> = [];
   state.lastChunk = (stream, data) => { chunks.push({ stream, data }); };
   try {
-    return await fn({ taskId, sessionName: state.sessionName, chunks });
+    return await fn({ taskId, sessionName: state.sessionName, chunks, state });
   } finally {
     __forTest.uninstallSession(taskId);
     if (prevBin === undefined) delete process.env.AGETOR_TMUX_BIN;
@@ -441,8 +441,14 @@ describe("driveAskAnswers — typed text step over a recorded fake tmux", () => 
 // finding: a 30 ms Down+Enter pair was accepted by tmux but ignored by claude).
 // ────────────────────────────────────────────────────────────────────────────
 
-describe("confirmStartupDialog — key gap over a recorded fake tmux", () => {
-  const dialog = (cursorIndex: number, acceptIndex: number) => ({
+describe("confirmStartupDialog — live-read key drive over a recorded fake tmux", () => {
+  // The unnumbered 2.1.284+ workspace-trust dialog: cursor starts on "No, exit".
+  const trustPane = (cursorOnYes: boolean) =>
+    "Quick safety check: Is this a project you created or one you trust?\n\n"
+    + (cursorOnYes ? "  No, exit\n❯ Yes, I trust this folder\n" : "❯ No, exit\n  Yes, I trust this folder\n")
+    + "\nEnter to confirm · Esc to cancel\n";
+  const live = { stillCurrent: () => true, firstSeenAt: 0, rematch: (pane: string) => matchStartupConsentDialog(pane) };
+  const dialog = (cursorIndex: number | null, acceptIndex: number) => ({
     name: "trust-folder",
     choices: [{ key: "1", label: "No, exit" }, { key: "2", label: "Yes, I trust this folder" }],
     cursorIndex,
@@ -450,11 +456,21 @@ describe("confirmStartupDialog — key gap over a recorded fake tmux", () => {
     fingerprint: `fp-${cursorIndex}`,
   });
 
+  test("a boot whose session was replaced (a respawn reuses the tmux name) sends no key", async () => {
+    const fake = makeFakeTmux({ emptyPaneOnEnter: false });
+    fake.setPane(trustPane(false));
+    await withDrive(fake, async ({ taskId, sessionName, state }) => {
+      expect(await confirmStartupDialog(taskId, sessionName, dialog(0, 1), { ...live, state, stillCurrent: () => false })).toBe(false);
+      expect(fake.times().filter((c) => c.k === "Down" || c.k === "Enter")).toEqual([]);
+    });
+  });
+
   test("Down then Enter, at least STARTUP_CONFIRM_KEY_GAP_MS apart", async () => {
     expect(STARTUP_CONFIRM_KEY_GAP_MS).toBe(150);
     const fake = makeFakeTmux({ emptyPaneOnEnter: false });
-    await withDrive(fake, async ({ taskId, sessionName }) => {
-      expect(await confirmStartupDialog(taskId, sessionName, dialog(0, 1))).toBe(true);
+    fake.setPane(trustPane(false));
+    await withDrive(fake, async ({ taskId, sessionName, state }) => {
+      expect(await confirmStartupDialog(taskId, sessionName, dialog(0, 1), { ...live, state })).toBe(true);
       const keys = fake.times().filter((c) => c.k === "Down" || c.k === "Enter");
       expect(keys.map((c) => c.k)).toEqual(["Down", "Enter"]);
       // Wall-clock gap (process-spawn latency only ever adds to it).
@@ -464,9 +480,80 @@ describe("confirmStartupDialog — key gap over a recorded fake tmux", () => {
 
   test("cursor already on the accept row → Enter alone (the retry case where only Enter was lost)", async () => {
     const fake = makeFakeTmux({ emptyPaneOnEnter: false });
-    await withDrive(fake, async ({ taskId, sessionName }) => {
-      expect(await confirmStartupDialog(taskId, sessionName, dialog(1, 1))).toBe(true);
+    fake.setPane(trustPane(true));
+    await withDrive(fake, async ({ taskId, sessionName, state }) => {
+      expect(await confirmStartupDialog(taskId, sessionName, dialog(1, 1), { ...live, state })).toBe(true);
       expect(fake.calls().filter((a) => a[0] === "send-keys")).toEqual([["send-keys", "-t", sessionName, "Enter"]]);
+    });
+  });
+
+  test("the cursor is read LIVE: a stale registered cursor on 0 with the pane already on Yes sends no Down", async () => {
+    const fake = makeFakeTmux({ emptyPaneOnEnter: false });
+    fake.setPane(trustPane(true));
+    await withDrive(fake, async ({ taskId, sessionName, state }) => {
+      expect(await confirmStartupDialog(taskId, sessionName, dialog(0, 1), { ...live, state })).toBe(true);
+      expect(fake.calls().filter((a) => a[0] === "send-keys").map((a) => a[a.length - 1])).toEqual(["Enter"]);
+    });
+  });
+
+  test("the dialog is gone from the pane → no key at all", async () => {
+    const fake = makeFakeTmux({ emptyPaneOnEnter: false });
+    fake.setPane("❯ \n");
+    await withDrive(fake, async ({ taskId, sessionName, state }) => {
+      expect(await confirmStartupDialog(taskId, sessionName, dialog(0, 1), { ...live, state })).toBe(false);
+      expect(fake.calls().filter((a) => a[0] === "send-keys")).toEqual([]);
+    });
+  });
+
+  test("a DIFFERENT dialog on the pane → no key at all", async () => {
+    const fake = makeFakeTmux({ emptyPaneOnEnter: false });
+    fake.setPane("Quick safety check: Is this a project you created or one you trust?\n❯ No, exit\n  Yes, I trust this folder\n  Something else\n\nEnter to confirm · Esc to cancel\n");
+    await withDrive(fake, async ({ taskId, sessionName, state }) => {
+      expect(await confirmStartupDialog(taskId, sessionName, dialog(0, 1), { ...live, state })).toBe(false);
+      expect(fake.calls().filter((a) => a[0] === "send-keys")).toEqual([]);
+    });
+  });
+
+  test("an unreadable cursor never sends a Down (the select wraps onto No, exit)", async () => {
+    const fake = makeFakeTmux({ emptyPaneOnEnter: false });
+    fake.setPane(trustPane(false));
+    await withDrive(fake, async ({ taskId, sessionName, state }) => {
+      const noCursor = { stillCurrent: () => true, firstSeenAt: 0, rematch: (pane: string) => ({ ...matchStartupConsentDialog(pane)!, cursorIndex: null }) };
+      expect(await confirmStartupDialog(taskId, sessionName, dialog(0, 1), { ...noCursor, state })).toBe(false);
+      expect(fake.calls().filter((a) => a[0] === "send-keys")).toEqual([]);
+    });
+
+
+  });
+
+  test("a dialog a card already owns (the user is answering it) is left to the card: no key", async () => {
+    const { registerTmuxPrompt } = await import("./interactions.ts");
+    const fake = makeFakeTmux({ emptyPaneOnEnter: false });
+    fake.setPane(trustPane(false));
+    await withDrive(fake, async ({ taskId, sessionName, state }) => {
+      const match = __forTest.pickScrapeMatch(trustPane(false), { paneWorking: false, paneIdle: false, watchdogArmed: false, boot: true })!;
+      const reg = registerTmuxPrompt({
+        taskId, runId: "run-askdrive", paneText: match.paneText, choices: match.choices, cursorIndex: match.cursorIndex,
+        nav: match.nav, fingerprint: match.fingerprint, identity: __forTest.identityOf(match),
+      });
+      try {
+        expect(await confirmStartupDialog(taskId, sessionName, dialog(0, 1), { ...live, state })).toBe(false);
+        expect(fake.calls().filter((a) => a[0] === "send-keys")).toEqual([]);
+      } finally {
+        const { answerTmuxPrompt } = await import("./interactions.ts");
+        answerTmuxPrompt(reg.req.id, { key: "__external__" });
+      }
+    });
+  });
+
+  test("waits out the 500 ms arm window after the dialog first appeared", async () => {
+    const fake = makeFakeTmux({ emptyPaneOnEnter: false });
+    fake.setPane(trustPane(true));
+    await withDrive(fake, async ({ taskId, sessionName, state }) => {
+      const t0 = Date.now();
+      await confirmStartupDialog(taskId, sessionName, dialog(1, 1), { ...live, state, firstSeenAt: t0 });
+      const enter = fake.times().find((c) => c.k === "Enter")!;
+      expect(enter.t - t0).toBeGreaterThanOrEqual(480);
     });
   });
 });
