@@ -98,7 +98,8 @@ import { Select } from "@/components/ui/select";
 import { Switch } from "@/components/ui/switch";
 import { Textarea } from "@/components/ui/textarea";
 import { abbreviateHome, cn } from "@/lib/utils";
-import { tmuxChoiceLabel } from "@/lib/tmux-prompt";
+import { tmuxChoiceLabel, tmuxPromptAnswerKind } from "@/lib/tmux-prompt";
+import { TmuxPromptAnswerControls } from "@/components/kanban/TmuxPromptAnswerControls";
 import {
   formatHarnessSwapNotice,
   isHarnessStackContinuation,
@@ -171,6 +172,7 @@ import {
 } from "../../../shared/model-catalog.ts";
 import { modelDisplayName } from "../../../shared/model-display.ts";
 import { parseIssueUrl } from "../../../shared/issue-task.ts";
+import { BOARD_DRAG_SELECTOR } from "@/lib/board-keyboard";
 import { draftsEqual, normalizeDraft } from "@/lib/draft";
 import { createEventDeduper } from "@/lib/event-dedup";
 import { collapseRepeatedStatusChips } from "@/lib/status-collapse";
@@ -210,6 +212,10 @@ import { AssistantHandoffMessage, UserHandoffMarkdown } from "@/components/hando
 import { handoffCardsEnabled, handoffUsage, indexLastHandoffEventByRun } from "@/lib/handoff-view";
 import { SpeedPicker } from "./SpeedPicker";
 import { importedSessionOf } from "../../../shared/imported-session.ts";
+
+/** Layers that own an Escape before the panel or its search bar do: a modal
+ *  dialog, an open popover, the floating quote pill. */
+const ESCAPE_HIGHER_LAYERS = '[role="dialog"][aria-modal="true"], [data-popover-open], [data-quote-open]';
 
 /**
  * Resolve a task's harness id to its underlying kind. Falls back to
@@ -581,7 +587,7 @@ export function RunPanel({ task, stickyUserMessages, agents, harnesses, stacks =
     const onKey = (e: KeyboardEvent) => {
       if (e.key !== "Escape") return;
       if (e.defaultPrevented) return;
-      if (document.querySelector('[role="dialog"][aria-modal="true"], [data-popover-open], [data-quote-open], [data-search-open]')) return;
+      if (document.querySelector(`${ESCAPE_HIGHER_LAYERS}, [data-search-open], ${BOARD_DRAG_SELECTOR}`)) return;
       e.preventDefault();
       onCloseRef.current();
     };
@@ -2319,7 +2325,8 @@ function RunPanelBody({
       if (e.key !== "Escape") return;
       // Already handled by a layer above (see the panel-close listener).
       if (e.defaultPrevented) return;
-      if (document.querySelector('[role="dialog"][aria-modal="true"], [data-popover-open], [data-quote-open]')) return;
+      // A held board card owns this Escape (dnd-kit puts it back).
+      if (document.querySelector(`${ESCAPE_HIGHER_LAYERS}, ${BOARD_DRAG_SELECTOR}`)) return;
       e.preventDefault();
       closeSearch();
     };
@@ -9684,6 +9691,11 @@ function TmuxPromptCard({
   // would swap the card to the plan layout, whose button filter keeps only
   // `Yes …` rows and would drop the Chrome prompt's "No, keep browser tools
   // off" choice.
+  // Enter-only screens and the OAuth code prompt are not menus: they have
+  // their own card (T11, docs/plans/claude-enter-to-confirm-prompts.md).
+  if (tmuxPromptAnswerKind(req) !== "choice") {
+    return <TmuxPromptAnswerControls req={req} onResolved={onResolved} />;
+  }
   const isPlan = req.unparsable !== true && !req.hideKeys && CLAUDE_PLAN_PROMPT_RE.test(req.paneText);
   if (isPlan) {
     const planLabel = (label: string): string => {
@@ -9811,6 +9823,11 @@ function TmuxPromptCard({
       <pre className="max-h-96 overflow-auto whitespace-pre-wrap break-words rounded-md border border-border/40 bg-muted/40 p-2 font-mono text-[11px] leading-snug">
         {cleanPromptPane(req.paneText)}
       </pre>
+      {req.held === true && (
+        <p className="mt-2 text-[11px] text-warning" data-testid="tmux-prompt-held-hint">
+          Claude didn’t take the first keypress — choose again.
+        </p>
+      )}
       <div className="mt-3 flex flex-wrap items-center justify-end gap-2">
         {req.choices.map((c) => {
           // Visual hint only: dim out the "negative" choice so it doesn't

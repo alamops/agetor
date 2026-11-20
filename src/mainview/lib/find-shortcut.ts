@@ -41,9 +41,10 @@ export const KEYBOARD_OWNING_POPOVERS = '[data-popover-open]:not([data-popover-k
  * (`[data-popover-open]`) — so ⌘F doesn't hijack the browser/OS's own find
  * behavior, or a dialog's own input, while one of those is up. Popovers
  * marked `data-popover-keys="escape-only"` (SlashAutocomplete,
- * AtFileAutocomplete, ExtensionPicker) are excluded from the guard: they
- * only want Escape yielded to them, so ⌘F stays live while the `/` or `@`
- * menu or the Extensions popover is open (see the `data-popover-keys`
+ * AtFileAutocomplete, ExtensionPicker, the app bar's Harnesses panel) are
+ * excluded from the guard: they only want Escape yielded to them, so ⌘F stays
+ * live while the `/` or `@` menu, the Extensions popover or the Harnesses
+ * panel is open (see the `data-popover-keys`
  * convention documented in
  * docs/architecture/prompt-composer.md, and this exact string previously inline in RunPanel.tsx's
  * Cmd/Ctrl+F handler).

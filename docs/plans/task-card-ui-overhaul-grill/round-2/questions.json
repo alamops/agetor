@@ -1,0 +1,138 @@
+{
+  "version": 1,
+  "id": "task-card-ui-overhaul-grill-r2",
+  "title": "Grill — Task card UI overhaul (round 2)",
+  "skill": "grill",
+  "slug": "task-card-ui-overhaul",
+  "round": 2,
+  "summary": "Round 1 is recorded (15 recommendations accepted, 6 overridden). **5 follow-ups**: two of your notes opened new choices, and two of your picks conflict with something you'd want to see first.\n\nAlready settled from round 1: full redesign; titles keep their full wrap; progress = distinct steps with `✓ Done`; Primary only + `⋯` (Diff in the menu); keyboard dragging **in**; first-prose preview; one chip system, `h-7` buttons, `p-3`, one repo · branch line; you eyeball the dev build before merge.",
+  "proven": [
+    {
+      "text": "**Keyboard drops reuse the pointer drop path.** A keyboard drag ends in the same `onDragEnd`, so the pipeline-parent refusal (toast) and the server-409 re-sync apply unchanged, with no new drop rules.",
+      "evidence": [
+        { "path": "src/mainview/App.tsx", "line": 2079, "lang": "tsx", "code": "    if (t.pipelineId && !(col === \"done\" && t.pipelineRun?.status === \"done\")) {\n      toast(\"This pipeline task's column is managed by its run.\");\n      return;\n    }" }
+      ]
+    },
+    "There is no `AGENTS.md` in the repo; `CLAUDE.md` is the agent rules file, so a card rule goes there (and/or a topic doc it points to)."
+  ],
+  "sections": [
+    {
+      "id": "design",
+      "title": "Design exploration & the pipeline name",
+      "questions": [
+        {
+          "id": "design-process",
+          "type": "single",
+          "title": "How should the designs be explored before one is picked?",
+          "impact": "blocking",
+          "why": "Your header answer and your mockup answer pull in different directions; this decides what Planning delivers before code.",
+          "context": "Round 1, header layout, you wrote: *\"We actually need to follow the best practices and try some designs to make sure the new one won't have the 'breaking' issue.\"* But on the mockup question you picked *\"one mockup of the chosen layout\"*, and there is no chosen layout yet. Worst-case content in your DB: 26-char pipeline name, 25-char profile name, stack chip, every count badge, 128-char title (now unclamped), `Answer (12)`.",
+          "options": [
+            { "id": "alts-measured", "label": "Planning publishes 2–3 whole-card alternatives, each measured; you pick one", "description": "Each alternative is rendered at the real 262 px width with the worst-case content above, in every card state, in light and dark. Each is checked automatically: every child inside the card box, nothing overlapping. The mockup shows pass/fail per state. My meta-footer layout is one of them.", "consequence": "One sign-off round with you before coding; the winner's measurements become the e2e bounds spec." },
+            { "id": "alts-visual", "label": "2–3 alternatives, judged by eye only", "consequence": "Faster mockup; overflow is only caught later by the e2e spec." },
+            { "id": "agent-picks", "label": "The agent builds and measures alternatives, and shows me only the winner", "consequence": "No pick round; you only see one design." }
+          ],
+          "recommendation": { "value": "alts-measured", "reason": "Matches your 'try some designs' and 'make sure it won't break': the comparison is visual, and the non-breaking claim is measured, not eyeballed." }
+        },
+        {
+          "id": "pipeline-name",
+          "type": "single",
+          "title": "Pipeline cards: how is the full pipeline name shown?",
+          "impact": "blocking",
+          "why": "Round 1 picked 'name truncates', but your note says the full name must be visible, so the pill design changes.",
+          "context": "Your note: *\"We need full name been seen. We can even have it as a sub card to the main card. Or a special 'hat' in the UI when the card is a pipeline.\"* Already decided: progress never truncates, and the active step gets its own line.",
+          "options": [
+            {
+              "id": "hat",
+              "label": "A pipeline \"hat\": a full-width band at the top of the card",
+              "description": "Tinted by run status (running/blocked/done/failed). Holds `⧉` + the full pipeline name (wraps if needed) and the progress (`3/10` or `✓ Done`) on the right. The active step / pending gate line sits at the bottom of the hat. The card body below looks like any other card.",
+              "consequence": "Pipeline cards are recognisable at a glance; row 1 keeps only the type icon, count badges and stack chip, so it can't overflow.",
+              "preview": "┌───────────────────────────────┐\n│▓⧉ Zebra Pipeline (No Audio)  3/10▓│\n│▓▶ Implementing                  ▓│\n├───────────────────────────────┤\n│ ▣ 🤖2                       1/2 │\n│ Acme Sync - Keep the inbox      │\n│ watched for the whole session   │\n│ …                               │"
+            },
+            {
+              "id": "sub-card",
+              "label": "A sub-card (inset panel) inside the card, below the title",
+              "description": "Bordered inset with the full name, progress and the active step.",
+              "consequence": "Reads as 'attached run'; adds nested borders inside a 233 px box.",
+              "preview": "│ ▣ 🤖2                       1/2 │\n│ Acme Sync - Keep the inbox…     │\n│ ┌───────────────────────────┐ │\n│ │⧉ Zebra Pipeline (No Audio)│ │\n│ │3/10 · ▶ Implementing      │ │\n│ └───────────────────────────┘ │"
+            },
+            {
+              "id": "own-row",
+              "label": "The pill moves to its own row in the header and wraps",
+              "consequence": "Smallest change; a wrapped pill is an unusual shape.",
+              "preview": "│ ▣ 🤖2                       1/2 │\n│ ⧉ Zebra Pipeline (No Audio) 3/10│\n│ Acme Sync - Keep the inbox…     │"
+            },
+            {
+              "id": "mockup-decides",
+              "label": "Mock up the hat and the sub-card as alternatives, and I'll pick from the mockup",
+              "consequence": "Decided in the design round instead of now."
+            }
+          ],
+          "recommendation": { "value": "hat", "reason": "A hat gives the full name a full-width line without competing with other chips, and marks pipeline cards apart at a glance. It's your idea, and the cleanest fit for 233 px." }
+        }
+      ]
+    },
+    {
+      "id": "rule",
+      "title": "Guarding against regressions",
+      "questions": [
+        {
+          "id": "card-rule",
+          "type": "single",
+          "title": "Where does the 'don't break the card' rule live?",
+          "impact": "shape",
+          "why": "Your note asked for a CLAUDE.md/AGENTS.md rule; CLAUDE.md keeps only rules every task needs and points to a topic doc for the rest.",
+          "context": "Your note on header layout: *\"It'd be important to also have in the Claude or Agents MD a rule for checking the card design to make sure a change is not turning that broken.\"*",
+          "options": [
+            {
+              "id": "rule-and-doc",
+              "label": "A short rule in CLAUDE.md's *Webview* rules + a new `docs/architecture/task-card.md` + a Topic map row",
+              "description": "The doc holds the layout contract: the 262 px card / 233 px content budget, no `shrink-0` on a variable-length chip, the per-state button table, the hat, the e2e bounds spec and how to run it.",
+              "consequence": "Every agent sees the rule; the details sit where CLAUDE.md says subsystem contracts go.",
+              "preview": "- **A TaskCard change must keep every child inside the card in every state.**\n  Run `e2e/task-card-bounds.spec.ts` (worst-case names, every badge, every\n  action state, light and dark) before merging; it fails on any overflow.\n  Layout contract: [task-card.md](docs/architecture/task-card.md)."
+            },
+            { "id": "rule-only", "label": "The rule in CLAUDE.md only, no topic doc" },
+            { "id": "doc-only", "label": "Topic doc + Topic map row only, no rule bullet" }
+          ],
+          "recommendation": { "value": "rule-and-doc", "reason": "The rule has to fire for anyone touching the card; the contract is too long for CLAUDE.md, which already sends subsystem detail to docs/architecture/." }
+        }
+      ]
+    },
+    {
+      "id": "actions",
+      "title": "Action row & keyboard (consequences of round-1 picks)",
+      "questions": [
+        {
+          "id": "action-states",
+          "type": "single",
+          "title": "With 'Primary only + ⋯', confirm the per-state buttons, in particular Stop on a pending human gate",
+          "impact": "shape",
+          "why": "This reverses an earlier owner decision (pipeline human gate grill: Stop stays visible as a secondary danger action) unless you keep it.",
+          "context": "Planned buttons per state (everything else, including Diff, Archive, Unarchive, Stop-extra and Delete…, moves into `⋯`, which opens the existing right-click menu):\n\n| State | Visible |\n| --- | --- |\n| backlog / ready | `Run` · ⋯ |\n| running | `Stop` (destructive, as today) · ⋯ |\n| awaiting | `Answer (N) →` · ⋯ |\n| review | `Open` · `✓ Done` · ⋯ |\n| done / archived | `Open` · ⋯ |\n| gate pending | `Review` · `Open` · ⋯ ← **Stop moves into ⋯** |",
+          "evidence": [
+            { "label": "today's gate-pending row and the earlier decision", "path": "src/mainview/components/kanban/TaskCard.tsx", "line": 395, "lang": "tsx", "code": "            // A pending human gate is a decision, not a failure: Review is the\n            // primary action, Open browses the run, and Stop stays available\n            // as a single, visually secondary danger action (owner decisions:\n            // grill round-1 \"Open + Review\", round-2 \"Review primary, danger\n            // Stop secondary\"). No icon Stop here — one Stop is enough." }
+          ],
+          "options": [
+            { "id": "table-menu-stop", "label": "Table as shown: Stop goes into ⋯ on a pending gate", "consequence": "Consistent: running is the only state with a visible Stop. Supersedes the earlier gate decision; `pipelines-human-step.spec` retargets its Stop click." },
+            { "id": "table-keep-stop", "label": "Table, but a pending gate keeps a visible Stop (compact danger icon)", "consequence": "Keeps the earlier gate decision; that row is Review · Open · ■ · ⋯ (fits in 233 px)." }
+          ],
+          "recommendation": { "value": "table-menu-stop", "reason": "You chose 'primary only'; a gate is a decision point, and stopping the whole pipeline from it is rare and destructive, so one extra click is a fair guard." }
+        },
+        {
+          "id": "keyboard-keys",
+          "type": "single",
+          "title": "Keyboard: Enter/Space open the card AND start a keyboard drag. Which key does what?",
+          "impact": "shape",
+          "why": "You picked both 'Enter/Space opens' and keyboard dragging; dnd-kit's KeyboardSensor starts a drag on Space and Enter by default, so they collide.",
+          "context": "The board has no ordering within a column (drops only change the column), so a keyboard drag moves left/right between columns. Screen-reader announcements are dnd-kit's built-in live region, with our own wording.",
+          "options": [
+            { "id": "enter-open-space-drag", "label": "Enter opens; Space picks up / drops; ← → move between columns; Esc cancels", "consequence": "The common board convention (Trello, GitHub Projects); Space no longer opens." },
+            { "id": "both-open-shortcut", "label": "Enter and Space open; a modifier shortcut (e.g. ⌥← / ⌥→) moves the card one column", "consequence": "No pick-up mode; it's a move command, not a drag." },
+            { "id": "drag-keys-o-open", "label": "Enter/Space start a drag (dnd-kit default); `O` opens", "consequence": "Opening a card by keyboard needs a non-standard key." }
+          ],
+          "recommendation": { "value": "enter-open-space-drag", "reason": "Enter = activate, Space = grab is the convention screen-reader users expect on boards, and it keeps both of your picks." }
+        }
+      ]
+    }
+  ]
+}

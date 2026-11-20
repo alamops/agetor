@@ -1,0 +1,123 @@
+{
+  "version": 1,
+  "id": "app-bar-redesign-grill-r2",
+  "title": "Grill round 2 — App bar redesign: the aggregate button",
+  "skill": "grill",
+  "slug": "app-bar-redesign",
+  "round": 2,
+  "flags": [],
+  "summary": "Thanks. Round 1 is recorded. You picked **(A), one aggregate \"Harnesses\" button**, instead of my hybrid. That leaves a few questions that the chip-shaped answers don't settle, plus one conflict between two of your answers.\n\nThere are **4 questions** and **3 confirms**.",
+  "proven": [
+    "**Settled in round 1:** aggregate button; stack summaries with dots, headroom, primary meter and reset; stack section with members, cooldowns, Refresh, Manage and History (Clear cooldown stays in Settings); a failover badge; Settings, Pipelines, Git and Worktrees always visible, Import in More when narrow; 720 px minimum; RunPanel kept as is; bar pinned in px under zoom; every action in the native menu; task count moved to `KanbanFilters`; wordmark collapses first; all 10 confirms accepted.",
+    "**The native menu makes \"RunPanel covers the actions\" safe.** With every action in the menu bar (and Settings on ⌘,), nothing becomes unreachable while the panel is open."
+  ],
+  "sections": [
+    {
+      "id": "pushback",
+      "title": "Follow-ups to round 1",
+      "questions": [
+        {
+          "id": "button-content",
+          "type": "multi",
+          "title": "What should the aggregate button itself show in the bar?",
+          "impact": "blocking",
+          "why": "This is the only harness surface left in the bar, so it decides what you can see without clicking.",
+          "context": "Round 1: `direction = aggregate`. My round-1 sketch was `[● Harnesses 7 ▮▮▮▯ 82%]`. The bar is pinned at 40 px. At 720 px wide, the logo, the button, 4 actions and More fit with room to spare.",
+          "options": [
+            { "id": "dot", "label": "A status dot: the worst state across accounts (red unavailable, amber logged out or cooling, green ok)" },
+            { "id": "text", "label": "The text \"Harnesses\"", "consequence": "About 70 px; hidden when narrow (below)." },
+            { "id": "count", "label": "The count of enabled accounts (\"7\")" },
+            { "id": "meter", "label": "One usage meter (Q2 decides which)" },
+            { "id": "percent", "label": "That meter's percentage as text (\"82%\")" },
+            { "id": "badge", "label": "The failover badge: tasks waiting for quota or mid-swap (round 1: `failover-activity = badge`)" },
+            { "id": "reset", "label": "\"until 14:30\" when every account that can run is out of quota" }
+          ],
+          "min": 1,
+          "recommendation": { "value": ["dot", "text", "meter", "badge", "reset"], "reason": "State, capacity and blocked work at a glance; the count and percent are in the tooltip and the panel." }
+        },
+        {
+          "id": "button-meter",
+          "type": "single",
+          "title": "Which usage does the button's meter show?",
+          "impact": "shape",
+          "showIf": { "question": "button-content", "in": ["meter", "percent"] },
+          "why": "Decides whether a single nearly-full account turns the whole button red.",
+          "context": "Your accounts today: the two stack members and Codex report usage; Bravo, PBSCO and Cursor report `unavailable`; OpenCode has no usage support.",
+          "options": [
+            { "id": "worst", "label": "The highest usage of any enabled account (CodexBar's \"highest-usage\")", "consequence": "One busy unstacked account turns it red even if everything else has room. The tooltip names that account." },
+            { "id": "capacity", "label": "The tightest \"what can still run\" figure: stacks count by headroom, accounts in no stack by their own meter", "consequence": "A stack whose primary is full but whose backup has room doesn't alarm. More logic, all pure and unit-tested." }
+          ],
+          "recommendation": { "value": "capacity", "reason": "Consistent with the stack headroom you chose. A full primary with a free backup isn't a problem, and the button shouldn't say it is." }
+        },
+        {
+          "id": "stack-meters",
+          "type": "single",
+          "title": "In the panel's stack section, where do the headroom meter and the primary's meter go?",
+          "impact": "shape",
+          "why": "In round 1 you picked both `headroom` and `primary-meter`. I had offered the primary's meter *instead of* headroom.",
+          "context": "The stack section lists its members anyway, each with its own `StackQuotaMeter`, which includes the primary.",
+          "options": [
+            { "id": "header-headroom", "label": "Stack heading: headroom. Member rows: each member's own meter (the primary's included)", "consequence": "No duplicate meter." },
+            { "id": "both-header", "label": "Stack heading: headroom *and* the primary's meter, side by side, plus each member's own meter", "consequence": "The primary's meter appears twice." },
+            { "id": "primary-header", "label": "Stack heading: the primary's meter; members as usual" }
+          ],
+          "recommendation": { "value": "header-headroom", "reason": "Both numbers are on screen, and each appears once." }
+        },
+        {
+          "id": "panel-order",
+          "type": "single",
+          "title": "Your priority ranking was stacks, running, problem, built-in. With one aggregate button nothing overflows, so how should it order the panel?",
+          "impact": "shape",
+          "context": "Round 1 `priority`: stacks, then accounts with a running task, then accounts with a problem, then built-in/DB order. With direction A, that ranking can only decide the panel's order.",
+          "options": [
+            { "id": "ranked", "label": "Stacks first; then accounts in no stack ordered running → problem → DB order", "consequence": "Your ranking, literally. Rows in the lower section can move as state changes." },
+            { "id": "stable", "label": "Stacks first; then accounts in no stack in fixed DB order, with running and problem shown as badges only", "consequence": "Nothing moves while you read it." }
+          ],
+          "recommendation": { "value": "ranked", "reason": "It's the ranking you gave. The panel is opened briefly, so movement is a small cost." }
+        },
+        {
+          "id": "runpanel-test",
+          "type": "single",
+          "title": "Two of your answers conflict: RunPanel is kept as is, but the accepted test says the always-visible actions are clickable while RunPanel is open. Which one gives way?",
+          "impact": "shape",
+          "why": "With `runpanel-overlap = keep`, the panel (720 px by default, `fixed top-0 right-0 z-40`) covers Settings, Pipelines, Git and Worktrees.",
+          "evidence": [
+            { "label": "RunPanel aside", "path": "src/mainview/components/kanban/RunPanel.tsx", "line": 630 }
+          ],
+          "options": [
+            { "id": "fix-test", "label": "Keep RunPanel as is. With it open, the test asserts no sideways scroll and a usable aggregate button, and that every action is still reachable through the native menu", "consequence": "No RunPanel change." },
+            { "id": "below", "label": "Change RunPanel to start below the bar after all, so the actions stay clickable", "consequence": "RunPanel loses 40 px of height; its layout gets checked." }
+          ],
+          "recommendation": { "value": "fix-test", "reason": "Respects your keep answer; the native menu now covers reachability." }
+        }
+      ]
+    },
+    {
+      "id": "confirm",
+      "title": "Confirm or override",
+      "questions": [
+        {
+          "id": "c-panel-accounts",
+          "type": "confirm",
+          "title": "Account rows in the panel",
+          "impact": "minor",
+          "recommendation": { "value": "Each account row (in a stack or not) shows its icon, its full label, a status with text, the plan, every meter with % and reset, \"updated N ago\" (dimmed when stale), cooldown chips and a Refresh button, as today's per-chip popover does. Kinds without usage support (OpenCode) show the existing explanation.", "reason": "Today's popover content moves into the panel; nothing is lost." }
+        },
+        {
+          "id": "c-badge",
+          "type": "confirm",
+          "title": "The failover badge",
+          "impact": "minor",
+          "recommendation": { "value": "The badge counts tasks whose `harnessState` has `allExhausted` or `pendingSwap` set. The panel lists them under their stack (\"waiting for quota until 14:30\" / \"switching to <account>\"), and clicking one opens that task.", "reason": "Already in the 2-second task poll; no server change." }
+        },
+        {
+          "id": "c-collapse",
+          "type": "confirm",
+          "title": "What collapses as the window narrows",
+          "impact": "minor",
+          "recommendation": { "value": "Measured fit (it re-measures on resize and on zoom), in this order: the wordmark hides first, then Import sessions moves into ⋯ More, then the button's \"Harnesses\" text hides (its dot, meter and badge stay). The logo, the aggregate button, Settings, Pipelines, Git, Worktrees and More never hide, and the document never scrolls sideways at any width.", "reason": "Follows your round-1 answers; measured, so it holds at 170% zoom." }
+        }
+      ]
+    }
+  ]
+}

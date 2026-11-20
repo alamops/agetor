@@ -1,0 +1,164 @@
+{
+  "version": 1,
+  "id": "claude-enter-to-confirm-prompts-grill-r2",
+  "title": "Grill round 2 — Claude Code \"Enter to confirm\" prompts",
+  "skill": "grill",
+  "slug": "claude-enter-to-confirm-prompts",
+  "round": 2,
+  "summary": "Thanks, round 1 is complete. Your **overrides and notes** opened **7 follow-ups**. Each one quotes your round-1 answer. The rest of round 1 is settled and won't be asked again.\n\nThe ones that shape the plan most: **what \"the General settings are getting polluted\" should turn into**, **who may turn auto-trust on**, and **how an OAuth code typed into a card is handled**.",
+  "proven": [
+    "Only **claude-code, codex and copilot** get `--add-dir` for a multi-repo task. Cursor, fx, OpenCode, Gemini and Antigravity rely on the cwd (`docs/architecture/multi-repo-tasks.md:234`), so they can't show an add-dir trust prompt. The spike you asked for covers codex and copilot only.",
+    "**codex-cli 0.166.0 is installed here, and copilot is not.** A live copilot spike needs the CLI installed first (round-2 question below).",
+    "General settings today has 11 rows in one flat list: Default harness, tmux for Claude Code, Theme, Font size, Background + Remote access, Look for Claude Code/OpenCode sessions on launch, Sticky user messages, Keep Agetor's macOS permissions away from agents, fx auto-resume (+ delay), and Getting started (`SettingsDialog.tsx:1276–1590`)."
+  ],
+  "sections": [
+    {
+      "id": "settings",
+      "title": "The auto-trust setting and Settings → General",
+      "questions": [
+        {
+          "id": "general-cleanup",
+          "type": "single",
+          "title": "You wrote \"use this change to also update settings General UI, it's getting polluted\". What should General become?",
+          "impact": "shape",
+          "why": "Moving rows changes where users find them, the Settings tests and any deep links. The new auto-trust toggle needs a home either way.",
+          "context": "Your round-1 note on the add-dir question: *\"btw, use this change to also update settings General UI, it's getting polluted\"*.\n\nGeneral mixes **app-wide** rows (theme, font size, sticky messages, background, getting started) with rows that only matter for **one harness**: tmux for Claude Code, the Claude Code/OpenCode session scan, and fx auto-resume (+ delay). The Harnesses page already has a card per harness.",
+          "evidence": [
+            { "label": "the flat list of General rows", "path": "src/mainview/components/settings/SettingsDialog.tsx", "line": 1364 },
+            { "label": "sidebar sections", "path": "src/mainview/lib/settings-dialog-view.ts", "line": 4, "code": "export const SETTINGS_SECTIONS = [\n  { id: \"general\", label: \"General\" },\n  { id: \"harnesses\", label: \"Harnesses\" },\n  { id: \"agents\", label: \"Agents\" },\n  { id: \"pipelines\", label: \"Pipelines\" },\n  { id: \"git\", label: \"Git Integration\" },\n  { id: \"prompts\", label: \"Saved Prompts\" },\n] as const;" }
+          ],
+          "options": [
+            { "id": "move-and-group", "label": "Move harness-specific rows to the Harnesses page, and group what's left in General under headings", "description": "On the Harnesses page, a per-kind \"Behaviour\" block holds Claude Code's rows (tmux source, the new **Auto-trust a task's repositories**) and fx's (auto-resume + delay). The session-import scan, which covers Claude Code and OpenCode, moves there too. General keeps app-wide rows under headings: **Appearance** (theme, font size, sticky messages), **Tasks** (default harness), **Privacy & security** (macOS permissions), **Background**, **Getting started**.", "consequence": "The biggest move: Settings tests change, and the onboarding tour is checked for steps that point at moved rows." },
+            { "id": "group-only", "label": "Keep every row in General, but group it under headings", "description": "Same headings, with a **Harness behaviour** group for the harness-specific rows and the new toggle.", "consequence": "Smallest change; General stays long." },
+            { "id": "new-sections", "label": "Split General into new sidebar sections", "description": "e.g. General, Appearance, Privacy & security, Background.", "consequence": "More sidebar entries; the harness-specific rows still need a home." }
+          ],
+          "recommendation": { "value": "move-and-group", "reason": "Harness rows live with their harness, and General becomes a short list grouped by headings." }
+        },
+        {
+          "id": "general-mock",
+          "type": "upload",
+          "title": "Got a sketch or screenshot of how you want General to look? Drop it here.",
+          "impact": "minor",
+          "required": false,
+          "accept": ".png,.jpg,.jpeg,.pdf",
+          "multiple": true,
+          "maxSizeMB": 10
+        },
+        {
+          "id": "autotrust-cli",
+          "type": "single",
+          "title": "Who may turn the \"Auto-trust a task's repositories\" setting back ON?",
+          "impact": "blocking",
+          "oneWayDoor": true,
+          "why": "Turning it on widens what agetor confirms for you, and any program running as you, an agent included, can read the CLI token.",
+          "context": "Your round-1 answer: *\"Auto-confirm as above, behind a setting (default on)\"*.\n\nThere's a precedent for a setting that relaxes a safety layer: `PUT /preferences/disclaimSpawnedAgents` with an **off** value is refused for the CLI token, because an agent could otherwise turn its own guard off. Turning auto-trust **off** only makes things safer.",
+          "evidence": [
+            { "label": "CLAUDE.md: value-level rule for the CLI token", "path": "CLAUDE.md", "note": "\"`PUT /preferences/disclaimSpawnedAgents` with an off value and `PUT /preferences/tmux_source` are refused for the CLI token\"" }
+          ],
+          "options": [
+            { "id": "app-on-cli-off", "label": "Desktop app may turn it on or off; the CLI may only turn it off", "description": "Same pattern as disclaim, enforced in the handler with a test.", "consequence": "An agent with the CLI token can't re-enable auto-trust after you turn it off." },
+            { "id": "app-only", "label": "Desktop app only; the CLI can't change it at all", "consequence": "No `agetor` command for it." },
+            { "id": "both", "label": "App and CLI alike", "consequence": "Full CLI parity; an agent could turn it back on." }
+          ],
+          "recommendation": { "value": "app-on-cli-off", "reason": "Same rule as the other setting that relaxes a safety layer; the CLI keeps the safe direction." }
+        }
+      ]
+    },
+    {
+      "id": "login",
+      "title": "Login and the OAuth code",
+      "questions": [
+        {
+          "id": "paste-code-caller",
+          "type": "single",
+          "title": "The new OAuth-code text box sends a login code through agetor's API. Who may submit it?",
+          "impact": "blocking",
+          "oneWayDoor": true,
+          "why": "The code logs Claude into **an account**. Whoever can submit it can choose which account a task's Claude runs as.",
+          "context": "Your round-1 answer: *\"A text box on the card that types the code into the pane\"* (I'd recommended the terminal).\n\nThe answer route `POST /tmux-prompts/:id/answer` is `app+cli` today, so `agetor answer` and the TUI can answer cards. Any program running as you, an agent included, can read the CLI token. A typed code is text an agent could choose: it could paste a code for **an account it controls** and log your task's Claude into it.",
+          "options": [
+            { "id": "app-only", "label": "Desktop app only for the code", "description": "The route refuses a text answer from the CLI token (`403 desktop-only`). `agetor answer` and the TUI show the card and say \"enter the code in the Agetor app or the terminal\". Their Enter and choice answers keep working.", "consequence": "One documented gap in CLI parity, pinned by a route-policy test." },
+            { "id": "app-and-cli", "label": "App, `agetor answer --text` and the TUI", "consequence": "Full parity; an agent with the CLI token could submit a code of its choosing." }
+          ],
+          "recommendation": { "value": "app-only", "reason": "This is the one card answer that picks an identity. Keep it off the token that agents can read." }
+        },
+        {
+          "id": "paste-code-handling",
+          "type": "confirm",
+          "title": "How the typed code is handled",
+          "recommendation": { "value": "A single line, at most 512 characters, no control characters. It is sent with `tmux send-keys -l` (literal) and then Enter. It is never written to run_events, a status line, a log or an error message, and a boot-timeout pane dump masks the paste-code line. The text box is offered only on the `Paste code here if prompted >` screen; no other card gets free text", "reason": "Keeps an auth code out of everything agetor stores, and stops the text box from becoming a general way to type into any prompt." }
+        },
+        {
+          "id": "stack-logged-out",
+          "type": "single",
+          "title": "Your note says \"should cover all cases\". When a harness-stack account is logged out, what should happen?",
+          "impact": "shape",
+          "why": "Decides whether the new pre-flight takes part in the stack's account selection (`harness-stacks.ts`) or only refuses a start.",
+          "context": "Your round-1 answer covered mid-session `/login` and a logged-out default account, with the note *\"but should cover all cases\"*. That brings in a second stack account that was never logged in, and a swap landing on a logged-out account. Today a stack moves between accounts on limit signals; it knows nothing about login state.",
+          "options": [
+            { "id": "skip", "label": "Skip a logged-out account like an exhausted one", "description": "At start and at swap, an account whose `claude auth status` says logged out is skipped, with a status line \"skipped <account>: not logged in\". If every account is logged out, start is refused with the login hint. If the probe can't tell, the account is used (fail-open) and the onboarding cards cover it.", "consequence": "The pre-flight is wired into stack selection; a test per path." },
+            { "id": "refuse", "label": "Refuse to start or swap, naming the logged-out account", "consequence": "Simpler; the task stops until you log that account in." },
+            { "id": "cards", "label": "Use it anyway and card the login screens", "consequence": "The run waits on you to log in from the card." }
+          ],
+          "recommendation": { "value": "skip", "reason": "A stack exists so a run keeps going on another account. A logged-out account is just one more reason to move on." }
+        },
+        {
+          "id": "preflight-details",
+          "type": "confirm",
+          "title": "The Claude Code login pre-flight",
+          "recommendation": { "value": "A spike first proves that `claude auth status` writes nothing, needs no network, and gives a parseable logged-out signal. It is probed with the harness's own env (`CLAUDE_CONFIG_DIR`), with a 5 s cap, and it fails open (only an explicit logged-out refuses). The header status dot shows \"logged out\" for Claude Code as it does for fx. If the spike shows it writes or is unreliable, the pre-flight is dropped and the onboarding cards alone cover login, and that is reported back to you", "reason": "Same fail-open contract as the fx probe. A pre-flight that misfires would block every run." }
+        }
+      ]
+    },
+    {
+      "id": "harness-spike",
+      "title": "The codex and copilot spike",
+      "questions": [
+        {
+          "id": "copilot-install",
+          "type": "single",
+          "title": "Copilot CLI isn't installed on this machine. How should its part of the spike run?",
+          "impact": "shape",
+          "why": "Without the binary there's nothing to spike, so this decides whether copilot's result is proved live or inferred.",
+          "context": "Your round-1 answer: *\"Spike them in this change; fix whatever shows up\"*. codex-cli 0.166.0 is here; copilot is not.",
+          "options": [
+            { "id": "install", "label": "Install it for the spike (`npm i -g @github/copilot`) and log it in myself when pinged", "consequence": "A live result; needs you once for the login." },
+            { "id": "fake-provider", "label": "Use the opt-in real-binary test path (`copilot-real-binary.test.ts`, fake provider)", "description": "It ran Copilot CLI 1.0.109 against a fake provider before.", "consequence": "Still needs the binary installed, but no login." },
+            { "id": "codex-only", "label": "Spike codex only; copilot is a separate ticket", "consequence": "Copilot stays unverified, recorded as out of scope." }
+          ],
+          "recommendation": { "value": "fake-provider", "reason": "It proves how the binary treats `--add-dir` without a real login, and the seam already exists." }
+        },
+        {
+          "id": "spike-fix-bound",
+          "type": "single",
+          "title": "\"Fix whatever shows up\": if the codex or copilot spike finds a problem that isn't an Enter-to-confirm prompt, is fixing it part of this change?",
+          "impact": "shape",
+          "why": "Both run one-shot without an interactive TUI, so a trust problem there would show as an error or a refused directory, not a menu.",
+          "options": [
+            { "id": "any-adddir", "label": "Fix anything that breaks a multi-repo task's extra directories on those two harnesses", "description": "e.g. a refused `--add-dir`, a trust error, a missing flag.", "consequence": "Open-ended until the spike runs. If the spike finds something large, I come back to you before planning it." },
+            { "id": "prompts-only", "label": "Fix only prompts that wait for input; anything else becomes a separate ticket", "consequence": "A tighter change." }
+          ],
+          "recommendation": { "value": "any-adddir", "reason": "Your \"fix whatever shows up\" reads that way, and a spike result I can't act on helps nobody. Large finds still come back to you." }
+        }
+      ]
+    },
+    {
+      "id": "confirm",
+      "title": "Confirm or override",
+      "questions": [
+        {
+          "id": "retry-both",
+          "type": "confirm",
+          "title": "What \"Both\" means for retry after a failed boot",
+          "recommendation": { "value": "The session id is recorded on the run only once Claude's session file appears. A boot that fails leaves the run with no id, so the next turn starts fresh. Separately, every resume first checks that the recorded session file exists, and if it doesn't, starts fresh under the same id (`--session-id`). That heals runs already in the DB. Harness-stack swap and transfer read the id only after it's recorded, and a test covers that order", "reason": "Your round-1 \"Both\". The order matters for the swap and transfer code, so it's stated here." }
+        },
+        {
+          "id": "setting-scope",
+          "type": "confirm",
+          "title": "Scope of the auto-trust setting",
+          "recommendation": { "value": "One setting for the Claude Code kind (`claude_auto_trust_repositories`, default on), applying to every Claude Code account. If the codex or copilot spike finds an equivalent prompt, it uses the same setting, renamed \"Auto-trust a task's repositories\" without the harness name. Turning it off brings back the card for each dialog", "reason": "It's one trust decision about your repositories, not about an account." }
+        }
+      ]
+    }
+  ]
+}

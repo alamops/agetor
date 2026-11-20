@@ -19,6 +19,7 @@
  * testable (both setters accept an injectable `now`) and safe to import from
  * both index.ts and server.ts.
  */
+import type { AppMenuAction } from "../shared/types.ts";
 
 /** How long a stashed open stays deliverable. Long enough to cover a window
  *  cold-start + webview boot, short enough that a later reconnect can't
@@ -42,4 +43,27 @@ export function consumePendingOpenTask(now: number = Date.now()): string | null 
   if (!entry) return null;
   if (now - entry.ts > PENDING_OPEN_TTL_MS) return null;
   return entry.taskId;
+}
+
+/**
+ * The same cold-start slot for a native menu click ("Settings…", the Go menu,
+ * `src/bun/app-menu.ts`): with no `/app/events` client attached there is
+ * nobody to broadcast `menu_action` to, so `deliverMenuAction` parks the action
+ * here and the route flushes it to the next subscriber. Same 10 s TTL, same
+ * reason: a later, unrelated reconnect must not replay an old click. One slot:
+ * a second click before the first is consumed replaces it.
+ */
+let pendingMenu: { action: AppMenuAction; ts: number } | null = null;
+
+export function setPendingMenuAction(action: AppMenuAction, now: number = Date.now()): void {
+  pendingMenu = { action, ts: now };
+}
+
+/** Return and clear the parked menu action, or `null` when none is queued or it is older than the TTL. */
+export function consumePendingMenuAction(now: number = Date.now()): AppMenuAction | null {
+  const entry = pendingMenu;
+  pendingMenu = null;
+  if (!entry) return null;
+  if (now - entry.ts > PENDING_OPEN_TTL_MS) return null;
+  return entry.action;
 }

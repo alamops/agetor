@@ -40,6 +40,10 @@ let previousFloor: string | undefined;
 let db: typeof import("./db.ts");
 let orch: typeof import("./orchestrator.ts");
 let restoreHarnesses: () => void;
+/** Tasks this file created. `bun test` shares one db.ts singleton across every
+ *  file, so teardown deletes only these, never other files' leftovers (deleting
+ *  every task there blew the 5 s afterAll budget in a full run). */
+const ownTaskIds: string[] = [];
 
 beforeAll(async () => {
   db = await import("./db.ts");
@@ -58,7 +62,7 @@ afterAll(async () => {
   const codexFloors = MODEL_MIN_CLI_VERSION.codex as Record<string, string>;
   if (previousFloor === undefined) delete codexFloors[MODEL];
   else codexFloors[MODEL] = previousFloor;
-  for (const t of db.tasks.list()) await orch.deleteTask(t.id).catch(() => {});
+  for (const id of ownTaskIds) await orch.deleteTask(id).catch(() => {});
   await Bun.sleep(150);
   restoreHarnesses();
   for (const key of ENV_KEYS) {
@@ -80,6 +84,7 @@ async function waitFor(fn: () => boolean, ms = 8000): Promise<boolean> {
 
 test("Stop on a failed card with running background agents, while a Run holds the start claim, cancels the turn that start mints (A2)", async () => {
   const taskId = randomUUID();
+  ownTaskIds.push(taskId);
   const workdir = mkdtempSync(path.join(DATA_DIR, "wd-"));
   db.tasks.insert({
     id: taskId, title: "hold scope claim", prompt: "work", agent: "codex", workdir, isolation: "none", taskType: "task",

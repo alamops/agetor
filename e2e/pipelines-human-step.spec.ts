@@ -61,9 +61,16 @@ test("pause + accept: card Review/no Done, panel contents, Accept carries the co
   await expect(card).toBeVisible();
   await expect(card.getByRole("button", { name: "Open" })).toBeVisible();
   await expect(card.getByTestId("task-card-pipeline-review")).toBeVisible();
-  await expect(card.getByTestId("task-card-pipeline-stop")).toHaveCount(1);
-  await expect(card.locator('button[title="Stop"]')).toHaveCount(1);
+  // Stop is not a card button at a gate (Review is the one primary action,
+  // Open browses); it lives in the `⋯` menu, where it still asks to confirm.
+  await expect(card.locator('button[title="Stop"]')).toHaveCount(0);
+  await expect(card.getByRole("button", { name: "Stop" })).toHaveCount(0);
   await expect(card.getByRole("button", { name: "Done" })).toHaveCount(0);
+  await card.getByTestId("task-card-more").click();
+  const menu = page.getByTestId("task-context-menu");
+  await expect(menu.getByRole("menuitem", { name: "Stop" })).toBeVisible();
+  await page.keyboard.press("Escape");
+  await expect(menu).toHaveCount(0);
 
   await card.getByTestId("task-card-pipeline-review").click();
   const panel = page.getByTestId("pipeline-human-panel");
@@ -126,7 +133,13 @@ test("stop at a gate: card moves to Ready, the gate section is gone, history kep
   await startTaskRest(backend, task.id);
   await gateRow(backend, task.id);
 
-  await page.locator(`[data-task-id="${task.id}"]`).getByTestId("task-card-pipeline-stop").click();
+  // gateRow reads the backend; wait for the board's 2 s poll to show the gate
+  // too, so the menu is built from the gated card.
+  const card = page.locator(`[data-task-id="${task.id}"]`);
+  await expect(card.getByTestId("task-card-pipeline-review")).toBeVisible();
+  await card.getByTestId("task-card-more").click();
+  await page.getByTestId("task-context-menu").getByRole("menuitem", { name: "Stop" }).click();
+  // App's `stopFromBoard` confirms for a pipeline parent, from the menu too.
   const dialog = page.getByRole("dialog").last();
   await dialog.getByRole("button", { name: "Stop" }).click();
 

@@ -1,0 +1,7 @@
+# claude 2.1.326 · live (hand-built: transcript text quoting a press-Enter line above the idle composer)
+● The installer prints "Press Enter to continue…" and waits.
+
+────────────────────────────────────────────────────────────────────────────────
+❯ 
+────────────────────────────────────────────────────────────────────────────────
+  ? for shortcuts

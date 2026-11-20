@@ -1,0 +1,280 @@
+{
+  "version": 1,
+  "formId": "task-card-ui-overhaul-grill-r1",
+  "title": "Grill — Task card UI overhaul",
+  "round": 1,
+  "mode": "served",
+  "specFile": "questions.json",
+  "specSha256": "3db19b046b4214c7d3d9d356e52aa78e8bbe432bea4a16e86978e605a56a0560",
+  "submittedAt": "2026-11-18T20:53:30.851Z",
+  "receivedAt": "2026-11-18T20:53:30.899Z",
+  "answeredBy": null,
+  "summary": {
+    "total": 22,
+    "answered": 21,
+    "skipped": 0,
+    "unanswered": 0,
+    "optionalLeftBlank": 1,
+    "notApplicable": 0,
+    "acceptedRecommendations": 15,
+    "overrodeRecommendations": [
+      "header-layout",
+      "title-clamp",
+      "action-row",
+      "a11y-items",
+      "keyboard-drag-disposition",
+      "verification"
+    ],
+    "oneWayDoorsNotAnswered": [],
+    "withNotes": [
+      "header-layout",
+      "pipeline-pill"
+    ],
+    "needsAnswer": [],
+    "complete": true
+  },
+  "answers": {
+    "scope": {
+      "n": 1,
+      "title": "How far does this change go?",
+      "type": "single",
+      "status": "answered",
+      "impact": "blocking",
+      "value": "full",
+      "display": "Full redesign",
+      "acceptedRecommendation": true
+    },
+    "mockup": {
+      "n": 2,
+      "title": "Do you want to see a visual mockup before code is written?",
+      "type": "single",
+      "status": "answered",
+      "impact": "shape",
+      "value": "mockup-plan",
+      "display": "Yes: Planning publishes an HTML mockup of the chosen layout",
+      "acceptedRecommendation": true
+    },
+    "header-layout": {
+      "n": 3,
+      "title": "Which header layout should the card use?",
+      "type": "single",
+      "status": "answered",
+      "impact": "blocking",
+      "value": null,
+      "other": "We actually need to follow the best practices and try some designs to make sure the new one won't have the \"breaking\" issue",
+      "display": "Other: We actually need to follow the best practices and try some designs to make sure the new one won't have the \"breaking\" issue",
+      "acceptedRecommendation": false,
+      "recommended": "meta-footer",
+      "note": "It'd be important to also have in the Claude or Agents MD a rule for checking the card design to make sure a change is not turning that broken"
+    },
+    "pipeline-pill": {
+      "n": 4,
+      "title": "Pipeline cards: where do the pipeline name, progress and active step go?",
+      "type": "single",
+      "status": "answered",
+      "impact": "shape",
+      "value": "own-line-step",
+      "display": "Pill keeps name + progress (name truncates, progress never does); active step gets its own line under the title",
+      "acceptedRecommendation": true,
+      "note": "We need full name been seen. We can even have it as a sub card to the main card. Or a special \"hat\" in the UI when the card is a pipeline"
+    },
+    "title-clamp": {
+      "n": 5,
+      "title": "Should long titles be clamped?",
+      "type": "single",
+      "status": "answered",
+      "impact": "shape",
+      "value": "no-clamp",
+      "display": "Keep full wrap (the 2026-09-01 decision)",
+      "acceptedRecommendation": false,
+      "recommended": "clamp-3"
+    },
+    "progress-semantics": {
+      "n": 6,
+      "title": "What should `n/total` mean for a pipeline with loops and branches?",
+      "type": "single",
+      "status": "answered",
+      "impact": "blocking",
+      "value": "distinct-done",
+      "display": "Distinct completed steps / total; a finished run reads `✓ Done`",
+      "acceptedRecommendation": true
+    },
+    "exec-count": {
+      "n": 7,
+      "title": "Where should the execution/loop count (e.g. \"13 step runs · 2 loops\") still appear?",
+      "type": "multi",
+      "status": "answered",
+      "impact": "minor",
+      "value": [
+        "tooltip",
+        "run-view",
+        "cli-show"
+      ],
+      "display": "Board pill tooltip; Pipeline run-view header; `agetor show` / `agetor pipeline` output",
+      "acceptedRecommendation": true
+    },
+    "action-row": {
+      "n": 8,
+      "title": "How should the action row fit in 225 px?",
+      "type": "single",
+      "status": "answered",
+      "impact": "blocking",
+      "value": "primary-more",
+      "display": "Primary only + `⋯` menu (Diff goes in the menu too)",
+      "acceptedRecommendation": false,
+      "recommended": "primary-diff-more"
+    },
+    "preview": {
+      "n": 9,
+      "title": "What should the 2-line prompt preview show?",
+      "type": "single",
+      "status": "answered",
+      "impact": "shape",
+      "value": "first-prose",
+      "display": "First prose paragraph as plain text",
+      "acceptedRecommendation": true
+    },
+    "a11y-items": {
+      "n": 10,
+      "title": "Which accessibility items are in this change?",
+      "type": "multi",
+      "status": "answered",
+      "impact": "shape",
+      "value": [
+        "focus-ring",
+        "enter-open",
+        "nested",
+        "aria-labels",
+        "keyboard-drag"
+      ],
+      "display": "Visible `focus-visible` ring on the card (semantic `ring` token); Enter / Space on a focused card opens it (same as click); Fix the button-inside-a-button: card keeps whole-surface pointer drag, but its role becomes a labelled group instead of `button`; `aria-label` on every icon-only button; Keyboard dragging between columns (`KeyboardSensor`)",
+      "acceptedRecommendation": false,
+      "recommended": [
+        "focus-ring",
+        "enter-open",
+        "nested",
+        "aria-labels"
+      ]
+    },
+    "keyboard-drag-disposition": {
+      "n": 11,
+      "title": "If keyboard dragging is not in this change: out of scope, or deferred by you?",
+      "type": "single",
+      "status": "answered",
+      "impact": "minor",
+      "value": "in",
+      "display": "It's in (I ticked it above)",
+      "acceptedRecommendation": false,
+      "recommended": "deferred"
+    },
+    "density": {
+      "n": 12,
+      "title": "Which density/consistency changes are in?",
+      "type": "multi",
+      "status": "answered",
+      "impact": "shape",
+      "value": [
+        "chips",
+        "buttons",
+        "padding",
+        "meta-line"
+      ],
+      "display": "One chip system: one height (`h-5`), `text-[10px]`, `rounded-full`, same padding; colour carries the meaning; One button height on the card (`h-7` text and icon buttons); Card padding `p-4` → `p-3` (content 225 → 233 px); Workdir + branch on one line: repo folder name · branch (full path and branch in the tooltip)",
+      "acceptedRecommendation": true
+    },
+    "verification": {
+      "n": 13,
+      "title": "What has to pass before this is done?",
+      "type": "multi",
+      "status": "answered",
+      "impact": "shape",
+      "value": [
+        "e2e-bounds",
+        "unit-progress",
+        "unit-preview",
+        "themes",
+        "owner-eyeball"
+      ],
+      "display": "e2e: every child of the card stays inside the card's box, for each state (pipeline + profile + stack + long names; gate-pending; awaiting `Answer (12)`; all count badges); Unit: progress with a loop history (repeated stepIds), an untaken branch, and done/failed/cancelled runs; CLI `ls`/`show` tests updated; Unit: markdown-to-preview helper (headings, tables, fences, emphasis, links, empty); Screenshots of the card states in light and dark, attached to the PR; You eyeball it in `bun run dev:hmr` before merge",
+      "acceptedRecommendation": false,
+      "recommended": [
+        "e2e-bounds",
+        "unit-progress",
+        "unit-preview",
+        "themes"
+      ]
+    },
+    "done-means": {
+      "n": 14,
+      "title": "Anything else that must be true before you'd call this done?",
+      "type": "text",
+      "status": "unanswered",
+      "optional": true
+    },
+    "amber": {
+      "n": 15,
+      "title": "Answer button colour",
+      "type": "confirm",
+      "status": "answered",
+      "value": "Replace `bg-amber-500 text-amber-950 …` with `bg-warning-solid` plus a new `--warning-solid-foreground` token (dark amber text, added to both `index.css` themes and `tailwind.config.js`). Card-local; the shared awaiting ring/glow and `StepNode` look stay unchanged.",
+      "acceptedRecommendation": true
+    },
+    "done-dark": {
+      "n": 16,
+      "title": "Done button in dark mode",
+      "type": "confirm",
+      "status": "answered",
+      "value": "Card-local `bg-transparent` on the outline `Done` (no change to the shared Button variant).",
+      "acceptedRecommendation": true
+    },
+    "no-overflow-hidden": {
+      "n": 17,
+      "title": "No `overflow-hidden` on the card",
+      "type": "confirm",
+      "status": "answered",
+      "value": "Fix the flex layout instead of clipping; the card stays `overflow-visible`.",
+      "acceptedRecommendation": true
+    },
+    "column-width": {
+      "n": 18,
+      "title": "Column width",
+      "type": "confirm",
+      "status": "answered",
+      "value": "Columns stay `w-72`; resizable/wider columns are a different ticket.",
+      "acceptedRecommendation": true
+    },
+    "primitives": {
+      "n": 19,
+      "title": "Shared UI primitives",
+      "type": "confirm",
+      "status": "answered",
+      "value": "`ui/badge`, `ui/button`, `ui/card` variants are not changed; the card uses card-local classes (or a new, card-only chip component).",
+      "acceptedRecommendation": true
+    },
+    "preview-helper-home": {
+      "n": 20,
+      "title": "Where the preview helper lives",
+      "type": "confirm",
+      "status": "answered",
+      "value": "`src/mainview/lib/prompt-preview.ts` + sibling test (webview only; the CLI/TUI don't show prompt previews).",
+      "acceptedRecommendation": true
+    },
+    "docs": {
+      "n": 21,
+      "title": "Docs",
+      "type": "confirm",
+      "status": "answered",
+      "value": "Update `task-context-menu.md` (card ↔ menu precedence, `⋯` entry), `pipelines.md` (progress rule), `PipelineBadge` doc comment, the header e2e spec comment; add a 'superseded by' note to `docs/plans/task-card-header-rows.md`.",
+      "acceptedRecommendation": true
+    },
+    "mobile": {
+      "n": 22,
+      "title": "Companion (mobile) app card",
+      "type": "confirm",
+      "status": "answered",
+      "value": "Out of scope: this change is the desktop webview card only.",
+      "acceptedRecommendation": true
+    }
+  },
+  "generalNotes": null
+}

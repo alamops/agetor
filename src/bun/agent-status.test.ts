@@ -1243,3 +1243,190 @@ describe("claude account fields read where the spawn reads (CR1)", () => {
     }
   });
 });
+
+// --- claude-code login probe (`claude auth status`) --------------------------
+// Plan docs/plans/claude-enter-to-confirm-prompts.md T3. The probe reads ONLY
+// `loggedIn`, fails open, is skipped when the account has no `.claude.json`,
+// and never lets the child's output (it carries an email) reach any string
+// agetor returns or logs.
+describe("claude-code login probe", () => {
+  /** A claude stub: answers `--version`, and `auth status` per `authBody`. Records
+   *  every `auth status` invocation in `<dir>/calls`. */
+  function plantClaude(authBody: string): { bin: string; dir: string; account: string; calls: () => number } {
+    const dir = mkdtempSync(path.join(tmpdir(), "agetor-agent-status-claude-"));
+    sandbox = dir;
+    const account = path.join(dir, "account");
+    mkdirSync(account, { recursive: true });
+    const bin = path.join(dir, "claude");
+    writeFileSync(
+      bin,
+      `#!/bin/sh\n`
+        + `if [ "$1" = "--version" ]; then echo "2.1.326 (Claude Code)"; exit 0; fi\n`
+        + `if [ "$1" = "auth" ] && [ "$2" = "status" ]; then echo x >> "${dir}/calls"; ${authBody}; fi\n`
+        + `exit 1\n`,
+      { mode: 0o755 },
+    );
+    return {
+      bin, dir, account,
+      calls: () => { try { return readFileSync(path.join(dir, "calls"), "utf8").split("\n").filter(Boolean).length; } catch { return 0; } },
+    };
+  }
+  function account(id: string, home: string): Harness {
+    return { id, kind: "claude-code", label: id, isBuiltin: false, home, bin: null, env: {}, enabled: true };
+  }
+  function withClaudeJson(acct: string): void {
+    writeFileSync(path.join(acct, ".claude.json"), "{}");
+  }
+
+  beforeEach(() => { process.env.AGETOR_TMUX_BIN = "/bin/echo"; });
+
+  test("logged-out JSON on exit 1 -> loggedIn:false with the login hint", async () => {
+    const c = plantClaude(`echo '{"loggedIn": false, "authMethod": "none"}'; exit 1`);
+    withClaudeJson(c.account);
+    process.env.AGETOR_CLAUDE_BIN = c.bin;
+    const status = await checkHarness(account("claude-a", c.account));
+    expect(status.available).toBe(true);
+    expect(status.loggedIn).toBe(false);
+    expect(status.authHelp).toContain("claude auth login");
+    expect(status.authHelp).toContain("Settings → Harnesses");
+  });
+
+  test("logged-in JSON on exit 0 -> loggedIn:true", async () => {
+    const c = plantClaude(`echo '{"loggedIn": true, "authMethod": "claude.ai"}'; exit 0`);
+    withClaudeJson(c.account);
+    process.env.AGETOR_CLAUDE_BIN = c.bin;
+    const status = await checkHarness(account("claude-a", c.account));
+    expect(status.loggedIn).toBe(true);
+    expect(status.authHelp).toBeNull();
+  });
+
+  test.each([
+    ["non-JSON", `echo 'Not logged in.'; exit 1`],
+    ["empty output", `exit 0`],
+    ["a JSON array", `echo '[]'; exit 0`],
+    ["loggedIn missing", `echo '{"authMethod":"none"}'; exit 0`],
+    ["loggedIn not a boolean", `echo '{"loggedIn":"no"}'; exit 0`],
+  ])("%s -> fail-open (null)", async (_label, body) => {
+    const c = plantClaude(body);
+    withClaudeJson(c.account);
+    process.env.AGETOR_CLAUDE_BIN = c.bin;
+    const status = await checkHarness(account("claude-a", c.account));
+    expect(status.loggedIn).toBeNull();
+    expect(status.authHelp).toBeNull();
+    expect(status.available).toBe(true);
+  });
+
+  test("a hung probe is cut off and fails open", async () => {
+    const c = plantClaude(`sleep 30`);
+    withClaudeJson(c.account);
+    process.env.AGETOR_CLAUDE_BIN = c.bin;
+    const t0 = Date.now();
+    const status = await checkHarness(account("claude-a", c.account));
+    expect(status.loggedIn).toBeNull();
+    expect(Date.now() - t0).toBeLessThan(9_000);
+  }, 15_000);
+
+  test("no .claude.json in the account -> the child is never spawned", async () => {
+    const c = plantClaude(`echo '{"loggedIn": true}'; exit 0`);
+    process.env.AGETOR_CLAUDE_BIN = c.bin;
+    // An API key in the account env is login evidence (true), which is not "logged out".
+    const keyed: Harness = { ...account("claude-a", c.account), env: { CLAUDE_CONFIG_DIR: c.account, ANTHROPIC_API_KEY: "sk-test" } };
+    const status = await checkHarness(keyed);
+    expect(c.calls()).toBe(0);
+    expect(status.loggedIn).toBeNull();
+  });
+
+  test("no .claude.json but loginEvidence says logged out -> loggedIn:false, still no spawn", async () => {
+    const c = plantClaude(`echo '{"loggedIn": true}'; exit 0`);
+    process.env.AGETOR_CLAUDE_BIN = c.bin;
+    // An account with a pinned config dir, no credentials, no settings: the
+    // stack code's own evidence reads that as logged out.
+    const pinned: Harness = { ...account("claude-b", c.account), env: { CLAUDE_CONFIG_DIR: c.account } };
+    const { loginEvidence } = await import("./harness-stacks.ts");
+    const evidence = loginEvidence(pinned);
+    const status = await checkHarness(pinned);
+    expect(c.calls()).toBe(0);
+    expect(status.loggedIn).toBe(evidence === false ? false : null);
+  });
+
+  test("the child's output (an email) never reaches the status", async () => {
+    const c = plantClaude(`echo '{"loggedIn": false, "email": "someone@example.test", "orgName": "Acme Org"}'; exit 1`);
+    withClaudeJson(c.account);
+    process.env.AGETOR_CLAUDE_BIN = c.bin;
+    const status = await checkHarness(account("claude-a", c.account));
+    const dump = JSON.stringify(status);
+    expect(dump).not.toContain("someone@example.test");
+    expect(dump).not.toContain("Acme Org");
+  });
+
+  test("memoized for the TTL, and freshAuth bypasses the cache", async () => {
+    const c = plantClaude(`echo '{"loggedIn": true}'; exit 0`);
+    withClaudeJson(c.account);
+    process.env.AGETOR_CLAUDE_BIN = c.bin;
+    const h = account("claude-a", c.account);
+    await checkHarness(h);
+    await checkHarness(h);
+    expect(c.calls()).toBe(1);
+    await checkHarness(h, { freshAuth: true });
+    expect(c.calls()).toBe(2);
+    await checkHarness(h);
+    expect(c.calls()).toBe(2); // the fresh result was written back
+  });
+
+  test("a changed key or token in the account env re-probes; an unrelated env change keeps the cached answer", async () => {
+    const { peekClaudeLoggedIn } = await import("./agent-status.ts");
+    const c = plantClaude(`echo '{"loggedIn": false}'; exit 1`);
+    withClaudeJson(c.account);
+    process.env.AGETOR_CLAUDE_BIN = c.bin;
+    const h = account("claude-a", c.account);
+    expect((await checkHarness(h)).loggedIn).toBe(false);
+    expect(c.calls()).toBe(1);
+    await checkHarness({ ...h, env: { ...h.env, SOME_UNRELATED_SETTING: "1" } });
+    expect(c.calls()).toBe(1);
+    // The user adds an API key to the account: the cached "logged out" no longer applies.
+    const keyed: Harness = { ...h, env: { ...h.env, ANTHROPIC_API_KEY: "sk-test-new" } };
+    expect(peekClaudeLoggedIn(keyed)).toBeNull();
+    await checkHarness(keyed);
+    expect(c.calls()).toBe(2);
+    const tokened: Harness = { ...h, env: { ...h.env, CLAUDE_CODE_OAUTH_TOKEN: "tok-test" } };
+    await checkHarness(tokened);
+    expect(c.calls()).toBe(3);
+  });
+
+  test("peekClaudeLoggedIn reads the cache and never probes; refreshClaudeAuth warms it in parallel", async () => {
+    const { peekClaudeLoggedIn, refreshClaudeAuth } = await import("./agent-status.ts");
+    const c = plantClaude(`echo '{"loggedIn": false}'; exit 1`);
+    withClaudeJson(c.account);
+    process.env.AGETOR_CLAUDE_BIN = c.bin;
+    const h = account("claude-a", c.account);
+    expect(peekClaudeLoggedIn(h)).toBeNull();
+    expect(c.calls()).toBe(0);
+    await refreshClaudeAuth([h, { ...builtin("codex") }]);
+    expect(c.calls()).toBe(1);
+    expect(peekClaudeLoggedIn(h)).toBe(false);
+    expect(peekClaudeLoggedIn(builtin("codex"))).toBeNull();
+  });
+
+  test("refreshClaudeAuth returns within its budget even when the probe hangs", async () => {
+    const { refreshClaudeAuth } = await import("./agent-status.ts");
+    const c = plantClaude(`sleep 30`);
+    withClaudeJson(c.account);
+    process.env.AGETOR_CLAUDE_BIN = c.bin;
+    const t0 = Date.now();
+    await refreshClaudeAuth([account("claude-a", c.account)], 300);
+    expect(Date.now() - t0).toBeLessThan(2_000);
+  });
+
+  test("a non-claude kind never gets a claude probe", async () => {
+    process.env.AGETOR_CODEX_BIN = "/bin/echo";
+    const status = await checkHarness(builtin("codex"));
+    expect(status.loggedIn).toBeNull();
+  });
+
+  test("a /bin/echo claude stand-in stays unknown (echo's output is not JSON)", async () => {
+    process.env.AGETOR_CLAUDE_BIN = "/bin/echo";
+    const status = await checkAgent("claude-code");
+    expect(status.available).toBe(true);
+    expect(status.loggedIn).toBeNull();
+  });
+});

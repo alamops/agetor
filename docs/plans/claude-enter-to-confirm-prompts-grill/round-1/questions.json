@@ -1,0 +1,281 @@
+{
+  "version": 1,
+  "id": "claude-enter-to-confirm-prompts-grill-r1",
+  "title": "Grill — Claude Code \"Enter to confirm\" prompts",
+  "skill": "grill",
+  "slug": "claude-enter-to-confirm-prompts",
+  "round": 1,
+  "summary": "The failed run you pasted is **four separate bugs in a chain**, not one. The investigation (`docs/plans/claude-enter-to-confirm-prompts-investigation.md`) proved each of them live on claude **2.1.326**:\n\n1. A new **\"Adding a new directory\"** startup dialog (one per `--add-dir` repository Claude doesn't trust yet) isn't auto-confirmed, so it becomes a card.\n2. The boot poller **never shows a second card** for a dialog that looks the same as one you just answered, so the next repository's dialog sits there with no card.\n3. The long-prompt paste then gives up, refuses to type into the dialog, and **fails the run**.\n4. agetor records the Claude session id **before the session exists**, so every \"try again\" runs `--resume` on a session that was never created, and claude exits at once.\n\nThe **Login** half is separate. \"Login successful. Press Enter to continue…\" only gets a card whose one action is *Open in Terminal*, and a logged-out account's first screen (the theme picker) isn't detected at all.\n\nThere are **11 decisions** below. Answer the **Blocking** section first; the confirm list at the end holds defaults I'd bet on. Your progress is saved in the browser as you go.",
+  "proven": [
+    {
+      "text": "**The dialog is new in 2.1.326** and missing from 2.1.321 to 2.1.325, which is why multi-repo tasks worked in the 2.1.322 smoke.",
+      "evidence": [{ "label": "P13: binary grep across installed versions", "path": "docs/plans/claude-enter-to-confirm-prompts-investigation.md", "line": 108 }]
+    },
+    {
+      "text": "**Claude doesn't save the answer.** It asks again on **every** launch and **every** `--resume`, once per untrusted repository. If the source repository is already trusted in `~/.claude.json`, it doesn't ask.",
+      "evidence": [{ "label": "P4, P5, P6", "path": "docs/plans/claude-enter-to-confirm-prompts-investigation.md", "line": 99 }]
+    },
+    {
+      "text": "**Two hazards in claude's own select.** (a) Claude ignores keys sent in the first ~500 ms after the dialog appears, and the footer then changes to `Esc to exit · To add it, press ↓ to Yes, then Enter`, which none of agetor's matchers recognise. (b) The two rows wrap, so a Down sent from the wrong row lands on **\"No, exit\"**, and an Enter there **closes claude**.",
+      "evidence": [{ "label": "P7, P8", "path": "docs/plans/claude-enter-to-confirm-prompts-investigation.md", "line": 102 }]
+    },
+    {
+      "text": "**Retrying can never work today.** `claude --resume <id>` on a session that was never written prints `No conversation found` and exits 1. That is the empty pane in your third run.",
+      "evidence": [{ "label": "session id stamped before the JSONL exists", "path": "src/bun/agents.ts", "line": 4249, "code": "    const sessionId = opts.resumeSessionId ?? crypto.randomUUID();\n    const built = buildCommand(harness, prompt, {\n      ...opts,\n      sessionId: opts.resumeSessionId ? null : sessionId,\n    });\n    onSessionId?.(sessionId);" }]
+    },
+    "The workspace-trust dialog (\"Yes, I trust this folder\") is still auto-confirmed on 2.1.326 (P12). Nothing to change there.",
+    "Bugs 2 and 3 are plain bugs whatever you decide below (a boot check that never expires, and a paste that fails the run while a dialog is on screen). They're in the fix with no decision needed."
+  ],
+  "sections": [
+    {
+      "id": "blocking",
+      "title": "Blocking: these shape the fix",
+      "questions": [
+        {
+          "id": "adddir-policy",
+          "type": "single",
+          "title": "How should agetor handle Claude's startup \"Adding a new directory\" dialog for a multi-repo task's own repository checkouts?",
+          "impact": "blocking",
+          "oneWayDoor": true,
+          "why": "Decides whether agetor answers a Claude **trust** prompt for you. That's a trust boundary, so it can't be bulk-accepted.",
+          "context": "agetor passes one `--add-dir ~/.agetor/worktrees/<task>/<repo>` for each repository you picked for the task. On 2.1.326 Claude asks about each one whose **source repository** you haven't trusted in Claude before, at **every** launch and resume. Claude says: *\"Trusting it trusts that whole repository, including its other worktrees and subdirectories … its skills, commands, and agents load and can run commands, and so can the git settings of its repository. Your answer holds for this session.\"*\n\nThe existing policy comment auto-confirms only screens that follow from a choice you already made. Workspace trust qualifies because you pointed the task's workdir at the folder. Picking a repository for a multi-repo task is the same kind of choice.\n\nIf the answer is to card it, a 5-repo task can need up to **5 clicks per follow-up turn** after hibernation, and a pipeline or unattended run stalls until someone clicks.",
+          "evidence": [
+            { "label": "auto-confirm policy", "path": "src/bun/claude-tmux.ts", "line": 6134, "code": " * Each entry here is tied to a choice the user has *already made*, so\n * auto-confirming the affirmative option at boot matches intent rather than\n * deciding anything on the user's behalf:" },
+            { "label": "the dialog on the failed run's pane", "path": "docs/plans/claude-enter-to-confirm-prompts-investigation.md", "line": 211 }
+          ],
+          "options": [
+            { "id": "auto-scoped", "label": "Auto-confirm, tightly scoped", "description": "Only the **startup** variant (`No, exit` / `Yes, add it`), only when the path on screen equals one of the `--add-dir` paths agetor passed for this spawn, matched on the exact `Yes, add it` label. Anything else, including mid-session `/add-dir` (`No, leave it out`) and a path agetor didn't pass, still gets a card.", "consequence": "No clicks, no stalls; matches workspace-trust precedent. A status line says which repo was confirmed." },
+            { "id": "auto-setting", "label": "Auto-confirm as above, behind a setting (default on)", "description": "Same scope, with a Settings → Claude Code toggle \"Auto-trust a task's repositories\" that turns it off.", "consequence": "One more preference, one more UI row, and CLI parity for it." },
+            { "id": "pretrust", "label": "Pre-trust the source repo in `~/.claude.json` instead", "description": "When a multi-repo task starts, agetor writes `hasTrustDialogAccepted: true` for each source repository, so Claude never asks again (P6).", "consequence": "Claude persists it beyond the session (a bigger trust grant than the dialog's own). agetor writes another program's config while claude may be writing it too, which risks corrupting it." },
+            { "id": "card", "label": "Always card it", "description": "Fix only the bugs (re-card the second dialog, don't fail the paste, safe drive), and leave every dialog to you.", "consequence": "Safest trust-wise. N clicks per launch or resume, and unattended runs and pipelines stall." }
+          ],
+          "recommendation": { "value": "auto-scoped", "reason": "You already chose these repositories, the grant lasts only for the session, and the path match means pane text can never trigger it." }
+        },
+        {
+          "id": "login-case",
+          "type": "multi",
+          "title": "Which Login situation(s) did you actually hit, the ones that made you name Login in the request?",
+          "impact": "blocking",
+          "why": "Each one is a different code path: the runtime card, the boot poller, or a pre-flight before start.",
+          "context": "The prod DB shows `/login` typed mid-session 5 times. The 2026-10-04 one sat on `Select login method` for 12 h. I couldn't find a boot-time login failure. Tell me what you saw so the fix targets it.",
+          "options": [
+            { "id": "midsession", "label": "`/login` typed mid-session in a running task", "description": "Ends on \"Login successful. Press Enter to continue…\", which today only gets an *Open in Terminal* card." },
+            { "id": "boot-default", "label": "A task started while my default Claude account was logged out or expired", "description": "Claude opens on the theme picker or login screens before the REPL." },
+            { "id": "boot-stack", "label": "A task started on a second harness-stack account (its own `CLAUDE_CONFIG_DIR`) that was never logged in" },
+            { "id": "swap", "label": "A harness-stack swap landed on an account that needed login" }
+          ],
+          "min": 1
+        },
+        {
+          "id": "logged-out-boot",
+          "type": "single",
+          "title": "When a task starts and Claude isn't logged in (theme picker → login method → browser → paste code → \"Press Enter to continue\"), what should agetor do?",
+          "impact": "blocking",
+          "why": "Decides whether agetor drives Claude's whole onboarding from cards or refuses to start with a clear error.",
+          "context": "Claude-code has **no** logged-in pre-flight today; only fx does (`orchestrator.ts:2529`). Claude 2.1.326 has `claude auth status`, which could back one, but whether it is fail-open and writes nothing is **not verified yet**. At boot the theme picker has **no footer**, so nothing cards it and the run dies at 30 s. The login-method screen is numbered and would card. The \"Paste code here if prompted >\" screen takes **typed text**, and no card type can do that today.",
+          "evidence": [
+            { "label": "the logged-in pre-flight is fx-only", "path": "src/bun/orchestrator.ts", "line": 2529, "code": "    } else if (status.loggedIn === false) {\n      // Fail-open: only an explicit `false` means the CLI positively reported\n      // it's logged out." },
+            { "label": "theme picker capture (no footer)", "path": "docs/plans/claude-enter-to-confirm-prompts-investigation.md", "line": 281 }
+          ],
+          "options": [
+            { "id": "both", "label": "Pre-flight AND cards", "description": "Start is refused with \"Claude Code isn't logged in, run `claude /login`\" when `claude auth status` reports logged out (fail-open on anything unparseable). Each onboarding screen still gets a working card (theme, login method, Enter-to-continue) as a fallback, for when the pre-flight can't tell or the login expires mid-run.", "consequence": "Most complete; the biggest change (a new probe plus a theme-picker anchor)." },
+            { "id": "preflight", "label": "Pre-flight only", "description": "Refuse to start when logged out. Don't card the onboarding screens at boot.", "consequence": "Small and clear. If the probe can't tell (it fails open), the run still dies at 30 s on the theme picker." },
+            { "id": "cards", "label": "Cards only", "description": "Let the run start and card every onboarding screen.", "consequence": "The user logs in from the card. The browser and paste-code steps still need the terminal." },
+            { "id": "out", "label": "Out of scope; only mid-session `/login`", "description": "A separate ticket.", "consequence": "Logged-out boots keep dying at 30 s." }
+          ],
+          "recommendation": { "value": "both", "reason": "Your request says *all* Enter-to-confirm scenarios. The pre-flight gives the clearest error, and the cards cover what it can't detect." }
+        },
+        {
+          "id": "paste-code",
+          "type": "single",
+          "title": "The OAuth \"Paste code here if prompted >\" screen asks for typed text. How should agetor handle it?",
+          "impact": "shape",
+          "showIf": { "question": "logged-out-boot", "in": ["both", "cards"] },
+          "why": "A text-entry card is a new kind of card, with webview, CLI and TUI parity. It also means the user's code passes through agetor's API.",
+          "context": "The browser login usually completes on its own and this screen is only a fallback (\"if prompted\"). Today nothing matches it (P16).",
+          "options": [
+            { "id": "terminal", "label": "Card it, with *Open in Terminal* as the only action", "description": "The user pastes the code in the real terminal.", "consequence": "No new card type; the code never touches agetor." },
+            { "id": "textbox", "label": "A text box on the card that types the code into the pane", "consequence": "A new card type with a text-input path (webview, CLI, TUI). The OAuth code passes through the API." }
+          ],
+          "recommendation": { "value": "terminal", "reason": "A rare fallback; keeping an auth code out of agetor's API is worth one terminal hop." }
+        },
+        {
+          "id": "enter-card",
+          "type": "single",
+          "title": "For screens that only want Enter (\"Login successful. Press Enter to continue…\", \"Security notes … Press Enter to continue…\", \"Press Enter to retry.\"), what should the card do?",
+          "impact": "blocking",
+          "why": "Adds a new card action with webview, `agetor answer` and TUI parity, or doesn't.",
+          "context": "Today these match only the *unparsable* card, whose one button is **Open in Terminal** (`RunPanel.tsx:9732`). The answer route only accepts one of the recorded choice keys, or Escape.",
+          "evidence": [
+            { "label": "unparsable card: one action", "path": "src/mainview/components/kanban/RunPanel.tsx", "line": 9732, "code": "            {opening ? \"Opening…\" : \"Open in Terminal\"}" }
+          ],
+          "options": [
+            { "id": "continue-btn", "label": "A \"Continue (press Enter)\" button", "description": "Offered only when the screen is Enter-only: a `Press Enter to continue…` / `to retry` line at the bottom and **no** choice rows or `❯` cursor anywhere in the dialog, so Enter can't confirm a hidden default. Never pressed on its own. Same action in `agetor answer` and the TUI.", "consequence": "A new answer shape on the existing route (closed allow-list kept), plus card, CLI and TUI work." },
+            { "id": "auto-press", "label": "Auto-press Enter on these screens", "description": "agetor presses Enter as soon as it sees one.", "consequence": "No click. You never see \"Login successful\" or the security notes, and agetor presses a key on a screen it only recognised by text." },
+            { "id": "terminal-only", "label": "Keep *Open in Terminal* only", "consequence": "No new card work; the user switches windows." }
+          ],
+          "recommendation": { "value": "continue-btn", "reason": "One click, you see what you're confirming, and the Enter-only check means it can't confirm a menu by accident." }
+        },
+        {
+          "id": "retry-semantics",
+          "type": "single",
+          "title": "When a run's Claude never wrote its session file (a failed boot), what should the next \"try again\" or follow-up do?",
+          "impact": "blocking",
+          "why": "Bug 4 makes every retry after a failed boot fail. The fix changes how a session id is recorded or looked up.",
+          "context": "`spawnAgent` stamps the new session id on the run **before** claude has written anything (`agents.ts:4254`). `findSessionIdForHarness` returns the newest stamped id without checking that the session exists (`harness-session-transfer.ts:738`), and the follow-up path resumes it (`orchestrator.ts:12192`).",
+          "options": [
+            { "id": "check-then-fresh", "label": "Before resuming, check the session file exists. If not, start fresh with the same id (`--session-id`)", "description": "A resume-time check. It also heals runs already in the DB that carry a never-created id (like the failed task).", "consequence": "One extra stat, through `task-dir-fs`/no-follow rules, of a file in Claude's own config dir. No migration." },
+            { "id": "stamp-later", "label": "Only record the id once the session file appears", "description": "Move `onSessionId` to after the JSONL is found.", "consequence": "Runs already in the DB with a bad id stay broken. The timing change touches swap and transfer code." },
+            { "id": "both", "label": "Both", "consequence": "Belt and braces; more surface to test." }
+          ],
+          "recommendation": { "value": "check-then-fresh", "reason": "Fixes new and existing rows in one place without changing when the swap/transfer code sees the id." }
+        }
+      ]
+    },
+    {
+      "id": "shape",
+      "title": "Scope edges and behaviour",
+      "questions": [
+        {
+          "id": "families",
+          "type": "multi",
+          "title": "Which members of the Enter-to-confirm family are in this change?",
+          "impact": "shape",
+          "why": "Each one is a matcher, a fixture and a test. Anything unticked is a decided out-of-scope or later item, never a silent one.",
+          "context": "\"Fix it for all Enter to Confirm scenarios\" is your wording. These are every shape the investigation found. Claude's binary uses Enter hints with ~20 verbs (`confirm` ×32, `select` ×14, `continue` ×9, `save` ×7 …); agetor's footer list knows only `enter to confirm`, `enter to continue` and `esc to cancel`.",
+          "options": [
+            { "id": "adddir-startup", "label": "Startup \"Adding a new directory\" (the incident)" },
+            { "id": "held", "label": "The \"held\" footer after a refused key (`Esc to exit · To add it, press ↓ to Yes, then Enter`), at startup and mid-session" },
+            { "id": "cutoff", "label": "Cut-off dialogs: long paths push an `Adding: <path>` line below the footer and nothing matches (P10)" },
+            { "id": "midsession-dir", "label": "Mid-session `/add-dir` and `/cd` dialogs (`No, leave it out`, `No, stay put`, `Yes, move here`, `Yes, trust it and apply them`): cards, safe to drive" },
+            { "id": "enter-only", "label": "Enter-only screens: Login successful, Security notes, Press Enter to retry" },
+            { "id": "onboarding", "label": "Theme picker and login method at boot (per the Login answer above)" },
+            { "id": "all-verbs", "label": "Widen the footer match to every `Enter to <verb>` hint in claude's binary, each backed by a captured or binary-extracted fixture" }
+          ],
+          "recommendation": { "value": ["adddir-startup", "held", "cutoff", "midsession-dir", "enter-only", "onboarding", "all-verbs"], "reason": "That's what \"all Enter to Confirm scenarios\" covers. Leaving one out ships a known gap." }
+        },
+        {
+          "id": "held-recovery",
+          "type": "single",
+          "title": "When Claude refuses a confirm (the dialog goes \"held\"), what should agetor do?",
+          "impact": "shape",
+          "why": "A wrong Down from a stale cursor closes claude (P8), so the retry rule matters.",
+          "options": [
+            { "id": "split", "label": "Retry the auto-confirmed ones, re-card the user-answered ones", "description": "Retry: read the cursor from the live pane, wait ≥500 ms, press Down **only if** the cursor isn't on Yes, then Enter. Bounded at 4 tries, as today. If you answered a card and Claude refused it, the card comes back with the held hint. Never press Down without first reading where the cursor is.", "consequence": "Two code paths, both covered by tests." },
+            { "id": "retry-all", "label": "Retry everything, including your card answers", "description": "Your click on Yes is retried until it lands.", "consequence": "No re-click. agetor keeps driving after your one click." },
+            { "id": "card-all", "label": "Never retry; always re-card", "consequence": "The auto-confirm can fall back to a card, so an unattended run can stall again." }
+          ],
+          "recommendation": { "value": "split", "reason": "Auto-confirms stay hands-off. For your clicks, you see the refusal and decide again." }
+        },
+        {
+          "id": "pipeline-surface",
+          "type": "single",
+          "title": "The incident was a pipeline step. Where did you see its \"Claude is asking\" card, and is that right?",
+          "impact": "shape",
+          "why": "Cards carry `pipelineParentId` (`interactions.ts:194`). If the parent's panel or notification didn't show it, that's part of this fix.",
+          "options": [
+            { "id": "fine", "label": "I saw it where I expected (the parent and/or the step); nothing to change" },
+            { "id": "missed", "label": "I didn't see a card at all; it only failed", "description": "That's what bug 2 predicts for the second dialog.", "consequence": "Confirms the root cause; nothing extra." },
+            { "id": "notify", "label": "Also send an OS notification for an Enter-to-confirm card on a pipeline step", "consequence": "Touches `task-notifier.ts` for `tmux_prompt` on pipeline children." }
+          ],
+          "recommendation": { "value": "missed", "reason": "That's my reading of the log, but only you know what you saw." }
+        },
+        {
+          "id": "other-harnesses",
+          "type": "single",
+          "title": "Codex and Copilot get the same `--add-dir` for multi-repo tasks. Check them for their own trust prompts in this change?",
+          "impact": "shape",
+          "why": "They have different drivers (one-shot `exec`, no Enter-confirm TUI), so this widens the change past Claude.",
+          "context": "Not investigated. `agents.ts:1080` (codex) and `:1155` (copilot) pass the extra dirs. Both run one-shot without an interactive TUI, so a trust prompt there would surface as an error, not a menu.",
+          "options": [
+            { "id": "out", "label": "Out of scope, a separate ticket", "consequence": "This change stays Claude-only." },
+            { "id": "spike", "label": "Spike them in this change; fix whatever shows up", "consequence": "Adds a live check of two more CLIs, possibly more fixes." }
+          ],
+          "recommendation": { "value": "out", "reason": "No reported failure, and a different kind of driver; widening the change risks the Claude fix." }
+        },
+        {
+          "id": "login-capture",
+          "type": "single",
+          "title": "\"Login successful. Press Enter to continue…\" was taken from claude's binary, not seen live. Can you help capture it?",
+          "impact": "minor",
+          "why": "A matcher built from binary strings can miss the real layout. A live pane makes it a tested fixture.",
+          "options": [
+            { "id": "live", "label": "Yes, ping me during implementation and I'll do a browser login on a scratch `CLAUDE_CONFIG_DIR`" },
+            { "id": "binary", "label": "No, build it from the binary strings and a reconstructed pane", "consequence": "Assumption A4 stays open and goes in the PR body." }
+          ],
+          "recommendation": { "value": "live", "reason": "One browser round trip turns an assumption into a fixture." }
+        },
+        {
+          "id": "acceptance",
+          "type": "multi",
+          "title": "What has to pass before you'd call this done?",
+          "impact": "shape",
+          "why": "No test drives the boot poller end to end today, and no e2e reaches a `tmux_prompt` card (the fake claude driver bypasses tmux).",
+          "options": [
+            { "id": "unit", "label": "Unit fixtures for every captured pane (2.1.326, tagged by version) in `claude-tmux-scraper.test.ts`" },
+            { "id": "boot-int", "label": "A boot-poller integration test on the stub-tmux seam: two identical dialogs, a held refusal, the long-prompt paste, the add-dir auto-confirm" },
+            { "id": "resume", "label": "A test that a missing session file means a fresh start, not `--resume`" },
+            { "id": "e2e-card", "label": "A Playwright e2e for the \"Continue (press Enter)\" card through a new fake-driver prompt marker" },
+            { "id": "live-smoke", "label": "A live smoke on a headless dev core (port 4319, `~/.agetor-dev`): a multi-repo task over 2 untrusted scratch repos, plus a follow-up after hibernation" }
+          ],
+          "recommendation": { "value": ["unit", "boot-int", "resume", "e2e-card", "live-smoke"], "reason": "The incident got past every existing test layer, so each layer needs its own guard." }
+        }
+      ]
+    },
+    {
+      "id": "confirm",
+      "title": "Confirm or override",
+      "intro": "Defaults I'd bet on. Confirm with one click, or override with what it should be.",
+      "questions": [
+        {
+          "id": "status-line",
+          "type": "confirm",
+          "title": "Visibility of an add-dir auto-confirm",
+          "recommendation": { "value": "A run status line per repository, e.g. `auto-confirmed Claude's \"Adding a new directory\" prompt for <repo-name>`, like the existing trust-folder status", "reason": "You can see what agetor answered for you, the same way it reports workspace trust." }
+        },
+        {
+          "id": "timing",
+          "type": "confirm",
+          "title": "Keystroke timing for every dialog agetor drives",
+          "recommendation": { "value": "Wait ≥500 ms after the dialog first appears, re-read the cursor from the live pane right before sending, ≥150 ms between Down and Enter, and confirm the dialog is gone (not held) before reporting success", "reason": "Matches claude's 500 ms arm guard (P7) and the wrap hazard (P8); 150 ms is the gap the startup confirm already uses." }
+        },
+        {
+          "id": "card-reread",
+          "type": "confirm",
+          "title": "Card clicks drive from the live cursor",
+          "recommendation": { "value": "`dismissTmuxPrompt` re-reads the pane before sending and drives from the current cursor, not the one recorded at registration. If the pane no longer shows the same dialog, it refuses with a clear error", "reason": "A stale cursor on a wrapping two-row select can confirm \"No, exit\" and close claude." }
+        },
+        {
+          "id": "boot-ticks",
+          "type": "confirm",
+          "title": "Boot poller stability",
+          "recommendation": { "value": "Expire `recentlyAnsweredFingerprints` at boot after the same 3 s the runtime scraper uses. A suppressed sighting still keeps the boot window open. Unparsable cards need 3 stable ticks at boot, as at runtime", "reason": "Fixes bug 2 and removes the one place the boot and runtime pollers disagree." }
+        },
+        {
+          "id": "paste-defer",
+          "type": "confirm",
+          "title": "Long-prompt paste while a dialog is up",
+          "recommendation": { "value": "While the boot poller sees any startup dialog, the deferred paste keeps waiting and doesn't fail the run. It only fails when the boot itself times out, with the pane in the error", "reason": "Fixes bug 3. Today the paste gives up 28 s in while the dialog is still on screen." }
+        },
+        {
+          "id": "pane-size",
+          "type": "confirm",
+          "title": "Cut-off dialogs",
+          "recommendation": { "value": "Match the cut-off shape (the `Adding: <path>` trailer below the footer). Don't resize the boot pane in this change", "reason": "Matching fixes it at any size; resizing changes every boot and the ask collector's sizing." }
+        },
+        {
+          "id": "docs",
+          "type": "confirm",
+          "title": "Docs updated in the same change",
+          "recommendation": { "value": "`docs/architecture/harness-claude-code.md` (boot poller, consent table, held state, Enter-only card), `docs/architecture/multi-repo-tasks.md` (add-dir trust), and the `STARTUP_CONSENT_DIALOGS` / `MODAL_FOOTER_RE` comments", "reason": "CLAUDE.md: a behaviour change updates its subsystem doc in the same change." }
+        },
+        {
+          "id": "scrub-brief",
+          "type": "confirm",
+          "title": "Client names in the investigation brief",
+          "recommendation": { "value": "Before committing, replace the real client repository names and paths in the investigation brief (its incident log and Appendix A pane) with synthetic ones (`repo-a` … `repo-e`), and keep them out of fixtures and the plan", "reason": "Your rule: no real client or company names in committed files. The brief quotes the failed run's pane verbatim." }
+        }
+      ]
+    }
+  ]
+}

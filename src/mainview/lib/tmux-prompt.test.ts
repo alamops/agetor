@@ -27,3 +27,25 @@ test("tmuxChoiceLabel — only a literal true hides keys (a truthy non-boolean c
   expect(tmuxChoiceLabel({ key: "1", label: "Yes" }, "true" as unknown as boolean)).toBe("1. Yes");
   expect(tmuxChoiceLabel({ key: "1", label: "Yes" }, null as unknown as boolean)).toBe("1. Yes");
 });
+
+import { checkOAuthCodeInput, OAUTH_CODE_INPUT_MAX_LEN, tmuxPromptAnswerKind } from "./tmux-prompt.ts";
+
+test("tmuxPromptAnswerKind — only the literal enter/code are non-choice cards", () => {
+  expect(tmuxPromptAnswerKind({})).toBe("choice");
+  expect(tmuxPromptAnswerKind({ answerKind: "choice" })).toBe("choice");
+  expect(tmuxPromptAnswerKind({ answerKind: "enter" })).toBe("enter");
+  expect(tmuxPromptAnswerKind({ answerKind: "code" })).toBe("code");
+  for (const bad of ["ENTER", "text", 1, true, null, undefined, {}]) {
+    expect(tmuxPromptAnswerKind({ answerKind: bad })).toBe("choice");
+  }
+});
+
+test("checkOAuthCodeInput — mirrors the server's rules and never quotes the value", () => {
+  expect(checkOAuthCodeInput("  abc#def  ")).toEqual({ ok: true, code: "abc#def" });
+  expect(checkOAuthCodeInput("a".repeat(OAUTH_CODE_INPUT_MAX_LEN)).ok).toBe(true);
+  for (const bad of ["a".repeat(OAUTH_CODE_INPUT_MAX_LEN + 1), "a\nb", "a\tb", "a\u001bb", "", "   "]) {
+    const r = checkOAuthCodeInput(bad);
+    expect(r.ok).toBe(false);
+    if (!r.ok && bad.trim()) expect(r.reason).not.toContain(bad.trim());
+  }
+});

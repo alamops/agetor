@@ -14,6 +14,14 @@ import { escapeControlChars, escapeFreeText } from "../../shared/terminal-text.t
 import { CURSOR_ASK_FREEFORM } from "../../shared/cursor-ask-verdict.ts";
 import { cursorAskOptionChoiceLabel, cursorAskOptionValue, cursorAskPicksFromValues } from "../../shared/cursor-ask.ts";
 import { sanitizeDrop } from "./paste.ts";
+import {
+  TMUX_HELD_HINT,
+  tmuxAnswerBody,
+  tmuxAnswerFailure,
+  tmuxCardKind,
+  tmuxCardRows,
+  tmuxCodeProblem,
+} from "../answer-logic.ts";
 
 const OTHER = "✎ Other — type a custom answer";
 const SKIP = "Skip";
@@ -59,6 +67,8 @@ export function AnswerOverlay({
   // no reason.
   const [reason, setReason] = useState<string | null>(null);
   const [reasonFor, setReasonFor] = useState<"reject" | "skip">("reject");
+  // The OAuth code card: the text typed so far (shown masked, never echoed).
+  const [codeText, setCodeText] = useState("");
 
   useEffect(() => {
     let alive = true;
@@ -227,6 +237,32 @@ export function AnswerOverlay({
         return;
       }
 
+      // The OAuth sign-in code card: one masked text field, no rows. Enter
+      // validates locally (the route validates again) and submits `{ code }`.
+      if (req.kind === "tmux_prompt" && tmuxCardKind(req) === "code") {
+        if (key.escape) return onCancel();
+        if (key.return) {
+          const problem = tmuxCodeProblem(codeText);
+          if (problem) return setHint(problem);
+          setSubmitting(true);
+          const code = codeText.trim();
+          setCodeText("");
+          client
+            .answerTmuxPrompt(req.id, { code })
+            .then((r) => onDone(r.ok ? "✓ answered" : `! ${r.error ?? "failed"}`))
+            .catch((e) => onDone(`! ${tmuxFailureText(e)}`));
+          return;
+        }
+        if (key.backspace || key.delete) return setCodeText((t) => t.slice(0, -1));
+        if (input && !key.ctrl && !key.meta) {
+          // Appended as typed: a code is not a dropped path, and trimming and
+          // validation belong to the shared OAuth-code path on submit.
+          setHint("");
+          return setCodeText((t) => t + input);
+        }
+        return;
+      }
+
       // Typing a custom (free-text) answer.
       if (custom !== null) {
         if (key.escape) return setCustom(null); // back to the option list
@@ -303,13 +339,14 @@ export function AnswerOverlay({
 
       // tmux_prompt — last entry is the synthetic "reject".
       if (key.return && req.kind === "tmux_prompt") {
-        const isReject = cursor === req.choices.length;
+        const row = tmuxCardRows(req)[cursor];
+        if (!row) return;
         setSubmitting(true);
-        const body = isReject ? { reject: true } : { key: req.choices[cursor]!.key };
         client
-          .answerTmuxPrompt(req.id, body)
-          .then((r) => onDone(r.ok ? "✓ answered" : `! ${r.error ?? "failed"}`))
-          .catch((e) => onDone(`! ${(e as Error).message}`));
+          .answerTmuxPrompt(req.id, tmuxAnswerBody(row.value))
+          // `held`: claude refused the confirm and the card came back.
+          .then((r) => onDone(r.ok ? (r.held ? `! ${TMUX_HELD_HINT}` : "✓ answered") : `! ${r.error ?? "failed"}`))
+          .catch((e) => onDone(`! ${tmuxFailureText(e)}`));
       }
 
       // fx_permission — last entry is the synthetic "Dismiss (reject)".
@@ -373,10 +410,12 @@ export function AnswerOverlay({
           ) + `  (${req.mode})`}
         </Text>
       ) : (
+        // The pane is third-party text: escaped like every other stored string.
         <Text dimColor wrap="truncate-end">
-          {req.paneText.split("\n").filter(Boolean).slice(-2).join("  ")}
+          {escapeFreeText(req.paneText.split("\n").filter(Boolean).slice(-2).join("  "))}
         </Text>
       )}
+      {req.kind === "tmux_prompt" && req.held === true ? <Text color="yellow">{TMUX_HELD_HINT}</Text> : null}
       {reason !== null ? (
         <Box flexDirection="column" marginTop={1} width={width}>
           <Text dimColor wrap="truncate-end">
@@ -387,6 +426,15 @@ export function AnswerOverlay({
           <Text wrap="truncate-start">
             <Text color="cyan">✎ </Text>
             {reason}
+            <Text color="cyan">▏</Text>
+          </Text>
+        </Box>
+      ) : req.kind === "tmux_prompt" && tmuxCardKind(req) === "code" ? (
+        <Box flexDirection="column" marginTop={1} width={width}>
+          <Text dimColor wrap="truncate-end">Sign-in code (typed into Claude's prompt; Enter submits, Esc closes)</Text>
+          <Text wrap="truncate-start">
+            <Text color="cyan">✎ </Text>
+            {"•".repeat(codeText.length)}
             <Text color="cyan">▏</Text>
           </Text>
         </Box>
@@ -450,5 +498,11 @@ function optionLabels(req: AnyRequest | null, qIndex: number): string[] {
     if (isOpencodePermission(req)) return req.options.map((o) => escapeControlChars(o.name));
     return [...req.options.map((o) => o.name), "Dismiss (reject)"];
   }
-  return [...req.choices.map((ch) => ch.label), "Reject / Esc"];
+  return tmuxCardRows(req).map((row) => escapeFreeText(row.label));
+}
+
+/** The line for a refused tmux answer: the route's fixed sentence (it never
+ *  quotes a typed code), or the error's own message. */
+function tmuxFailureText(e: unknown): string {
+  return e instanceof ApiError ? tmuxAnswerFailure(e.status, e.message, e.body) : (e as Error).message;
 }

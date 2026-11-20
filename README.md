@@ -64,7 +64,7 @@ Coding agents are good enough now that the limiting factor is you: one terminal,
 ### Stay in the loop
 
 - **Notifications.** Native macOS notifications link straight to the task that needs you. Cards show an unread dot when the agent has said something new.
-- **Usage meter.** Plan quota for Claude Code, Codex and Cursor accounts, read with the logins those CLIs already have, plus local token rollups.
+- **Usage meter.** Plan quota for Claude Code, Codex and Cursor accounts, read with the logins those CLIs already have, plus local token rollups, shown in the app bar's Harnesses panel, grouped by stack.
 - **Themes and automatic updates.** Auto, dark or light theme. The app is signed, notarized and updates itself in place.
 
 ---

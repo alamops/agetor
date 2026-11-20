@@ -102,6 +102,7 @@ import type {
   TaskReference,
   TaskType,
   TerminalTab,
+  TmuxPromptAnswerBody,
   UpdateStatus,
   WorktreeGitStatus,
   WorktreeInfo,
@@ -301,7 +302,17 @@ export interface PendingTmuxPrompt {
    *  Chrome startup prompt). Display-only: `choices[].key` is still what the
    *  answer route validates. See `tmuxChoiceLabel`. */
   hideKeys?: boolean;
+  /** What the card asks of the user (absent ≡ `"choice"`): `"enter"` is an
+   *  Enter-only screen (a Continue button), `"code"` the OAuth code prompt (a
+   *  one-line text box). Both carry empty `choices`. */
+  answerKind?: "choice" | "enter" | "code";
+  /** True when the dialog refused the first confirm and the card was
+   *  re-registered: the first click did not take, choose again. */
+  held?: boolean;
 }
+
+/** Body of `POST /tmux-prompts/:id/answer` (the shared exact-one type). */
+export type { TmuxPromptAnswerBody };
 
 /** The ACP tool call an fx permission request is asking about — mirrors
  *  `FxPermissionToolCall` on the server (`src/bun/interactions.ts`). Only
@@ -492,6 +503,53 @@ async function jRequest<T>(
   return body as T;
 }
 
+/** The last `GET /tasks` answer per path (archive filter and kept ids), with
+ *  its ETag. Most recent last; a handful of paths is all the board uses. */
+const taskListAnswers = new Map<string, { etag: string; tasks: Task[] }>();
+const TASK_LIST_ANSWERS_MAX = 8;
+
+/** `GET /tasks` as a conditional request: the ETag of the last answer for the
+ *  same path rides in `If-None-Match`, and an unchanged list comes back as an
+ *  empty 304, answered here with that same array (same reference), so the
+ *  poll costs neither the transfer nor a parse
+ *  (docs/architecture/core-responsiveness.md). `cache: "no-store"` keeps
+ *  WebKit's own HTTP cache out of it. */
+async function jTaskList(path: string): Promise<Task[]> {
+  const known = taskListAnswers.get(path);
+  const res = await fetchWithRecovery({ fetchImpl: fetch, base: BASE }, path, {
+    cache: "no-store",
+    headers: {
+      "content-type": "application/json",
+      "authorization": `Bearer ${API_TOKEN}`,
+      ...(known ? { "if-none-match": known.etag } : {}),
+    },
+  });
+  if (res.status === 304 && known) {
+    taskListAnswers.delete(path);
+    taskListAnswers.set(path, known);
+    return known.tasks;
+  }
+  const body = await res.json().catch(() => null);
+  if (!res.ok) {
+    const msg = (body && typeof body === "object" && "error" in body && body.error)
+      ? String(body.error)
+      : `${res.status} ${res.statusText}`;
+    throw new ApiError(msg, res.status, body);
+  }
+  const tasks = body as Task[];
+  const etag = res.headers.get("etag");
+  taskListAnswers.delete(path);
+  if (etag && Array.isArray(tasks)) {
+    taskListAnswers.set(path, { etag, tasks });
+    while (taskListAnswers.size > TASK_LIST_ANSWERS_MAX) {
+      const oldest = taskListAnswers.keys().next().value;
+      if (oldest === undefined) break;
+      taskListAnswers.delete(oldest);
+    }
+  }
+  return tasks;
+}
+
 /** `j` for the bundle routes, whose callers read fields off the answer:
  *  a 2xx whose body didn't parse as a JSON object (`j` resolves `null` for
  *  an unparsable one) is an answer the request lost on the way back, so it
@@ -651,7 +709,7 @@ export const api = {
   defaults: () => j<AppDefaults>("/defaults"),
   info: () => j<{ version: string }>("/info"),
   /** Toggle the window's macOS "zoom" state. Wired up to double-click on
-   *  the app bar in App.tsx because Electrobun's drag region doesn't
+   *  the app bar (components/app-bar/AppBar.tsx) because Electrobun's drag region doesn't
    *  implement the native title-bar double-click gesture. */
   toggleWindowZoom: () =>
     j<{ ok: boolean; skipped?: string }>("/window/toggle-zoom", { method: "POST" }),
@@ -1803,8 +1861,10 @@ export const api = {
   },
   /** Every task by default. The board poll passes `{ archived: "exclude",
    *  keep }` so archived tasks stay server-side unless a view needs them
-   *  (`TaskListArchived`, docs/architecture/core-responsiveness.md). */
-  listTasks: (opts?: TaskListOptions) => j<Task[]>(taskListPath(opts)),
+   *  (`TaskListArchived`, docs/architecture/core-responsiveness.md). A
+   *  conditional request: an unchanged list resolves to the very array the
+   *  previous call for the same options returned (`jTaskList`). */
+  listTasks: (opts?: TaskListOptions) => trackRequest(jTaskList(taskListPath(opts))),
   /** Single task by id, fresh from the server (bypasses the 2s board poll's
    *  staleness). Used to re-check a task's persisted draft right after the
    *  panel seeds from a possibly-stale polled object — see RunPanel's
@@ -2293,11 +2353,13 @@ export const api = {
   /** Answer a tmux-pane-scraped REPL prompt. `key` must be one of the
    *  keys advertised on the request — the server validates against the
    *  recorded set before injecting keystrokes via `tmux send-keys`. */
-  answerTmuxPrompt: (id: string, body: { key: string } | { reject: true }) =>
-    j<{ ok: boolean }>(`/tmux-prompts/${id}/answer`, {
+  answerTmuxPrompt: (id: string, body: TmuxPromptAnswerBody) =>
+    // `retry: false`: a replayed answer would type the keys (an Enter, an OAuth
+    // code) into the pane a second time.
+    j<{ ok: boolean; error?: string; held?: boolean }>(`/tmux-prompts/${id}/answer`, {
       method: "POST",
       body: JSON.stringify(body),
-    }),
+    }, { retry: false }),
   /** Answer an fx ACP permission request. `{ optionId }` must be one of the
    *  option ids the request advertised — the server validates against the
    *  recorded set before echoing it back into the ACP RPC reply.

@@ -1,0 +1,12 @@
+# claude 2.1.326 · live (spike: ~450-char path on 80x24, title scrolled off, trailer below the footer)
+ its repository. Your answer holds for this session.
+ Security guide
+ ❯ No, exit
+   Yes, add it
+ Enter to confirm · Esc to cancel
+ Adding: /Users/me/.agetor/worktrees/long/ws/ddddddddddddddddddddddddddddddddddd
+dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd
+dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd
+dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd
+dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd
+ddddddddddddddddddddddddddddddddddddddddddddddddd/repo-long

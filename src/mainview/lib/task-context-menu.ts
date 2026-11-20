@@ -1,8 +1,8 @@
 import type { Task } from "../../shared/types.ts";
 import { isTaskFxPaused } from "../../shared/fx-recovery.ts";
-import { importedSessionOf } from "../../shared/imported-session.ts";
 import { isMultiRepoTask } from "../../shared/multi-repo.ts";
 import { taskPrsOf } from "../../shared/task-prs.ts";
+import { taskActionFlags } from "./task-card-actions.ts";
 
 /** Every action the task context menu can offer. A subset of App.tsx's
  *  existing card callbacks (`start`/`cancel`/`markDone`/`archive`/
@@ -70,13 +70,14 @@ export const MAX_FLAT_PR_ENTRIES = 3;
  * side-effect-free: no React, no `api` calls — App.tsx resolves each
  * returned `action` to its real handler and renders the entries.
  *
- * Gating mirrors `TaskCard`'s own button precedence exactly (see the
- * "Button precedence: Answer > Stop > Open > Run" comment in TaskCard.tsx)
- * so the menu never offers an action the card's own hover buttons wouldn't:
- * `awaiting`/`active`/`openable` are computed the same way, and "Run" is
- * hidden whenever the card would instead show "Answer"/"Review"/"Stop"/
- * "Open" — re-running from the menu while a turn is live or unread output
- * is waiting would be surprising, not a shortcut.
+ * Gating shares `TaskCard`'s button precedence through `taskActionFlags`
+ * (`task-card-actions.ts`), so the menu never offers an action the card's own
+ * buttons wouldn't: "Run" is hidden whenever the card would instead show
+ * "Answer"/"Review"/"Stop"/"Open" — re-running from the menu while a turn is
+ * live or unread output is waiting would be surprising, not a shortcut. The
+ * card shows only its primary actions; everything else it used to carry as
+ * icon buttons (Diff, Archive, Unarchive, the extra Stop, Delete) is an entry
+ * here, opened from the card's `⋯` button.
  *
  * `ctx.isOpen` mirrors `TaskCard`'s `isOpen` prop (`task.id ===
  * selected?.id`): the read/unread entries are suppressed while the run
@@ -85,34 +86,20 @@ export const MAX_FLAT_PR_ENTRIES = 3;
  * mid-session).
  */
 export function buildTaskContextMenu(task: Task, ctx: { isOpen: boolean }): TaskMenuEntry[] {
-  const archived = task.archivedAt != null;
-  const active = task.column === "running" || task.column === "blocked";
-  const awaiting = task.pendingInteractionCount > 0 || task.column === "blocked";
-  // A pipeline PARENT never gets its own `runId`/`hasOpenableRun` — only its
-  // step tasks do (see `isPipelineParent` below) — so `hasOpenableRun` alone
-  // would forever gate the "Run" entry open even once the pipeline has
-  // actually executed. `hasOpenablePipelineRun` is the parent-shaped
-  // equivalent: once any step execution has landed in history, there's
-  // something worth opening the run view for, and Retry/Restart live there
-  // instead of the card (M15, docs/plans/pipelines.md review).
-  const hasOpenablePipelineRun = !!task.pipelineRun
-    && (task.pipelineRun.history.length > 0 || (task.pipelineRun.humanSteps ?? []).length > 0);
-  const openable = task.hasOpenableRun || hasOpenablePipelineRun;
-  const gatePending = task.pipelineId != null && (task.pipelineRun?.humanSteps ?? []).length > 0;
-  // A pipeline PARENT task (`pipelineId` set) opens the full-page run view
-  // instead of the run panel — "Open pipeline" replaces "Open details" as
-  // the first entry (App.tsx maps it to `openPipelineRun`). A hidden STEP
-  // task (`pipelineParentId` set) can't be deleted/archived/unarchived
-  // individually — the parent owns its lifecycle (409 server-side, D9) — so
-  // those entries never appear for one, even though the board never
-  // renders a menu for a step row today (D11 hides them from the board).
-  const isPipelineParent = task.pipelineId != null;
-  const isStepTask = task.pipelineParentId != null;
-  // Stop is only honoured server-side for a pipeline PARENT while its run
-  // is genuinely `running` (`POST /tasks/:id/pipeline/cancel` 409s
-  // otherwise — e.g. a `blocked` run with nothing live), so the entry gates
-  // on `pipelineRun.status`, not the column (L-A1). Mirrors `TaskCard`.
-  const stoppable = isPipelineParent ? task.pipelineRun?.status === "running" || gatePending : active;
+  // The same flags `TaskCardActions` reads (`taskActionFlags`), so the menu
+  // and the card's buttons cannot disagree about what a task can do.
+  //
+  // A pipeline PARENT task (`isPipelineParent`) opens the full-page run view
+  // instead of the run panel — "Open pipeline" replaces "Open details" as the
+  // first entry (App.tsx maps it to `openPipelineRun`). A hidden STEP task
+  // (`isStepTask`) can't be deleted/archived/unarchived individually — the
+  // parent owns its lifecycle (409 server-side, D9) — so those entries never
+  // appear for one, even though the board never renders a menu for a step
+  // row today (D11 hides them from the board).
+  const {
+    archived, active, awaiting, openable, gatePending, stoppable,
+    isPipelineParent, isStepTask, imported, canMarkDone,
+  } = taskActionFlags(task);
 
   const entries: TaskMenuEntry[] = [];
 
@@ -125,7 +112,7 @@ export function buildTaskContextMenu(task: Task, ctx: { isOpen: boolean }): Task
   } else {
     entries.push({ action: "open", label: "Open details", group: "primary" });
   }
-  if (!archived && !awaiting && !active && !openable && !importedSessionOf(task)) {
+  if (!archived && !awaiting && !active && !openable && !imported) {
     entries.push({ action: "start", label: "Run", group: "primary" });
   }
   if (stoppable && !archived) {
@@ -142,7 +129,7 @@ export function buildTaskContextMenu(task: Task, ctx: { isOpen: boolean }): Task
       entries.push({ action: "cancel-auto-resume", label: "Cancel auto-resume", group: "primary" });
     }
   }
-  if (task.column === "review" && !archived && !gatePending && !(isPipelineParent && task.pipelineRun?.status !== "done")) {
+  if (canMarkDone) {
     entries.push({ action: "mark-done", label: "Mark done", group: "primary" });
   }
   if (!archived && !isStepTask && (task.column === "done" || active)) {

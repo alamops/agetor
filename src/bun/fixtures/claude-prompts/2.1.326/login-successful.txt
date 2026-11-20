@@ -1,0 +1,3 @@
+# claude 2.1.326 · binary (["Login successful. Press ", <b>Enter</b>, " to continue…"]; layout reconstructed, not live-captured — plan A4)
+
+ Login successful. Press Enter to continue…

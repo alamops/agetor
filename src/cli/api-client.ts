@@ -40,6 +40,7 @@ import type {
   OpencodeSessionList,
   BackgroundStatus,
   RemoteAccessStatus,
+  TmuxPromptAnswerBody,
 } from "../shared/types.ts";
 import type { NotificationKind } from "../shared/os-notification.ts";
 import type { DiscoveredModel } from "../shared/model-options.ts";
@@ -411,8 +412,8 @@ export class AgetorClient {
   }
   answerTmuxPrompt(
     id: string,
-    body: { key?: string; reject?: boolean },
-  ): Promise<{ ok: boolean; error?: string }> {
+    body: TmuxPromptAnswerBody,
+  ): Promise<{ ok: boolean; error?: string; held?: boolean }> {
     return this.req("POST", `/tmux-prompts/${encodeURIComponent(id)}/answer`, body);
   }
   /** `message` is the reason an OpenCode card's `reject` may carry; the core

@@ -69,6 +69,9 @@ export const pidFilePath = path.join(DATA_DIR, "agetor.pid");
  *  and authenticate to the running core. See `core-creds.ts`. */
 export const credsFilePath = coreCredsPath(DATA_DIR);
 
+/** SQLite page cache for the core's connection, in KiB (64 MiB). */
+export const SQLITE_CACHE_KIB = 65_536;
+
 export const db = new Database(path.join(DATA_DIR, "agetor.sqlite"));
 db.exec("PRAGMA journal_mode = WAL;");
 // WAL + NORMAL is SQLite's documented sweet spot for a local single-writer
@@ -82,9 +85,58 @@ db.exec("PRAGMA journal_mode = WAL;");
 // up is that a kernel panic mid-stream may roll back the final commit(s).
 db.exec("PRAGMA synchronous = NORMAL;");
 db.exec("PRAGMA foreign_keys = ON;");
+// A 64 MiB page cache (negative = KiB) instead of SQLite's 2 MiB default. The
+// board's task list and a run's history are read again and again; with 2 MiB
+// against a multi-GB database every read went back to the OS, and under
+// memory pressure to disk, while the one core thread waited
+// (docs/architecture/core-responsiveness.md). The cache only holds pages
+// actually read, so a small database costs no more than before.
+db.exec(`PRAGMA cache_size = ${-SQLITE_CACHE_KIB};`);
+
+/** Most of the database file SQLite reads through a memory map. */
+export const DB_MMAP_SIZE_BYTES = 256 * 1024 * 1024;
+// Read-side tuning beside the page cache above (docs/architecture/persistence.md).
+// `mmap_size` serves reads from the OS file cache without the extra copy into
+// SQLite's own buffers, and macOS reclaims those pages under memory pressure;
+// the trade-off is that a disk read error surfaces as a crash (SIGBUS) rather
+// than SQLITE_IOERR. Measured on a 4.6 GB owner DB, the 3,363-row task list
+// took ~1 s at SQLite's defaults, ~0.28 s with the 64 MiB cache alone and
+// ~0.22 s with the cache and this map. `temp_store = MEMORY` keeps the list's
+// GROUP BY / ORDER BY scratch b-trees off disk. It must run before the TEMP
+// table and triggers below are created: changing `temp_store` drops every
+// TEMP object already on the connection.
+db.exec(`PRAGMA mmap_size = ${DB_MMAP_SIZE_BYTES};`);
+db.exec("PRAGMA temp_store = MEMORY;");
 
 const applied = migrate(db, migrations);
 if (applied.length) console.log(`[agetor] applied migrations: ${applied.join(", ")}`);
+
+// Change counter for the `GET /tasks` answer cache (`task-list-cache.ts`).
+// Every row written to `tasks`, `runs` or `subagents` (the tables the list is
+// built from) bumps it, through TEMP triggers that live on this connection
+// only: no migration, nothing persisted, and every write path is covered
+// without touching it. Writes made by another connection are caught by
+// `PRAGMA data_version`, read alongside (`taskListDataVersion`).
+db.exec("CREATE TEMP TABLE IF NOT EXISTS task_list_version (n INTEGER NOT NULL)");
+db.exec("INSERT INTO temp.task_list_version SELECT 0 WHERE NOT EXISTS (SELECT 1 FROM temp.task_list_version)");
+for (const table of ["tasks", "runs", "subagents"]) {
+  for (const op of ["INSERT", "UPDATE", "DELETE"]) {
+    // The trigger body can't qualify the table; the TEMP table resolves first.
+    db.exec(
+      `CREATE TEMP TRIGGER IF NOT EXISTS task_list_version_${table}_${op.toLowerCase()} `
+      + `AFTER ${op} ON main.${table} BEGIN UPDATE task_list_version SET n = n + 1; END`,
+    );
+  }
+}
+
+/** Changes whenever a row of `tasks`, `runs` or `subagents` was written, by
+ *  this connection (the TEMP triggers above) or another one
+ *  (`data_version`). Cheap: two single-row reads. */
+export function taskListDataVersion(): string {
+  const n = db.query<{ n: number }, []>("SELECT n FROM temp.task_list_version").get()?.n ?? 0;
+  const v = db.query<{ data_version: number }, []>("PRAGMA data_version").get()?.data_version ?? 0;
+  return `${n}.${v}`;
+}
 
 type TaskRow = {
   id: string; title: string; prompt: string; column: string; agent: string;

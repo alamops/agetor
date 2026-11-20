@@ -521,7 +521,7 @@ test("reconcileTaskSession: a withheld /plan mirror leaves a '\u26a0\ufe0f plan 
  *  claude-opus-5`), not just the argv shape. Reading fd 0 synchronously is
  *  safe even for calls where the real caller passed `stdin: "ignore"`
  *  (`Bun.spawnSync` maps that to `/dev/null`, which reads as immediate EOF). */
-function withRecordingTmuxBin<T>(fn: (logPath: string) => Promise<T>): Promise<T> {
+function withRecordingTmuxBin<T>(fn: (logPath: string) => Promise<T>, pane = ""): Promise<T> {
   const dir = mkdtempSync(path.join(tmpdir(), "agetor-tmux-rec-"));
   const binPath = path.join(dir, "tmux");
   const logPath = path.join(dir, "log.jsonl");
@@ -530,7 +530,9 @@ function withRecordingTmuxBin<T>(fn: (logPath: string) => Promise<T>): Promise<T
     `#!${process.execPath}\n` +
       `import { appendFileSync, readFileSync } from "node:fs";\n` +
       `let stdin = ""; try { stdin = readFileSync(0, "utf8"); } catch {}\n` +
-      `appendFileSync(${JSON.stringify(logPath)}, JSON.stringify({ ms: Date.now(), argv: process.argv.slice(2), stdin }) + "\\n");\n`,
+      `appendFileSync(${JSON.stringify(logPath)}, JSON.stringify({ ms: Date.now(), argv: process.argv.slice(2), stdin }) + "\\n");\n` +
+      // The card drive re-reads the pane before every key: serve one.
+      `if (process.argv.includes("capture-pane")) process.stdout.write(${JSON.stringify(pane)});\n`,
   );
   chmodSync(binPath, 0o755);
   const prevBin = process.env.AGETOR_TMUX_BIN;
@@ -559,6 +561,18 @@ function readTmuxLog(logPath: string): Array<{ ms: number; argv: string[]; stdin
 
 describe("nav end-to-end via POST /tmux-prompts/:id/answer", () => {
   test("nav:'horizontal' choices send Right,Right,Enter", async () => {
+    // The real slider pane: the drive re-reads it, so the card must be the one
+    // the matcher produces for it (cursor on `xhigh`, two stops left of `ultracode`).
+    const SLIDER = [
+      "   Effort",
+      "",
+      "                             Faster                                                 Smarter",
+      "                             ──────────────────────────────▲────────────┆──────────────────",
+      "                             low     medium     high     xhigh      max       ultracode",
+      "                                                                          xhigh + workflows",
+      "",
+      "   ←/→ to adjust · Enter to confirm · Esc to cancel",
+    ].join("\n");
     await withRecordingTmuxBin(async (logPath) => {
       const { startApiServer, API_TOKEN } = await import("./server.ts");
       const claudeTmux = await import("./claude-tmux.ts");
@@ -569,23 +583,25 @@ describe("nav end-to-end via POST /tmux-prompts/:id/answer", () => {
       claudeTmux.__forTest.installSession(taskId, freshJsonl());
 
       try {
-        const choices = ["1", "2", "3", "4"].map((key) => ({ key, label: `choice ${key}` }));
-        // cursorIndex 0 (currently on key "1") → target key "3" is index 2 →
-        // delta +2 → two Right presses before the confirming Enter.
+        const slider = claudeTmux.__forTest.matchSliderModal(SLIDER)!;
+        expect(slider.nav).toBe("horizontal");
         const { req } = registerTmuxPrompt({
           taskId,
           runId: "r-nav-h",
-          paneText: "\u2190/\u2192 to adjust",
-          choices,
-          cursorIndex: 0,
+          paneText: slider.paneText,
+          choices: slider.choices,
+          cursorIndex: slider.cursorIndex,
           nav: "horizontal",
-          fingerprint: "fp-nav-e2e-horizontal",
+          fingerprint: slider.fingerprint,
+          identity: claudeTmux.__forTest.identityOf(slider),
         });
+        // Two stops to the right of the cursor → two Right presses before Enter.
+        const target = slider.choices[slider.cursorIndex! + 2]!;
 
         const res = await fetch(`http://127.0.0.1:4427/tmux-prompts/${req.id}/answer`, {
           method: "POST",
           headers: { authorization: `Bearer ${API_TOKEN}`, "content-type": "application/json" },
-          body: JSON.stringify({ key: "3" }),
+          body: JSON.stringify({ key: target.key }),
         });
         expect(res.status).toBe(200);
         const body = await res.json();
@@ -599,10 +615,11 @@ describe("nav end-to-end via POST /tmux-prompts/:id/answer", () => {
         claudeTmux.__forTest.uninstallSession(taskId);
         server.stop();
       }
-    });
+    }, SLIDER);
   }, 10_000);
 
   test("no nav (vertical default) sends Down,Down,Enter", async () => {
+    const NUMBERED = "Choose an option:\n❯ 1. choice 1\n  2. choice 2\n  3. choice 3\n  4. choice 4";
     await withRecordingTmuxBin(async (logPath) => {
       const { startApiServer, API_TOKEN } = await import("./server.ts");
       const claudeTmux = await import("./claude-tmux.ts");
@@ -613,15 +630,16 @@ describe("nav end-to-end via POST /tmux-prompts/:id/answer", () => {
       claudeTmux.__forTest.installSession(taskId, freshJsonl());
 
       try {
-        const choices = ["1", "2", "3", "4"].map((key) => ({ key, label: `choice ${key}` }));
+        const numbered = claudeTmux.__forTest.matchNumberedModal(NUMBERED)!;
         const { req } = registerTmuxPrompt({
           taskId,
           runId: "r-nav-v",
-          paneText: "Choose an option:",
-          choices,
-          cursorIndex: 0,
+          paneText: numbered.paneText,
+          choices: numbered.choices,
+          cursorIndex: numbered.cursorIndex,
           // nav omitted — dismissal path treats this as vertical.
-          fingerprint: "fp-nav-e2e-vertical",
+          fingerprint: numbered.fingerprint,
+          identity: claudeTmux.__forTest.identityOf(numbered),
         });
 
         const res = await fetch(`http://127.0.0.1:4427/tmux-prompts/${req.id}/answer`, {
@@ -641,7 +659,7 @@ describe("nav end-to-end via POST /tmux-prompts/:id/answer", () => {
         claudeTmux.__forTest.uninstallSession(taskId);
         server.stop();
       }
-    });
+    }, NUMBERED);
   }, 10_000);
 });
 

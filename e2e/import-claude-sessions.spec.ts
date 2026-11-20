@@ -3,7 +3,7 @@ import { mkdirSync, mkdtempSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import path from "node:path";
 import { test, expect } from "./fixtures";
-import { getPreferences, gotoApp, openSettingsGeneral } from "./helpers";
+import { getPreferences, gotoApp, openSettingsHarnesses } from "./helpers";
 import { plainEncodedProjectPath } from "../src/shared/claude-session-meta.ts";
 
 const home = mkdtempSync(path.join(tmpdir(), "cc-e2e-home-"));
@@ -76,7 +76,8 @@ test("header import lands the session in Review with history and no Run", async 
   await row.getByRole("button", { name: "Import", exact: true }).click();
   await expect(dialog.getByText("please fix the login")).toHaveCount(0);
   await page.getByRole("button", { name: "Close" }).click();
-  const card = page.getByRole("button", { name: /please fix the login/ });
+  // The card is a labelled group (not a button), so locate it by its task id hook.
+  const card = page.locator("[data-task-id]").filter({ hasText: /please fix the login/ });
   await card.scrollIntoViewIfNeeded();
   await expect(card.getByRole("button", { name: "Run", exact: true })).toHaveCount(0);
   await card.getByRole("button", { name: "Open", exact: true }).click();
@@ -94,9 +95,9 @@ test("a live registry session cannot be imported", async ({ page, freshBackend }
   await expect(row.getByRole("button", { name: "Import", exact: true })).toBeDisabled();
 });
 
-test("Settings → General turns the launch scan off", async ({ page, freshBackend, request }) => {
+test("Settings → Harnesses → Behaviour turns the launch scan off", async ({ page, freshBackend, request }) => {
   await gotoApp(page, freshBackend.bootBase);
-  const dialog = await openSettingsGeneral(page);
+  const dialog = await openSettingsHarnesses(page);
   const toggle = dialog.getByTestId("claude-sessions-launch-scan");
   await expect(toggle).toBeChecked();
   await toggle.click();

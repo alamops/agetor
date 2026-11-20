@@ -8,6 +8,7 @@ import {
   createStackViaApi,
   deleteAll,
   gotoApp,
+  headerSettingsButton,
   removeLimitStates,
   seedLimitState,
 } from "./helpers";
@@ -291,7 +292,7 @@ test.describe("stack account switching (shared backend)", () => {
     });
     expect(patch.status).toBe(200);
     await page.reload();
-    await expect(page.getByTitle("Settings", { exact: true })).toBeVisible();
+    await expect(headerSettingsButton(page)).toBeVisible();
     await pickAccount(form, a);
     const hint = form.getByTestId("launch-stack-fallback-hint");
     await expect(hint).toBeVisible();

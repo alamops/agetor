@@ -6,6 +6,7 @@ import { stackPositionFor } from "@/lib/stack-badge";
 import { cooldownChips, groupHarnesses } from "@/lib/stack-editor";
 import { AccountRow } from "@/components/settings/HarnessAccountRow";
 import { HarnessStackCard } from "@/components/settings/HarnessStackCard";
+import { HarnessBehaviourSection, type HarnessBehaviourProps } from "@/components/settings/HarnessBehaviourSection";
 import type { Harness, HarnessQuota, HarnessStack } from "../../../shared/types.ts";
 
 interface Props {
@@ -39,6 +40,8 @@ interface Props {
   pendingProfileMcp: Record<string, boolean>;
   onClearCooldown: (h: Harness, model: string | null) => void;
   onRestore: (h: Harness) => void;
+  /** The per-kind Behaviour block (tmux source, auto-trust, session scan, fx auto-resume). */
+  behaviour: HarnessBehaviourProps;
 }
 
 /**
@@ -139,6 +142,8 @@ export function HarnessesPage(props: Props) {
         {stackGroups.length > 0 && <p className="text-xs text-muted-foreground">Other accounts</p>}
         <div className="space-y-1.5">{others.map((h) => renderRow(h, false))}</div>
       </section>
+
+      <HarnessBehaviourSection {...props.behaviour} />
     </div>
   );
 }

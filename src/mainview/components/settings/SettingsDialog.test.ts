@@ -1,9 +1,9 @@
 // StackEditor's save can land after the user left it (review N6): only the
 // editor that saved may pop back, never the subpage now on screen.
 import { describe, expect, test } from "bun:test";
-import { stackSavedHandler, viewAfterSave } from "./SettingsDialog.tsx";
+import { entryView, stackSavedHandler, viewAfterSave } from "./SettingsDialog.tsx";
 import type { SettingsView } from "@/lib/settings-dialog-view";
-import { openSection, openStackEditor, openStackHistory } from "@/lib/settings-dialog-view";
+import { initialView, openAgentEditor, openSection, openStackEditor, openStackHistory } from "@/lib/settings-dialog-view";
 
 describe("viewAfterSave", () => {
   test("pops the saving editor back to its section while it is still showing", () => {
@@ -62,5 +62,24 @@ describe("stackSavedHandler (the StackEditor onSaved wiring)", () => {
     state.set(reopened);
     onSaved();
     expect(state.get()).toBe(reopened);
+  });
+});
+
+describe("entryView (what the modal opens on)", () => {
+  test("an agent profile beats a stack history, which beats a section, which beats General", () => {
+    expect(entryView("harnesses", "p1", "s1")).toEqual(openAgentEditor("p1"));
+    expect(entryView("harnesses", null, "s1")).toEqual(openStackHistory("s1"));
+    expect(entryView("harnesses", null, null)).toEqual(openSection("harnesses"));
+    expect(entryView(undefined, null, null)).toEqual(initialView());
+  });
+
+  test("the stack-history argument is optional (every older call site)", () => {
+    expect(entryView("harnesses", undefined)).toEqual(openSection("harnesses"));
+    expect(entryView(undefined, undefined)).toEqual(initialView());
+  });
+
+  test("reopening with a different stack id lands on that stack's history", () => {
+    expect(entryView(undefined, null, "s2")).toEqual(openStackHistory("s2"));
+    expect(entryView(undefined, null, "s2")).not.toEqual(entryView(undefined, null, "s1"));
   });
 });

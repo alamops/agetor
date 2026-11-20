@@ -1,6 +1,6 @@
 import { useCallback, useEffect, useLayoutEffect, useMemo, useRef, useState } from "react";
 import { AnimatePresence, motion } from "motion/react";
-import { DndContext, type DragEndEvent, PointerSensor, useSensor, useSensors } from "@dnd-kit/core";
+import { DndContext, type DragEndEvent, KeyboardSensor, PointerSensor, useSensor, useSensors } from "@dnd-kit/core";
 import {
   AlertTriangle,
   Archive,
@@ -8,18 +8,15 @@ import {
   CheckCircle2,
   CircleDot,
   Copy,
-  FolderGit2,
   FolderOpen,
   Folder,
   GitBranch,
   GitCompare,
   GitPullRequest,
-  Import,
   Mail,
   MailOpen,
   Play,
   PlayCircle,
-  Settings,
   Square,
   TimerOff,
   Trash2,
@@ -29,17 +26,14 @@ import {
   type LucideIcon,
 } from "lucide-react";
 import { api, ApiError, type AgentModelMap, type HarnessModelMap } from "@/lib/api";
-import { Button } from "@/components/ui/button";
-import { clampFontSizePercent, COLUMNS, describeArchiveUncommittedChanges, isArchiveUncommittedChanges, USAGE_SUPPORTED_KINDS, type AgentStatus, type ColumnId, type GlobalEvent, type Harness, type HarnessLimitState, type HarnessQuota, type HarnessStack, type Project, type Task, type TaskListOptions, type TaskType } from "../shared/types.ts";
+import { clampFontSizePercent, COLUMNS, describeArchiveUncommittedChanges, isArchiveUncommittedChanges, type AgentStatus, type AppMenuAction, type ColumnId, type GlobalEvent, type Harness, type HarnessLimitState, type HarnessQuota, type HarnessStack, type Project, type Task, type TaskListOptions, type TaskType } from "../shared/types.ts";
 import { parseIssueUrl } from "../shared/issue-task.ts";
-import { AgentIcon } from "@/components/kanban/AgentIcon";
 import { Column } from "@/components/kanban/Column";
 import { ContextMenu, type ContextMenuItem, type ContextMenuLeafItem } from "@/components/ui/context-menu";
 import { DiffDialog } from "@/components/kanban/DiffDialog";
 import { GitHubDialog, type GitHubItemDetailPrefill, type GitHubPullPrefill } from "@/components/kanban/GitHubDialog";
-import { UsageMeter } from "@/components/usage/UsageMeter";
-import { UsagePopover } from "@/components/usage/UsagePopover";
-import { visibleTopbarAgents } from "@/lib/usage";
+import { AppBar } from "@/components/app-bar/AppBar";
+import { isAppMenuAction, isSettingsShortcut, MENU_ACTION_BLOCKING_LAYERS } from "@/lib/app-menu";
 import { KanbanFilters } from "@/components/kanban/KanbanFilters";
 import { isMacPlatform } from "@/lib/platform";
 import { activeLeaveGuard } from "@/lib/leave-guard";
@@ -64,6 +58,7 @@ import { WelcomeDialog } from "@/components/onboarding/WelcomeDialog";
 import { OnboardingChecklist } from "@/components/onboarding/OnboardingChecklist";
 import type { UpdateSnapshot } from "@/lib/api";
 import { useConfirm } from "@/components/ui/confirm";
+import { BOARD_KEYBOARD_CODES, BOARD_SCREEN_READER_INSTRUCTIONS, boardKeyboardCoordinates, isBoardCancelInProgress, makeBoardAnnouncements, setBoardDragging } from "@/lib/board-keyboard";
 import { toast } from "sonner";
 import { Toaster } from "@/components/ui/sonner";
 import { dismissPending, dismissTaskToast, hasPendingToast, notifyFilesSent, notifyWaitingInput, toastApiError, toastError, toastFxAutoResumeExhausted, toastFxAutoResumeFired, toastHarnessExhausted, toastHarnessSwap, toastHarnessUnusable, toastPending, toastPipelineReview, toastSendFailed, toastSessionEnded, toastSuccess, toastUnknownCommand, type ToastArgs } from "@/lib/toasts";
@@ -92,7 +87,6 @@ import { reconcileById } from "@/lib/reconcile";
 import { parseStickyUserMessagesPreference, STICKY_USER_MESSAGES_PREF } from "@/lib/user-message-display";
 import { FX_AUTO_RESUME_DELAY_PREF, FX_AUTO_RESUME_PREF } from "@/lib/fx-auto-resume-prefs";
 import { parseFxAutoResumePrefs } from "../shared/fx-recovery.ts";
-import iconUrl from "../assets/agetor.iconset/icon_32x32@2x.png";
 
 /** The `pipelineParentId` a `GlobalEvent` carries when it concerns a hidden
  *  pipeline STEP task — the orchestrator stamps it on the `run-status`/
@@ -286,8 +280,8 @@ function AppInner() {
   // the webview's first fetch can race the sweep's own first probe).
   const [harnessModels, setHarnessModels] = useState<HarnessModelMap["byHarness"]>({});
   const [discoveryReady, setDiscoveryReady] = useState(false);
-  // Per-harness quota/usage snapshots for the topbar chip mini-bar + popover
-  // (D2). Seeded once on boot via `getAllUsage`, kept current afterwards by
+  // Per-harness quota/usage snapshots for the app bar's Harnesses button and
+  // panel (D2). Seeded once on boot via `getAllUsage`, kept current afterwards by
   // the `harness_usage` AppEvent (see the `subscribeAppEvents` handler
   // below) — no polling here, the Bun-side poller drives freshness.
   const [usage, setUsage] = useState<Record<string, HarnessQuota>>({});
@@ -336,6 +330,16 @@ function AppInner() {
   // pipeline subagent satellite), cleared on every close/other open path so a
   // later "Manage agents…" or gear open lands on the plain list.
   const [settingsInitialAgentId, setSettingsInitialAgentId] = useState<string | null>(null);
+  // Harness stack whose swap-history subpage Settings should open on — set
+  // only by the Harnesses panel's "Swap history" link, cleared by every other
+  // Settings entry point and on close (same rule as the agent id above).
+  const [settingsInitialStackHistoryId, setSettingsInitialStackHistoryId] = useState<string | null>(null);
+  // Bumped by `runMenuAction`: the app bar closes its Harnesses panel when a
+  // menu action takes over the screen.
+  const [appBarDismissNonce, setAppBarDismissNonce] = useState(0);
+  // `runMenuAction` is declared far below the app-events effect that calls
+  // it; the ref keeps that effect's deps (and its subscription) stable.
+  const runMenuActionRef = useRef<(action: AppMenuAction) => void>(() => {});
   // --- Onboarding (docs/plans/onboarding-first-run.md) ---------------------
   // Server preference mirror. `undefined` = never fetched OR never set;
   // `resolveOnboardingVisibility` treats those the same (both gate on
@@ -399,7 +403,14 @@ function AppInner() {
   // SettingsDialog so new-harness HOME suggestions point under the current
   // data dir instead of always hard-coding the prod tree.
   const [dataDir, setDataDir] = useState<string>("");
-  const sensors = useSensors(useSensor(PointerSensor, { activationConstraint: { distance: 6 } }));
+  // Pointer drags need a 6 px move, so a click still opens the card. The
+  // keyboard sensor makes the board usable without a mouse: Space picks a card
+  // up, ← → move it between columns, Space drops, Escape cancels
+  // (`lib/board-keyboard.ts`). Both end in the one `onDragEnd` below.
+  const sensors = useSensors(
+    useSensor(PointerSensor, { activationConstraint: { distance: 6 } }),
+    useSensor(KeyboardSensor, { keyboardCodes: BOARD_KEYBOARD_CODES, coordinateGetter: boardKeyboardCoordinates }),
+  );
   const confirm = useConfirm();
 
   // True while the pipeline canvas editor has unsaved changes — set via the
@@ -758,6 +769,9 @@ function AppInner() {
   // function's doc comment. A ref (not state) since it's pure bookkeeping
   // that must survive across polls without itself triggering a render.
   const taskReconcileCacheRef = useRef(new Map<string, { obj: Task; json: string }>());
+  // The last poll answer `refresh()` reconciled and the state it produced,
+  // so a 304 (same array back) skips the per-task compare.
+  const lastAppliedTaskListRef = useRef<{ list: Task[]; result: Task[] } | null>(null);
   // In-flight guards for the 2s `refresh()` / 15s `refreshAgents()` interval
   // pollers below (task-details-blank-while-session-restores.md §3.1/§3.4):
   // a tick is skipped while the previous poll of the same kind hasn't
@@ -790,7 +804,18 @@ function AppInner() {
       // `list` (unreconciled) is what callers get back for immediate reads
       // (e.g. re-checking a just-created task's branch); the reconciled,
       // identity-preserving version is what actually lands in state.
-      setTasks((prev) => reconcileById(prev, list, (t) => t.id, taskReconcileCacheRef.current));
+      setTasks((prev) => {
+        // An unchanged list (the conditional poll's 304) comes back as the
+        // same array; when the state is still exactly what that array was
+        // reconciled into, there is nothing to compare. An optimistic edit
+        // since then (archive, unarchive…) changed `prev`, so the server's
+        // answer is applied over it as before.
+        const last = lastAppliedTaskListRef.current;
+        if (last && last.list === list && last.result === prev) return prev;
+        const next = reconcileById(prev, list, (t) => t.id, taskReconcileCacheRef.current);
+        lastAppliedTaskListRef.current = { list, result: next };
+        return next;
+      });
       // Gates onboarding visibility (see `resolveOnboardingVisibility`'s
       // `loaded` input) — set unconditionally on every success, cheap no-op
       // once already true.
@@ -829,7 +854,7 @@ function AppInner() {
       setHarnessLimitStates((prev) => reconcileById(prev, payload.limitStates ?? [], (s) => `${s.harnessId}\u0000${s.model ?? ""}`));
       setAgents((prev) => reconcileById(prev, payload.statuses, (a) => a.harnessId));
       // Harness rows (carries `enabled`) are already fetched here for the
-      // header's status dots — onboarding's harness step reuses this same
+      // app bar's Harnesses button and panel — onboarding's harness step reuses this same
       // state instead of a second fetch, but needs to distinguish "not
       // loaded yet" from "loaded, zero harnesses" (the latter can't
       // actually happen — built-ins are always seeded — but the checklist
@@ -909,10 +934,10 @@ function AppInner() {
     void refreshAgentModels();
     void refreshHarnessModels();
     void refreshProjects();
-    // Seed the topbar usage tracker with whatever the Bun side last
-    // persisted, so chips show a meter immediately on boot rather than
-    // waiting for the next poll or SSE push. Best-effort — a failure here
-    // just means chips render without a mini-bar until the first
+    // Seed the usage tracker (the app bar's Harnesses button and panel) with
+    // whatever the Bun side last persisted, so the meter shows immediately on
+    // boot rather than waiting for the next poll or SSE push. Best-effort — a
+    // failure here just means the bar renders without a meter until the first
     // `harness_usage` event arrives.
     api.getAllUsage()
       .then((list) => setUsage(Object.fromEntries(list.map((q) => [q.harnessId, q]))))
@@ -1390,6 +1415,12 @@ function AppInner() {
         setUsage((prev) => ({ ...prev, [ev.quota.harnessId]: ev.quota }));
         return;
       }
+      if (ev.type === "menu_action") {
+        // A native menu item ("Settings…", the Go menu). The core sends the
+        // action id only; an unknown id (a newer core) is ignored.
+        if (isAppMenuAction(ev.action)) runMenuActionRef.current(ev.action);
+        return;
+      }
       if (ev.type === "claude_sessions_found") {
         const n = ev.count;
         toast(`${n} Claude Code session${n === 1 ? "" : "s"} found outside Agetor — Review`, {
@@ -1405,7 +1436,7 @@ function AppInner() {
       }
       if (ev.type === "harnesses_auto_enabled") {
         // D-14: built-in harnesses turned on because their CLI is installed.
-        // Reload the header's harness state so the new rows show at once.
+        // Reload the app bar's harness state so the new rows show at once.
         const text = autoEnabledToastText(ev.harnessIds, ev.labels);
         void refreshAgents();
         if (text) {
@@ -1415,6 +1446,7 @@ function AppInner() {
               onClick: () => {
                 setSettingsInitialSection("harnesses");
                 setSettingsInitialAgentId(null);
+                setSettingsInitialStackHistoryId(null);
                 setSettingsOpen(true);
               },
             },
@@ -1511,7 +1543,7 @@ function AppInner() {
   const pipelineGateRef = useRef(new Map<string, { runStartedAt: number | null; seqs: number[] }>());
   useEffect(() => {
     /** Refetch just one pipeline parent and merge the three fields the
-     *  board's `PipelineBadge`, the card's column and the "needs input"
+     *  card's pipeline hat, the card's column and the "needs input"
      *  glow read — never the whole snapshot (a wholesale replace would
      *  revert a concurrent optimistic patch, same rule `mergeTaskFields`'s
      *  doc comment states). A failed refetch just leaves the 2s `/tasks`
@@ -1795,8 +1827,8 @@ function AppInner() {
       }
       // Pipeline run-state changes ride their own kind (D12,
       // `docs/plans/pipelines.md`). The event only carries a status/active-
-      // step-ids summary, not the full `PipelineRunState` the board's
-      // `PipelineBadge` and an open run view need, so the parent is
+      // step-ids summary, not the full `PipelineRunState` the card's
+      // pipeline hat and an open run view need, so the parent is
       // refetched (coalesced per parent, see `refetchPipelineParent`) and
       // only its run-derived fields merged in.
       if (ev.kind === "pipeline") {
@@ -1914,7 +1946,7 @@ function AppInner() {
   }, [openTask, openPipelineStep, openPipelineAttention, mergeTaskFields, raisePipelineNeedsYou, raisePipelineReview, settleOwedPipelineAlert]);
 
   // Hidden pipeline STEP tasks never count toward anything user-facing (D11,
-  // `docs/plans/pipelines.md`) — the header's "N of M tasks" count and the
+  // `docs/plans/pipelines.md`) — the board filter row's "N of M tasks" count and the
   // harness filter's option set (m4) must both be computed over this, not
   // the raw `tasks` state, or a running pipeline's hidden steps would
   // silently inflate the total and spam the harness filter with ids the
@@ -1932,7 +1964,7 @@ function AppInner() {
     return tasks.filter((t) => {
       // Hidden pipeline STEP tasks never appear as their own board cards
       // (D11, `docs/plans/pipelines.md`) — they're driven entirely from the
-      // pipeline run view, opened via the parent's `PipelineBadge`. `tasks`
+      // pipeline run view, opened via the parent card's pipeline hat. `tasks`
       // state itself still holds them (the run panel's `selected`-sync
       // effect and `GET /tasks/:id/pipeline` both need the full list/row).
       if (t.pipelineParentId != null) return false;
@@ -2035,6 +2067,23 @@ function AppInner() {
   const openSettingsHarnesses = useCallback(() => {
     setSettingsInitialSection("harnesses");
     setSettingsInitialAgentId(null);
+    setSettingsInitialStackHistoryId(null);
+    setSettingsOpen(true);
+  }, []);
+  /** The app bar's Settings button and the native "Settings…" item: the plain
+   *  open, landing on General. */
+  const openSettings = useCallback(() => {
+    setSettingsInitialSection(undefined);
+    setSettingsInitialAgentId(null);
+    setSettingsInitialStackHistoryId(null);
+    setSettingsOpen(true);
+  }, []);
+  /** The Harnesses panel's "Swap history": Settings → Harnesses, on that
+   *  stack's history subpage. */
+  const openStackHistory = useCallback((stackId: string) => {
+    setSettingsInitialSection("harnesses");
+    setSettingsInitialAgentId(null);
+    setSettingsInitialStackHistoryId(stackId);
     setSettingsOpen(true);
   }, []);
   // `profileId` deep-links to that profile's edit subpage; no argument opens
@@ -2044,10 +2093,11 @@ function AppInner() {
   const openSettingsAgents = useCallback((profileId?: string) => {
     setSettingsInitialSection("agents");
     setSettingsInitialAgentId(typeof profileId === "string" ? profileId : null);
+    setSettingsInitialStackHistoryId(null);
     setSettingsOpen(true);
   }, []);
   /** Switch the app-level `view` to the full-page pipelines list — the
-   *  header's Pipelines button (m2: routed through `navigate` so leaving a
+   *  app bar's Pipelines button (m2: routed through `navigate` so leaving a
    *  dirty editor confirms first). */
   const openPipelinesPage = useCallback(() => {
     navigate({ kind: "pipelines", pipelineId: null, editing: false });
@@ -2060,9 +2110,80 @@ function AppInner() {
   const onSettingsOpenPipelines = useCallback((id: string | null, editing: boolean) => {
     setSettingsOpen(false);
     setSettingsInitialAgentId(null);
+    setSettingsInitialStackHistoryId(null);
     setSettingsInitialSection(undefined);
     navigate({ kind: "pipelines", pipelineId: id, editing });
   }, [navigate]);
+  const openGitDialog = useCallback(() => setGithubOpen(true), []);
+  const openImportSessions = useCallback(() => setImportSessionsOpen(true), []);
+  const openWorktrees = useCallback(() => setWorktreesOpen(true), []);
+  /** The Harnesses panel's refresh: force-refresh one account's usage and
+   *  merge the snapshot (the `harness_usage` event would also deliver it). */
+  const refreshHarnessUsage = useCallback(async (harnessId: string) => {
+    const fresh = await api.refreshHarnessUsage(harnessId);
+    setUsage((prev) => ({ ...prev, [fresh.harnessId]: fresh }));
+  }, []);
+  /** A failover task listed in the Harnesses panel: open it like a
+   *  notification click does (`open_task`) — a pipeline step through its run
+   *  view, anything else in the run panel — fetching the list first when the
+   *  2 s poll hasn't picked the task up. */
+  const openFailoverTask = useCallback((taskId: string) => {
+    void (async () => {
+      try {
+        let task: Task | null = findTaskById(tasksRef.current, taskId);
+        if (!task) {
+          const fresh = await refresh();
+          task = fresh ? findTaskById(fresh, taskId) : null;
+        }
+        if (!task) return;
+        if (task.pipelineParentId) openPipelineStep(task.pipelineParentId, task.id);
+        else openTask(task);
+      } catch {
+        // Best-effort, like the `open_task` handler: no-op on a fetch failure.
+      }
+    })();
+  }, [refresh, openPipelineStep, openTask]);
+  /** The ONE place a native-menu action (and ⌘,) runs in the webview. A modal
+   *  dialog owns the screen, so the action is a no-op while one is open (the
+   *  same reason a click on the bar is blocked by its overlay). Every action is
+   *  an idempotent "open", never a toggle, so a ⌘, that reaches both the page
+   *  and the native menu cannot flip anything back. */
+  const runMenuAction = useCallback((action: AppMenuAction) => {
+    if (document.querySelector(MENU_ACTION_BLOCKING_LAYERS)) return;
+    setAppBarDismissNonce((n) => n + 1);
+    switch (action) {
+      case "settings":
+        openSettings();
+        break;
+      case "pipelines":
+        openPipelinesPage();
+        break;
+      case "worktrees":
+        setWorktreesOpen(true);
+        break;
+      case "git":
+        setGithubOpen(true);
+        break;
+      case "import-sessions":
+        setImportSessionsOpen(true);
+        break;
+    }
+  }, [openSettings, openPipelinesPage]);
+  runMenuActionRef.current = runMenuAction;
+  // ⌘, (Ctrl+, off macOS) opens Settings from anywhere in the page. The native
+  // menu item carries the same accelerator; both paths end in `runMenuAction`.
+  useEffect(() => {
+    const isMac = isMacPlatform();
+    const onKey = (e: KeyboardEvent) => {
+      if (!isSettingsShortcut(e, isMac)) return;
+      // A modal layer owns the keyboard: leave the chord alone.
+      if (document.querySelector(MENU_ACTION_BLOCKING_LAYERS)) return;
+      e.preventDefault();
+      runMenuAction("settings");
+    };
+    document.addEventListener("keydown", onKey);
+    return () => document.removeEventListener("keydown", onKey);
+  }, [runMenuAction]);
   const onFocusNewTask = useCallback(() => {
     setNewTaskFocusNonce((n) => n + 1);
   }, []);
@@ -2088,12 +2209,36 @@ function AppInner() {
     setError(e instanceof Error ? e.message : String(e));
   }, []);
 
+  // `data-board-drag` on <body> while a card is held: the run panel's document
+  // Escape handler leaves the key to dnd-kit's cancel instead of also closing.
+  //
+  // dnd-kit's `RestoreFocus` re-focuses the card after any keyboard drag that
+  // ends with focus elsewhere, which would undo a cancel caused by a press
+  // elsewhere or focus moving on (Cmd/Ctrl+F to the board search). Such a
+  // cancel comes from `cancelBoardDrag` and turns the restore off in the same
+  // batched update that ends the drag; Escape and Tab keep it on, so a card
+  // that remounted under the same id while held gets focus back. The next drag
+  // turns it back on: a drop into another column remounts the card, and that
+  // one needs the restore.
+  const [restoreFocus, setRestoreFocus] = useState(true);
+  const onDragStart = useCallback(() => {
+    setBoardDragging(true);
+    setRestoreFocus(true);
+  }, []);
+  const onDragCancel = useCallback(() => {
+    setBoardDragging(false);
+    setRestoreFocus(!isBoardCancelInProgress());
+  }, []);
   const onDragEnd = useCallback(async (e: DragEndEvent) => {
+    setBoardDragging(false);
     const id = String(e.active.id);
     const col = e.over?.id as ColumnId | undefined;
     if (!col) return;
     const t = tasksRef.current.find((x) => x.id === id);
     if (!t || t.column === col) return;
+    // Re-read: the task may have been archived while the card was held, and an
+    // archived task never moves columns (its card can't be dragged).
+    if (t.archivedAt != null) return;
     // A pipeline PARENT's column mirrors its run while that run is in
     // progress (the server 409s any other column patch). Once the run
     // status is `done`, dropping the card on Done is the same park the
@@ -2113,6 +2258,18 @@ function AppInner() {
       await refresh();
     }
   }, [refresh, surfaceError]);
+
+  // Live-region wording for a keyboard drag: task titles and column labels,
+  // never dnd-kit's default of the draggable id (a task UUID). Lookups read
+  // `tasksRef`, so this is built once and `DndContext`'s props stay stable.
+  const boardAccessibility = useMemo(() => ({
+    announcements: makeBoardAnnouncements(
+      (id) => tasksRef.current.find((t) => t.id === id)?.title ?? "",
+      (id) => COLUMNS.find((c) => c.id === id)?.label ?? "",
+    ),
+    screenReaderInstructions: { draggable: BOARD_SCREEN_READER_INSTRUCTIONS },
+    restoreFocus,
+  }), [restoreFocus]);
 
   // `startTask` materializes the worktree, which can re-pin the branch when a
   // create-time uniqueness race is only detectable once the branch actually
@@ -2170,6 +2327,24 @@ function AppInner() {
       surfaceError(e);
     }
   }, [surfaceError, refresh]);
+  // Stop from the board: the card's Stop button and the task menu's Stop both
+  // come through here, so stopping a pipeline PARENT always asks first (its
+  // Stop cancels live steps and dismisses a pending review). Every other
+  // task keeps the one-click Stop. `TaskCard` has no stop logic of its own.
+  const stopFromBoard = useCallback((t: Task) => {
+    if (!t.pipelineId) {
+      void cancel(t);
+      return;
+    }
+    void confirm({
+      title: "Stop this pipeline?",
+      description: "Live steps will be cancelled and the pending review dismissed. History is kept.",
+      confirmLabel: "Stop",
+      variant: "destructive",
+    }).then((ok) => {
+      if (ok) void cancel(t);
+    });
+  }, [cancel, confirm]);
   const markDone = useCallback(async (t: Task) => {
     setTasks((cur) => cur.map((x) => (x.id === t.id ? { ...x, column: "done" } : x)));
     try {
@@ -2538,7 +2713,7 @@ const runTaskMenuAction = useCallback((action: TaskMenuAction, snapshot: Task, r
         void start(t);
         break;
       case "stop":
-        void cancel(t);
+        stopFromBoard(t);
         break;
       case "resume-recovery":
         void api.resumeFxRecovery(t.id).catch((e: unknown) => {
@@ -2632,7 +2807,7 @@ const runTaskMenuAction = useCallback((action: TaskMenuAction, snapshot: Task, r
         return exhaustive;
       }
     }
-  }, [start, cancel, markDone, archive, unarchive, openInFinder, viewPullRequest, viewIssue, markRead, markUnread, copyToClipboard, del, openPipelineRun, reviewPipelineFromBoard]);
+  }, [start, stopFromBoard, markDone, archive, unarchive, openInFinder, viewPullRequest, viewIssue, markRead, markUnread, copyToClipboard, del, openPipelineRun, reviewPipelineFromBoard]);
 
   // Maps `buildTaskContextMenu`'s pure entries onto the primitive's
   // `ContextMenuItem[]`, inserting a separator whenever the group changes
@@ -2704,139 +2879,29 @@ const runTaskMenuAction = useCallback((action: TaskMenuAction, snapshot: Task, r
 
   return (
     <div className="flex h-screen w-screen flex-col bg-background text-foreground">
-      {/* Top app bar sits on the same row as the macOS traffic lights (see
-          titleBarStyle: "hiddenInset" in src/bun/index.ts). `pl-20` clears the
-          traffic-light cluster (≈64px wide + the 8px x-offset configured on
-          the BrowserWindow). The bar itself is a drag region; the icon + h1
-          inside have no click handlers, but if one is ever added the target
-          must be wrapped in `electrobun-webkit-app-region-no-drag` or the
-          mousedown will be swallowed by the window-move handler. */}
-      {/* Double-click zooms the window — Electrobun's drag-region preload
-          fires startWindowMove on mousedown but doesn't preventDefault, so
-          React's synthesized dblclick still arrives. Guard against zooming
-          when the click originates on a no-drag child (Settings, agent
-          badges) to match AppKit's title-bar behavior — clicking a control
-          there shouldn't zoom. */}
-      <header
-        className="electrobun-webkit-app-region-drag flex h-10 shrink-0 items-center justify-between border-b border-border/60 pl-20 pr-4"
-        onDoubleClick={(e) => {
-          if ((e.target as Element).closest(".electrobun-webkit-app-region-no-drag")) return;
-          void api.toggleWindowZoom().catch(() => {});
-        }}
-      >
-        <div className="flex items-center gap-3">
-          <div className="flex items-center gap-2">
-            <img src={iconUrl} alt="" className="block size-7 shrink-0 -translate-y-0.5 object-contain" />
-            <h1 className="font-geist text-base font-semibold leading-none tracking-tight">Agetor</h1>
-          </div>
-          <div className="electrobun-webkit-app-region-no-drag flex items-center gap-2 text-xs text-muted-foreground">
-            {visibleTopbarAgents(agents, harnesses).map((a) => {
-              const harness = harnesses.find((h) => h.id === a.harnessId);
-              const displayName = harness?.label ?? a.harnessId;
-              const q = usage[a.harnessId];
-              const loggedOut = a.available && a.loggedIn === false;
-              const dot = (
-                <span
-                  className={
-                    "inline-block size-1.5 rounded-full " +
-                    (!a.available ? "bg-danger-solid" : loggedOut ? "bg-warning-solid" : "bg-success-solid")
-                  }
-                />
-              );
-              // Every chip is clickable: with a snapshot the popover shows
-              // meters; without one it explains WHY there's no data (kind
-              // unsupported / first poll pending) instead of silently
-              // rendering a bare chip — "no bar and no explanation" reads as
-              // broken.
-              const kindSupported = (USAGE_SUPPORTED_KINDS as readonly string[]).includes(a.kind);
-              const placeholder = !kindSupported
-                ? { message: "Usage tracking isn't supported for this harness yet.", canRefresh: false }
-                : { message: "No usage data yet — the first poll runs shortly, or refresh now.", canRefresh: true };
-              const chip = (
-                <span
-                  className="flex items-center gap-1"
-                  title={loggedOut ? (a.authHelp ?? "Not logged in") : (a.reason ?? a.path ?? "")}
-                >
-                  <AgentIcon kind={a.kind} className="size-3" />
-                  {displayName}
-                  {q && <UsageMeter quota={q} />}
-                  {dot}
-                </span>
-              );
-              return (
-                <UsagePopover
-                  key={a.harnessId}
-                  quota={q ?? null}
-                  harnessLabel={displayName}
-                  placeholder={placeholder}
-                  onRefresh={async () => {
-                    const fresh = await api.refreshHarnessUsage(a.harnessId);
-                    setUsage((prev) => ({ ...prev, [fresh.harnessId]: fresh }));
-                  }}
-                >
-                  {chip}
-                </UsagePopover>
-              );
-            })}
-          </div>
-        </div>
-        <div className="electrobun-webkit-app-region-no-drag flex items-center gap-2">
-          <span className="text-xs text-muted-foreground">
-            {/* m4: counted over `nonStepTasks`, not raw `tasks` — a hidden
-                pipeline step must not inflate the total. */}
-            {visibleTasks.length === nonStepTasks.length
-              ? `${nonStepTasks.length} tasks`
-              : `${visibleTasks.length} of ${nonStepTasks.length} tasks`}
-          </span>
-          <Button
-            variant="ghost"
-            size="icon"
-            onClick={() => setGithubOpen(true)}
-            aria-label="Git"
-            title="Git pull requests and issues (GitHub, GitLab, Bitbucket)"
-          >
-            <GitPullRequest className="size-4" />
-          </Button>
-          <Button
-            variant="ghost"
-            size="icon"
-            onClick={() => setImportSessionsOpen(true)}
-            aria-label="Import Claude Code sessions and OpenCode sessions"
-            title="Import Claude Code sessions and OpenCode sessions"
-            data-testid="import-claude-sessions-open"
-          >
-            <Import className="size-4" />
-          </Button>
-          <Button
-            variant="ghost"
-            size="icon"
-            onClick={() => setWorktreesOpen(true)}
-            aria-label="Worktrees"
-            title="Worktrees"
-          >
-            <FolderGit2 className="size-4" />
-          </Button>
-          <Button
-            variant={view.kind === "pipelines" || view.kind === "pipeline-run" ? "secondary" : "ghost"}
-            size="icon"
-            data-testid="pipelines-button"
-            onClick={openPipelinesPage}
-            aria-label="Pipelines"
-            title="Pipelines"
-          >
-            <Workflow className="size-4" />
-          </Button>
-          <Button
-            variant="ghost"
-            size="icon"
-            onClick={() => setSettingsOpen(true)}
-            aria-label="Settings"
-            title="Settings"
-          >
-            <Settings className="size-4" />
-          </Button>
-        </div>
-      </header>
+      {/* The window app bar (components/app-bar/AppBar.tsx): logo, the
+          Harnesses button and panel, and the actions. Its layout, drag
+          regions, zoom pinning and collapse ladder are documented there and
+          in docs/architecture/app-bar.md. */}
+      <AppBar
+        agents={agents}
+        harnesses={harnesses}
+        stacks={harnessStacks}
+        limitStates={harnessLimitStates}
+        usage={usage}
+        tasks={tasks}
+        pipelinesActive={view.kind === "pipelines" || view.kind === "pipeline-run"}
+        dismissNonce={appBarDismissNonce}
+        onOpenGit={openGitDialog}
+        onOpenImportSessions={openImportSessions}
+        onOpenWorktrees={openWorktrees}
+        onOpenPipelines={openPipelinesPage}
+        onOpenSettings={openSettings}
+        onOpenHarnessSettings={openSettingsHarnesses}
+        onOpenStackHistory={openStackHistory}
+        onOpenFailoverTask={openFailoverTask}
+        onRefreshUsage={refreshHarnessUsage}
+      />
       <div className="flex min-h-0 flex-1">
         <NewTaskForm
         stacks={harnessStacks}
@@ -2939,6 +3004,9 @@ const runTaskMenuAction = useCallback((action: TaskMenuAction, snapshot: Task, r
                   projects={projects}
                   harnesses={harnesses}
                   taskAgentIds={taskAgentIds}
+                  // m4: counted over `nonStepTasks`, not raw `tasks` — a hidden
+                  // pipeline step must not inflate the total.
+                  taskCount={{ visible: visibleTasks.length, total: nonStepTasks.length }}
                 />
                 {/* Kanban gets all remaining vertical space and scrolls horizontally
                     on its own — the bottom bar stays anchored regardless of column
@@ -2955,7 +3023,7 @@ const runTaskMenuAction = useCallback((action: TaskMenuAction, snapshot: Task, r
                     className="kanban-scroll absolute inset-0 overflow-x-scroll"
                     onScroll={(e) => saveBoardScroll(e.currentTarget.scrollLeft, e.currentTarget.scrollTop)}
                   >
-                    <DndContext sensors={sensors} onDragEnd={onDragEnd}>
+                    <DndContext sensors={sensors} onDragStart={onDragStart} onDragEnd={onDragEnd} onDragCancel={onDragCancel} accessibility={boardAccessibility}>
                       <div className="flex gap-3 p-4">
                         {visibleColumns.map((c) => (
                           <Column
@@ -2967,18 +3035,15 @@ const runTaskMenuAction = useCallback((action: TaskMenuAction, snapshot: Task, r
                             stacks={harnessStacks}
                             limitStates={harnessLimitStates}
                             onStart={start}
-                            onCancel={cancel}
-                            onDelete={del}
+                            onCancel={stopFromBoard}
                             onOpen={openTaskFromBoard}
                             onOpenAttention={openAttention}
                             onReviewPipeline={reviewPipelineFromBoard}
-                            onDiff={setDiffTask}
                             onMarkDone={markDone}
-                            onArchive={archive}
-                            onUnarchive={unarchive}
                             emptyHint={onboardingVisibility.showChecklist ? EMPTY_COLUMN_HINT[c.id] : undefined}
                             selectedTaskId={selected?.id ?? null}
                             onContextMenu={openTaskMenu}
+                            menuTaskId={taskMenu?.task.id ?? null}
                           />
                         ))}
                       </div>
@@ -3220,6 +3285,7 @@ const runTaskMenuAction = useCallback((action: TaskMenuAction, snapshot: Task, r
           // on General instead of wherever onboarding last sent it.
           setSettingsInitialSection(undefined);
           setSettingsInitialAgentId(null);
+          setSettingsInitialStackHistoryId(null);
           // Reflects a "Show getting started guide" replay (General section
           // writes the pref server-side, then calls this same onClose) —
           // simplest correct option without threading a dedicated callback
@@ -3236,6 +3302,7 @@ const runTaskMenuAction = useCallback((action: TaskMenuAction, snapshot: Task, r
         dataDir={dataDir}
         initialSection={settingsInitialSection}
         initialAgentProfileId={settingsInitialAgentId}
+        initialStackHistoryId={settingsInitialStackHistoryId}
         onOpenPipelines={onSettingsOpenPipelines}
       />
       <TmuxInstallDialog

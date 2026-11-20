@@ -1,0 +1,7 @@
+# claude 2.1.326 · binary (background sessions bar: chrome hint, NOT a modal footer)
+● Done. The tests pass.
+
+────────────────────────────────────────────────────────────────────────────────
+❯ 
+────────────────────────────────────────────────────────────────────────────────
+  1 background session · enter to return · space to reply
