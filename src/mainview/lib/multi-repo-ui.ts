@@ -239,7 +239,6 @@ export function resolveConflictsKey(multiRepo: boolean, activeRepoName: string |
 // the first one had just opened PRs for, and GitHub's 422 showed as a failure.
 
 const runningBatches = new Set<string>();
-const stampedByBatch = new Map<string, Set<string>>();
 const batchListeners = new Set<() => void>();
 
 function notifyBatches(): void {
@@ -272,32 +271,31 @@ export function endPrBatch(taskId: string): void {
   if (runningBatches.delete(taskId)) notifyBatches();
 }
 
-/** Records that a batch opened a PR for this repository of the task. */
-export function markRepositoryPrOpened(taskId: string, repoName: string): void {
-  let set = stampedByBatch.get(taskId);
-  if (!set) {
-    set = new Set();
-    stampedByBatch.set(taskId, set);
-  }
-  set.add(repoName);
-}
+const openedHeadsByTask = new Map<string, Set<string>>();
+
+const headKey = (repoName: string, head: string) => `${repoName}\u0000${head}`;
 
 /**
- * The repositories a "Create all PRs" press may target: no `prUrl` on the
- * row, and not opened by an earlier batch this session whose stamp the board
- * poll hasn't delivered yet.
+ * Records that a batch opened a PR from this head of this repository, so a press
+ * before the board poll delivers the stamp can't open it twice (docs/architecture/run-panel.md).
  */
-export function repositoriesForPrBatch<T extends { name: string; prUrl: string | null }>(
-  taskId: string,
-  repos: readonly T[],
-): T[] {
-  const opened = stampedByBatch.get(taskId);
-  return repos.filter((r) => !r.prUrl && !opened?.has(r.name));
+export function markPrOpened(taskId: string, repoName: string, head: string): void {
+  let set = openedHeadsByTask.get(taskId);
+  if (!set) {
+    set = new Set();
+    openedHeadsByTask.set(taskId, set);
+  }
+  set.add(headKey(repoName, head));
+}
+
+/** True when a batch this session opened a PR from this (task, repository, head). */
+export function prOpenedInSession(taskId: string, repoName: string, head: string): boolean {
+  return openedHeadsByTask.get(taskId)?.has(headKey(repoName, head)) ?? false;
 }
 
 /** Test seam: forget every batch. */
 export function resetPrBatchesForTest(): void {
   runningBatches.clear();
-  stampedByBatch.clear();
+  openedHeadsByTask.clear();
   notifyBatches();
 }

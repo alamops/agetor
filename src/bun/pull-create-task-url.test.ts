@@ -82,19 +82,47 @@ function fakeTask(overrides: Partial<Task> & { workdir: string }): Task {
 
 /* ── Case 6: db round-trip for tasks.prUrl (migration 030 + column mapping) ── */
 
-test("db round-trip: tasks.update persists prUrl and tasks.get re-reads it", async () => {
+test("db round-trip: tasks.appendPr persists a PR, tasks.get re-reads it, and the generic update never writes it", async () => {
   const { tasks } = await import("./db.ts");
   const dir = mkdtempSync(path.join(tmpdir(), "agetor-pr-url-db-"));
   const inserted = tasks.insert(fakeTask({ workdir: dir, prUrl: null }));
   expect(inserted.prUrl).toBeNull();
+  expect(inserted.prs).toEqual([]);
 
-  const updated = tasks.update(inserted.id, { prUrl: "https://github.com/o/r/pull/1" });
-  expect(updated?.prUrl).toBe("https://github.com/o/r/pull/1");
+  const entry = { url: "https://github.com/o/r/pull/1", head: "feature/x", base: "main", number: 1, createdAt: 5 };
+  const appended = tasks.appendPr(inserted.id, entry);
+  expect(appended?.prUrl).toBe("https://github.com/o/r/pull/1");
+  expect(appended?.prs).toEqual([entry]);
 
-  // Re-read via a fresh `get` (not just the `update` return value) so the
-  // round-trip actually exercises the `pr_url` column read path in `toTask`.
-  const reread = tasks.get(inserted.id);
-  expect(reread?.prUrl).toBe("https://github.com/o/r/pull/1");
+  // Re-read via a fresh `get` (not just the `appendPr` return value) so the
+  // round-trip actually exercises the `prs` column read path in `toTask`.
+  expect(tasks.get(inserted.id)?.prs).toEqual([entry]);
+
+  // The generic SET clause skips `prs`/`prUrl`/`baseBranch`: a patch can't drop or forge one.
+  const patched = tasks.update(inserted.id, { prUrl: "https://forged", prs: [], baseBranch: "evil", title: "renamed" });
+  expect(patched?.title).toBe("renamed");
+  expect(patched?.prs).toEqual([entry]);
+  expect(patched?.prUrl).toBe("https://github.com/o/r/pull/1");
+  expect(patched?.baseBranch).toBeNull();
+});
+
+test("PATCH /tasks/:id ignores prs, baseBranch and prUrl (server-managed)", async () => {
+  const { tasks } = await import("./db.ts");
+  const dir = mkdtempSync(path.join(tmpdir(), "agetor-pr-url-patch-"));
+  const task = tasks.insert(fakeTask({ workdir: dir, prUrl: null }));
+  const entry = { url: "https://github.com/o/r/pull/1", head: "feature/x", base: "main", number: 1, createdAt: 5 };
+  tasks.appendPr(task.id, entry);
+  const res = await realFetch(url(`/tasks/${task.id}`), {
+    method: "PATCH",
+    headers: { authorization: `Bearer ${token}`, "content-type": "application/json" },
+    body: JSON.stringify({ title: "patched", prs: [], baseBranch: "evil", prUrl: "https://forged" }),
+  });
+  expect(res.status).toBe(200);
+  const got = tasks.get(task.id)!;
+  expect(got.title).toBe("patched");
+  expect(got.prs).toEqual([entry]);
+  expect(got.baseBranch).toBeNull();
+  expect(got.prUrl).toBe(entry.url);
 });
 
 /* ── Cases 7-9: POST /github/pull-create with/without taskId ────────────── */
@@ -156,6 +184,9 @@ test("POST /github/pull-create with a valid taskId persists the created PR's htm
 
   const reread = tasks.get(task.id);
   expect(reread?.prUrl).toBe("https://github.com/o/r/pull/42");
+  expect(reread?.prs).toMatchObject([
+    { url: "https://github.com/o/r/pull/42", head: "feature/x", base: "main", number: 42 },
+  ]);
 });
 
 test("POST /github/pull-create with an unknown taskId still succeeds (200/ok) without crashing", async () => {
@@ -261,7 +292,7 @@ test("GET /tasks/:id/git-status reports ignored+no-upstream for a non-git workdi
   });
 });
 
-test("pull-create guards: archived task, mismatched workdir, and existing prUrl are never stamped", async () => {
+test("pull-create guards: archived task and mismatched workdir are never stamped; a task that already has a PR gets another appended", async () => {
   const { tasks } = await import("./db.ts");
   const repoDir = await makeGitHubRepo("o", "rg");
   const otherDir = await makeGitHubRepo("o", "rg2");
@@ -297,10 +328,17 @@ test("pull-create guards: archived task, mismatched workdir, and existing prUrl 
 
   expect(tasks.get(archived.id)?.prUrl).toBeNull();
   expect(tasks.get(elsewhere.id)?.prUrl).toBeNull();
+  // Append-only: a task that already has a PR gains another (one per head), and keeps the first as `prUrl`.
   expect(tasks.get(already.id)?.prUrl).toBe("https://github.com/o/rg/pull/1");
+  expect(tasks.get(already.id)?.prs?.map((p) => p.url)).toEqual([
+    "https://github.com/o/rg/pull/1",
+    "https://github.com/o/rg/pull/99",
+  ]);
+  expect(tasks.get(archived.id)?.prs).toEqual([]);
+  expect(tasks.get(elsewhere.id)?.prs).toEqual([]);
 });
 
-test("pull-create stamps only the matching multi-repository entry, first write wins, task.prUrl stays null", async () => {
+test("pull-create stamps only the matching multi-repository entry, appending each PR; task.prUrl stays null", async () => {
   const { tasks } = await import("./db.ts");
   const frontendDir = await makeGitHubRepo("o", "fe");
   const backendDir = await makeGitHubRepo("o", "be");
@@ -343,11 +381,20 @@ test("pull-create stamps only the matching multi-repository entry, first write w
   expect(reread.repositories?.find((r) => r.name === "backend")?.prUrl).toBe("https://github.com/o/be/pull/5");
   expect(reread.repositories?.find((r) => r.name === "frontend")?.prUrl).toBeNull();
 
-  // A second create for the same repository returns a DIFFERENT url; the
-  // first stamp must survive (a last-write-wins regression would land #6).
+  // A second create for the same repository (another PR) APPENDS: the first
+  // stays first (the derived `prUrl`), the second joins it.
   await create(backendDir, "https://github.com/o/be/pull/6");
   reread = tasks.get(task.id)!;
   expect(reread.repositories?.find((r) => r.name === "backend")?.prUrl).toBe("https://github.com/o/be/pull/5");
+  expect(reread.repositories?.find((r) => r.name === "backend")?.prs?.map((p) => p.url)).toEqual([
+    "https://github.com/o/be/pull/5",
+    "https://github.com/o/be/pull/6",
+  ]);
+  expect(reread.repositories?.find((r) => r.name === "backend")?.prs?.[0]).toMatchObject({
+    head: "feature/multi",
+    base: "main",
+    number: 42,
+  });
   expect(reread.repositories?.find((r) => r.name === "frontend")?.prUrl).toBeNull();
   expect(reread.prUrl).toBeNull();
 
@@ -357,4 +404,42 @@ test("pull-create stamps only the matching multi-repository entry, first write w
   expect(reread.repositories?.find((r) => r.name === "frontend")?.prUrl).toBeNull();
   expect(reread.repositories?.find((r) => r.name === "backend")?.prUrl).toBe("https://github.com/o/be/pull/5");
   expect(reread.prUrl).toBeNull();
+});
+
+test("pull-create stamps a single-repo task when the PR is opened from its worktree with trimmed head/base, and a repeated URL is recorded once", async () => {
+  const { tasks } = await import("./db.ts");
+  const sourceDir = await makeGitHubRepo("o", "wt-src");
+  const worktreeDir = await makeGitHubRepo("o", "wt-src");
+  const task = tasks.insert(
+    fakeTask({ workdir: sourceDir, isolation: "worktree", worktreePath: worktreeDir, branch: "feature/wt" }),
+  );
+
+  const create = async (htmlUrl: string) => {
+    fetchMock = mockPullCreateRoute(htmlUrl);
+    try {
+      const res = await realFetch(url("/github/pull-create"), {
+        method: "POST",
+        headers: { authorization: `Bearer ${token}`, "content-type": "application/json" },
+        // Padded names: the record stores what the forge was sent (trimmed),
+        // so the live head `feature/wt` matches it.
+        body: JSON.stringify({ path: worktreeDir, title: "From worktree", head: " feature/wt ", base: "develop\n", taskId: task.id }),
+      });
+      expect(res.status).toBe(200);
+    } finally {
+      fetchMock.restore();
+      fetchMock = null;
+    }
+  };
+
+  await create("https://github.com/o/wt-src/pull/42");
+  let reread = tasks.get(task.id)!;
+  expect(reread.prs).toMatchObject([
+    { url: "https://github.com/o/wt-src/pull/42", head: "feature/wt", base: "develop", number: 42 },
+  ]);
+  expect(reread.prUrl).toBe("https://github.com/o/wt-src/pull/42");
+
+  // The forge answering with the same PR again (a retried create) appends nothing.
+  await create("https://github.com/o/wt-src/pull/42");
+  reread = tasks.get(task.id)!;
+  expect(reread.prs?.map((p) => p.url)).toEqual(["https://github.com/o/wt-src/pull/42"]);
 });

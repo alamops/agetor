@@ -41,6 +41,38 @@ export function placeContextMenu(input: PlaceContextMenuInput): { top: number; l
   return { top, left };
 }
 
+export interface PlaceSubmenuInput {
+  /** The parent item's bounding rect, viewport coordinates. */
+  anchor: { top: number; left: number; right: number; bottom: number };
+  /** Measured submenu panel size. */
+  width: number;
+  height: number;
+  viewportWidth: number;
+  viewportHeight: number;
+  /** Minimum gap kept between the panel and every viewport edge. Default 8. */
+  margin?: number;
+}
+
+/**
+ * Positions a submenu beside its parent item: opening to the right of the
+ * item's rect, flipping to its left when that would overflow the viewport,
+ * then clamping into the margin on both axes. Top-aligned with the item so the
+ * child reads as hanging off it (the same place-then-clamp strategy as
+ * {@link placeContextMenu}).
+ */
+export function placeSubmenu(input: PlaceSubmenuInput): { top: number; left: number } {
+  const { anchor, width, height, viewportWidth, viewportHeight } = input;
+  const margin = input.margin ?? 8;
+
+  let left = anchor.right;
+  if (anchor.right + width > viewportWidth - margin) left = anchor.left - width;
+
+  const clamp = (v: number, lo: number, hi: number) => Math.min(Math.max(v, lo), Math.max(lo, hi));
+  left = clamp(left, margin, viewportWidth - width - margin);
+  const top = clamp(anchor.top, margin, viewportHeight - height - margin);
+  return { top, left };
+}
+
 /**
  * Roving-focus step for the menu's ArrowUp/ArrowDown handling: advance from
  * `current` by `delta`, wrapping around the ends, and skipping any index

@@ -3572,6 +3572,17 @@ test("a multi-repository pipeline runs its step in the parent's workspace and se
   if ("error" in created) throw new Error(created.error);
   const parentId = created.task.id;
   liveParentIds.push(parentId);
+  // A PR the parent already opened must not become the step's: the step's
+  // per-repository history starts empty, like its scalar `prs`.
+  const parentPrUrl = "https://github.com/acme/a/pull/7";
+  const stamped = tasks.appendRepositoryPr(parentId, created.task.repositories![0]!.name, {
+    url: parentPrUrl,
+    head: "feature/x",
+    base: "main",
+    number: 7,
+    createdAt: Date.now(),
+  });
+  expect(stamped?.repositories?.[0]?.prs?.map((p) => p.url)).toEqual([parentPrUrl]);
 
   const started = await startTask(parentId);
   if ("error" in started) throw new Error(started.error);
@@ -3582,6 +3593,7 @@ test("a multi-repository pipeline runs its step in the parent's workspace and se
   }, 15000);
   const parent = tasks.get(parentId)!;
   const workspace = parent.worktreePath!;
+  expect(parent.repositories?.[0]?.prs?.map((p) => p.url)).toEqual([parentPrUrl]);
   expect(finished.worktreePath).toBe(workspace);
   expect(parent.repositories).toHaveLength(2);
 
@@ -3590,6 +3602,11 @@ test("a multi-repository pipeline runs its step in the parent's workspace and se
   // private `<WORKTREES>/<step-id>` checkout.
   expect(step.worktreePath).toBe(workspace);
   expect(step.repositories?.map((r) => r.worktreePath)).toEqual(parent.repositories!.map((r) => r.worktreePath));
+  // The step targets the same bases and starts with no PRs of its own.
+  expect(step.repositories?.map((r) => r.baseBranch)).toEqual(parent.repositories!.map((r) => r.baseBranch));
+  expect(step.prs).toEqual([]);
+  expect(step.repositories?.map((r) => r.prs)).toEqual([[], []]);
+  expect(step.repositories?.map((r) => r.prUrl ?? null)).toEqual([null, null]);
 
   const names = uniqueRepoSlugs([a, b]);
   expect(existsSync(path.join(workspace, names[0]!, ".git"))).toBe(true);
@@ -3602,6 +3619,40 @@ test("a multi-repository pipeline runs its step in the parent's workspace and se
   expect(spawn).toContain(`- ${names[0]}: ${path.join(workspace, names[0]!)} (branch `);
   expect(spawn).toContain(`- ${names[1]}: ${path.join(workspace, names[1]!)} (branch `);
 
+  await waitUntilIdle(parentId);
+});
+
+test("a single-repository pipeline step copies the parent's base branch and starts with no PRs", async () => {
+  const { createTask, startTask } = await import("./orchestrator.ts");
+  const { tasks, pipelines } = await import("./db.ts");
+  const { newStep } = await import("../shared/pipeline.ts");
+  const { FAKE_CLAUDE_HANDOFF_PROMPT_MARKER } = await import("./agents.ts");
+
+  const repo = await makeRepo();
+  const profile = await makeProfile("base-branch-copy");
+  const A = newStep({ name: "A", agentProfileId: profile.id, instructions: `Do A. ${FAKE_CLAUDE_HANDOFF_PROMPT_MARKER}:done` });
+  const graph = { steps: [A], edges: [], startStepId: A.id };
+  const pipeline = pipelines.insert({ name: uniqueName("base-branch-pipeline"), graph, maxSteps: 25 });
+  const created = await createTask({
+    title: "base copy",
+    prompt: "goal",
+    workdir: repo,
+    isolation: "worktree",
+    baseRef: "main",
+    pipelineId: pipeline.id,
+  });
+  if ("error" in created) throw new Error(created.error);
+  const parentId = created.task.id;
+  liveParentIds.push(parentId);
+  expect(created.task.baseBranch).toBe("main");
+
+  const started = await startTask(parentId);
+  if ("error" in started) throw new Error(started.error);
+  await waitFor(() => (tasks.get(parentId)?.pipelineRun?.status === "done" ? true : undefined), 15000);
+
+  const step = tasks.stepsForParent(parentId)[0]!;
+  expect(step.baseBranch).toBe("main");
+  expect(step.prs).toEqual([]);
   await waitUntilIdle(parentId);
 });
 

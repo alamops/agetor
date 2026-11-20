@@ -1,0 +1,101 @@
+{
+  "version": 1,
+  "formId": "create-all-prs-title-and-base-grill-r3",
+  "title": "Grill round 3: replacing prUrl with a list, and Create all PRs on single-repo tasks",
+  "round": 3,
+  "mode": "served",
+  "specFile": "questions.json",
+  "specSha256": "0f2f62e1dd5c859fd372983e2381def922eae4e69729235cc0258adfee30e7f1",
+  "submittedAt": "2026-11-17T14:44:24.001Z",
+  "receivedAt": "2026-11-17T14:44:24.014Z",
+  "answeredBy": null,
+  "summary": {
+    "total": 7,
+    "answered": 7,
+    "skipped": 0,
+    "unanswered": 0,
+    "optionalLeftBlank": 0,
+    "notApplicable": 0,
+    "acceptedRecommendations": 6,
+    "overrodeRecommendations": [
+      "task-json-field"
+    ],
+    "oneWayDoorsNotAnswered": [],
+    "withNotes": [],
+    "needsAnswer": [],
+    "complete": true
+  },
+  "answers": {
+    "pr-url-column": {
+      "n": 1,
+      "title": "Migration 092 copies each single-repo task's `pr_url` into the new list. What happens to the old `tasks.pr_url` column?",
+      "type": "single",
+      "status": "answered",
+      "oneWayDoor": true,
+      "impact": "blocking",
+      "value": "keep-unused",
+      "display": "Keep the column, stop reading and writing it",
+      "acceptedRecommendation": true
+    },
+    "task-json-field": {
+      "n": 2,
+      "title": "The Task JSON (`GET /tasks`, `agetor ls --json`): what happens to the `prUrl` field?",
+      "type": "single",
+      "status": "answered",
+      "oneWayDoor": true,
+      "impact": "blocking",
+      "value": "deprecated-derived",
+      "display": "Add `prs`; keep `prUrl` as a deprecated, derived read-only field (the first PR's URL), never read by agetor itself",
+      "acceptedRecommendation": false,
+      "recommended": "remove"
+    },
+    "pr-entry-shape": {
+      "n": 3,
+      "title": "Shape of one PR entry",
+      "type": "confirm",
+      "status": "answered",
+      "impact": "shape",
+      "value": "`{ url: string, head: string, base: string, number: number | null, createdAt: number }`, in creation order. A repository's (or single-repo task's) **live-head PR** is the one whose `head` matches its branch, not just the first item.",
+      "acceptedRecommendation": true
+    },
+    "single-repo-trigger": {
+      "n": 4,
+      "title": "On a single-repo task, when does Create all PRs appear?",
+      "type": "single",
+      "status": "answered",
+      "impact": "shape",
+      "value": "two-heads",
+      "display": "When the newest matching proposals name **two or more distinct heads** that don't have a PR yet; shown next to the existing Create PR chip",
+      "acceptedRecommendation": true
+    },
+    "view-pr-many": {
+      "n": 5,
+      "title": "\"View PR\" (run panel link, task card, right-click menu) when a task or repository has several PRs?",
+      "type": "single",
+      "status": "answered",
+      "impact": "shape",
+      "value": "list-all",
+      "display": "List them all: the run panel shows each `head → base` link; the context menu gets one \"View PR: <head>\" item per PR (a submenu past 3)",
+      "acceptedRecommendation": true
+    },
+    "c-server-managed": {
+      "n": 6,
+      "title": "Server-managed rules for the new columns",
+      "type": "confirm",
+      "status": "answered",
+      "impact": "minor",
+      "value": "`tasks.base_branch` and `tasks.prs` are server-managed (not in `ALLOWED_PATCH_FIELDS`, skipped by the generic SET, never bump `updated_at`, written by targeted UPDATEs). Both go in migration 092, and the CLAUDE.md list is updated.",
+      "acceptedRecommendation": true
+    },
+    "c-pipeline-step": {
+      "n": 7,
+      "title": "Pipeline steps",
+      "type": "confirm",
+      "status": "answered",
+      "impact": "minor",
+      "value": "A new step's task-level `prs` starts empty (as `prUrl: null` does today, `pipeline-runner.ts:1441`). Its `baseBranch` is copied from the parent like `baseRef` (`:1434`). Its `repositories[]`, each entry's `prs` and `baseBranch` included, are copied from the parent as they are today (`:1437`).",
+      "acceptedRecommendation": true
+    }
+  },
+  "generalNotes": null
+}
