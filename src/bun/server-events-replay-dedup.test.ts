@@ -124,3 +124,116 @@ test("a row committed during the replay read is sent once, whether its live send
   expect(frames.filter((f) => f.data.stream === "interaction")).toHaveLength(1);
   expect(before.id).toBeLessThan(raced[0]!.id!);
 });
+
+function newRun(): { taskId: string; runId: string } {
+  const taskId = randomUUID();
+  const runId = randomUUID();
+  dbm.tasks.insert(makeTaskRow(taskId));
+  dbm.runs.insert({
+    id: runId, taskId, agent: "claude-code", status: "running", startedAt: Date.now(), endedAt: null, exitCode: null,
+    tmuxSession: null, claudeSessionId: null, codexSessionId: null, cursorSessionId: null, geminiSessionId: null, fxSessionId: null,
+  });
+  return { taskId, runId };
+}
+
+/** Connect to the task stream and collect saved frames until the live-only sentinel arrives. */
+async function collectSaved(taskId: string, cursor?: number): Promise<RunEvent[]> {
+  const ctrl = new AbortController();
+  const out: RunEvent[] = [];
+  try {
+    const headers: Record<string, string> = { authorization: `Bearer ${token}` };
+    if (cursor !== undefined) headers["last-event-id"] = String(cursor);
+    const res = await fetch(`${BASE}/tasks/${taskId}/events`, { signal: ctrl.signal, headers });
+    const reader = res.body!.getReader();
+    const dec = new TextDecoder();
+    let buf = "";
+    const deadline = Date.now() + 10_000;
+    let seenSentinel = false;
+    while (!seenSentinel) {
+      if (Date.now() > deadline) throw new Error(`timed out; frames: ${JSON.stringify(out).slice(0, 600)}`);
+      const r = await reader.read();
+      if (r.done) break;
+      buf += dec.decode(r.value, { stream: true });
+      let i: number;
+      while ((i = buf.indexOf("\n\n")) >= 0) {
+        const block = buf.slice(0, i);
+        buf = buf.slice(i + 2);
+        const lines = block.split("\n");
+        const dataLine = lines.find((l) => l.startsWith("data:"));
+        if (!dataLine || lines.some((l) => l.startsWith("event:"))) continue;
+        const ev = JSON.parse(dataLine.slice(5).trim()) as RunEvent;
+        if (ev.stream === "interaction") seenSentinel = true;
+        else if (typeof ev.id === "number") out.push(ev);
+      }
+    }
+  } finally {
+    ctrl.abort();
+  }
+  return out;
+}
+
+/** Rewrite a saved row in place and build its live frame, as the OpenCode mapper does. */
+function rewrite(taskId: string, runId: string, id: number, data: string): RunEvent {
+  dbm.runs.replaceEventData(id, data);
+  return { id, runId, taskId, stream: "assistant", data, ts: Date.now(), subagentId: null };
+}
+
+const sentinel = (taskId: string, runId: string) =>
+  setTimeout(() => orchestrator.emitRunEvent({ runId, taskId, stream: "interaction", data: "{}", ts: Date.now() }), 50);
+
+test("an in-place rewrite of a replayed row reaches the client, on a fresh connect and on a resume", async () => {
+  for (const mode of ["fresh", "resume"] as const) {
+    const { taskId, runId } = newRun();
+    const row = commit(taskId, runId, "generic name");
+    const cursor = mode === "resume" ? row.id! - 1 : undefined;
+    const real = dbm.runs.eventsForTask.bind(dbm.runs);
+    const realAfter = dbm.runs.eventsForTaskAfter.bind(dbm.runs);
+    const sendRewrite = () => {
+      // The replay read already holds the old data; the rewrite lands after it.
+      orchestrator.emitRunEvent(rewrite(taskId, runId, row.id!, "real name"));
+      sentinel(taskId, runId);
+    };
+    const spy = spyOn(dbm.runs, "eventsForTask").mockImplementation((...args: Parameters<typeof real>) => {
+      const out = real(...args);
+      if (args[0] === taskId) void Promise.resolve(out).then(sendRewrite);
+      return out;
+    });
+    const spyAfter = spyOn(dbm.runs, "eventsForTaskAfter").mockImplementation((...args: Parameters<typeof realAfter>) => {
+      const out = realAfter(...args);
+      if (args[0] === taskId) void Promise.resolve(out).then(sendRewrite);
+      return out;
+    });
+    let frames: RunEvent[];
+    try {
+      frames = await collectSaved(taskId, cursor);
+    } finally {
+      spy.mockRestore();
+      spyAfter.mockRestore();
+    }
+    expect(frames.map((f) => f.data)).toEqual(["generic name", "real name"]);
+    expect(frames.every((f) => f.id === row.id)).toBe(true);
+  }
+});
+
+test("a live duplicate of a replayed row (same id, same data) is still dropped", async () => {
+  const { taskId, runId } = newRun();
+  const row = commit(taskId, runId, "once");
+  const real = dbm.runs.eventsForTask.bind(dbm.runs);
+  const spy = spyOn(dbm.runs, "eventsForTask").mockImplementation((...args: Parameters<typeof real>) => {
+    const out = real(...args);
+    if (args[0] === taskId) {
+      void Promise.resolve(out).then(() => {
+        orchestrator.emitRunEvent(row); // the same frame, same data
+        sentinel(taskId, runId);
+      });
+    }
+    return out;
+  });
+  let frames: RunEvent[];
+  try {
+    frames = await collectSaved(taskId);
+  } finally {
+    spy.mockRestore();
+  }
+  expect(frames.map((f) => f.data)).toEqual(["once"]);
+});

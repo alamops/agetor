@@ -57,7 +57,7 @@ import {
   runArchivedHistoryRetentionPass,
 } from "./retention.ts";
 import { advancePipeline, cancelPipelineRun, isPipelineStepTask, retryPipelineStep, reviewHumanStep, startPipelineRun } from "./pipeline-runner.ts";
-import { approvePlan, effectiveContent, planSlug } from "./task-plans.ts";
+import { effectiveContent, planSlug } from "./task-plans.ts";
 import { checkAllHarnesses } from "./agent-status.ts";
 import { claudeJsonDirFor, effectiveHome, expandHomePath, harnessStacks, StackChangedError, StackInputError, validateInput as validateStackInput } from "./harness-stacks.ts";
 import { claudeConfigDirFor } from "./harness-config-root.ts";
@@ -8684,8 +8684,8 @@ export function startApiServer(
       // kind / plan-pending / runId / worktree-presence, all read from ONE
       // fresh `task` snapshot) → write (plan file to disk) → flip (an unbound
       // plan-mode task to auto; reverted if the send below doesn't deliver)
-      // → send (the approval message into the live session) → persist (`approvePlan` +
-      // `tasks.update`, still against that same snapshot) → release the claim
+      // → send (the approval message into the live session) → persist (`server.approvePlan`,
+      // one worker transaction that re-reads `plans`) → release the claim
       // in `finally`. See the finding-by-finding notes below for why each
       // step is where it is.
       "/tasks/:id/plans/:planId/approve": {
@@ -8715,8 +8715,8 @@ export function startApiServer(
             // `approvalsInFlight` claim above only serializes concurrent
             // *approves* of this plan; it doesn't need to also block a
             // concurrent PATCH, because PATCH never touches `status`, so
-            // `approvePlan`'s pending-check below still holds against this
-            // snapshot even if a PATCH races in.)
+            // the op's pending-check below still holds against the fresh
+            // row even if a PATCH races in.)
             const task = await tasks.get(req.params.id);
             if (!task) return json({ error: "not found" }, { status: 404, headers: corsHeaders(req) });
 
@@ -8863,17 +8863,20 @@ export function startApiServer(
             // The message is now delivered and cannot be un-sent — every
             // branch from here on must report `messageSent: true` so the
             // webview knows not to let the user retry the approve action
-            // (a retry would double-send). `approvePlan` re-validates
-            // `status === "pending"` against the same snapshot captured
-            // above, so a `null` result here is a defensive check for an
-            // in-memory-shape surprise rather than a real race — the
-            // `approvalsInFlight` claim already rules out a concurrent
-            // approve of this exact plan.
-            const result = approvePlan(task.plans, req.params.planId, {
-              now: Date.now(),
-              filePath: relPath,
-            });
-            if (!result) {
+            // (a retry would double-send). The flip runs in ONE worker
+            // transaction that re-reads `plans` and changes only this plan, so a
+            // plan detected, edited or reverted during the send is kept.
+            // `approvedEdited` still comes from the snapshot above (the version
+            // whose text was sent), which is what the snapshot comment guards.
+            // `not-pending` is now a real race (the plan was superseded or
+            // reverted during the send); the `approvalsInFlight` claim only rules
+            // out a concurrent approve of this exact plan.
+            const outcome = await dbOp("server.approvePlan", [
+              req.params.id,
+              req.params.planId,
+              { now: Date.now(), filePath: relPath, approvedEdited: edited },
+            ]);
+            if (outcome === "not-pending") {
               return json(
                 {
                   error:
@@ -8884,8 +8887,7 @@ export function startApiServer(
                 { status: 409, headers: corsHeaders(req) },
               );
             }
-            const updated = await tasks.update(req.params.id, { plans: result.plans });
-            if (!updated) {
+            if (outcome === "missing") {
               return json(
                 {
                   error: "approval message was sent, but the task could not be found to persist it",
@@ -8894,6 +8896,7 @@ export function startApiServer(
                 { status: 404, headers: corsHeaders(req) },
               );
             }
+            const updated = outcome;
             // `warning` is additive on the Task payload (a bound plan-mode
             // task that keeps Plan); every other approve answers the plain
             // Task as before.
@@ -9815,12 +9818,23 @@ export function startApiServer(
             // wait in `buffer`. A saved row committed before that read is in
             // the replay, and its live send may land either in the buffer or
             // after it is drained, so every saved row at or below the last id
-            // the replay covered (`replayedThrough`) is dropped as a duplicate.
+            // the replay covered (`replayedThrough`) is dropped as a duplicate
+            // ONLY when the replay sent that very row with that very data
+            // (`replayedHashes`: id -> data hash, one number per replayed row, so
+            // memory stays bounded by the replay window). OpenCode rewrites a
+            // tool_use row in place and re-broadcasts it under the same id with
+            // new data; that frame differs from what the replay sent (or the row
+            // is at or below a resume cursor and was never replayed), so it goes
+            // through, and the client replaces the row by id.
             // Live-only frames (no id) always go through.
             let buffer: RunEvent[] | null = [];
             let replayedThrough = 0;
+            const replayedHashes = new Map<number, number | bigint>();
             const sendLive = (e: RunEvent) => {
-              if (typeof e.id === "number" && e.id <= replayedThrough) return;
+              if (typeof e.id === "number" && e.id <= replayedThrough) {
+                const sent = replayedHashes.get(e.id);
+                if (sent !== undefined && sent === Bun.hash(e.data)) return;
+              }
               send(e);
             };
             const unsubscribe = subscribe((e) => {
@@ -9936,7 +9950,10 @@ export function startApiServer(
               return;
             }
             if (cleanedUp) return;
-            for (const ev of replay) replayedThrough = Math.max(replayedThrough, ev.id);
+            for (const ev of replay) {
+              replayedThrough = Math.max(replayedThrough, ev.id);
+              replayedHashes.set(ev.id, Bun.hash(ev.data));
+            }
             sendNamed(TASK_EVENTS_REPLAY_META_EVENT, meta);
             for (const ev of replay) {
               send({

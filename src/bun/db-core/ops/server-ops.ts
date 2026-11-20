@@ -1,4 +1,4 @@
-import { setEditedContent } from "../../task-plans.ts";
+import { approvePlan, setEditedContent } from "../../task-plans.ts";
 import { defineOp } from "./define.ts";
 
 // Read-check-write units of the HTTP routes (`src/bun/server.ts`) that were
@@ -33,6 +33,29 @@ export const serverOps = {
       if (!next) return "not-pending";
       modules.tasks.update(taskId, { plans: next });
       return "ok";
+    },
+  }),
+  /** `POST /tasks/:id/plans/:planId/approve`, the persist step after the
+   *  approval message was delivered: re-read `plans` and flip only the target
+   *  plan to approved, in one transaction, so a plan detected, edited or
+   *  reverted during the (slow) send is never overwritten by a stale array.
+   *  `approvedEdited` comes from the caller's snapshot, the version whose text
+   *  was actually sent. Returns the updated task, `"missing"` when it is gone,
+   *  `"not-pending"` when the plan is no longer pending (or no longer exists). */
+  "server.approvePlan": defineOp({
+    tx: true,
+    run: (
+      { modules },
+      taskId: string,
+      planId: string,
+      opts: { now: number; filePath: string | null; approvedEdited: boolean },
+    ) => {
+      const task = modules.tasks.get(taskId);
+      if (!task) return "missing" as const;
+      const result = approvePlan(task.plans, planId, { now: opts.now, filePath: opts.filePath });
+      if (!result) return "not-pending" as const;
+      const plans = result.plans.map((p) => (p.id === planId ? { ...p, approvedEdited: opts.approvedEdited } : p));
+      return modules.tasks.update(taskId, { plans }) ?? ("missing" as const);
     },
   }),
 };
