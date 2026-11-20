@@ -64,7 +64,7 @@ import { WelcomeDialog } from "@/components/onboarding/WelcomeDialog";
 import { OnboardingChecklist } from "@/components/onboarding/OnboardingChecklist";
 import type { UpdateSnapshot } from "@/lib/api";
 import { useConfirm } from "@/components/ui/confirm";
-import { BOARD_KEYBOARD_CODES, BOARD_SCREEN_READER_INSTRUCTIONS, boardKeyboardCoordinates, makeBoardAnnouncements, setBoardDragging } from "@/lib/board-keyboard";
+import { BOARD_KEYBOARD_CODES, BOARD_SCREEN_READER_INSTRUCTIONS, boardKeyboardCoordinates, isBoardCancelInProgress, makeBoardAnnouncements, setBoardDragging } from "@/lib/board-keyboard";
 import { toast } from "sonner";
 import { Toaster } from "@/components/ui/sonner";
 import { dismissPending, dismissTaskToast, hasPendingToast, notifyFilesSent, notifyWaitingInput, toastApiError, toastError, toastFxAutoResumeExhausted, toastFxAutoResumeFired, toastHarnessExhausted, toastHarnessSwap, toastHarnessUnusable, toastPending, toastPipelineReview, toastSendFailed, toastSessionEnded, toastSuccess, toastUnknownCommand, type ToastArgs } from "@/lib/toasts";
@@ -2100,10 +2100,13 @@ function AppInner() {
   // Escape handler leaves the key to dnd-kit's cancel instead of also closing.
   //
   // dnd-kit's `RestoreFocus` re-focuses the card after any keyboard drag that
-  // ends with focus elsewhere, which would undo a cancel caused by focus moving
-  // on (Cmd/Ctrl+F to the board search). A cancel turns it off in the
-  // same batched update that ends the drag, and the next drag turns it back on:
-  // a drop into another column remounts the card, and that one needs the restore.
+  // ends with focus elsewhere, which would undo a cancel caused by a press
+  // elsewhere or focus moving on (Cmd/Ctrl+F to the board search). Such a
+  // cancel comes from `cancelBoardDrag` and turns the restore off in the same
+  // batched update that ends the drag; Escape and Tab keep it on, so a card
+  // that remounted under the same id while held gets focus back. The next drag
+  // turns it back on: a drop into another column remounts the card, and that
+  // one needs the restore.
   const [restoreFocus, setRestoreFocus] = useState(true);
   const onDragStart = useCallback(() => {
     setBoardDragging(true);
@@ -2111,7 +2114,7 @@ function AppInner() {
   }, []);
   const onDragCancel = useCallback(() => {
     setBoardDragging(false);
-    setRestoreFocus(false);
+    setRestoreFocus(!isBoardCancelInProgress());
   }, []);
   const onDragEnd = useCallback(async (e: DragEndEvent) => {
     setBoardDragging(false);
@@ -2120,6 +2123,9 @@ function AppInner() {
     if (!col) return;
     const t = tasksRef.current.find((x) => x.id === id);
     if (!t || t.column === col) return;
+    // Re-read: the task may have been archived while the card was held, and an
+    // archived task never moves columns (its card can't be dragged).
+    if (t.archivedAt != null) return;
     // A pipeline PARENT's column mirrors its run while that run is in
     // progress (the server 409s any other column patch). Once the run
     // status is `done`, dropping the card on Done is the same park the

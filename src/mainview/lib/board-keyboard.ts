@@ -22,13 +22,29 @@ export const BOARD_KEYBOARD_CODES = {
   end: ["Space"],
 };
 
+let cancellingFromBoard = false;
+
 /** Cancels the keyboard drag in progress, if any: dnd-kit's document keydown
  *  listener takes the private cancel code like a key. No drag, no listener,
  *  no effect. */
 export function cancelBoardDrag(doc: Document = document): void {
   const view = doc.defaultView;
   if (!view) return;
-  doc.dispatchEvent(new view.KeyboardEvent("keydown", { code: BOARD_CANCEL_CODE, key: BOARD_CANCEL_CODE, bubbles: true }));
+  cancellingFromBoard = true;
+  try {
+    doc.dispatchEvent(new view.KeyboardEvent("keydown", { code: BOARD_CANCEL_CODE, key: BOARD_CANCEL_CODE, bubbles: true }));
+  } finally {
+    cancellingFromBoard = false;
+  }
+}
+
+/** True only while `cancelBoardDrag`'s own keydown is being handled. dnd-kit
+ *  calls `onDragCancel` synchronously from that keydown, so App can tell a
+ *  cancel caused by a press elsewhere or focus leaving the card (leave focus
+ *  where it went) from Escape or Tab (focus goes back to the card, or to the
+ *  card that replaced it under the same id). */
+export function isBoardCancelInProgress(): boolean {
+  return cancellingFromBoard;
 }
 
 /** Cancels the drag when the held task's card is gone from the board: its

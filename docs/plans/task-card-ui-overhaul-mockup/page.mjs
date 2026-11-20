@@ -1,8 +1,9 @@
 import { readFileSync, writeFileSync, existsSync } from "node:fs";
+import { fileURLToPath } from "node:url";
 import { STATES } from "./states.mjs";
 import { renderA, renderB, renderC, renderC1, renderC2, renderToday } from "./render.mjs";
 
-const here = new URL(".", import.meta.url).pathname;
+const here = fileURLToPath(new URL(".", import.meta.url));
 const css = existsSync(here + "out.css") ? readFileSync(here + "out.css", "utf8") : "";
 const checker = readFileSync(here + "checker.js", "utf8");
 const results = existsSync(here + "results.json") ? JSON.parse(readFileSync(here + "results.json", "utf8")) : null;

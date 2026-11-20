@@ -6,6 +6,7 @@ import {
   boardKeyboardCoordinates,
   cancelBoardDrag,
   cancelBoardDragIfGone,
+  isBoardCancelInProgress,
   handleCardKeyDown,
   isOutsideCard,
   BOARD_DRAG_SELECTOR,
@@ -122,9 +123,10 @@ describe("keyboard codes", () => {
 });
 
 describe("makeBoardAnnouncements", () => {
+  const COLUMN_LABELS: Record<string, string> = { ready: "Ready", review: "Review" };
   const ann = makeBoardAnnouncements(
     (id) => (id === "uuid-1" ? "Fix login" : ""),
-    (id) => ({ ready: "Ready", review: "Review" })[id] ?? "",
+    (id) => COLUMN_LABELS[id] ?? "",
   );
   const active = { id: "uuid-1" } as never;
 
@@ -218,6 +220,25 @@ describe("leaving a held card", () => {
     expect(seen[0]!.init.code).toBe(BOARD_CANCEL_CODE);
     // A document with no window (detached) is a no-op, not a throw.
     cancelBoardDrag({ defaultView: null } as unknown as Document);
+  });
+
+  test("isBoardCancelInProgress is true only while cancelBoardDrag's keydown is handled", () => {
+    const during: boolean[] = [];
+    class FakeKeyboardEvent {
+      constructor(public type: string, public init: Record<string, unknown>) {}
+    }
+    const doc = {
+      defaultView: { KeyboardEvent: FakeKeyboardEvent },
+      dispatchEvent: () => { during.push(isBoardCancelInProgress()); return true; },
+    } as unknown as Document;
+    expect(isBoardCancelInProgress()).toBe(false);
+    cancelBoardDrag(doc);
+    expect(during).toEqual([true]);
+    expect(isBoardCancelInProgress()).toBe(false);
+    // A listener that throws still leaves the flag cleared for the next cancel.
+    const throwing = { ...doc, dispatchEvent: () => { throw new Error("listener"); } } as unknown as Document;
+    expect(() => cancelBoardDrag(throwing)).toThrow("listener");
+    expect(isBoardCancelInProgress()).toBe(false);
   });
 
   test("cancelBoardDragIfGone cancels only when no card carries the held task's id", () => {

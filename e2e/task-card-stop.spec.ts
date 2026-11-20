@@ -58,7 +58,9 @@ const runningPipeline = (): PipelineRunState => ({
 
 /** The board reads `id`'s row with `patch` merged in. */
 async function mergeRow(page: Page, backend: E2EBackend, id: string, patch: Partial<Task>): Promise<void> {
-  await page.route(`${backend.apiBase}/tasks`, async (route) => {
+  // The board poll adds `?archived=exclude&keep=…` (core-responsiveness.md),
+  // so match the list path with or without a query.
+  await page.route((u) => u.href.split("?")[0] === `${backend.apiBase}/tasks`, async (route) => {
     if (route.request().method() !== "GET") return route.continue();
     const response = await route.fetch();
     const rows = (await response.json()) as Task[];

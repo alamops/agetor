@@ -323,7 +323,9 @@ test("a pipeline parent moved by keyboard keeps its column and says why", async 
   const task = await createTask(request, backend, title);
   // Fixture: the board reads this task as a pipeline parent. The refusal is
   // client-side (App's onDragEnd), so no real pipeline run is needed.
-  await page.route(`${backend.apiBase}/tasks`, async (route) => {
+  // The board poll adds `?archived=exclude&keep=…` (core-responsiveness.md),
+  // so match the list path with or without a query.
+  await page.route((u) => u.href.split("?")[0] === `${backend.apiBase}/tasks`, async (route) => {
     if (route.request().method() !== "GET") return route.continue();
     const response = await route.fetch();
     const rows = (await response.json()) as { id: string }[];

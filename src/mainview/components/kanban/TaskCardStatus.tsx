@@ -19,7 +19,9 @@ import { StackBadge } from "./StackBadge";
  * agent: the profile is per step, so only the model and mode remain.
  */
 export function TaskCardIdentity({ task }: { task: Task }) {
-  const isPipeline = task.pipelineRun != null;
+  // `pipelineId`, not `pipelineRun`: a pipeline parent that has never run has
+  // no run yet, and still names no agent (as `taskActionFlags` decides).
+  const isPipeline = task.pipelineId != null;
   const kind = task.agentProfile?.harnessKind ?? asAgentKind(task.agent);
   const name = isPipeline ? null : (task.agentProfile?.name ?? task.agent);
   const detail = [task.model ? modelDisplayName(kind, task.model) : null, task.mode].filter(Boolean).join(" · ");

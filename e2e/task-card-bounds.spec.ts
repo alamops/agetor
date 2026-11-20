@@ -33,6 +33,12 @@ import type { PipelineRunState, PipelineStepRecord, Task } from "../src/shared/t
 
 test.describe.configure({ mode: "serial" });
 
+// The board polls `GET /tasks` every 2 s, so a merge handler can be mid-fetch
+// when the test ends; closing the page under it hangs the context teardown.
+test.afterEach(async ({ page }) => {
+  await page.unrouteAll({ behavior: "ignoreErrors" });
+});
+
 const LONG_TITLE =
   "Refactor src/mainview/components/kanban/TaskCard.tsx so the pipeline hat, chips and action row never overflow the narrow card".slice(0, 128);
 const PROFILE_25 = "Exemplars Helper (Cursor)";
@@ -77,6 +83,8 @@ const ALL_COUNTS: Partial<Task> = {
 const STACK = (over: Record<string, unknown> = {}) => ({
   harnessState: { stackId: "stack-x", position: 0, count: 2, tried: [], pendingSwap: null, allExhausted: null, lastMove: null, ...over } as unknown as Task["harnessState"],
 });
+// One unbroken word: the identity line must cut it, never let it run out.
+const PROFILE_UNBROKEN = "ExemplarsHelperCursorProfileWithNoSpacesAnywhereInItsName";
 const PROFILE = { id: "p", name: PROFILE_25, harness: "claude-code", harnessKind: "cursor", harnessLabel: "Cursor", model: MODEL_LONG, effort: null, mode: "auto" } as unknown as Task["agentProfile"];
 
 /** One entry per state: the title it is seeded under, and the fields merged
@@ -84,6 +92,7 @@ const PROFILE = { id: "p", name: PROFILE_25, harness: "claude-code", harnessKind
 const STATES: { key: string; patch: Partial<Task> }[] = [
   { key: "backlog", patch: { title: "Fix login redirect loop", prompt: "The login page sends the user back to itself after a successful sign-in when the session cookie is set on a subdomain.", model: "opus-5.5", mode: "auto", workdir: `${WORKDIR}/web-dashboard`, branch: null, baseRef: "a1b2c3d4" } },
   { key: "ready-worst", patch: { title: LONG_TITLE, taskType: "bug", column: "ready", agentProfile: PROFILE, model: MODEL_LONG, mode: "auto", ...ALL_COUNTS, ...STACK(), workdir: `${WORKDIR}/agetor-companion-mobile-app`, branch: "agetor/1f2e3d4c-refactor-taskcard-so-the-pipeline-hat-chips", checkoutBranch: "main", branchSource: "existing", baseRef: "a1b2c3d4", prompt: "Every child of the card must stay inside the card box in every state, with the longest names we have seen in a real database." } },
+  { key: "identity-unbroken", patch: { title: "Long unbroken profile name", column: "ready", agentProfile: { ...PROFILE!, name: PROFILE_UNBROKEN } as Task["agentProfile"], model: MODEL_LONG, mode: "auto", workdir: `${WORKDIR}/agetor`, branch: "fix/identity-unbroken", baseRef: "a1b2c3d4" } },
   { key: "running", patch: { title: "Spike: can WKWebView lay out the card like Chromium?", taskType: "spike", column: "running", runId: "run-1", hasOpenableRun: true, model: "opus-5.5", mode: "auto", runningSubagents: 3, todoProgress: { completed: 7, total: 12 }, ...STACK({ scheduledSwitch: { requestedAt: 1 }, count: 1 }), workdir: `${WORKDIR}/agetor`, branch: "agetor/9a8b7c6d-spike-wkwebview-layout", baseRef: "a1b2c3d4" } },
   { key: "awaiting", patch: { title: LONG_TITLE, column: "running", pendingInteractionCount: 12, unread: true, agentProfile: PROFILE, model: MODEL_LONG, mode: "auto", ...ALL_COUNTS, ...STACK({ position: 1 }), workdir: `${WORKDIR}/agetor`, branch: "fix/agetor-card-ui-improvement", baseRef: "a1b2c3d4", prompt: "The agent asked twelve questions about the layout contract and is waiting for your answers before it continues." } },
   // An awaiting task in Review: Answer (N) + Done + `⋯` share the 233 px row.
@@ -117,7 +126,9 @@ async function seed(request: import("@playwright/test").APIRequestContext, backe
 
 async function mergeFixtures(page: Page, backend: E2EBackend, byId: Map<string, string>): Promise<void> {
   const patches = new Map(STATES.map((s) => [s.key, s.patch]));
-  await page.route(`${backend.apiBase}/tasks`, async (route) => {
+  // The board poll adds `?archived=exclude&keep=…` (core-responsiveness.md),
+  // so match the list path with or without a query.
+  await page.route((u) => u.href.split("?")[0] === `${backend.apiBase}/tasks`, async (route) => {
     if (route.request().method() !== "GET") return route.continue();
     const response = await route.fetch();
     const rows = (await response.json()) as Task[];
@@ -135,6 +146,27 @@ function report(results: CardCheckResult[], byId: Map<string, string>): string {
     .map((r) => `[${r.theme}] ${byId.get(r.taskId) ?? r.taskId}:\n  - ${r.fails.join("\n  - ")}`)
     .join("\n");
 }
+
+// The checker itself: a long unbroken identity name whose text runs out of its
+// block must fail, even though every element box fits; the same name in a
+// `truncate` span (clipped by design) must pass.
+test("the checker flags text that overflows its block, not text a truncate span clips", async ({ page }) => {
+  const card = (key: string, identityClass: string) =>
+    `<div class="cursor-grab" data-task-id="${key}" style="width:233px;padding:8px;overflow:hidden;background:#fff;color:#111;font:11px/16px system-ui">` +
+    `<div data-part="identity" style="${identityClass}">${PROFILE_UNBROKEN}</div></div>`;
+  await page.setContent(
+    `<!doctype html><html><body style="margin:0;background:#fff"><div style="width:260px">` +
+      card("spill", "") +
+      card("clipped", "overflow:hidden;text-overflow:ellipsis;white-space:nowrap") +
+      `</div></body></html>`,
+  );
+  const results = await page.evaluate(checkBoardCards);
+  const spill = results.find((r) => r.taskId === "spill")!;
+  const clipped = results.find((r) => r.taskId === "clipped")!;
+  expect(spill.fails.join("\n")).toContain("text outside the card");
+  expect(spill.fails.join("\n")).toContain("text spills out of its row");
+  expect(clipped.fails).toEqual([]);
+});
 
 for (const theme of ["light", "dark"] as const) {
   test(`every card state stays inside its card — ${theme}`, async ({ page, request, backend, browserName }, testInfo) => {

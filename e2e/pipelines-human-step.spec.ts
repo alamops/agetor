@@ -133,7 +133,11 @@ test("stop at a gate: card moves to Ready, the gate section is gone, history kep
   await startTaskRest(backend, task.id);
   await gateRow(backend, task.id);
 
-  await page.locator(`[data-task-id="${task.id}"]`).getByTestId("task-card-more").click();
+  // gateRow reads the backend; wait for the board's 2 s poll to show the gate
+  // too, so the menu is built from the gated card.
+  const card = page.locator(`[data-task-id="${task.id}"]`);
+  await expect(card.getByTestId("task-card-pipeline-review")).toBeVisible();
+  await card.getByTestId("task-card-more").click();
   await page.getByTestId("task-context-menu").getByRole("menuitem", { name: "Stop" }).click();
   // App's `stopFromBoard` confirms for a pipeline parent, from the menu too.
   const dialog = page.getByRole("dialog").last();

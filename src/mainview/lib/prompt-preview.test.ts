@@ -22,6 +22,28 @@ describe("promptPreview", () => {
     expect(promptPreview("<!-- note to self -->\n---\n***\n\nReal ask.")).toBe("Real ask.");
   });
 
+  test("a fence closes only on the same character, a run at least as long, and nothing after it", () => {
+    // A longer opener holds a ``` line, as when a prompt quotes a code block.
+    expect(promptPreview("````md\n```\ninner\n```\n````\n\nAfter the long fence.")).toBe("After the long fence.");
+    // A ~~~ line does not close a ``` fence, nor ``` a ~~~ one.
+    expect(promptPreview("```\n~~~\nhidden\n```\n\nAfter.")).toBe("After.");
+    expect(promptPreview("~~~\n```\nhidden\n~~~\n\nAfter.")).toBe("After.");
+    // A line with text after the run is not a closer.
+    expect(promptPreview("```\n```js still code\n```\n\nAfter.")).toBe("After.");
+    // The fallback path (no prose block) scans fences the same way.
+    expect(promptPreview("# Title\n````\n```\nhidden\n```\n````")).toBe("Title");
+  });
+
+  test("HTML comments: each complete one goes, an unclosed opener keeps the rest", () => {
+    expect(promptPreview("A <!-- one --> and <!-- two --> B.")).toBe("A and B.");
+    expect(promptPreview("Keep <!-- this open")).toBe("Keep <!-- this open");
+    // Many unclosed openers stay linear: a lazy regex retried per opener was quadratic.
+    const t0 = performance.now();
+    const out = promptPreview("Ask. " + "<!-- ".repeat(100_000));
+    expect(performance.now() - t0).toBeLessThan(1_000);
+    expect(out.startsWith("Ask. <!--")).toBe(true);
+  });
+
   test("image → alt, inline code → text, list marker and quote marker stripped", () => {
     expect(promptPreview("![diagram](a.png) shows `foo()`")).toBe("diagram shows foo()");
     expect(promptPreview("- first item\n- second item")).toBe("first item second item");

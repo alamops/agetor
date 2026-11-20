@@ -341,6 +341,19 @@ describe("TaskCard identity line", () => {
     expect(m).not.toContain("<svg");
   });
 
+  test("a pipeline parent that has never run (no pipelineRun yet) still names no agent", () => {
+    const m = identity(makeTask({ pipelineId: "p1", pipelineRun: null }));
+    expect(m).toContain('title="Opus 5.5 · auto"');
+    expect(m).not.toContain("claude-code");
+    expect(m).not.toContain("<svg");
+  });
+
+  test("an ordinary task (no pipelineId) still names its agent", () => {
+    const m = identity(makeTask({ pipelineId: null, pipelineRun: null }));
+    expect(m).toContain('title="claude-code · Opus 5.5 · auto"');
+    expect(m).toContain("<svg");
+  });
+
   test("a pipeline parent with no model or mode renders no identity line at all", () => {
     expect(identity(makeTask({ pipelineId: "p1", pipelineRun: pipelineRun(), model: null, mode: null }))).toBe("");
   });

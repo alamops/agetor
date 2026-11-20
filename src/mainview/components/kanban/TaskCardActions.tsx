@@ -114,6 +114,9 @@ export function TaskCardActions({ task, menuOpen, onStart, onCancel, onOpen, onO
             const skip = closedByPress.current && e.detail > 0;
             closedByPress.current = false;
             if (skip) return;
+            // WebKit (the app's WKWebView) doesn't focus a button on click, and
+            // the menu returns focus to whatever had it when it opened.
+            e.currentTarget.focus({ preventScroll: true });
             const r = e.currentTarget.getBoundingClientRect();
             onMore(task, { x: r.left, y: r.bottom + 4 });
           }}

@@ -11,6 +11,10 @@
  *   1. every descendant stays inside the card box (clip-aware, so text a
  *      `truncate` span hides by design is not counted as spilling);
  *   2. every child stays inside its parent's row horizontally;
+ *   2b. every text run stays inside the card and its row: an element's box can
+ *      fit while unbroken text spills past it (`overflow: visible`), so the
+ *      text's own line boxes (`Range.getClientRects`) are measured, clipped by
+ *      every clipping ancestor so a `truncate` span still passes;
  *   3. no two flex/grid siblings overlap;
  *   3b. no text is squeezed below 24 px wide;
  *   4. `[data-must-not-truncate]` text (pipeline name, progress, title) is not cut;
@@ -92,15 +96,15 @@ export function checkBoardCards(): CardCheckResult[] {
     const col = card.parentElement!;
     const els = [...card.querySelectorAll("*")].filter((e) => !e.closest(EXEMPT)) as HTMLElement[];
 
-    // The part of an element that is visible: clipped by every ancestor (up to
-    // the card) whose overflow is not visible.
-    function visibleRect(e: Element) {
-      const r = e.getBoundingClientRect();
+    // The part of an element (or a text run's line box) that is visible:
+    // clipped by every ancestor, from `from` up to the card, whose overflow is
+    // not visible.
+    function visibleRect(e: Element, r: { left: number; top: number; right: number; bottom: number } = e.getBoundingClientRect(), from: Element | null = e.parentElement) {
       let l = r.left;
       let t = r.top;
       let rt = r.right;
       let b = r.bottom;
-      for (let n = e.parentElement; n && n !== card; n = n.parentElement) {
+      for (let n = from; n && n !== card; n = n.parentElement) {
         const cs = getComputedStyle(n);
         const nr = n.getBoundingClientRect();
         if (cs.overflowX !== "visible") { l = Math.max(l, nr.left); rt = Math.min(rt, nr.right); }
@@ -112,7 +116,9 @@ export function checkBoardCards(): CardCheckResult[] {
     // 1. every child inside the card box
     for (const e of els) {
       const r = visibleRect(e);
-      if (r.width === 0 && r.height === 0) continue;
+      // Clipped to nothing in either axis (a span a `truncate` parent hides
+      // whole) is not visible, so it cannot spill.
+      if (r.width === 0 || r.height === 0) continue;
       if (!inside(r, cr)) {
         const dx = Math.max(cr.left - r.left, r.right - cr.right, 0);
         const dy = Math.max(cr.top - r.top, r.bottom - cr.bottom, 0);
@@ -133,6 +139,34 @@ export function checkBoardCards(): CardCheckResult[] {
       if (r.width === 0) continue;
       if (r.left < pr.left - TOL || r.right > pr.right + TOL) {
         fails.push(`spills out of its row by ${Math.round(Math.max(pr.left - r.left, r.right - pr.right))}px: ${describe(e)}`);
+      }
+    }
+    // 2b. every text run inside the card and inside its row. The row is the
+    // nearest ancestor that is not a plain inline box; the run is clipped from
+    // its own parent up, since an element clips its own text.
+    for (const e of [card, ...els]) {
+      for (const n of e.childNodes) {
+        if (n.nodeType !== 3 || !(n.textContent ?? "").trim()) continue;
+        let row: Element = e;
+        while (row !== card && row.parentElement) {
+          const d = getComputedStyle(row).display;
+          if (!(d.startsWith("inline") && !d.includes("flex") && !d.includes("grid") && !d.includes("block"))) break;
+          row = row.parentElement;
+        }
+        const rowR = row.getBoundingClientRect();
+        const range = document.createRange();
+        range.selectNodeContents(n);
+        for (const box of range.getClientRects()) {
+          const v = visibleRect(e, box, e);
+          if (v.width === 0 || v.height === 0) continue;
+          if (!inside(v, cr)) {
+            fails.push(`text outside the card by ${Math.round(Math.max(cr.left - v.left, v.right - cr.right, cr.top - v.top, v.bottom - cr.bottom, 0))}px: ${describe(e)}`);
+          }
+          if (row !== card && (v.left < rowR.left - TOL || v.right > rowR.right + TOL)) {
+            fails.push(`text spills out of its row by ${Math.round(Math.max(rowR.left - v.left, v.right - rowR.right))}px: ${describe(e)}`);
+          }
+        }
+        range.detach();
       }
     }
     // 3. no two flex/grid siblings overlap (the icon-under-the-pill bug)

@@ -120,6 +120,12 @@ function TaskCardImpl({ task, homeDir, stacks = [], limitStates = [], onStart, o
       document.removeEventListener("focusout", leave, true);
     };
   }, [isDragging]);
+  // A held card whose task is archived elsewhere while it stays on the board
+  // (the archive filter shows archived cards) can't be dragged any more:
+  // dnd-kit keeps an active drag even after `disabled` turns on, so end it.
+  useEffect(() => {
+    if (isDragging && archived) cancelBoardDrag();
+  }, [isDragging, archived]);
   // Those listeners leave with the card. If the held task disappears from the
   // board (deleted or archived elsewhere), nothing else would end the drag,
   // and dnd-kit would keep taking Space and the arrows document-wide. A card

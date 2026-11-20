@@ -9,9 +9,10 @@
  *
  * Rules, in order:
  *  1. Drop front matter (a leading `---` … `---` block).
- *  2. Drop code fences (``` and ~~~, through the closing fence; an unclosed
- *     fence drops the rest), HTML comments, headings, horizontal rules and
- *     tables (`|`-led lines).
+ *  2. Drop code fences (a run of three or more ` or ~, through the closing
+ *     fence: the same character, a run at least as long, nothing after it; an
+ *     unclosed fence drops the rest), HTML comments, headings, horizontal
+ *     rules and tables (`|`-led lines).
  *  3. Split what is left on blank lines; the first block is the paragraph.
  *     List items count as prose with their markers stripped.
  *  4. Strip inline syntax (emphasis, inline code, links → text, images → alt,
@@ -24,7 +25,7 @@ export function promptPreview(prompt: string, maxChars = 280): string {
   const text = prompt.replace(/\r\n?/g, "\n");
   if (text.trim() === "") return "";
 
-  const withoutComments = text.replace(/<!--[\s\S]*?-->/g, "\n");
+  const withoutComments = dropHtmlComments(text);
   const lines = dropFrontMatter(withoutComments.split("\n"));
 
   const prose = firstProseBlock(lines);
@@ -105,6 +106,38 @@ function closeOpenSpan(s: string, end: number): number {
   return end;
 }
 
+/** Each complete `<!-- … -->` becomes a newline; an opener with no closer
+ *  leaves the rest as it is. One forward scan: a lazy regex retried from every
+ *  opener is quadratic on a paste full of unclosed `<!--`. */
+function dropHtmlComments(text: string): string {
+  let out = "";
+  let from = 0;
+  for (;;) {
+    const open = text.indexOf("<!--", from);
+    if (open === -1) break;
+    const close = text.indexOf("-->", open + 4);
+    // No closer after this opener means none after any later one either.
+    if (close === -1) break;
+    out += text.slice(from, open) + "\n";
+    from = close + 3;
+  }
+  return out + text.slice(from);
+}
+
+/** A fence opener's marker character and run length (``` or ~~~, three or
+ *  more), or null. */
+function fenceOpen(line: string): { ch: string; len: number } | null {
+  const m = /^\s{0,3}(`{3,}|~{3,})/.exec(line);
+  return m ? { ch: m[1]![0]!, len: m[1]!.length } : null;
+}
+
+/** A closing fence: the opener's character, a run at least as long, and
+ *  nothing but whitespace after it. */
+function closesFence(line: string, fence: { ch: string; len: number }): boolean {
+  const m = /^\s{0,3}(`{3,}|~{3,})\s*$/.exec(line);
+  return !!m && m[1]![0] === fence.ch && m[1]!.length >= fence.len;
+}
+
 function dropFrontMatter(lines: string[]): string[] {
   if (lines[0]?.trim() !== "---") return lines;
   for (let i = 1; i < lines.length; i++) {
@@ -116,14 +149,14 @@ function dropFrontMatter(lines: string[]): string[] {
 /** Lines outside code fences; an unclosed fence swallows the rest. */
 function withoutFences(lines: string[]): string[] {
   const out: string[] = [];
-  let fence: string | null = null;
+  let fence: { ch: string; len: number } | null = null;
   for (const line of lines) {
     if (fence) {
-      if (line.trim().startsWith(fence)) fence = null;
+      if (closesFence(line, fence)) fence = null;
       continue;
     }
-    const open = /^\s{0,3}(```|~~~)/.exec(line);
-    if (open) fence = open[1]!;
+    const open = fenceOpen(line);
+    if (open) fence = open;
     else out.push(line);
   }
   return out;
@@ -134,17 +167,17 @@ const isHeading = (l: string) => /^\s{0,3}#{1,6}(\s|$)/.test(l);
 const isTableLine = (l: string) => /^\s*\|/.test(l) || /^\s*:?-{3,}:?\s*(\|\s*:?-{3,}:?\s*)+\|?\s*$/.test(l);
 
 function firstProseBlock(lines: string[]): string {
-  let fence: string | null = null;
+  let fence: { ch: string; len: number } | null = null;
   let block: string[] = [];
   for (const line of lines) {
     if (fence) {
-      if (line.trim().startsWith(fence)) fence = null;
+      if (closesFence(line, fence)) fence = null;
       continue;
     }
-    const open = /^\s{0,3}(```|~~~)/.exec(line);
+    const open = fenceOpen(line);
     if (open) {
       if (block.length > 0) break;
-      fence = open[1]!;
+      fence = open;
       continue;
     }
     if (line.trim() === "") {
