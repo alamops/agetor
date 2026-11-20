@@ -65,7 +65,7 @@ function userLine(cwd: string, text: string, extra: Record<string, unknown> = {}
 
 const harnessFor = (configDir: string) => [{ id: "claude-code", kind: "claude-code", home: configDir }];
 
-test("a harness env CLAUDE_CONFIG_DIR is the scanned root, not its home", () => {
+test("a harness env CLAUDE_CONFIG_DIR is the scanned root, not its home", async () => {
   const root = home();
   const cwd = path.join(root, "repo-env");
   mkdirSync(cwd, { recursive: true });
@@ -77,7 +77,7 @@ test("a harness env CLAUDE_CONFIG_DIR is the scanned root, not its home", () => 
     cwd,
     lines: [userLine(cwd, "env account")],
   });
-  const dirs = claudeConfigDirsToScan({
+  const dirs = await claudeConfigDirsToScan({
     homeDir: root,
     env: {},
     harnesses: [{
@@ -488,5 +488,31 @@ test("a symlinked projects/ or sessions/ folder is not listed", async () => {
   expect(rows).toEqual([]);
   expect(read).toEqual([]);
   const { readClaudeRegistry } = await import("./claude-session-scan.ts");
-  expect(readClaudeRegistry(config)).toEqual([]);
+  expect(await readClaudeRegistry(config)).toEqual([]);
+});
+
+test("discoverAgetorWorktreeRoots lists only .agetor data dirs that hold agetor.sqlite", async () => {
+  const root = home();
+  for (const name of [".agetor", ".agetor-dev", ".agetor-empty", ".other"]) {
+    mkdirSync(path.join(root, name), { recursive: true });
+  }
+  writeFileSync(path.join(root, ".agetor", "agetor.sqlite"), "");
+  writeFileSync(path.join(root, ".agetor-dev", "agetor.sqlite"), "");
+  writeFileSync(path.join(root, ".other", "agetor.sqlite"), "");
+  const { discoverAgetorWorktreeRoots } = await import("./claude-session-scan.ts");
+  const roots = (await discoverAgetorWorktreeRoots(root)).sort();
+  expect(roots).toEqual([path.join(root, ".agetor", "worktrees"), path.join(root, ".agetor-dev", "worktrees")].sort());
+  expect(await discoverAgetorWorktreeRoots(path.join(root, "missing"))).toEqual([]);
+});
+
+test("claudeConfigDirsToScan finds .claude* dirs under home, de-duplicated, skipping missing ones", async () => {
+  const root = home();
+  mkdirSync(path.join(root, ".claude"), { recursive: true });
+  mkdirSync(path.join(root, ".claude-work"), { recursive: true });
+  const dirs = await claudeConfigDirsToScan({
+    homeDir: root,
+    env: { CLAUDE_CONFIG_DIR: path.join(root, "gone") },
+    harnesses: [],
+  });
+  expect(dirs.sort()).toEqual([path.join(root, ".claude"), path.join(root, ".claude-work")]);
 });

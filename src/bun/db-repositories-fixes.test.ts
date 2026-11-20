@@ -163,8 +163,12 @@ describe("S22: a single-repository row derives its entry through repositoriesFor
     tasks.delete(t.id);
   });
 
-  test("db.ts carries no copy of the derivation", async () => {
-    const src = await Bun.file(new URL("./db.ts", import.meta.url)).text();
+  test("the task store carries no copy of the derivation", async () => {
+    // The tasks module moved from db.ts into db-core/ (docs/plans/non-blocking-core.md, T5):
+    // the row derivation lives in task-parsers.ts, and neither file re-derives a name.
+    const tasksSrc = await Bun.file(new URL("./db-core/tasks.ts", import.meta.url)).text();
+    expect(tasksSrc).not.toContain("repoNameForPath(");
+    const src = await Bun.file(new URL("./db-core/task-parsers.ts", import.meta.url)).text();
     expect(src).toContain("repositoriesForTask(");
     expect(src).not.toContain("repoNameForPath(");
   });

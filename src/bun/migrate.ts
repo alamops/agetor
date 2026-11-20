@@ -36,8 +36,36 @@ export function splitSqlStatements(sql: string): string[] {
   const statements: string[] = [];
   let current = "";
   let i = 0;
+  // CREATE TRIGGER bodies hold `;`-terminated statements between BEGIN and END,
+  // so inside a trigger a `;` only ends the statement at block depth 0. BEGIN
+  // and CASE open a block, END closes one (a `CASE ... END` expression nests).
+  // `isTrigger` caches the "does this statement start with CREATE TRIGGER"
+  // check, which is only evaluated when a BEGIN/CASE/END token shows up.
+  let depth = 0;
+  let isTrigger: boolean | null = null;
+  const isWordChar = (c: string | undefined) => c !== undefined && /[A-Za-z0-9_$]/.test(c);
   while (i < sql.length) {
     const ch = sql[i];
+    if (/[A-Za-z_]/.test(ch!) && !isWordChar(sql[i - 1])) {
+      let end = i + 1;
+      while (end < sql.length && isWordChar(sql[end])) end++;
+      const word = sql.slice(i, end);
+      const upper = word.toUpperCase();
+      if (upper === "BEGIN" || upper === "CASE" || upper === "END") {
+        // A quoted identifier ("end", `end`, [end]) is not a keyword.
+        const quoted = /["`\[]/.test(sql[i - 1] ?? "") && /["`\]]/.test(sql[end] ?? "");
+        if (!quoted) {
+          if (isTrigger === null) {
+            const bare = current.replace(/--[^\n]*/g, "").replace(/\/\*[\s\S]*?\*\//g, "");
+            isTrigger = /^\s*CREATE\s+(?:TEMP(?:ORARY)?\s+)?TRIGGER\b/i.test(bare);
+          }
+          if (isTrigger) depth += upper === "END" ? -1 : 1;
+        }
+      }
+      current += word;
+      i = end;
+      continue;
+    }
     if (ch === "'") {
       // Consume the whole string literal, including any '' escapes, so a
       // semicolon or comment-opener inside it is never mistaken for one.
@@ -68,8 +96,15 @@ export function splitSqlStatements(sql: string): string[] {
       continue;
     }
     if (ch === ";") {
+      if (isTrigger && depth > 0) {
+        current += ch;
+        i++;
+        continue;
+      }
       statements.push(current);
       current = "";
+      depth = 0;
+      isTrigger = null;
       i++;
       continue;
     }

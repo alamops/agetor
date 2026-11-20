@@ -48,14 +48,14 @@ function sessionHome(): string {
   return process.env.HOME || homedir();
 }
 
-export function claudeSessionScanOptions(): ScanClaudeSessionsOptions {
+export async function claudeSessionScanOptions(): Promise<ScanClaudeSessionsOptions> {
   const homeDir = sessionHome();
   return {
     homeDir,
     harnesses: harnesses.list()
       .filter((h) => h.kind === "claude-code")
       .map((h) => ({ id: h.id, kind: h.kind, home: h.home, env: h.env, bin: h.bin })),
-    worktreeRoots: discoverAgetorWorktreeRoots(homeDir),
+    worktreeRoots: await discoverAgetorWorktreeRoots(homeDir),
     ownedSessionIds: hiddenClaudeSessionIds(),
   };
 }
@@ -110,14 +110,14 @@ export async function startClaudeSessionLaunchScan(deps?: {
     // Resume inserts a missing seed run before it returns (that write sits
     // ahead of the transcript read). Ownership for the toast is read after
     // that insert. A snapshot taken before it misses the new run id.
-    await resumeIncompleteImports(claudeSessionScanOptions());
+    await resumeIncompleteImports(await claudeSessionScanOptions());
   } catch (err) {
     console.error("[agetor] claude session import resume failed:", err);
   }
   if (scanOff) return;
   try {
-    const opts = claudeSessionScanOptions();
-    await refreshClaudeSessionLiveness(claudeConfigDirsToScan(opts), process.env, opts.harnesses, opts.homeDir);
+    const opts = await claudeSessionScanOptions();
+    await refreshClaudeSessionLiveness(await claudeConfigDirsToScan(opts), process.env, opts.harnesses, opts.homeDir);
     const scan = deps?.scan ?? scanClaudeSessions;
     const sessions = await scan(opts);
     const known = claudeSessionSeen.ids();

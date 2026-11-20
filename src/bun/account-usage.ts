@@ -1,8 +1,13 @@
-import { closeSync, readdirSync, readSync, statSync } from "node:fs";
+import { close as closeFd, read as readFd } from "node:fs";
+import { readdir, stat } from "node:fs/promises";
+import { promisify } from "node:util";
 import * as path from "node:path";
 import type { AccountUsageSummary, TokenTotals } from "../shared/types.ts";
 import { db } from "./db.ts";
 import { isPlainDirBelow, openReadNoFollow } from "./no-follow.ts";
+
+const readFdAsync = promisify(readFd);
+const closeFdAsync = promisify(closeFd);
 
 /**
  * Local, deterministic per-account token-usage rollups (SDD: "plane A").
@@ -31,14 +36,24 @@ const MIN_SCAN_INTERVAL_MS = 15_000;
 const lastScanAt = new Map<string, number>();
 
 /**
- * Per-pass byte budget. Bun.serve is single-threaded and this scan is
- * synchronous, so an unbounded first pass over a large history (100MB+ of
- * JSONL is normal) would stall every concurrent request for seconds. The
- * budget caps one pass; cursors carry the progress, so the 15s `/harnesses`
- * poll converges on the full history within a few polls and every later
- * pass is just appended bytes. Not a silent cap: `budgetExhausted` reports it.
+ * Per-pass byte budget. Bun.serve is single-threaded, so an unbounded first
+ * pass over a large history (100MB+ of JSONL is normal) would hold every
+ * concurrent request for seconds. The budget caps one pass; cursors carry the
+ * progress, so the 15s `/harnesses` poll converges on the full history within
+ * a few polls and every later pass is just appended bytes. Not a silent cap:
+ * `budgetExhausted` reports it.
  */
 const SCAN_BUDGET_BYTES = 16 * 1024 * 1024;
+
+/** One file read never allocates more than this; a bigger span is read as
+ *  several consecutive slices, each applied (and its cursor persisted) before
+ *  the next is read, with the event loop free in between. */
+const MAX_READ_BYTES = 8 * 1024 * 1024;
+
+/** A single transcript line longer than this is not buffered further: the
+ *  line is dropped (counted as a parse error) and scanning resumes after its
+ *  newline. Real assistant lines are far below it. */
+const MAX_LINE_BYTES = 64 * 1024 * 1024;
 
 export interface ScanResult {
   filesScanned: number;
@@ -144,38 +159,48 @@ export function parseUsageLine(line: string): UsageEvent | { error: true } | nul
   };
 }
 
-function listJsonlFiles(root: string, out: string[] = []): string[] {
+async function listJsonlFiles(root: string, out: string[] = []): Promise<string[]> {
   let entries;
-  try { entries = readdirSync(root, { withFileTypes: true }); }
+  try { entries = await readdir(root, { withFileTypes: true }); }
   catch { return out; }
   for (const e of entries) {
     const p = path.join(root, e.name);
-    if (e.isDirectory()) listJsonlFiles(p, out);
+    if (e.isDirectory()) await listJsonlFiles(p, out);
     else if (e.isFile() && e.name.endsWith(".jsonl")) out.push(p);
   }
   return out;
 }
 
-/** Read bytes [offset, size) of a file. Returns null when unreadable. */
-function readSlice(p: string, offset: number, size: number): Buffer | null {
-  if (size <= offset) return Buffer.alloc(0);
+/** Read bytes [offset, end) of a file, at most MAX_READ_BYTES of them (the
+ *  caller continues from where the returned buffer ends). Returns null when
+ *  unreadable. A short buffer means the file ended early (truncated). */
+async function readSlice(p: string, offset: number, end: number): Promise<Buffer | null> {
+  const want = Math.min(end - offset, MAX_READ_BYTES);
+  if (want <= 0) return Buffer.alloc(0);
   let fd: number;
   try { fd = openReadNoFollow(p); } catch { return null; }
   try {
-    const buf = Buffer.alloc(size - offset);
-    const n = readSync(fd, buf, 0, buf.length, offset);
-    return n === buf.length ? buf : buf.subarray(0, n);
+    const buf = Buffer.alloc(want);
+    let got = 0;
+    // A read may return fewer bytes than asked; loop until the slice is full
+    // or the file ends. Bounded: each pass either advances or breaks.
+    while (got < want) {
+      const { bytesRead } = await readFdAsync(fd, buf, got, want - got, offset + got);
+      if (bytesRead === 0) break;
+      got += bytesRead;
+    }
+    return got === want ? buf : buf.subarray(0, got);
   } catch {
     return null;
   } finally {
-    closeSync(fd);
+    await closeFdAsync(fd).catch(() => {});
   }
 }
 
 /** Scan one file's new bytes, up to `budget`. Returns bytes consumed. */
-function scanFile(configDir: string, filePath: string, result: ScanResult, budget: number): number {
+async function scanFile(configDir: string, filePath: string, result: ScanResult, budget: number): Promise<number> {
   let st;
-  try { st = statSync(filePath); } catch { return 0; }
+  try { st = await stat(filePath); } catch { return 0; }
   const cursor = s().getCursor.get(filePath) as { mtime_ms: number; size: number; offset: number } | null;
   // Skip only when the file is unchanged AND fully consumed — a budget-
   // truncated pass leaves offset < size with matching stat, and must resume.
@@ -183,40 +208,69 @@ function scanFile(configDir: string, filePath: string, result: ScanResult, budge
   // A shrunken file was rewritten/truncated out from under us — restart.
   // Re-reading is safe: usage_seen makes recounting a no-op.
   let offset = cursor && st.size >= cursor.offset ? cursor.offset : 0;
-  const end = Math.min(st.size, offset + budget);
-  const buf = readSlice(filePath, offset, end);
-  if (buf === null) return 0;
+  const limit = Math.min(st.size, offset + budget);
 
-  // Only complete lines are processed; the offset never advances past the
+  // Slices of at most MAX_READ_BYTES are read one after another. Only
+  // complete lines are processed and the cursor offset never advances past the
   // last newline, so a partially-flushed (or budget-cut) line is re-read on
-  // the next scan.
-  const lastNewline = buf.lastIndexOf(0x0a);
-  if (lastNewline >= 0) {
-    const complete = buf.subarray(0, lastNewline + 1);
-    const apply = db.transaction(() => {
-      for (const lineBuf of splitLines(complete)) {
-        const parsed = parseUsageLine(lineBuf.toString("utf8"));
-        if (!parsed) continue;
-        if ("error" in parsed) { result.parseErrors++; continue; }
-        const inserted = s().markSeen.run(configDir, parsed.key);
-        if (inserted.changes === 0) continue; // already counted
-        s().addDaily.run(
-          configDir, parsed.day, parsed.model,
-          parsed.inputTokens, parsed.outputTokens, parsed.cacheWriteTokens, parsed.cacheReadTokens,
-        );
-        result.eventsCounted++;
-      }
-      offset += lastNewline + 1;
-      s().putCursor.run(filePath, configDir, st.mtimeMs, st.size, offset);
-    });
-    apply();
-  } else {
+  // the next scan; the tail of a slice that ends mid-line is carried into the
+  // next slice instead.
+  let readPos = offset;
+  let consumed = 0;
+  let carry: Buffer = Buffer.alloc(0);
+  let persisted = false;
+  while (readPos < limit) {
+    const slice = await readSlice(filePath, readPos, limit);
+    if (slice === null) {
+      if (consumed === 0) return 0;
+      break;
+    }
+    if (slice.length === 0) break; // file shrank under us; next scan restarts
+    readPos += slice.length;
+    consumed += slice.length;
+    const buf = carry.length > 0 ? Buffer.concat([carry, slice]) : slice;
+    const lastNewline = buf.lastIndexOf(0x0a);
+    if (lastNewline >= 0) {
+      const complete = buf.subarray(0, lastNewline + 1);
+      const advance = lastNewline + 1;
+      const apply = db.transaction(() => {
+        for (const lineBuf of splitLines(complete)) {
+          const parsed = parseUsageLine(lineBuf.toString("utf8"));
+          if (!parsed) continue;
+          if ("error" in parsed) { result.parseErrors++; continue; }
+          const inserted = s().markSeen.run(configDir, parsed.key);
+          if (inserted.changes === 0) continue; // already counted
+          s().addDaily.run(
+            configDir, parsed.day, parsed.model,
+            parsed.inputTokens, parsed.outputTokens, parsed.cacheWriteTokens, parsed.cacheReadTokens,
+          );
+          result.eventsCounted++;
+        }
+        offset += advance;
+        s().putCursor.run(filePath, configDir, st.mtimeMs, st.size, offset);
+      });
+      apply();
+      persisted = true;
+      // Copy the tail so the (up to 8 MB) slice buffer can be freed.
+      carry = Buffer.from(buf.subarray(lastNewline + 1));
+    } else {
+      carry = buf;
+    }
+    if (carry.length > MAX_LINE_BYTES) {
+      // One line larger than any real transcript line: drop it rather than
+      // buffer without bound. Scanning resumes at the next newline.
+      offset += carry.length;
+      carry = Buffer.alloc(0);
+      result.parseErrors++;
+    }
+  }
+  if (!persisted) {
     // No complete line in the new bytes — just refresh the stat cursor so an
     // unchanged file is skipped next time (offset untouched).
     s().putCursor.run(filePath, configDir, st.mtimeMs, st.size, offset);
   }
   result.filesScanned++;
-  return buf.length;
+  return consumed;
 }
 
 function* splitLines(buf: Buffer): Generator<Buffer> {
@@ -231,7 +285,7 @@ function* splitLines(buf: Buffer): Generator<Buffer> {
 }
 
 /** Incrementally fold new transcript bytes for one account into the rollups. */
-export function scanAccountUsage(configDir: string, budgetBytes = SCAN_BUDGET_BYTES): ScanResult {
+export async function scanAccountUsage(configDir: string, budgetBytes = SCAN_BUDGET_BYTES): Promise<ScanResult> {
   const result: ScanResult = { filesScanned: 0, eventsCounted: 0, parseErrors: 0, budgetExhausted: false };
   let remaining = budgetBytes;
   const projects = path.join(configDir, "projects");
@@ -239,15 +293,42 @@ export function scanAccountUsage(configDir: string, budgetBytes = SCAN_BUDGET_BY
   // a symlink into a protected folder (no-follow.ts). Dirents below it carry
   // their own type, so nested symlinks are never followed either.
   if (!isPlainDirBelow(configDir, projects)) return result;
-  for (const f of listJsonlFiles(projects)) {
+  for (const f of await listJsonlFiles(projects)) {
     if (remaining <= 0) {
       result.budgetExhausted = true;
       break;
     }
-    remaining -= scanFile(configDir, f, result, remaining);
+    remaining -= await scanFile(configDir, f, result, remaining);
   }
   if (remaining <= 0) result.budgetExhausted = true;
   return result;
+}
+
+/** In-flight throttled scans by account, so two callers (the `/harnesses`
+ *  poll and the drill-down) share one pass instead of interleaving two. */
+const scansInFlight = new Map<string, Promise<unknown>>();
+
+/** Run a scan when the account's last one is older than MIN_SCAN_INTERVAL_MS;
+ *  otherwise wait for the one already running, if any. A failing scan never
+ *  rejects the caller: the rollups it already folded in are still served. */
+async function scanThrottled(configDir: string): Promise<void> {
+  const running = scansInFlight.get(configDir);
+  if (running) {
+    await running;
+    return;
+  }
+  const last = lastScanAt.get(configDir) ?? 0;
+  if (Date.now() - last < MIN_SCAN_INTERVAL_MS) return;
+  lastScanAt.set(configDir, Date.now());
+  const pass = scanAccountUsage(configDir).catch((err) => {
+    console.error("[agetor] account usage scan failed:", err);
+  });
+  scansInFlight.set(configDir, pass);
+  try {
+    await pass;
+  } finally {
+    scansInFlight.delete(configDir);
+  }
 }
 
 function utcDay(daysAgo: number): string {
@@ -275,12 +356,8 @@ function totalsSince(configDir: string, day: string): TokenTotals {
  * separate concern, covered by `src/bun/usage/*`'s per-harness-kind quota
  * pollers (claude-code/codex/cursor), not this module.
  */
-export function accountUsageSummary(configDir: string): AccountUsageSummary {
-  const last = lastScanAt.get(configDir) ?? 0;
-  if (Date.now() - last >= MIN_SCAN_INTERVAL_MS) {
-    lastScanAt.set(configDir, Date.now());
-    scanAccountUsage(configDir);
-  }
+export async function accountUsageSummary(configDir: string): Promise<AccountUsageSummary> {
+  await scanThrottled(configDir);
   return {
     configDir,
     today: totalsSince(configDir, utcDay(0)),
@@ -299,11 +376,7 @@ export interface UsageDayRow {
 }
 
 /** Daily per-model rows for the Settings drill-down (default: last 30 days). */
-export function accountUsageDays(configDir: string, days = 30): UsageDayRow[] {
-  const last = lastScanAt.get(configDir) ?? 0;
-  if (Date.now() - last >= MIN_SCAN_INTERVAL_MS) {
-    lastScanAt.set(configDir, Date.now());
-    scanAccountUsage(configDir);
-  }
+export async function accountUsageDays(configDir: string, days = 30): Promise<UsageDayRow[]> {
+  await scanThrottled(configDir);
   return s().daysSince.all(configDir, utcDay(days - 1)) as UsageDayRow[];
 }

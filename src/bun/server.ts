@@ -5912,7 +5912,7 @@ export function startApiServer(
       // above, which reports task counts — do not overload that route.
       // claude-code only: other kinds have no local usage source wired yet.
       "/harnesses/:id/account-usage": {
-        GET: authed((req) => {
+        GET: authed(async (req) => {
           const h = harnesses.getByIdOrKind(req.params.id);
           if (!h) {
             return json({ error: "not found" }, { status: 404, headers: corsHeaders(req) });
@@ -5927,7 +5927,7 @@ export function startApiServer(
           // env-map HOME included), which is what the rollup reads.
           const configDir = claudeConfigDirFor(h);
           return json(
-            { configDir, days: accountUsageDays(configDir) },
+            { configDir, days: await accountUsageDays(configDir) },
             { headers: corsHeaders(req) },
           );
         }),
@@ -6780,7 +6780,7 @@ export function startApiServer(
           // response, not a later status the click never observes. A large
           // transcript can outlast the idle timeout.
           server.timeout(req, 0);
-          const result = await retryImport(req.params.id, claudeSessionScanOptions());
+          const result = await retryImport(req.params.id, await claudeSessionScanOptions());
           return "error" in result
             ? json(result, { status: tasks.get(req.params.id) ? 400 : 404, headers: corsHeaders(req) })
             : json(result, { headers: corsHeaders(req) });
@@ -6805,9 +6805,9 @@ export function startApiServer(
           // A first scan reads every transcript Agetor does not own; it can
           // outlast the idle timeout on a large ~/.claude.
           server.timeout(req, 0);
-          const opts = claudeSessionScanOptions();
+          const opts = await claudeSessionScanOptions();
           const sessions = await scanClaudeSessions(opts);
-          const livenessCheckedAt = claudeSessionLivenessCheckedAt(claudeConfigDirsToScan(opts));
+          const livenessCheckedAt = claudeSessionLivenessCheckedAt(await claudeConfigDirsToScan(opts));
           return json({ sessions, livenessCheckedAt }, { headers: corsHeaders(req) });
         }),
       },
@@ -6816,8 +6816,8 @@ export function startApiServer(
         POST: authed(async (req) => {
           // `claude agents --json` per config dir (up to 8 s each), then a scan.
           server.timeout(req, 0);
-          const opts = claudeSessionScanOptions();
-          const configDirs = claudeConfigDirsToScan(opts);
+          const opts = await claudeSessionScanOptions();
+          const configDirs = await claudeConfigDirsToScan(opts);
           await refreshClaudeSessionLiveness(configDirs, process.env, opts.harnesses, opts.homeDir);
           const sessions = await scanClaudeSessions(opts);
           const livenessCheckedAt = claudeSessionLivenessCheckedAt(configDirs);
@@ -6833,7 +6833,7 @@ export function startApiServer(
           if (!body || !Array.isArray(body.ids) || body.ids.some((id) => typeof id !== "string")) {
             return json({ error: "ids must be a string array" }, { status: 400, headers: corsHeaders(req) });
           }
-          const result = await importClaudeSessions(body.ids, { ...claudeSessionScanOptions(), ...sessionCwdGate(req) });
+          const result = await importClaudeSessions(body.ids, { ...(await claudeSessionScanOptions()), ...sessionCwdGate(req) });
           return json(result, { headers: corsHeaders(req) });
         }),
       },
@@ -6893,7 +6893,7 @@ export function startApiServer(
           }
           const result = await checkoutSessionBranch(
             body.sessionId,
-            { ...claudeSessionScanOptions(), ...sessionCwdGate(req) },
+            { ...(await claudeSessionScanOptions()), ...sessionCwdGate(req) },
             typeof body.branch === "string" ? body.branch : undefined,
           );
           return "error" in result

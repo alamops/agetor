@@ -155,7 +155,7 @@ export function importedTaskPrompt(firstHumanPrompt: string | null, title: strin
   return capPrompt(text);
 }
 
-function scanOptions(opts: ImportClaudeSessionsOptions | undefined): ScanClaudeSessionsOptions {
+async function scanOptions(opts: ImportClaudeSessionsOptions | undefined): Promise<ScanClaudeSessionsOptions> {
   const homeDir = opts?.homeDir ?? (process.env.HOME || homedir());
   const listed = opts?.harnesses ?? harnesses.list()
     .filter((h) => h.kind === "claude-code")
@@ -164,7 +164,7 @@ function scanOptions(opts: ImportClaudeSessionsOptions | undefined): ScanClaudeS
     homeDir,
     env: opts?.env ?? process.env,
     ownedSessionIds: hiddenClaudeSessionIds(),
-    worktreeRoots: opts?.worktreeRoots ?? discoverAgetorWorktreeRoots(homeDir),
+    worktreeRoots: opts?.worktreeRoots ?? (await discoverAgetorWorktreeRoots(homeDir)),
     harnesses: listed,
     encodePath: opts?.encodePath,
     listLive: opts?.listLive,
@@ -523,7 +523,7 @@ async function runBackfill(
   try {
     const record = known?.sessionId === provenance.sessionId
       ? known
-      : await findClaudeSession(provenance.sessionId, scanOptions(opts));
+      : await findClaudeSession(provenance.sessionId, await scanOptions(opts));
     if (!record) throw new Error("session transcript is gone");
     await importSubagents(taskId, runId, record.jsonlPath, provenance.sessionId, opts);
     const fresh = requireTask(taskId);
@@ -592,7 +592,7 @@ export async function importClaudeSessions(
   ids: string[],
   opts?: ImportClaudeSessionsOptions,
 ): Promise<{ results: ImportClaudeSessionResult[] }> {
-  const scan = scanOptions(opts);
+  const scan = await scanOptions(opts);
   const records = await findClaudeSessions(new Set(ids), scan);
   // The scanner's liveness was taken before the transcript read. Probe again
   // so a session that started during that read is refused.
@@ -733,7 +733,7 @@ export async function checkoutSessionBranch(
   opts?: ImportClaudeSessionsOptions,
   requested?: string,
 ): Promise<{ ok: true; branch: string } | { error: string }> {
-  const scan = scanOptions(opts);
+  const scan = await scanOptions(opts);
   const record = await findClaudeSession(sessionId, scan);
   if (!record) return { error: "session not found" };
   // The list probe can be stale by the time checkout runs. A live Claude

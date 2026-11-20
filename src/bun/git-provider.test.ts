@@ -1,5 +1,5 @@
 import { test, expect, beforeEach, afterEach, afterAll } from "bun:test";
-import { existsSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
+import { existsSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import path from "node:path";
 import {
@@ -11,6 +11,8 @@ import {
   gitlabToken,
   bitbucketCreds,
   apiHostForRemote,
+  resolveApiHost,
+  __apiHostCacheSizeForTest,
   __clearApiHostCacheForTest,
 } from "./git-provider.ts";
 import { setGitHubToken, tokenForHost } from "./github-tokens.ts";
@@ -592,4 +594,48 @@ test("tokenForHost: default fallbackHost is still github.com", () => {
   setGitHubToken("github.com", "gh-default-tok");
   expect(tokenForHost("some-unrelated-host.example.com")).toBe("gh-default-tok");
   expect(tokenForHost(null)).toBe("gh-default-tok");
+});
+
+// ---------------------------------------------------------------------------
+// resolveApiHost — the non-blocking twin (one ssh -G per host, bounded cache)
+// ---------------------------------------------------------------------------
+
+test("resolveApiHost: resolves an alias through the async ssh -G and spawns ssh once per host", async () => {
+  const dir = mkdtempSync(path.join(tmpdir(), "agetor-git-provider-ssh-count-"));
+  createdDirs.push(dir);
+  const counter = path.join(dir, "count");
+  const bin = path.join(dir, "ssh");
+  writeFileSync(bin, `#!/bin/sh\necho x >> "${counter}"\nprintf 'hostname gitlab.com\\n'\n`, { mode: 0o755 });
+  process.env.AGETOR_SSH_BIN = bin;
+  const [a, b] = await Promise.all([resolveApiHost("gitlab-async"), resolveApiHost("GitLab-Async")]);
+  expect(a).toBe("gitlab.com");
+  expect(b).toBe("gitlab.com");
+  expect(await resolveApiHost("gitlab-async")).toBe("gitlab.com");
+  // The sync reader hits the same cache, so it does not spawn either.
+  expect(apiHostForRemote("gitlab-async")).toBe("gitlab.com");
+  expect(readFileSync(counter, "utf8").trim().split("\n")).toHaveLength(1);
+});
+
+test("resolveApiHost: falls back to the normalized input when ssh is missing or fails", async () => {
+  process.env.AGETOR_SSH_BIN = "/nonexistent/ssh-binary";
+  expect(await resolveApiHost("Gitlab-Missing.IO")).toBe("gitlab-missing.io");
+  process.env.AGETOR_SSH_BIN = writeSshStub("#!/bin/sh\nexit 1\n");
+  expect(await resolveApiHost("gitlab-fails.io")).toBe("gitlab-fails.io");
+});
+
+test("resolveApiHost: cloud hosts and illegal hostnames never spawn ssh; transport aliases map to the cloud host", async () => {
+  const { bin, marker } = writeSshSpawnMarkerStub("printf 'hostname altssh.gitlab.com\\n'\n");
+  process.env.AGETOR_SSH_BIN = bin;
+  expect(await resolveApiHost("GitLab.com")).toBe("gitlab.com");
+  expect(await resolveApiHost("-oProxyCommand=x")).toBe("-oproxycommand=x");
+  expect(await resolveApiHost("a b")).toBe("a b");
+  expect(existsSync(marker)).toBe(false);
+  expect(await resolveApiHost("gitlab-work")).toBe("gitlab.com");
+  expect(existsSync(marker)).toBe(true);
+});
+
+test("resolveApiHost: the cache is bounded", async () => {
+  process.env.AGETOR_SSH_BIN = "/nonexistent/ssh-binary";
+  for (let i = 0; i < 300; i++) await resolveApiHost(`bound-${i}.example`);
+  expect(__apiHostCacheSizeForTest()).toBeLessThanOrEqual(256);
 });

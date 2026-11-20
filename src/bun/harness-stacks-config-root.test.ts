@@ -63,11 +63,11 @@ describe("claude", () => {
     expect(root.claudeConfigDirEnvFor({ home: null })).toBeNull();
   });
 
-  test("the session scanner reads an env-map HOME account's root", () => {
+  test("the session scanner reads an env-map HOME account's root", async () => {
     const fakeHome = mkdtempSync(path.join(tmpdir(), "agetor-scan-home-"));
     const envHome = mkdtempSync(path.join(tmpdir(), "agetor-scan-envhome-"));
     mkdirSync(path.join(envHome, ".claude"), { recursive: true });
-    const dirs = claudeConfigDirsToScan({
+    const dirs = await claudeConfigDirsToScan({
       homeDir: fakeHome,
       env: {},
       harnesses: [{ id: "c-envhome", kind: "claude-code", home: null, env: { HOME: envHome } }],

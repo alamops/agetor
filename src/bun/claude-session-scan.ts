@@ -10,7 +10,8 @@
  * cached per file until its size or mtime changes. `git` runs only for rows
  * that stay visible.
  */
-import { closeSync, createReadStream, existsSync, lstatSync, readdirSync, readFileSync, readSync, realpathSync, statSync } from "node:fs";
+import { closeSync, createReadStream, readFileSync, readSync, realpathSync } from "node:fs";
+import { lstat, readdir, stat } from "node:fs/promises";
 import { createInterface } from "node:readline";
 import { homedir, tmpdir } from "node:os";
 import path from "node:path";
@@ -156,6 +157,16 @@ function envOf(opts: { env?: Record<string, string | undefined> }): Record<strin
   return opts.env ?? process.env;
 }
 
+/** Async `existsSync`: true when the path can be stat-ed (following links). */
+async function pathExists(p: string): Promise<boolean> {
+  try {
+    await stat(p);
+    return true;
+  } catch {
+    return false;
+  }
+}
+
 function safeRealpath(p: string): string {
   try { return realpathSync(p); } catch { return path.resolve(p); }
 }
@@ -235,24 +246,24 @@ function isTempAgetorCwd(cwd: string): boolean {
 }
 
 /** `~/.agetor` and `~/.agetor-*` data dirs that contain `agetor.sqlite`. */
-export function discoverAgetorWorktreeRoots(homeDir: string): string[] {
+export async function discoverAgetorWorktreeRoots(homeDir: string): Promise<string[]> {
   const roots: string[] = [];
   let entries: string[] = [];
   try {
-    entries = readdirSync(homeDir);
+    entries = await readdir(homeDir);
   } catch {
     return roots;
   }
   for (const name of entries) {
     if (name !== ".agetor" && !name.startsWith(".agetor-")) continue;
     const dir = path.join(homeDir, name);
-    if (!existsSync(path.join(dir, "agetor.sqlite"))) continue;
+    if (!(await pathExists(path.join(dir, "agetor.sqlite")))) continue;
     roots.push(path.join(dir, "worktrees"));
   }
   return roots;
 }
 
-export function claudeConfigDirsToScan(opts: ScanClaudeSessionsOptions): string[] {
+export async function claudeConfigDirsToScan(opts: ScanClaudeSessionsOptions): Promise<string[]> {
   const discovery = { homeDir: opts.homeDir, env: envOf(opts) };
   const found: string[] = [];
   for (const harness of opts.harnesses ?? []) {
@@ -261,7 +272,7 @@ export function claudeConfigDirsToScan(opts: ScanClaudeSessionsOptions): string[
   }
   found.push(effectiveClaudeConfigDir(null, discovery));
   try {
-    for (const entry of readdirSync(opts.homeDir, { withFileTypes: true })) {
+    for (const entry of await readdir(opts.homeDir, { withFileTypes: true })) {
       if (entry.isDirectory() && entry.name.startsWith(".claude")) {
         found.push(path.join(opts.homeDir, entry.name));
       }
@@ -273,7 +284,7 @@ export function claudeConfigDirsToScan(opts: ScanClaudeSessionsOptions): string[
   const seen = new Set<string>();
   const out: string[] = [];
   for (const dir of found) {
-    if (!dir || !existsSync(dir)) continue;
+    if (!dir || !(await pathExists(dir))) continue;
     const real = safeRealpath(dir);
     if (seen.has(real)) continue;
     seen.add(real);
@@ -392,14 +403,14 @@ function harnessBinFor(
   return null;
 }
 
-export function readClaudeRegistry(configDir: string): ClaudeRegistryRecord[] {
+export async function readClaudeRegistry(configDir: string): Promise<ClaudeRegistryRecord[]> {
   const dir = path.join(configDir, "sessions");
   // The config dir is the user's; `sessions/` inside it is agent-writable and
   // is never listed in-process through a planted symlink (no-follow.ts).
   if (!isPlainDirBelow(configDir, dir)) return [];
   let names: string[] = [];
   try {
-    names = readdirSync(dir);
+    names = await readdir(dir);
   } catch {
     return [];
   }
@@ -726,8 +737,8 @@ async function loadMeta(
   hidePrefixes: readonly string[],
   opts: ScanClaudeSessionsOptions,
 ): Promise<{ meta: ClaudeSessionMeta; mtime: number } | "hidden" | null> {
-  let st: ReturnType<typeof statSync>;
-  try { st = lstatSync(jsonlPath); } catch { return null; }
+  let st: Awaited<ReturnType<typeof lstat>>;
+  try { st = await lstat(jsonlPath); } catch { return null; }
   // A planted symlink is never read (no-follow.ts); Claude writes regular files.
   if (!st.isFile()) return null;
   let entry = metaCache.get(jsonlPath);
@@ -751,9 +762,9 @@ async function loadMeta(
   return { meta: entry.meta, mtime: st.mtimeMs };
 }
 
-function folderExists(cwd: string): boolean {
+async function folderExists(cwd: string): Promise<boolean> {
   try {
-    return statSync(cwd).isDirectory();
+    return (await stat(cwd)).isDirectory();
   } catch {
     return false;
   }
@@ -771,13 +782,13 @@ async function collect(opts: ScanClaudeSessionsOptions): Promise<Collected[]> {
   const out: Collected[] = [];
   let sliceStart = Date.now();
 
-  for (const configDir of claudeConfigDirsToScan(opts)) {
+  for (const configDir of await claudeConfigDirsToScan(opts)) {
     const projects = path.join(configDir, "projects");
     // Same rule one level up: a `projects/` linked elsewhere is not listed.
     if (!isPlainDirBelow(configDir, projects)) continue;
     let projectDirs: string[] = [];
     try {
-      projectDirs = readdirSync(projects);
+      projectDirs = await readdir(projects);
     } catch {
       continue;
     }
@@ -791,13 +802,13 @@ async function collect(opts: ScanClaudeSessionsOptions): Promise<Collected[]> {
 
     for (const dirName of projectDirs) {
       const dirPath = path.join(projects, dirName);
-      let st: ReturnType<typeof statSync>;
+      let st: Awaited<ReturnType<typeof lstat>>;
       // lstat: a project dir planted as a symlink into a protected folder is
       // skipped, never listed in-process (no-follow.ts).
-      try { st = lstatSync(dirPath); } catch { continue; }
+      try { st = await lstat(dirPath); } catch { continue; }
       if (!st.isDirectory()) continue;
       let files: string[] = [];
-      try { files = readdirSync(dirPath); } catch { continue; }
+      try { files = await readdir(dirPath); } catch { continue; }
       for (const file of files) {
         if (!file.endsWith(".jsonl")) continue;
         if (Date.now() - sliceStart >= SLICE_MS) {
@@ -816,7 +827,7 @@ async function collect(opts: ScanClaudeSessionsOptions): Promise<Collected[]> {
         const unresolved = claudeProjectDirUnresolved(meta.cwd, dirName, encode);
         let folderOk = folders.get(meta.cwd);
         if (folderOk === undefined) {
-          folderOk = folderExists(meta.cwd);
+          folderOk = await folderExists(meta.cwd);
           folders.set(meta.cwd, folderOk);
         }
         const reg = registryById.get(sessionId);

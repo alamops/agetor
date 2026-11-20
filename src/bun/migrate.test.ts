@@ -2117,7 +2117,7 @@ test("086 on the real schema: cursor Fable 5.2/5.1 variants fold to a base id th
        ('lastModel:fx', 'claude-fable-5-2-high', 7)`,
   );
 
-  expect(migrate(db, migrations)).toEqual(["086_normalize_cursor_fable_5_2", "087_harness_stacks_fix_round", "088_harness_orphaned_copies", "089_harness_mirror_sources", "090_harness_mirror_backup_folder", "091_task_repositories", "092_task_base_branch_and_prs"]);
+  expect(migrate(db, migrations)).toEqual(["086_normalize_cursor_fable_5_2", "087_harness_stacks_fix_round", "088_harness_orphaned_copies", "089_harness_mirror_sources", "090_harness_mirror_backup_folder", "091_task_repositories", "092_task_base_branch_and_prs", "093_task_revs"]);
 
   type TaskRow = {
     id: string;
@@ -2280,7 +2280,7 @@ test("082 adds opencode_stopped_children (no foreign key) and the partial OpenCo
     INSERT INTO subagents (id, task_id, parent_kind, source_path, status, started_at, ended_at)
       VALUES ('opencode-ses_1', 't1', 'opencode_subagent', 'opencode-session:ses_1', 'orphaned', 1, 2);
   `);
-  expect(migrate(db, migrations)).toEqual(["082_opencode_child_bookkeeping", "083_opencode_watch_tombstones", "084_harness_stacks", "085_harness_stack_members_no_harness_fk", "086_normalize_cursor_fable_5_2", "087_harness_stacks_fix_round", "088_harness_orphaned_copies", "089_harness_mirror_sources", "090_harness_mirror_backup_folder", "091_task_repositories", "092_task_base_branch_and_prs"]);
+  expect(migrate(db, migrations)).toEqual(["082_opencode_child_bookkeeping", "083_opencode_watch_tombstones", "084_harness_stacks", "085_harness_stack_members_no_harness_fk", "086_normalize_cursor_fable_5_2", "087_harness_stacks_fix_round", "088_harness_orphaned_copies", "089_harness_mirror_sources", "090_harness_mirror_backup_folder", "091_task_repositories", "092_task_base_branch_and_prs", "093_task_revs"]);
   expect(columnNames(db, "opencode_stopped_children")).toEqual(["child_session_id", "task_id", "stopped_at"]);
   expect(db.query<unknown, []>(`PRAGMA foreign_key_list(opencode_stopped_children)`).all()).toEqual([]);
   // A note for a task id that doesn't exist (or no longer does) is accepted.
@@ -2313,7 +2313,6 @@ test("084 (harness stacks) follows 083 (opencode watch tombstones)", () => {
 
 test("091 (task repositories) follows 090 (harness mirror backup folder) and precedes 092", () => {
   const at = migrations.findIndex((m) => m.id === "091_task_repositories");
-  expect(at).toBe(migrations.length - 2);
   expect(migrations[at - 1]?.id).toBe("090_harness_mirror_backup_folder");
   expect(migrations[at + 1]?.id).toBe("092_task_base_branch_and_prs");
   expect(migrations[at]?.aliases).toEqual(["087_task_repositories"]);
@@ -2341,7 +2340,7 @@ test("083 adds opencode_watch_tombstones (no foreign key, session id primary key
   const db = new Database(":memory:");
   migrateThrough(db, "082_opencode_child_bookkeeping");
   db.exec(`INSERT INTO tasks (id, title, prompt, "column", agent, workdir, created_at, updated_at) VALUES ('t1', 't', 'p', 'backlog', 'opencode', '/w', 1, 1)`);
-  expect(migrate(db, migrations)).toEqual(["083_opencode_watch_tombstones", "084_harness_stacks", "085_harness_stack_members_no_harness_fk", "086_normalize_cursor_fable_5_2", "087_harness_stacks_fix_round", "088_harness_orphaned_copies", "089_harness_mirror_sources", "090_harness_mirror_backup_folder", "091_task_repositories", "092_task_base_branch_and_prs"]);
+  expect(migrate(db, migrations)).toEqual(["083_opencode_watch_tombstones", "084_harness_stacks", "085_harness_stack_members_no_harness_fk", "086_normalize_cursor_fable_5_2", "087_harness_stacks_fix_round", "088_harness_orphaned_copies", "089_harness_mirror_sources", "090_harness_mirror_backup_folder", "091_task_repositories", "092_task_base_branch_and_prs", "093_task_revs"]);
   expect(columnNames(db, "opencode_watch_tombstones")).toEqual(["session_id", "harness_id", "task_id", "expires_at"]);
   expect(db.query<unknown, []>(`PRAGMA foreign_key_list(opencode_watch_tombstones)`).all()).toEqual([]);
   // A tombstone outlives its task: a task id that doesn't exist is accepted.
@@ -2406,6 +2405,7 @@ test("078-080 on a 077-era DB keep every harnesses row and column, seed a disabl
     "090_harness_mirror_backup_folder",
     "091_task_repositories",
     "092_task_base_branch_and_prs",
+    "093_task_revs",
   ]);
   expect(db.query(`SELECT name FROM sqlite_master WHERE type = 'table' AND name = 'cursor_asks'`).get()).toBeTruthy();
 
@@ -2502,7 +2502,7 @@ test("085 rebuilds harness_stack_members without the harnesses FK, keeping rows,
     INSERT INTO harness_stacks (id, label, kind, created_at, updated_at) VALUES ('s1', 'Claude', 'claude-code', 1, 1);
     INSERT INTO harness_stack_members (stack_id, harness_id, position) VALUES ('s1', 'claude-code', 0), ('s1', 'cc-b', 1);
   `);
-  expect(migrate(db, migrations)).toEqual(["085_harness_stack_members_no_harness_fk", "086_normalize_cursor_fable_5_2", "087_harness_stacks_fix_round", "088_harness_orphaned_copies", "089_harness_mirror_sources", "090_harness_mirror_backup_folder", "091_task_repositories", "092_task_base_branch_and_prs"]);
+  expect(migrate(db, migrations)).toEqual(["085_harness_stack_members_no_harness_fk", "086_normalize_cursor_fable_5_2", "087_harness_stacks_fix_round", "088_harness_orphaned_copies", "089_harness_mirror_sources", "090_harness_mirror_backup_folder", "091_task_repositories", "092_task_base_branch_and_prs", "093_task_revs"]);
   expect(columnNames(db, "harness_stack_members")).toEqual(["stack_id", "harness_id", "position"]);
   const fks = db.query<{ table: string; on_delete: string }, []>(`PRAGMA foreign_key_list(harness_stack_members)`).all();
   expect(fks.map((f) => [f.table, f.on_delete])).toEqual([["harness_stacks", "CASCADE"]]);
@@ -2562,7 +2562,7 @@ test("087 keeps cooldown rows as whole-account (model ''), keys by (harness, mod
   migrateThrough(db, "086_normalize_cursor_fable_5_2");
   db.exec(`INSERT INTO harness_limit_state (harness_id, reason, source, message, exhausted_until_ms, updated_at)
            VALUES ('cc-a', 'quota', 'claude-pane', 'usage limit', 9000, 100)`);
-  expect(migrate(db, migrations)).toEqual(["087_harness_stacks_fix_round", "088_harness_orphaned_copies", "089_harness_mirror_sources", "090_harness_mirror_backup_folder", "091_task_repositories", "092_task_base_branch_and_prs"]);
+  expect(migrate(db, migrations)).toEqual(["087_harness_stacks_fix_round", "088_harness_orphaned_copies", "089_harness_mirror_sources", "090_harness_mirror_backup_folder", "091_task_repositories", "092_task_base_branch_and_prs", "093_task_revs"]);
   expect(columnNames(db, "harness_limit_state")).toEqual(
     ["harness_id", "model", "reason", "source", "message", "exhausted_until_ms", "updated_at"],
   );
@@ -2602,7 +2602,7 @@ test("087 N-1: several real cooldown rows survive byte-for-byte as whole-account
       [id, reason, source, message, until, at],
     );
   }
-  expect(migrate(db, migrations)).toEqual(["087_harness_stacks_fix_round", "088_harness_orphaned_copies", "089_harness_mirror_sources", "090_harness_mirror_backup_folder", "091_task_repositories", "092_task_base_branch_and_prs"]);
+  expect(migrate(db, migrations)).toEqual(["087_harness_stacks_fix_round", "088_harness_orphaned_copies", "089_harness_mirror_sources", "090_harness_mirror_backup_folder", "091_task_repositories", "092_task_base_branch_and_prs", "093_task_revs"]);
   const rows = db.query(`SELECT * FROM harness_limit_state ORDER BY harness_id`).all();
   expect(rows).toEqual(
     seeded.map(([harness_id, reason, source, message, exhausted_until_ms, updated_at]) => ({
@@ -2648,7 +2648,7 @@ test("088 adds harness_orphaned_copies (no foreign key, (harness, column, path) 
      VALUES ('t1', 'cc-b', 'claude_session_id', 's-new', '["/r/projects/e/s-old.jsonl","/r/projects/e/s-new.jsonl"]', 5)`,
   );
   const before = db.query(`SELECT * FROM harness_session_handoffs`).all();
-  expect(migrate(db, migrations)).toEqual(["088_harness_orphaned_copies", "089_harness_mirror_sources", "090_harness_mirror_backup_folder", "091_task_repositories", "092_task_base_branch_and_prs"]);
+  expect(migrate(db, migrations)).toEqual(["088_harness_orphaned_copies", "089_harness_mirror_sources", "090_harness_mirror_backup_folder", "091_task_repositories", "092_task_base_branch_and_prs", "093_task_revs"]);
   expect(db.query(`SELECT * FROM harness_session_handoffs`).all()).toEqual(before);
   expect(columnNames(db, "harness_orphaned_copies")).toEqual(["harness_id", "column_name", "session_id", "path", "created_at"]);
   expect(db.query<{ name: string }, []>(`PRAGMA foreign_key_list(harness_orphaned_copies)`).all()).toEqual([]);
@@ -2666,7 +2666,7 @@ test("088 adds harness_orphaned_copies (no foreign key, (harness, column, path) 
 test("089 adds harness_mirror_sources (one row per backup account, no foreign key) on an 088 DB", () => {
   const db = new Database(":memory:");
   migrateThrough(db, "088_harness_orphaned_copies");
-  expect(migrate(db, migrations)).toEqual(["089_harness_mirror_sources", "090_harness_mirror_backup_folder", "091_task_repositories", "092_task_base_branch_and_prs"]);
+  expect(migrate(db, migrations)).toEqual(["089_harness_mirror_sources", "090_harness_mirror_backup_folder", "091_task_repositories", "092_task_base_branch_and_prs", "093_task_revs"]);
   expect(columnNames(db, "harness_mirror_sources")).toEqual([
     "harness_id", "primary_id", "primary_root", "primary_config", "updated_at", "backup_root", "backup_config",
   ]);
@@ -2681,7 +2681,7 @@ test("090 adds the backup's own folder and fingerprint to harness_mirror_sources
   const db = new Database(":memory:");
   migrateThrough(db, "089_harness_mirror_sources");
   db.run(`INSERT INTO harness_mirror_sources VALUES ('backup', 'primary', '/a', '{"home":null,"env":{}}', 7)`);
-  expect(migrate(db, migrations)).toEqual(["090_harness_mirror_backup_folder", "091_task_repositories", "092_task_base_branch_and_prs"]);
+  expect(migrate(db, migrations)).toEqual(["090_harness_mirror_backup_folder", "091_task_repositories", "092_task_base_branch_and_prs", "093_task_revs"]);
   expect(columnNames(db, "harness_mirror_sources")).toEqual([
     "harness_id", "primary_id", "primary_root", "primary_config", "updated_at", "backup_root", "backup_config",
   ]);
@@ -2708,4 +2708,153 @@ test("090 adds the backup's own folder and fingerprint to harness_mirror_sources
   }
   expect(migrate(db, migrations)).toEqual([]);
   db.close();
+});
+
+// ---------------------------------------------------------------------------
+// splitSqlStatements and CREATE TRIGGER bodies
+// ---------------------------------------------------------------------------
+
+/** Frozen copy of `splitSqlStatements` as it was before it learned about trigger
+ *  bodies. The regression test below proves every migration that existed then
+ *  still splits into exactly the statements this produces. Never edit it. */
+function frozenSplitSqlStatements(sql: string): string[] {
+  const statements: string[] = [];
+  let current = "";
+  let i = 0;
+  while (i < sql.length) {
+    const ch = sql[i];
+    if (ch === "'") {
+      // Consume the whole string literal, including any '' escapes, so a
+      // semicolon or comment-opener inside it is never mistaken for one.
+      current += ch;
+      i++;
+      while (i < sql.length) {
+        current += sql[i];
+        if (sql[i] === "'") {
+          if (sql[i + 1] === "'") { current += sql[i + 1]; i += 2; continue; }
+          i++;
+          break;
+        }
+        i++;
+      }
+      continue;
+    }
+    if (ch === "-" && sql[i + 1] === "-") {
+      const nl = sql.indexOf("\n", i);
+      current += sql.slice(i, nl === -1 ? sql.length : nl);
+      i = nl === -1 ? sql.length : nl;
+      continue;
+    }
+    if (ch === "/" && sql[i + 1] === "*") {
+      const end = sql.indexOf("*/", i + 2);
+      const stop = end === -1 ? sql.length : end + 2;
+      current += sql.slice(i, stop);
+      i = stop;
+      continue;
+    }
+    if (ch === ";") {
+      statements.push(current);
+      current = "";
+      i++;
+      continue;
+    }
+    current += ch;
+    i++;
+  }
+  if (current.trim()) statements.push(current);
+  // Drop statements that are empty once comments/whitespace are stripped —
+  // a trailing `-- comment\n` after the last `;` would otherwise become a
+  // bogus "empty" statement that `db.run()` rejects.
+  return statements
+    .map((s) => s.trim())
+    .filter((s) => s.replace(/--[^\n]*/g, "").replace(/\/\*[\s\S]*?\*\//g, "").trim().length > 0);
+}
+
+test("splitSqlStatements keeps a trigger with two statements whole", () => {
+  const sql = `CREATE TRIGGER t AFTER INSERT ON a BEGIN
+  UPDATE m SET n = n + 1;
+  INSERT INTO b (x) VALUES (NEW.id);
+END;`;
+  const out = splitSqlStatements(sql);
+  expect(out).toHaveLength(1);
+  expect(out[0]).toContain("UPDATE m SET n = n + 1;");
+  expect(out[0]).toMatch(/END$/);
+});
+
+test("splitSqlStatements nests a CASE ... END expression inside a trigger body", () => {
+  const sql = `CREATE TRIGGER t AFTER UPDATE ON a BEGIN
+  UPDATE b SET x = CASE WHEN NEW.y > 0 THEN 1 ELSE 0 END;
+  UPDATE c SET z = 2;
+END;
+SELECT 1;`;
+  const out = splitSqlStatements(sql);
+  expect(out).toHaveLength(2);
+  expect(out[0]).toContain("UPDATE c SET z = 2;");
+  expect(out[0]).toMatch(/END$/);
+  expect(out[1]).toBe("SELECT 1");
+});
+
+test("splitSqlStatements splits a normal statement that follows a trigger", () => {
+  const sql = `CREATE TABLE t (id INTEGER);
+CREATE TRIGGER g AFTER INSERT ON t BEGIN UPDATE t SET id = id; END;
+CREATE INDEX i ON t(id);
+INSERT INTO t VALUES (1);`;
+  expect(splitSqlStatements(sql).map((s) => s.split("\n")[0]!.slice(0, 20))).toEqual([
+    "CREATE TABLE t (id I",
+    "CREATE TRIGGER g AFT",
+    "CREATE INDEX i ON t(",
+    "INSERT INTO t VALUES",
+  ]);
+});
+
+test("splitSqlStatements ignores semicolons and BEGIN/CASE/END words in strings and comments inside a trigger", () => {
+  const sql = `CREATE TRIGGER t AFTER INSERT ON a BEGIN
+  -- a ; and an END in a comment, plus BEGIN
+  INSERT INTO b (x) VALUES ('end; begin; case');
+  /* ; END ; */
+  UPDATE c SET y = 'it''s; END';
+END;
+SELECT 2;`;
+  const out = splitSqlStatements(sql);
+  expect(out).toHaveLength(2);
+  expect(out[0]).toContain("'end; begin; case'");
+  expect(out[0]).toContain("'it''s; END'");
+  expect(out[1]).toBe("SELECT 2");
+});
+
+test("splitSqlStatements treats a TEMP trigger and lower-case keywords the same way", () => {
+  const sql = "create temp trigger t after insert on a begin select 1; select case when 1 then 2 end; end; select 3;";
+  expect(splitSqlStatements(sql)).toHaveLength(2);
+});
+
+test("splitSqlStatements leaves a non-trigger statement with BEGIN/END words alone", () => {
+  expect(splitSqlStatements("BEGIN; SELECT 1; COMMIT;")).toEqual(["BEGIN", "SELECT 1", "COMMIT"]);
+  expect(splitSqlStatements("SELECT CASE WHEN 1 THEN 2 END; SELECT 4;")).toEqual(["SELECT CASE WHEN 1 THEN 2 END", "SELECT 4"]);
+});
+
+test("splitSqlStatements does not count a quoted identifier named end as a keyword", () => {
+  const sql = `CREATE TRIGGER t AFTER INSERT ON a BEGIN
+  UPDATE b SET "end" = 1;
+  UPDATE c SET y = 2;
+END;`;
+  expect(splitSqlStatements(sql)).toHaveLength(1);
+});
+
+test("splitSqlStatements splits every migration through 092 exactly as it did before trigger support", () => {
+  const legacy = migrations.filter((m) => m.id < "093");
+  expect(legacy.length).toBeGreaterThanOrEqual(92);
+  for (const m of legacy) {
+    expect({ id: m.id, statements: splitSqlStatements(m.sql) }).toEqual({
+      id: m.id,
+      statements: frozenSplitSqlStatements(m.sql),
+    });
+  }
+});
+
+test("migration 093 splits into whole trigger statements and applies", () => {
+  const m093 = migrations.find((m) => m.id === "093_task_revs")!;
+  const statements = splitSqlStatements(m093.sql);
+  const triggers = statements.filter((s) => /^CREATE TRIGGER/.test(s));
+  expect(triggers).toHaveLength(7);
+  for (const t of triggers) expect(t).toMatch(/\bEND$/);
 });

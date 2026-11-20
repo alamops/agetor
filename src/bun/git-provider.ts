@@ -85,11 +85,91 @@ const HOSTNAME_CHARSET_RE = /^[a-z0-9.-]+$/;
  *  supported flow. */
 const apiHostCache = new Map<string, string>();
 
+/** Upper bound on `apiHostCache`: hosts come from remotes the user (or an
+ *  agent-planted repo) names, so the map must not grow without limit. Past the
+ *  cap the oldest entry is evicted (Map insertion order); an evicted host is
+ *  simply resolved again on its next use. */
+const API_HOST_CACHE_MAX = 256;
+
+/** In-flight async resolutions by normalized host, so concurrent callers for
+ *  one host share a single `ssh -G`. */
+const apiHostInflight = new Map<string, Promise<string>>();
+
+function rememberApiHost(normalized: string, resolved: string): string {
+  if (!apiHostCache.has(normalized) && apiHostCache.size >= API_HOST_CACHE_MAX) {
+    const oldest = apiHostCache.keys().next().value;
+    if (oldest !== undefined) apiHostCache.delete(oldest);
+  }
+  apiHostCache.set(normalized, resolved);
+  return resolved;
+}
+
+/** Pull the `hostname <value>` line out of `ssh -G` output, or null. */
+function parseSshHostname(stdout: string): string | null {
+  const match = stdout.match(/^hostname\s+(\S+)\s*$/m);
+  return match && match[1] ? match[1] : null;
+}
+
+/** The hosts that never need an `ssh -G` spawn: the three cloud domains, and
+ *  anything that is not a legal hostname (empty, leading "-", bad charset).
+ *  Returns the answer, or null when ssh has to be asked. */
+function resolveWithoutSsh(normalized: string): string | null {
+  if (CLOUD_HOSTS.has(normalized)) return normalized;
+  if (!normalized || normalized.startsWith("-") || !HOSTNAME_CHARSET_RE.test(normalized)) {
+    return normalized;
+  }
+  return null;
+}
+
 /** Test-only escape hatch: clears `apiHostForRemote`'s cache, mirroring
  *  `__clearRemoteHostsCacheForTest` below for the same reason (deterministic,
  *  order-independent tests). */
 export function __clearApiHostCacheForTest(): void {
   apiHostCache.clear();
+  apiHostInflight.clear();
+}
+
+/** Test-only: how many hosts the cache holds (bound check). */
+export function __apiHostCacheSizeForTest(): number {
+  return apiHostCache.size;
+}
+
+/**
+ * Non-blocking twin of {@link apiHostForRemote}: same normalization, guards,
+ * cloud short-circuit, transport-alias mapping and fallbacks, but `ssh -G` runs
+ * through the async `run` (so through `coreSpawn`) and never holds the main
+ * thread. Resolves once per host for the process lifetime (bounded cache,
+ * concurrent callers share one spawn) and never rejects.
+ */
+export async function resolveApiHost(remoteHost: string): Promise<string> {
+  const normalized = remoteHost.trim().toLowerCase();
+  const cached = apiHostCache.get(normalized);
+  if (cached !== undefined) return cached;
+  const direct = resolveWithoutSsh(normalized);
+  if (direct !== null) return rememberApiHost(normalized, direct);
+  const pending = apiHostInflight.get(normalized);
+  if (pending) return pending;
+  const task = (async () => {
+    let resolved = normalized;
+    try {
+      const res = await run(
+        [process.env.AGETOR_SSH_BIN || "ssh", "-G", "--", normalized],
+        undefined,
+        SSH_RESOLVE_TIMEOUT_MS,
+      );
+      if (res.ok) resolved = parseSshHostname(res.stdout) ?? resolved;
+    } catch {
+      // Missing binary, spawn error, etc. — resolved stays normalized.
+    }
+    resolved = SSH_TRANSPORT_ALIASES.get(resolved) ?? resolved;
+    return rememberApiHost(normalized, resolved);
+  })();
+  apiHostInflight.set(normalized, task);
+  try {
+    return await task;
+  } finally {
+    apiHostInflight.delete(normalized);
+  }
 }
 
 /**
@@ -121,9 +201,12 @@ export function __clearApiHostCacheForTest(): void {
  * failure (missing `ssh` binary, non-zero exit, timeout, unparseable
  * output, empty resolved hostname) falls back to returning `remoteHost`
  * unchanged — today's behavior. Synchronous and cached (see `apiHostCache`
- * above) because this feeds `gitlabApiBase` (H2, gitlab.ts), which is called
- * inline from ~25 template-literal call sites that have no reason to become
- * async just for this.
+ * above) because this feeds `gitlabApiBase` (H2, gitlab.ts) and
+ * `bitbucketServerError`, which are called inline from ~55 sites. A cache miss
+ * still spawns `ssh -G` synchronously (<= SSH_RESOLVE_TIMEOUT_MS, once per
+ * host): every async entry that can learn a host first primes the cache through
+ * {@link resolveApiHost} (`providerRemoteForDir`, `gitlabToken`), so on those
+ * paths this is a cache hit. New async code should call `resolveApiHost`.
  *
  * Binary overridable via `AGETOR_SSH_BIN` (house pattern — `AGETOR_TMUX_BIN`
  * in tmux-resolution.ts, `AGETOR_CLAUDE_BIN`/`AGETOR_CODEX_BIN`/… in
@@ -155,10 +238,7 @@ export function apiHostForRemote(remoteHost: string): string {
   // that already IS exactly one of the three cloud domains is unambiguous
   // (there's no legitimate alias resolution that could improve on it), so
   // short-circuit before ever spawning ssh.
-  if (CLOUD_HOSTS.has(normalized)) {
-    apiHostCache.set(normalized, normalized);
-    return normalized;
-  }
+  if (CLOUD_HOSTS.has(normalized)) return rememberApiHost(normalized, normalized);
 
   // Guard rather than spawn: an empty host is nothing to resolve, a leading
   // "-" could otherwise be misread by ssh as an option, and a hostname
@@ -169,8 +249,7 @@ export function apiHostForRemote(remoteHost: string): string {
   // this guard is the cheap first line of defense that also sidesteps ever
   // spawning a process for garbage input.
   if (!normalized || normalized.startsWith("-") || !HOSTNAME_CHARSET_RE.test(normalized)) {
-    apiHostCache.set(normalized, normalized);
-    return normalized;
+    return rememberApiHost(normalized, normalized);
   }
 
   const sshBin = process.env.AGETOR_SSH_BIN || "ssh";
@@ -186,8 +265,7 @@ export function apiHostForRemote(remoteHost: string): string {
       timeout: SSH_RESOLVE_TIMEOUT_MS,
     });
     if (res.status === 0 && typeof res.stdout === "string") {
-      const match = res.stdout.match(/^hostname\s+(\S+)\s*$/m);
-      if (match && match[1]) resolved = match[1];
+      resolved = parseSshHostname(res.stdout) ?? resolved;
     }
   } catch {
     // Missing binary, spawn error, etc. — resolved stays normalized.
@@ -198,8 +276,7 @@ export function apiHostForRemote(remoteHost: string): string {
   // back to the cloud domain it's a transport stand-in for.
   resolved = SSH_TRANSPORT_ALIASES.get(resolved) ?? resolved;
 
-  apiHostCache.set(normalized, resolved);
-  return resolved;
+  return rememberApiHost(normalized, resolved);
 }
 
 /** Map a canonical provider host (as produced by `canonicalGitHost`) to the
@@ -255,6 +332,9 @@ export async function providerRemoteForDir(
     if (!parsed) continue;
     const provider = providerForHost(parsed.host);
     if (!provider) continue;
+    // Prime the per-host cache off the main thread so the sync
+    // `apiHostForRemote` readers downstream (gitlab.ts, bitbucket.ts) hit it.
+    await resolveApiHost(parsed.rawHost);
     return {
       remote: name,
       info: {
@@ -401,7 +481,7 @@ export async function remoteHostsForDirs(dirs: string[]): Promise<string[]> {
  */
 export async function gitlabToken(remoteHost: string | null): Promise<string | null> {
   if (remoteHost === null) return gitlabCloudToken(null);
-  const resolved = apiHostForRemote(remoteHost);
+  const resolved = await resolveApiHost(remoteHost);
   if (resolved === "gitlab.com") return gitlabCloudToken(remoteHost);
   return gitlabSelfHostedToken(remoteHost, resolved);
 }

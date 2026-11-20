@@ -186,7 +186,7 @@ async function getMainViewUrl(): Promise<string> {
 // `Bun.which("claude")` / "codex" / "tmux" can find what's there. Has to run
 // before the API server starts handling /agents probes. Idempotent and safe
 // in dev runs — the merge dedupes.
-rehydratePath();
+await rehydratePath();
 
 // Boot order (boot-gate.ts): bind the API port first — taking it over from a
 // live background/CLI core — then restore (`reconcileOrphans` and friends),
