@@ -13603,7 +13603,7 @@ export async function unarchiveTask(taskId: string): Promise<{ task: Task } | { 
   // mirror, m8) — a gate reached then would leave the card on whatever column
   // it held before archiving. A pending gate forces Review now that the row
   // is live again (other statuses keep the owner's parked column).
-  restorePipelineGateColumn(taskId);
+  await restorePipelineGateColumn(taskId);
   // A step row's worktree belongs to its pipeline parent (D2) — restoring
   // it here (were a step row ever unarchived on its own, which the normal
   // UI never does) would be redundant at best and racy at worst against the

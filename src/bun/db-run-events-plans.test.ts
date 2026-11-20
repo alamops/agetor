@@ -234,6 +234,8 @@ function invocationTable(s: Seed): Record<string, Invocation[]> {
   const anchor = { maxEvents: 3000, maxBytes: 16 * 1024 * 1024 };
   return {
     "runs.events": [{ label: "events(runId)", run: () => runs.events(s.runId) }],
+    "runs.mainTextEvents": [{ label: "mainTextEvents(runId)", run: () => runs.mainTextEvents(s.runId) }],
+    "runs.firstMainStatusData": [{ label: "firstMainStatusData(runId)", run: () => runs.firstMainStatusData(s.runId) }],
     "runs.lastEventData": [{ label: "lastEventData(runId)", run: () => runs.lastEventData(s.runId) }],
     "runs.lastToolUseData": [{ label: "lastToolUseData(runId)", run: () => runs.lastToolUseData(s.runId) }],
     "runs.mainUserRows": [{ label: "mainUserRows(runId)", run: () => runs.mainUserRows(s.runId) }],

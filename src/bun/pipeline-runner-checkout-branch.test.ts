@@ -117,7 +117,7 @@ test("a step's run start/settle writes the parent; refresh on a drifted worktree
     ...done.pipelineRun!,
     active: [{ taskId: step!.id, stepId: step!.pipelineStepId!, seq: 1 }],
   } as unknown as PipelineRunState;
-  __forTest.propagateWorktreeToActiveSteps(refreshed.parent, runWithActive);
+  await __forTest.propagateWorktreeToActiveSteps(refreshed.parent, runWithActive);
   expect(tasks.get(step!.id)?.checkoutBranch).toBe("implement/x");
 });
 

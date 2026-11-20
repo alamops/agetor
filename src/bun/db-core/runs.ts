@@ -304,6 +304,30 @@ export function makeRuns(conn: Database) {
        ORDER BY id ASC`,
       ).all(runId);
     },
+    /** A run's MAIN-stream text rows (`subagent_id IS NULL`, streams
+     *  `assistant`, `status` and `stderr`) in id order, as `{ stream, data }`.
+     *  The pipeline runner's settle reads exactly these to find a step's
+     *  `<handoff>` and the tail of a failure; fetching them instead of
+     *  `events(runId)` keeps tool calls, tool results and thinking rows (the
+     *  bulk of a long run) from being cloned across the database thread.
+     *  `INDEXED BY idx_run_events_run` bounds the read to this run's rows. */
+    mainTextEvents(runId: string) {
+      return conn.query<{ stream: string; data: string }, [string]>(
+        `SELECT stream, data FROM run_events INDEXED BY idx_run_events_run
+       WHERE run_id = ? AND subagent_id IS NULL AND stream IN ('assistant', 'status', 'stderr')
+       ORDER BY id ASC`,
+      ).all(runId);
+    },
+    /** The raw `data` of a run's first MAIN-stream `status` row, or `null`
+     *  (a continuation run's opening line says who started it). Pinned like
+     *  `mainTextEvents`. */
+    firstMainStatusData(runId: string): string | null {
+      const row = conn.query<{ data: string }, [string]>(
+        `SELECT data FROM run_events INDEXED BY idx_run_events_run
+       WHERE run_id = ? AND stream = 'status' AND subagent_id IS NULL ORDER BY id ASC LIMIT 1`,
+      ).get(runId);
+      return row ? row.data : null;
+    },
     /** The most recently persisted MAIN-stream event's raw `data` for a run
      *  (`subagent_id IS NULL`, like `seenLineUuidsForTask`), or `null` if the
      *  run has none yet.

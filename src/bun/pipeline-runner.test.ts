@@ -979,7 +979,7 @@ test("a pipeline parked in Done survives a same-status persist, and Restart pull
   // the route's `tasks.update` does, then a same-status persist must leave
   // it alone.
   tasks.update(parentId, { column: "done" });
-  __forTest.persist(parentId, tasks.get(parentId)!.pipelineRun!);
+  await __forTest.persist(parentId, tasks.get(parentId)!.pipelineRun!);
   expect(tasks.get(parentId)!.column).toBe("done");
   expect(tasks.get(parentId)!.pipelineRun!.status).toBe("done");
 
@@ -3049,10 +3049,15 @@ test("Medium 4: a response with no valid handoff but a pending interaction block
   const retried = await retryPipelineStep(parentId, { taskId: stepAId });
   if ("error" in retried) throw new Error(retried.error);
 
+  // Wait for the running-column handler's own write (it queues behind the
+  // retry on the per-parent lock, and the database reads are asynchronous, so
+  // the retry's persist — which already clears the block — is observable
+  // first): the stale `responseKind` is what only the handler resets.
   await waitFor(() => {
     const t = tasks.get(parentId);
     const stillBlocked = t?.pipelineRun?.blocked.some((b) => b.taskId === stepAId);
-    return stillBlocked === false ? t : undefined;
+    const staleKind = t?.pipelineRun?.history.find((h) => h.stepId === A.id)?.responseKind ?? null;
+    return stillBlocked === false && staleKind === null ? t : undefined;
   });
   const afterRunning = tasks.get(parentId)!.pipelineRun!;
   const recordAfterRunning = afterRunning.history.find((h) => h.stepId === A.id);
@@ -4408,7 +4413,7 @@ test("U7(10b) an orphaned settle during a whole-run stop does NOT look back", as
     // What `cancelPipelineRun` records: the marker, then a forced status.
     run.stopRequestedAt = Date.now();
     run.status = "cancelled";
-    __forTest.persist(s.parentId, run, { preserveStatus: true });
+    await __forTest.persist(s.parentId, run, { preserveStatus: true });
 
     runs.update(C.runId, { status: "orphaned" });
     await __forTest.handleRunStatus(s.stepTaskId, C.runId, "orphaned");
@@ -4727,10 +4732,10 @@ test("L4: a finished run's parse is cached, and parsed again once the run gains 
 
   const s = await startOverlapStep("l4-parse-cache");
   try {
-    expect(__forTest.parsedRunResponse(s.firstRunId).kind).toBe("handoff-missing");
-    expect(__forTest.parsedRunResponse(s.firstRunId)).toBe(__forTest.parsedRunResponse(s.firstRunId));
+    expect((await __forTest.parsedRunResponse(s.firstRunId)).kind).toBe("handoff-missing");
+    expect(await __forTest.parsedRunResponse(s.firstRunId)).toBe(await __forTest.parsedRunResponse(s.firstRunId));
     runs.appendEvent(s.firstRunId, "assistant", await handoffReply("written by a rebuild"));
-    const reparsed = __forTest.parsedRunResponse(s.firstRunId);
+    const reparsed = await __forTest.parsedRunResponse(s.firstRunId);
     expect(reparsed.kind).toBe("handoff");
     expect(reparsed.handoff?.reason).toBe("written by a rebuild");
   } finally {
@@ -5012,7 +5017,7 @@ test("a re-settle of a stopped step that succeeded without a handoff keeps the r
     if ("error" in result) throw new Error(result.error);
 
     // The paths that used to undo the Stop: a plain persist, then re-settles.
-    __forTest.persist(s.parentId, tasks.get(s.parentId)!.pipelineRun!);
+    await __forTest.persist(s.parentId, tasks.get(s.parentId)!.pipelineRun!);
     await __forTest.resettleCurrentRun(s.stepTaskId);
     await __forTest.handleRunStatus(s.stepTaskId, s.firstRunId, "succeeded");
     await expectStoppedCleanly(s);
@@ -5122,7 +5127,7 @@ test("R3-3: Stop on the only live step from its own panel, then the user's redir
     expect(stopped.stopRequestedAt).toBeNull();
     expect(stopped.history[0]!.stoppedAt).toBeNumber();
     // A later bookkeeping persist keeps it stopped: every active execution is.
-    __forTest.persist(s.parentId, stopped);
+    await __forTest.persist(s.parentId, stopped);
     expect(tasks.get(s.parentId)!.pipelineRun!.status).toBe("cancelled");
 
     await tick();

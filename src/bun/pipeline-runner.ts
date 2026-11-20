@@ -39,7 +39,7 @@
 import { randomUUID } from "node:crypto";
 import { existsSync, mkdirSync, rmSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
-import { agentProfiles, backlog, dataDir, harnesses, pipelines, runs, subagents, tasks } from "./db.ts";
+import { agentProfiles, backlog, dataDir, harnesses, pipelines, runs, subagents, tasks } from "./db-async.ts";
 import {
   appendRunStatusLine,
   archiveTask,
@@ -175,7 +175,9 @@ function runExclusive<T>(parentId: string, fn: () => Promise<T>): Promise<T> {
   const chained = prev.then(fn, fn);
   const guard = chained.then(() => {}, () => {});
   parentChains.set(parentId, guard);
-  guard.finally(() => {
+  // `guard` never rejects (both branches of its `then` swallow), and this
+  // callback only touches a Map, so the derived promise cannot reject either.
+  void guard.finally(() => {
     if (parentChains.get(parentId) === guard) parentChains.delete(parentId);
   });
   return chained;
@@ -299,7 +301,7 @@ const COLUMN_FOR_RUN_STATUS: Partial<Record<PipelineRunStatus, ColumnId>> = {
  * mirroring a column or firing an event nobody should react to. The single
  * choke point every mutator below ends on.
  */
-function persist(parentId: string, run: PipelineRunState, opts?: { preserveStatus?: boolean }): void {
+async function persist(parentId: string, run: PipelineRunState, opts?: { preserveStatus?: boolean }): Promise<void> {
   // Always store the key: a stored row WITHOUT it is a pre-marker legacy row,
   // which `parsePipelineRunState` reads as stopped when it is `cancelled`.
   run.stopRequestedAt ??= null;
@@ -318,9 +320,12 @@ function persist(parentId: string, run: PipelineRunState, opts?: { preserveStatu
   // bookkeeping write, a reminder stamp, a reconcile pass) snap the card
   // back to `review`. `server.ts` allows that one park (`column: "done"`
   // while status is already `done`) and 409s every other column change.
-  const previousStatus = tasks.get(parentId)?.pipelineRun?.status ?? null;
-  tasks.setPipelineRun(parentId, run);
-  const parent = tasks.get(parentId);
+  // Atomic because every caller holds this parent's `withPipelineLock` (the
+  // only writer of `pipeline_run`): nothing else reads-then-writes this row
+  // between the read below and the write.
+  const previousStatus = (await tasks.get(parentId))?.pipelineRun?.status ?? null;
+  await tasks.setPipelineRun(parentId, run);
+  const parent = await tasks.get(parentId);
   if (parent?.archivedAt != null) return; // m8
   const nextColumn = COLUMN_FOR_RUN_STATUS[run.status];
   if (nextColumn && parent && parent.column !== nextColumn && previousStatus !== run.status) {
@@ -348,8 +353,8 @@ function persist(parentId: string, run: PipelineRunState, opts?: { preserveStatu
  * keep the owner's column. A no-op while still archived, for a non-pipeline
  * parent, or when the card already reads Review.
  */
-export function restorePipelineGateColumn(taskId: string): void {
-  const task = tasks.get(taskId);
+export async function restorePipelineGateColumn(taskId: string): Promise<void> {
+  const task = await tasks.get(taskId);
   const run = task?.pipelineRun;
   if (!task || !run || task.archivedAt != null) return;
   if (run.status !== "review" || task.column === "review") return;
@@ -373,12 +378,12 @@ export function restorePipelineGateColumn(taskId: string): void {
  * execution's `stoppedAt`, and an orphaned settle (agetor restarted mid-turn)
  * is not a user stop at all.
  */
-function finalizeCancelled(parentId: string, run: PipelineRunState): void {
+async function finalizeCancelled(parentId: string, run: PipelineRunState): Promise<void> {
   if (run.blocked.length === 0) {
     run.status = "cancelled";
-    persist(parentId, run, { preserveStatus: true });
+    await persist(parentId, run, { preserveStatus: true });
   } else {
-    persist(parentId, run);
+    await persist(parentId, run);
   }
 }
 
@@ -438,12 +443,12 @@ function isStopApplied(
  *  persisted. Deliberately re-fetches rather than trusting whatever the
  *  caller's own (possibly half-mutated) `run` variable holds, since that
  *  object was never written to the DB if the throw happened before its own
- *  `persist()` call — the actual DB row is untouched, so reading fresh here
+ *  `await persist()` call — the actual DB row is untouched, so reading fresh here
  *  can't double-apply a partial mutation. A no-op when the parent, its run,
  *  or this specific active entry no longer exist. */
-function persistReconcileFailure(parentId: string, taskId: string, err: unknown): void {
+async function persistReconcileFailure(parentId: string, taskId: string, err: unknown): Promise<void> {
   try {
-    const parent = tasks.get(parentId);
+    const parent = await tasks.get(parentId);
     if (!parent || !parent.pipelineRun) return;
     const run = parent.pipelineRun;
     const activeEntry = run.active.find((a) => a.taskId === taskId);
@@ -456,7 +461,7 @@ function persistReconcileFailure(parentId: string, taskId: string, err: unknown)
       message: `internal error while processing this step: ${message}`,
     });
     checkJoinIncomplete(run);
-    persist(parentId, run);
+    await persist(parentId, run);
   } catch {
     // Best-effort — if even this fails, the step just stays `active` with
     // no block until the next event or `reconcilePipelineRuns` sweep.
@@ -465,8 +470,8 @@ function persistReconcileFailure(parentId: string, taskId: string, err: unknown)
 
 /** The step's current run (`task.runId`) when it is a different run from
  *  `settledRunId`; null when this settle is still the current run. */
-function differentCurrentRunId(taskId: string, settledRunId: string): string | null {
-  const currentId = tasks.get(taskId)?.runId;
+async function differentCurrentRunId(taskId: string, settledRunId: string): Promise<string | null> {
+  const currentId = (await tasks.get(taskId))?.runId;
   if (!currentId || currentId === settledRunId) return null;
   return currentId;
 }
@@ -481,21 +486,19 @@ function differentCurrentRunId(taskId: string, settledRunId: string): string | n
  *  `ignoreRunId` is the reminder turn `sendInput` just started. That run
  *  is not a continuation; treating it as one skips the stamp and every
  *  later settle of the same execution queues another send. */
-function runningSuccessorSupersedes(taskId: string, settledRunId: string, ignoreRunId?: string): boolean {
-  const currentId = differentCurrentRunId(taskId, settledRunId);
+async function runningSuccessorSupersedes(taskId: string, settledRunId: string, ignoreRunId?: string): Promise<boolean> {
+  const currentId = await differentCurrentRunId(taskId, settledRunId);
   if (!currentId || currentId === ignoreRunId) return false;
-  return runs.get(currentId)?.status === "running";
+  return (await runs.get(currentId))?.status === "running";
 }
 
-/** A run's MAIN-stream rows (`subagentId == null`) in id order, loaded ONCE
- *  per settle (L-R6) — both derivations below read from this one array
- *  instead of each re-fetching the whole `run_events` table for the run.
- *  `runs.events` has no stream filter (db.ts isn't this module's to change;
- *  a `stream IN (…)` variant there would be the real fix), so the filter is
- *  applied here, after the single load. */
+/** A run's MAIN-stream text rows (assistant, status, stderr; `subagentId` null)
+ *  in id order, loaded ONCE per settle (L-R6) — both derivations below read
+ *  from this one array. `runs.mainTextEvents` filters in SQL, so the tool and
+ *  thinking rows of a long run are never cloned across the database thread. */
 type MainStreamEvent = { stream: string; data: string };
-function mainStreamEventsForRun(runId: string): MainStreamEvent[] {
-  return runs.events(runId).filter((e) => e.subagentId == null);
+async function mainStreamEventsForRun(runId: string): Promise<MainStreamEvent[]> {
+  return runs.mainTextEvents(runId);
 }
 
 /** The `assistant` rows of {@link mainStreamEventsForRun}'s output, one
@@ -541,10 +544,10 @@ const parsedResponseCache = new Map<string, ParsedRunResponse>();
 
 /** The parse of `runId`'s final response with no pending interactions,
  *  from the cache when the run has finished and gained no events since. */
-function parsedRunResponse(runId: string): ClassifiedResponse {
-  const row = runs.get(runId);
+async function parsedRunResponse(runId: string): Promise<ClassifiedResponse> {
+  const row = await runs.get(runId);
   const finished = row != null && row.status !== "running" && row.endedAt != null;
-  const maxEventId = finished ? runs.maxEventIdForRun(runId) : -1;
+  const maxEventId = finished ? await runs.maxEventIdForRun(runId) : -1;
   if (finished) {
     const hit = parsedResponseCache.get(runId);
     if (hit && hit.maxEventId === maxEventId) {
@@ -556,8 +559,8 @@ function parsedRunResponse(runId: string): ClassifiedResponse {
   }
   const parsed = classifyStepResponse({
     runStatus: "succeeded",
-    assistantText: assistantSegmentsFrom(mainStreamEventsForRun(runId)),
-    codeAware: handoffScanIsCodeAware(row ? harnesses.getByIdOrKind(row.agent)?.kind : undefined),
+    assistantText: assistantSegmentsFrom(await mainStreamEventsForRun(runId)),
+    codeAware: handoffScanIsCodeAware(row ? (await harnesses.getByIdOrKind(row.agent))?.kind : undefined),
     pendingInteractions: 0,
   });
   if (finished) {
@@ -575,10 +578,10 @@ function parsedRunResponse(runId: string): ClassifiedResponse {
 /** Classify a SUCCEEDED run's final response, at most once per `cache`. A
  *  parse without a handoff becomes `user-ask` while a question is pending on
  *  that run — the same precedence as `classifyStepResponse`. */
-function classifyRunResponse(taskId: string, runId: string, cache: Map<string, ClassifiedResponse>): ClassifiedResponse {
+async function classifyRunResponse(taskId: string, runId: string, cache: Map<string, ClassifiedResponse>): Promise<ClassifiedResponse> {
   const hit = cache.get(runId);
   if (hit) return hit;
-  const parsed = parsedRunResponse(runId);
+  const parsed = await parsedRunResponse(runId);
   const classified: ClassifiedResponse =
     parsed.handoff === null && pendingInteractionsForRun(taskId, runId) > 0
       ? { kind: "user-ask", handoff: null, error: null }
@@ -609,19 +612,19 @@ function classifyRunResponse(taskId: string, runId: string, cache: Map<string, C
  * handoff is not superseded that way: a later run without one (a
  * continuation's acknowledgement) doesn't undo the step's result.
  */
-function findHandoffSupplier(
+async function findHandoffSupplier(
   taskId: string,
   historyEntry: PipelineStepRecord | undefined,
   cache: Map<string, ClassifiedResponse>,
   succeededRunId?: string,
-): HandoffSupplier | null {
-  const rows = runs.listForTask(taskId);
+): Promise<HandoffSupplier | null> {
+  const rows = await runs.listForTask(taskId);
   const windowStart = historyEntry ? attemptWindowStart(historyEntry) : 0;
   const candidates = rows.map((r) =>
     r.id === succeededRunId ? { ...r, status: "succeeded" as const, endedAt: r.endedAt ?? Date.now() } : r,
   );
   for (const id of handoffLookbackOrder(candidates, windowStart)) {
-    const classified = classifyRunResponse(taskId, id, cache);
+    const classified = await classifyRunResponse(taskId, id, cache);
     if ((classified.kind === "handoff" || classified.kind === "handoff-blocked") && classified.handoff) {
       const supplierRow = candidates.find((r) => r.id === id)!;
       // Newer = started after the blocked turn ended, i.e. ran after the
@@ -648,13 +651,13 @@ function findHandoffSupplier(
  * also gets a status line saying so (O2) — once per supplier, so a
  * re-settle of the same execution doesn't repeat it.
  */
-function recordHandoffSource(
+async function recordHandoffSource(
   taskId: string,
   settlingRunId: string,
   historyEntry: PipelineStepRecord,
   supplier: HandoffSupplier,
   newerRun: boolean,
-): void {
+): Promise<void> {
   const fromOtherRun = supplier.runId !== settlingRunId;
   const alreadyRecorded = historyEntry.handoffFromOtherRun === true && historyEntry.handoffRunId === supplier.runId;
   historyEntry.responseKind = supplier.kind;
@@ -674,14 +677,14 @@ function recordHandoffSource(
  *  Two continuations can open in the same millisecond, so a `startedAt` tie
  *  goes to the task's current run (the one opened last), as in
  *  {@link currentRunRow}. */
-function newerRunThanSupplier(
+async function newerRunThanSupplier(
   taskId: string,
   historyEntry: PipelineStepRecord | undefined,
   supplier: HandoffSupplier,
-): boolean {
+): Promise<boolean> {
   const windowStart = historyEntry ? attemptWindowStart(historyEntry) : 0;
-  const currentRunId = tasks.get(taskId)?.runId ?? null;
-  return runs.listForTask(taskId).some((r) =>
+  const currentRunId = (await tasks.get(taskId))?.runId ?? null;
+  return (await runs.listForTask(taskId)).some((r) =>
     r.id !== supplier.runId &&
     r.startedAt >= windowStart &&
     (r.startedAt > supplier.startedAt || (r.startedAt === supplier.startedAt && r.id === currentRunId)),
@@ -713,11 +716,11 @@ const releaseGraceTimers = new Map<string, ReturnType<typeof setTimeout>>();
  *  the first one's notification starting a continuation while the second
  *  still runs — holds that continuation on an agent tagged with the earlier
  *  run. */
-function releaseGraceDeadline(taskId: string, runId: string): number | null {
-  const endedAt = runs.get(runId)?.endedAt;
+async function releaseGraceDeadline(taskId: string, runId: string): Promise<number | null> {
+  const endedAt = (await runs.get(runId))?.endedAt;
   if (endedAt == null) return null;
   let releasedAt = 0;
-  for (const s of subagents.listForTask(taskId)) {
+  for (const s of await subagents.listForTask(taskId)) {
     if (s.endedAt == null || s.startedAt > endedAt || s.endedAt <= endedAt) continue;
     releasedAt = Math.max(releasedAt, s.endedAt);
   }
@@ -932,11 +935,11 @@ function reasonMessage(reason: string | undefined, stepName: string): string {
  * caller runs that validation, since it also needs to decide what to do
  * with an invalid stored graph before ever reaching this far.
  */
-function buildSnapshot(
+async function buildSnapshot(
   graph: PipelineGraph,
   maxSteps: number,
   now: number,
-): { snapshot: PipelineRunSnapshot } | { error: string } {
+): Promise<{ snapshot: PipelineRunSnapshot } | { error: string }> {
   const neededIds = new Set<string>();
   for (const step of graph.steps) {
     // A human gate spawns nothing — it needs no profile, and requiring one
@@ -948,7 +951,7 @@ function buildSnapshot(
   }
   const profiles: Record<string, AgentProfileSnapshot> = {};
   for (const id of neededIds) {
-    const profile = agentProfiles.get(id);
+    const profile = await agentProfiles.get(id);
     if (!profile) {
       const owner = graph.steps.find((s) => s.agentProfileId === id)?.name;
       return {
@@ -957,7 +960,7 @@ function buildSnapshot(
           : `agent "${id}" (a step's delegation list) no longer exists`,
       };
     }
-    const harness = harnesses.getByIdOrKind(profile.harness);
+    const harness = await harnesses.getByIdOrKind(profile.harness);
     if (!harness) return { error: `harness for agent "${profile.name}" no longer exists` };
     profiles[id] = snapshotFromProfile(profile, { kind: harness.kind, label: harness.label }, now);
   }
@@ -1001,14 +1004,14 @@ async function refreshParentWorktree(parent: Task, run: PipelineRunState): Promi
   const prepared = await prepareTaskWorkdir(parent, {
     takenBranches: await branchesPinnedByOtherTasks(
       parent.id,
-      tasks.list(),
+      await tasks.list(),
       parentMulti ? { resolveRoot: repoRoot } : {},
     ),
   });
   if ("error" in prepared) return { error: prepared.error };
   // `prepared.repositories` is present exactly when the multi path ran.
   if (prepared.repositories) {
-    tasks.setRepositories(parent.id, prepared.repositories);
+    await tasks.setRepositories(parent.id, prepared.repositories);
     // setRepositories keeps a stored checkout (a concurrent settle/archive
     // write wins over this snapshot); the live reads from THIS prepare are
     // authoritative for the parent row, which is the pipeline's last-seen
@@ -1020,16 +1023,16 @@ async function refreshParentWorktree(parent: Task, run: PipelineRunState): Promi
   // touches nothing; an unknown read (`recordableCheckout` → undefined) keeps
   // the stored value instead of erasing it.
   const checkout = recordableCheckout(prepared);
-  if (checkout !== undefined) tasks.setCheckoutBranch(parent.id, checkout);
-  if (prepared.warning) noteParentWorktreeWarning(parent.id, prepared.warning);
+  if (checkout !== undefined) await tasks.setCheckoutBranch(parent.id, checkout);
+  if (prepared.warning) await noteParentWorktreeWarning(parent.id, prepared.warning);
   // Only write the row when something actually changed — an unconditional
   // `tasks.update` bumps `updated_at` on every refresh, which re-renders the
   // board card for a no-op and defeats `reconcileById`'s identity
   // preservation in the webview (same rationale as the watermark columns).
   if (parent.branch === prepared.branch && parent.worktreePath === prepared.worktreePath) {
-    return { parent: tasks.get(parent.id) ?? parent };
+    return { parent: (await tasks.get(parent.id)) ?? parent };
   }
-  const updated = tasks.update(parent.id, { branch: prepared.branch, worktreePath: prepared.worktreePath }) ?? parent;
+  const updated = (await tasks.update(parent.id, { branch: prepared.branch, worktreePath: prepared.worktreePath })) ?? parent;
   return { parent: updated };
 }
 
@@ -1038,10 +1041,10 @@ async function refreshParentWorktree(parent: Task, run: PipelineRunState): Promi
  *  branch). A pipeline parent never runs an agent of its own, so the line
  *  goes on the most recent run of any of its step tasks; console only when
  *  no step has run yet. */
-function noteParentWorktreeWarning(parentId: string, warning: string): void {
+async function noteParentWorktreeWarning(parentId: string, warning: string): Promise<void> {
   let latest: { taskId: string; runId: string; startedAt: number } | null = null;
-  for (const step of tasks.stepsForParent(parentId)) {
-    const run = runs.listForTask(step.id)[0];
+  for (const step of await tasks.stepsForParent(parentId)) {
+    const run = (await runs.listForTask(step.id))[0];
     if (run && (!latest || run.startedAt > latest.startedAt)) {
       latest = { taskId: step.id, runId: run.id, startedAt: run.startedAt };
     }
@@ -1059,11 +1062,11 @@ function withoutPrs(repos: readonly TaskRepository[]): TaskRepository[] {
  *  still `active` in `run`, so each step's own `startTask` → `prepareWorkdir`
  *  reuse-check sees the up-to-date path instead of whatever it was inserted
  *  with (M6). No-op for a row already in sync. */
-function propagateWorktreeToActiveSteps(parent: Task, run: PipelineRunState): void {
+async function propagateWorktreeToActiveSteps(parent: Task, run: PipelineRunState): Promise<void> {
   for (const a of run.active) {
-    const step = tasks.get(a.taskId);
+    const step = await tasks.get(a.taskId);
     if (step && (step.worktreePath !== parent.worktreePath || step.branch !== parent.branch)) {
-      tasks.update(a.taskId, { worktreePath: parent.worktreePath, branch: parent.branch });
+      await tasks.update(a.taskId, { worktreePath: parent.worktreePath, branch: parent.branch });
     }
     // A multi-repository parent's step must carry the same repository set so
     // its own read paths (diff/status/prompt) see every repository.
@@ -1072,7 +1075,7 @@ function propagateWorktreeToActiveSteps(parent: Task, run: PipelineRunState): vo
       const parentNames = parent.repositories.map((r) => `${r.name}:${r.worktreePath}:${r.branch}`).join("|");
       // Without the parent's PRs: `setRepositories` falls back to the incoming
       // `prs` when the step has none yet, and the step's history is its own.
-      if (stepNames !== parentNames) tasks.setRepositories(a.taskId, withoutPrs(parent.repositories));
+      if (stepNames !== parentNames) await tasks.setRepositories(a.taskId, withoutPrs(parent.repositories));
       // The step shares the parent's checkouts; mirror the parent's last-seen
       // values too (setRepositories alone keeps the step's older stored value).
       recordPreparedRepositoryCheckouts(a.taskId, parent.repositories);
@@ -1081,7 +1084,7 @@ function propagateWorktreeToActiveSteps(parent: Task, run: PipelineRunState): vo
     // step→parent mirror inside `setCheckoutBranch` writes the same value
     // back, a no-op).
     if (step && (step.checkoutBranch ?? null) !== (parent.checkoutBranch ?? null)) {
-      tasks.setCheckoutBranch(a.taskId, parent.checkoutBranch ?? null);
+      await tasks.setCheckoutBranch(a.taskId, parent.checkoutBranch ?? null);
     }
   }
 }
@@ -1177,12 +1180,12 @@ function holdForArchivedParent(
  * resolve/join/fan-out path reaches a gate through the same machinery as an
  * agent step.
  */
-function enterHumanGate(
+async function enterHumanGate(
   parentId: string,
   run: PipelineRunState,
   step: PipelineStep,
   arrivals: PipelineJoinArrival[],
-): LaunchResult {
+): Promise<LaunchResult> {
   const seq = nextRunSeq(run);
   run.seqCounter = seq;
   const now = Date.now();
@@ -1197,7 +1200,7 @@ function enterHumanGate(
     handoff: null,
     nextStepIds: [],
   });
-  persist(parentId, run);
+  await persist(parentId, run);
   return { ok: true, runId: null };
 }
 
@@ -1262,7 +1265,7 @@ async function launchStep(
   const snapshot = run.snapshot;
   if (!snapshot) {
     upsertBlocked(run, { taskId: null, stepId: step.id, kind: "profile-missing", message: "pipeline run has no snapshot" });
-    persist(parent.id, run);
+    await persist(parent.id, run);
     return { ok: false };
   }
 
@@ -1273,7 +1276,7 @@ async function launchStep(
   // an archive that raced this launch through the same per-parent lock (or,
   // belt-and-braces, landed outside it) must never have a step inserted, or
   // the worktree refreshed, behind its back.
-  const currentParent = tasks.get(parent.id);
+  const currentParent = await tasks.get(parent.id);
   if (tombstonedPipelineParents.has(parent.id) || !currentParent) {
     return { ok: false };
   }
@@ -1281,11 +1284,11 @@ async function launchStep(
   // recorded even on an archived parent (`persist` stores the run but skips
   // the column write and event), because the gate is data, not a launch.
   if (isHumanStep(step)) {
-    return enterHumanGate(parent.id, run, step, pendingArrivals);
+    return await enterHumanGate(parent.id, run, step, pendingArrivals);
   }
   if (currentParent.archivedAt != null) {
     holdForArchivedParent(run, step, previous, opts);
-    persist(parent.id, run);
+    await persist(parent.id, run);
     return { ok: false };
   }
   parent = currentParent;
@@ -1303,7 +1306,7 @@ async function launchStep(
         message: `could not prepare the pipeline's worktree: ${prepared.error}`,
         pending: pendingLaunch(step.id, previous, opts),
       });
-      persist(parent.id, run);
+      await persist(parent.id, run);
       return { ok: false };
     }
     parent = prepared.parent;
@@ -1317,7 +1320,7 @@ async function launchStep(
       message: `reached the ${effectiveStepCap(run)}-step cap for this run — retry to keep going, or stop here`,
       pending: pendingLaunch(step.id, previous, opts),
     });
-    persist(parent.id, run);
+    await persist(parent.id, run);
     return { ok: false };
   }
   const profile = step.agentProfileId ? snapshot.profiles[step.agentProfileId] : undefined;
@@ -1329,7 +1332,7 @@ async function launchStep(
       message: `step "${step.name}" has no agent`,
       pending: pendingLaunch(step.id, previous, opts),
     });
-    persist(parent.id, run);
+    await persist(parent.id, run);
     return { ok: false };
   }
 
@@ -1428,7 +1431,7 @@ async function launchStep(
   const childId = randomUUID();
   // Before the row exists: no card can register for this step without its parent known.
   notePipelineParent(childId, parent.id);
-  tasks.insert({
+  await tasks.insert({
     id: childId,
     title: `${run.pipelineName} · ${step.name}`,
     prompt: composed,
@@ -1492,21 +1495,21 @@ async function launchStep(
     nextStepIds: [],
     ...(opts?.returnToStepId ? { returnToStepId: opts.returnToStepId } : {}),
   });
-  persist(parent.id, run);
+  await persist(parent.id, run);
 
   const started = await startTask(childId);
 
   // M7: the parent may have been deleted WHILE `startTask` was in flight
   // (an unlocked, very-slow spawn racing a delete that queued behind this
   // same launch — belt-and-braces on top of the pre-insert check above).
-  if (tombstonedPipelineParents.has(parent.id) || !tasks.get(parent.id)) {
+  if (tombstonedPipelineParents.has(parent.id) || !(await tasks.get(parent.id))) {
     if (!("error" in started)) await deleteTask(childId, { fromPipeline: true });
     return { ok: false };
   }
 
   if ("error" in started) {
     upsertBlocked(run, { taskId: childId, stepId: step.id, kind: "step-failed", message: started.error });
-    persist(parent.id, run);
+    await persist(parent.id, run);
     return { ok: false };
   }
   return { ok: true, runId: started.runId, ...(started.pending ? { pending: true as const } : {}) };
@@ -1642,7 +1645,7 @@ async function retryActiveExecutions(
     }
   }
   checkJoinIncomplete(run);
-  persist(parent.id, run);
+  await persist(parent.id, run);
   return first ?? { error: "retry failed for every blocked step" };
 }
 
@@ -1731,7 +1734,7 @@ async function performPipelineRetry(
   // Minor 5: a delete cascade tombstones the parent (and removes its row)
   // before tearing down any step task — a retry racing in through this same
   // per-parent lock must bail before ever touching the worktree.
-  if (tombstonedPipelineParents.has(parent.id) || !tasks.get(parent.id)) {
+  if (tombstonedPipelineParents.has(parent.id) || !(await tasks.get(parent.id))) {
     return { error: "pipeline task no longer exists" };
   }
   if (parent.archivedAt != null) {
@@ -1740,7 +1743,7 @@ async function performPipelineRetry(
   const refreshed = await refreshParentWorktree(parent, run);
   if ("error" in refreshed) return { error: refreshed.error };
   const parentRow = refreshed.parent;
-  propagateWorktreeToActiveSteps(parentRow, run);
+  await propagateWorktreeToActiveSteps(parentRow, run);
 
   // A Retry resumes a stopped run: clear the marker before relaunching so
   // the relaunched steps' persists and settles see a live run. Restored if
@@ -1760,7 +1763,7 @@ async function performPipelineRetry(
     // pendingResult === null` check, which was vacuously true either way.
     const pendingResult = await retryPendingBlocks(parentRow, run);
     checkJoinIncomplete(run);
-    persist(parentRow.id, run);
+    await persist(parentRow.id, run);
     if (pendingResult && !result) result = pendingResult;
   }
 
@@ -1768,7 +1771,7 @@ async function performPipelineRetry(
     if (stoppedAt !== null) {
       run.stopRequestedAt = stoppedAt;
       run.status = statusBefore;
-      persist(parentRow.id, run);
+      await persist(parentRow.id, run);
     }
     return "error" in activeResult ? { error: activeResult.error } : { error: "nothing to retry" };
   }
@@ -1782,7 +1785,7 @@ async function performPipelineRetry(
     );
     blockStoppedLeftovers(run, restarted);
     checkJoinIncomplete(run);
-    persist(parentRow.id, run);
+    await persist(parentRow.id, run);
   }
   return result;
 }
@@ -1814,10 +1817,10 @@ export async function startPipelineRun(
     // Minor 5: a delete cascade tombstones the parent (and removes its row)
     // before tearing down any step task — a start/restart racing in through
     // this same per-parent lock must bail before touching the worktree.
-    if (tombstonedPipelineParents.has(parent.id) || !tasks.get(parent.id)) {
+    if (tombstonedPipelineParents.has(parent.id) || !(await tasks.get(parent.id))) {
       return { error: "pipeline task no longer exists" };
     }
-    const fresh = tasks.get(parent.id) ?? parent;
+    const fresh = (await tasks.get(parent.id)) ?? parent;
     if (!fresh.pipelineId) return { error: "not a pipeline task" };
     if (fresh.archivedAt != null) return { error: "pipeline task is archived — unarchive it first" };
 
@@ -1878,12 +1881,12 @@ export async function startPipelineRun(
     // onto a run's frozen snapshot — an edited-in-place or otherwise
     // corrupted graph must fail the run start with a clear error instead of
     // reaching `buildSnapshot`/the runner with malformed shape.
-    const pipeline = pipelines.get(fresh.pipelineId);
+    const pipeline = await pipelines.get(fresh.pipelineId);
     let snapshot: PipelineRunSnapshot;
     if (pipeline) {
       const validated = validatePipelineGraph(pipeline.graph);
       if (!validated.ok) return { error: `pipeline graph is invalid: ${validated.error}` };
-      const built = buildSnapshot(validated.graph, pipeline.maxSteps, Date.now());
+      const built = await buildSnapshot(validated.graph, pipeline.maxSteps, Date.now());
       if ("error" in built) return { error: built.error };
       snapshot = built.snapshot;
     } else if (run.snapshot) {
@@ -1935,7 +1938,7 @@ export async function startPipelineRun(
     // it. The explicit `cancelRun` on `restartTargets` is folded into this
     // — `archiveTask({stopRun})` is exactly the Stop button's own path.
     if (opts?.restart) {
-      for (const step of tasks.list()) {
+      for (const step of await tasks.list()) {
         if (step.pipelineParentId !== fresh.id || step.archivedAt != null) continue;
         cancelPendingForTask(step.id, "pipeline restarted");
         const archived = await archiveTask(step.id, { force: true, stopRun: true, fromPipeline: true });
@@ -1967,8 +1970,8 @@ export async function startPipelineRun(
     // the parent's column to `running` (L-R4: only on a status change), so
     // the column and the stored run can never disagree, and a launch that
     // throws below lands its block on a run that already exists in the DB.
-    persist(parentRow.id, run, { preserveStatus: true });
-    parentRow = tasks.get(parentRow.id) ?? parentRow;
+    await persist(parentRow.id, run, { preserveStatus: true });
+    parentRow = (await tasks.get(parentRow.id)) ?? parentRow;
 
     // Through `launchTarget`, not `launchStep` directly (M-R4): a throw
     // from the start step's own launch (an unwritable run dir, a DB error
@@ -1978,7 +1981,7 @@ export async function startPipelineRun(
     // it.
     const result = await launchTarget(parentRow, run, startStep, [], { skipWorktreeRefresh: true });
     checkJoinIncomplete(run);
-    persist(parentRow.id, run);
+    await persist(parentRow.id, run);
     if (!result.ok) {
       return { error: "pipeline failed to start — see the run's blocked step for details" };
     }
@@ -2011,7 +2014,7 @@ export async function advancePipeline(
 ): Promise<{ task: Task } | { error: string; status: 400 | 404 | 409 }> {
   return runExclusive(parentId, async () => {
     if (launchesFrozen()) return { error: LAUNCHES_FROZEN_REASON, status: 409 as const };
-    const parent = tasks.get(parentId);
+    const parent = await tasks.get(parentId);
     if (!parent || !parent.pipelineId) return { error: "not a pipeline task", status: 404 as const };
     // Minor 5: a delete cascade tombstones the parent before tearing down
     // any step task — an advance racing in through this same per-parent
@@ -2031,7 +2034,7 @@ export async function advancePipeline(
     const refreshed = await refreshParentWorktree(parent, run);
     if ("error" in refreshed) return { error: refreshed.error, status: 409 as const };
     let parentRow = refreshed.parent;
-    propagateWorktreeToActiveSteps(parentRow, run);
+    await propagateWorktreeToActiveSteps(parentRow, run);
 
     let targetTaskId: string | null = null;
     let joinStepId: string | null = null;
@@ -2069,7 +2072,10 @@ export async function advancePipeline(
       } else if (joinBlocks.length === 1 && handoffBlocks.length === 0) {
         joinStepId = joinBlocks[0]!.stepId;
       } else {
-        const reviewCandidates = run.active.filter((a) => tasks.get(a.taskId)?.column === "review");
+        const reviewCandidates: PipelineActiveStep[] = [];
+        for (const a of run.active) {
+          if ((await tasks.get(a.taskId))?.column === "review") reviewCandidates.push(a);
+        }
         if (reviewCandidates.length === 1) {
           targetTaskId = reviewCandidates[0]!.taskId;
         } else {
@@ -2116,8 +2122,8 @@ export async function advancePipeline(
       }
 
       checkJoinIncomplete(run);
-      persist(parentId, run);
-      return { task: tasks.get(parentId)! };
+      await persist(parentId, run);
+      return { task: (await tasks.get(parentId))! };
     }
 
     if (!targetTaskId) return { error: "nothing to advance", status: 409 as const };
@@ -2165,7 +2171,7 @@ export async function advancePipeline(
       historyEntry.handoffRunId = null;
       historyEntry.handoffFromOtherRun = false;
     }
-    pipelineUpdateColumn(targetTaskId, tasks.get(targetTaskId)?.runId ?? null, "done");
+    pipelineUpdateColumn(targetTaskId, (await tasks.get(targetTaskId))?.runId ?? null, "done");
 
     // m9: every target launched in THIS batch counts as a parallel sibling
     // of every other one — computed up front so the first step launched
@@ -2203,8 +2209,8 @@ export async function advancePipeline(
     }
 
     checkJoinIncomplete(run);
-    persist(parentId, run);
-    return { task: tasks.get(parentId)! };
+    await persist(parentId, run);
+    return { task: (await tasks.get(parentId))! };
   });
 }
 
@@ -2220,7 +2226,7 @@ export async function retryPipelineStep(
 ): Promise<{ task: Task } | { error: string; status: 400 | 404 | 409 }> {
   return runExclusive(parentId, async () => {
     if (launchesFrozen()) return { error: LAUNCHES_FROZEN_REASON, status: 409 as const };
-    const parent = tasks.get(parentId);
+    const parent = await tasks.get(parentId);
     if (!parent || !parent.pipelineId) return { error: "not a pipeline task", status: 404 as const };
     if (!parent.pipelineRun) return { error: "pipeline has never run", status: 409 as const };
     const run = parent.pipelineRun;
@@ -2229,7 +2235,7 @@ export async function retryPipelineStep(
     }
     const result = await performPipelineRetry(parent, run, opts?.taskId);
     if ("error" in result) return { error: result.error, status: 409 as const };
-    return { task: tasks.get(parentId)! };
+    return { task: (await tasks.get(parentId))! };
   });
 }
 
@@ -2249,7 +2255,7 @@ export async function retryPipelineStep(
  */
 export async function cancelPipelineRun(parentId: string): Promise<{ task: Task } | { error: string; status: 404 | 409 }> {
   return runExclusive(parentId, async () => {
-    const parent = tasks.get(parentId);
+    const parent = await tasks.get(parentId);
     if (!parent || !parent.pipelineId) return { error: "not a pipeline task", status: 404 as const };
     if (!parent.pipelineRun) return { error: "pipeline has never run", status: 409 as const };
     const run = parent.pipelineRun;
@@ -2288,9 +2294,9 @@ export async function cancelPipelineRun(parentId: string): Promise<{ task: Task 
       // that same run later (its row before the kill lands, a parked card
       // pulled back) is not a new turn — see `isTurnSinceStop`.
       const historyEntry = run.history.find((h) => h.taskId === a.taskId && h.seq === a.seq);
-      if (historyEntry) historyEntry.stoppedRunId = tasks.get(a.taskId)?.runId ?? null;
+      if (historyEntry) historyEntry.stoppedRunId = (await tasks.get(a.taskId))?.runId ?? null;
     }
-    persist(parentId, run);
+    await persist(parentId, run);
     for (const a of run.active) {
       clearStepTimers(a.taskId);
       // A step that is neither live nor deciding can still have work queued
@@ -2309,9 +2315,9 @@ export async function cancelPipelineRun(parentId: string): Promise<{ task: Task 
       // The grace and the busy backstop clear `responseKind` while they
       // wait; keep what the step's last turn actually answered.
       if (historyEntry.responseKind == null) {
-        const currentRunId = tasks.get(a.taskId)?.runId;
-        if (currentRunId && runs.get(currentRunId)?.status === "succeeded") {
-          historyEntry.responseKind = classifyRunResponse(a.taskId, currentRunId, new Map()).kind;
+        const currentRunId = (await tasks.get(a.taskId))?.runId;
+        if (currentRunId && (await runs.get(currentRunId))?.status === "succeeded") {
+          historyEntry.responseKind = (await classifyRunResponse(a.taskId, currentRunId, new Map())).kind;
         }
       }
       historyEntry.endedAt = Date.now();
@@ -2320,8 +2326,8 @@ export async function cancelPipelineRun(parentId: string): Promise<{ task: Task 
 
     for (const t of runningTargets) await cancelLiveRunOfTask(t.taskId);
 
-    finalizeCancelled(parentId, run);
-    return { task: tasks.get(parentId)! };
+    await finalizeCancelled(parentId, run);
+    return { task: (await tasks.get(parentId))! };
   });
 }
 
@@ -2429,7 +2435,7 @@ export async function reviewHumanStep(
 ): Promise<{ task: Task } | { error: string; status: 400 | 404 | 409 }> {
   const outcome = await runExclusive(parentId, async (): Promise<ReviewHumanStepResult> => {
     if (launchesFrozen()) return { error: LAUNCHES_FROZEN_REASON, status: 409 as const };
-    const parent = tasks.get(parentId);
+    const parent = await tasks.get(parentId);
     if (!parent || !parent.pipelineId) return { error: "not a pipeline task", status: 404 as const };
     if (tombstonedPipelineParents.has(parentId)) {
       return { error: "pipeline task no longer exists", status: 404 as const };
@@ -2517,7 +2523,7 @@ export async function reviewHumanStep(
     }
 
     // Re-read the parent fresh — an archive may have raced this decision.
-    const parentRow = tasks.get(parentId) ?? parent;
+    const parentRow = (await tasks.get(parentId)) ?? parent;
     if (parentRow.archivedAt != null) {
       return { error: "pipeline task is archived — unarchive it first", status: 409 as const };
     }
@@ -2586,8 +2592,8 @@ export async function reviewHumanStep(
         }
       }
       checkJoinIncomplete(run);
-      persist(parentId, run);
-      return { task: tasks.get(parentId)! };
+      await persist(parentId, run);
+      return { task: (await tasks.get(parentId))! };
     }
 
     // Return.
@@ -2611,8 +2617,8 @@ export async function reviewHumanStep(
         humanFeedback: returnComment,
       });
       checkJoinIncomplete(run);
-      persist(parentId, run);
-      return { task: tasks.get(parentId)! };
+      await persist(parentId, run);
+      return { task: (await tasks.get(parentId))! };
     }
 
     // Resume: re-arm the previous step's settled execution as a new turn on
@@ -2634,11 +2640,11 @@ export async function reviewHumanStep(
     if (reviewResumeSendsInFlight.has(previousTaskId)) {
       return { error: "the previous step is already resuming — wait", status: 409 as const };
     }
-    const previousTask = tasks.get(previousTaskId);
+    const previousTask = (await tasks.get(previousTaskId));
     if (!previousTask) {
       return { error: "resume is unavailable for this step — run it fresh instead", status: 409 as const };
     }
-    const currentRunId = previousTask.runId ?? runs.listForTask(previousTaskId)[0]?.id ?? null;
+    const currentRunId = previousTask.runId ?? (await runs.listForTask(previousTaskId))[0]?.id ?? null;
     if (!currentRunId) {
       return { error: "resume is unavailable for this step — run it fresh instead", status: 409 as const };
     }
@@ -2658,7 +2664,7 @@ export async function reviewHumanStep(
       nextStepIds: [],
       returnToStepId: step.id,
     });
-    persist(parentId, run);
+    await persist(parentId, run);
 
     const message = composeReviewReturnMessage({
       stepName: returnTarget.name,
@@ -2699,7 +2705,7 @@ export async function reviewHumanStep(
       // Cancel the turn this send just started and report the stop rather than
       // reviving a cancelled run.
       return await runExclusive(lockedId, async () => {
-        const task = tasks.get(lockedId);
+        const task = (await tasks.get(lockedId));
         if (!task) return { error: "pipeline task no longer exists", status: 404 as const };
         const run = task.pipelineRun;
         if (run && (run.stopRequestedAt != null || run.status === "cancelled")) {
@@ -2709,7 +2715,7 @@ export async function reviewHumanStep(
           const execution = run.history.find((h) => h.taskId === taskId && h.seq === seq);
           if (execution && sent.runId) {
             execution.stoppedRunId = sent.runId;
-            persist(lockedId, run);
+            await persist(lockedId, run);
           }
           await cancelLiveRunOfTask(taskId).catch(() => {});
           return { error: "the pipeline run was stopped while the review was resuming", status: 409 as const };
@@ -2722,7 +2728,7 @@ export async function reviewHumanStep(
     // the lock and only undo the record if it is still ours: a Stop, a settle or
     // another decision that raced the send owns the run now and must win.
     await runExclusive(lockedId, async () => {
-      const run = tasks.get(lockedId)?.pipelineRun;
+      const run = (await tasks.get(lockedId))?.pipelineRun;
       if (!run || run.stopRequestedAt != null || run.status === "cancelled") return;
       if (!run.active.some((a) => a.taskId === taskId && a.seq === seq)) return;
       const record = run.history.find((h) => h.taskId === taskId && h.seq === seq);
@@ -2741,7 +2747,7 @@ export async function reviewHumanStep(
         humanRecord.human = null;
         humanRecord.nextStepIds = [];
       }
-      persist(lockedId, run);
+      await persist(lockedId, run);
     });
     return {
       error: `couldn't resume the previous step: ${sent.reason ?? "the agent refused the message"}`,
@@ -2769,10 +2775,10 @@ export async function reviewHumanStep(
 export async function cascadePipelineDelete(parentId: string): Promise<void> {
   tombstonedPipelineParents.add(parentId);
   try {
-    // Every step row — archived ones included (`tasks.list()` carries
+    // Every step row — archived ones included (`(await tasks.list())` carries
     // archived rows; don't depend on `stepsForParent`'s own filtering, which
     // may exclude them — a restart archives the replaced run's steps, M-R8).
-    for (const step of tasks.list()) {
+    for (const step of (await tasks.list())) {
       if (step.pipelineParentId !== parentId) continue;
       await deleteTask(step.id, { fromPipeline: true });
     }
@@ -2795,7 +2801,7 @@ export async function cascadePipelineDelete(parentId: string): Promise<void> {
  *  Best-effort — a step that refuses to archive (logged) doesn't block the
  *  rest, or the parent's own subsequent archive. */
 export async function cascadePipelineArchive(parentId: string): Promise<void> {
-  for (const step of tasks.stepsForParent(parentId)) {
+  for (const step of (await tasks.stepsForParent(parentId))) {
     if (step.archivedAt != null) continue;
     const result = await archiveTask(step.id, { force: true, stopRun: true, fromPipeline: true });
     if ("error" in result) {
@@ -2958,7 +2964,7 @@ let beforeReminderStamp: (() => Promise<void> | void) | null = null;
  *    send records NOTHING there, so the NEXT settle may still try once, and
  *    folds the failure reason into the ordinary block's message instead.
  */
-function attemptHandoffReminderOrBlock(input: {
+async function attemptHandoffReminderOrBlock(input: {
   parentId: string;
   run: PipelineRunState;
   taskId: string;
@@ -2970,7 +2976,7 @@ function attemptHandoffReminderOrBlock(input: {
   reason: HandoffReminderReason;
   detail: string;
   baseMessage: string;
-}): PendingReminder | null {
+}): Promise<PendingReminder | null> {
   const { parentId, run, taskId, runId, activeEntry, historyEntry, graph, stepName, reason, detail, baseMessage } = input;
   const blockKind = reminderBlockKind(reason);
 
@@ -2978,11 +2984,11 @@ function attemptHandoffReminderOrBlock(input: {
   // `handoff-next-unknown` never waits — a parsed handoff exists, so no
   // continuation is expected to supply a better one.
   if (reason !== "handoff-next-unknown") {
-    const deadline = releaseGraceDeadline(taskId, runId);
+    const deadline = await releaseGraceDeadline(taskId, runId);
     if (deadline !== null && Date.now() < deadline) {
       if (historyEntry && historyEntry.outcome === null) historyEntry.responseKind = null;
       armReleaseGraceTimer(taskId, deadline);
-      persist(parentId, run);
+      await persist(parentId, run);
       return null;
     }
   }
@@ -2998,16 +3004,16 @@ function attemptHandoffReminderOrBlock(input: {
       message: `still no valid handoff after one reminder — ${baseMessage}`,
     });
     checkJoinIncomplete(run);
-    persist(parentId, run);
+    await persist(parentId, run);
     return null;
   }
 
   // Major 1: re-read fresh — see this function's doc for why the top-of-turn
   // copies can be stale.
-  const parentFresh = tasks.get(parentId);
+  const parentFresh = await tasks.get(parentId);
   const parentGone = tombstonedPipelineParents.has(parentId) || !parentFresh;
   const parentArchived = !parentGone && parentFresh!.archivedAt != null;
-  const stepFresh = tasks.get(taskId);
+  const stepFresh = await tasks.get(taskId);
   const stepArchived = stepFresh != null && stepFresh.archivedAt != null;
 
   const skipReason = parentGone
@@ -3026,7 +3032,7 @@ function attemptHandoffReminderOrBlock(input: {
       message: `${baseMessage} (automatic reminder skipped — ${skipReason})`,
     });
     checkJoinIncomplete(run);
-    persist(parentId, run);
+    await persist(parentId, run);
     return null;
   }
 
@@ -3037,7 +3043,7 @@ function attemptHandoffReminderOrBlock(input: {
   // in-flight send only when this run also has no handoff.
   const inFlightRunId = remindersInFlight.get(taskId);
   if (inFlightRunId && inFlightRunId !== runId) {
-    persist(parentId, run);
+    await persist(parentId, run);
     return null;
   }
 
@@ -3050,7 +3056,7 @@ function attemptHandoffReminderOrBlock(input: {
   // happens once the caller has released the lock (L-R7).
   remindersInFlight.set(taskId, runId);
   checkJoinIncomplete(run);
-  persist(parentId, run);
+  await persist(parentId, run);
   return {
     parentId,
     taskId,
@@ -3072,20 +3078,20 @@ function attemptHandoffReminderOrBlock(input: {
  *  reminder moot (a live turn, or one carrying the handoff) decides the
  *  step, and a later reply that still lacks a handoff can still be
  *  reminded once. */
-function releaseReminderOwnership(p: PendingReminder): void {
+async function releaseReminderOwnership(p: PendingReminder): Promise<void> {
   if (remindersInFlight.get(p.taskId) !== p.runId) return;
   remindersInFlight.delete(p.taskId);
-  const parent = tasks.get(p.parentId);
+  const parent = await tasks.get(p.parentId);
   const run = parent?.pipelineRun;
   if (!run) return;
   const historyEntry = run.history.find((h) => h.taskId === p.taskId && h.seq === p.seq);
   if (historyEntry && !historyEntry.reminder && historyEntry.outcome == null) historyEntry.responseKind = null;
-  persist(p.parentId, run);
+  await persist(p.parentId, run);
 }
 
 async function abandonReminderForSuccessor(p: PendingReminder): Promise<void> {
   await runExclusive(p.parentId, async () => {
-    releaseReminderOwnership(p);
+    await releaseReminderOwnership(p);
   });
 }
 
@@ -3100,9 +3106,9 @@ function terminalRunStatus(status: string): "succeeded" | "failed" | "cancelled"
  *  reminder, not a continuation — the question is answered from the run rows
  *  (`running` and not the ignored one), since the orchestrator's `active`
  *  map cannot exclude a single run. */
-function otherRunOfTaskLive(taskId: string, ignoreRunId?: string): boolean {
+async function otherRunOfTaskLive(taskId: string, ignoreRunId?: string): Promise<boolean> {
   if (!ignoreRunId) return isAnyRunOfTaskLive(taskId);
-  return runs.listForTask(taskId).some((r) => r.id !== ignoreRunId && r.status === "running");
+  return (await runs.listForTask(taskId)).some((r) => r.id !== ignoreRunId && r.status === "running");
 }
 
 /** True when settling `supplier`'s handoff would resolve or block the step
@@ -3143,7 +3149,7 @@ type ReminderRecheck = "send" | "abandon" | "stopped" | { resettle: true };
 async function recheckReminder(p: PendingReminder, ignoreRunId?: string): Promise<ReminderRecheck> {
   return runExclusive(p.parentId, async (): Promise<ReminderRecheck> => {
     if (remindersInFlight.get(p.taskId) !== p.runId) return "abandon";
-    const run = tasks.get(p.parentId)?.pipelineRun;
+    const run = (await tasks.get(p.parentId))?.pipelineRun;
     const historyEntry = run?.history.find((h) => h.taskId === p.taskId && h.seq === p.seq);
     const stillActive = !!run && run.active.some((a) => a.taskId === p.taskId && a.seq === p.seq);
     if (!run || !historyEntry) {
@@ -3161,20 +3167,20 @@ async function recheckReminder(p: PendingReminder, ignoreRunId?: string): Promis
       return "send";
     }
     if (isStopApplied(run, p.taskId, historyEntry)) {
-      releaseReminderOwnership(p);
+      await releaseReminderOwnership(p);
       return "stopped";
     }
-    if (otherRunOfTaskLive(p.taskId, ignoreRunId)) {
-      releaseReminderOwnership(p);
+    if (await otherRunOfTaskLive(p.taskId, ignoreRunId)) {
+      await releaseReminderOwnership(p);
       return "abandon";
     }
     // A supplier is only a reason to settle again when that settle would act
     // on it. A handoff whose `next` doesn't resolve is exactly what this
     // reminder is FOR (`handoff-next-unknown`): settling it again would just
     // queue this same reminder, forever.
-    const supplier = findHandoffSupplier(p.taskId, historyEntry, new Map());
+    const supplier = await findHandoffSupplier(p.taskId, historyEntry, new Map());
     if (supplier && handoffSettlesStep(run, p.stepId, supplier)) {
-      releaseReminderOwnership(p);
+      await releaseReminderOwnership(p);
       return { resettle: true };
     }
     return "send";
@@ -3281,13 +3287,13 @@ async function deliverHandoffReminder(p: PendingReminder): Promise<void> {
     // this callback acquired it. Recording either way would stamp a reminder
     // onto an execution a newer run now owns.
     if (remindersInFlight.get(p.taskId) !== p.runId) return;
-    if (runningSuccessorSupersedes(p.taskId, p.runId, sent.delivered ? sent.runId : undefined)) {
-      releaseReminderOwnership(p);
+    if (await runningSuccessorSupersedes(p.taskId, p.runId, sent.delivered ? sent.runId : undefined)) {
+      await releaseReminderOwnership(p);
       return;
     }
     remindersInFlight.delete(p.taskId);
     try {
-      const parent = tasks.get(p.parentId);
+      const parent = (await tasks.get(p.parentId));
       if (!parent || !parent.pipelineRun) return;
       const run = parent.pipelineRun;
       const historyEntry = run.history.find((h) => h.taskId === p.taskId && h.seq === p.seq);
@@ -3309,8 +3315,8 @@ async function deliverHandoffReminder(p: PendingReminder): Promise<void> {
         }
         appendRunStatusLine(p.taskId, p.runId, reminderSentStatusLine(p.reason));
         checkJoinIncomplete(run);
-        persist(p.parentId, run);
-        const reminderRun = sent.runId !== p.runId ? runs.get(sent.runId) : null;
+        await persist(p.parentId, run);
+        const reminderRun = sent.runId !== p.runId ? (await runs.get(sent.runId)) : null;
         resettleReminderRun = reminderRun != null && terminalRunStatus(reminderRun.status) !== null;
         return;
       }
@@ -3322,9 +3328,9 @@ async function deliverHandoffReminder(p: PendingReminder): Promise<void> {
       // must never block recording the ordinary blocked-path outcome below.
       if (sent.withheld && sent.savedToBacklog) {
         try {
-          const stashed = tasks.get(p.taskId);
+          const stashed = (await tasks.get(p.taskId));
           const item = stashed?.backlog.find((b) => b.text === p.reminderText);
-          if (item) backlog.remove(p.taskId, item.id);
+          if (item) await backlog.remove(p.taskId, item.id);
         } catch (err) {
           console.warn(`[agetor] pipeline runner: failed to remove stashed reminder draft for task ${p.taskId}:`, err);
         }
@@ -3346,15 +3352,15 @@ async function deliverHandoffReminder(p: PendingReminder): Promise<void> {
         message: `${p.baseMessage} (automatic reminder could not be sent: ${sent.reason})`,
       });
       checkJoinIncomplete(run);
-      persist(p.parentId, run);
+      await persist(p.parentId, run);
     } catch (err) {
-      persistReconcileFailure(p.parentId, p.taskId, err);
+      await persistReconcileFailure(p.parentId, p.taskId, err);
     }
   }).catch((err) => {
     console.warn(`[agetor] pipeline runner failed stamping reminder outcome for task ${p.taskId}:`, err);
   });
   if (resettleReminderRun && sent.delivered) {
-    const row = runs.get(sent.runId);
+    const row = (await runs.get(sent.runId));
     const status = row ? terminalRunStatus(row.status) : null;
     if (status) await handleRunStatus(p.taskId, sent.runId, status);
   }
@@ -3387,12 +3393,12 @@ function scheduleBusyRecheck(p: PendingReminder): void {
   if (attempts >= busyRecheckDelaysMs.length) {
     busyRefusals.delete(p.taskId);
     void runExclusive(p.parentId, async () => {
-      const run = tasks.get(p.parentId)?.pipelineRun;
+      const run = (await tasks.get(p.parentId))?.pipelineRun;
       if (!run || !run.active.some((a) => a.taskId === p.taskId && a.seq === p.seq)) return;
       if (isAnyRunOfTaskLive(p.taskId) || remindersInFlight.has(p.taskId)) return;
       const historyEntry = run.history.find((h) => h.taskId === p.taskId && h.seq === p.seq);
       if (isStopApplied(run, p.taskId, historyEntry)) {
-        settleStoppedExecution(p.parentId, run, p.taskId, historyEntry);
+        await settleStoppedExecution(p.parentId, run, p.taskId, historyEntry);
         return;
       }
       // `releaseReminderOwnership` cleared the classification while the
@@ -3407,7 +3413,7 @@ function scheduleBusyRecheck(p: PendingReminder): void {
         message: `${p.baseMessage} (automatic reminder not sent: the agent session still reports a turn in progress)`,
       });
       checkJoinIncomplete(run);
-      persist(p.parentId, run);
+      await persist(p.parentId, run);
     }).catch((err) => {
       console.warn(`[agetor] pipeline runner failed blocking task ${p.taskId} after busy refusals:`, err);
     });
@@ -3527,7 +3533,7 @@ async function advanceOnHandoff(input: {
         holdForStoppedRun(run, targetStep, [{ stepId: activeEntry.stepId, seq: activeEntry.seq, handoff }]);
       }
     }
-    finalizeCancelled(parentId, run);
+    await finalizeCancelled(parentId, run);
     return;
   }
 
@@ -3538,7 +3544,7 @@ async function advanceOnHandoff(input: {
   // it). An archived parent must never have this settle spawn a new
   // step task or touch its worktree — every resolved next step is
   // recorded as a retryable pending hold instead of launched.
-  const parentForLaunch = tasks.get(parentId) ?? parent;
+  const parentForLaunch = (await tasks.get(parentId)) ?? parent;
   const parentArchived = parentForLaunch.archivedAt != null;
   // Minor 5: same tombstone/existence guard as every other locked body
   // that refreshes the worktree — a delete cascade racing in through
@@ -3546,7 +3552,7 @@ async function advanceOnHandoff(input: {
   // refresh touch the worktree (`launchStep`/`launchTarget` below
   // still bail on this independently, this just skips the redundant
   // refresh call).
-  const parentGone = tombstonedPipelineParents.has(parentId) || !tasks.get(parentId);
+  const parentGone = tombstonedPipelineParents.has(parentId) || !(await tasks.get(parentId));
   // Minor 15: refresh the shared worktree ONCE for this whole batch (a
   // fan-out can resolve several next steps from one settle) instead of
   // once per `launchStep` call — a failed batch refresh here just
@@ -3609,7 +3615,7 @@ async function advanceOnHandoff(input: {
   }
 
   checkJoinIncomplete(run);
-  persist(parentId, run);
+  await persist(parentId, run);
 }
 
 /**
@@ -3621,12 +3627,12 @@ async function advanceOnHandoff(input: {
  * then {@link closeStoppedExecution} decides the run. Idempotent: a later
  * re-settle of the same run lands here again.
  */
-function settleStoppedExecution(
+async function settleStoppedExecution(
   parentId: string,
   run: PipelineRunState,
   taskId: string,
   historyEntry: PipelineStepRecord | undefined,
-): void {
+): Promise<void> {
   clearStepTimers(taskId);
   removeBlockedFor(run, taskId);
   if (historyEntry && historyEntry.outcome === null) {
@@ -3634,7 +3640,7 @@ function settleStoppedExecution(
     historyEntry.outcome = "cancelled";
   }
   checkJoinIncomplete(run);
-  closeStoppedExecution(parentId, run, taskId);
+  await closeStoppedExecution(parentId, run, taskId);
 }
 
 /**
@@ -3648,7 +3654,7 @@ function settleStoppedExecution(
  * a deliberate whole-run stop — `finalizeCancelled` (idempotent) is the
  * whole story, and never records a block of its own.
  */
-function closeStoppedExecution(parentId: string, run: PipelineRunState, taskId: string): void {
+async function closeStoppedExecution(parentId: string, run: PipelineRunState, taskId: string): Promise<void> {
   const activeEntry = run.active.find((a) => a.taskId === taskId);
   if (activeEntry && workingSiblings(run, taskId).length > 0 && !isDeliberateWholeRunStop(run, taskId)) {
     const stepName = run.snapshot ? stepNameById(run.snapshot.graph, activeEntry.stepId) : activeEntry.stepId;
@@ -3658,10 +3664,10 @@ function closeStoppedExecution(parentId: string, run: PipelineRunState, taskId: 
       kind: "step-failed",
       message: `step "${stepName}" was stopped — retry it or advance past it`,
     });
-    persist(parentId, run);
+    await persist(parentId, run);
     return;
   }
-  finalizeCancelled(parentId, run);
+  await finalizeCancelled(parentId, run);
 }
 
 /**
@@ -3717,7 +3723,7 @@ async function settleStepRun(
   // settles it from scratch.
   if (launchesFrozen()) return null;
   try {
-    const parent = tasks.get(parentId);
+    const parent = (await tasks.get(parentId));
     if (!parent || !parent.pipelineRun || !parent.pipelineRun.snapshot) return null;
     const run = parent.pipelineRun;
     const activeIdx = run.active.findIndex((a) => a.taskId === taskId);
@@ -3749,8 +3755,8 @@ async function settleStepRun(
     // body through `handleColumnChange`'s `review` branch once the last
     // helper finishes, and THAT settle advances the graph.
     if (status === "succeeded" && isHeldByBackgroundAgents(taskId)) {
-      if (historyEntry) historyEntry.responseKind = classifyRunResponse(taskId, runId, responses).kind;
-      persist(parentId, run);
+      if (historyEntry) historyEntry.responseKind = (await classifyRunResponse(taskId, runId, responses)).kind;
+      await persist(parentId, run);
       return null;
     }
 
@@ -3761,7 +3767,7 @@ async function settleStepRun(
     // re-enters here and decides. A Stop never waits.
     if (status !== "cancelled" && isAnyRunOfTaskLive(taskId)) {
       if (historyEntry && historyEntry.outcome === null) historyEntry.responseKind = null;
-      persist(parentId, run);
+      await persist(parentId, run);
       scheduleWaitRecheck(taskId);
       return null;
     }
@@ -3780,7 +3786,7 @@ async function settleStepRun(
 
     // (5) A pending question on the settling run is the step's state — an
     // older run's handoff must not override it.
-    const settlingResponse = status === "succeeded" ? classifyRunResponse(taskId, runId, responses) : null;
+    const settlingResponse = status === "succeeded" ? await classifyRunResponse(taskId, runId, responses) : null;
     if (settlingResponse?.kind === "user-ask") {
       // Medium 4: the step's task already reflects a pending interaction
       // through the ordinary interactions/column machinery — but a
@@ -3800,7 +3806,7 @@ async function settleStepRun(
         message: `step "${stepName}" is waiting for you`,
       });
       checkJoinIncomplete(run);
-      persist(parentId, run);
+      await persist(parentId, run);
       return null;
     }
 
@@ -3811,7 +3817,7 @@ async function settleStepRun(
       status === "failed" ||
       (status === "orphaned" && !isDeliberateWholeRunStop(run, taskId));
     const supplier = mayLookBack
-      ? findHandoffSupplier(taskId, historyEntry, responses, status === "succeeded" ? runId : undefined)
+      ? await findHandoffSupplier(taskId, historyEntry, responses, status === "succeeded" ? runId : undefined)
       : null;
 
     // (7) A run of the attempt window holds a valid handoff.
@@ -3820,7 +3826,7 @@ async function settleStepRun(
       // in the attempt window, not the run whose settle got here: which
       // settle wins the lock is timing, and a late settle of an older run
       // must not turn "the step's newer run had none" into "another run".
-      const newerRun = newerRunThanSupplier(taskId, historyEntry, supplier);
+      const newerRun = await newerRunThanSupplier(taskId, historyEntry, supplier);
 
       // A returned execution is forced back to its gate regardless of its
       // transition or the handoff's `next` (a stale or adversarial handoff
@@ -3841,7 +3847,7 @@ async function settleStepRun(
           ? ` (open questions: ${handoff.openQuestions.join("; ")})`
           : "";
         const reasonText = handoff.reason.trim().length > 0 ? handoff.reason : "no reason given";
-        if (historyEntry) recordHandoffSource(taskId, runId, historyEntry, supplier, newerRun);
+        if (historyEntry) await recordHandoffSource(taskId, runId, historyEntry, supplier, newerRun);
         upsertBlocked(run, {
           taskId,
           stepId: activeEntry.stepId,
@@ -3850,7 +3856,7 @@ async function settleStepRun(
         });
         if (historyEntry) historyEntry.handoff = handoff;
         checkJoinIncomplete(run);
-        persist(parentId, run);
+        await persist(parentId, run);
         return null;
       }
 
@@ -3871,14 +3877,14 @@ async function settleStepRun(
           historyEntry.handoffFromOtherRun = false;
         }
         if (isStopApplied(run, taskId, historyEntry)) {
-          settleStoppedExecution(parentId, run, taskId, historyEntry);
+          await settleStoppedExecution(parentId, run, taskId, historyEntry);
           return null;
         }
         const candidates = resolved.candidates.join(", ") || "(no outgoing steps)";
         const baseMessage = resolved.kind === "ambiguous"
           ? `step "${stepName}" finished but didn't say which step comes next — choices: ${candidates}`
           : `step "${stepName}" asked for step "${resolved.next}", which doesn't match any of: ${candidates}`;
-        return attemptHandoffReminderOrBlock({
+        return await attemptHandoffReminderOrBlock({
           parentId,
           run,
           taskId,
@@ -3893,7 +3899,7 @@ async function settleStepRun(
         });
       }
 
-      if (historyEntry) recordHandoffSource(taskId, runId, historyEntry, supplier, newerRun);
+      if (historyEntry) await recordHandoffSource(taskId, runId, historyEntry, supplier, newerRun);
       await advanceOnHandoff({
         parentId, parent, run, graph, taskId, runId, activeEntry, historyEntry, handoff: supplier.handoff, resolved,
       });
@@ -3923,7 +3929,7 @@ async function settleStepRun(
         // The user stopped the run, or this step: no grace, no reminder —
         // see `settleStoppedExecution`.
         if (isStopApplied(run, taskId, historyEntry)) {
-          settleStoppedExecution(parentId, run, taskId, historyEntry);
+          await settleStoppedExecution(parentId, run, taskId, historyEntry);
           return null;
         }
         // Not blocked yet — attempt the ONE automatic reminder as an
@@ -3941,7 +3947,7 @@ async function settleStepRun(
         const detail = classified.error ?? (reason === "handoff-missing"
           ? "no <handoff> block was found"
           : "the handoff JSON could not be parsed");
-        return attemptHandoffReminderOrBlock({
+        return await attemptHandoffReminderOrBlock({
           parentId, run, taskId, runId, activeEntry, historyEntry, graph, stepName, reason, detail, baseMessage,
         });
       }
@@ -3949,7 +3955,7 @@ async function settleStepRun(
       // The settling run carries a handoff but fell outside the attempt
       // window (it started before the last Retry): it can't satisfy this
       // attempt. Nothing to record; the attempt's own run settles later.
-      persist(parentId, run);
+      await persist(parentId, run);
       return null;
     }
 
@@ -3963,7 +3969,7 @@ async function settleStepRun(
           pendingInteractions: pendingInteractionsForRun(taskId, runId),
         }).kind;
       }
-      const tail = lastStatusLineFrom(mainStreamEventsForRun(runId));
+      const tail = lastStatusLineFrom(await mainStreamEventsForRun(runId));
       upsertBlocked(run, {
         taskId,
         stepId: activeEntry.stepId,
@@ -3974,7 +3980,7 @@ async function settleStepRun(
         historyEntry.endedAt = Date.now();
         historyEntry.outcome = "failed";
       }
-      persist(parentId, run);
+      await persist(parentId, run);
       return null;
     }
 
@@ -4001,9 +4007,9 @@ async function settleStepRun(
         historyEntry.stoppedRunId = runId;
       }
     }
-    closeStoppedExecution(parentId, run, taskId);
+    await closeStoppedExecution(parentId, run, taskId);
   } catch (err) {
-    persistReconcileFailure(parentId, taskId, err);
+    await persistReconcileFailure(parentId, taskId, err);
   }
   return null;
 }
@@ -4018,7 +4024,7 @@ async function handleRunStatus(
    *  decision away meanwhile, and nothing is settled. */
   claim?: () => boolean,
 ): Promise<void> {
-  const task = tasks.get(taskId);
+  const task = (await tasks.get(taskId));
   const parentId = task?.pipelineParentId;
   if (!task || !parentId) return;
   // L-R1: a delete cascade already owns this parent — nothing here may
@@ -4047,7 +4053,7 @@ async function handleColumnChange(
   // (`pipelineUpdateColumn`) — reprocessing them here would be at best
   // redundant, at worst a feedback loop.
   if (reason === "pipeline") return;
-  const task = tasks.get(taskId);
+  const task = (await tasks.get(taskId));
   const parentId = task?.pipelineParentId;
   if (!task || !parentId) return;
   // L-R1: same bail as `handleRunStatus`.
@@ -4063,7 +4069,7 @@ async function handleColumnChange(
       // parent still gets its state recorded correctly with no extra
       // guard; the `ready`/`review` branches route into `settleStepRun`,
       // which carries its own archived/tombstoned guards.
-      const parent = tasks.get(parentId);
+      const parent = (await tasks.get(parentId));
       if (!parent || !parent.pipelineRun) return;
       const run = parent.pipelineRun;
       const activeEntry = run.active.find((a) => a.taskId === taskId);
@@ -4077,7 +4083,7 @@ async function handleColumnChange(
           kind: "step-blocked",
           message: reasonMessage(reason, stepName),
         });
-        persist(parentId, run);
+        await persist(parentId, run);
       } else if (column === "running") {
         const historyEntry = run.history.find((h) => h.taskId === taskId && h.seq === activeEntry.seq);
         let changed = false;
@@ -4098,7 +4104,7 @@ async function handleColumnChange(
           // turn: the runner owns it, not the user. The post-send confirm
           // sees the Stop and cancels it; this event must never resume.
           if (reviewResumeSendsInFlight.has(taskId)) return;
-          const latest = currentRunRow(taskId);
+          const latest = await currentRunRow(taskId);
           // No turn started since the Stop: the card moved without a new run
           // — the orchestrator's `pullBackParkedTask` pulls a `review` card
           // back to `running`, its current run still `succeeded`, when a
@@ -4118,8 +4124,8 @@ async function handleColumnChange(
           // newest listed run when the task points at none, and a failed run
           // the task has moved off is not a turn the user is running.
           if (latest.status === "cancelled") return;
-          if (latest.status === "failed" && tasks.get(taskId)?.runId !== latest.id) return;
-          if (!turnStartedByUser(taskId, latest, historyEntry)) {
+          if (latest.status === "failed" && (await tasks.get(taskId))?.runId !== latest.id) return;
+          if (!await turnStartedByUser(taskId, latest, historyEntry)) {
             // Decided by run identity, so the turn may already have ended
             // while this event waited for the lock: only a live one has
             // anything to cancel. Its settle is still recorded as stopped.
@@ -4167,7 +4173,7 @@ async function handleColumnChange(
           historyEntry.handoffFromOtherRun = false;
           changed = true;
         }
-        if (changed) persist(parentId, run);
+        if (changed) await persist(parentId, run);
       } else if (column === "ready" || column === "review") {
         // H1b (`ready`) / M-R3 (`review`): belt-and-braces settle off the
         // step task's own column transition, so an execution never sits
@@ -4185,7 +4191,7 @@ async function handleColumnChange(
         if (isTaskRunLive(taskId)) return;
         const historyEntry = run.history.find((h) => h.taskId === taskId && h.seq === activeEntry.seq);
         if (historyEntry && historyEntry.outcome !== null) return;
-        const latest = currentRunRow(taskId);
+        const latest = await currentRunRow(taskId);
         if (!latest || latest.status === "running") return;
         // The in-flight reminder owns the settle of its own run. A newer
         // run (the continuation) is `latest` once it exists and still has
@@ -4195,7 +4201,7 @@ async function handleColumnChange(
         pending = await settleStepRun(parentId, taskId, latest.id, latest.status);
       }
     } catch (err) {
-      persistReconcileFailure(parentId, taskId, err);
+      await persistReconcileFailure(parentId, taskId, err);
     }
   }).catch((err) => {
     console.warn(`[agetor] pipeline runner failed handling column change for task ${taskId}:`, err);
@@ -4212,8 +4218,8 @@ async function handleColumnChange(
  *  used by {@link reconcilePipelineRuns} for an active entry whose task has
  *  no run row at all (the insert landed but `startTask` itself never
  *  actually produced a run, e.g. a crash between the two). */
-function markStepNeverStarted(parentId: string, taskId: string): void {
-  const parent = tasks.get(parentId);
+async function markStepNeverStarted(parentId: string, taskId: string): Promise<void> {
+  const parent = (await tasks.get(parentId));
   if (!parent || !parent.pipelineRun) return;
   const run = parent.pipelineRun;
   const idx = run.active.findIndex((a) => a.taskId === taskId);
@@ -4227,7 +4233,7 @@ function markStepNeverStarted(parentId: string, taskId: string): void {
     h.outcome = "failed";
   }
   checkJoinIncomplete(run);
-  persist(parentId, run);
+  await persist(parentId, run);
 }
 
 /**
@@ -4254,7 +4260,7 @@ function markStepNeverStarted(parentId: string, taskId: string): void {
  */
 export async function reconcilePipelineRuns(): Promise<number> {
   let count = 0;
-  const parents = tasks.list().filter((t) => {
+  const parents = (await tasks.list()).filter((t) => {
     if (t.pipelineId == null || t.pipelineParentId != null || t.archivedAt != null || !t.pipelineRun) return false;
     const status = t.pipelineRun.status;
     return (
@@ -4272,7 +4278,7 @@ export async function reconcilePipelineRuns(): Promise<number> {
     for (const a of activeSnapshot) {
       if (isAnyRunOfTaskLive(a.taskId)) continue;
       try {
-        const latest = currentRunRow(a.taskId);
+        const latest = await currentRunRow(a.taskId);
         if (!latest) {
           await runExclusive(parent.id, async () => markStepNeverStarted(parent.id, a.taskId));
           count++;
@@ -4281,7 +4287,7 @@ export async function reconcilePipelineRuns(): Promise<number> {
           count++;
         }
       } catch (err) {
-        await runExclusive(parent.id, async () => persistReconcileFailure(parent.id, a.taskId, err)).catch(() => {});
+        await runExclusive(parent.id, async () => await persistReconcileFailure(parent.id, a.taskId, err)).catch(() => {});
       }
     }
   }
@@ -4313,7 +4319,7 @@ function isTurnSinceStop(latest: Run, historyEntry: PipelineStepRecord | undefin
  * (`origin: "harness-swap"`) is not.
  * An OpenCode server wake (`origin: "agent"`) is not either.
  */
-function turnStartedByUser(taskId: string, latest: Run, historyEntry: PipelineStepRecord | undefined): boolean {
+async function turnStartedByUser(taskId: string, latest: Run, historyEntry: PipelineStepRecord | undefined): Promise<boolean> {
   if (remindersInFlight.has(taskId) || historyEntry?.reminder?.runId === latest.id) return false;
   if (latest.origin === "auto-resume") return false;
   // A harness-stack successor (or its all-exhausted retry) is the SAME
@@ -4329,8 +4335,8 @@ function turnStartedByUser(taskId: string, latest: Run, historyEntry: PipelineSt
   if (latest.origin !== "continuation") return true;
   // `startContinuationRun` writes the opening status line before it emits
   // the `running` column event that brings us here.
-  const opening = runs.events(latest.id).find((e) => e.stream === "status" && e.subagentId == null);
-  return opening?.data === CONTINUATION_STATUS_TEXT.user;
+  const opening = await runs.firstMainStatusData(latest.id);
+  return opening === CONTINUATION_STATUS_TEXT.user;
 }
 
 /**
@@ -4341,12 +4347,12 @@ function turnStartedByUser(taskId: string, latest: Run, historyEntry: PipelineSt
  * hold's release gets no release grace and no reminder. When the release
  * already settled it (that settle armed the grace), settle it again now.
  */
-function handleHeldStepStopped(taskId: string, stoppedRunId: string | null): void {
+async function handleHeldStepStopped(taskId: string, stoppedRunId: string | null): Promise<void> {
   if (!listenerEnabled) return;
-  const parentId = tasks.get(taskId)?.pipelineParentId;
+  const parentId = (await tasks.get(taskId))?.pipelineParentId;
   if (!parentId || tombstonedPipelineParents.has(parentId)) return;
-  void runExclusive(parentId, async (): Promise<PendingReminder | null> => {
-    const run = tasks.get(parentId)?.pipelineRun;
+  await runExclusive(parentId, async (): Promise<PendingReminder | null> => {
+    const run = (await tasks.get(parentId))?.pipelineRun;
     const activeEntry = run?.active.find((a) => a.taskId === taskId);
     if (!run || !activeEntry) return null;
     const historyEntry = run.history.find((h) => h.taskId === taskId && h.seq === activeEntry.seq);
@@ -4359,11 +4365,11 @@ function handleHeldStepStopped(taskId: string, stoppedRunId: string | null): voi
     historyEntry.stoppedRunId = stoppedRunId;
     clearStepTimers(taskId);
     if (!isAnyRunOfTaskLive(taskId) && remindersInFlight.get(taskId) == null) {
-      const row = currentRunRow(taskId);
+      const row = await currentRunRow(taskId);
       const status = row ? terminalRunStatus(row.status) : null;
       if (row && status) return settleStepRun(parentId, taskId, row.id, status);
     }
-    persist(parentId, run);
+    await persist(parentId, run);
     return null;
   })
     .then((pending) => (pending ? deliverHandoffReminder(pending) : undefined))
@@ -4382,7 +4388,7 @@ function handleHeldStepStopped(taskId: string, stoppedRunId: string | null): voi
  * step's newest run stands in.
  */
 async function resettleCurrentRun(taskId: string, claim?: () => boolean): Promise<void> {
-  const row = currentRunRow(taskId);
+  const row = await currentRunRow(taskId);
   const status = row ? terminalRunStatus(row.status) : null;
   if (!row || !status) return;
   await handleRunStatus(taskId, row.id, status, claim);
@@ -4393,10 +4399,10 @@ async function resettleCurrentRun(taskId: string, claim?: () => boolean): Promis
  *  continuation and a run that displaces it can start in the same
  *  millisecond, and settling the displaced one as if it were current would
  *  misattribute which run supplied the handoff. */
-function currentRunRow(taskId: string): Run | null {
-  const task = tasks.get(taskId);
+async function currentRunRow(taskId: string): Promise<Run | null> {
+  const task = (await tasks.get(taskId));
   if (!task) return null;
-  return (task.runId ? runs.get(task.runId) : null) ?? runs.listForTask(taskId)[0] ?? null;
+  return (task.runId ? (await runs.get(task.runId)) : null) ?? (await runs.listForTask(taskId))[0] ?? null;
 }
 
 /** The orchestrator's runner-only report that a run of a step task which is
@@ -4433,7 +4439,13 @@ export function initPipelineRunner(): void {
   if (runnerInitialized) return;
   runnerInitialized = true;
   setDisplacedStepRunSettledHandler(handleDisplacedRunSettle);
-  setHeldStepStoppedHandler(handleHeldStepStopped);
+  // The orchestrator's hook is synchronous: run the async handler detached,
+  // with its failure logged (it holds no state the orchestrator waits on).
+  setHeldStepStoppedHandler((taskId, stoppedRunId) => {
+    void handleHeldStepStopped(taskId, stoppedRunId).catch((err) => {
+      console.warn(`[agetor] pipeline runner failed handling a stop of held task ${taskId}:`, err);
+    });
+  });
   subscribeGlobal((e: GlobalEvent) => {
     if (!listenerEnabled) return;
     if (e.kind === "run-status") {
@@ -4443,9 +4455,15 @@ export function initPipelineRunner(): void {
       // terminal status is. Treating them as failure would fail the step and
       // strand the pipeline before the automatic retry can continue it.
       if (e.reason === "harness-swap" || e.reason === "harness-exhausted") return;
-      void handleRunStatus(e.taskId, e.runId, e.status);
+      // A synchronous listener: the handler logs its own lock-body failures;
+      // this catch covers the lookup before the lock.
+      void handleRunStatus(e.taskId, e.runId, e.status).catch((err) => {
+        console.warn(`[agetor] pipeline runner failed handling run-status for task ${e.taskId}:`, err);
+      });
     } else if (e.kind === "column") {
-      void handleColumnChange(e.taskId, e.column, e.reason);
+      void handleColumnChange(e.taskId, e.column, e.reason).catch((err) => {
+        console.warn(`[agetor] pipeline runner failed handling column change for task ${e.taskId}:`, err);
+      });
     }
   });
 }
