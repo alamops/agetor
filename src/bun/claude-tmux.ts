@@ -5749,11 +5749,7 @@ function matchNumberedModal(tail: string): ScrapeMatch | null {
   // terminal left its card standing for the second (same fingerprint, so
   // neither swept nor re-registered), and the card drive refused it forever.
   // A cursor-only move changes only `@cursorIndex`, never the question text.
-  const question = paneText
-    .split("\n")
-    .map((l) => l.replace(/^\s*[❯›]\s?/, "").trim())
-    .filter((l) => l.length > 0)
-    .join("\n");
+  const question = cursorFreeText(paneText);
   const fingerprint = sha1(
     `numbered:${choices.map((c) => `${c.key}|${c.label}`).join("/")}|@${cursorIndex}|${question}`,
   );
@@ -6193,11 +6189,17 @@ function matchUnnumberedModal(tail: string): ScrapeMatch | null {
     if (/^\d+\.\s/.test(label)) return null;           // numbered row (matchNumberedModal owns it)
   }
   if (parsed.choices.length > UNNUMBERED_MAX_CHOICE_ROWS) return null;
+  const paneText = unnumberedPreview(lines, parsed.firstRowAt);
   return {
-    paneText: unnumberedPreview(lines, parsed.firstRowAt),
+    paneText,
     choices: parsed.choices,
     cursorIndex: parsed.cursorIndex,
-    fingerprint: parsed.fingerprint,
+    // The question is part of it (as on a numbered menu): two dialogs with the
+    // same labels and cursor but different text are two cards, so the second
+    // one replaces the first instead of inheriting its card. The parser's own
+    // fingerprint (labels + cursor) stays as it is for the startup-confirm
+    // tracker, whose retry rule needs the cursor in it.
+    fingerprint: sha1(`unnumbered-card:${parsed.fingerprint}|${cursorFreeText(paneText)}`),
     hideKeys: true,
   };
 }
@@ -6282,12 +6284,18 @@ function identityOf(m: ScrapeMatch): string {
   // The labels alone can't tell two Yes/No dialogs apart (allow THIS command vs
   // THAT edit), so the dialog's own text is part of it: every line of the card
   // with the cursor glyph removed, which is all the cursor changes on a menu.
-  const text = m.paneText
+  return sha1(`choices:${m.choices.map((c) => c.label).join("\u0001")}|${cursorFreeText(m.paneText)}`);
+}
+
+/** A card's text with the cursor glyph removed, trimmed, blank lines dropped:
+ *  the same dialog before and after a cursor move. Part of `identityOf`, and of
+ *  the numbered and unnumbered menus' fingerprints (the question they ask). */
+function cursorFreeText(paneText: string): string {
+  return paneText
     .split("\n")
     .map((l) => l.replace(/^\s*[❯›]\s?/, "").trim())
     .filter((l) => l.length > 0)
     .join("\n");
-  return sha1(`choices:${m.choices.map((c) => c.label).join("\u0001")}|${text}`);
 }
 
 /**

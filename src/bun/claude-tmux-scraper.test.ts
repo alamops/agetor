@@ -782,6 +782,41 @@ test("scrapeOnce: a second numbered question with the same choices and cursor re
   });
 });
 
+test("scrapeOnce: a second unnumbered question with the same labels and cursor replaces the first one's card", async () => {
+  const quiet = { paneWorking: false, paneIdle: false, watchdogArmed: false };
+  const ask = (what: string) => [
+    " Use " + what + " for this session?",
+    "",
+    " Claude will read and change files through it.",
+    "",
+    " ❯ Yes, use it",
+    "   No, skip it",
+    "",
+    " Enter to confirm · Esc to cancel",
+  ].join("\n");
+  const first = pickScrapeMatch(ask("the docs server"), quiet)!;
+  const second = pickScrapeMatch(ask("the deploy server"), quiet)!;
+  expect(first.choices.map((c) => c.label)).toEqual(["Yes, use it", "No, skip it"]);
+  expect(first.fingerprint).not.toBe(second.fingerprint);
+  // The same frame again keeps its fingerprint (stability and suppression hold).
+  expect(pickScrapeMatch(ask("the docs server"), quiet)!.fingerprint).toBe(first.fingerprint);
+
+  await withScrapeTask(ask("the docs server"), async ({ pending, tick, setPane }) => {
+    await tick();
+    await tick();
+    const [card] = pending();
+    expect(card!.paneText).toContain("the docs server");
+    // Answered in the terminal; claude asks the same thing about another server.
+    setPane(ask("the deploy server"));
+    await tick();
+    await tick();
+    const cards = pending();
+    expect(cards).toHaveLength(1);
+    expect(cards[0]!.id).not.toBe(card!.id);
+    expect(cards[0]!.paneText).toContain("the deploy server");
+  });
+});
+
 test("scrapeOnce → registerTmuxPrompt — two stable ticks on the reconstructed Chrome prompt register one answerable card, hideKeys included", async () => {
   await withScrapeTask(CHROME_UNNUMBERED_PANE, async ({ taskId, runId, pending, tick }) => {
     // The unnumbered matcher is NOT high-confidence, so the first sighting only
