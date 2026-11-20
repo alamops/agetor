@@ -76,3 +76,21 @@ export function isSafeClientRelPath(path: string): boolean {
   if (!path || path.startsWith("/") || path.includes("\0")) return false;
   return !path.split("/").some((seg) => seg === "..");
 }
+
+/** A GitHub-style handle: 1–39 chars of letters, digits and hyphens, starting
+ *  with an alphanumeric. */
+const HANDLE_LIKE = /^[A-Za-z0-9][A-Za-z0-9-]{0,38}$/;
+
+/**
+ * True for an `@token` that reads as a person's handle (`@octocat`,
+ * `@some-user`) and not as a file path: no `/` and no `.`. An issue's thread
+ * quotes its author as `@author`, which the unresolved-token warning used to
+ * flag as "doesn't match a project file". This is a warning filter only: the
+ * highlight backdrop, the server-side `@` expansion and the prompt text are
+ * unchanged (a real, listed file with such a name still resolves and highlights;
+ * it never reaches the filter). See docs/architecture/at-file-references.md.
+ */
+export function isHandleLikeAtToken(path: string): boolean {
+  if (path.includes("/") || path.includes(".")) return false;
+  return HANDLE_LIKE.test(path);
+}

@@ -1,45 +1,49 @@
-import { Button } from "@/components/ui/button";
+import { useId } from "react";
+import { SegmentedControl } from "@/components/ui/segmented-control";
+import { Label } from "@/components/ui/field";
 import { cn } from "@/lib/utils";
 import { taskTypeIcon } from "@/lib/task-type-icon";
 import { TASK_TYPES, type TaskType } from "../../../shared/types.ts";
 
 /**
- * The Type grid — Task / Bug / Spike buttons, each with its icon and hint
- * tooltip. Lifted verbatim out of `NewTaskForm.tsx` (its original home) so
- * `CreateTaskFromIssueDialog` can reuse the exact same control (seeded from
- * the issue's labels via `inferTaskTypeFromLabels`, see `issue-task.ts`)
- * without the two surfaces drifting.
+ * The Type control — Task / Bug / Spike as a radiogroup, each with its icon and
+ * hint tooltip. Shared by the New Task panel and `CreateTaskFromIssueDialog`
+ * (seeded from the issue's labels via `inferTaskTypeFromLabels`, see
+ * `issue-task.ts`) so the two surfaces don't drift.
  */
 export function TaskTypePicker({
   value,
   onChange,
   className,
+  disabled,
 }: {
   value: TaskType;
   onChange: (t: TaskType) => void;
   className?: string;
+  disabled?: boolean;
 }) {
+  // Per-instance: the panel is always mounted beside an open issue dialog.
+  const labelId = `${useId()}-type-label`;
   return (
-    <div className={cn("space-y-1", className)} data-testid="task-type-picker">
-      <label className="text-muted-foreground">Type</label>
-      <div className="grid grid-cols-3 gap-1">
-        {TASK_TYPES.map((t) => {
-          const Icon = taskTypeIcon(t.icon);
-          const selected = value === t.id;
-          return (
-            <Button
-              key={t.id}
-              size="sm"
-              variant={selected ? "default" : "outline"}
-              onClick={() => onChange(t.id)}
-              title={t.hint}
-              className="justify-start"
-            >
-              <Icon className={cn("mr-1 size-3.5", !selected && t.iconClass)} />
-              <span className="truncate">{t.label}</span>
-            </Button>
-          );
-        })}
+    <div className={cn("space-y-1.5", className)}>
+      <Label id={labelId}>Type</Label>
+      <div data-testid="task-type-picker">
+        <SegmentedControl
+          aria-labelledby={labelId}
+          value={value}
+          onChange={(v) => onChange(v as TaskType)}
+          disabled={disabled}
+          items={TASK_TYPES.map((t) => {
+            const Icon = taskTypeIcon(t.icon);
+            return {
+              value: t.id,
+              label: t.label,
+              title: t.hint,
+              testId: `task-type-${t.id}`,
+              icon: <Icon className={cn("size-3.5", value !== t.id && t.iconClass)} />,
+            };
+          })}
+        />
       </div>
     </div>
   );

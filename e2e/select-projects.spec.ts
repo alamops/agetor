@@ -502,7 +502,7 @@ test("a repo plus its own subdirectory dedupes to one project", async ({ page, r
   await expect(form.locator('[data-testid^="branch-row-"]')).toHaveCount(1);
   await expect(form.getByTestId("isolate-toggle")).toBeEnabled();
 
-  await form.getByRole("button", { name: "To backlog", exact: true }).click();
+  await form.getByRole("button", { name: "Add to backlog", exact: true }).click();
   const created = await awaitTask(request, backend, "select-projects dedupe");
   expect(created.multiRepo ?? false).toBe(false);
   expect(created.workdir).toBe(repoA);
@@ -720,7 +720,7 @@ test("a submit keeps the selection and refs and resets the branch name", async (
   await branchName.fill("custom/one-off");
   await expect(branchName).toHaveValue("custom/one-off");
 
-  await form.getByRole("button", { name: "To backlog", exact: true }).click();
+  await form.getByRole("button", { name: "Add to backlog", exact: true }).click();
 
   // The selection and its per-project ref survive; the branch-name field
   // resets to its live pattern for the next task.
@@ -740,7 +740,7 @@ test("a non-git folder with Isolate off creates with workdir and isolation none"
   await expect(form.getByTestId("isolate-toggle")).not.toBeChecked();
   await expect(form.getByTestId("branch-name-input")).toHaveCount(0);
 
-  await form.getByRole("button", { name: "To backlog", exact: true }).click();
+  await form.getByRole("button", { name: "Add to backlog", exact: true }).click();
   const created = await awaitTask(request, backend, "select-projects plain folder");
   expect(created.workdir).toBe(repoPlain);
   expect(created.isolation).toBe("none");
@@ -760,7 +760,7 @@ test("with no project selected the form cannot create a task", async ({ page, fr
 
   await expect(form.getByTestId("select-projects-button")).toContainText("Select projects…");
   await expect(form.getByTestId("select-projects-empty")).toBeVisible();
-  await expect(form.getByRole("button", { name: "To backlog", exact: true })).toBeDisabled();
+  await expect(form.getByRole("button", { name: "Add to backlog", exact: true })).toBeDisabled();
   await expect(form.getByRole("button", { name: "Run task", exact: true })).toBeDisabled();
 });
 
@@ -806,7 +806,7 @@ test("a picker's automatic current-branch seed is not saved as a pick", async ({
   await expect(branchRow(form, slugFor(repoA))).toContainText("current branch");
   await expect(branchRow(form, slugFor(repoB))).toContainText(BRANCH);
 
-  await form.getByRole("button", { name: "To backlog", exact: true }).click();
+  await form.getByRole("button", { name: "Add to backlog", exact: true }).click();
   const created = await awaitTask(request, backend, "select-projects seed not saved");
   // No ref for A means HEAD at create time, which is A's `main`.
   expect(created.repositories.map((r) => r.path)).toEqual([repoA, repoB]);

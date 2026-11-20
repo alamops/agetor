@@ -5,6 +5,17 @@ import { tmpdir } from "node:os";
 import path from "node:path";
 import { test, expect, type APIRequestContext, type E2EBackend, type Locator, type Page } from "./fixtures";
 import { gotoApp } from "./helpers";
+import {
+  effortField,
+  expectHarness,
+  harnessPicker,
+  maxModeToggle,
+  modeField,
+  modelField,
+  openMore,
+  pickHarness,
+  speedOption,
+} from "./launch-helpers";
 import { AGENT_PROFILE_LIMITS } from "../src/shared/agent-profile.ts";
 
 /**
@@ -104,20 +115,6 @@ async function openSettingsHarnesses(page: Page): Promise<Locator> {
 }
 
 /**
- * `TaskLaunchPickers`' Mode/Model/Effort `<Select>`s carry no test id — each
- * is a native `<select>` immediately following a `<label>` with the field
- * name, inside its own `space-y-1` wrapper div (same shape for all three;
- * Model/Effort additionally sit inside a `grid-cols-2` row, which doesn't
- * change the label→select adjacency). Mirrors `e2e/agent-profiles.spec.ts`'s
- * `detailsRow` xpath-sibling pattern.
- */
-function launchSelect(container: Locator, label: string): Locator {
-  return container
-    .locator("label", { hasText: new RegExp(`^${label}$`) })
-    .locator("xpath=following-sibling::*[1]//select");
-}
-
-/**
  * The Settings modal itself, located by its own title id — NOT bare
  * `getByRole("dialog")`, which becomes ambiguous (strict-mode violation on
  * `toBeHidden()` etc.) the moment the "Discard unsaved changes?" confirm
@@ -159,12 +156,6 @@ async function expectAgentsList(modal: Locator): Promise<void> {
   await expect(modal.getByTestId("agent-profiles-section")).toBeVisible();
   await expect(modal.getByTestId("agent-profile-editor")).toHaveCount(0);
   await expect(modal.getByRole("button", { name: "Back", exact: true })).toHaveCount(0);
-}
-
-/** One of the harness-picker's grid buttons (`AgentIcon` + exact label text;
- *  the icon is `aria-hidden`, so `name` matches the label alone). */
-function harnessButton(container: Locator, label: string): Locator {
-  return container.getByRole("button", { name: label, exact: true });
 }
 
 // ---- REST helpers ----
@@ -245,9 +236,9 @@ test.describe("agent profiles — Settings surface", () => {
     // itself) never mounts inside this form.
     await expect(form.getByTestId("agent-profile-picker")).toHaveCount(0);
     await expect(form.getByText("Harness", { exact: true })).toBeVisible();
-    await expect(launchSelect(form, "Mode")).toBeVisible();
-    await expect(launchSelect(form, "Model")).toBeVisible();
-    await expect(launchSelect(form, "Effort")).toBeVisible();
+    await expect(modeField(form).trigger).toBeVisible();
+    await expect(modelField(form).trigger).toBeVisible();
+    await expect(effortField(form).trigger).toBeVisible();
 
     // Only Claude Code is enabled at this point (cursor ships disabled by
     // migration 032, and this is the very first test in the suite) — one
@@ -255,17 +246,16 @@ test.describe("agent profiles — Settings surface", () => {
     // The harness buttons render off TaskLaunchPickers' own `/harnesses`
     // fetch (one probe per harness), which under parallel-run load outlasts
     // the 5s default — the form itself is up long before the buttons are.
-    const claudeButton = harnessButton(form, "Claude Code");
-    await expect(claudeButton).toBeVisible({ timeout: CONVERGE_TIMEOUT });
-    await expect(claudeButton).toHaveClass(/bg-primary/);
+    await expect(harnessPicker(form)).toBeVisible({ timeout: CONVERGE_TIMEOUT });
+    await expectHarness(form, "Claude Code");
 
     // Switch model first, then mode, then effort — in that order — so each
     // later pick lands after any auto-reset effect the earlier one could
     // trigger (TaskLaunchPickers.tsx's kind/model-keyed effort/mode reset
     // effects), and reads back as exactly what was picked.
-    await launchSelect(form, "Model").selectOption("sonnet-5");
-    await launchSelect(form, "Mode").selectOption("plan");
-    await launchSelect(form, "Effort").selectOption("medium");
+    await modelField(form).selectOption("sonnet-5");
+    await modeField(form).selectOption("plan");
+    await effortField(form).selectOption("medium");
 
     await form.getByTestId("agent-profile-instructions").fill(WIDGET_BUILDER_INSTRUCTIONS);
 
@@ -318,13 +308,13 @@ test.describe("agent profiles — Settings surface", () => {
     await expect(form).toBeVisible();
 
     await expect(form.getByTestId("agent-profile-name")).toHaveValue(WIDGET_BUILDER_NAME);
-    await expect(launchSelect(form, "Model")).toHaveValue("sonnet-5");
-    await expect(launchSelect(form, "Effort")).toHaveValue("medium");
-    await expect(launchSelect(form, "Mode")).toHaveValue("plan");
+    await modelField(form).expectValue("sonnet-5");
+    await effortField(form).expectValue("medium");
+    await modeField(form).expectValue("plan");
     await expect(form.getByTestId("agent-profile-instructions")).toHaveValue(WIDGET_BUILDER_INSTRUCTIONS);
     // Harness buttons render only once TaskLaunchPickers' `/harnesses` fetch
     // lands (one probe per harness) — past the 5s default under load.
-    await expect(harnessButton(form, "Claude Code")).toHaveClass(/bg-primary/, { timeout: CONVERGE_TIMEOUT });
+    await expectHarness(form, "Claude Code");
     await expect(form.locator('[data-testid="skills-picker-chip"]')).toHaveCount(0);
 
     await form.getByTestId("agent-profile-save").click();
@@ -535,9 +525,9 @@ test.describe("agent profiles — Settings surface", () => {
     await expect(form.getByTestId("agent-profile-name")).toHaveValue(WIDGET_BUILDER_NAME);
     // Wait for the async launch seeding (harness fetch, preference reads) to
     // fully settle — an untouched Edit form must not read dirty afterwards.
-    await expect(harnessButton(form, "Claude Code")).toHaveClass(/bg-primary/, { timeout: CONVERGE_TIMEOUT });
-    await expect(launchSelect(form, "Model")).toHaveValue("sonnet-5");
-    await expect(launchSelect(form, "Mode")).toHaveValue("plan");
+    await expectHarness(form, "Claude Code");
+    await modelField(form).expectValue("sonnet-5");
+    await modeField(form).expectValue("plan");
 
     // Back.
     await modal.getByRole("button", { name: "Back", exact: true }).click();
@@ -547,7 +537,7 @@ test.describe("agent profiles — Settings surface", () => {
     // Escape pops (does NOT close the modal), still no confirm.
     await row.getByTestId("agent-profile-edit").click();
     await expect(modal.getByRole("heading", { name: "Edit agent" })).toBeVisible();
-    await expect(harnessButton(form, "Claude Code")).toHaveClass(/bg-primary/, { timeout: CONVERGE_TIMEOUT });
+    await expectHarness(form, "Claude Code");
     await page.keyboard.press("Escape");
     await expectAgentsList(modal);
     await expect(discardConfirm(page)).toHaveCount(0);
@@ -770,10 +760,10 @@ test.describe("agent profiles — Settings surface", () => {
     const { modal, form } = await openAddSubpage(page);
     // Name and every text field stay untouched. Let the picker block finish
     // its async seeding first, so the pick below is unambiguously the user's.
-    await expect(harnessButton(form, "Claude Code")).toHaveClass(/bg-primary/, { timeout: CONVERGE_TIMEOUT });
+    await expectHarness(form, "Claude Code");
     await expect(form.getByTestId("agent-profile-name")).toHaveValue("");
-    await launchSelect(form, "Mode").selectOption("plan");
-    await expect(launchSelect(form, "Mode")).toHaveValue("plan");
+    await modeField(form).selectOption("plan");
+    await modeField(form).expectValue("plan");
 
     await modal.getByRole("button", { name: "Back", exact: true }).click();
     const confirm = discardConfirm(page);
@@ -781,7 +771,7 @@ test.describe("agent profiles — Settings surface", () => {
     await confirm.getByRole("button", { name: "Cancel", exact: true }).click();
     await expect(confirm).toBeHidden();
     await expect(modal.getByRole("heading", { name: "Add agent" })).toBeVisible();
-    await expect(launchSelect(form, "Mode")).toHaveValue("plan");
+    await modeField(form).expectValue("plan");
 
     await modal.getByRole("button", { name: "Back", exact: true }).click();
     await expect(confirm).toBeVisible();
@@ -806,28 +796,30 @@ test.describe("agent profiles — Settings surface", () => {
     const cursorName = `Cursor MaxMode Test ${randomUUID()}`;
     await form.getByTestId("agent-profile-name").fill(cursorName);
 
-    await harnessButton(form, "Cursor").click();
-    await expect(harnessButton(form, "Cursor")).toHaveClass(/bg-primary/);
+    await pickHarness(form, "Cursor");
+    await expectHarness(form, "Cursor");
 
     // "Codex 5.3" (CURSOR_MODEL_SPECS["gpt-5.3-codex"]) supports BOTH the
     // fast variant and Max Mode at the default cursor effort ("high") — see
     // src/shared/types.ts's cursorModelSupportsFast/cursorModelSupportsMaxMode
     // and that spec's effortIds/fastEfforts entries.
-    await launchSelect(form, "Model").selectOption("gpt-5.3-codex");
-    await expect(launchSelect(form, "Effort")).toHaveValue("high");
+    await modelField(form).selectOption("gpt-5.3-codex");
+    await effortField(form).expectValue("high");
 
-    const maxModeToggle = form.getByTestId("launch-max-mode-toggle");
+    // Speed and Max Mode sit behind Agent → More options.
+    await openMore(form);
+    const maxModeSwitch = await maxModeToggle(form);
     const speedPicker = form.getByTestId("launch-speed");
-    await expect(maxModeToggle).toBeVisible();
+    await expect(maxModeSwitch).toBeVisible();
     await expect(speedPicker).toBeVisible();
     await expect(speedPicker).toHaveAttribute("data-value", "off");
-    await expect(speedPicker.getByTestId("launch-speed-off")).toHaveAttribute("aria-pressed", "true");
-    await expect(speedPicker.getByTestId("launch-speed-fast")).toHaveAttribute("aria-pressed", "false");
+    await expect(await speedOption(form, "off")).toBeChecked();
+    await expect(await speedOption(form, "fast")).not.toBeChecked();
     // Cursor offers no Ultrafast tier.
     await expect(speedPicker.getByTestId("launch-speed-ultrafast")).toHaveCount(0);
 
-    await maxModeToggle.getByRole("switch").click();
-    await expect(maxModeToggle.getByRole("switch")).toHaveAttribute("aria-checked", "true");
+    await maxModeSwitch.click();
+    await expect(maxModeSwitch).toHaveAttribute("aria-checked", "true");
 
     await form.getByTestId("agent-profile-save").click();
     await expect(form).toBeHidden();
@@ -845,8 +837,9 @@ test.describe("agent profiles — Settings surface", () => {
     await row.getByTestId("agent-profile-edit").click();
     const editForm = dialog.getByTestId("agent-profile-form");
     await expect(editForm).toBeVisible();
+    await openMore(editForm);
     await expect(editForm.getByTestId("launch-max-mode-toggle")).toBeVisible();
-    await harnessButton(editForm, "Claude Code").click();
+    await pickHarness(editForm, "Claude Code");
     await expect(editForm.getByTestId("launch-max-mode-toggle")).toHaveCount(0);
     await expect(editForm.getByTestId("launch-speed")).toHaveCount(0);
     await editForm.getByTestId("agent-profile-cancel").click();
@@ -1054,9 +1047,9 @@ test.describe("agent profiles — Settings surface", () => {
     await expect(form.getByTestId("agent-profile-instructions")).toHaveValue(sourceInstructions);
     // These are not the blank-create defaults (opus-5.5 / auto), so a missed
     // launch seed cannot pass the way a Claude Code harness check can.
-    await expect(launchSelect(form, "Model")).toHaveValue("sonnet-5");
-    await expect(launchSelect(form, "Effort")).toHaveValue("medium");
-    await expect(launchSelect(form, "Mode")).toHaveValue("plan");
+    await modelField(form).expectValue("sonnet-5");
+    await effortField(form).expectValue("medium");
+    await modeField(form).expectValue("plan");
     await expect(form.locator('[data-testid="skills-picker-chip"][data-skill="code-review"]')).toBeVisible();
     await expect(modal.getByTestId("agent-profile-editor")).toBeVisible();
     await form.getByTestId("agent-profile-save").click();
@@ -1091,7 +1084,7 @@ test.describe("agent profiles — Settings surface", () => {
     await expect(heading).toHaveText("Edit agent");
     await expect(form.getByTestId("agent-profile-name")).toHaveValue(copyName);
     await expect(form.getByTestId("agent-profile-instructions")).toHaveValue(sourceInstructions);
-    await expect(launchSelect(form, "Model")).toHaveValue("sonnet-5");
+    await modelField(form).expectValue("sonnet-5");
     await expect(form.locator('[data-testid="skills-picker-chip"][data-skill="code-review"]')).toBeVisible();
     await form.getByTestId("agent-profile-cancel").click();
     await expect(form).toBeHidden();
@@ -1110,10 +1103,10 @@ test.describe("agent profiles — Settings surface", () => {
     await expect(form).toBeVisible();
     await expect(heading).toHaveText("Duplicate agent");
     await expect(form.getByTestId("agent-profile-name")).toHaveValue(`${sourceName} (copy 2)`);
-    await expect(launchSelect(form, "Model")).toHaveValue("sonnet-5");
-    await expect(launchSelect(form, "Effort")).toHaveValue("medium");
-    await expect(launchSelect(form, "Mode")).toHaveValue("plan");
-    await expect(harnessButton(form, "Claude Code")).toHaveClass(/bg-primary/, { timeout: CONVERGE_TIMEOUT });
+    await modelField(form).expectValue("sonnet-5");
+    await effortField(form).expectValue("medium");
+    await modeField(form).expectValue("plan");
+    await expectHarness(form, "Claude Code");
     await modal.getByRole("button", { name: "Back", exact: true }).click();
     await expect(discardConfirm(page)).toHaveCount(0);
     await expectAgentsList(modal);
@@ -1174,12 +1167,12 @@ test.describe("agent profiles — Settings surface", () => {
       await expect(form).toBeVisible();
       await expect(modal.locator("#settings-dialog-title")).toHaveText("Duplicate agent");
       await expect(form.getByTestId("agent-profile-name")).toHaveValue(`${sourceName} (copy)`);
-      await expect(harnessButton(form, "Cursor")).toHaveClass(/bg-primary/, { timeout: CONVERGE_TIMEOUT });
-      await expect(launchSelect(form, "Model")).toHaveValue("gpt-5.3-codex");
-      await expect(launchSelect(form, "Mode")).toHaveValue("ask");
-      await expect(form.getByTestId("launch-max-mode-toggle").getByRole("switch")).toHaveAttribute("aria-checked", "true");
+      await expectHarness(form, "Cursor");
+      await modelField(form).expectValue("gpt-5.3-codex");
+      await modeField(form).expectValue("ask");
+      await expect(await maxModeToggle(form)).toHaveAttribute("aria-checked", "true");
       await expect(form.getByTestId("launch-speed")).toHaveAttribute("data-value", "fast");
-      await expect(form.getByTestId("launch-speed-fast")).toHaveAttribute("aria-pressed", "true");
+      await expect(await speedOption(form, "fast")).toBeChecked();
 
       await form.getByTestId("agent-profile-save").click();
       await expect(form).toBeHidden();

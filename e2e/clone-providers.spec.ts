@@ -474,6 +474,11 @@ test.describe("Clone repository dialog — progress streaming and cancel", () =>
     await expect(cancel).toBeVisible();
     await expect(cancel).toBeEnabled();
     await expect(cancel).toHaveText("Cancel clone");
+    // The header × can't close the dialog mid-clone (Cancel clone is the way out), and it looks
+    // disabled (ui/dialog.tsx DialogClose's disabled styles).
+    const headerClose = dialog.getByRole("button", { name: "Close", exact: true });
+    await expect(headerClose).toBeDisabled();
+    await expect(headerClose).toHaveCSS("opacity", "0.5");
 
     const progressRow = dialog.getByTestId("clone-progress");
     await expect(progressRow).toBeVisible({ timeout: CONVERGE_TIMEOUT });

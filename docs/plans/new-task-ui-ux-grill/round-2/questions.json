@@ -1,0 +1,76 @@
+{
+  "version": 1,
+  "id": "new-task-ui-ux-grill-r2",
+  "title": "Grill round 2: New Task redesign, push-back",
+  "skill": "grill",
+  "slug": "new-task-ui-ux",
+  "round": 2,
+  "summary": "Round 1 settled 23 of 24 items, and I accepted every one as given. **Three answers need one more decision**, because two of them pull against each other or against the code:\n\n1. In **surfaces** you picked both *RunPanel send box: shared-primitive changes only* **and** *RunPanel send box: full redesign too*. Those are exclusive, so I need to know what \"full\" covers.\n2. **Sections with collapsible summaries** plus your **frequent fields** list. You change Project, Isolate, Pipeline, Harness, Model and Effort on most tasks, and those are almost all of Workspace and Agent. Collapsing those sections would hide what you use most.\n3. **Mode** isn't in your frequent list, but it got a dedicated segmented control. Where does it live?",
+  "proven": [
+    "Round-1 decisions recorded as given: one shared launch picker, every drift item carried everywhere (gate Run included), a Code|Plan segmented control plus variant, a searchable harness picker, a resizable panel (default 384 px), a two-column dialog, the subtle selected style, one custom picker family, all three bugs fixed (handles skipped by the warning), **Run task** everywhere, primitives added additively on this branch, the full acceptance bar, and all 8 confirm defaults."
+  ],
+  "sections": [
+    {
+      "id": "pushback",
+      "title": "Push-back on round 1",
+      "questions": [
+        {
+          "id": "runpanel-scope",
+          "type": "single",
+          "title": "You chose both 'shared changes only' and 'full redesign' for the RunPanel send box. What should this change do to it?",
+          "impact": "blocking",
+          "why": "A full redesign adds a second large surface (the send dock and its toolbar) to the plan and to e2e.",
+          "context": "Round 1 answer: `surfaces` = [..., `runpanel-shared-only`, `runpanel-full`].\n\nThe send box is `PromptComposer` with `label={null}`, `placement=\"above\"` and flattened spacing. Its toolbar carries **Save for later**, **Commit & push**, **Resolve conflicts** and **Send**, plus the drag-and-drop ring and the read-only 'Viewing a background agent' bar. A full redesign would restyle that toolbar and its buttons to the new pattern (subtle states, h-9, one picker family, rem text, Cmd/Ctrl+Enter parity).",
+          "evidence": [
+            { "label": "send dock", "path": "src/mainview/components/kanban/RunPanel.tsx", "line": 4976, "endLine": 5040 }
+          ],
+          "options": [
+            { "id": "full-in", "label": "Full redesign in this change: the dock, its toolbar actions and the background-agent bar adopt the new pattern", "consequence": "Bigger plan. RunPanel e2e specs are touched, and the send-box screenshots become before/after." },
+            { "id": "shared-only", "label": "Shared changes only (it inherits the tokens, label association and text sizes through PromptComposer); the layout is unchanged", "consequence": "As recommended in round 1." },
+            { "id": "deferred", "label": "Shared changes now; the full send-box redesign is a separate ticket I'm deferring", "consequence": "Recorded as owner-deferred, with you as the decider." }
+          ],
+          "recommendation": { "value": "full-in", "reason": "You ticked it, and you usually prefer the complete path. It makes the composer look the same wherever you type a prompt." }
+        },
+        {
+          "id": "collapse-model",
+          "type": "single",
+          "title": "Your frequent fields cover most of Workspace and Agent. What should collapse?",
+          "impact": "blocking",
+          "why": "This decides the panel's default state, and whether a frequently used control can end up hidden behind a click.",
+          "context": "Round 1: `ia` = **sections-summary**. `frequent-fields` = Type, Title, Prompt, Files, **Project, Isolate, Pipeline, Harness, Model, Effort**.\n\nNot frequent: Branch name, Extensions (MCP · Skills…), Agent profile, **Mode**, Speed / Max Mode.",
+          "options": [
+            {
+              "id": "more-options",
+              "label": "Sections are always open, and the frequent fields are always visible. The rare fields in each section sit behind a small **More options** disclosure, remembered in localStorage. No whole-section collapse",
+              "preview": "TASK       Type · Title · Prompt · Files\nWORKSPACE  Project · Isolate\n           ▸ More options (Branch name)\nAGENT      Pipeline · Harness · Model · Effort\n           ▸ More options (Agent profile, Mode, Speed, Max Mode)",
+              "consequence": "Nothing you use often is ever hidden. The panel is still shorter than today."
+            },
+            {
+              "id": "sections-expanded-default",
+              "label": "Workspace and Agent can collapse to a summary line, but they start **expanded** and only collapse when you choose to (remembered)",
+              "consequence": "Closest to round 1. The default length is the same as today, minus the regrouping."
+            },
+            {
+              "id": "both",
+              "label": "Both: each section can collapse to its summary line, and inside an open section the rare fields sit behind More options",
+              "consequence": "The most flexible, with two disclosure levels to build and test."
+            }
+          ],
+          "recommendation": { "value": "both", "reason": "It keeps your round-1 summary-line choice and makes sure the open state never puts a frequent field behind a click." }
+        },
+        {
+          "id": "mode-placement",
+          "type": "single",
+          "title": "Where does the Code | Plan control sit, given that Mode isn't in your frequent list?",
+          "impact": "shape",
+          "context": "Round 1: `mode-control` = **segmented-plus-variant**. `frequent-fields` doesn't include Mode.",
+          "options": [
+            { "id": "visible", "label": "Always visible in Agent, under Harness (one row); only the variant picker goes into More options", "consequence": "Plan stays one click away; the variant (Auto / Accept edits / Ask) is behind the disclosure." },
+            { "id": "in-more", "label": "The whole Mode control (segmented + variant) goes into More options", "consequence": "A shorter Agent section; switching to Plan takes 2 clicks." }
+          ],
+          "recommendation": { "value": "visible", "reason": "The segmented control is what makes Plan one click. Hiding it would defeat the reason it was chosen." }
+        }
+      ]
+    }
+  ]
+}

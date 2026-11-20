@@ -4,6 +4,7 @@ import { tmpdir } from "node:os";
 import path from "node:path";
 import { test, expect, type APIRequestContext, type E2EBackend, type Locator, type Page } from "./fixtures";
 import { gotoApp, selectProject } from "./helpers";
+import { effortField, modelField, openMore, pickHarness, type PickerHandle } from "./launch-helpers";
 
 /**
  * Mirrors three prompt-embedded fake-driver markers exported from
@@ -181,9 +182,7 @@ function newTaskFormPanel(page: Page): Locator {
  *  that the harness is actually enabled. Mirrors e2e/fx-models.spec.ts's
  *  identical helper. */
 async function selectHarness(page: Page, label: string): Promise<void> {
-  const button = newTaskFormPanel(page).getByRole("button", { name: label, exact: true });
-  await expect(button).toBeVisible({ timeout: 20_000 });
-  await button.click();
+  await pickHarness(newTaskFormPanel(page), label);
 }
 
 /**
@@ -193,13 +192,13 @@ async function selectHarness(page: Page, label: string): Promise<void> {
  * see that file's `enableFxHarness`/`createFxTask` duplication rationale).
  * There is no `htmlFor`/`aria-labelledby` wiring the "Model" `<label>` to
  * the `<select>` in NewTaskForm.tsx, so this locates structurally instead:
- * the "Refresh model list" button (`data-testid="refresh-models"`) sits in a
+ * the "Refresh model list" button (`data-testid="launch-refresh-models"`) sits in a
  * small flex row that is the immediate previous sibling of the `<Select>`,
  * both children of one shared `space-y-1` wrapper. Two levels up from the
  * button lands on that wrapper; `select` inside it is the Model dropdown.
  */
-function newTaskModelSelect(page: Page): Locator {
-  return newTaskFormPanel(page).getByTestId("refresh-models").locator("xpath=../..").locator("select");
+function newTaskModelSelect(page: Page): PickerHandle {
+  return modelField(newTaskFormPanel(page));
 }
 
 /**
@@ -218,8 +217,8 @@ function newTaskModelSelect(page: Page): Locator {
  * `<label>`, and lives in the run panel's own `<aside>` — see
  * `detailsEffortSelect` below).
  */
-function newTaskEffortSelect(page: Page): Locator {
-  return newTaskFormPanel(page).getByText("Effort", { exact: true }).locator("xpath=..").locator("select");
+function newTaskEffortSelect(page: Page): PickerHandle {
+  return effortField(newTaskFormPanel(page));
 }
 
 /**
@@ -528,8 +527,8 @@ test.describe("fx interactions", () => {
     // id "Full access" (fx 0.0.8's own --full-access / /permissions
     // full-access naming) — the old "Yolo" label must not survive anywhere
     // in the picker.
-    const modeLabel = form.getByText("Mode", { exact: true });
-    const modeTrigger = modeLabel.locator("xpath=following-sibling::div[2]//button").first();
+    await openMore(form);
+    const modeTrigger = form.getByTestId("launch-mode-variant-picker-trigger");
     await modeTrigger.click();
 
     // `getByText(..., { exact: true })`, not `getByRole` — a popover row's
@@ -550,9 +549,9 @@ test.describe("fx interactions", () => {
     // = "yolo"), so an unscoped `getByRole("button", { name: /^Full
     // access\b/ })` resolves to both the trigger and the popover row and
     // trips Playwright's strict-mode violation.
-    const fullAccessOption = form
-      .locator("[data-popover-open]")
-      .getByRole("button", { name: /^Full access\b/ });
+    const fullAccessOption = page
+      .getByTestId("launch-mode-variant-picker-popover")
+      .getByRole("option", { name: /^Full access\b/ });
     await expect(fullAccessOption).toBeVisible();
     await fullAccessOption.click();
     await expect(modeTrigger).toHaveText("Full access");
@@ -605,14 +604,14 @@ test.describe("fx interactions", () => {
     // order), so no `selectProject` call is needed for this test, which
     // never submits the form.
     const modelSelect = newTaskModelSelect(page);
-    await expect(modelSelect).toHaveValue("deepseek/deepseek-v4-flash");
+    await modelSelect.expectValue("deepseek/deepseek-v4-flash");
 
     // DEFAULT_EFFORT.fx = "auto" ("Model default") — fx's own default, per
     // docs/plans/fx-0.0.10-compat.md D1 — so a freshly-selected fx harness
     // shows "Model default" without the user picking anything.
     const effortSelect = newTaskEffortSelect(page);
-    await expect(effortSelect).toHaveValue("auto");
-    await expect(effortSelect.locator("option:checked")).toHaveText("Model default");
+    await effortSelect.expectValue("auto");
+    await expect(effortSelect.trigger).toContainText("Model default");
 
     // --- Offered rows: MODEL_EFFORT_SUPPORT.fx["deepseek/deepseek-v4-flash"]
     // is exactly ["high", "medium", "low", "none", "auto"] (the stub's
@@ -620,7 +619,7 @@ test.describe("fx interactions", () => {
     // source), rendered through EFFORT_OPTIONS in that canonical (highest →
     // lowest, "auto" last) order — "Max thinking" is never one of them for
     // this model (other fx models, like GLM 5.3 Flash, do list it).
-    const optionTexts = await effortSelect.locator("option").allTextContents();
+    const optionTexts = await effortSelect.optionLabels();
     expect(optionTexts).toEqual(["High", "Medium", "Low", "No thinking", "Model default"]);
     // `getByText(..., { exact: true })` scoped to the whole form, not just
     // the select — same exact-match rationale as the mode picker test above
@@ -631,8 +630,8 @@ test.describe("fx interactions", () => {
 
     // --- Picking a row updates the trigger --------------------------------
     await effortSelect.selectOption({ label: "High" });
-    await expect(effortSelect).toHaveValue("high");
-    await expect(effortSelect.locator("option:checked")).toHaveText("High");
+    await effortSelect.expectValue("high");
+    await expect(effortSelect.trigger).toContainText("High");
 
     // --- A no-effort model collapses/disables the picker --------------------
     // MODEL_EFFORT_SUPPORT.fx["minimax/minimax-m3"] is `[]` (one of the two

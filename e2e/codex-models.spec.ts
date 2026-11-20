@@ -9,6 +9,7 @@ import {
   type FakeCodexModel,
 } from "../src/bun/test-codex-app-server.ts";
 import { AGENT_OPTIONS, DEFAULT_MODEL } from "../src/shared/types.ts";
+import { modeField, modelField, newTaskPanel, pickHarness, type PickerHandle } from "./launch-helpers";
 
 /**
  * E2E coverage for the codex side of docs/plans/dynamic-model-catalog.md:
@@ -117,11 +118,13 @@ function runPanel(page: Page): Locator {
 }
 
 /** The New Task form's Model `<select>` (see e2e/claude-models.spec.ts). */
-function modelSelect(page: Page): Locator {
-  return page.getByTestId("refresh-models").locator("xpath=../..").locator("select");
+function modelSelect(page: Page): PickerHandle {
+  return modelField(newTaskPanel(page));
 }
 
-async function optionValues(select: Locator): Promise<string[]> {
+/** Row values of a launch picker, or of a native `<select>` (the run panel's details editor). */
+async function optionValues(select: PickerHandle | Locator): Promise<string[]> {
+  if ("optionValues" in select) return select.optionValues();
   return select.locator("option").evaluateAll((options) => options.map((o) => (o as HTMLOptionElement).value));
 }
 
@@ -140,14 +143,10 @@ async function rememberCodexPicks(request: APIRequestContext, backend: E2EBacken
 async function openFormOnCodex(page: Page, backend: E2EBackend, projectName: string): Promise<Locator> {
   await gotoApp(page, backend.bootBase);
   const form = newTaskForm(page);
-  const codexButton = form.getByRole("button", { name: "Codex", exact: true });
-  await expect(codexButton).toBeVisible({ timeout: 20_000 });
-  await codexButton.click();
+  await pickHarness(form, "Codex");
   await selectProject(page, form, projectName);
-  const modeLabel = form.getByText("Mode", { exact: true });
-  await expect(modeLabel.locator("xpath=following-sibling::div[2]//button").first()).toHaveText("Read-only", {
-    timeout: 15_000,
-  });
+  // Codex's `ask` mode ("Read-only") is its Plan bucket.
+  await modeField(form).expectValue("ask", { timeout: 15_000 });
   return form;
 }
 
@@ -179,7 +178,7 @@ test.describe("Codex model catalog from the CLI", () => {
 
       await openFormOnCodex(page, freshBackend, projectName);
       const select = modelSelect(page);
-      await expect(select).toHaveValue(DEFAULT);
+      await select.expectValue(DEFAULT);
       const values = await optionValues(select);
       expect(values).toEqual(expect.arrayContaining([CLI_ONLY, DEFAULT, LISTED_BUILTIN]));
       // Every row the CLI did not list would be refused at start: none is offered.
@@ -200,12 +199,12 @@ test.describe("Codex model catalog from the CLI", () => {
       await waitForCodexCatalog(request, freshBackend);
 
       await openFormOnCodex(page, freshBackend, projectName);
-      await expect(modelSelect(page)).toHaveValue(LISTED_BUILTIN);
+      await modelSelect(page).expectValue(LISTED_BUILTIN);
 
       await putPreference(request, freshBackend, "lastModel:codex", CLI_ONLY);
       await page.reload();
       await openFormOnCodex(page, freshBackend, projectName);
-      await expect(modelSelect(page)).toHaveValue(CLI_ONLY, { timeout: 15_000 });
+      await modelSelect(page).expectValue(CLI_ONLY, { timeout: 15_000 });
     });
 
     test("a task stored on a model the CLI no longer lists keeps it in the run panel editor, marked as not in the CLI's list", async ({
@@ -258,17 +257,17 @@ test.describe("Codex model catalog from the CLI", () => {
       const form = await openFormOnCodex(page, freshBackend, projectName);
       const select = modelSelect(page);
       // No trusted catalog: the curated rows are all offered and the remembered one is applied.
-      await expect(select).toHaveValue(UNLISTED, { timeout: 15_000 });
+      await select.expectValue(UNLISTED, { timeout: 15_000 });
       expect(await optionValues(select)).toContain(ALSO_UNLISTED);
 
       // The CLI now reports its list (without the remembered model); the manual
       // refresh probes it again and refetches.
       writeFakeCodexCatalog(LATE_STUB.catalogFile, CATALOG);
-      await form.getByTestId("refresh-models").click();
+      await form.getByTestId("launch-refresh-models").click();
       await expect
         .poll(() => optionValues(select), { timeout: 20_000, message: "the refreshed codex list never reached the picker" })
         .toContain(CLI_ONLY);
-      await expect(select).toHaveValue(DEFAULT, { timeout: 15_000 });
+      await select.expectValue(DEFAULT, { timeout: 15_000 });
       const values = await optionValues(select);
       expect(values).not.toContain(UNLISTED);
       expect(values).not.toContain(ALSO_UNLISTED);

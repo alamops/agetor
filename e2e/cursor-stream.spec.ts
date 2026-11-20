@@ -4,6 +4,7 @@ import { tmpdir } from "node:os";
 import path from "node:path";
 import { test, expect, type APIRequestContext, type E2EBackend, type Locator, type Page } from "./fixtures";
 import { gotoApp, selectProject } from "./helpers";
+import { modeField, pickHarness } from "./launch-helpers";
 
 /**
  * E2E coverage for docs/plans/fx-0.0.14-and-cursor-updates.md E3 (D33 flow
@@ -130,28 +131,22 @@ test.describe("cursor stream (worker backend)", () => {
 
     await gotoApp(page, backend.bootBase);
     const form = newTaskFormPanel(page);
-    const cursorButton = form.getByRole("button", { name: "Cursor", exact: true });
-    await expect(cursorButton).toBeVisible({ timeout: 20_000 });
-    await cursorButton.click();
+    await pickHarness(form, "Cursor");
     await selectProject(page, form, projectName);
 
-    // The Mode label's first sibling is the Code/Plan pill pair; the second
-    // is the exact-mode picker, whose trigger then also reads "Plan".
-    const modeLabel = form.getByText("Mode", { exact: true });
-    const planButton = modeLabel
-      .locator("xpath=following-sibling::div[1]")
-      .getByRole("button", { name: "Plan", exact: true });
+    // Code | Plan: Plan routes to cursor-agent's `--mode plan`.
+    const planButton = form.getByTestId("launch-mode-plan");
     await planButton.click();
     await expect(planButton).toHaveAttribute("title", /--mode plan/);
-    await expect(modeLabel.locator("xpath=following-sibling::div[2]//button").first()).toHaveText("Plan");
+    await modeField(form).expectValue("plan");
 
     const title = `cursor-stream-e2e ${randomUUID()}`;
     await form.getByPlaceholder("Short description").fill(title);
     await form.getByTestId("prompt-textarea").fill(`${FAKE_CURSOR_STREAM_PROMPT_MARKER} ${title}`);
     await form.getByTestId("worktree-options").getByTestId("isolate-toggle").uncheck();
-    // To backlog, then start with the panel open, so the `started — …`
+    // Add to backlog, then start with the panel open, so the `started — …`
     // breadcrumb arrives live on the panel's subscription.
-    await form.getByRole("button", { name: "To backlog", exact: true }).click();
+    await form.getByRole("button", { name: "Add to backlog", exact: true }).click();
 
     let row: Record<string, any> | null = null;
     await expect(async () => {

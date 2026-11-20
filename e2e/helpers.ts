@@ -1,4 +1,6 @@
 import { Database } from "bun:sqlite";
+import { execFileSync } from "node:child_process";
+import { createHash } from "node:crypto";
 import { mkdirSync, writeFileSync } from "node:fs";
 import path from "node:path";
 import { expect, type APIRequestContext, type Locator, type Page } from "@playwright/test";
@@ -13,6 +15,15 @@ import type { HarnessQuota } from "../src/shared/types.ts";
  */
 
 export interface GotoAppOptions {
+  /**
+   * Defaults to `true`: before the page loads, opens every launch section's
+   * "More options" disclosure (`agetor:launch:<surface>:<section>:more`, see
+   * src/mainview/lib/panel-collapse.ts), so a spec reaches the rarely-changed
+   * fields (Branch name, Speed, the agent profile picker, the Mode variant,
+   * Max Mode) without clicking through. e2e/launch-layout.spec.ts opts out
+   * (`{ launchMoreOpen: false }`) to test the real default and its persistence.
+   */
+  launchMoreOpen?: boolean;
   /**
    * Defaults to `true`: before navigating, seeds `onboardingDismissed="true"`
    * directly against the backend this `url` points at, so the first-run
@@ -56,7 +67,22 @@ function backendFromBootUrl(url: string): { apiBase: string; token: string } | n
  *  hash params, e.g. font-size.spec's `&fontSize=`). See `GotoAppOptions`
  *  for the default onboarding-dismissal seeding. */
 export async function gotoApp(page: Page, url: string, options: GotoAppOptions = {}): Promise<void> {
-  const { seedOnboardingDismissed = true } = options;
+  const { seedOnboardingDismissed = true, launchMoreOpen = true } = options;
+  if (launchMoreOpen) {
+    await page.addInitScript(() => {
+      try {
+        for (const surface of ["panel", "dialog"]) {
+          for (const section of ["workspace", "agent"]) {
+            if (localStorage.getItem(`agetor:launch:${surface}:${section}:more`) === null) {
+              localStorage.setItem(`agetor:launch:${surface}:${section}:more`, "1");
+            }
+          }
+        }
+      } catch {
+        /* storage unavailable — the specs then open More options themselves */
+      }
+    });
+  }
   if (seedOnboardingDismissed) {
     const backend = backendFromBootUrl(url);
     if (backend) {
@@ -627,4 +653,28 @@ export async function selectBaseBranch(
   await pickDialogBranch(dialog, pathOrName, branch);
   await dialog.getByRole("button", { name: "Save", exact: true }).click();
   await expect(dialog).toBeHidden({ timeout: SELECT_PROJECTS_TIMEOUT });
+}
+
+/** Registers `name` as a project backed by a real git repo with one committed README.md, so
+ *  isolation, the Branch name field and the composer's `@` listing all have something to work
+ *  with (a plain directory can't be listed: GET /files/index answers "not a git repository").
+ *  Returns the repo's path. */
+export async function registerGitProject(backend: E2EBackend, name: string): Promise<string> {
+  const dir = path.join(backend.dataDir, "e2e-projects", createHash("sha1").update(name).digest("hex").slice(0, 12));
+  mkdirSync(dir, { recursive: true });
+  const git = (args: string[]) => execFileSync("git", args, { cwd: dir, stdio: ["ignore", "pipe", "pipe"] });
+  git(["init", "-q", "-b", "main"]);
+  git(["config", "user.email", "e2e@example.com"]);
+  git(["config", "user.name", "e2e"]);
+  git(["config", "commit.gpgsign", "false"]);
+  writeFileSync(path.join(dir, "README.md"), "e2e fixture repo\n");
+  git(["add", "-A"]);
+  git(["commit", "-q", "-m", "initial commit"]);
+  const res = await fetch(`${backend.apiBase}/projects`, {
+    method: "POST",
+    headers: { authorization: `Bearer ${backend.apiToken}`, "content-type": "application/json" },
+    body: JSON.stringify({ path: dir, name }),
+  });
+  if (!res.ok) throw new Error(`POST /projects -> ${res.status}: ${await res.text()}`);
+  return dir;
 }

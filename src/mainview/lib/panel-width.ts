@@ -13,7 +13,9 @@
  * falls back to the default and the writer is best-effort.
  */
 
-import type { PanelStorage } from "./panel-collapse.ts";
+import { NEW_TASK_PANEL_WIDTH_KEY, type PanelStorage } from "./panel-collapse.ts";
+
+export { NEW_TASK_PANEL_WIDTH_KEY };
 
 /** Storage key for the RunPanel's persisted width (px, integer). */
 export const RUN_PANEL_WIDTH_KEY = "agetor:runPanelWidth";
@@ -85,6 +87,78 @@ export function writePanelWidth(
   if (!storage) return;
   try {
     storage.setItem(RUN_PANEL_WIDTH_KEY, String(Math.round(width)));
+  } catch {
+    /* quota / disabled storage — width simply doesn't persist */
+  }
+}
+
+// ---------------------------------------------------------------------------
+// New Task panel width (resizable by drag and keyboard).
+// ---------------------------------------------------------------------------
+
+/** Default width when nothing (valid) is persisted. */
+export const NEW_TASK_PANEL_DEFAULT_WIDTH = 384;
+/** Narrowest the user can make the panel. */
+export const NEW_TASK_PANEL_MIN_WIDTH = 320;
+/** Widest the user can make the panel. */
+export const NEW_TASK_PANEL_MAX_WIDTH = 560;
+/** The board must keep at least this much room next to the panel. */
+export const NEW_TASK_PANEL_MIN_BOARD_WIDTH = 480;
+
+/**
+ * Generic width clamp: inside `[min, max]`, and (when `viewportWidth` is given)
+ * no wider than `viewportWidth - minRemaining` so the content next to the
+ * panel keeps its room. The lower bound wins on a degenerate viewport, so state
+ * never goes below the minimum and re-widening the window restores a usable
+ * panel.
+ */
+export function clampWidth(
+  width: number,
+  opts: { min: number; max: number; fallback: number; viewportWidth?: number; minRemaining?: number },
+): number {
+  if (!Number.isFinite(width)) return opts.fallback;
+  let cap = opts.max;
+  if (opts.viewportWidth !== undefined) cap = Math.min(cap, opts.viewportWidth - (opts.minRemaining ?? 0));
+  cap = Math.max(opts.min, cap);
+  return Math.min(Math.max(Math.round(width), opts.min), cap);
+}
+
+/** Clamp a New Task panel width for the given viewport. */
+export function clampNewTaskPanelWidth(width: number, viewportWidth: number): number {
+  return clampWidth(width, {
+    min: NEW_TASK_PANEL_MIN_WIDTH,
+    max: NEW_TASK_PANEL_MAX_WIDTH,
+    fallback: NEW_TASK_PANEL_DEFAULT_WIDTH,
+    viewportWidth,
+    minRemaining: NEW_TASK_PANEL_MIN_BOARD_WIDTH,
+  });
+}
+
+/** Read the persisted New Task panel width, clamped for the viewport. */
+export function readNewTaskPanelWidth(
+  viewportWidth: number,
+  storage: PanelStorage | null = defaultStorage(),
+): number {
+  let raw: string | null = null;
+  if (storage) {
+    try {
+      raw = storage.getItem(NEW_TASK_PANEL_WIDTH_KEY);
+    } catch {
+      raw = null;
+    }
+  }
+  const parsed = raw === null ? NaN : Number.parseInt(raw, 10);
+  return clampNewTaskPanelWidth(Number.isNaN(parsed) ? NEW_TASK_PANEL_DEFAULT_WIDTH : parsed, viewportWidth);
+}
+
+/** Persist the New Task panel width. Best-effort. */
+export function writeNewTaskPanelWidth(
+  width: number,
+  storage: PanelStorage | null = defaultStorage(),
+): void {
+  if (!storage) return;
+  try {
+    storage.setItem(NEW_TASK_PANEL_WIDTH_KEY, String(Math.round(width)));
   } catch {
     /* quota / disabled storage — width simply doesn't persist */
   }

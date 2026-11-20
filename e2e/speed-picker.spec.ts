@@ -4,6 +4,7 @@ import { tmpdir } from "node:os";
 import path from "node:path";
 import { test, expect, type APIRequestContext, type E2EBackend, type Locator, type Page } from "./fixtures";
 import { gotoApp, selectProject } from "./helpers";
+import { modelField, openMore, pickHarness, type PickerHandle } from "./launch-helpers";
 
 /**
  * E2E coverage for docs/plans/fx-0.0.14-and-cursor-updates.md E2 (D33 flow
@@ -134,15 +135,13 @@ async function openTask(page: Page, title: string): Promise<Locator> {
 }
 
 async function selectHarness(page: Page, label: string): Promise<void> {
-  const button = newTaskFormPanel(page).getByRole("button", { name: label, exact: true });
-  await expect(button).toBeVisible({ timeout: 20_000 });
-  await button.click();
+  await pickHarness(newTaskFormPanel(page), label);
 }
 
 /** The New Task form's Model `<select>` — see e2e/fx-models.spec.ts's
  *  identical helper for the structural locator. */
-function newTaskModelSelect(page: Page): Locator {
-  return newTaskFormPanel(page).getByTestId("refresh-models").locator("xpath=../..").locator("select");
+function newTaskModelSelect(page: Page): PickerHandle {
+  return modelField(newTaskFormPanel(page));
 }
 
 /** Registers a per-name directory as a project (no native folder dialog in
@@ -201,14 +200,6 @@ async function openSettingsAgents(page: Page): Promise<Locator> {
   await dialog.getByRole("button", { name: "Agents", exact: true }).click();
   await expect(dialog.getByTestId("agent-profiles-section")).toBeVisible();
   return dialog;
-}
-
-/** `TaskLaunchPickers`' labelled native `<select>` — see
- *  e2e/agent-profiles-settings.spec.ts's identical helper. */
-function launchSelect(container: Locator, label: string): Locator {
-  return container
-    .locator("label", { hasText: new RegExp(`^${label}$`) })
-    .locator("xpath=following-sibling::*[1]//select");
 }
 
 /** The `last*:fx` prefs the New Task form test's submit writes. They live on
@@ -297,37 +288,38 @@ test.describe("speed picker", () => {
     // This harness's own catalog, curated order (the catalogOnly Sol row is
     // in because discovery has it).
     await expect
-      .poll(async () => modelSelect.locator("option").allTextContents(), { timeout: 20_000 })
+      .poll(async () => modelSelect.optionLabels(), { timeout: 20_000 })
       .toEqual(["DeepSeek V4 Flash", "GPT-5.2", "GPT-6.1 Sol"]);
 
     // The default model offers no tier, so there's no picker at all.
-    await expect(modelSelect).toHaveValue(DEEPSEEK);
-    const picker = form.getByTestId("new-task-speed");
+    await modelSelect.expectValue(DEEPSEEK);
+    await openMore(form);
+    const picker = form.getByTestId("launch-speed");
     await expect(picker).toHaveCount(0);
 
     await modelSelect.selectOption(SOL);
-    await expectTiers(picker, "new-task-speed", ["off", "fast", "ultrafast"]);
+    await expectTiers(picker, "launch-speed", ["off", "fast", "ultrafast"]);
     await expect(picker).toHaveAttribute("data-value", "off");
-    await expect(picker.getByTestId("new-task-speed-ultrafast")).toHaveAttribute("title", /costs more per token/);
+    await expect(picker.getByTestId("launch-speed-ultrafast")).toHaveAttribute("title", /costs more per token/);
 
     await modelSelect.selectOption(GPT52);
-    await expectTiers(picker, "new-task-speed", ["off", "fast"]);
-    await expect(picker.getByTestId("new-task-speed-ultrafast")).toHaveCount(0);
+    await expectTiers(picker, "launch-speed", ["off", "fast"]);
+    await expect(picker.getByTestId("launch-speed-ultrafast")).toHaveCount(0);
 
     await modelSelect.selectOption(DEEPSEEK);
     await expect(picker).toHaveCount(0);
 
     await modelSelect.selectOption(SOL);
-    await picker.getByTestId("new-task-speed-ultrafast").click();
+    await picker.getByTestId("launch-speed-ultrafast").click();
     await expect(picker).toHaveAttribute("data-value", "ultrafast");
-    await expect(picker.getByTestId("new-task-speed-ultrafast")).toHaveAttribute("aria-pressed", "true");
-    await expect(picker.getByTestId("new-task-speed-off")).toHaveAttribute("aria-pressed", "false");
+    await expect(picker.getByTestId("launch-speed-ultrafast")).toBeChecked();
+    await expect(picker.getByTestId("launch-speed-off")).not.toBeChecked();
 
     formTaskTitle = `speed-picker-form-e2e ${randomUUID()}`;
     await form.getByPlaceholder("Short description").fill(formTaskTitle);
     await form.getByTestId("prompt-textarea").fill(formTaskTitle);
     await form.getByTestId("worktree-options").getByTestId("isolate-toggle").uncheck();
-    await form.getByRole("button", { name: "To backlog", exact: true }).click();
+    await form.getByRole("button", { name: "Add to backlog", exact: true }).click();
 
     let row: Record<string, any> | null = null;
     await expect(async () => {
@@ -382,9 +374,10 @@ test.describe("speed picker", () => {
     await gotoApp(page, backend.bootBase);
     const form = newTaskFormPanel(page);
     await selectHarness(page, SPEED_HARNESS.label);
-    await expect(newTaskModelSelect(page)).toHaveValue(SOL);
-    const picker = form.getByTestId("new-task-speed");
-    await expectTiers(picker, "new-task-speed", ["off", "fast", "ultrafast"]);
+    await newTaskModelSelect(page).expectValue(SOL);
+    await openMore(form);
+    const picker = form.getByTestId("launch-speed");
+    await expectTiers(picker, "launch-speed", ["off", "fast", "ultrafast"]);
     await expect(picker).toHaveAttribute("data-value", "ultrafast");
   });
 
@@ -400,24 +393,25 @@ test.describe("speed picker", () => {
     const modelSelect = newTaskModelSelect(page);
     // Discovery is in once the catalogOnly Sol row is listed.
     await expect
-      .poll(async () => modelSelect.locator("option").allTextContents(), { timeout: 20_000 })
+      .poll(async () => modelSelect.optionLabels(), { timeout: 20_000 })
       .toEqual(["DeepSeek V4 Flash", "GPT-5.2", "GPT-6.1 Sol"]);
-    const picker = form.getByTestId("new-task-speed");
+    await openMore(form);
+    const picker = form.getByTestId("launch-speed");
 
     await modelSelect.selectOption(SOL);
-    await picker.getByTestId("new-task-speed-ultrafast").click();
+    await picker.getByTestId("launch-speed-ultrafast").click();
     await expect(picker).toHaveAttribute("data-value", "ultrafast");
 
     // GPT-5.2 has no Ultrafast lane → back to Off.
     await modelSelect.selectOption(GPT52);
-    await expectTiers(picker, "new-task-speed", ["off", "fast"]);
+    await expectTiers(picker, "launch-speed", ["off", "fast"]);
     await expect(picker).toHaveAttribute("data-value", "off");
 
     // Fast survives a move to a model that also has it.
-    await picker.getByTestId("new-task-speed-fast").click();
+    await picker.getByTestId("launch-speed-fast").click();
     await expect(picker).toHaveAttribute("data-value", "fast");
     await modelSelect.selectOption(SOL);
-    await expectTiers(picker, "new-task-speed", ["off", "fast", "ultrafast"]);
+    await expectTiers(picker, "launch-speed", ["off", "fast", "ultrafast"]);
     await expect(picker).toHaveAttribute("data-value", "fast");
 
     // DeepSeek offers no tier: reset to Off, so the picker is gone entirely
@@ -495,7 +489,7 @@ test.describe("speed picker", () => {
     const stale = picker.getByTestId("task-speed-fast");
     await expect(stale).toHaveText("Fast (not offered)");
     await expect(stale).toBeDisabled();
-    await expect(stale).toHaveAttribute("aria-pressed", "true");
+    await expect(stale).toBeChecked();
     await expect(stale).toHaveAttribute("title", /isn't offered for this model/);
     await expect(picker.getByTestId("task-speed-off")).toBeEnabled();
     expect((await getTask(request, backend, task.id)).speed).toBe("fast");
@@ -601,10 +595,11 @@ test.describe("speed picker", () => {
       const form = newTaskFormPanel(page);
       await selectHarness(page, "Cursor");
       const modelSelect = newTaskModelSelect(page);
-      const picker = form.getByTestId("new-task-speed");
+      await openMore(form);
+    const picker = form.getByTestId("launch-speed");
 
       await modelSelect.selectOption("gpt-5.3-codex");
-      await picker.getByTestId("new-task-speed-fast").click();
+      await picker.getByTestId("launch-speed-fast").click();
       await expect(picker).toHaveAttribute("data-value", "fast");
 
       // Cursor's "Auto" model has no -fast variant.
@@ -613,7 +608,7 @@ test.describe("speed picker", () => {
 
       // Coming back does not restore Fast — it was cleared, not hidden.
       await modelSelect.selectOption("gpt-5.3-codex");
-      await expectTiers(picker, "new-task-speed", ["off", "fast"]);
+      await expectTiers(picker, "launch-speed", ["off", "fast"]);
       await expect(picker).toHaveAttribute("data-value", "off");
     } finally {
       await patchHarness(backend, "cursor", { enabled: false });
@@ -659,10 +654,11 @@ test.describe("speed picker", () => {
       // Codex 5.3 has a Fast variant at every effort it offers
       // (`CURSOR_MODEL_SPECS["gpt-5.3-codex"].fastEfforts`).
       await newTaskModelSelect(page).selectOption("gpt-5.3-codex");
-      const picker = form.getByTestId("new-task-speed");
-      await expectTiers(picker, "new-task-speed", ["off", "fast"]);
-      await expect(picker.getByTestId("new-task-speed-ultrafast")).toHaveCount(0);
-      await picker.getByTestId("new-task-speed-fast").click();
+      await openMore(form);
+    const picker = form.getByTestId("launch-speed");
+      await expectTiers(picker, "launch-speed", ["off", "fast"]);
+      await expect(picker.getByTestId("launch-speed-ultrafast")).toHaveCount(0);
+      await picker.getByTestId("launch-speed-fast").click();
       await expect(picker).toHaveAttribute("data-value", "fast");
     } finally {
       await patchHarness(backend, "cursor", { enabled: false });
@@ -681,9 +677,10 @@ test.describe("speed picker", () => {
     const form = dialog.getByTestId("agent-profile-form");
     await expect(form).toBeVisible();
     await form.getByTestId("agent-profile-name").fill(name);
-    await form.getByRole("button", { name: SPEED_HARNESS.label, exact: true }).click();
-    await launchSelect(form, "Model").selectOption(SOL);
+    await pickHarness(form, SPEED_HARNESS.label);
+    await modelField(form).selectOption(SOL);
 
+    await openMore(form);
     const picker = form.getByTestId("launch-speed");
     await expectTiers(picker, "launch-speed", ["off", "fast", "ultrafast"]);
     await picker.getByTestId("launch-speed-ultrafast").click();

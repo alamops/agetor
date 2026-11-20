@@ -620,7 +620,7 @@ subdirectory selections under one root are not serialized against each other.)
 
 ## Surfaces
 
-- **New Task / issue dialog** — one **Select Projects** control
+- **New Task / issue dialog** — one **Select Projects** control (the Workspace section of [task-launch-ui.md](task-launch-ui.md); the Branch name sits behind More options)
   (`src/mainview/components/kanban/ProjectSelection.tsx` +
   `SelectProjectsDialog.tsx`, rendered by `WorktreeOptions`): a full-width
   button above Isolate whose label is the project name (one) or

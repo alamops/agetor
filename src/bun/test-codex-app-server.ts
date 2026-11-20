@@ -26,6 +26,8 @@ export interface FakeCodexModel {
    *  key is absent (the original stub behavior), the explicit value (`null`
    *  for "the CLI names no default") when present. */
   defaultEffort?: string | null;
+  /** Reported with a `priority` service tier, which is how the CLI says "this model has a Fast lane". */
+  fast?: boolean;
 }
 
 export interface FakeCodexAppServerOptions {
@@ -60,6 +62,7 @@ function toWire(m: FakeCodexModel): Record<string, unknown> {
     isDefault: false,
     defaultReasoningEffort: "defaultEffort" in m ? (m.defaultEffort ?? null) : (m.efforts?.[0] ?? null),
     supportedReasoningEfforts: (m.efforts ?? []).map((e) => ({ reasoningEffort: e, description: "" })),
+    ...(m.fast ? { serviceTiers: [{ id: "priority", name: "Fast", description: "Faster responses at a higher rate." }] } : {}),
     upgrade: null,
     upgradeInfo: null,
     availabilityNux: null,

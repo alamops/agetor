@@ -2,7 +2,7 @@ import { useEffect, useMemo, useRef, useState } from "react";
 import { FolderGit2, FolderPlus, GitBranch, Import, Loader2, Search, Trash2, TriangleAlert } from "lucide-react";
 import { api } from "@/lib/api";
 import { Button } from "@/components/ui/button";
-import { Dialog } from "@/components/ui/dialog";
+import { Dialog, DialogBody, DialogFooter, DialogHeader, DialogTitle, DialogDescription } from "@/components/ui/dialog";
 import { Input } from "@/components/ui/input";
 import { IDENTIFIER_INPUT_PROPS } from "@/lib/identifier-input";
 import {
@@ -278,26 +278,27 @@ export function SelectProjectsDialog({ open, onClose, value, onSave, lockedPath,
         labelledBy="select-projects-dialog-title"
         closeOnBackdrop={false}
         initialFocusRef={searchRef}
-        className="w-[32rem] max-w-[92vw]"
+        className="flex max-h-[calc(100vh-2rem)] w-[36rem] max-w-[92vw] flex-col p-0"
       >
-        <div className="flex items-start justify-between gap-3">
+        <DialogHeader>
           <div className="min-w-0">
-            <h2 id="select-projects-dialog-title" className="flex items-center gap-2 text-sm font-semibold">
-              <FolderGit2 className="h-4 w-4" /> Select projects
-            </h2>
-            <p className="mt-1 text-xs text-muted-foreground">
+            <DialogTitle id="select-projects-dialog-title" className="flex items-center gap-2">
+              <FolderGit2 className="size-4" aria-hidden /> Select projects
+            </DialogTitle>
+            <DialogDescription>
               Pick one or more projects and the branch each one starts from. Two or more use worktree
               isolation.
-            </p>
+            </DialogDescription>
           </div>
           <Button size="sm" variant="outline" onClick={() => void addFolder()} disabled={picking || busy}>
-            {picking ? <Loader2 className="h-3.5 w-3.5 animate-spin" /> : <FolderPlus className="h-3.5 w-3.5" />}
+            {picking ? <Loader2 className="size-3.5 animate-spin" /> : <FolderPlus className="size-3.5" />}
             Add folder
           </Button>
-        </div>
+        </DialogHeader>
 
-        <div className="mt-3 flex items-center gap-2 rounded-md border border-border/60 px-2 py-1">
-          <Search className="size-3.5 shrink-0 opacity-60" aria-hidden />
+        <DialogBody className="space-y-3">
+        <div className="flex items-center gap-2 rounded-md border border-input bg-background px-3">
+          <Search className="size-3.5 shrink-0 text-muted-foreground" aria-hidden />
           <Input
             ref={searchRef}
             data-testid="select-projects-search"
@@ -306,11 +307,11 @@ export function SelectProjectsDialog({ open, onClose, value, onSave, lockedPath,
             onChange={(e) => setQuery(e.target.value)}
             placeholder="Search projects…"
             aria-label="Search projects"
-            className="h-7 border-0 px-0 text-xs shadow-none focus-visible:ring-0"
+            className="border-0 px-0 shadow-none focus-visible:ring-0"
           />
         </div>
 
-        <div className="mt-2 max-h-[min(60vh,calc(100vh_-_18rem))] space-y-1 overflow-y-auto" data-testid="select-projects-list">
+        <div className="space-y-1.5" data-testid="select-projects-list">
           {visible.length === 0 ? (
             query.trim() ? (
               <p className="py-6 text-center text-xs text-muted-foreground">No matches.</p>
@@ -336,13 +337,14 @@ export function SelectProjectsDialog({ open, onClose, value, onSave, lockedPath,
             return (
               <div
                 key={path}
-                className="rounded-md border border-border/60 px-2 py-1.5"
+                className="rounded-md border border-border bg-background/40 px-2.5 py-2"
                 data-testid={`select-projects-row-${testId}`}
               >
                 <div className="flex items-center gap-2">
                   <label className="flex min-w-0 flex-1 cursor-pointer items-center gap-2 text-xs">
                     <input
                       type="checkbox"
+                      className="size-4 shrink-0 accent-primary"
                       checked={selected}
                       disabled={lockedRow || busy}
                       onChange={() => toggle(path)}
@@ -351,7 +353,7 @@ export function SelectProjectsDialog({ open, onClose, value, onSave, lockedPath,
                     <span className="min-w-0 shrink-0 truncate font-medium">{label}</span>
                     <span className="min-w-0 flex-1 truncate text-muted-foreground" title={path}>{path}</span>
                     {selected ? (
-                      <span className="shrink-0 text-[10px] text-muted-foreground">{names[idx]}</span>
+                      <span className="shrink-0 text-3xs text-muted-foreground">{names[idx]}</span>
                     ) : null}
                   </label>
                   {selected ? (
@@ -388,35 +390,35 @@ export function SelectProjectsDialog({ open, onClose, value, onSave, lockedPath,
         </div>
 
         {tooManyRepositories(dedupedCount) ? (
-          <p className="mt-2 flex items-center gap-1.5 text-xs text-warning">
+          <p className="flex items-center gap-1.5 text-xs text-warning">
             <TriangleAlert className="h-3.5 w-3.5" />
             {dedupedCount} repositories — preparation may be slow. There is no hard limit.
           </p>
         ) : null}
 
         {conflicts.length > 0 ? (
-          <p className="mt-2 flex items-start gap-1.5 text-xs text-destructive" role="alert" data-testid="select-projects-save-error">
+          <p className="flex items-start gap-1.5 text-xs text-danger" role="alert" data-testid="select-projects-save-error">
             <TriangleAlert className="mt-0.5 h-3.5 w-3.5 shrink-0" />
             {conflicts.map(describeRootConflict).join(" ")}
           </p>
         ) : null}
 
         {draft.length === 0 ? (
-          <p className="mt-2 text-xs text-warning">Select at least one project.</p>
+          <p className="text-xs text-warning">Select at least one project.</p>
         ) : null}
 
-        <div className="mt-3 flex items-center justify-between gap-2">
+        <div className="flex items-center justify-between gap-2">
           <span className="min-w-0 truncate text-xs text-muted-foreground">
             {draft.length} selected
             {draft.length !== dedupeSelections(draft).length ? " (some share a git root)" : ""}
           </span>
-          <div className="flex shrink-0 items-center gap-2">
+          <div className="flex shrink-0 items-center gap-1">
             <button
               type="button"
               data-testid="project-clone-open"
               onClick={() => setCloneOpen(true)}
               disabled={busy}
-              className="inline-flex items-center gap-1 rounded px-1 text-xs text-muted-foreground transition-colors hover:text-foreground disabled:cursor-not-allowed disabled:opacity-50"
+              className="inline-flex h-8 items-center gap-1 rounded-md px-2 text-xs text-muted-foreground transition-colors hover:bg-accent/50 hover:text-foreground focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring disabled:cursor-not-allowed disabled:opacity-50"
             >
               <GitBranch className="size-3.5" aria-hidden />
               Clone repository…
@@ -426,7 +428,7 @@ export function SelectProjectsDialog({ open, onClose, value, onSave, lockedPath,
               data-testid="project-import-sessions-open"
               onClick={() => setImportOpen(true)}
               disabled={busy}
-              className="inline-flex items-center gap-1 rounded px-1 text-xs text-muted-foreground transition-colors hover:text-foreground disabled:cursor-not-allowed disabled:opacity-50"
+              className="inline-flex h-8 items-center gap-1 rounded-md px-2 text-xs text-muted-foreground transition-colors hover:bg-accent/50 hover:text-foreground focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring disabled:cursor-not-allowed disabled:opacity-50"
             >
               <Import className="size-3.5" aria-hidden />
               Import sessions…
@@ -434,15 +436,17 @@ export function SelectProjectsDialog({ open, onClose, value, onSave, lockedPath,
           </div>
         </div>
 
-        <div className="mt-3 flex items-center justify-end gap-2">
-          <Button size="sm" variant="outline" onClick={close}>
+        </DialogBody>
+
+        <DialogFooter>
+          <Button variant="ghost" onClick={close}>
             Cancel
           </Button>
-          <Button size="sm" onClick={() => void save()} disabled={busy || picking || draft.length === 0}>
-            {busy ? <Loader2 className="h-3.5 w-3.5 animate-spin" /> : null}
+          <Button onClick={() => void save()} disabled={busy || picking || draft.length === 0}>
+            {busy ? <Loader2 className="size-4 animate-spin" /> : null}
             Save
           </Button>
-        </div>
+        </DialogFooter>
       </Dialog>
       {/* Mounted as siblings of the dialog (not in its scrolling body): the
           nested dialog takes focus, and a footer inside the panel would be

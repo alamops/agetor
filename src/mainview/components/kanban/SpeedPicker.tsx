@@ -1,4 +1,4 @@
-import { Button } from "@/components/ui/button";
+import { SegmentedControl } from "@/components/ui/segmented-control";
 import { SPEED_OPTIONS, speedLabel } from "../../../shared/speed.ts";
 import type { Speed } from "../../../shared/types.ts";
 
@@ -10,10 +10,9 @@ export function showsSpeedPicker(options: readonly Speed[], value: Speed): boole
 }
 
 /**
- * Speed tier picker (`off | fast | ultrafast`) — a segmented button group
- * shared by the launch dialogs (`launch-speed`), the New Task form
- * (`new-task-speed`) and RunPanel's task details (`task-speed`). It replaced
- * the cursor-only Fast switches.
+ * Speed tier picker (`off | fast | ultrafast`) — a segmented radiogroup
+ * shared by every launch surface (`launch-speed`) and RunPanel's task details
+ * (`task-speed`). It replaced the cursor-only Fast switches.
  *
  * `options` is what the kind/model/effort offers (`supportedSpeeds`), always
  * starting with `"off"`. Renders `null` when there's nothing to pick (a lone
@@ -21,8 +20,8 @@ export function showsSpeedPicker(options: readonly Speed[], value: Speed): boole
  * don't include renders as one extra disabled, pressed segment ("Fast (not
  * offered)") so the tier stays visible instead of silently disappearing —
  * the same idea as the model picker's unlisted-selected row. The root
- * carries `data-value` and each segment `aria-pressed`, which is what tests
- * assert on. No label of its own: consumers render theirs (a `<dt>` in task
+ * carries `data-value` and each segment `aria-checked` (radio), which is what
+ * tests assert on. No label of its own: consumers render theirs (a `<dt>` in task
  * details, a field label elsewhere), gated on {@link showsSpeedPicker}.
  *
  * `fastHint` / `note` are optional lines rendered under the group; without
@@ -51,46 +50,33 @@ export function SpeedPicker({
   if (!showsSpeedPicker(options, value)) return null;
   const offered = options.includes(value);
   const hintFor = (id: Speed) => SPEED_OPTIONS.find((o) => o.id === id)?.hint;
+  const items = options.map((id) => ({
+    value: id,
+    label: speedLabel(id),
+    title: hintFor(id),
+    testId: `${testId}-${id}`,
+  }));
+  // A stored tier the current options don't include renders as one extra
+  // disabled, selected segment so it stays visible instead of silently vanishing.
+  if (!offered) {
+    items.push({
+      value,
+      label: `${speedLabel(value)} (not offered)`,
+      title: `${speedLabel(value)} isn't offered for this model — pick another tier to change it.`,
+      testId: `${testId}-${value}`,
+    });
+  }
   const group = (
-    <div
-      data-testid={testId}
-      data-value={value}
-      role="group"
-      aria-label="Speed"
-      className="flex gap-1"
-    >
-      {options.map((id) => (
-        <Button
-          key={id}
-          type="button"
-          size="sm"
-          variant={value === id ? "default" : "outline"}
-          data-testid={`${testId}-${id}`}
-          aria-pressed={value === id}
-          title={hintFor(id)}
-          disabled={disabled}
-          onClick={() => {
-            if (id !== value) onChange(id);
-          }}
-          className="min-w-0 flex-1 px-2"
-        >
-          <span className="truncate">{speedLabel(id)}</span>
-        </Button>
-      ))}
-      {!offered && (
-        <Button
-          type="button"
-          size="sm"
-          variant="default"
-          data-testid={`${testId}-${value}`}
-          aria-pressed
-          title={`${speedLabel(value)} isn't offered for this model — pick another tier to change it.`}
-          disabled
-          className="min-w-0 flex-1 px-2"
-        >
-          <span className="truncate">{speedLabel(value)} (not offered)</span>
-        </Button>
-      )}
+    <div data-testid={testId} data-value={value}>
+      <SegmentedControl
+        aria-label="Speed"
+        value={value}
+        onChange={(v) => {
+          if (v !== value) onChange(v as Speed);
+        }}
+        disabled={disabled}
+        items={offered ? items : items.map((it) => (it.value === value ? { ...it, disabled: true } : it))}
+      />
     </div>
   );
   // No hint and no note: the control's DOM is exactly the segmented group.
@@ -99,10 +85,10 @@ export function SpeedPicker({
     <>
       {group}
       {fastHint && value === "fast" && (
-        <p data-testid={`${testId}-hint`} className="mt-1 text-[11px] text-muted-foreground">{fastHint}</p>
+        <p data-testid={`${testId}-hint`} className="mt-1 text-2xs text-muted-foreground">{fastHint}</p>
       )}
       {note && (
-        <p data-testid={`${testId}-note`} className="mt-1 text-[11px] text-muted-foreground">{note}</p>
+        <p data-testid={`${testId}-note`} className="mt-1 text-2xs text-muted-foreground">{note}</p>
       )}
     </>
   );

@@ -276,6 +276,8 @@ interface Props {
    *  Pipelines page. Optional for the same reason as `onOpenSettings` — when
    *  absent, the pickers render no manage row. */
   onOpenPipelines?: () => void;
+  /** Settings → Agents: the launch dialogs' "Manage agents…" row (the inner dialog has already closed itself). */
+  onOpenSettingsAgents?: () => void;
 }
 
 const basename = (p: string) => {
@@ -611,7 +613,7 @@ function credentialSetupStep1(provider: GitProvider | "mixed" | null): string {
   }
 }
 
-export function GitHubDialog({ open, projects, initialProjectPath, pullPrefill, itemDetailPrefill, onClose, onOpenSettings, onOpenPipelines }: Props) {
+export function GitHubDialog({ open, projects, initialProjectPath, pullPrefill, itemDetailPrefill, onClose, onOpenSettings, onOpenPipelines, onOpenSettingsAgents }: Props) {
   const [projectPath, setProjectPath] = useState("");
   // "All repositories" (G8/F15) — see AGGREGATE_PROJECT_PATH.
   const isAggregate = projectPath === AGGREGATE_PROJECT_PATH;
@@ -3870,6 +3872,7 @@ export function GitHubDialog({ open, projects, initialProjectPath, pullPrefill, 
             canPush={canPush}
             viewerLogin={viewerLogin}
             onOpenPipelines={onOpenPipelines}
+            onOpenSettingsAgents={onOpenSettingsAgents}
             diff={expandedItem.kind === "pulls" ? diffs[itemKey(expandedItem)] : undefined}
             diffLoading={expandedItem.kind === "pulls" ? !!diffLoading[itemKey(expandedItem)] : false}
             diffError={expandedItem.kind === "pulls" ? diffErrors[itemKey(expandedItem)] : undefined}
@@ -6792,6 +6795,7 @@ function GitHubItemDetail({
   canPush,
   viewerLogin,
   onOpenPipelines,
+  onOpenSettingsAgents,
   diff,
   diffLoading,
   diffError,
@@ -6909,6 +6913,8 @@ function GitHubItemDetail({
   viewerLogin: string;
   /** Forwarded to the task-launch dialogs' Pipeline picker manage row. */
   onOpenPipelines?: () => void;
+  /** Settings → Agents: the launch dialogs' "Manage agents…" row (the inner dialog has already closed itself). */
+  onOpenSettingsAgents?: () => void;
   diff?: TaskDiff;
   diffLoading: boolean;
   diffError?: string;
@@ -7117,6 +7123,7 @@ function GitHubItemDetail({
             canPush={canPush}
             canModifyOwn={canModifyOwn}
             onOpenPipelines={onOpenPipelines}
+            onOpenSettingsAgents={onOpenSettingsAgents}
           />
           <PullTriage
             caps={caps}
@@ -7205,6 +7212,7 @@ function GitHubItemDetail({
           onTransferIssue={onTransferIssue}
           onCancelTransfer={onCancelTransfer}
           onOpenPipelines={onOpenPipelines}
+          onOpenSettingsAgents={onOpenSettingsAgents}
         />
       )}
       <Conversation
@@ -7306,6 +7314,7 @@ function IssueActions({
   canPush,
   canModifyOwn,
   onOpenPipelines,
+  onOpenSettingsAgents,
 }: {
   item: GitHubListItem;
   caps: ProviderCaps;
@@ -7338,6 +7347,8 @@ function IssueActions({
   canModifyOwn: boolean;
   /** Forwards the Pipeline picker's manage row to the task dialog. */
   onOpenPipelines?: () => void;
+  /** Settings → Agents: the launch dialogs' "Manage agents…" row (the inner dialog has already closed itself). */
+  onOpenSettingsAgents?: () => void;
 }) {
   const isBusy = !!busy;
   const pushDisabled = isBusy || !canPush;
@@ -7500,6 +7511,7 @@ function IssueActions({
           setTimeout(() => setTaskConfirmed(false), 5_000);
         }}
         onManagePipelines={onOpenPipelines}
+        onManageAgents={onOpenSettingsAgents}
       />
     </div>
   );
@@ -7933,6 +7945,7 @@ function PullActions({
   canPush,
   canModifyOwn,
   onOpenPipelines,
+  onOpenSettingsAgents,
 }: {
   item: GitHubListItem;
   caps: ProviderCaps;
@@ -7970,6 +7983,8 @@ function PullActions({
   canModifyOwn: boolean;
   /** Forwards the Pipeline picker's manage row to the task dialog. */
   onOpenPipelines?: () => void;
+  /** Settings → Agents: the launch dialogs' "Manage agents…" row (the inner dialog has already closed itself). */
+  onOpenSettingsAgents?: () => void;
 }) {
   // A merged PR replaces the mergeability banner + Review/Merge/Close grid
   // below with a single positive card — there's nothing actionable left to
@@ -8208,6 +8223,7 @@ function PullActions({
           setTimeout(() => setResolveConfirmed(false), 5_000);
         }}
         onManagePipelines={onOpenPipelines}
+        onManageAgents={onOpenSettingsAgents}
       />
     </div>
   );

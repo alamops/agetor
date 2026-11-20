@@ -1873,7 +1873,7 @@ account move and every blocked outcome. The trigger per path is the table under
   While the retry run itself is
   live the banner reads "Running on <account> after a quota reset (attempt n/3)."
   with no Run now (`src/mainview/lib/harness-stack-banner.ts`). The launch pickers
-  (`NewTaskForm`) say "This account can't start right now — the run starts on the
+  (`TaskLaunchPickers`, directly under the Harness picker) say "This account can't start right now — the run starts on the
   next usable account in its stack" instead of a red "not installed" box when
   `stackBackupCanServe`.
 - **Launch surfaces**: a launch is never refused client-side on an account
