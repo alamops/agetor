@@ -1,4 +1,5 @@
 import type {
+  ForgeBranch,
   GitHubCheckRun,
   GitHubChecksResult,
   GitHubComment,
@@ -140,6 +141,10 @@ export function bitbucketServerError(repo: ProviderRepoInfo): string | null {
 interface BitbucketError {
   ok: false;
   error: string;
+  /** Set by the pull-request create call when Bitbucket says one is already open. */
+  code?: "already-exists";
+  /** The open pull request's URL, when a lookup by source branch found it. */
+  existingUrl?: string;
 }
 
 // Local response unions, mirroring the shape of github.ts's (unexported)
@@ -774,10 +779,148 @@ export async function createBitbucketPull(
   );
   if (!("status" in res)) return res;
   const json = await res.json().catch(() => null);
-  if (!res.ok) return { ok: false, error: errorFrom(res, json, repo, !!creds) };
+  if (!res.ok) {
+    const message = errorFrom(res, json, repo, !!creds);
+    if (res.status === 400 && BITBUCKET_ALREADY_OPEN_RE.test(apiErrorMessage(json, res.status, res.statusText))) {
+      const existingUrl = await findOpenBitbucketPullUrl(repo, creds, head, base);
+      return { ok: false, error: message, code: "already-exists", ...(existingUrl ? { existingUrl } : {}) };
+    }
+    return { ok: false, error: message };
+  }
   const item = normalizeBitbucketPull(json, null);
   if (!item) return { ok: false, error: "Bitbucket returned an unexpected pull request response" };
   return { ok: true, item, message: "Pull request created." };
+}
+
+/**
+ * Bitbucket's duplicate-PR wording is not documented; this matches the phrasings
+ * seen in the wild ("There is already an open pull request…", "Only one pull
+ * request may be open for a given source and target branch"). A miss shows as
+ * an ordinary failure, which is the pre-existing behavior.
+ */
+const BITBUCKET_ALREADY_OPEN_RE = /already (?:an )?open|only one pull request may be open|already exists/i;
+
+/**
+ * The open pull request from this repository's `head` into `base`, by BBQL.
+ * Best effort. One head may have open PRs into several bases (or a fork's
+ * same-named branch may), so the query pins all three.
+ */
+async function findOpenBitbucketPullUrl(
+  repo: ProviderRepoInfo,
+  creds: BitbucketCreds | null,
+  head: string,
+  base: string,
+): Promise<string | null> {
+  const q = [
+    `source.repository.full_name="${escapeBBQLString(`${repo.owner}/${repo.name}`)}"`,
+    `source.branch.name="${escapeBBQLString(head)}"`,
+    `destination.branch.name="${escapeBBQLString(base)}"`,
+    `state="OPEN"`,
+  ].join(" AND ");
+  const res = await fetchBitbucket(
+    `${repoBasePath(repo)}/pullrequests?pagelen=1&q=${encodeURIComponent(q)}`,
+    creds,
+    "application/json",
+  );
+  if (!("status" in res) || !res.ok) return null;
+  const json = await res.json().catch(() => null);
+  const values = json && typeof json === "object" ? (json as { values?: unknown }).values : null;
+  const first = Array.isArray(values) ? values[0] : null;
+  const links = first && typeof first === "object" ? (first as { links?: unknown }).links : null;
+  const html = links && typeof links === "object" ? (links as { html?: unknown }).html : null;
+  const href = html && typeof html === "object" ? (html as { href?: unknown }).href : null;
+  // The URL is shown as a link: only an http(s) one is passed on.
+  return typeof href === "string" && /^https?:\/\//i.test(href) ? href : null;
+}
+
+/** Branch names a pull-target listing carries (10 pages of 100). */
+const BITBUCKET_BRANCH_LIST_MAX_PAGES = 10;
+
+function normalizeBitbucketBranch(raw: unknown): ForgeBranch | null {
+  if (!raw || typeof raw !== "object") return null;
+  const o = raw as { name?: unknown; target?: unknown };
+  if (typeof o.name !== "string" || !o.name) return null;
+  const hash = o.target && typeof o.target === "object" ? (o.target as { hash?: unknown }).hash : null;
+  return { name: o.name, sha: typeof hash === "string" && hash ? hash : null };
+}
+
+/** `GET …/refs/branches?pagelen=100`, following the body's `next` link up to `maxPages`. */
+export async function listBitbucketBranches(
+  repo: ProviderRepoInfo,
+  opts: { maxPages?: number } = {},
+): Promise<{ ok: true; branches: ForgeBranch[]; truncated: boolean } | BitbucketError> {
+  const serverError = bitbucketServerError(repo);
+  if (serverError) return { ok: false, error: serverError };
+  const creds = await bitbucketCreds(repo.remoteHost);
+  const maxPages = Math.max(1, Math.min(opts.maxPages ?? BITBUCKET_BRANCH_LIST_MAX_PAGES, 20));
+  const branches: ForgeBranch[] = [];
+  let next: string | null = `${repoBasePath(repo)}/refs/branches?pagelen=100`;
+  for (let page = 1; page <= maxPages && next; page++) {
+    const res: Response | BitbucketError = await fetchBitbucket(next, creds, "application/json");
+    if (!("status" in res)) return res;
+    const json = await res.json().catch(() => null);
+    if (!res.ok) return { ok: false, error: errorFrom(res, json, repo, !!creds) };
+    const values = json && typeof json === "object" && Array.isArray((json as { values?: unknown }).values)
+      ? (json as { values: unknown[] }).values
+      : [];
+    for (const v of values) {
+      const b = normalizeBitbucketBranch(v);
+      if (b) branches.push(b);
+    }
+    const rawNext = (json as { next?: unknown } | null)?.next;
+    next = sanitizeNextUrl(rawNext);
+    // A `next` link that is present but rejected (off-origin, malformed) means
+    // more branches exist that this walk won't fetch: the listing is
+    // incomplete, so report it truncated and let callers ask per name.
+    if (!next) return { ok: true, branches, truncated: rawNext != null && rawNext !== "" };
+  }
+  return { ok: true, branches, truncated: next !== null };
+}
+
+/** A 404 that is about the branch itself ("Branch zz not found", "No such
+ *  branch"), not a repository or access failure that merely mentions a branch. */
+const BITBUCKET_BRANCH_NOT_FOUND_RE = /^\s*branch\b.*\bnot found\b|\bno such branch\b/i;
+
+/**
+ * `GET …/refs/branches/:name` (encoded per path segment). A 404 whose message
+ * names a branch is a missing branch (`branch: null`); any other 404 is the
+ * repository (or an auth gap) and stays an error.
+ */
+export async function getBitbucketBranch(
+  repo: ProviderRepoInfo,
+  name: string,
+): Promise<{ ok: true; branch: ForgeBranch | null } | BitbucketError> {
+  const serverError = bitbucketServerError(repo);
+  if (serverError) return { ok: false, error: serverError };
+  const trimmed = name.trim();
+  if (!trimmed) return { ok: false, error: "branch name required" };
+  const creds = await bitbucketCreds(repo.remoteHost);
+  const encoded = trimmed.split("/").map(encodeURIComponent).join("/");
+  const res = await fetchBitbucket(`${repoBasePath(repo)}/refs/branches/${encoded}`, creds, "application/json");
+  if (!("status" in res)) return res;
+  const json = await res.json().catch(() => null);
+  if (res.ok) return { ok: true, branch: normalizeBitbucketBranch(json) };
+  if (res.status === 404 && BITBUCKET_BRANCH_NOT_FOUND_RE.test(apiErrorMessage(json, res.status, res.statusText))) {
+    return { ok: true, branch: null };
+  }
+  return { ok: false, error: errorFrom(res, json, repo, !!creds) };
+}
+
+/** `GET …` repository → `mainbranch.name`, with no guessed fallback. */
+export async function getBitbucketDefaultBranch(
+  repo: ProviderRepoInfo,
+): Promise<{ ok: true; name: string } | BitbucketError> {
+  const serverError = bitbucketServerError(repo);
+  if (serverError) return { ok: false, error: serverError };
+  const creds = await bitbucketCreds(repo.remoteHost);
+  const res = await fetchBitbucket(repoBasePath(repo), creds, "application/json");
+  if (!("status" in res)) return res;
+  const json = await res.json().catch(() => null);
+  if (!res.ok) return { ok: false, error: errorFrom(res, json, repo, !!creds) };
+  const main = json && typeof json === "object" ? (json as { mainbranch?: unknown }).mainbranch : null;
+  const name = main && typeof main === "object" ? (main as { name?: unknown }).name : null;
+  if (typeof name !== "string" || !name) return { ok: false, error: "Bitbucket did not report a main branch" };
+  return { ok: true, name };
 }
 
 /** Fetches the raw unified diff for a pull request. Mirrors

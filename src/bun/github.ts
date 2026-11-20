@@ -1,5 +1,6 @@
 import { existsSync } from "node:fs";
 import type {
+  ForgeBranch,
   GitHubAssigneesResult,
   GitHubCheckRun,
   GitHubChecksResult,
@@ -64,6 +65,7 @@ import type {
   TaskDiff,
 } from "../shared/types.ts";
 import { GIT_HOST_TOKENS_SECTION } from "../shared/types.ts";
+import { canonicalGitHost } from "../shared/git-host.ts";
 import { contentTypeForPreviewPath, MAX_BLOB_PREVIEW_BYTES } from "../shared/attachments.ts";
 import { MAX_DIFF_FILES, parseGitDiff } from "./git-diff.ts";
 import { tokenForHost } from "./github-tokens.ts";
@@ -479,6 +481,10 @@ interface RemoveGitHubReactionInput {
 interface GitHubListError {
   ok: false;
   error: string;
+  /** Set by the pull/merge-request create calls when the forge says one already exists. */
+  code?: "already-exists";
+  /** The existing pull request's URL, when the forge's own lookup found it. */
+  existingUrl?: string;
 }
 
 type GitHubListResponse = ({ ok: true } & GitHubListResult) | GitHubListError;
@@ -577,17 +583,7 @@ export async function run(cmd: string[], cwd?: string, timeoutMs = 10_000): Prom
   }
 }
 
-/** Map a remote's host to its canonical provider host. Users pin per-identity
- *  SSH keys via `~/.ssh/config` host aliases (`github-work.com`, `bitbucket-x.org`,
- *  …), so the host in a remote URL is often not the provider's real hostname.
- *  Any host containing the provider's name resolves to that provider. */
-export function canonicalGitHost(host: string): string {
-  const lower = host.toLowerCase();
-  if (lower.includes("github")) return "github.com";
-  if (lower.includes("gitlab")) return "gitlab.com";
-  if (lower.includes("bitbucket")) return "bitbucket.org";
-  return lower;
-}
+export { canonicalGitHost };
 
 /** Extract host + owner/name from a git remote URL in https, ssh://, or
  *  scp-like (`[user@]host:owner/repo`) form. `host` is canonicalized via
@@ -1611,6 +1607,50 @@ export async function getGitHubPullDefaults(input: { dir: string }): Promise<Git
   };
 }
 
+/** GitHub's duplicate-PR 422 reads "A pull request already exists for <owner>:<head>.". */
+const ALREADY_EXISTS_RE = /already exists/i;
+
+/** The `errors[].message` strings of a GitHub 422 body ("Validation Failed" carries the real reason there). */
+function validationMessages(body: unknown): string[] {
+  const errors = body && typeof body === "object" ? (body as { errors?: unknown }).errors : null;
+  if (!Array.isArray(errors)) return [];
+  const out: string[] = [];
+  for (const e of errors) {
+    if (typeof e === "string") out.push(e);
+    else if (e && typeof e === "object") {
+      const o = e as { message?: unknown; field?: unknown; code?: unknown };
+      if (typeof o.message === "string" && o.message) out.push(o.message);
+      else if (typeof o.field === "string" && typeof o.code === "string") out.push(`${o.field} ${o.code}`);
+    }
+  }
+  return out;
+}
+
+/** `message`, extended with the 422's `errors[]` detail so "Validation Failed" says what failed. */
+function createErrorMessage(body: unknown, status: number, statusText: string): string {
+  const base = apiError(body, status, statusText);
+  if (status !== 422) return base;
+  const detail = validationMessages(body);
+  return detail.length > 0 ? `${base}: ${detail.join("; ")}` : base;
+}
+
+/**
+ * The URL of the open pull request from `head` into `base`, if GitHub says
+ * there is one. Best effort. `base` matters: one head may have open PRs into
+ * several bases, and the duplicate is the one this create targeted.
+ */
+async function findOpenPullUrl(repo: GitHubRepo, token: string | null, head: string, base: string): Promise<string | null> {
+  const qualified = head.includes(":") ? head : `${repo.owner}:${head}`;
+  const url = `${GITHUB_API_BASE}/repos/${repo.owner}/${repo.name}/pulls?head=${encodeURIComponent(qualified)}&base=${encodeURIComponent(base)}&state=open&per_page=1`;
+  const res = await fetchGitHub(url, token, "application/vnd.github+json");
+  if (!("status" in res) || !res.ok) return null;
+  const json = await res.json().catch(() => null);
+  const first = Array.isArray(json) ? json[0] : null;
+  const htmlUrl = first && typeof first === "object" ? (first as { html_url?: unknown }).html_url : null;
+  // The URL is shown as a link: only an http(s) one is passed on.
+  return typeof htmlUrl === "string" && /^https?:\/\//i.test(htmlUrl) ? htmlUrl : null;
+}
+
 export async function createGitHubPull(input: CreateGitHubPullInput): Promise<GitHubIssueResponse> {
   const repo = await repoForDir(input.dir);
   if (!repo) return { ok: false, error: "project does not have a GitHub remote" };
@@ -1641,7 +1681,18 @@ export async function createGitHubPull(input: CreateGitHubPullInput): Promise<Gi
   );
   if (!("status" in res)) return res;
   const json = await res.json().catch(() => null);
-  if (!res.ok) return { ok: false, error: apiError(json, res.status, res.statusText) };
+  if (!res.ok) {
+    if (res.status === 422 && validationMessages(json).some((m) => ALREADY_EXISTS_RE.test(m))) {
+      const existingUrl = await findOpenPullUrl(repo, token, head, base);
+      return {
+        ok: false,
+        error: createErrorMessage(json, res.status, res.statusText),
+        code: "already-exists",
+        ...(existingUrl ? { existingUrl } : {}),
+      };
+    }
+    return { ok: false, error: createErrorMessage(json, res.status, res.statusText) };
+  }
   const item = normalizeItem("pulls", json, input.dir);
   if (!item) return { ok: false, error: "GitHub returned an unexpected pull request response" };
 
@@ -1669,6 +1720,93 @@ export async function createGitHubPull(input: CreateGitHubPullInput): Promise<Gi
     };
   }
   return { ok: true, item, message: "Pull request created and reviewers requested." };
+}
+
+/** Branch names a pull-target listing carries (10 pages of 100). */
+const GITHUB_BRANCH_LIST_MAX_PAGES = 10;
+
+function normalizeForgeBranch(raw: unknown): ForgeBranch | null {
+  if (!raw || typeof raw !== "object") return null;
+  const o = raw as { name?: unknown; commit?: unknown };
+  if (typeof o.name !== "string" || !o.name) return null;
+  const sha = o.commit && typeof o.commit === "object" ? (o.commit as { sha?: unknown }).sha : null;
+  return { name: o.name, sha: typeof sha === "string" && sha ? sha : null };
+}
+
+/**
+ * `GET /repos/:o/:r/branches`, following `per_page=100&page=N` until a short
+ * page or `maxPages`. `truncated` is true when the cap stopped the walk with a
+ * full last page. Read-only; the token is optional (public repos), so a 404
+ * runs through `privateRepoHint`.
+ */
+export async function listGitHubBranches(
+  input: { dir: string; maxPages?: number },
+): Promise<{ ok: true; branches: ForgeBranch[]; truncated: boolean } | GitHubListError> {
+  const repo = await repoForDir(input.dir);
+  if (!repo) return { ok: false, error: "project does not have a GitHub remote" };
+  const maxPages = Math.max(1, Math.min(input.maxPages ?? GITHUB_BRANCH_LIST_MAX_PAGES, 20));
+  const token = await githubToken(repo.remoteHost ?? null);
+  const branches: ForgeBranch[] = [];
+  for (let page = 1; page <= maxPages; page++) {
+    const url = `${GITHUB_API_BASE}/repos/${repo.owner}/${repo.name}/branches?per_page=100&page=${page}`;
+    const res = await fetchGitHub(url, token, "application/vnd.github+json");
+    if (!("status" in res)) return res;
+    const json = await res.json().catch(() => null);
+    if (!res.ok) {
+      return { ok: false, error: privateRepoHint(res.status, apiError(json, res.status, res.statusText), repo, !!token) };
+    }
+    const rows = Array.isArray(json) ? json : [];
+    for (const r of rows) {
+      const b = normalizeForgeBranch(r);
+      if (b) branches.push(b);
+    }
+    if (rows.length < 100) return { ok: true, branches, truncated: false };
+  }
+  return { ok: true, branches, truncated: true };
+}
+
+/**
+ * `GET /repos/:o/:r/branches/:name` — one branch, so a name beyond a truncated
+ * listing can still be checked. `branch: null` means GitHub has no such branch
+ * (its "Branch not found" 404); a plain "Not Found" 404 is the repository (or a
+ * private-repo auth gap) and stays an error. The name is encoded per path
+ * segment, so `release/1.2` survives.
+ */
+export async function getGitHubBranch(
+  input: { dir: string; name: string },
+): Promise<{ ok: true; branch: ForgeBranch | null } | GitHubListError> {
+  const repo = await repoForDir(input.dir);
+  if (!repo) return { ok: false, error: "project does not have a GitHub remote" };
+  const name = input.name.trim();
+  if (!name) return { ok: false, error: "branch name required" };
+  const token = await githubToken(repo.remoteHost ?? null);
+  const encoded = name.split("/").map(encodeURIComponent).join("/");
+  const url = `${GITHUB_API_BASE}/repos/${repo.owner}/${repo.name}/branches/${encoded}`;
+  const res = await fetchGitHub(url, token, "application/vnd.github+json");
+  if (!("status" in res)) return res;
+  const json = await res.json().catch(() => null);
+  if (res.ok) return { ok: true, branch: normalizeForgeBranch(json) };
+  const message = apiError(json, res.status, res.statusText);
+  if (res.status === 404 && !/^not found$/i.test(message.trim())) return { ok: true, branch: null };
+  return { ok: false, error: privateRepoHint(res.status, message, repo, !!token) };
+}
+
+/** `GET /repos/:o/:r` → `default_branch`. */
+export async function getGitHubDefaultBranch(
+  input: { dir: string },
+): Promise<{ ok: true; name: string } | GitHubListError> {
+  const repo = await repoForDir(input.dir);
+  if (!repo) return { ok: false, error: "project does not have a GitHub remote" };
+  const token = await githubToken(repo.remoteHost ?? null);
+  const res = await fetchGitHub(`${GITHUB_API_BASE}/repos/${repo.owner}/${repo.name}`, token, "application/vnd.github+json");
+  if (!("status" in res)) return res;
+  const json = await res.json().catch(() => null);
+  if (!res.ok) {
+    return { ok: false, error: privateRepoHint(res.status, apiError(json, res.status, res.statusText), repo, !!token) };
+  }
+  const name = json && typeof json === "object" ? (json as { default_branch?: unknown }).default_branch : null;
+  if (typeof name !== "string" || !name) return { ok: false, error: "GitHub did not report a default branch" };
+  return { ok: true, name };
 }
 
 export async function getGitHubPullDiff(input: GetGitHubPullDiffInput): Promise<GitHubDiffResponse> {

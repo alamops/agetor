@@ -1,20 +1,40 @@
 import { useEffect, useLayoutEffect, useMemo, useRef, useState, type KeyboardEvent as ReactKeyboardEvent } from "react";
 import { createPortal } from "react-dom";
-import type { LucideIcon } from "lucide-react";
-import { placeContextMenu, moveMenuIndex } from "@/lib/context-menu";
+import { ChevronRight, type LucideIcon } from "lucide-react";
+import { placeContextMenu, placeSubmenu, moveMenuIndex } from "@/lib/context-menu";
 import { cn } from "@/lib/utils";
 
-export type ContextMenuItem =
-  | {
-      type?: "item";
-      id: string;
-      label: string;
-      icon?: LucideIcon;
-      danger?: boolean;
-      disabled?: boolean;
-      onSelect: () => void;
-    }
-  | { type: "separator"; id: string };
+export interface ContextMenuLeafItem {
+  type?: "item";
+  id: string;
+  label: string;
+  icon?: LucideIcon;
+  danger?: boolean;
+  disabled?: boolean;
+  onSelect: () => void;
+}
+
+/** An item that opens a child panel of leaf items (hover, Enter or ArrowRight). */
+export interface ContextMenuSubmenuItem {
+  type: "submenu";
+  id: string;
+  label: string;
+  icon?: LucideIcon;
+  disabled?: boolean;
+  items: ContextMenuLeafItem[];
+}
+
+export type ContextMenuItem = ContextMenuLeafItem | ContextMenuSubmenuItem | { type: "separator"; id: string };
+
+const ITEM_CLASS = (isActive: boolean, danger?: boolean, disabled?: boolean) =>
+  cn(
+    "flex w-full items-center gap-2 rounded-sm px-2 py-1.5 text-left outline-none transition-colors",
+    "hover:bg-accent hover:text-accent-foreground focus-visible:bg-accent focus-visible:text-accent-foreground",
+    isActive && "bg-accent text-accent-foreground",
+    danger && "text-destructive hover:text-destructive focus-visible:text-destructive",
+    isActive && danger && "text-destructive",
+    disabled && "pointer-events-none opacity-50",
+  );
 
 export interface ContextMenuProps {
   open: boolean;
@@ -56,6 +76,13 @@ export function ContextMenu({ open, x, y, items, onClose, label = "Context menu"
   const [pos, setPos] = useState<{ top: number; left: number } | null>(null);
   const panelRef = useRef<HTMLDivElement>(null);
   const [activeIndex, setActiveIndex] = useState(-1);
+  // The open submenu (at most one), its panel position and its roving focus.
+  const [sub, setSub] = useState<{ id: string } | null>(null);
+  const [subPos, setSubPos] = useState<{ top: number; left: number } | null>(null);
+  const [subIndex, setSubIndex] = useState(-1);
+  const subPanelRef = useRef<HTMLDivElement>(null);
+  /** The anchor + item ids the open root menu was laid out for (null while closed). */
+  const rootKeyRef = useRef<string | null>(null);
   const onCloseRef = useRef(onClose);
   onCloseRef.current = onClose;
 
@@ -65,6 +92,11 @@ export function ContextMenu({ open, x, y, items, onClose, label = "Context menu"
     () => items.map((it) => (it.type === "separator" ? false : !it.disabled)),
     [items],
   );
+  const openSub = useMemo(
+    () => items.find((it): it is ContextMenuSubmenuItem => it.type === "submenu" && it.id === sub?.id) ?? null,
+    [items, sub],
+  );
+  const subEnabled = useMemo(() => (openSub ? openSub.items.map((it) => !it.disabled) : []), [openSub]);
 
   // Reset positioning + roving focus each time the menu (re)opens, so a
   // stale position/index from a previous open never flashes before the
@@ -73,8 +105,41 @@ export function ContextMenu({ open, x, y, items, onClose, label = "Context menu"
     if (!open) {
       setPos(null);
       setActiveIndex(-1);
+      setSub(null);
+      setSubPos(null);
+      setSubIndex(-1);
     }
   }, [open]);
+
+  // Place the submenu beside its parent item once it has rendered (measured
+  // hidden at 0,0 first, like the root panel).
+  useLayoutEffect(() => {
+    if (!open || !sub) {
+      setSubPos(null);
+      return;
+    }
+    const panel = subPanelRef.current;
+    const parent = panelRef.current?.querySelector<HTMLElement>(`[data-menu-id="${sub.id}"]`);
+    if (!panel || !parent) return;
+    const r = parent.getBoundingClientRect();
+    setSubPos(
+      placeSubmenu({
+        anchor: { top: r.top, left: r.left, right: r.right, bottom: r.bottom },
+        width: panel.offsetWidth,
+        height: panel.offsetHeight,
+        viewportWidth: window.innerWidth,
+        viewportHeight: window.innerHeight,
+      }),
+    );
+  }, [open, sub]);
+
+  // Wait for the child panel's real position: until `subPos` is set it is
+  // still `visibility: hidden`, which refuses focus, so focus would stay on
+  // the parent and the next ArrowDown/Escape would act on the root menu.
+  useEffect(() => {
+    if (subIndex === -1 || !subPos) return;
+    subPanelRef.current?.querySelector<HTMLElement>(`[data-sub-index="${subIndex}"]`)?.focus();
+  }, [subIndex, subPos]);
 
   // Snapshot whatever had focus right before the menu opened, and restore it
   // once the menu closes OR is unmounted outright — the cleanup fires either
@@ -91,7 +156,23 @@ export function ContextMenu({ open, x, y, items, onClose, label = "Context menu"
   }, [open]);
 
   useLayoutEffect(() => {
-    if (!open) return;
+    if (!open) {
+      rootKeyRef.current = null;
+      return;
+    }
+    // A new anchor or item set while the menu stays open (a right-click on
+    // another card closes and reopens it in one React batch, so `open` never
+    // goes false) replaces the root menu: drop the old child so it can't
+    // linger at the previous anchor. Compared by value, not array identity,
+    // so an ordinary re-render of the same menu keeps its open child.
+    const rootKey = `${x},${y}|${items.map((it) => (it.type === "separator" ? "-" : it.id)).join(",")}`;
+    const replaced = rootKeyRef.current !== null && rootKeyRef.current !== rootKey;
+    if (replaced) {
+      setSub(null);
+      setSubPos(null);
+      setSubIndex(-1);
+    }
+    rootKeyRef.current = rootKey;
     const panel = panelRef.current;
     if (!panel) return;
     const width = panel.offsetWidth;
@@ -110,7 +191,12 @@ export function ContextMenu({ open, x, y, items, onClose, label = "Context menu"
     // queued to the next microtask so it runs after this paint commits.
     queueMicrotask(() => {
       const first = moveMenuIndex(-1, 1, enabled);
-      if (first !== -1) setActiveIndex(first);
+      if (first === -1) return;
+      setActiveIndex(first);
+      // A replacement may leave `activeIndex` unchanged (the old menu's
+      // first item was active too), so the effect below won't re-run; focus
+      // directly, or focus stays on the removed child panel.
+      if (replaced) panelRef.current?.querySelector<HTMLElement>(`[data-menu-index="${first}"]`)?.focus();
     });
     // `items` is frozen for the lifetime of one open (App hands a stable
     // array identity that only changes when the menu (re)opens), so this
@@ -136,6 +222,7 @@ export function ContextMenu({ open, x, y, items, onClose, label = "Context menu"
       // every right-click, re-running the focus-restore cleanup each time.
       if (e.button === 2) return;
       if (panelRef.current?.contains(e.target as Node)) return;
+      if (subPanelRef.current?.contains(e.target as Node)) return;
       onCloseRef.current();
     };
     const onContextMenuOutside = (e: MouseEvent) => {
@@ -148,6 +235,7 @@ export function ContextMenu({ open, x, y, items, onClose, label = "Context menu"
       // new card) and the menu moves instead of flashing closed. Left/middle
       // clicks and Ctrl+click still dismiss via mousedown above.
       if (panelRef.current?.contains(e.target as Node)) return;
+      if (subPanelRef.current?.contains(e.target as Node)) return;
       onCloseRef.current();
     };
     const onKey = (e: KeyboardEvent) => {
@@ -171,6 +259,7 @@ export function ContextMenu({ open, x, y, items, onClose, label = "Context menu"
       // scrolling, scrollbar drags already dismiss via the outside-mousedown
       // path, and keyboard scrolling can't happen while the menu owns focus.
       if (panelRef.current && e.target instanceof Node && panelRef.current.contains(e.target)) return;
+      if (subPanelRef.current && e.target instanceof Node && subPanelRef.current.contains(e.target)) return;
       onCloseRef.current();
     };
     const onResize = () => onCloseRef.current();
@@ -194,10 +283,68 @@ export function ContextMenu({ open, x, y, items, onClose, label = "Context menu"
 
   if (!open) return null;
 
-  const selectItem = (item: Extract<ContextMenuItem, { type?: "item" }>) => {
+  const selectItem = (item: ContextMenuLeafItem) => {
     if (item.disabled) return;
     item.onSelect();
     onCloseRef.current();
+  };
+
+  const openSubmenu = (item: ContextMenuSubmenuItem, viaKeyboard: boolean) => {
+    if (item.disabled || item.items.length === 0) return;
+    setSub({ id: item.id });
+    setSubIndex(viaKeyboard ? moveMenuIndex(-1, 1, item.items.map((it) => !it.disabled)) : -1);
+  };
+
+  const closeSubmenu = (refocusParent: boolean) => {
+    const parentIndex = items.findIndex((it) => it.id === sub?.id);
+    setSub(null);
+    setSubIndex(-1);
+    if (refocusParent && parentIndex !== -1) {
+      setActiveIndex(parentIndex);
+      panelRef.current?.querySelector<HTMLElement>(`[data-menu-index="${parentIndex}"]`)?.focus();
+    }
+  };
+
+  const onSubKeyDown = (e: ReactKeyboardEvent<HTMLDivElement>) => {
+    // Every key handled here stops at the child: its React events also bubble
+    // to the root panel's handler (the child is a portal inside the root's tree).
+    switch (e.key) {
+      case "ArrowDown":
+        e.preventDefault();
+        e.stopPropagation();
+        setSubIndex((cur) => moveMenuIndex(cur, 1, subEnabled));
+        break;
+      case "ArrowUp":
+        e.preventDefault();
+        e.stopPropagation();
+        setSubIndex((cur) => moveMenuIndex(cur, -1, subEnabled));
+        break;
+      case "Home":
+        e.preventDefault();
+        e.stopPropagation();
+        setSubIndex(moveMenuIndex(-1, 1, subEnabled));
+        break;
+      case "End":
+        e.preventDefault();
+        e.stopPropagation();
+        setSubIndex(moveMenuIndex(-1, -1, subEnabled));
+        break;
+      case "ArrowLeft":
+      case "Escape":
+        // The first Escape (or ArrowLeft) closes only the child; a second
+        // Escape, now landing on the root panel, closes the menu.
+        e.preventDefault();
+        e.stopPropagation();
+        closeSubmenu(true);
+        break;
+      case "Tab":
+        e.preventDefault();
+        e.stopPropagation();
+        onCloseRef.current();
+        break;
+      default:
+        break;
+    }
   };
 
   const onKeyDown = (e: ReactKeyboardEvent<HTMLDivElement>) => {
@@ -222,13 +369,24 @@ export function ContextMenu({ open, x, y, items, onClose, label = "Context menu"
         setActiveIndex(moveMenuIndex(-1, -1, enabled));
         break;
       }
+      case "ArrowRight": {
+        const cur = items[activeIndex];
+        if (cur?.type === "submenu") {
+          e.preventDefault();
+          openSubmenu(cur, true);
+        }
+        break;
+      }
       case "Escape": {
         // Consume here so no enclosing Escape handler (RunPanel, dialogs)
         // also reacts to the same keypress — data-popover-open is the
         // marker those handlers check, this is the belt-and-suspenders.
         e.preventDefault();
         e.stopPropagation();
-        onCloseRef.current();
+        // One level at a time: a child opened by hover leaves focus on its
+        // parent item, so this Escape closes that child first.
+        if (sub) closeSubmenu(true);
+        else onCloseRef.current();
         break;
       }
       case "Tab": {
@@ -242,6 +400,7 @@ export function ContextMenu({ open, x, y, items, onClose, label = "Context menu"
   };
 
   return createPortal(
+    <>
     <div
       ref={panelRef}
       role="menu"
@@ -265,6 +424,37 @@ export function ContextMenu({ open, x, y, items, onClose, label = "Context menu"
         }
         const Icon = item.icon;
         const isActive = index === activeIndex;
+        if (item.type === "submenu") {
+          const expanded = sub?.id === item.id;
+          return (
+            <button
+              key={item.id}
+              type="button"
+              role="menuitem"
+              aria-haspopup="menu"
+              aria-expanded={expanded}
+              data-menu-index={index}
+              data-menu-id={item.id}
+              data-testid={testId ? `${testId}-${item.id}` : undefined}
+              disabled={item.disabled}
+              tabIndex={isActive ? 0 : -1}
+              onClick={() => openSubmenu(item, true)}
+              onMouseEnter={
+                item.disabled
+                  ? undefined
+                  : () => {
+                      setActiveIndex(index);
+                      openSubmenu(item, false);
+                    }
+              }
+              className={ITEM_CLASS(isActive || expanded, false, item.disabled)}
+            >
+              {Icon && <Icon className="size-3.5 shrink-0" aria-hidden />}
+              <span className="min-w-0 flex-1 truncate">{item.label}</span>
+              <ChevronRight className="size-3.5 shrink-0 text-muted-foreground" aria-hidden />
+            </button>
+          );
+        }
         return (
           <button
             key={item.id}
@@ -275,22 +465,61 @@ export function ContextMenu({ open, x, y, items, onClose, label = "Context menu"
             disabled={item.disabled}
             tabIndex={isActive ? 0 : -1}
             onClick={() => selectItem(item)}
-            onMouseEnter={item.disabled ? undefined : () => setActiveIndex(index)}
-            className={cn(
-              "flex w-full items-center gap-2 rounded-sm px-2 py-1.5 text-left outline-none transition-colors",
-              "hover:bg-accent hover:text-accent-foreground focus-visible:bg-accent focus-visible:text-accent-foreground",
-              isActive && "bg-accent text-accent-foreground",
-              item.danger && "text-destructive hover:text-destructive focus-visible:text-destructive",
-              isActive && item.danger && "text-destructive",
-              item.disabled && "pointer-events-none opacity-50",
-            )}
+            onMouseEnter={
+              item.disabled
+                ? undefined
+                : () => {
+                    setActiveIndex(index);
+                    // Moving onto a plain item closes any open child.
+                    if (sub) closeSubmenu(false);
+                  }
+            }
+            className={ITEM_CLASS(isActive, item.danger, item.disabled)}
           >
             {Icon && <Icon className="size-3.5 shrink-0" aria-hidden />}
             <span className="min-w-0 flex-1 truncate">{item.label}</span>
           </button>
         );
       })}
-    </div>,
+    </div>
+    {openSub && (
+      <div
+        ref={subPanelRef}
+        role="menu"
+        aria-label={openSub.label}
+        data-popover-open=""
+        data-testid={testId ? `${testId}-${openSub.id}-submenu` : undefined}
+        tabIndex={-1}
+        onKeyDown={onSubKeyDown}
+        onClick={(e) => e.stopPropagation()}
+        onContextMenu={(e) => e.preventDefault()}
+        style={subPos ? { top: subPos.top, left: subPos.left } : { top: 0, left: 0, visibility: "hidden" }}
+        className="fixed z-50 max-h-[calc(100vh-16px)] min-w-44 overflow-y-auto rounded-md border border-border bg-card p-1 text-sm text-card-foreground shadow-xl"
+      >
+        {openSub.items.map((child, index) => {
+          const ChildIcon = child.icon;
+          const isActive = index === subIndex;
+          return (
+            <button
+              key={child.id}
+              type="button"
+              role="menuitem"
+              data-sub-index={index}
+              data-testid={testId ? `${testId}-${child.id}` : undefined}
+              disabled={child.disabled}
+              tabIndex={isActive ? 0 : -1}
+              onClick={() => selectItem(child)}
+              onMouseEnter={child.disabled ? undefined : () => setSubIndex(index)}
+              className={ITEM_CLASS(isActive, child.danger, child.disabled)}
+            >
+              {ChildIcon && <ChildIcon className="size-3.5 shrink-0" aria-hidden />}
+              <span className="min-w-0 flex-1 truncate">{child.label}</span>
+            </button>
+          );
+        })}
+      </div>
+    )}
+    </>,
     document.body,
   );
 }

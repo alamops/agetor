@@ -1,6 +1,23 @@
 import { describe, expect, test } from "bun:test";
-import { latestPrProposal, parsePrProposal } from "./pr-proposal.ts";
+import {
+  cleanBaseValue,
+  collectRunProposals,
+  extractLinkLine,
+  parsePrProposals,
+} from "./pr-proposal.ts";
 import type { RunEvent } from "../../shared/types.ts";
+
+/** Test adapter: a reply's newest proposal in the single-proposal shape the first suites below were written for. */
+function parsePrProposal(text: string): { title: string; description: string; link: string | null } | null {
+  const p = parsePrProposals(text).at(-1);
+  return p ? { title: p.title, description: p.description, link: p.link } : null;
+}
+
+/** Test adapter: the newest proposal across a task's run events. */
+function latestPrProposal(events: RunEvent[]): { title: string; description: string; link: string | null } | null {
+  const p = collectRunProposals(events).at(-1);
+  return p ? { title: p.title, description: p.description, link: p.link } : null;
+}
 
 const LINK = "https://github.com/acme/widgets/pull/new/feature/add-login";
 
@@ -253,12 +270,9 @@ describe("parsePrProposal — link line", () => {
     expect(proposal?.link).toBe(LINK);
   });
 
-  // Pinning actual behavior, not the contract's aspiration: extractUrlLine's
-  // BARE regex (`\S+`) already matches trailing punctuation as part of the
-  // URL when the line has no other whitespace, so the "strip trailing
-  // sentence punctuation" fallback branch never fires for a line that is
-  // *only* a URL + punctuation — the period is kept as part of the link.
-  test("a trailing period on an otherwise-bare URL line is kept, not stripped (BARE's \\S+ already consumes it)", () => {
+  // Git forbids a ref name ending in "." and the link is read to find the
+  // branch, so sentence punctuation after a bare URL is dropped.
+  test("a trailing period on an otherwise-bare URL line is dropped", () => {
     const text = [
       `${LINK}.`,
       "",
@@ -272,7 +286,7 @@ describe("parsePrProposal — link line", () => {
       "Body text.",
       "````",
     ].join("\n");
-    expect(parsePrProposal(text)?.link).toBe(`${LINK}.`);
+    expect(parsePrProposal(text)?.link).toBe(LINK);
   });
 });
 
@@ -467,7 +481,7 @@ describe("review-fix regressions", () => {
   });
 });
 
-describe("multi-repository proposals", () => {
+describe("Repository: labels", () => {
   const labeled = [
     "Repository: frontend",
     LINK,
@@ -492,158 +506,251 @@ describe("multi-repository proposals", () => {
     "````",
   ].join("\n");
 
-  test("parses one proposal per Repository label", () => {
-    const { parseRepositoryProposals } = require("./pr-proposal.ts") as typeof import("./pr-proposal.ts");
-    const map = parseRepositoryProposals(labeled);
-    expect([...map.keys()]).toEqual(["frontend", "backend"]);
-    expect(map.get("frontend")?.title).toBe("Add login UI");
-    expect(map.get("frontend")?.description).toBe("Frontend body.");
-    expect(map.get("backend")?.link).toBe("https://github.com/acme/backend/pull/new/feature/add-login");
+  const block = (label: string, title: string) =>
+    [label, LINK, "PR title:", "```", title, "```", "PR description:", "````", "Body.", "````"].join("\n");
+  const labelsOf = (text: string) => parsePrProposals(text).map((p) => p.repositoryLabel);
+
+  test("one proposal per Repository label, each with its own link", () => {
+    const ps = parsePrProposals(labeled);
+    expect(ps.map((p) => p.repositoryLabel)).toEqual(["frontend", "backend"]);
+    expect(ps[0]).toMatchObject({ title: "Add login UI", description: "Frontend body." });
+    expect(ps[1]!.link).toBe("https://github.com/acme/backend/pull/new/feature/add-login");
   });
 
   test("repository names containing underscores are not truncated", () => {
-    const { parseRepositoryProposals } = require("./pr-proposal.ts") as typeof import("./pr-proposal.ts");
-    const text = [
-      "Repository: agetor_api",
-      LINK,
-      "PR title:",
-      "```",
-      "Add API",
-      "```",
-      "PR description:",
-      "````",
-      "Body.",
-      "````",
-    ].join("\n");
-    const map = parseRepositoryProposals(text);
-    expect([...map.keys()]).toEqual(["agetor_api"]);
-    expect(map.get("agetor_api")?.title).toBe("Add API");
+    expect(labelsOf(block("Repository: agetor_api", "Add API"))).toEqual(["agetor_api"]);
   });
 
   test("repository names ending or starting with an underscore survive", () => {
-    const { parseRepositoryProposals } = require("./pr-proposal.ts") as typeof import("./pr-proposal.ts");
-    const block = (name: string) => [
-      `Repository: ${name}`,
-      LINK,
-      "PR title:",
-      "```",
-      `Add ${name}`,
-      "```",
-      "PR description:",
-      "````",
-      "Body.",
-      "````",
-    ].join("\n");
-    const map = parseRepositoryProposals([block("api_"), block("_worker")].join("\n\n"));
     // A lone edge underscore is part of the slug — `repoNameForPath` keeps it,
     // so the label must too (only a *balanced* pair is emphasis).
-    expect([...map.keys()]).toEqual(["api_", "_worker"]);
+    expect(labelsOf([block("Repository: api_", "A"), block("Repository: _worker", "B")].join("\n\n"))).toEqual([
+      "api_",
+      "_worker",
+    ]);
   });
 
   test("markdown emphasis around the label and value is stripped", () => {
-    const { parseRepositoryProposals } = require("./pr-proposal.ts") as typeof import("./pr-proposal.ts");
-    const text = [
-      "**Repository:** **frontend**",
-      LINK,
-      "PR title:",
-      "```",
-      "UI",
-      "```",
-      "PR description:",
-      "````",
-      "Frontend body.",
-      "````",
-      "",
-      "### _Repository:_ agetor_api",
-      LINK,
-      "PR title:",
-      "```",
-      "API",
-      "```",
-      "PR description:",
-      "````",
-      "API body.",
-      "````",
-    ].join("\n");
-    const map = parseRepositoryProposals(text);
-    expect([...map.keys()]).toEqual(["frontend", "agetor_api"]);
-    expect(map.get("frontend")?.title).toBe("UI");
-    expect(map.get("agetor_api")?.title).toBe("API");
+    expect(
+      labelsOf([block("**Repository:** **frontend**", "UI"), block("### _Repository:_ agetor_api", "API")].join("\n\n")),
+    ).toEqual(["frontend", "agetor_api"]);
   });
 
   test("inline-code-wrapped labels keep their proposal (backticks and nested emphasis)", () => {
-    const { parseRepositoryProposals } = require("./pr-proposal.ts") as typeof import("./pr-proposal.ts");
-    const block = (label: string, title: string) => [
-      label,
-      LINK,
+    expect(
+      labelsOf(
+        [
+          block("Repository: `frontend`", "UI"),
+          block("**Repository: `backend`**", "API"),
+          block("Repository: **`infra`**", "Infra"),
+        ].join("\n\n"),
+      ),
+    ).toEqual(["frontend", "backend", "infra"]);
+  });
+
+  test("an unlabeled proposal has a null label", () => {
+    expect(labelsOf(canonicalText())).toEqual([null]);
+  });
+});
+
+// ---------------------------------------------------------------------------
+// parsePrProposals / collectRunProposals (Create all PRs)
+// ---------------------------------------------------------------------------
+
+const block = (title: string, desc: string) =>
+  ["PR title:", "```", title, "```", "", "PR description:", "````", desc, "````"].join("\n");
+
+// The shape of a real multi-PR reply: bold headings, bare pull/new links, no labels.
+function threePrReply(): string {
+  return [
+    "Pushed all branches.",
+    "",
+    "**PR-1: app → `main`**",
+    "https://github.com/acme/app/pull/new/feature/login",
+    "",
+    block("Add login", "Adds login to app."),
+    "",
+    "**PR-2: infra → `main`**",
+    "https://github.com/acme/infra/pull/new/feature/login",
+    "",
+    block("Add login infra", "Infra for login."),
+    "",
+    "**PR-3: app second branch**",
+    "https://github.com/acme/app/pull/new/feature/docs",
+    "",
+    block("Docs for login", "Docs."),
+  ].join("\n");
+}
+
+describe("parsePrProposals", () => {
+  test("a title with no description of its own never takes the next proposal's; the next one stays whole", () => {
+    const text = [
+      "https://github.com/acme/app/compare/main...a",
       "PR title:",
       "```",
-      title,
+      "Orphan title",
       "```",
-      "PR description:",
-      "````",
-      "Body.",
-      "````",
+      "",
+      "https://github.com/acme/app/compare/main...b",
+      block("Second", "second description"),
     ].join("\n");
-    const map = parseRepositoryProposals([
-      block("Repository: `frontend`", "UI"),
-      block("**Repository: `backend`**", "API"),
-      block("Repository: **`infra`**", "Infra"),
-    ].join("\n\n"));
-    expect([...map.keys()]).toEqual(["frontend", "backend", "infra"]);
-    expect(map.get("backend")?.title).toBe("API");
-    expect(map.get("infra")?.title).toBe("Infra");
+    const ps = parsePrProposals(text);
+    expect(ps.map((p) => [p.title, p.description, p.link])).toEqual([
+      ["Second", "second description", "https://github.com/acme/app/compare/main...b"],
+    ]);
   });
 
-  test("tolerates a missing label only when exactly one proposal exists", () => {
-    const { latestRepositoryProposals } = require("./pr-proposal.ts") as typeof import("./pr-proposal.ts");
-    const events = [ev({ data: canonicalText() })];
-    expect([...latestRepositoryProposals(events).keys()]).toEqual([]);
-    expect(latestRepositoryProposals(events, "frontend").get("frontend")?.title).toBe("Add login flow");
-  });
-
-  test("repositoriesNeedingPr skips already-stamped repositories", () => {
-    const { repositoriesNeedingPr } = require("./pr-proposal.ts") as typeof import("./pr-proposal.ts");
-    const repos = [
-      { name: "frontend", prUrl: "https://github.com/acme/frontend/pull/1" },
-      { name: "backend", prUrl: null },
-      { name: "infra", prUrl: null },
+  test("a proposal never inherits the link or base of a dropped proposal above it; its own link still wins", () => {
+    const orphan = [
+      "Base: develop",
+      "https://github.com/acme/app/compare/develop...a",
+      "PR title:",
+      "```",
+      "Orphan title",
+      "```",
+      "",
     ];
-    expect(repositoriesNeedingPr(repos).map((r) => r.name)).toEqual(["backend", "infra"]);
-    expect(repositoriesNeedingPr(repos.map((r) => ({ ...r, prUrl: "x" })))).toEqual([]);
+    const linkless = parsePrProposals([...orphan, block("Second", "second description")].join("\n"));
+    expect(linkless.map((p) => [p.title, p.link, p.baseLine])).toEqual([["Second", null, null]]);
+    const own = parsePrProposals(
+      [...orphan, "Base: main", "https://github.com/acme/app/compare/main...b", block("Second", "d")].join("\n"),
+    );
+    expect(own.map((p) => [p.title, p.link, p.baseLine])).toEqual([["Second", "https://github.com/acme/app/compare/main...b", "main"]]);
   });
 
-  test("latestProposalForRepository never returns another repository's labeled block", () => {
-    const { latestProposalForRepository, latestPrProposal } =
-      require("./pr-proposal.ts") as typeof import("./pr-proposal.ts");
-    const events = [ev({ data: labeled })];
-    // `latestPrProposal` takes the LAST PR title label (backend) regardless of
-    // which repository the user is acting on — the bug this helper closes.
-    expect(latestPrProposal(events)?.title).toBe("Add login API");
-    expect(latestProposalForRepository(events, "frontend")?.title).toBe("Add login UI");
-    expect(latestProposalForRepository(events, "backend")?.title).toBe("Add login API");
-    expect(latestProposalForRepository(events, "infra")).toBeNull();
+  test("a three-PR reply gives three proposals, each with its own link", () => {
+    const ps = parsePrProposals(threePrReply());
+    expect(ps.map((p) => p.title)).toEqual(["Add login", "Add login infra", "Docs for login"]);
+    expect(ps.map((p) => p.link)).toEqual([
+      "https://github.com/acme/app/pull/new/feature/login",
+      "https://github.com/acme/infra/pull/new/feature/login",
+      "https://github.com/acme/app/pull/new/feature/docs",
+    ]);
+    expect(ps[1]!.description).toBe("Infra for login.");
   });
 
-  test("latestProposalsForTargets attributes an unlabeled proposal only when there is one target", () => {
-    const { latestProposalsForTargets } = require("./pr-proposal.ts") as typeof import("./pr-proposal.ts");
-    const events = [ev({ data: canonicalText() })];
-    // Several PR targets: an unlabeled block could belong to any of them, so
-    // it is not stamped onto the first one.
-    expect([...latestProposalsForTargets(events, ["frontend", "backend"]).keys()]).toEqual([]);
-    expect(latestProposalsForTargets(events, ["frontend"]).get("frontend")?.title).toBe("Add login flow");
-    // Duplicates collapse before the one-target rule.
-    expect(latestProposalsForTargets(events, ["frontend", "frontend"]).get("frontend")?.title)
-      .toBe("Add login flow");
+  test("a proposal without its own link gets null, never a sibling's", () => {
+    const text = [
+      "https://github.com/acme/app/compare/main...a",
+      block("One", "d1"),
+      "",
+      block("Two", "d2"),
+    ].join("\n");
+    const ps = parsePrProposals(text);
+    expect(ps).toHaveLength(2);
+    expect(ps[0]!.link).toBe("https://github.com/acme/app/compare/main...a");
+    expect(ps[1]!.link).toBeNull();
   });
 
-  test("newest run wins and subagent streams are ignored", () => {
-    const { latestRepositoryProposals } = require("./pr-proposal.ts") as typeof import("./pr-proposal.ts");
-    const events = [
-      ev({ runId: "old", data: labeled }),
-      ev({ runId: "new", data: "Repository: frontend\nPR title:\n```\nNewer\n```\nPR description:\n````\nNew body.\n````" }),
-      ev({ runId: "new", subagentId: "s1", data: labeled }),
+  test("reads Base: variants (emphasis, backticks, Base branch:, trailing prose)", () => {
+    const mk = (line: string) => parsePrProposals([line, block("T", "D")].join("\n"))[0]!.baseLine;
+    expect(mk("Base: develop")).toBe("develop");
+    expect(mk("**Base:** `develop`")).toBe("develop");
+    expect(mk("**Base**: release/1.2")).toBe("release/1.2");
+    expect(mk("Base branch: `main` (the default).")).toBe("main");
+    expect(mk("- Base: origin/develop")).toBe("origin/develop");
+    expect(mk("Base: <branch>")).toBeNull();
+    expect(mk("no base here")).toBeNull();
+  });
+
+  test("a Base: line belongs to the proposal below it only", () => {
+    const text = ["Base: develop", block("One", "d1"), "", block("Two", "d2")].join("\n");
+    const ps = parsePrProposals(text);
+    expect(ps[0]!.baseLine).toBe("develop");
+    expect(ps[1]!.baseLine).toBeNull();
+  });
+
+  test("the label is the most recent Repository: line above, even above an earlier proposal", () => {
+    const text = [
+      "Repository: app",
+      "https://github.com/acme/app/compare/main...a",
+      block("One", "Repository: not-a-label inside a description"),
+      "",
+      "https://github.com/acme/app/compare/main...b",
+      block("Two", "d2"),
+      "",
+      "Repository: infra",
+      block("Three", "d3"),
+    ].join("\n");
+    const ps = parsePrProposals(text);
+    expect(ps.map((p) => p.repositoryLabel)).toEqual(["app", "app", "infra"]);
+  });
+
+  test("\\r\\n and bare \\r input parse", () => {
+    const text = threePrReply();
+    expect(parsePrProposals(text.replace(/\n/g, "\r\n"))).toHaveLength(3);
+    expect(parsePrProposals(text.replace(/\n/g, "\r"))).toHaveLength(3);
+  });
+
+  test("a four-backtick description holding ``` survives", () => {
+    const desc = "Intro\n```ts\nconst a = 1;\n```\nOutro";
+    const ps = parsePrProposals(block("T", desc));
+    expect(ps[0]!.description).toBe(desc);
+  });
+
+  test("an incomplete trailing proposal is ignored and garbage gives []", () => {
+    expect(parsePrProposals(["PR title:", "```", "Only a title", "```"].join("\n"))).toEqual([]);
+    expect(parsePrProposals("")).toEqual([]);
+    expect(parsePrProposals("nothing\nPR title:")).toEqual([]);
+  });
+});
+
+describe("extractLinkLine", () => {
+  test("bare, angle-bracketed, markdown and labeled forms", () => {
+    const url = "https://github.com/a/b/compare/main...x?quick_pull=1";
+    expect(extractLinkLine(url)).toBe(url);
+    expect(extractLinkLine(`<${url}>`)).toBe(url);
+    expect(extractLinkLine(`[Open PR](${url})`)).toBe(url);
+    expect(extractLinkLine(`PR link: ${url}`)).toBe(url);
+    expect(extractLinkLine(`- **Link:** [open](${url})`)).toBe(url);
+    expect(extractLinkLine(`${url}.`)).toBe(url);
+  });
+  test("prose and non-links are not links", () => {
+    expect(extractLinkLine("Open it at https://x.example/y later")).toBeNull();
+    expect(extractLinkLine("")).toBeNull();
+    expect(extractLinkLine("Base: main")).toBeNull();
+  });
+});
+
+describe("cleanBaseValue", () => {
+  test("keeps underscores and slashes, drops decoration", () => {
+    expect(cleanBaseValue("`feature/a_b`")).toBe("feature/a_b");
+    expect(cleanBaseValue("**main**")).toBe("main");
+    expect(cleanBaseValue("")).toBeNull();
+  });
+  test("a backtick-quoted name is read whole: an apostrophe inside is kept, prose after the closing backtick ignored", () => {
+    expect(cleanBaseValue("`fix/it's-done`")).toBe("fix/it's-done");
+    expect(cleanBaseValue("`release/1.2` (the branch it was cut from).")).toBe("release/1.2");
+    expect(cleanBaseValue("**`develop`** — not main")).toBe("develop");
+    expect(cleanBaseValue("`<branch>`")).toBeNull();
+    expect(cleanBaseValue("``")).toBeNull();
+    // Unquoted values keep the token rules.
+    expect(cleanBaseValue("main (the default).")).toBe("main");
+  });
+});
+
+describe("collectRunProposals", () => {
+  test("ignores subagent and non-assistant events, orders by run then position", () => {
+    const events: RunEvent[] = [
+      ev({ runId: "r1", data: block("Old", "d") }),
+      ev({ runId: "r1", stream: "stdout", data: block("Nope", "d") }),
+      ev({ runId: "r1", subagentId: "sa", data: block("Sub", "d") }),
+      ev({ runId: "r2", data: [block("New A", "d"), "", block("New B", "d")].join("\n") }),
     ];
-    expect(latestRepositoryProposals(events).get("frontend")?.title).toBe("Newer");
+    const ps = collectRunProposals(events);
+    expect(ps.map((p) => [p.runId, p.title])).toEqual([
+      ["r1", "Old"],
+      ["r2", "New A"],
+      ["r2", "New B"],
+    ]);
+    expect(ps.map((p) => p.order)).toEqual([0, 1, 2]);
+  });
+
+  test("joins an assistant reply split across event chunks", () => {
+    const events: RunEvent[] = [
+      ev({ runId: "r1", data: ["PR title:", "```", "Split", "```"].join("\n") }),
+      ev({ runId: "r1", data: ["PR description:", "````", "body", "````"].join("\n") }),
+    ];
+    expect(collectRunProposals(events).map((p) => p.title)).toEqual(["Split"]);
   });
 });

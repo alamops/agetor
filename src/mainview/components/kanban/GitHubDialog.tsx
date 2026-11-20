@@ -202,6 +202,37 @@ export interface GitHubPullPrefill {
   title: string;
   body: string;
   taskId: string;
+  /**
+   * The base branch to merge into, chosen by `buildPrPlan` (stored task base,
+   * else the agent's, else the remote default). Unset leaves the composer's
+   * own default-base fetch to fill it.
+   */
+  base?: string;
+}
+
+/** The composer fields a New-PR prefill seeds. `base` is present only when the prefill names one. */
+export function prefillPullFields(
+  pending: Pick<GitHubPullPrefill, "head" | "title" | "body" | "base">,
+): { head: string; title: string; body: string; base?: string } {
+  const out: { head: string; title: string; body: string; base?: string } = {
+    head: pending.head,
+    title: pending.title,
+    body: pending.body,
+  };
+  if (pending.base) out.base = pending.base;
+  return out;
+}
+
+/**
+ * Merge `/github/pull-defaults` into the composer's current head and base: an
+ * already-filled value (typed by the user, or seeded by a prefill that landed
+ * before the defaults resolved) is never overwritten.
+ */
+export function mergePullDefaults(
+  cur: { head: string; base: string },
+  defaults: { head: string; base: string },
+): { head: string; base: string } {
+  return { head: cur.head || defaults.head, base: cur.base || defaults.base };
 }
 
 /** One-shot prefill for an item's detail subpage (T4, "View PR" from a task's
@@ -1232,9 +1263,11 @@ export function GitHubDialog({ open, projects, initialProjectPath, pullPrefill, 
     const pending = pendingPullPrefillRef.current;
     if (!pending || projectPath !== pending.projectPath || kind !== "pulls") return;
     setView(openCompose());
-    setNewPullHead(pending.head);
-    setNewPullTitle(pending.title);
-    setNewPullBody(pending.body);
+    const fields = prefillPullFields(pending);
+    setNewPullHead(fields.head);
+    setNewPullTitle(fields.title);
+    setNewPullBody(fields.body);
+    if (fields.base) setNewPullBase(fields.base);
     setPullPrefillTaskId(pending.taskId);
     pendingPullPrefillRef.current = null;
   }, [open, projectPath, kind, pullPrefill]);
@@ -2286,8 +2319,8 @@ export function GitHubDialog({ open, projects, initialProjectPath, pullPrefill, 
     api.getGitHubPullDefaults({ path: projectPath })
       .then((defaults) => {
         if (cancelled) return;
-        setNewPullHead((cur) => cur || defaults.head);
-        setNewPullBase((cur) => cur || defaults.base);
+        setNewPullHead((cur) => mergePullDefaults({ head: cur, base: "" }, defaults).head);
+        setNewPullBase((cur) => mergePullDefaults({ head: "", base: cur }, defaults).base);
       })
       .catch(() => {
         // Defaults are convenience only; creation will surface real errors.

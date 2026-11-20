@@ -1,0 +1,131 @@
+{
+  "version": 1,
+  "formId": "create-all-prs-title-and-base-grill-r2",
+  "title": "Grill round 2: follow-ups on base precedence, the Base line and multiple PRs per repository",
+  "round": 2,
+  "mode": "served",
+  "specFile": "questions.json",
+  "specSha256": "0ba72a5f7c2a3461aa733a86a21720b510af0594e453d4932fcf5a88ad702304",
+  "submittedAt": "2026-11-17T14:39:59.244Z",
+  "receivedAt": "2026-11-17T14:39:59.251Z",
+  "answeredBy": null,
+  "summary": {
+    "total": 10,
+    "answered": 10,
+    "skipped": 0,
+    "unanswered": 0,
+    "optionalLeftBlank": 0,
+    "notApplicable": 0,
+    "acceptedRecommendations": 8,
+    "overrodeRecommendations": [
+      "extra-pr-stamping",
+      "single-repo-multi"
+    ],
+    "oneWayDoorsNotAnswered": [],
+    "withNotes": [],
+    "needsAnswer": [],
+    "complete": true
+  },
+  "answers": {
+    "stale-stored-base": {
+      "n": 1,
+      "title": "The stored base is first. What happens when the agent moved the branch onto another base?",
+      "type": "single",
+      "status": "answered",
+      "impact": "blocking",
+      "value": "stale-aware",
+      "display": "Stored base first, unless git proves it stale; then the agent's base",
+      "acceptedRecommendation": true
+    },
+    "base-line-conflict": {
+      "n": 2,
+      "title": "The agent's `Base:` line and its link name different branches. Which is \"the agent's base\"?",
+      "type": "single",
+      "status": "answered",
+      "impact": "shape",
+      "value": "line-wins-flag",
+      "display": "The `Base:` line wins; the confirm list flags the mismatch",
+      "acceptedRecommendation": true
+    },
+    "extra-heads-trust": {
+      "n": 3,
+      "title": "Which branches may Create all PRs open a PR *from*, besides each repository's live checkout?",
+      "type": "single",
+      "status": "answered",
+      "oneWayDoor": true,
+      "impact": "blocking",
+      "value": "remote-unchecked",
+      "display": "Any branch on that repository's remote that a proposal names; shown in the confirm list **unchecked** by default",
+      "acceptedRecommendation": true
+    },
+    "extra-pr-stamping": {
+      "n": 4,
+      "title": "How are the extra PRs recorded on the task?",
+      "type": "single",
+      "status": "answered",
+      "oneWayDoor": true,
+      "impact": "blocking",
+      "value": "replace-list",
+      "display": "Replace `prUrl` with a list everywhere",
+      "acceptedRecommendation": false,
+      "recommended": "additive-list"
+    },
+    "single-repo-multi": {
+      "n": 5,
+      "title": "A **single-repository** task whose reply proposes two PRs: does it get this too?",
+      "type": "single",
+      "status": "answered",
+      "impact": "shape",
+      "value": "create-all",
+      "display": "Yes: show Create all PRs (with the same confirm list) on single-repo tasks with more than one proposal",
+      "acceptedRecommendation": false,
+      "recommended": "out"
+    },
+    "c-extra-base": {
+      "n": 6,
+      "title": "Base for an extra (non-live-head) PR",
+      "type": "confirm",
+      "status": "answered",
+      "impact": "minor",
+      "value": "The stored create-time base belongs to the task branch only. An extra PR's base is the agent's base (`Base:` line, then link), then the remote default. It's editable in the confirm list.",
+      "acceptedRecommendation": true
+    },
+    "c-extra-head-pushed": {
+      "n": 7,
+      "title": "An extra head that isn't on the remote",
+      "type": "confirm",
+      "status": "answered",
+      "impact": "minor",
+      "value": "Shown disabled in the confirm list: \"branch `<x>` isn't on origin\". No PR is attempted.",
+      "acceptedRecommendation": true
+    },
+    "c-proposal-key": {
+      "n": 8,
+      "title": "Which proposal is current",
+      "type": "confirm",
+      "status": "answered",
+      "impact": "minor",
+      "value": "The newest matching proposal per (repository, head) across runs, extending your round-1 Q7 answer from per-repository.",
+      "acceptedRecommendation": true
+    },
+    "c-duplicate": {
+      "n": 9,
+      "title": "Duplicate PRs",
+      "type": "confirm",
+      "status": "answered",
+      "impact": "minor",
+      "value": "A head already stamped (live or extra) is skipped. A forge \"a pull request already exists\" answer is shown as \"already open\" (with the URL when the forge returns one), not as a failure.",
+      "acceptedRecommendation": true
+    },
+    "c-base-line-prompt": {
+      "n": 10,
+      "title": "Where the `Base:` line goes",
+      "type": "confirm",
+      "status": "answered",
+      "impact": "minor",
+      "value": "Both prompts (single and multi) ask for a `Base: <branch>` line right above the link, inside each repository's block for multi.",
+      "acceptedRecommendation": true
+    }
+  },
+  "generalNotes": null
+}

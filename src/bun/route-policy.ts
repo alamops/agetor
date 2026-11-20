@@ -188,6 +188,9 @@ export const ROUTE_POLICY: Record<string, PolicyEntry> = {
   "/github/items-aggregate": { POST: cli({ pathParams: BODY_PATHS }) },
   "/github/repo-permissions": { GET: GH_QUERY },
   "/github/pull-diff": { GET: GH_QUERY },
+  // Create-all-PRs facts for one repository (identity, default branch, remote
+  // branches, stored-base staleness): read-only, path-gated like its siblings.
+  "/github/pull-targets": { GET: GH_QUERY },
   "/github/pull-blob": { GET: GH_QUERY },
   "/github/pull-detail": { GET: GH_QUERY },
   "/github/issue-thread": { GET: GH_QUERY },

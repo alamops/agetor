@@ -16,7 +16,7 @@ import { tokenForHost } from "./github-tokens.ts";
  * Raw-host-is-identity convention: a user pins per-identity SSH keys via
  * `~/.ssh/config` host aliases (`git@gitlab-work.io:group/app.git`), so the
  * host in a remote URL is often not the provider's real hostname.
- * `canonicalGitHost` (github.ts) maps any such alias to the provider's cloud
+ * `canonicalGitHost` (`src/shared/git-host.ts`) maps any such alias to the provider's cloud
  * hostname (`gitlab.com`, `bitbucket.org`, …) for API-base-URL purposes, but
  * the RAW pre-canonicalization host is what identifies this specific
  * account/workspace — that's the key the token store (`github-tokens.ts`) is
@@ -232,6 +232,17 @@ export function providerForHost(canonicalHost: string): GitProvider | null {
  * has no remotes, or its remotes all resolve to an unsupported host.
  */
 export async function providerRepoForDir(dir: string): Promise<ProviderRepoInfo | null> {
+  return (await providerRemoteForDir(dir))?.info ?? null;
+}
+
+/**
+ * {@link providerRepoForDir} that also names the git remote the identity came
+ * from (`origin`, or the first parseable remote). Create-all-PRs needs it to
+ * read `<remote>/HEAD` and to strip a `<remote>/` prefix from an agent's base.
+ */
+export async function providerRemoteForDir(
+  dir: string,
+): Promise<{ info: ProviderRepoInfo; remote: string } | null> {
   if (!existsSync(dir)) return null;
   const remotes = await run(["git", "remote"], dir);
   if (!remotes.ok) return null;
@@ -245,11 +256,14 @@ export async function providerRepoForDir(dir: string): Promise<ProviderRepoInfo 
     const provider = providerForHost(parsed.host);
     if (!provider) continue;
     return {
-      provider,
-      host: parsed.host,
-      remoteHost: parsed.rawHost,
-      owner: parsed.owner,
-      name: parsed.name,
+      remote: name,
+      info: {
+        provider,
+        host: parsed.host,
+        remoteHost: parsed.rawHost,
+        owner: parsed.owner,
+        name: parsed.name,
+      },
     };
   }
   return null;

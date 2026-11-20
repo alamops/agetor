@@ -231,6 +231,37 @@ describe("commitPushPrompt", () => {
     expect(p).toContain("````");
     expect(p).toContain("four backticks");
   });
+  test("asks for a Base: line, then a link that targets that base, before the PR blocks", () => {
+    const p = commitPushPrompt({ branch: "feature/add-login", taskType: "task", baseBranch: "develop" });
+    expect(p).toContain('"Base: <branch>"');
+    expect(p).toContain("'develop'");
+    expect(p).toContain("unless you moved");
+    expect(p).toContain("compare/<base>...<head>?quick_pull=1");
+    expect(p).toContain("merge_request[target_branch]=<base>");
+    expect(p).toContain("dest=<base>");
+    expect(p).toContain("always targets the default branch");
+    expect(p.indexOf("Base: <branch>")).toBeLessThan(p.indexOf("full link to open a pull request"));
+    expect(p.indexOf("full link to open a pull request")).toBeLessThan(p.indexOf("PR title:"));
+  });
+  test("with no stored base it asks for the branch the work started from", () => {
+    const p = commitPushPrompt({ branch: "feature/add-login", taskType: "task", baseBranch: null });
+    expect(p).toContain("the branch this work started from, or the repository's default branch if unsure");
+    expect(p).not.toContain("recorded for this task");
+  });
+  test("shell-quotes a stored base that contains a quote", () => {
+    const p = commitPushPrompt({ branch: "x", taskType: "task", baseBranch: "we'ird" });
+    expect(p).toContain("'we'\\''ird'");
+  });
+  test("asks for one block per pull request when several are proposed", () => {
+    const p = commitPushPrompt({ branch: "feature/add-login", taskType: "task" });
+    expect(p).toContain("repeat the block for each pull request");
+  });
+  test("never names the product", () => {
+    for (const base of [null, "develop"]) {
+      const p = commitPushPrompt({ branch: "feature/x", taskType: "task", baseBranch: base });
+      expect(p.toLowerCase()).not.toContain("agetor");
+    }
+  });
   test("forbids AI-attribution footers in the commit message and PR fields", () => {
     const p = commitPushPrompt({ branch: "feature/add-login", taskType: "task" });
     expect(p).toContain("Do not include any AI attribution");

@@ -1,0 +1,337 @@
+{
+  "version": 1,
+  "id": "create-all-prs-title-and-base-grill-r1",
+  "title": "Grill — Create all PRs: right title/body, right base, base-aware PR link",
+  "skill": "grill",
+  "slug": "create-all-prs-title-and-base",
+  "round": 1,
+  "summary": "Before this gets planned: **13 decisions** the build would otherwise make silently, plus a short confirm-or-override list at the end.\n\nStart with **Q1** (what the two real PRs actually got). It's the one place where your account and the code disagree. Then the **base** section, which decides whether we add migration `092`, and the **attribution** section, which decides how a proposal gets matched to a repository.\n\nSource: the pipeline's overall goal (it isn't in the repo yet) and the investigation brief `docs/plans/create-all-prs-title-and-base-investigation.md`.",
+  "proven": [
+    {
+      "text": "**Why the titles were wrong.** Create all PRs matches a proposal to a repository only through a `Repository: <name>` line. Your pipeline's \"Commit And Push\" step reuses the *single-repo* prompt text, so the reply had no such lines. Both repositories fell back to `task.title` (the step's \"`<pipeline>` · Commit And Push\") with an **empty body**. A spike on the real reply printed `labeled blocks: 0`, `map size for 2 targets: 0`.",
+      "evidence": [
+        { "label": "the fallback", "path": "src/mainview/components/kanban/RunPanel.tsx", "line": 3826, "lang": "ts", "code": "          await api.createGitHubPull({\n            path: projectPath,\n            title: proposal?.title || task.title,\n            head,\n            base: defaults.base," }
+      ]
+    },
+    {
+      "text": "**A latent wrong-repo bug.** When exactly one repository is targeted (a retry, or one repo left), the reply's *last* unlabeled proposal is attributed to it, even when it was written for another repo. On the real reply the app repo would get the infra PR's title and body.",
+      "evidence": [
+        { "path": "src/mainview/lib/pr-proposal.ts", "line": 323, "lang": "ts", "code": "    const labeled = parseRepositoryProposals(text);\n    if (labeled.size > 0) return labeled;\n    const single = parsePrProposal(text);\n    if (single && fallbackName) return new Map([[fallbackName, single]]);" }
+      ]
+    },
+    {
+      "text": "**Why the base was wrong.** Every PR's base is `origin/HEAD` (or the literal `\"main\"` when that's unset). Nothing reads the branch the task was created from, and the task can't supply it anyway: `createTask` stores only the base **sha**, so the branch name you picked in the base picker is thrown away.",
+      "evidence": [
+        { "path": "src/bun/github.ts", "line": 1276, "lang": "ts", "code": "async function defaultBaseBranch(dir: string): Promise<string> {\n  const result = await run([\"git\", \"symbolic-ref\", \"--quiet\", \"--short\", \"refs/remotes/origin/HEAD\"], dir, 5_000);\n  if (result.ok && result.stdout.trim()) {\n    const raw = result.stdout.trim();\n    return raw.startsWith(\"origin/\") ? raw.slice(\"origin/\".length) : raw;\n  }\n  return \"main\";\n}" },
+        { "path": "src/bun/orchestrator.ts", "line": 12570, "lang": "ts", "code": "    for (const entry of keptRepositories) {\n      const requested = requestedByPath.get(entry.path)?.trim() || defaultBaseRef || \"HEAD\";\n      const sha = await resolveRef(entry.path, requested);\n      ...\n      repositories.push({ ...entry, baseRef: sha ?? null });" }
+      ]
+    },
+    "**The real infra task was created from a non-default branch.** Its pinned sha is exactly the tip of a remote feature branch, while `origin/HEAD` is `main`.",
+    "**The create-time base isn't always right either.** Mid-pipeline the agent reset the app repo's task branch onto `origin/main`, so its pinned feature-branch base went stale and `main` was correct. Only the agent's reply knew that (it said so in prose).",
+    "**The prompt's link always targets the default branch.** `commitPushPrompt` asks for the link git prints on push (`…/pull/new/<branch>`), which opens a PR against the default branch. It's shared by the RunPanel chip, `agetor commit` and the TUI `c` key.",
+    "**Link-based attribution works on the real reply.** Matching each proposal's link against a repository's remote owner/name plus its live head attributed 3 of 3 proposals. Two matched the two repos. The third was a second branch in the app repo. A GitHub `compare/<base>...<head>` link also gives the base unambiguously, since git refs can't contain `..`.",
+    "**No test would catch either bug today.** The two e2e Create all PRs tests check only the PR count, `Closes #N` and the stamps. Nothing checks the title, the base, or attribution.",
+    "**The canned multi-repo prompt has never been sent in prod** (zero `run_events` hits), so the labeled format Create all PRs relies on has never appeared in real use."
+  ],
+  "sections": [
+    {
+      "id": "facts",
+      "title": "What actually happened",
+      "intro": "One place where the goal and the code disagree. The investigation couldn't read the real PRs (`gh` isn't logged in here).",
+      "questions": [
+        {
+          "id": "real-prs",
+          "type": "single",
+          "title": "The goal says Create all PRs \"is not creating the PR\" when the target isn't the default branch. What actually happened to the two real PRs?",
+          "impact": "blocking",
+          "why": "If creation actually *failed* (a 422), there is a second root cause the investigation didn't find, and the plan needs another task for it.",
+          "context": "The code always sends `origin/HEAD` as the base, and **both** repository entries in the prod DB were stamped with a PR URL. That points to *opened against the wrong base*, not *not created*. Please check the infra PR on GitHub.",
+          "evidence": [
+            { "label": "RunPanel stamps a repo only after createGitHubPull resolves", "path": "src/mainview/components/kanban/RunPanel.tsx", "line": 3836, "lang": "ts", "code": "          markRepositoryPrOpened(taskId, repo.name);\n          opened += 1;" }
+          ],
+          "options": [
+            { "id": "wrong-base", "label": "Both opened, but against `main` with the step title and an empty body", "consequence": "Matches the investigation. No extra root cause." },
+            { "id": "infra-failed", "label": "The infra PR failed with an error", "description": "Please paste the toast text in the note.", "consequence": "Adds an investigation task to the plan for a second root cause." },
+            { "id": "wrong-base-closed", "label": "It opened against `main` and I closed it or retargeted it by hand", "consequence": "Same as the first option. Your manual fix is what we automate." },
+            { "id": "dont-know", "label": "I'll check and tell you" }
+          ],
+          "recommendation": { "value": "wrong-base", "reason": "Both entries carry a PR URL, and the stamp is written only after the create call succeeds." }
+        }
+      ]
+    },
+    {
+      "id": "base",
+      "title": "Which branch each PR targets",
+      "intro": "These decide the base the button sends, and whether we add a migration.",
+      "questions": [
+        {
+          "id": "base-precedence",
+          "type": "rank",
+          "title": "Rank the sources Create all PRs should take a repository's base branch from, first match wins.",
+          "impact": "blocking",
+          "why": "This is the core of the base fix. The order decides which source wins when two disagree.",
+          "context": "The real case needs **the agent's link** to beat **the create-time base** (the app repo was moved onto `main` mid-run) and **the create-time base** to beat **`origin/HEAD`** (the infra repo was based on a feature branch).\n\nThe link's base is only trusted when the link's owner/repo and head match that repository's remote and live head (see Q6).",
+          "options": [
+            { "id": "link", "label": "The base in the agent's newest matching PR link", "description": "e.g. `compare/develop...my-branch`. Old `pull/new/<branch>` links carry no base and are skipped." },
+            { "id": "stored", "label": "The base branch recorded when the task was created", "description": "New. Needs Q3." },
+            { "id": "origin-head", "label": "The remote's default branch (`origin/HEAD`, then the provider's default)", "description": "Today's only source." }
+          ],
+          "recommendation": { "value": ["link", "stored", "origin-head"], "reason": "That's the only order that gets both real repositories right." }
+        },
+        {
+          "id": "store-base",
+          "type": "single",
+          "title": "Record the base branch's name when a task is created?",
+          "impact": "blocking",
+          "oneWayDoor": true,
+          "why": "Yes means migration `092` (one-way, like every migration) plus a new server-managed column. No means a non-default base is only ever known from the agent's link.",
+          "context": "Today the name you pick in the per-repository base picker (`develop`, `origin/develop`) is resolved to a sha and discarded.\n\nStoring it touches:\n- a new server-managed `tasks.base_branch` (single repo; not in `ALLOWED_PATCH_FIELDS`, never bumps `updated_at`);\n- `repositories[].baseBranch` inside the existing JSON (no column needed);\n- `createTask`, `parseTaskRepositories` and the pipeline step copy.\n\n**Existing rows can't be backfilled.** One sha matched three refs, so they fall back to the next source.",
+          "evidence": [
+            { "label": "where the name is lost", "path": "src/bun/orchestrator.ts", "line": 12542, "lang": "ts", "code": "  const requestedRef = singleRepoInput?.baseRef?.trim() || defaultBaseRef || \"HEAD\";" },
+            { "label": "the picker's value", "path": "src/mainview/components/kanban/SelectProjectsDialog.tsx", "line": 376 }
+          ],
+          "options": [
+            { "id": "store", "label": "Store it (migration 092 plus `repositories[].baseBranch`)", "consequence": "Fixes the infra case even when the agent prints an old-style link. One more migration and server-managed column." },
+            { "id": "infer", "label": "Don't store it; infer it from git at PR time", "description": "Pick the remote branch whose tip is the nearest ancestor of the head.", "consequence": "No migration, and it works for existing tasks. A guess, though: it picks wrongly when several branches share history, and it costs extra git calls on each press." },
+            { "id": "link-only", "label": "Don't store it; rely on the agent's link only", "consequence": "Smallest change. An old-style link, or an agent that ignores the ask, opens against the default branch, which is today's bug." }
+          ],
+          "recommendation": { "value": "store", "reason": "It's the only deterministic source for a non-default base when the agent doesn't cooperate, and it also lets the prompt name the base (Q12)." }
+        },
+        {
+          "id": "head-base",
+          "type": "single",
+          "title": "When the task's base is `HEAD` (no branch picked), what should be recorded as its base branch?",
+          "impact": "shape",
+          "why": "`HEAD` is the default for most tasks, so this decides whether the stored base helps in the common case.",
+          "showIf": { "question": "store-base", "in": ["store"] },
+          "context": "With `HEAD`, the task branches from whatever the source repo has checked out at create time, for example a feature branch you were standing on.",
+          "options": [
+            { "id": "checked-out-if-remote", "label": "The checked-out branch, but only if it exists on the remote", "consequence": "A local-only or detached checkout records nothing and falls back to `origin/HEAD`." },
+            { "id": "checked-out", "label": "The checked-out branch, always", "consequence": "A local-only branch becomes a base the remote doesn't have, so the PR fails (Q5)." },
+            { "id": "nothing", "label": "Nothing: only an explicitly picked branch is recorded", "consequence": "`HEAD` tasks keep falling back to `origin/HEAD`." }
+          ],
+          "recommendation": { "value": "checked-out-if-remote", "reason": "It covers branching while standing on a feature branch without inventing a base the remote doesn't have." }
+        },
+        {
+          "id": "missing-base",
+          "type": "single",
+          "title": "The chosen base doesn't exist on the remote (deleted, never pushed, typo in the agent's link). What happens to that repository?",
+          "impact": "shape",
+          "why": "Today GitHub answers 422 and the toast shows a raw API message.",
+          "options": [
+            { "id": "fail-clear", "label": "Fail that repository with a clear message", "description": "e.g. \"infra: base branch `develop` isn't on origin\". Other repos continue, and a retry is possible (per-repo best effort, as today).", "consequence": "No surprise PRs. You fix the base and press again (or use the confirm list, Q9)." },
+            { "id": "next-source", "label": "Fall through to the next source in the Q2 order", "consequence": "Always opens a PR, but possibly against the default branch. That's the bug we're fixing, just less often." }
+          ],
+          "recommendation": { "value": "fail-clear", "reason": "A PR against the wrong base shows someone else's commits, which is worse than a clear failure you can retry." }
+        }
+      ]
+    },
+    {
+      "id": "attribution",
+      "title": "Which proposal belongs to which repository",
+      "questions": [
+        {
+          "id": "attribution",
+          "type": "single",
+          "title": "How should Create all PRs match a proposal to a repository?",
+          "impact": "blocking",
+          "why": "This fixes the wrong titles. It also decides what happens to today's \"one unlabeled proposal → the one target\" fallback, which causes the wrong-repo bug.",
+          "context": "A proposal's link is already parsed (`PrProposal.link`) but nothing reads it.\n\nLink match means:\n- the link's host and owner/repo equal that repository's remote (from `/github/provider-info`);\n- **and** its head branch equals the repository's live PR head.\n\nIt's also the trust bound: an agent-written URL can never attribute a title to another repository or head.",
+          "options": [
+            { "id": "link-or-label", "label": "Link match OR a `Repository:` label; drop the blind single-target fallback", "description": "A labeled block whose link names another repo is ignored for that repo.", "consequence": "Fixes the real reply (3/3) and the latent bug. Breaks the `pr-proposal.test.ts:628` case, which changes on purpose." },
+            { "id": "link-or-label-keep-fallback", "label": "Link match OR label; keep the single-target fallback only when the proposal has no link at all", "consequence": "Same fixes, but a linkless proposal can still be misattributed when there's one target." },
+            { "id": "label-only", "label": "Labels only; fix the pipeline prompt instead", "consequence": "Your existing pipeline keeps producing empty-body PRs until you edit it." }
+          ],
+          "recommendation": { "value": "link-or-label", "reason": "Every prompt asks for a link, so a linkless proposal is rare, and guessing its repo is exactly what caused the wrong-repo bug." }
+        },
+        {
+          "id": "proposal-scope",
+          "type": "single",
+          "title": "Which run's proposal counts for each repository?",
+          "impact": "shape",
+          "why": "Today the newest run that contains *any* proposal wins outright, so a later turn that proposes only one repo hides the other repo's proposal from an earlier turn.",
+          "options": [
+            { "id": "per-repo-newest", "label": "Per repository: its newest matching proposal from any run", "description": "Still bounded by the live head and remote match.", "consequence": "Committing repo A in one turn and repo B in a later one still works. A stale proposal from an old run on the same branch can win if nothing newer exists." },
+            { "id": "newest-run", "label": "Keep it: only the newest run that proposed anything", "consequence": "Simpler. A split commit-and-push across turns loses the earlier repo's title." }
+          ],
+          "recommendation": { "value": "per-repo-newest", "reason": "Agents (and pipelines) often push repos in separate turns, and the head match keeps stale proposals for other branches out." }
+        },
+        {
+          "id": "no-proposal",
+          "type": "single",
+          "title": "No proposal matches a repository. What should its PR get?",
+          "impact": "shape",
+          "why": "Today it gets `task.title`, which for a pipeline step is \"`<pipeline>` · Commit And Push\", and an empty body.",
+          "options": [
+            { "id": "root-title-flagged", "label": "The root task's title (the pipeline parent's, for a step) and an empty body, marked \"no proposal\" in the confirm list", "consequence": "Never blocks, never uses a step name. Relies on Q9 to show you before creating." },
+            { "id": "skip", "label": "Skip that repository: \"no PR proposal found, run Commit & push first\"", "consequence": "No placeholder PRs. Someone who pushed by hand can't use the button for that repo." },
+            { "id": "keep", "label": "Keep today's behavior (`task.title`, empty body)" }
+          ],
+          "recommendation": { "value": "root-title-flagged", "reason": "Keeps the button useful after a manual push while removing the step-name title that started this." }
+        }
+      ]
+    },
+    {
+      "id": "ux",
+      "title": "What you see before and while creating",
+      "questions": [
+        {
+          "id": "confirm-list",
+          "type": "single",
+          "title": "Keep Create all PRs one-click, or show a short confirm list first?",
+          "impact": "shape",
+          "why": "PRs are outward-facing (reviewers get notified), and a wrong base shows someone else's commits, so this is the safety net for every guess above.",
+          "options": [
+            { "id": "editable", "label": "Confirm list, editable", "description": "One row per repository: `head → base` (base editable from the remote's branches), title (editable) and a \"no proposal\" or \"base from: link / task / default\" hint. Then Create.", "consequence": "New dialog, its tests and an e2e step. Catches every bad guess before it becomes a public PR.", "preview": "Create pull requests\n─────────────────────────────────────────────\n app    fix/x → [main     ▾]   base from: link\n        Title: [fix: handle empty config      ]\n infra  fix/x → [develop  ▾]   base from: task\n        Title: [fix: retry on 502             ]\n─────────────────────────────────────────────\n                         [Cancel] [Create 2 PRs]" },
+            { "id": "readonly", "label": "Confirm list, read-only", "description": "Same rows, but no editing. To change something, cancel and use the single Create PR composer.", "consequence": "Less UI. Fixing a bad base takes more clicks." },
+            { "id": "one-click", "label": "One-click, as today", "description": "The toast reports each repo's base afterwards.", "consequence": "Smallest change. A bad guess becomes a public PR before you see it." }
+          ],
+          "recommendation": { "value": "editable", "reason": "Every base source here can be wrong (stale create-time base, agent typo), and fixing it before the PR is public costs one click, not a closed PR." }
+        },
+        {
+          "id": "single-chip-base",
+          "type": "single",
+          "title": "Should the single-repo \"Create PR\" chip also prefill the composer's base from the proposal?",
+          "impact": "shape",
+          "why": "Without it, the new base-aware link improves Create all PRs but the single-repo path still defaults to `origin/HEAD`.",
+          "context": "That means adding `base?` to `GitHubPullPrefill` and making sure the defaults effect doesn't overwrite it. The same Q2 order applies: link, then the stored base, then the default.",
+          "evidence": [
+            { "path": "src/mainview/components/kanban/GitHubDialog.tsx", "line": 198, "lang": "ts", "code": "export interface GitHubPullPrefill {\n  projectPath: string;\n  head: string;\n  title: string;\n  body: string;\n  taskId: string;\n}" }
+          ],
+          "options": [
+            { "id": "yes", "label": "Yes, same base rules as Create all PRs", "consequence": "Both PR paths agree." },
+            { "id": "no", "label": "No, out of scope" }
+          ],
+          "recommendation": { "value": "yes", "reason": "Single-repo tasks hit the same non-default-base bug, and leaving that path out would look unfinished." }
+        }
+      ]
+    },
+    {
+      "id": "prompt",
+      "title": "The Commit & push prompt (single and multi; RunPanel chip, `agetor commit`, TUI `c`)",
+      "questions": [
+        {
+          "id": "link-format",
+          "type": "single",
+          "title": "Which link should the prompt ask the agent to print?",
+          "impact": "shape",
+          "why": "The goal asks for a link that already targets the destination branch. The format decides what the parser reads the base from.",
+          "context": "- **GitHub** (documented): `https://github.com/<owner>/<repo>/compare/<base>...<head>?quick_pull=1`. `expand=1` is common but undocumented.\n- **GitLab** (community-sourced): `…/-/merge_requests/new?merge_request[source_branch]=<head>&merge_request[target_branch]=<base>`.\n- **Bitbucket Cloud** (community-sourced): `…/pull-requests/new?source=<head>&dest=<base>`.\n\nIf the GitLab or Bitbucket parameters don't work, the link still opens the new-PR page, just without the target preselected.",
+          "evidence": [
+            { "label": "GitHub: query parameters for a new PR", "url": "https://docs.github.com/en/pull-requests/reference/using-query-parameters-to-create-a-pull-request" }
+          ],
+          "options": [
+            { "id": "per-forge", "label": "Per-forge destination links: GitHub `compare/…?quick_pull=1`, GitLab `target_branch`, Bitbucket `dest`", "consequence": "The parser reads the base from all three forms." },
+            { "id": "github-only", "label": "GitHub compare link only; keep \"whatever git prints\" for others", "consequence": "GitLab and Bitbucket PRs keep targeting the default branch." },
+            { "id": "per-forge-expand", "label": "Per-forge, but GitHub with `expand=1`", "consequence": "Opens the full form instead of the quick one. Undocumented." }
+          ],
+          "recommendation": { "value": "per-forge", "reason": "Create all PRs already works on all three forges, and `quick_pull=1` is the documented GitHub form." }
+        },
+        {
+          "id": "prompt-names-base",
+          "type": "single",
+          "title": "Should the prompt name the base agetor already knows?",
+          "impact": "shape",
+          "why": "Naming it makes the agent's link match the task by default. It's also only possible if Q3 stores the base (otherwise all we know is `origin/HEAD`).",
+          "context": "For example: \"target `develop` unless you moved this branch onto another base; then target that one.\" In a multi-repo prompt, the base goes on each repository line. The CLI and TUI build the same prompt from the same `Task`, so they get it for free.",
+          "options": [
+            { "id": "name-with-escape", "label": "Name the known base, with \"unless you moved the branch onto another base\"", "consequence": "Handles the real app-repo case (reset onto `main`). Adds a clause per repository." },
+            { "id": "name-strict", "label": "Name it and require it", "consequence": "The app-repo case would have targeted the stale feature branch." },
+            { "id": "dont-name", "label": "Don't name it; let the agent work out the destination", "consequence": "Shorter prompt. The agent guesses, and often guesses the default branch." }
+          ],
+          "recommendation": { "value": "name-with-escape", "reason": "The real run needed both: the known base for infra, and the agent's own judgment for the app repo." }
+        },
+        {
+          "id": "base-line",
+          "type": "single",
+          "title": "Should the agent also print an explicit `Base: <branch>` line?",
+          "impact": "minor",
+          "options": [
+            { "id": "link-only", "label": "No, the link carries the base", "consequence": "One source per proposal, so the line and the link can never disagree." },
+            { "id": "base-line", "label": "Yes, plus the link", "consequence": "Easier to parse and works if a forge link format is wrong. Adds a rule for when the line and the link disagree." }
+          ],
+          "recommendation": { "value": "link-only", "reason": "A compare link already states the base unambiguously, and a second copy just adds a conflict case." }
+        }
+      ]
+    },
+    {
+      "id": "scope",
+      "title": "Scope",
+      "questions": [
+        {
+          "id": "multi-pr-per-repo",
+          "type": "single",
+          "title": "The real reply proposed two PRs for the app repo (a second branch). Support more than one PR per repository?",
+          "impact": "shape",
+          "why": "Today the model is one PR per repository, headed at its live checkout.",
+          "options": [
+            { "id": "out", "label": "Out of scope: one PR per repository, its live head", "description": "A proposal for another branch is ignored by Create all PRs, and the confirm list doesn't show it.", "consequence": "The second branch's PR stays manual (the link in the reply still works)." },
+            { "id": "in", "label": "In scope: one PR per matching proposal", "consequence": "New stamping model (`prUrl` per repository becomes a list), which changes the data shape. A different-sized change." }
+          ],
+          "recommendation": { "value": "out", "reason": "It's a different feature with its own data change. This ticket is about the right title and base for the one PR." }
+        },
+        {
+          "id": "owner-pipeline",
+          "type": "single",
+          "title": "Your pipeline's \"Commit And Push\" step text is an old copy of the single-repo prompt. What do we do about it?",
+          "impact": "minor",
+          "why": "That text lives in your pipeline definition in the agetor DB, not in this repo.",
+          "options": [
+            { "id": "rely", "label": "Nothing in code; link attribution covers it. I'll update my own step text myself.", "consequence": "The plan notes the new prompt text so you can paste it." },
+            { "id": "rely-and-note", "label": "Same, and the docs say pipeline authors should reuse the canned prompt's wording", "consequence": "One paragraph in `docs/architecture/pipelines.md`." }
+          ],
+          "recommendation": { "value": "rely-and-note", "reason": "The code fix covers your pipeline either way, and a note keeps the next pipeline author from copying the old text." }
+        }
+      ]
+    },
+    {
+      "id": "confirm",
+      "title": "Confirm or override",
+      "intro": "Defaults I'd bet on. One click each.",
+      "questions": [
+        {
+          "id": "c-no-backfill",
+          "type": "confirm",
+          "title": "Existing tasks",
+          "impact": "minor",
+          "recommendation": { "value": "No backfill. Existing tasks have no stored base and fall through to the next source in the Q2 order.", "reason": "One pinned sha matched three refs, so any backfill would be a guess." }
+        },
+        {
+          "id": "c-normalize",
+          "type": "confirm",
+          "title": "Base name normalization",
+          "impact": "minor",
+          "recommendation": { "value": "A picked `origin/develop` is stored as `develop` (the remote prefix is stripped when it names a configured remote). Links are URL-decoded (`release%2F1.2` → `release/1.2`).", "reason": "PR APIs take the bare branch name." }
+        },
+        {
+          "id": "c-legacy-links",
+          "type": "confirm",
+          "title": "Old transcripts",
+          "impact": "minor",
+          "recommendation": { "value": "Old `pull/new/<branch>` links still attribute a proposal (by owner/repo and head), with no base taken from them.", "reason": "Existing transcripts and agents that ignore the new ask keep working." }
+        },
+        {
+          "id": "c-tests",
+          "type": "confirm",
+          "title": "Acceptance tests",
+          "impact": "minor",
+          "recommendation": { "value": "Unit tests for link parsing, attribution and base precedence. Updated prompt tests. A new `FAKE_CLAUDE_*_PROMPT_MARKER` that emits proposal text on the assistant stream, plus an e2e that drives Create all PRs and asserts each PR's **title, body and base** through the GitHub stub's recorded POST bodies, including a repository with a non-default base.", "reason": "No test checks the title or base today, so the fix needs one that can fail." }
+        },
+        {
+          "id": "c-docs",
+          "type": "confirm",
+          "title": "Docs updated in the same change",
+          "impact": "minor",
+          "recommendation": { "value": "`docs/architecture/multi-repo-tasks.md` (pull-create section), `docs/architecture/run-panel.md` (Create all PRs), `docs/architecture/persistence.md` (new server-managed column, if Q3 = store), the CLAUDE.md server-managed list, the `commitPushPrompt` and `pr-proposal.ts` header comments, and the Commit & push tooltip. `docs/plans/multi-repo-tasks.md` A10 marked superseded.", "reason": "CLAUDE.md requires a doc update whenever a subsystem's behavior changes." }
+        },
+        {
+          "id": "c-pipeline-step-stamp",
+          "type": "confirm",
+          "title": "PRs opened from a pipeline step's panel",
+          "impact": "minor",
+          "recommendation": { "value": "Unchanged: a PR opened from a step is stamped on the step only (already documented). Out of scope.", "reason": "It's a separate, documented limitation, and this ticket doesn't touch stamping." }
+        }
+      ]
+    }
+  ]
+}
