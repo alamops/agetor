@@ -6,6 +6,25 @@
 The packaged .app defaults to `~/.agetor/`; the dev scripts (`bun run dev` / `bun run dev:hmr`) set `AGETOR_DATA_DIR=$HOME/.agetor-dev` in `package.json` so an in-progress migration, a fixture, or a corrupt seed can't poison the release build's state.
 Wipe the dev dir with `bun run wipe:dev` (only ever touches `~/.agetor-dev`).
 WAL with `synchronous = NORMAL` (crash-consistent, but no fsync per commit — every streamed `run_events` row used to pay one) + foreign keys on.
+
+**The database worker owns the only production connection** (`docs/plans/non-blocking-core.md`, [core-responsiveness.md](core-responsiveness.md)). The `db` role of `src/bun/core-worker.ts` opens `agetor.sqlite`, runs the migrations and serves every query; the main thread opens none. Production code imports `src/bun/db-async.ts` (same module names as `db.ts`, every method a Promise), never `db.ts` (`src/bun/db-import-guard.test.ts`). The SQL lives in `src/bun/db-core/*.ts` as factories over a connection (`makeTasks(conn)`, …), which both the worker and `db.ts` instantiate.
+
+**Pragmas** (`applyConnectionPragmas`, `src/bun/db-core/connection.ts`, one definition for both connections):
+
+| Pragma | Value | Why |
+|---|---|---|
+| `journal_mode` | `WAL` | readers do not block the writer |
+| `synchronous` | `NORMAL` | no fsync per commit (above) |
+| `foreign_keys` | `ON` | before `migrate()` runs |
+| `cache_size` | `-65536` (64 MB) | the board's projection and run-events reads stay in memory |
+| `mmap_size` | `268435456` (256 MB) | the same, for a multi-GB file |
+| `busy_timeout` | worker role 5000 ms; main role (the `db.ts` singleton) 100 ms | the main connection's wait would block the event loop, so a contended write there fails fast |
+
+Write transactions are `BEGIN IMMEDIATE` (`.immediate()` on the transaction, and `tx: true` for a named op), so a writer takes the lock up front instead of failing on a later upgrade. The migration runner checks `_migrations` again inside its own `BEGIN IMMEDIATE`, so two cores starting at once apply each migration once.
+
+**Named ops.** A multi-statement write that must be atomic is a named op in `src/bun/db-core/ops/` and runs whole inside the worker; no transaction is held across a thread hop. The ops and the three read-modify-write patterns are in [core-responsiveness.md](core-responsiveness.md#named-ops).
+
+**Test mode.** Under `bun test` the database client runs in-process (`AGETOR_DB_MODE` defaults to `inprocess` when `NODE_ENV=test`): `db-async.ts` calls the same db-core code on the `db.ts` singleton, on the calling thread. Tests keep the synchronous `db.ts` singleton, so the fixture calls in the ~200 test files are unchanged. A test that calls a production helper that became async `await`s it. `src/bun/db-rpc-worker.test.ts` and the other `*-worker.test.ts` files run the real Worker thread.
 Tests set `AGETOR_DATA_DIR` to a `mkdtemp` directory at the top level of the file, never in `beforeAll` — keep doing that for any new test that imports `./db.ts` or `./orchestrator.ts`, since the db opens (and migrates) on module load and `bun test` runs every file in one process, where the first import of `db.ts` wins (the `NODE_ENV=test` guard comment in `db.ts` has the history).
 Never `rmSync` a test data dir in `afterAll` — if it's still the process-wide `db.ts` singleton's open directory (or just happens to hold a live `agetor.sqlite`), that yanks the file out from under it; use `rmTestDataDir` (`src/bun/test-data-dir.ts`) instead, which refuses (returns `false`) whenever `agetor.sqlite` exists in the target dir and only `rmSync`s otherwise.
 **Discovered model catalogs** (no migration, dynamic-model-catalog #16) live in the generic `preferences` table: `modelCatalog:kind:<kind>` for kinds that share one list and `modelCatalog:harness:<harnessId>` for fx, codex and opencode (the per-harness catalogs; the built-in harness's row also seeds its kind-level slot), each `{"v":1,"cliVersion":string|null,"savedAt":number,"models":DiscoveredModel[]}` holding only the whitelisted model fields — never a raw CLI response (the claude `initialize` answer carries the account email and organization). `model-discovery.ts` writes a row when a probe finds models and the snapshot or CLI version changed (an identical sweep writes nothing), hydrates the in-memory caches from them synchronously before the first sweep's first probe (so a restart or an offline start still has rows), keeps the previous catalog across a transient empty probe, and drops it when the harness is known unavailable or its CLI version differs from the stored one. The rows are **server-managed**: `GET /preferences` omits every `modelCatalog:*` key and `PUT /preferences/modelCatalog:*` answers `403 {code: "server-managed"}` for both tokens (the CLI token is readable by agents). They are inert for an older build (opaque keys nothing reads), so rolling back needs no cleanup.
@@ -64,6 +83,16 @@ Routes: `GET /db/stats` (`DbStats`), `POST /db/compact`, `POST /db/retention/run
 
 **Every `run_events` query must SEARCH.** `src/bun/db-run-events-plans.test.ts` runs `EXPLAIN QUERY PLAN` over every `runs.*` / `tasks.*` method that mentions `run_events` (plus the retention SQL) and fails on a `SCAN run_events` or a run-scoped query planned onto `idx_run_events_user_history`; without `sqlite_stat1` SQLite picked that `(stream, id)` index for `lastToolUseData` and the claude API-error probe (`runs.hasPriorApiErrorStatus`) and walked the whole table, so both pin `INDEXED BY idx_run_events_run`.
 A new `run_events` method that isn't exercised by that test fails it by name.
+The `runs.*` / `tasks.*` methods now live in `src/bun/db-core/` and `db.ts` re-exports them, so the sweep still finds them through `db.ts`'s modules. The test does not discover a `run_events` statement inside a named op (`db-core/ops/orchestrator-ops.ts`, `retention-ops.ts`). Keep such SQL to the SEARCH shapes above and check its plan with `EXPLAIN QUERY PLAN` when you add one.
+
+**Migration 093 (`093_task_revs.sql`) is the board's revision log** ([core-responsiveness.md](core-responsiveness.md#delta-and-push-the-boards-task-list)). It is additive: two tables, one index and seven triggers, no `ALTER` or `DROP`.
+
+- `task_rev_meta(id = 1, epoch, rev)` is a single row. `epoch` is a random id of this database (a cursor minted against another or a wiped database carries another epoch and is answered with a full snapshot), and `rev` is the monotonic counter.
+- `task_revs(task_id PRIMARY KEY, rev, deleted)` has one row per task, indexed on `rev` (`idx_task_revs_rev`). There is **no foreign key to `tasks`**, so the row survives the task's deletion as a tombstone (`deleted = 1`). Tombstones are never pruned: the rows are tiny, and pruning would need a "cursor too old" path.
+- The triggers bump `rev` and upsert the affected task on: insert, update (any column, server-managed ones included) and delete of `tasks`; insert and `status` change of `runs`; insert and `status` change of `subagents`. A change to another column of a run (`ended_at` alone) does not bump. Because the log is kept by the database, no write path can forget it.
+- The triggers write only `task_revs` and `task_rev_meta`, never `tasks`, so they cannot bump `updated_at` and cannot recurse.
+- There is no backfill: no cursor means a snapshot, and `rev` 0 means nothing changed since the database was created. An older build ignores the tables; its writes still fire the triggers, which is harmless. Rollback is a revert.
+- **The migration splitter is trigger-aware.** `splitSqlStatements` (`src/bun/migrate.ts`) used to split on every top-level `;`. A `CREATE TRIGGER` body holds `;`-terminated statements between `BEGIN` and `END`, so inside a trigger it tracks `BEGIN`/`CASE`/`END` depth and only a `;` at depth 0 ends the statement. A name such as `NEW.end` is not an `END`. `migrate.test.ts` runs the splitter over every existing migration, and `task-revs-triggers.test.ts` asserts all seven triggers.
 
 **Adding a migration** (numbered `.sql` files, the `migrations/index.ts` entry, never editing an applied one, and why the SQL is inlined at bundle time) is described once, in [CLAUDE.md § Persistence, in brief](../../CLAUDE.md#persistence-in-brief).
 

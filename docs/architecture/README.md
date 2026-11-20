@@ -38,6 +38,7 @@ Code comments cite these docs by path (`docs/architecture/<doc>.md`); `src/bun/c
 | "Persistence" | [persistence.md](persistence.md); the how-to for adding a migration is in [CLAUDE.md § Persistence, in brief](../../CLAUDE.md#persistence-in-brief) |
 | "Things that will trip you up": the `RunPanel` bullet | [run-panel.md](run-panel.md) |
 | "Things that will trip you up": main thread, event-loop-lag monitor, busy banner, real-watcher seam | [core-responsiveness.md](core-responsiveness.md) |
+| New with the non-blocking core (no old section): the database and transcript workers, named ops, `core.log`, the task-list delta and push, the benchmark | [core-responsiveness.md](core-responsiveness.md); the connection, pragmas and migration 093 in [persistence.md](persistence.md); the worker test seams in [testing-seams.md](testing-seams.md); `core.log` redaction and the worker threads in [security.md](security.md) |
 | "Things that will trip you up": `POST /refs/pick` and the fake-pick seam | [testing-seams.md](testing-seams.md) |
 
 The rest of the old file (what this is, commands, UI conventions, the remaining traps and the JubarteAI section) is still in `CLAUDE.md`.
