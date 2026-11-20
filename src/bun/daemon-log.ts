@@ -37,6 +37,8 @@ export interface DaemonLogOptions {
   keep?: number;
   checkEveryMs?: number;
   now?: () => number;
+  /** File mode when the log is created (an existing file keeps its own). */
+  mode?: number;
 }
 
 export interface DaemonLogger {
@@ -80,7 +82,11 @@ export function createDaemonLogger(opts: DaemonLogOptions = {}): DaemonLogger {
   const log = ((message: string): void => {
     if (now() - lastCheck >= checkEveryMs) rotateIfNeeded();
     try {
-      appendFileSync(file, `[${new Date(now()).toISOString()}] ${message}\n`);
+      appendFileSync(
+        file,
+        `[${new Date(now()).toISOString()}] ${message}\n`,
+        opts.mode === undefined ? undefined : { mode: opts.mode },
+      );
     } catch {
       /* best-effort */
     }

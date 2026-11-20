@@ -3,6 +3,10 @@
 // that reaches db.ts (which opens and migrates SQLite on import) would otherwise
 // open the wrong data dir (docs/plans/always-on-host.md §3.6).
 import "./channel-defaults.ts";
+// Second, right after the data dir is settled: copies every console line of
+// the desktop core to `<dataDir>/core.log` (the packaged app's stdout/stderr
+// go to /dev/null), so it must be in place before db.ts logs its migrations.
+import "./core-log-boot.ts";
 import { writeFileSync, existsSync } from "node:fs";
 import { isAbsolute } from "node:path";
 import Electrobun, { ApplicationMenu, BrowserWindow, Screen, Updater, Utils } from "electrobun/bun";

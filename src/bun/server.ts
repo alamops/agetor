@@ -36,6 +36,7 @@ import {
   clampWindowByBytes,
   isHiddenContinuationUserText,
   resolveAnchoredMinId,
+  taskListDataVersion,
 } from "./db.ts";
 import { refreshOne } from "./usage/poller.ts";
 import { beginLagLabel } from "./event-loop-lag.ts";
@@ -87,7 +88,8 @@ import { discoverClaudeAccounts } from "./harness-discovery.ts";
 import { cancelClone, cloneAuthHeader, cloneRepo, defaultCloneDest, resolveCloneRepo } from "./clone.ts";
 import { buildEli5Prompt, eli5TaskTitle } from "../shared/clone-eli5.ts";
 import { CLONE_PROVIDERS, isGitProvider } from "../shared/clone-input.ts";
-import { stalledSince } from "./stall-registry.ts";
+import { stalledMarks, stalledSince } from "./stall-registry.ts";
+import { countsFingerprint, createTaskListCache, ifNoneMatchMatches } from "./task-list-cache.ts";
 import { readDragPasteboardPaths } from "./drag-pasteboard.ts";
 import { listGitHubTokens, setGitHubToken, deleteGitHubToken } from "./github-tokens.ts";
 import {
@@ -151,6 +153,7 @@ import {
   listTerminals,
   writeTerminal,
   resizeTerminal,
+  terminalCountsByTask,
   type TerminalSocketData,
 } from "./terminals.ts";
 import { listAgentCapabilities } from "./commands.ts";
@@ -244,6 +247,7 @@ import {
   findTmuxPromptById,
   getAskQuestionsById,
   listPendingForTask,
+  pendingCountsByTask,
   type AskQuestionsAnswer,
 } from "./interactions.ts";
 import {
@@ -409,6 +413,9 @@ function withRunningSubagents(t: Task): Task & { runningSubagents: number } {
   // carry — see stall-registry.ts.
   return { ...t, runningSubagents, stalledSince: stalledSince(t.id) };
 }
+
+/** `GET /tasks` answers, reused while nothing they are built from changed. */
+const taskListCache = createTaskListCache();
 
 /** `GET /tasks`'s `archived` and `keep` params (`TaskListArchived`). An
  *  absent `archived` is `include`, the route's original answer, so an older
@@ -652,7 +659,10 @@ function corsHeaders(req: Request): Record<string, string> {
     // `last-event-id`: the task event stream's reconnects send it (SSE resume
     // cursor); without it in the allow list the browser fails that
     // preflight and the stream could never reconnect.
-    "access-control-allow-headers": "content-type,authorization,last-event-id",
+    // `if-none-match`: the board's conditional `/tasks` poll sends the last
+    // ETag back (`task-list-cache.ts`), and must be allowed to read `etag`.
+    "access-control-allow-headers": "content-type,authorization,last-event-id,if-none-match",
+    "access-control-expose-headers": "etag",
     "access-control-allow-credentials": "true",
     // The Authorization header makes every webview request preflight; let the
     // browser cache each answer (WebKit caps this at 600 s) so a transcript's
@@ -6192,7 +6202,15 @@ export function startApiServer(
             return json({ error: query.error }, { status: 400, headers: corsHeaders(req) });
           }
           const counts = subagents.runningCountsByTask();
-          return json(
+          // The answer is rebuilt only when something it is built from changed
+          // (`task-list-cache.ts`): written rows of tasks/runs/subagents, and
+          // the in-memory pending, terminal, running-subagent and stall maps.
+          const version = [
+            taskListDataVersion(),
+            countsFingerprint([pendingCountsByTask(), terminalCountsByTask(), counts, stalledMarks()]),
+          ].join("|");
+          const key = `${query.archived}|${[...query.keepIds].sort().join(",")}`;
+          const answer = taskListCache.get(key, version, () => JSON.stringify(
             tasks.list(query).map((t) => ({
               ...t,
               // M-S3: the list route ships the trimmed pipelineRun variant
@@ -6201,8 +6219,13 @@ export function startApiServer(
               runningSubagents: counts.get(t.id) ?? 0,
               stalledSince: stalledSince(t.id),
             })),
-            { headers: corsHeaders(req) },
-          );
+          ));
+          const headers = { ...corsHeaders(req), etag: answer.etag, "cache-control": "no-cache" };
+          // The client already holds this exact list: nothing to send.
+          if (ifNoneMatchMatches(req.headers.get("if-none-match"), answer.etag)) {
+            return new Response(null, { status: 304, headers });
+          }
+          return new Response(answer.body, { headers: { "content-type": "application/json", ...headers } });
         }),
         POST: authed(async (req) => {
           const body = (await req.json()) as Partial<Task> & {
