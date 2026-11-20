@@ -492,6 +492,53 @@ async function jRequest<T>(
   return body as T;
 }
 
+/** The last `GET /tasks` answer per path (archive filter and kept ids), with
+ *  its ETag. Most recent last; a handful of paths is all the board uses. */
+const taskListAnswers = new Map<string, { etag: string; tasks: Task[] }>();
+const TASK_LIST_ANSWERS_MAX = 8;
+
+/** `GET /tasks` as a conditional request: the ETag of the last answer for the
+ *  same path rides in `If-None-Match`, and an unchanged list comes back as an
+ *  empty 304, answered here with that same array (same reference), so the
+ *  poll costs neither the transfer nor a parse
+ *  (docs/architecture/core-responsiveness.md). `cache: "no-store"` keeps
+ *  WebKit's own HTTP cache out of it. */
+async function jTaskList(path: string): Promise<Task[]> {
+  const known = taskListAnswers.get(path);
+  const res = await fetchWithRecovery({ fetchImpl: fetch, base: BASE }, path, {
+    cache: "no-store",
+    headers: {
+      "content-type": "application/json",
+      "authorization": `Bearer ${API_TOKEN}`,
+      ...(known ? { "if-none-match": known.etag } : {}),
+    },
+  });
+  if (res.status === 304 && known) {
+    taskListAnswers.delete(path);
+    taskListAnswers.set(path, known);
+    return known.tasks;
+  }
+  const body = await res.json().catch(() => null);
+  if (!res.ok) {
+    const msg = (body && typeof body === "object" && "error" in body && body.error)
+      ? String(body.error)
+      : `${res.status} ${res.statusText}`;
+    throw new ApiError(msg, res.status, body);
+  }
+  const tasks = body as Task[];
+  const etag = res.headers.get("etag");
+  taskListAnswers.delete(path);
+  if (etag && Array.isArray(tasks)) {
+    taskListAnswers.set(path, { etag, tasks });
+    while (taskListAnswers.size > TASK_LIST_ANSWERS_MAX) {
+      const oldest = taskListAnswers.keys().next().value;
+      if (oldest === undefined) break;
+      taskListAnswers.delete(oldest);
+    }
+  }
+  return tasks;
+}
+
 /** `j` for the bundle routes, whose callers read fields off the answer:
  *  a 2xx whose body didn't parse as a JSON object (`j` resolves `null` for
  *  an unparsable one) is an answer the request lost on the way back, so it
@@ -1781,8 +1828,10 @@ export const api = {
   },
   /** Every task by default. The board poll passes `{ archived: "exclude",
    *  keep }` so archived tasks stay server-side unless a view needs them
-   *  (`TaskListArchived`, docs/architecture/core-responsiveness.md). */
-  listTasks: (opts?: TaskListOptions) => j<Task[]>(taskListPath(opts)),
+   *  (`TaskListArchived`, docs/architecture/core-responsiveness.md). A
+   *  conditional request: an unchanged list resolves to the very array the
+   *  previous call for the same options returned (`jTaskList`). */
+  listTasks: (opts?: TaskListOptions) => trackRequest(jTaskList(taskListPath(opts))),
   /** Single task by id, fresh from the server (bypasses the 2s board poll's
    *  staleness). Used to re-check a task's persisted draft right after the
    *  panel seeds from a possibly-stale polled object — see RunPanel's
