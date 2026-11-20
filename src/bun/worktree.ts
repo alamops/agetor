@@ -8,7 +8,7 @@ import { readTextNoFollow } from "./no-follow.ts";
 import { readFileBytes } from "./core-file-read.ts";
 import { removeTaskDirWorkspaceIfOnlyScratch, taskDirLexists, taskDirWorkspaceHasOnlyScratch } from "./task-dir-fs.ts";
 import { MAX_DIFF_FILES, parseGitDiff } from "./git-diff.ts";
-import { LEGACY_BRANCH_PREFIX } from "../shared/types.ts";
+import { LEGACY_BRANCH_PREFIX, validateBranchName } from "../shared/types.ts";
 import type { BranchInfo, Task, TaskDiff, TaskRepository, WorktreeTeardownResult } from "../shared/types.ts";
 import { MAX_BLOB_PREVIEW_BYTES } from "../shared/attachments.ts";
 import { isMultiRepoTask } from "../shared/multi-repo.ts";
@@ -643,6 +643,84 @@ export async function resolveRef(dir: string, ref: string): Promise<string | nul
   const res = await git(["rev-parse", "--verify", `${ref}^{commit}`], dir);
   if (!res.ok) return null;
   return /^[0-9a-f]{40}$/.test(res.stdout) ? res.stdout : null;
+}
+
+/**
+ * The branch NAME a requested base ref resolves to at task creation, recorded
+ * as `Task.baseBranch` so Create all PRs can target it later (the pinned sha is
+ * `baseRef`). `develop` and `refs/heads/develop` give `develop`;
+ * `origin/release/1.2` gives `release/1.2`; a tag, a sha, a missing ref, a name
+ * that isn't a valid branch name, or a leading `-` (never passed to git) give
+ * null. `HEAD` gives the checked-out branch, but only when its remote-tracking
+ * ref (the upstream remote, else `origin`) exists locally: a purely local
+ * branch can't be a PR base, and nothing here touches the network. A picked
+ * branch that exists only locally is recorded and reported at PR time.
+ */
+/**
+ * The branch HEAD points at, or null when detached or not a valid branch name.
+ * Reads the FULL symbolic ref and strips exactly `refs/heads/`: `--short`
+ * answers `heads/<name>` when a tag shares the branch's name, which names no
+ * branch.
+ */
+async function checkedOutBranch(dir: string): Promise<string | null> {
+  const cur = await git(["symbolic-ref", "--quiet", "HEAD"], dir);
+  const full = cur.ok ? cur.stdout.trim() : "";
+  if (!full.startsWith("refs/heads/")) return null;
+  const name = full.slice("refs/heads/".length);
+  return name && validateBranchName(name).ok ? name : null;
+}
+
+/** `name` when its remote-tracking ref (its upstream's remote, else origin) exists, else null. */
+async function branchIfOnRemote(dir: string, name: string): Promise<string | null> {
+  const upstream = await git(["config", "--get", `branch.${name}.remote`], dir);
+  const remote = upstream.ok && upstream.stdout.trim() && upstream.stdout.trim() !== "." ? upstream.stdout.trim() : "origin";
+  const has = await git(["rev-parse", "--verify", "--quiet", `refs/remotes/${remote}/${name}^{commit}`], dir);
+  return has.ok ? name : null;
+}
+
+/**
+ * The pinned base sha and the recorded base branch name for a task created
+ * from `requestedRef`, both from ONE identity. For `HEAD` the checked-out
+ * branch is read once and both the sha (`refs/heads/<name>`) and the name come
+ * from it, so a checkout that changes mid-create can't pair one branch's
+ * commit with another branch's name. A detached HEAD pins its commit with no
+ * name; a tag or sha keeps `baseBranch: null` (see `resolveBaseBranchName`).
+ */
+export async function resolveBaseRefAndBranch(
+  dir: string,
+  requestedRef: string,
+): Promise<{ sha: string | null; baseBranch: string | null }> {
+  const ref = requestedRef.trim();
+  if (ref === "HEAD") {
+    const name = await checkedOutBranch(dir);
+    if (!name) return { sha: await resolveRef(dir, "HEAD"), baseBranch: null };
+    const sha = await resolveRef(dir, `refs/heads/${name}`);
+    return { sha, baseBranch: sha ? await branchIfOnRemote(dir, name) : null };
+  }
+  const sha = await resolveRef(dir, ref);
+  return { sha, baseBranch: sha ? await resolveBaseBranchName(dir, ref) : null };
+}
+
+export async function resolveBaseBranchName(dir: string, requestedRef: string): Promise<string | null> {
+  const ref = requestedRef.trim();
+  if (!ref || ref.startsWith("-")) return null;
+  if (ref === "HEAD") {
+    const name = await checkedOutBranch(dir);
+    return name ? await branchIfOnRemote(dir, name) : null;
+  }
+  const res = await git(["rev-parse", "--symbolic-full-name", "--verify", "--end-of-options", ref], dir);
+  if (!res.ok) return null;
+  const full = res.stdout.split("\n")[0]?.trim() ?? "";
+  let name: string | null = null;
+  if (full.startsWith("refs/heads/")) name = full.slice("refs/heads/".length);
+  else if (full.startsWith("refs/remotes/")) {
+    // refs/remotes/<remote>/<branch…>: the remote name is one path segment.
+    const rest = full.slice("refs/remotes/".length);
+    const slash = rest.indexOf("/");
+    name = slash > 0 ? rest.slice(slash + 1) : null;
+  }
+  if (!name || name === "HEAD" || !validateBranchName(name).ok) return null;
+  return name;
 }
 
 /**

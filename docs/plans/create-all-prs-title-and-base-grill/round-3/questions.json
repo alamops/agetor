@@ -1,0 +1,108 @@
+{
+  "version": 1,
+  "id": "create-all-prs-title-and-base-grill-r3",
+  "title": "Grill round 3: replacing prUrl with a list, and Create all PRs on single-repo tasks",
+  "skill": "grill",
+  "slug": "create-all-prs-title-and-base",
+  "round": 3,
+  "summary": "Round 2 is complete. You chose to **replace `prUrl` with a list everywhere** and to **show Create all PRs on single-repo tasks** with more than one proposal. Both are bigger than what I'd recommended. Here are the 4 decisions they force, plus 3 defaults to confirm. After this the record is complete.",
+  "proven": [
+    "**Who reads `prUrl` today.** In the core: `db.ts`, `server.ts` (stamping), `orchestrator.ts`/`pipeline-runner.ts` (initialize to null), `task-repos.ts`. In the webview: `RunPanel`, `App.tsx` (View PR), `task-context-menu.ts`, `pr-url.ts`, `commit-push.ts`, `multi-repo-ui.ts`, `repo-removal.ts`, `pr-proposal.ts`, `api.ts`. Shared: `types.ts`, `multi-repo.ts`. The e2e spec reads it too.",
+    "**The CLI and TUI never read `prUrl`.** Only test fixtures set it to null. The Companion app has no routes yet (`security.md`), so no client outside this repo reads it today. The one external surface is the Task JSON that `GET /tasks` and `agetor ls --json` print.",
+    "Storage today: `tasks.pr_url` (migration 031, single-repo) and `repositories[].prUrl` inside the `repositories` JSON (migration 091, multi-repo)."
+  ],
+  "sections": [
+    {
+      "id": "data",
+      "title": "Replacing `prUrl` with a list",
+      "intro": "Your round-2 answer: **\"Replace `prUrl` with a list everywhere.\"** These settle what that means for stored data and the Task JSON.",
+      "questions": [
+        {
+          "id": "pr-url-column",
+          "type": "single",
+          "title": "Migration 092 copies each single-repo task's `pr_url` into the new list. What happens to the old `tasks.pr_url` column?",
+          "impact": "blocking",
+          "oneWayDoor": true,
+          "why": "Dropping a column is one-way (like migration 072). If you ever run an older build against the migrated DB, it can't open it.",
+          "context": "Multi-repo entries are JSON, so `repositories[].prUrl` → `repositories[].prs` is a read-time conversion plus a rewrite on the next write, with no column change.\n\nFor `tasks.pr_url`, 092 adds a `prs` JSON column (server-managed) and backfills it.",
+          "options": [
+            { "id": "keep-unused", "label": "Keep the column, stop reading and writing it", "consequence": "Reversible. An older build would still see the PR it stamped before the upgrade, but none created after." },
+            { "id": "keep-mirror", "label": "Keep the column and mirror the first PR into it on each stamp (never read)", "consequence": "Reversible, and an older build sees the first PR. One extra write, which is a compatibility shim inside \"replace everywhere\"." },
+            { "id": "drop", "label": "Drop it (`ALTER TABLE … DROP COLUMN`)", "consequence": "Cleanest, and one-way. Downgrading requires restoring a backup." }
+          ],
+          "recommendation": { "value": "keep-unused", "reason": "It keeps the DB downgrade-safe at no cost, and no code in this repo reads the column any more, so the replace is still complete." }
+        },
+        {
+          "id": "task-json-field",
+          "type": "single",
+          "title": "The Task JSON (`GET /tasks`, `agetor ls --json`): what happens to the `prUrl` field?",
+          "impact": "blocking",
+          "oneWayDoor": true,
+          "why": "It's the only part of this change visible outside the repo: scripts that parse `agetor ls --json`, and the future Companion.",
+          "options": [
+            { "id": "remove", "label": "Remove `prUrl`; only `prs` remains (on the task and on each repository)", "consequence": "One shape everywhere. A script reading `.prUrl` silently gets `undefined`." },
+            { "id": "deprecated-derived", "label": "Add `prs`; keep `prUrl` as a deprecated, derived read-only field (the first PR's URL), never read by agetor itself", "consequence": "External readers keep working. The code still has one source of truth (`prs`)." }
+          ],
+          "recommendation": { "value": "remove", "reason": "No known consumer reads it, and you asked for the list everywhere. Keeping a derived copy is exactly the half-replacement you rejected." }
+        },
+        {
+          "id": "pr-entry-shape",
+          "type": "confirm",
+          "title": "Shape of one PR entry",
+          "impact": "shape",
+          "recommendation": { "value": "`{ url: string, head: string, base: string, number: number | null, createdAt: number }`, in creation order. A repository's (or single-repo task's) **live-head PR** is the one whose `head` matches its branch, not just the first item.", "reason": "`head` drives duplicate skipping, `base` is shown in the run panel, and `number` saves re-parsing the URL for View PR." }
+        }
+      ]
+    },
+    {
+      "id": "surfaces",
+      "title": "Where several PRs show up",
+      "questions": [
+        {
+          "id": "single-repo-trigger",
+          "type": "single",
+          "title": "On a single-repo task, when does Create all PRs appear?",
+          "impact": "shape",
+          "why": "Your round-2 answer: **\"show Create all PRs … on single-repo tasks with more than one proposal.\"** This pins down \"more than one\".",
+          "options": [
+            { "id": "two-heads", "label": "When the newest matching proposals name **two or more distinct heads** that don't have a PR yet; shown next to the existing Create PR chip", "consequence": "The chip stays the one-PR path into the composer. Create all PRs appears only when there's really more than one." },
+            { "id": "two-proposals", "label": "When the reply has two or more proposals, even for the same head", "consequence": "It can appear for duplicate proposals of one PR." },
+            { "id": "replace-chip", "label": "Always on single-repo tasks, replacing the Create PR chip", "consequence": "One flow, but the composer path (edit the body with full formatting) loses its entry point." }
+          ],
+          "recommendation": { "value": "two-heads", "reason": "It's the case you asked for and nothing else, and the familiar chip keeps working." }
+        },
+        {
+          "id": "view-pr-many",
+          "type": "single",
+          "title": "\"View PR\" (run panel link, task card, right-click menu) when a task or repository has several PRs?",
+          "impact": "shape",
+          "options": [
+            { "id": "list-all", "label": "List them all: the run panel shows each `head → base` link; the context menu gets one \"View PR: <head>\" item per PR (a submenu past 3)", "consequence": "Every PR stays reachable from where you look today." },
+            { "id": "live-only", "label": "Show only the live-head PR, as today; extra PRs only in the run panel", "consequence": "Less UI, but extra PRs are hidden from the card and the menu." }
+          ],
+          "recommendation": { "value": "list-all", "reason": "\"Replace everywhere\" means every reader handles the list, and a PR you can't find after creating it is a bug report waiting to happen." }
+        }
+      ]
+    },
+    {
+      "id": "confirm",
+      "title": "Confirm or override",
+      "questions": [
+        {
+          "id": "c-server-managed",
+          "type": "confirm",
+          "title": "Server-managed rules for the new columns",
+          "impact": "minor",
+          "recommendation": { "value": "`tasks.base_branch` and `tasks.prs` are server-managed (not in `ALLOWED_PATCH_FIELDS`, skipped by the generic SET, never bump `updated_at`, written by targeted UPDATEs). Both go in migration 092, and the CLAUDE.md list is updated.", "reason": "CLAUDE.md requires it for every server-written column." }
+        },
+        {
+          "id": "c-pipeline-step",
+          "type": "confirm",
+          "title": "Pipeline steps",
+          "impact": "minor",
+          "recommendation": { "value": "A new step's task-level `prs` starts empty (as `prUrl: null` does today, `pipeline-runner.ts:1441`). Its `baseBranch` is copied from the parent like `baseRef` (`:1434`). Its `repositories[]`, each entry's `prs` and `baseBranch` included, are copied from the parent as they are today (`:1437`).", "reason": "That's exactly how the step copies the parent's state today, with the new fields following the old ones." }
+        }
+      ]
+    }
+  ]
+}

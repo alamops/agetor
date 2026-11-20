@@ -96,20 +96,45 @@ describe("repositoryDetails", () => {
     expect(fe).toMatchObject({
       branchText: "on hotfix (drifted from agetor/x-fe)",
       drifted: true,
-      base: "0123456789ab",
+      baseText: "0123456789ab",
       checkoutText: "/ws/fe",
       checkoutCreated: true,
-      prUrl: "https://github.com/o/fe/pull/3",
+      // A legacy `prUrl` (no `prs`) reads as one PR with no head or base.
+      prs: [{ url: "https://github.com/o/fe/pull/3", head: null, base: null }],
       problem: null,
     });
     expect(be).toMatchObject({
       branchText: "agetor/x-be",
       drifted: false,
-      base: null,
+      baseText: null,
       checkoutText: "not created yet",
       checkoutCreated: false,
-      prUrl: null,
+      prs: [],
     });
+  });
+
+  test("shows the recorded base branch beside the short sha, and lists every PR with its head and base", () => {
+    const [fe, be] = repositoryDetails(
+      [
+        repo({
+          name: "fe",
+          baseRef: "0123456789abcdef",
+          baseBranch: "develop",
+          prs: [
+            { url: "https://github.com/o/fe/pull/3", head: "feature/a", base: "develop", number: 3, createdAt: 1 },
+            { url: "https://github.com/o/fe/pull/4", head: "feature/b", base: "main", number: 4, createdAt: 2 },
+          ],
+        }),
+        repo({ name: "be", baseRef: null, baseBranch: "develop" }),
+      ],
+      () => null,
+    );
+    expect(fe!.baseText).toBe("develop · 0123456789ab");
+    expect(fe!.prs).toEqual([
+      { url: "https://github.com/o/fe/pull/3", head: "feature/a", base: "develop" },
+      { url: "https://github.com/o/fe/pull/4", head: "feature/b", base: "main" },
+    ]);
+    expect(be!.baseText).toBe("develop");
   });
 
   test("an unreadable checkout falls back to the recorded checkout and is flagged", () => {
