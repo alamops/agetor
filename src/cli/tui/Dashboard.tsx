@@ -117,7 +117,7 @@ export function Dashboard({
   dataDir?: string;
 }) {
   const { exit } = useApp();
-  const tasks = useTasks(client);
+  const { tasks, onTasksChanged } = useTasks(client);
   const { stacks, limitStates } = useHarnessStacks(client);
   // Pipeline parents whose step rows are currently shown inline (`p`
   // toggles) — hidden by default, same as the board and `agetor ls`, since
@@ -149,7 +149,9 @@ export function Dashboard({
     () => new Set(tasks.filter((t) => t.pipelineParentId != null).map((t) => t.id)),
     [tasks],
   );
-  const toast = useGlobalEvents(dataDir, hiddenTaskIds);
+  const toast = useGlobalEvents(dataDir, hiddenTaskIds, (e) => {
+    if (e.kind === "tasks-changed") onTasksChanged(e.cursor);
+  });
 
   // Never let a mode get stranded (and the keyboard dead) if the target task
   // disappears from the board while composing / answering.

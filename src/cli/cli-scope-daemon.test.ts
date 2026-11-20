@@ -267,6 +267,7 @@ const ROWS: Record<ClientMethod, Row> = {
 
   // ── tasks ──────────────────────────────────────────────────────────────────
   listTasks: { expect: [200], why: "board list", call: () => client.listTasks() },
+  listTaskDelta: { expect: [200], why: "board delta (same route as the list)", call: () => client.listTaskDelta({ archived: "exclude" }) },
   getTask: { expect: [200], why: "seeded task", call: () => client.getTask(fx.taskId) },
   createTask: {
     expect: [200],

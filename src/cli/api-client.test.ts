@@ -640,3 +640,37 @@ test("a switch 409 refusal reaches the caller untouched (status, body, message);
   expect((plain as ApiError).status).toBe(0);
   expect((plain as ApiError).message).not.toContain("may have gone through");
 });
+
+// `listTaskDelta` against a bare stub: the path it builds, the envelope it
+// returns as is, and an older core's bare array returned as a legacy list.
+test("listTaskDelta: sends delta=1 and since, returns the envelope or a legacy array", async () => {
+  const seen: string[] = [];
+  let body: unknown = {
+    format: "delta", cursor: "c9", snapshot: false, tasks: [], removedIds: ["x"], decorations: {},
+  };
+  const server = Bun.serve({
+    port: 0,
+    fetch: (req) => {
+      const u = new URL(req.url);
+      seen.push(u.pathname + u.search);
+      return new Response(JSON.stringify(body), { headers: { "content-type": "application/json" } });
+    },
+  });
+  try {
+    const client = new AgetorClient({ port: server.port!, token: "tok" });
+    const env = await client.listTaskDelta({ archived: "exclude" }, "c8");
+    expect(seen[0]).toBe("/tasks?archived=exclude&delta=1&since=c8");
+    expect(Array.isArray(env)).toBe(false);
+    expect((env as { cursor: string }).cursor).toBe("c9");
+
+    body = [{ id: "legacy" }];
+    const legacy = await client.listTaskDelta({ archived: "exclude" });
+    expect(seen[1]).toBe("/tasks?archived=exclude&delta=1");
+    expect(legacy).toEqual([{ id: "legacy" }] as never);
+
+    body = { nope: true };
+    await expect(client.listTaskDelta()).rejects.toThrow("unexpected");
+  } finally {
+    server.stop(true);
+  }
+});
