@@ -7,6 +7,7 @@ import { randomUUID } from "node:crypto";
 import { insertCursorAsk, op, resolveCursorAsk, runs, tasks } from "./db-async.ts";
 import { appendAndEmit } from "./run-emit-queue.ts";
 import { questionText } from "../shared/cursor-ask.ts";
+import { noteDecorationChanged } from "./task-decoration-rev.ts";
 import type { RunEvent } from "../shared/types.ts";
 
 /**
@@ -488,6 +489,7 @@ export function setCardRegisteredListener(fn: ((taskId: string) => void) | null)
 }
 
 function noteCardRegistered(taskId: string): void {
+  noteDecorationChanged(taskId, pipelineParentCache.get(taskId)); // pending count moved (task delta + push)
   try {
     cardRegisteredListener?.(taskId);
   } catch (e) {
@@ -533,6 +535,7 @@ export function setResolvedBroadcaster(fn: ResolveBroadcastFn): ResolveBroadcast
  *  of the maps should call this with the request it removed so the UI
  *  hears about it. */
 function fanoutResolved(req: AnyRequest): void {
+  noteDecorationChanged(req.taskId, req.pipelineParentId ?? pipelineParentCache.get(req.taskId)); // card gone
   broadcastResolved({
     id: req.id,
     taskId: req.taskId,
@@ -554,6 +557,12 @@ let warnedParentFallback = false;
 /** Record a step task's parent. Call before anything can register a card for it. */
 export function notePipelineParent(taskId: string, parentId: string): void {
   pipelineParentCache.set(taskId, parentId);
+}
+
+/** Every known (step task id, pipeline parent id) pair, for the delta route's
+ *  fold of a step's pending count into its parent's. */
+export function pipelineParentPairs(): IterableIterator<[string, string]> {
+  return pipelineParentCache.entries();
 }
 
 /** Drop a deleted step task's entry. */

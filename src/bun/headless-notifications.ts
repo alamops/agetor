@@ -157,7 +157,7 @@ export function headlessNotificationFor(
   lookup: HeadlessTaskLookup,
   ctx: HeadlessNotificationContext = {},
 ): TaskNotification | null {
-  if (ev.kind === "update" || ev.kind === "send-failed" || ev.kind === "fx-auto-resume") return null;
+  if (ev.kind === "update" || ev.kind === "tasks-changed" || ev.kind === "send-failed" || ev.kind === "fx-auto-resume") return null;
 
   const stepParentId = stepParentIdOf(ev);
 

@@ -2180,6 +2180,38 @@ export function taskListPath(opts: TaskListOptions = {}): string {
   return qs ? `/tasks?${qs}` : "/tasks";
 }
 
+/**
+ * The in-memory decoration of one task that rides a delta: the four values the
+ * database row cannot carry (`Task.pendingInteractionCount`,
+ * `Task.openTerminalCount`, `Task.runningSubagents`, `Task.stalledSince`). A key
+ * absent from an entry means "unchanged"; an explicit `0` / `null` clears it.
+ * `applyTaskDelta` (`task-delta.ts`) overlays an entry onto the task row.
+ */
+export interface TaskDecorations {
+  pendingInteractions?: number;
+  openTerminals?: number;
+  runningSubagents?: number;
+  stalledSince?: number | null;
+}
+
+/**
+ * `GET /tasks?delta=1[&since=<cursor>]` (docs/architecture/core-responsiveness.md,
+ * "Delta and push"). `cursor` is opaque: send it back as `since` on the next
+ * call. `snapshot: true` means `tasks` is every task passing the filter and the
+ * client replaces its list; otherwise `tasks` holds only the changed rows and
+ * `removedIds` the rows to drop. `decorations` is sparse: tasks whose in-memory
+ * decoration changed since the cursor (every task with a non-default decoration
+ * on a snapshot).
+ */
+export interface TaskDelta {
+  format: "delta";
+  cursor: string;
+  snapshot: boolean;
+  tasks: Task[];
+  removedIds: string[];
+  decorations: Record<string, TaskDecorations>;
+}
+
 export interface Task {
   id: string;
   title: string;
@@ -6668,6 +6700,20 @@ export type GlobalEvent =
       pipelineParentId?: string;
       /** See the `run-status` member. */
       pipelineParentTitle?: string;
+    }
+  | {
+      /**
+       * The task list changed (a revision moved, or an in-memory decoration:
+       * open terminals, pending interactions, stall mark). Throttled (leading
+       * edge, then at most one per 250 ms) and coalesced; it carries no task data
+       * and no id. A client fetches `GET /tasks?delta=1&since=<its cursor>` on
+       * receipt. `cursor` is the server's current cursor (the format
+       * `GET /tasks?delta=1` returns), so a client may skip the fetch when it
+       * already holds it. Live-only, never replayed.
+       */
+      kind: "tasks-changed";
+      cursor: string;
+      ts: number;
     };
 
 /**

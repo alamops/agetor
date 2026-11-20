@@ -12,17 +12,21 @@
  * gate-testable without orchestrator.ts's module-load side effects.
  */
 
+import { noteDecorationChanged } from "./task-decoration-rev.ts";
+
 const stalled = new Map<string, number>();
 
 /** Mark a task's in-flight turn as possibly stuck. First mark wins — a
  *  repeated sentinel for the same continuous stall keeps the original
  *  timestamp so the UI's "since …" doesn't slide. */
 export function markStalled(taskId: string, at: number): void {
-  if (!stalled.has(taskId)) stalled.set(taskId, at);
+  if (stalled.has(taskId)) return;
+  stalled.set(taskId, at);
+  noteDecorationChanged(taskId); // the next task delta carries `stalledSince`
 }
 
 export function clearStalled(taskId: string): void {
-  stalled.delete(taskId);
+  if (stalled.delete(taskId)) noteDecorationChanged(taskId);
 }
 
 /** `Date.now()` when the task was flagged, or null when it isn't. */

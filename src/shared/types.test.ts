@@ -780,6 +780,8 @@ function describeGlobalEvent(event: GlobalEvent): string {
       return `send-failed:${event.savedToBacklog}`;
     case "harness-swap":
       return `harness-swap:${event.from}->${event.to}`;
+    case "tasks-changed":
+      return `tasks-changed:${event.cursor}`;
     default:
       return assertNever(event);
   }

@@ -23,6 +23,7 @@ import type { Task, TerminalTab } from "../shared/types.ts";
 import { isMultiRepoTask } from "../shared/multi-repo.ts";
 import { tasks } from "./db-async.ts";
 import { childEnv } from "./core-spawn.ts";
+import { noteDecorationChanged } from "./task-decoration-rev.ts";
 // NOTE: worktree.ts is imported *dynamically* inside createTerminal, not at
 // the top level. worktree.ts reads db.ts's `dataDir` at module init; importing
 // it statically here would pull that read into db.ts's own init chain (db.ts →
@@ -345,6 +346,7 @@ export async function createTerminal(
     entry.proc = proc;
     entry.term = proc.terminal!;
     terminals.set(id, entry);
+    noteDecorationChanged(taskId); // open-terminal count moved (task delta + push)
 
     // The PTY `exit` callback reports stream lifecycle, not the child's code;
     // use the real process exit for that, then tear the tab down.
@@ -352,7 +354,7 @@ export async function createTerminal(
       entry.exited = true;
       entry.exitCode = typeof code === "number" ? code : null;
       notifyExit(entry);
-      terminals.delete(id);
+      if (terminals.delete(id)) noteDecorationChanged(entry.taskId);
     });
 
     return toTab(entry);
@@ -422,6 +424,7 @@ export function closeTerminal(id: string): boolean {
   try { e.term.close(); } catch { /* already closed */ }
   try { e.proc.kill(); } catch { /* already exited */ }
   terminals.delete(id);
+  noteDecorationChanged(e.taskId);
   return true;
 }
 

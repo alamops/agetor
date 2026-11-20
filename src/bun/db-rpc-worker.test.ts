@@ -233,6 +233,36 @@ describe("ordering and consistency", () => {
     expect(events.map((e) => e.data)).toEqual(Array.from({ length: 2000 }, (_, i) => `line ${i}`));
   }, 60_000);
 
+  test("tasks.changedSince runs in the worker: snapshot, then a delta, a tombstone and a filtered removal", async () => {
+    const { rpc } = newClient();
+    const a = makeTask();
+    const b = makeTask();
+    await rpc.call("tasks", "insert", [a]);
+    await rpc.call("tasks", "insert", [b]);
+    type Res = { epoch: string; rev: number; snapshot: boolean; tasks: Array<{ id: string }>; removedIds: string[]; running: Record<string, number> };
+    const snap = (await rpc.op("tasks.changedSince", [null, "exclude", []])) as Res;
+    expect(snap.snapshot).toBe(true);
+    expect(snap.tasks.map((t) => t.id)).toEqual(expect.arrayContaining([a.id, b.id]));
+    const cursor = { epoch: snap.epoch, rev: snap.rev };
+
+    await rpc.call("tasks", "update", [a.id, { title: "changed" }]);
+    await rpc.call("tasks", "update", [b.id, { archivedAt: Date.now() }]);
+    const d = (await rpc.op("tasks.changedSince", [cursor, "exclude", []])) as Res;
+    expect(d.snapshot).toBe(false);
+    expect(d.tasks.map((t) => t.id)).toEqual([a.id]);
+    expect(d.removedIds).toEqual([b.id]);
+    expect(d.rev).toBeGreaterThan(cursor.rev);
+    const kept = (await rpc.op("tasks.changedSince", [cursor, "exclude", [b.id]])) as Res;
+    expect(kept.tasks.map((t) => t.id).sort()).toEqual([a.id, b.id].sort());
+
+    await rpc.call("tasks", "delete", [a.id]);
+    const gone = (await rpc.op("tasks.changedSince", [{ epoch: d.epoch, rev: d.rev }, "exclude", []])) as Res;
+    expect(gone.removedIds).toEqual([a.id]);
+    // Another database's epoch snapshots.
+    const other = (await rpc.op("tasks.changedSince", [{ epoch: "0".repeat(16), rev: 0 }, "exclude", []])) as Res;
+    expect(other.snapshot).toBe(true);
+  });
+
   test("onRevChanged fires on a worker write and not on a read", async () => {
     const { rpc } = newClient();
     await rpc.call("tasks", "list", []);

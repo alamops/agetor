@@ -9,6 +9,7 @@ import { backlogOps } from "./backlog-ops.ts";
 import { orchestratorOps } from "./orchestrator-ops.ts";
 import { retentionOps } from "./retention-ops.ts";
 import { serverOps } from "./server-ops.ts";
+import { deltaOps } from "./delta-ops.ts";
 
 export { defineOp };
 export type { OpCtx, OpDef };
@@ -38,6 +39,7 @@ export const ops = {
   ...orchestratorOps,
   ...retentionOps,
   ...serverOps,
+  ...deltaOps,
 };
 
 export type OpRegistry = typeof ops;

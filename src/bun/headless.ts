@@ -35,6 +35,7 @@ import {
 } from "./core-creds.ts";
 import { daemonLog } from "./daemon-log.ts";
 import { bootReadySignal } from "./boot-gate.ts";
+import { startTasksChangedPush } from "./task-change-push.ts";
 import { installCoreLog, registerLogSecret } from "./core-log.ts";
 import { preferences, runs, setTaskDecorations, subagents } from "./db-async.ts";
 import { awaitDbReady, drainCoreForQuit } from "./boot-db.ts";
@@ -479,6 +480,10 @@ export async function runDaemon(): Promise<void> {
 
   // The boot restore is done: let the routes through.
   markBootReady();
+
+  // Task-list push: one throttled `tasks-changed` event per task revision or
+  // decoration change on the global SSE stream (task-change-push.ts).
+  startTasksChangedPush();
 
   // Complete (or visibly block) harness-stack swaps a restart interrupted.
   // After the gate: a completion mirrors config and copies a transcript,

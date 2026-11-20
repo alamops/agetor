@@ -61,6 +61,7 @@ import {
 import { liveSupervisor, requestSupervisorStop } from "./login-daemon-state.ts";
 import { acquireApiPort } from "./app-takeover.ts";
 import { bootReadySignal } from "./boot-gate.ts";
+import { startTasksChangedPush } from "./task-change-push.ts";
 import { runRemoteAccessBox } from "./remote-access-box.ts";
 import {
   getBackgroundStatus,
@@ -604,6 +605,10 @@ const runningTasksSnapshot = createRunningTasksSnapshot({
   log: (m) => console.warn(m),
 });
 runningTasksSnapshot.start();
+
+// Task-list push: every task revision or decoration change becomes one throttled
+// `tasks-changed` event on the global SSE stream (task-change-push.ts).
+startTasksChangedPush();
 
 // Complete (or visibly block) harness-stack swaps a restart interrupted. After
 // the gate: a completion mirrors config and copies a transcript, which must not

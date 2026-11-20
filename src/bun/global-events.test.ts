@@ -28,7 +28,7 @@ test("startTask emits column → running and run-status → succeeded", async ()
 
   const events: GlobalEvent[] = [];
   const unsub = subscribeGlobal((e) => {
-    if (e.kind !== "update" && e.taskId === created.task.id) events.push(e);
+    if (e.kind !== "update" && e.kind !== "tasks-changed" && e.taskId === created.task.id) events.push(e);
   });
 
   const res = await startTask(created.task.id);
@@ -186,7 +186,7 @@ test("reconcileOrphans emits run-status → orphaned + column → ready", async 
 
   const events: GlobalEvent[] = [];
   const unsub = subscribeGlobal((e) => {
-    if (e.kind !== "update" && e.taskId === taskId) events.push(e);
+    if (e.kind !== "update" && e.kind !== "tasks-changed" && e.taskId === taskId) events.push(e);
   });
 
   // reconcileOrphans is async: boot awaits it, and it now awaits the OpenCode

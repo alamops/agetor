@@ -89,6 +89,7 @@ import { cancelClone, cloneAuthHeader, cloneRepo, defaultCloneDest, resolveClone
 import { buildEli5Prompt, eli5TaskTitle } from "../shared/clone-eli5.ts";
 import { CLONE_PROVIDERS, isGitProvider } from "../shared/clone-input.ts";
 import { stalledSince } from "./stall-registry.ts";
+import { buildTaskDelta } from "./task-delta-route.ts";
 import { readDragPasteboardPaths } from "./drag-pasteboard.ts";
 import { listGitHubTokens, setGitHubToken, deleteGitHubToken } from "./github-tokens.ts";
 import {
@@ -1363,6 +1364,20 @@ function trimPipelineRunForList(run: PipelineRunState): PipelineRunState {
       ...g,
       arrivals: g.arrivals.map(trimArrival),
     })),
+  };
+}
+
+/** One `GET /tasks` row: the stored task with the trimmed `pipelineRun` and the
+ *  two decorations the database row cannot carry (`runningSubagents`,
+ *  `stalledSince`). Shared by the legacy list and `?delta=1`, so they cannot drift. */
+function toTaskListRow(t: Task, runningSubagents: number): Task {
+  return {
+    ...t,
+    // M-S3: the list route ships the trimmed pipelineRun variant
+    // (no handoffs, no profile snapshots) — see the field's doc.
+    ...(t.pipelineRun ? { pipelineRun: trimPipelineRunForList(t.pipelineRun) } : {}),
+    runningSubagents,
+    stalledSince: stalledSince(t.id),
   };
 }
 
@@ -6221,16 +6236,18 @@ export function startApiServer(
           if ("error" in query) {
             return json({ error: query.error }, { status: 400, headers: corsHeaders(req) });
           }
+          // `?delta=1[&since=<cursor>]` opts into the delta envelope (see
+          // task-delta-route.ts); without it the answer below is unchanged.
+          const params = new URL(req.url).searchParams;
+          if (params.get("delta") === "1") {
+            return json(
+              await buildTaskDelta({ since: params.get("since"), ...query, toListRow: toTaskListRow }),
+              { headers: corsHeaders(req) },
+            );
+          }
           const counts = await subagents.runningCountsByTask();
           return json(
-            (await tasks.list(query)).map((t) => ({
-              ...t,
-              // M-S3: the list route ships the trimmed pipelineRun variant
-              // (no handoffs, no profile snapshots) — see the field's doc.
-              ...(t.pipelineRun ? { pipelineRun: trimPipelineRunForList(t.pipelineRun) } : {}),
-              runningSubagents: counts.get(t.id) ?? 0,
-              stalledSince: stalledSince(t.id),
-            })),
+            (await tasks.list(query)).map((t) => toTaskListRow(t, counts.get(t.id) ?? 0)),
             { headers: corsHeaders(req) },
           );
         }),

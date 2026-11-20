@@ -1564,6 +1564,9 @@ function AppInner() {
         });
         return;
       }
+      // The delta-refresh trigger (`tasks-changed`) carries no task: the board
+      // consumes it in its own handler (T13), not in the toast logic below.
+      if (ev.kind === "tasks-changed") return;
       // "Already looking at it" — the run panel is open on the task, OR the
       // full-page pipeline run view is showing it (L-A3: a pipeline parent
       // never opens in the panel, so `selectedIdRef` alone would toast a
