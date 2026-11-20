@@ -163,10 +163,13 @@ export function createTranscriptClient(opts: TranscriptClientOptions = {}): Tran
   let worker: TranscriptWorkerLike | null = null;
   let active: { id: number; job: Job; timer: ReturnType<typeof setTimeout> } | null = null;
   const crashes: number[] = [];
+  /** Set once a worker refused because its build id differs from this code's:
+   *  every call then rejects with it, and no worker is started again. */
+  let refusal: string | null = null;
 
   /** Drop the worker and fail the in-flight call. Queued calls stay queued and
    *  run on a fresh worker (subject to the restart cap). */
-  function crash(failed: TranscriptWorkerLike, reason: string): void {
+  function crash(failed: TranscriptWorkerLike, reason: string, code = "EWORKER"): void {
     if (worker !== failed) return; // a stale event from an already-replaced worker
     worker = null;
     crashes.push(now());
@@ -175,7 +178,7 @@ export function createTranscriptClient(opts: TranscriptClientOptions = {}): Tran
     active = null;
     if (cur) {
       clearTimeout(cur.timer);
-      cur.job.reject(new TranscriptClientError(`transcript worker failed: ${reason}`, "EWORKER"));
+      cur.job.reject(new TranscriptClientError(`transcript worker failed: ${reason}`, code));
     }
     pump();
   }
@@ -183,6 +186,13 @@ export function createTranscriptClient(opts: TranscriptClientOptions = {}): Tran
   function onReply(from: TranscriptWorkerLike, data: unknown): void {
     if (worker !== from) return;
     if (isLogMessage(data)) { forwardWorkerLog(data.log); return; } // never a reply
+    if (typeof data === "object" && data !== null && (data as { buildMismatch?: unknown }).buildMismatch === true) {
+      const why = (data as { error?: unknown }).error;
+      refusal = `${typeof why === "string" ? why : "core worker build mismatch"}; restart Agetor`;
+      console.error(`[agetor:transcript-worker] ${refusal}`);
+      crash(from, refusal, "EBUILDMISMATCH");
+      return;
+    }
     if (!active) return;
     const reply = data as TranscriptReply | null;
     if (!reply || typeof reply !== "object" || typeof reply.id !== "number" || reply.id !== active.id) return; // not ours (or no id): ignore
@@ -212,6 +222,10 @@ export function createTranscriptClient(opts: TranscriptClientOptions = {}): Tran
       const job = queue.shift()!;
       if (closed) {
         job.reject(new TranscriptClientError("transcript client is closed"));
+        continue;
+      }
+      if (refusal !== null) {
+        job.reject(new TranscriptClientError(refusal, "EBUILDMISMATCH"));
         continue;
       }
       let w = worker;

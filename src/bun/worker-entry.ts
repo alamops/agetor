@@ -3,6 +3,7 @@
 // module only resolves it.
 import { existsSync } from "node:fs";
 import path from "node:path";
+import { BUILD_ID } from "./build-id.ts";
 import type { TranscriptWorkerLike } from "./transcript-client.ts";
 
 export type CoreWorkerRole = "db" | "transcript";
@@ -31,19 +32,42 @@ export function coreWorkerCandidates(): string[] {
   return candidates;
 }
 
-/** The first candidate that exists. Throws when none does. */
-export function resolveCoreWorkerEntry(): string {
-  const candidates = coreWorkerCandidates();
+let pinnedEntry: string | null = null;
+
+/** The worker entry for this process. The first call resolves it from the
+ *  candidates and pins the result; every later start (a restart after a crash,
+ *  the lazily created transcript worker) reuses that path, so a file that is
+ *  swapped on disk afterwards (an in-place update, a dev rebuild) cannot change
+ *  which code a later worker runs. The test/e2e `AGETOR_CORE_WORKER_ENTRY` seam
+ *  is read on every call and never pinned. Throws when no candidate exists. */
+export function resolveCoreWorkerEntry(candidatesFn: () => string[] = coreWorkerCandidates): string {
+  const seam = process.env.AGETOR_CORE_WORKER_ENTRY;
+  if (seam && (process.env.NODE_ENV === "test" || process.env.AGETOR_E2E_HARNESS_SEAMS === "1") && existsSync(seam)) {
+    return seam;
+  }
+  if (pinnedEntry !== null) return pinnedEntry;
+  const candidates = candidatesFn();
   for (const candidate of candidates) {
-    if (existsSync(candidate)) return candidate;
+    if (existsSync(candidate)) {
+      pinnedEntry = candidate;
+      return candidate;
+    }
   }
   throw new Error(`core worker entry not found; looked in: ${candidates.join(", ")}`);
 }
 
-/** Start a worker and send its role's init message as the first message. */
+/** Test seam: forget the pinned entry. */
+export function resetPinnedCoreWorkerEntryForTests(): void {
+  pinnedEntry = null;
+}
+
+/** Start a worker and send its role's init message as the first message. The
+ *  init carries this bundle's build id; the worker refuses to run (before it
+ *  opens the database) when its own id differs. `init.buildId` overrides it
+ *  (tests). */
 export function createCoreWorker(role: CoreWorkerRole, init: Record<string, unknown> = {}): CoreWorkerLike {
   const worker = new Worker(resolveCoreWorkerEntry());
-  worker.postMessage({ role, ...init });
+  worker.postMessage({ role, buildId: BUILD_ID, ...init });
   return worker as unknown as CoreWorkerLike;
 }
 

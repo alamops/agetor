@@ -57,6 +57,7 @@ import {
 import type { DbModules } from "./db-core/modules.ts";
 import { executeDbRequest, serializeDbError, type DbErrorPayload, type DbReply } from "./workers/db-handler.ts";
 import { resolveDbPath } from "./db-path.ts";
+import { BUILD_ID } from "./build-id.ts";
 import { createCoreWorker, type CoreWorkerLike } from "./worker-entry.ts";
 import { markTasksChanged } from "./task-change-bus.ts";
 import type { OpArgs, OpName, OpResult } from "./db-core/ops/index.ts";
@@ -116,7 +117,7 @@ export function reconstructDbError(payload: DbErrorPayload): Error {
 // ---- client ----
 
 export interface DbRpcOptions {
-  /** Defaults to the `AGETOR_DB_MODE` env var (`inprocess` only under NODE_ENV=test or AGETOR_E2E_HARNESS_SEAMS=1), then "inprocess" under NODE_ENV=test, else "worker". */
+  /** Defaults to the `AGETOR_DB_MODE` env var (`inprocess` is the kill switch and is honored anywhere, with a boot warning), then "inprocess" under NODE_ENV=test, else "worker". */
   mode?: DbMode;
   /** Worker mode: the database file. Defaults to `resolveDbPath()`. */
   dbPath?: string;
@@ -302,8 +303,21 @@ function inProcessClient(base: Base, noteRev: (rev: number) => void): DbRpc {
     dbReady: async () => { await load(); },
     call: (module, method, args) => run({ kind: "call", module, method, args }),
     op: (name, args) => run({ kind: "op", name, args }) as Promise<never>,
-    // The db.ts singleton is shared by the whole process; closing it is not ours to do.
-    closeDb: async () => { closed = true; },
+    // The db.ts singleton is shared by the whole process, so closing it is not
+    // ours to do. A quit still checkpoints the WAL, as the worker's close does:
+    // the kill switch must not leave a long WAL behind. Never throws (a busy
+    // checkpoint returns a result row, and the short busy_timeout bounds the wait).
+    closeDb: async () => {
+      if (closed) return;
+      closed = true;
+      if (!loading) return;
+      try {
+        const loaded = await loading;
+        loaded.conn.exec("PRAGMA wal_checkpoint(TRUNCATE);");
+      } catch (e) {
+        console.error("[agetor:db-rpc] in-process checkpoint on close failed:", toError(e).message);
+      }
+    },
   };
 }
 
@@ -332,6 +346,9 @@ function workerClient(
   const pending = new Map<number, Pending>();
   const crashes: number[] = [];
   let drainWaiters: Array<() => void> = [];
+  /** Set once a worker reported a different build id: the client then refuses every
+   *  call instead of starting another worker from the same mismatched bundle. */
+  let refusal: string | null = null;
   /** Set while `closeDb` waits for the worker's `{ closed: true }`. */
   let closeAck: (() => void) | null = null;
 
@@ -435,6 +452,15 @@ function workerClient(
     }
     if ("ready" in msg) {
       if (ready) return;
+      if (msg.buildMismatch === true || (msg.ready === true && msg.buildId !== BUILD_ID)) {
+        // The worker bundle is from another build than this code. Never let it
+        // (or a restart of it) serve a call; a newer one would also have run its
+        // migrations under this older core.
+        const theirs = typeof msg.buildId === "string" ? msg.buildId : "unknown";
+        refusal = `core worker build mismatch: worker ${theirs}, main thread ${BUILD_ID}; restart Agetor`;
+        down(w, refusal, false);
+        return;
+      }
       if (msg.ready === true) {
         ready = true;
         clearReadyTimer();
@@ -481,6 +507,7 @@ function workerClient(
 
   function enqueue(request: Waiter["request"]): Promise<unknown> {
     if (closing || closed) return Promise.reject(new DbUnavailableError("db client is closed"));
+    if (refusal !== null) return Promise.reject(new DbUnavailableError(refusal));
     return new Promise<unknown>((resolve, reject) => {
       if (!worker) {
         if (crashesInWindow() > maxRestarts) {

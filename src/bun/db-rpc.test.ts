@@ -5,7 +5,7 @@
  * level (first import wins) and every assertion is relative to fresh uuids.
  */
 import { test, expect, beforeAll, afterAll, describe } from "bun:test";
-import { mkdtempSync } from "node:fs";
+import { mkdtempSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import path from "node:path";
 import { randomUUID } from "node:crypto";
@@ -259,5 +259,51 @@ describe("close", () => {
     await expect(other.call("tasks", "list", [])).rejects.toBeInstanceOf(rpcm.DbUnavailableError);
     // The shared db.ts connection is untouched.
     expect(dbm.tasks.list().length).toBeGreaterThan(0);
+  });
+});
+
+describe("kill-switch mode (AGETOR_DB_MODE=inprocess) outside tests", () => {
+  test("closeDb checkpoints the WAL, once, and only when the singleton was loaded", async () => {
+    const execs: string[] = [];
+    const realExec = dbm.db.exec.bind(dbm.db);
+    (dbm.db as { exec: (sql: string) => void }).exec = (sql: string) => { execs.push(sql); return realExec(sql); };
+    try {
+      const untouched = rpcm.createDbRpc({ mode: "inprocess" });
+      await untouched.closeDb();
+      expect(execs.filter((s) => s.includes("wal_checkpoint"))).toEqual([]);
+
+      const client = rpcm.createDbRpc({ mode: "inprocess" });
+      await client.dbReady();
+      await client.closeDb();
+      await client.closeDb(); // a second close is a no-op
+      expect(execs.filter((s) => s.includes("wal_checkpoint"))).toEqual(["PRAGMA wal_checkpoint(TRUNCATE);"]);
+      await expect(client.call("tasks", "list", [])).rejects.toBeInstanceOf(rpcm.DbUnavailableError);
+    } finally {
+      (dbm.db as { exec: (sql: string) => void }).exec = realExec;
+    }
+  });
+
+  test("the main-thread connection waits at most SHORT_BUSY_TIMEOUT_MS outside NODE_ENV=test; the worker's keeps 5 s", async () => {
+    const { SHORT_BUSY_TIMEOUT_MS } = await import("./db-core/connection.ts");
+    expect(SHORT_BUSY_TIMEOUT_MS).toBeLessThanOrEqual(250);
+    // The default (the worker's connection, and tests) is 5 s.
+    expect((dbm.db.query("PRAGMA busy_timeout").get() as { timeout: number }).timeout).toBe(5000);
+    const dir = mkdtempSync(path.join(tmpdir(), "agetor-busy-"));
+    try {
+      const proc = Bun.spawnSync({
+        cmd: [
+          process.execPath,
+          "-e",
+          `const m = await import(${JSON.stringify(path.join(import.meta.dir, "db.ts"))}); console.log(JSON.stringify(m.db.query("PRAGMA busy_timeout").get()));`,
+        ],
+        env: { ...process.env, NODE_ENV: "production", AGETOR_DATA_DIR: dir },
+        stdout: "pipe",
+        stderr: "pipe",
+      });
+      const lines = proc.stdout.toString().trim().split("\n");
+      expect(JSON.parse(lines[lines.length - 1]!)).toEqual({ timeout: SHORT_BUSY_TIMEOUT_MS });
+    } finally {
+      rmSync(dir, { recursive: true, force: true });
+    }
   });
 });

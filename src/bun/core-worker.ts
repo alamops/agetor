@@ -10,7 +10,11 @@
 // Messages a worker posts that are NOT replies to a request (none carries an
 // `id`; a client must never treat one as a reply, and never echo one back):
 //
-//   { ready: true } | { ready: false, error }   db role: open and migrated, or failed
+//   { ready: true, buildId } | { ready: false, error }   db role: open and migrated, or failed
+//   { ready: false, buildMismatch: true, error, buildId } (db role) or
+//   { buildMismatch: true, error, buildId } (transcript role): the init's `buildId`
+//                          is not this bundle's (src/bun/build-id.ts). The worker
+//                          refused BEFORE opening the database and answers nothing more.
 //   { migrating: true }    db role: the connection is open and migrations are about
 //                          to run (synchronously, so no heartbeat can follow). The
 //                          client stops its ready timer: only OPENING is timed.
@@ -39,6 +43,8 @@
 // (db.ts, interactions, terminals, orchestrator, server).
 
 import { format } from "node:util";
+import { BUILD_ID } from "./build-id.ts";
+import { prepareWorkerLogText } from "./workers/log-text.ts";
 import { handleDbMessage, openWorkerDb, type WorkerDb } from "./workers/db-handler.ts";
 import { handleTranscriptMessage } from "./workers/transcript-handler.ts";
 
@@ -46,9 +52,6 @@ declare const self: {
   postMessage(msg: unknown): void;
   onmessage: ((ev: { data: unknown }) => void) | null;
 };
-
-/** Longest `text` a forwarded log message carries; longer output is cut with a marker. */
-export const LOG_TEXT_MAX_CHARS = 8192;
 
 function forwardConsole(): void {
   for (const level of ["log", "info", "warn", "error", "debug"] as const) {
@@ -59,7 +62,7 @@ function forwardConsole(): void {
       } catch {
         text = "[unprintable log arguments]";
       }
-      if (text.length > LOG_TEXT_MAX_CHARS) text = `${text.slice(0, LOG_TEXT_MAX_CHARS)}... [truncated]`;
+      text = prepareWorkerLogText(text);
       try {
         self.postMessage({ log: { level, text } });
       } catch {
@@ -74,10 +77,12 @@ type Role = "db" | "transcript";
 interface InitMessage {
   role: Role;
   dbPath?: string;
+  /** The main thread's build id; a worker with a different one refuses to run. */
+  buildId?: string;
   testMigrateDelayMs?: number;
 }
 
-let role: Role | null = null;
+let role: Role | "refused" | null = null;
 let db: WorkerDb | null = null;
 /** Set by the test-only crash message: the worker answers nothing more while it exits. */
 let dying = false;
@@ -89,6 +94,15 @@ function isInit(msg: unknown): msg is InitMessage {
 
 function init(msg: InitMessage): void {
   role = msg.role;
+  // A worker bundle from a different build than the main code must not run:
+  // before it opens the database (and so before any migration), say so and stop.
+  if (msg.buildId !== BUILD_ID) {
+    const why = `core worker build mismatch: worker ${BUILD_ID}, main thread ${String(msg.buildId)}`;
+    role = "refused";
+    if (msg.role === "db") self.postMessage({ ready: false, buildMismatch: true, error: why, buildId: BUILD_ID });
+    else self.postMessage({ buildMismatch: true, error: why, buildId: BUILD_ID });
+    return;
+  }
   if (msg.role !== "db") return;
   try {
     if (typeof msg.dbPath !== "string" || msg.dbPath === "") throw new TypeError("db role needs a dbPath");
@@ -99,7 +113,7 @@ function init(msg: InitMessage): void {
         if (stallMs > 0) Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, stallMs);
       },
     });
-    self.postMessage({ ready: true });
+    self.postMessage({ ready: true, buildId: BUILD_ID });
   } catch (e) {
     self.postMessage({ ready: false, error: e instanceof Error ? e.message : String(e) });
   }
@@ -122,6 +136,7 @@ self.onmessage = (ev) => {
     process.exit(1);
     return;
   }
+  if (role === "refused") return; // refused at init (build mismatch): answers nothing
   if (role === "transcript") {
     void handleTranscriptMessage(msg).then((reply) => self.postMessage(reply));
     return;

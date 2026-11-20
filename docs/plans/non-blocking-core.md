@@ -220,6 +220,7 @@ Risks:
 - **The 15 s safety poll interval.** My default, inside the owner's "delta poll + push" choice.
 - **Tombstones in `task_revs` are never pruned.** Rows are tiny, and pruning would add a "cursor too old" path. Revisit if the table ever matters.
 - **Unverified by spike: Electrobun dev mode (`bun run dev`)** copies the worker bundle like the other vendor files. Phase 7 builds and smoke-tests it.
+- **The watcher-drift bar (X7) is looser than the "< 100 ms" first pinned.** `subagent-watcher-drift.test.ts` allows up to 3 times the measured idle gap, capped at a 250 ms hard ceiling: a deliberate machine-load tolerance (a 100 ms bar flaked on a loaded laptop). A real regression, a blocking read on the main thread, costs far more than the ceiling.
 - No unratified one-way decisions. Migration 093 is additive. No public contract changes (the old `GET /tasks` shape is kept).
 
 ## 9. Completeness ledger

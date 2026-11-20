@@ -259,8 +259,8 @@ export const orchestratorOps = {
 
   /** Several tasks by id in one hop, in the order asked (null: no such task).
    *  For loops over many tasks (boot reconcile, sweeps) instead of one read
-   *  per row. The badge counts are the main thread's (`db-async.ts` overlay
-   *  does not apply to op results), which none of those loops read. */
+   *  per row. The badge counts are the main thread's: the `db-async.ts` facade
+   *  overlays them onto a Task an op returns, as it does for a module call. */
   "orchestrator.getTasks": defineOp({
     tx: false,
     run: (ctx, ids: string[]): (Task | null)[] => ids.map((id) => ctx.modules.tasks.get(id)),

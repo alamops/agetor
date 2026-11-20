@@ -27,6 +27,7 @@ import type { Task } from "../shared/types.ts";
 import type { DbModules } from "./db-core/modules.ts";
 import type { TaskDecorationDeps } from "./db-core/tasks.ts";
 import { decorateTask, decorateTaskList, decorateTaskWithSteps } from "./db-core/task-decoration.ts";
+import type { OpArgs, OpName, OpResult } from "./db-core/ops/index.ts";
 import { getDbRpc, type DbRpc } from "./db-rpc.ts";
 
 export {
@@ -38,7 +39,6 @@ export {
   DbRestartingError,
   DbUnavailableError,
   onRevChanged,
-  op,
   type DbMode,
   type DbRpc,
   type DbRpcOptions,
@@ -101,6 +101,18 @@ async function overlayTaskResult(
   return decorateTask(result, decor);
 }
 
+/** Overlay the badge counts onto the Tasks an op returns: a Task, a Task or null,
+ *  or an array of those. Anything else (a projection, a count, a plain object) is
+ *  returned as is. Same functions as the module calls, so worker mode matches the
+ *  in-process modules, which decorate inside `db.ts`. */
+async function overlayOpResult(rpc: DbRpc, decor: TaskDecorationDeps, result: unknown): Promise<unknown> {
+  if (Array.isArray(result)) {
+    if (result.length === 0 || !result.every((t) => t === null || isTaskLike(t))) return result;
+    return result.map((t) => (t === null ? null : decorateTask(t as Task, decor)));
+  }
+  return overlayTaskResult(rpc, decor, "op", "op", result);
+}
+
 /** String property names a runtime probes on any object; never database methods. */
 const NON_METHOD_PROPS = new Set(["then", "toJSON", "inspect", "constructor", "toString", "valueOf", "toLocaleString", "asymmetricMatch", "$$typeof", "nodeType"]);
 
@@ -143,8 +155,15 @@ export function createDbAsync(getRpc: () => DbRpc, holder: TaskDecorationHolder 
   const m = <K extends keyof DbModules>(name: K) => makeAsyncModule(getRpc, holder, name);
   const cursorAsks = m("cursorAsks");
   const hiddenSessionIds = m("hiddenSessionIds");
+  const op = async <K extends OpName>(name: K, args: OpArgs<K>): Promise<OpResult<K>> => {
+    const rpc = getRpc();
+    const result = await rpc.op(name, args);
+    const decor = holder.current;
+    return (decor ? await overlayOpResult(rpc, decor, result) : result) as OpResult<K>;
+  };
   return {
     holder,
+    op,
     harnesses: m("harnesses"),
     harnessSessionHandoffs: m("harnessSessionHandoffs"),
     harnessOrphanedCopies: m("harnessOrphanedCopies"),
@@ -186,6 +205,7 @@ export function setTaskDecorations(deps: TaskDecorationDeps | null): void {
 }
 
 export const {
+  op,
   harnesses,
   harnessSessionHandoffs,
   harnessOrphanedCopies,

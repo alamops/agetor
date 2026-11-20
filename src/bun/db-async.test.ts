@@ -15,6 +15,7 @@ import type { Task } from "../shared/types.ts";
 import type { TaskDecorationDeps } from "./db-core/tasks.ts";
 import { rmTestDataDir } from "./test-data-dir.ts";
 import { makeTask } from "./db-rpc-test-util.ts";
+import { BUILD_ID } from "./build-id.ts";
 
 const dataDir = process.env.AGETOR_DATA_DIR ?? mkdtempSync(path.join(tmpdir(), "agetor-db-async-"));
 process.env.AGETOR_DATA_DIR = dataDir;
@@ -53,7 +54,7 @@ beforeAll(async () => {
     dbPath: path.join(workerDir, "agetor.sqlite"),
     workerFactory: (dbPath) => {
       const w = new Worker(path.join(import.meta.dir, "core-worker.ts"));
-      w.postMessage({ role: "db", dbPath });
+      w.postMessage({ role: "db", dbPath, buildId: BUILD_ID });
       return w as never;
     },
   });
@@ -129,6 +130,37 @@ describe("facade parity, worker vs in-process", () => {
       expect(inserted.openTerminalCount).toBe(2);
       const marked = await worker.tasks.markSeen(t.id);
       expect(marked?.pendingInteractionCount).toBe(4);
+    } finally {
+      pendingCounts.clear();
+      terminalCounts.clear();
+    }
+  });
+
+  test("a Task an op returns carries the same badge counts as a module call, in worker mode", async () => {
+    const t = makeTask();
+    inprocIds.push(t.id);
+    pendingCounts.set(t.id, 3);
+    terminalCounts.set(t.id, 2);
+    try {
+      await worker.tasks.insert(t);
+      // Array result with a hole: `orchestrator.getTasks` returns (Task | null)[].
+      const viaOp = await worker.op("orchestrator.getTasks", [[t.id, "no-such-task"]]);
+      expect(viaOp[1]).toBeNull();
+      expect(viaOp[0]!.pendingInteractionCount).toBe(3);
+      expect(viaOp[0]!.openTerminalCount).toBe(2);
+      // The same call without the overlay (the raw client) reports zeros: the
+      // overlay is what makes the two agree.
+      const raw = await workerRpc.op("orchestrator.getTasks", [[t.id]]);
+      expect(raw[0]!.pendingInteractionCount).toBe(0);
+      // A single Task result, and a non-Task one left alone, through a fake client.
+      const fake = {
+        op: async (name: string) => (name === "single" ? { ...raw[0]! } : { count: 5 }),
+        call: async () => [],
+      } as never;
+      const viaFake = am.createDbAsync(() => fake, { current: fakeDecorations });
+      const single = await (viaFake.op as unknown as (n: string, a: unknown[]) => Promise<Task>)("single", []);
+      expect(single.pendingInteractionCount).toBe(3);
+      expect(await (viaFake.op as unknown as (n: string, a: unknown[]) => Promise<unknown>)("other", [])).toEqual({ count: 5 });
     } finally {
       pendingCounts.clear();
       terminalCounts.clear();
@@ -297,7 +329,7 @@ function createBare() {
     dbPath: path.join(dir, "agetor.sqlite"),
     workerFactory: (dbPath) => {
       const w = new Worker(path.join(import.meta.dir, "core-worker.ts"));
-      w.postMessage({ role: "db", dbPath });
+      w.postMessage({ role: "db", dbPath, buildId: BUILD_ID });
       return w as never;
     },
   });

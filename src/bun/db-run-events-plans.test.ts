@@ -675,8 +675,9 @@ describe("run_events SQL inside db-core/ops", () => {
     const out: { file: string; sql: string }[] = [];
     for (const file of readdirSync(dir).filter((f) => f.endsWith(".ts") && !f.endsWith(".test.ts"))) {
       const src = await Bun.file(path.join(dir, file)).text();
-      for (const m of src.matchAll(/`([^`]*)`/g)) {
-        const sql = m[1]!;
+      // Template literals and plain "..." / '...' string literals alike.
+      for (const m of src.matchAll(/`([^`]*)`|"((?:[^"\\\n]|\\.)*)"|'((?:[^'\\\n]|\\.)*)'/g)) {
+        const sql = m[1] ?? m[2] ?? m[3] ?? "";
         if (/\brun_events\b/.test(sql) && /\b(SELECT|INSERT|UPDATE|DELETE)\b/i.test(sql)) out.push({ file, sql });
       }
     }

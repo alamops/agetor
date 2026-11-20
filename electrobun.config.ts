@@ -28,6 +28,17 @@ export default {
     // complexity for ~4 KB updates instead of ~5–30 MB full bundles.
     generatePatch: false,
   },
+  scripts: {
+    // Runs at the start of EVERY build, including each `electrobun dev --watch`
+    // rebuild (a change under src/bun/, the watched entrypoint directory). It
+    // rebuilds vendor/daemon (the worker bundle the copy step below puts next to
+    // the main bundle) and rewrites vendor/build-id, so the main bundle and the
+    // worker copy are always the same build. Without it a dev edit to
+    // src/bun/db-core would rebuild index.js but leave a stale core-worker.js
+    // (vendor/** is in watchIgnore on purpose: the script's own output must not
+    // trigger another rebuild). docs/architecture/core-responsiveness.md, "Worker build id".
+    preBuild: "scripts/build-daemon-bundle.ts",
+  },
   runtime: {
     // Don't quit the bun process when the user closes the window. Agetor
     // hosts long-running claude/codex sessions in tmux that should survive

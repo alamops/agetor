@@ -712,14 +712,17 @@ export function isDbWorkerError(err: unknown): err is Error {
   return err instanceof Error && (err.name === "DbRestartingError" || err.name === "DbUnavailableError");
 }
 
-/** The 503 a route answers when its database call hit a worker crash: retry
- *  in a second while the worker restarts, or the database is unavailable. */
+/** The 503 a route answers when its database call hit a worker crash, or the
+ *  database is unavailable. `Retry-After: 1` goes only on a safe method (GET,
+ *  HEAD): the outcome of a write that was in flight is unknown, so the answer
+ *  to any other method must not invite a third-party retry. */
 function dbWorkerErrorResponse(err: Error, req: Request, opts: RoutePolicyOptions): Response {
   if (err.name === "DbRestartingError") {
+    const safe = req.method === "GET" || req.method === "HEAD";
     return jsonResponse(
       { error: "database restarting", code: "db-restarting" },
       503,
-      { ...opts.cors(req), "retry-after": "1" },
+      safe ? { ...opts.cors(req), "retry-after": "1" } : opts.cors(req),
     );
   }
   return jsonResponse({ error: "database unavailable", code: "db-unavailable" }, 503, opts.cors(req));
@@ -798,7 +801,7 @@ function wrapHandler(
  * token with `pathParams` → the path gate (403 `path-not-accessible`) → the
  * handler, with the caller readable through `callerOf(req)`. A handler whose
  * database call failed on a worker crash answers 503: `DbRestartingError` →
- * `{error: "database restarting", code: "db-restarting"}` with `Retry-After: 1`,
+ * `{error: "database restarting", code: "db-restarting"}` (with `Retry-After: 1` on GET and HEAD only),
  * `DbUnavailableError` → `{error: "database unavailable", code: "db-unavailable"}`
  * ({@link isDbWorkerError}); every other error propagates.
  *

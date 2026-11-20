@@ -955,6 +955,9 @@ interface FileState {
   /** `Date.now()` of the last byte we read — the idle clock for done-detection. */
   lastAppendAt: number;
   status: SubagentStatus;
+  /** Set once the transcript worker's refusal of `sourcePath` was logged (and the
+   *  row settled); keeps the log to one line per row. */
+  refusalLogged?: boolean;
   sourcePath: string;
   agentType: string | null;
   description: string | null;
@@ -2858,10 +2861,11 @@ export function attachSubagentWatcher(opts: {
   /** Rows whose stored path the transcript worker refused (outside the dirs
    *  this watcher may read): logged once each, then settled `orphaned` so a row
    *  that can never be tailed stops holding its task. `allowedRoot` stays as is. */
-  const refusedPathRows = new Set<string>();
   function noteRefusedTranscriptPath(fs: FileState): void {
-    if (refusedPathRows.has(fs.subagentId)) return;
-    refusedPathRows.add(fs.subagentId);
+    // The "logged once" mark lives on the row's own FileState, so it is dropped
+    // with the row instead of accumulating in a separate set.
+    if (fs.refusalLogged) return;
+    fs.refusalLogged = true;
     console.warn(
       `[claude-subagents] transcript path refused for subagent ${fs.subagentId} of task ${taskId}: not under this session's ${fs.parentKind === "workflow_agent" ? "workflows" : "subagents"} directory; settling it as orphaned`,
     );

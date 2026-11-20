@@ -12,6 +12,7 @@ import { tmpdir } from "node:os";
 import path from "node:path";
 import { randomUUID } from "node:crypto";
 import { makeRun, makeTask } from "./db-rpc-test-util.ts";
+import { BUILD_ID } from "./build-id.ts";
 import { createCoreWorker } from "./worker-entry.ts";
 
 // Set before db-path.ts (imported by db-rpc.ts) reads it: it would otherwise
@@ -407,7 +408,7 @@ describe("worker console output", () => {
     try {
       const { rpc } = newClient({ workerFactory: () => fake });
       const first = rpc.call("preferences", "get", ["k"]);
-      emit({ ready: true });
+      emit({ ready: true, buildId: BUILD_ID });
       expect(await first).toBe("answer");
       expect(warned).toEqual(["[agetor:db-worker] from the worker"]);
     } finally {

@@ -30,7 +30,7 @@
 // the cap behave exactly as before. The caller owns the path (the worker
 // handler validates it against an `allowedRoot`, see workers/transcript-handler.ts).
 
-import { closeSync, read as readCb, readSync, statSync } from "node:fs";
+import { closeSync, read as readCb } from "node:fs";
 import { stat as statAsync } from "node:fs/promises";
 import path from "node:path";
 import { promisify } from "node:util";
@@ -116,17 +116,6 @@ function assemble(parts: Buffer[], offset: number, end: number, lastNewline: num
   return { text, nextOffset: lastNewline + 1, eof: end >= size, size };
 }
 
-function readRangeSync(fd: number, start: number, end: number): Buffer {
-  const buf = Buffer.allocUnsafe(end - start);
-  let got = 0;
-  while (got < buf.length) {
-    const n = readSync(fd, buf, got, buf.length - got, start + got);
-    if (n === 0) break;
-    got += n;
-  }
-  return got < buf.length ? buf.subarray(0, got) : buf;
-}
-
 async function readRange(fd: number, start: number, end: number): Promise<Buffer> {
   const buf = Buffer.allocUnsafe(end - start);
   let got = 0;
@@ -136,55 +125,6 @@ async function readRange(fd: number, start: number, end: number): Promise<Buffer
     got += bytesRead;
   }
   return got < buf.length ? buf.subarray(0, got) : buf;
-}
-
-/** Sync variant of `readChunk`. Identical semantics; used by the in-process
- *  fallback where a synchronous read is what the caller wants, and as the
- *  reference in the parity tests. */
-export function readChunkSync(
-  filePath: string,
-  offset: number,
-  maxBytes: number,
-  maxLineBytes?: number,
-): ChunkResult {
-  const lineCap = normalizeLineCap(maxLineBytes);
-  const chunkBytes = Math.min(normalizeChunkBytes(maxBytes), lineCap);
-  let st;
-  try { st = statSync(filePath); } catch { return none(offset, 0); }
-  if (!st.isFile() || st.size <= offset) return none(offset, st.size);
-  let fd;
-  try { fd = openReadNoFollow(filePath); } catch { return none(offset, st.size); }
-  try {
-    let size = st.size;
-    let end = offset;
-    let lastNewline = -1;
-    const parts: Buffer[] = [];
-    let skipping = false;
-    while (end < size) {
-      const want = Math.min(size, end + chunkBytes);
-      const part = readRangeSync(fd, end, want);
-      if (part.length < want - end) size = end + part.length; // shrank under us
-      const first = part.indexOf(0x0a);
-      if (first !== -1) {
-        if (end + first - offset > lineCap) return skipped(end + first + 1, size); // the line at `offset` is over the cap
-        lastNewline = end + part.lastIndexOf(0x0a);
-        parts.push(part);
-        end += part.length;
-        break;
-      }
-      end += part.length;
-      if (!skipping) {
-        parts.push(part);
-        if (end - offset > lineCap) { skipping = true; parts.length = 0; } // discard, never accumulate
-      }
-    }
-    if (lastNewline === -1) return none(offset, size);
-    return assemble(parts, offset, end, lastNewline, size);
-  } catch {
-    return none(offset, st.size);
-  } finally {
-    closeSync(fd);
-  }
 }
 
 /** Read at most ~`maxBytes` of what was appended to `filePath` since `offset`
@@ -272,32 +212,7 @@ function metaPath(dir: string, id: string): string {
   return path.join(dir, `agent-${id}.meta.json`);
 }
 
-/** Sync equivalent of `readMeta`: tolerates absence, a symlink, a non-regular
- *  file, an oversized file and malformed JSON by returning the defaults. */
-export function readMetaFileSync(dir: string, id: string): TranscriptMeta {
-  try {
-    const fd = openReadNoFollow(metaPath(dir, id), { maxBytes: META_MAX_BYTES });
-    try {
-      const parts: Buffer[] = [];
-      let pos = 0;
-      for (;;) {
-        const buf = Buffer.allocUnsafe(Math.min(META_READ_STEP, META_MAX_BYTES + 1 - pos));
-        const n = readSync(fd, buf, 0, buf.length, pos);
-        if (n === 0) break;
-        parts.push(buf.subarray(0, n));
-        pos += n;
-        if (pos > META_MAX_BYTES) return defaultMeta(); // grew past the cap while reading
-      }
-      return metaFromText(Buffer.concat(parts).toString("utf8"));
-    } finally {
-      closeSync(fd);
-    }
-  } catch {
-    return defaultMeta();
-  }
-}
-
-/** Async equivalent of `readMeta` (same tolerance as the sync variant). */
+/** Equivalent of `readMeta`: tolerates absence, a symlink, a non-regular file, an oversized file and malformed JSON by returning the defaults. */
 export async function readMetaFile(
   dir: string,
   id: string,

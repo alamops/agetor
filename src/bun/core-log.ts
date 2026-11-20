@@ -38,7 +38,7 @@ import { chmod, mkdir, open, rename, stat, type FileHandle } from "node:fs/promi
 import path from "node:path";
 import { format } from "node:util";
 import { resolveDataDir } from "./core-creds.ts";
-import { redactSecrets } from "./opencode-http.ts";
+import { redactLogPatterns } from "./log-redact.ts";
 
 /** Rotate once the live file passes this size. daemon-log.ts keeps its own
  *  identical constant; it could adopt these later. */
@@ -96,12 +96,7 @@ function redactLiterals(text: string): string {
 /** The one redactor for log text: registered secrets, then Bearer/Authorization
  *  and `token=` patterns, then `redactSecrets` (OpenCode password forms). */
 export function redactLogText(text: string): string {
-  const out = redactLiterals(text)
-    // "Bearer xyz" of any length (redactSecrets only catches 8+ chars).
-    .replace(/\b(bearer)(\s+)[^\s"']+/gi, "$1$2[redacted]")
-    // `token=…` / `access_token: …` in a URL, header dump or JSON.
-    .replace(/(\b\w*token["']?\s*[=:]\s*["']?)[^\s&"',;}]+/gi, "$1[redacted]");
-  return redactSecrets(out);
+  return redactLogPatterns(redactLiterals(text));
 }
 
 // --- state -----------------------------------------------------------------

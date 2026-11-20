@@ -3,7 +3,7 @@ import { mkdirSync, mkdtempSync, rmSync, symlinkSync, writeFileSync } from "node
 import os from "node:os";
 import path from "node:path";
 import { createTranscriptClient, TranscriptClientError, type TranscriptWorkerLike } from "./transcript-client.ts";
-import { readChunkSync, splitAndParseLines } from "./transcript-parse.ts";
+import { readChunk, splitAndParseLines } from "./transcript-parse.ts";
 
 const root = mkdtempSync(path.join(os.tmpdir(), "agetor-transcript-client-"));
 afterAll(() => rmSync(root, { recursive: true, force: true }));
@@ -356,11 +356,11 @@ describe("main-thread responsiveness reading a 20 MB JSONL", () => {
 
     const oneShot = await measure(async (off) => {
       if (off > 0) return { lines: 0, nextOffset: off, eof: true };
-      const c = readChunkSync(bigPath, 0, 64 * 1024 * 1024);
+      const c = await readChunk(bigPath, 0, 64 * 1024 * 1024);
       const parsed = splitAndParseLines(c.text);
       return { lines: parsed.length, nextOffset: c.nextOffset, eof: c.eof };
     });
-    console.log(`[transcript-client] 20 MB one-shot sync read+parse on the main thread: ${oneShot.lines} lines in ${oneShot.elapsedMs.toFixed(0)} ms, max main-loop gap ${oneShot.maxGapMs.toFixed(1)} ms`);
+    console.log(`[transcript-client] 20 MB one-shot read+parse on the main thread: ${oneShot.lines} lines in ${oneShot.elapsedMs.toFixed(0)} ms, max main-loop gap ${oneShot.maxGapMs.toFixed(1)} ms`);
     expect(oneShot.lines).toBe(BIG_LINES);
   });
 });

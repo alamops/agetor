@@ -7,9 +7,7 @@ import {
   META_MAX_BYTES,
   parseLine,
   readChunk,
-  readChunkSync,
   readMetaFile,
-  readMetaFileSync,
   splitAndParseLines,
 } from "./transcript-parse.ts";
 
@@ -109,18 +107,6 @@ async function drainNewAsync(p: string, chunk: number): Promise<Step[]> {
   return steps;
 }
 
-function drainNewSync(p: string, chunk: number): Step[] {
-  const steps: Step[] = [];
-  let offset = 0;
-  for (let i = 0; i < 100_000; i++) {
-    const r = readChunkSync(p, offset, chunk);
-    steps.push(stepOf(r));
-    if (r.nextOffset === offset) break;
-    offset = r.nextOffset;
-  }
-  return steps;
-}
-
 function refParse(line: string): { parsed: unknown; failed: boolean } | "skipped" {
   if (!line) return "skipped"; // dispatchTailedLines: `if (!line) continue`
   try { return { parsed: JSON.parse(line), failed: false }; } catch { return { parsed: null, failed: true }; }
@@ -129,14 +115,13 @@ function refParse(line: string): { parsed: unknown; failed: boolean } | "skipped
 async function expectParity(p: string, chunk: number): Promise<void> {
   const ref = drainReference(p, chunk);
   expect(ref.length).toBeGreaterThan(0);
-  expect(drainNewSync(p, chunk)).toEqual(ref);
   expect(await drainNewAsync(p, chunk)).toEqual(ref);
   // Parse parity over every line the reference produced.
   const refLines = ref.flatMap((s) => s.lines);
   let offset = 0;
   const newParsed = [];
   for (;;) {
-    const r = readChunkSync(p, offset, chunk);
+    const r = await readChunk(p, offset, chunk);
     newParsed.push(...splitAndParseLines(r.text));
     if (r.nextOffset === offset) break;
     offset = r.nextOffset;
@@ -296,9 +281,6 @@ describe("no-follow and tolerance", () => {
     symlinkSync(target, link);
     // The watcher's copy refuses it (ELOOP -> none); the new readers do too.
     expect(refReadAppendedLinesSync(link, 0, 4096).lines).toEqual([]);
-    const syncRes = readChunkSync(link, 0, 4096);
-    expect(syncRes.text).toBe("");
-    expect(syncRes.nextOffset).toBe(0);
     const asyncRes = await readChunk(link, 0, 4096);
     expect(asyncRes.text).toBe("");
     expect(asyncRes.nextOffset).toBe(0);
@@ -313,7 +295,6 @@ describe("no-follow and tolerance", () => {
     const size = statSync(p).size;
     for (const target of [path.join(root, "does-not-exist.jsonl"), dir]) {
       expect((await readChunk(target, 0, 4096)).nextOffset).toBe(0);
-      expect(readChunkSync(target, 0, 4096).nextOffset).toBe(0);
     }
     for (const off of [size, size + 100]) {
       const r = await readChunk(p, off, 4096);
@@ -333,10 +314,8 @@ describe("readMetaFile", () => {
     write("partial", json({ agentType: "Plan", spawnDepth: "deep", description: 5 }));
     const full = { agentType: "Explore", description: "look around", spawnDepth: 2, toolUseId: "toolu_1" };
     expect(await readMetaFile(metaDir, "full")).toEqual(full);
-    expect(readMetaFileSync(metaDir, "full")).toEqual(full);
     const partial = { agentType: "Plan", description: null, spawnDepth: 1, toolUseId: null };
     expect(await readMetaFile(metaDir, "partial")).toEqual(partial);
-    expect(readMetaFileSync(metaDir, "partial")).toEqual(partial);
   });
 
   test("absent, malformed, symlinked and oversized sidecars give the defaults", async () => {
@@ -346,7 +325,6 @@ describe("readMetaFile", () => {
     write("huge", json({ agentType: "Explore", pad: "x".repeat(META_MAX_BYTES) }));
     for (const id of ["missing", "bad", "linked", "huge"]) {
       expect(await readMetaFile(metaDir, id)).toEqual(defaults);
-      expect(readMetaFileSync(metaDir, id)).toEqual(defaults);
     }
     expect((await readMetaFile(metaDir, "real")).agentType).toBe("Explore");
   });
@@ -363,7 +341,6 @@ describe("per-line cap", () => {
     const p = fixture(ok1 + bigLine + ok2);
     for (const read of [
       (o: number, chunk: number) => readChunk(p, o, chunk, CAP),
-      async (o: number, chunk: number) => readChunkSync(p, o, chunk, CAP),
     ]) {
       for (const chunk of [64, 300, 4096]) {
         let off = 0;

@@ -2,7 +2,7 @@ import { Database } from "bun:sqlite";
 import { migrate } from "./migrate.ts";
 import { migrations } from "./migrations/index.ts";
 import { dataDir, pidFilePath, credsFilePath, resolveDbPath } from "./db-path.ts";
-import { applyConnectionPragmas } from "./db-core/connection.ts";
+import { applyConnectionPragmas, SHORT_BUSY_TIMEOUT_MS } from "./db-core/connection.ts";
 import { buildDbModules } from "./db-core/modules.ts";
 import type { TaskDecorationDeps } from "./db-core/tasks.ts";
 // Interactions live in-memory in `interactions.ts`. The import creates a
@@ -34,6 +34,11 @@ applyConnectionPragmas(db);
 
 const applied = migrate(db, migrations);
 if (applied.length) console.log(`[agetor] applied migrations: ${applied.join(", ")}`);
+// This connection is the main thread's (tests, and the AGETOR_DB_MODE=inprocess
+// kill switch, which production honors): outside tests a contended write must
+// fail fast instead of freezing the event loop for the 5 s the worker may wait.
+// Set after the migrations, which may legitimately wait on another core's lock.
+if (process.env.NODE_ENV !== "test") db.exec(`PRAGMA busy_timeout = ${SHORT_BUSY_TIMEOUT_MS};`);
 
 // Names that moved to `db-core/` and are still imported from here.
 export type { AgentProfileInsertInput, AgentProfilePatch } from "./db-core/agent-profiles.ts";

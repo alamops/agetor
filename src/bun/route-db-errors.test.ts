@@ -5,6 +5,7 @@
  * "Worker crash"):
  *
  *   DbRestartingError  → 503 {error: "database restarting", code: "db-restarting"}, Retry-After: 1
+ *                        on GET/HEAD only (a write's outcome is unknown: no invitation to retry)
  *   DbUnavailableError → 503 {error: "database unavailable", code: "db-unavailable"}
  *
  * Two layers: the wrapper itself over a stand-in route table (every way a
@@ -78,7 +79,7 @@ const authed = (url: string, method = "GET") =>
   new Request(url, { method, headers: { authorization: `Bearer ${token}` } });
 
 describe("applyRoutePolicy maps database worker errors to 503", () => {
-  test("DbRestartingError, thrown or rejected, on every kind of route → 503 db-restarting with Retry-After: 1", async () => {
+  test("DbRestartingError, thrown or rejected, on every kind of route → 503 db-restarting, Retry-After: 1 on GET only", async () => {
     const restarting = () => new rpcm.DbRestartingError("worker exited");
     const w = wrap({
       public: () => { throw restarting(); },
@@ -93,10 +94,13 @@ describe("applyRoutePolicy maps database worker errors to 503", () => {
       await w["/methods"].POST(authed("http://x/methods", "POST")),
     ];
     expect(responses).toHaveLength(4);
-    for (const res of responses) {
+    // The first three are GETs; the POST (an unknown outcome) carries no Retry-After.
+    responses.forEach((res, i) => {
       expect(res.status).toBe(503);
-      expect(res.headers.get("retry-after")).toBe("1");
+      expect(res.headers.get("retry-after")).toBe(i < 3 ? "1" : null);
       expect(res.headers.get("x-cors")).toBe("1");
+    });
+    for (const res of responses) {
       expect(await res.json()).toEqual({ error: "database restarting", code: "db-restarting" });
     }
   });
