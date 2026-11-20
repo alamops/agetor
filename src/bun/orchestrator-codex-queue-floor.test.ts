@@ -1,4 +1,4 @@
-import { test, expect, beforeAll } from "bun:test";
+import { test, expect, beforeAll, afterAll } from "bun:test";
 import { mkdtempSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import path from "node:path";
@@ -6,6 +6,23 @@ import path from "node:path";
 // db.ts captures AGETOR_DATA_DIR at first import — mkdtemp BEFORE any
 // import that could pull db.ts in transitively. Mirrors
 // orchestrator-min-cli-version.test.ts.
+// `bun test` runs every file in one process, so each env var this file sets
+// is restored in afterAll; a leaked 400ms fake resolve delay breaks every later
+// codex test that relies on the 20ms default.
+const ENV_KEYS = [
+  "AGETOR_CODEX_DRIVER",
+  "AGETOR_FAKE_CODEX_RESOLVE_DELAY_MS",
+  "AGETOR_CODEX_BIN",
+  "FAKE_CODEX_VERSION",
+] as const;
+const savedEnv = new Map<string, string | undefined>(ENV_KEYS.map((k) => [k, process.env[k]]));
+afterAll(() => {
+  for (const [k, v] of savedEnv) {
+    if (v === undefined) delete process.env[k];
+    else process.env[k] = v;
+  }
+});
+
 process.env.AGETOR_DATA_DIR = mkdtempSync(path.join(tmpdir(), "agetor-codex-queue-floor-"));
 
 // Drive codex through the in-process fake (no tmux, no real CLI).
