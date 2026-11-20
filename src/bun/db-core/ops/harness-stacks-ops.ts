@@ -1,4 +1,5 @@
 import type { Database } from "bun:sqlite";
+import type { TaskHarnessState } from "../../../shared/types.ts";
 import { defineOp, type OpCtx } from "./define.ts";
 
 // Row shapes of the harness-stack tables, as stored. `harness-stacks.ts` maps
@@ -154,6 +155,25 @@ export const harnessStacksOps = {
   "stacks.clearTaskState": defineOp({
     tx: true,
     run: (ctx, stackId: string): number => clearTaskStateForStackOn(ctx, stackId),
+  }),
+
+  /** Compare-and-set of a task's failover state: write `next` only while the
+   *  stored state still serializes to `expected` (the JSON the caller read; the
+   *  task's state through the same parser, so the two sides normalize alike).
+   *  The failover engine's read-modify-write (`updateTaskState`) ends here, so a
+   *  write that raced it (a stack delete clearing the state) is never silently
+   *  overwritten with a state computed from the old read. False: the task is
+   *  gone or its state changed; the caller re-reads and decides again. No
+   *  `updated_at` bump (`tasks.setHarnessState`). */
+  "harnessState.cas": defineOp({
+    tx: true,
+    run: ({ modules }, taskId: string, expected: string, next: TaskHarnessState | null): boolean => {
+      const task = modules.tasks.get(taskId);
+      if (!task) return false;
+      if (JSON.stringify(task.harnessState ?? null) !== expected) return false;
+      modules.tasks.setHarnessState(taskId, next);
+      return true;
+    },
   }),
 
   /** Write (or replace) a cooldown row, sweeping expired rows first. Returns the

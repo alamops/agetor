@@ -86,7 +86,7 @@ describe("pipeline Stop and a pending harness-stack retry", () => {
   test("cancels the armed retry instead of 409ing, and the run reads cancelled", async () => {
     const a = account("a");
     const b = account("b");
-    const stack = stacks.harnessStacks.create({ label: "pipeline-retry", kind: "claude-code", members: [a, b] });
+    const stack = await stacks.harnessStacks.create({ label: "pipeline-retry", kind: "claude-code", members: [a, b] });
 
     const pipelineId = randomUUID();
     const parentId = randomUUID();
@@ -170,13 +170,13 @@ describe("pipeline Stop and a pending harness-stack retry", () => {
     expect(stopped.status).toBe("cancelled");
     expect(stopped.history[0]!.outcome).toBe("cancelled");
 
-    stacks.harnessStacks.delete(stack.id);
+    await stacks.harnessStacks.delete(stack.id);
   });
 
   test("a harness-swap successor's running event does not resume a stopped step", async () => {
     const a = account("swap-a");
     const b = account("swap-b");
-    const stack = stacks.harnessStacks.create({ label: "pipeline-stop-swap", kind: "claude-code", members: [a, b] });
+    const stack = await stacks.harnessStacks.create({ label: "pipeline-stop-swap", kind: "claude-code", members: [a, b] });
 
     const pipelineId = randomUUID();
     const parentId = randomUUID();
@@ -265,7 +265,7 @@ describe("pipeline Stop and a pending harness-stack retry", () => {
     expect(after.status).toBe("cancelled");
     expect(after.history[0]!.outcome).toBeNull();
     expect(after.history[0]!.stoppedRunId).toBe(oldRunId);
-    stacks.harnessStacks.delete(stack.id);
+    await stacks.harnessStacks.delete(stack.id);
   });
 
   test("a Stop on a step's own panel during the swap window settles the step cancelled (Q5)", async () => {
@@ -273,7 +273,7 @@ describe("pipeline Stop and a pending harness-stack retry", () => {
     const orch = await import("./orchestrator.ts");
     const a = account("q5-a");
     const b = account("q5-b");
-    const stack = stacks.harnessStacks.create({ label: "pipeline-q5", kind: "claude-code", members: [a, b] });
+    const stack = await stacks.harnessStacks.create({ label: "pipeline-q5", kind: "claude-code", members: [a, b] });
     const pipelineId = randomUUID();
     const parentId = randomUUID();
     const stepId = randomUUID();
@@ -346,7 +346,7 @@ describe("pipeline Stop and a pending harness-stack retry", () => {
     expect(runs[0]!.status).toBe("cancelled");
     // A user Stop, not a step failure.
     expect(db.tasks.get(parentId)!.pipelineRun!.history[0]!.outcome).toBe("cancelled");
-    stacks.harnessStacks.clearLimitState(a);
-    stacks.harnessStacks.delete(stack.id);
+    await stacks.harnessStacks.clearLimitState(a);
+    await stacks.harnessStacks.delete(stack.id);
   }, 20_000);
 });

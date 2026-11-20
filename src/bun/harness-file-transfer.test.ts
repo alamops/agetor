@@ -388,3 +388,34 @@ describe("temp-file mode is set by descriptor (re-review nit)", () => {
     expect(statSync(victim).mode & 0o777).toBe(0o600);
   });
 });
+
+describe("removeCopiedPathsDetailed async shouldStop", () => {
+  test("an async check (a database read) is awaited: its answer decides, and it runs before the first file", async () => {
+    const { mkdtempSync, mkdirSync, writeFileSync, existsSync } = await import("node:fs");
+    const { tmpdir } = await import("node:os");
+    const path = (await import("node:path")).default;
+    const ft = await import("./harness-file-transfer.ts");
+    const root = mkdtempSync(path.join(tmpdir(), "agetor-stop-async-"));
+    const sid = "13131313-1313-4313-8313-131313131313";
+    const dir = path.join(root, "projects", "enc", sid, "subagents");
+    mkdirSync(dir, { recursive: true });
+    const files = ["a.jsonl", "b.jsonl"].map((n) => path.join(dir, n));
+    for (const f of files) writeFileSync(f, "x");
+    const stopped = await ft.removeCopiedPathsDetailed(files, root, "claude-code", sid, {
+      shouldStop: async () => {
+        await Bun.sleep(1);
+        return true;
+      },
+    });
+    expect(stopped.removed).toEqual([]);
+    expect(stopped.retained).toEqual(files);
+    for (const f of files) expect(existsSync(f)).toBe(true);
+    const done = await ft.removeCopiedPathsDetailed(files, root, "claude-code", sid, {
+      shouldStop: async () => {
+        await Bun.sleep(1);
+        return false;
+      },
+    });
+    expect(done.removed).toEqual(files);
+  });
+});

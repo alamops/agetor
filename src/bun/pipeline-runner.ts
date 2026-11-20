@@ -2301,7 +2301,7 @@ export async function cancelPipelineRun(parentId: string): Promise<{ task: Task 
       // Same for a harness-stack retry: nothing may spawn on a stopped run's
       // behalf. `cancelLiveRunOfTask` above already stops an in-flight retry
       // spawn; this clears the armed timer and the exhausted state.
-      cancelHarnessRetryForTask(a.taskId);
+      await cancelHarnessRetryForTask(a.taskId);
     }
     for (const a of decidingTargets) {
       const historyEntry = run.history.find((h) => h.taskId === a.taskId && h.seq === a.seq);

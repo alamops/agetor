@@ -4703,8 +4703,8 @@ export function startApiServer(
             {
               harnesses: harnesses.list(),
               statuses,
-              stacks: harnessStacks.list(),
-              limitStates: harnessStacks.listLimitStates(),
+              stacks: await harnessStacks.list(),
+              limitStates: await harnessStacks.listLimitStates(),
               mirrorRestorable: await harnessIdsWithProvenance(),
             },
             { headers: corsHeaders(req) },
@@ -4824,9 +4824,9 @@ export function startApiServer(
       // no bundle export, no global flag; deleting the stack makes failover
       // inert at the task's next selection.
       "/harness-stacks": {
-        GET: authed((req) =>
+        GET: authed(async (req) =>
           json(
-            { stacks: harnessStacks.list(), limitStates: harnessStacks.listLimitStates() },
+            { stacks: await harnessStacks.list(), limitStates: await harnessStacks.listLimitStates() },
             { headers: corsHeaders(req) },
           )),
         POST: authed(async (req) => {
@@ -4835,14 +4835,14 @@ export function startApiServer(
           const rootRefusal = await gateStackMemberRoots(req, (body.input as StackInput).members);
           if (rootRefusal) return rootRefusal;
           try {
-            const stack = harnessStacks.create(body.input as StackInput);
+            const stack = await harnessStacks.create(body.input as StackInput);
             // The mirror copies the primary's whole config tree (plugins alone
             // can be thousands of files). Keep the request alive so a slow
             // volume cannot trip Bun's 255 s idle cap after the stack is saved.
             server.timeout(req, 0);
             const mirror = await mirrorStack(stack, {});
             return json(
-              { stack: harnessStacks.get(stack.id, { warnings: true }) ?? stack, warnings: stack.warnings, mirror },
+              { stack: (await harnessStacks.get(stack.id, { warnings: true })) ?? stack, warnings: stack.warnings, mirror },
               { status: 201, headers: corsHeaders(req) },
             );
           } catch (err) {
@@ -4877,7 +4877,7 @@ export function startApiServer(
             return json({ error: "stackId must be a string" }, { status: 400, headers: corsHeaders(req) });
           }
           const members = body.members as string[];
-          const existing = typeof body.stackId === "string" ? harnessStacks.get(body.stackId) : null;
+          const existing = typeof body.stackId === "string" ? await harnessStacks.get(body.stackId) : null;
           if (typeof body.stackId === "string" && !existing) {
             return json({ error: "not found" }, { status: 404, headers: corsHeaders(req) });
           }
@@ -4888,7 +4888,7 @@ export function startApiServer(
           // and `stackWarnings` reads login evidence inside them, in-process.
           const rootRefusal = await gateStackMemberRoots(req, members);
           if (rootRefusal) return rootRefusal;
-          const validation = validateStackInput(
+          const validation = await validateStackInput(
             { label: existing?.label ?? "preview", kind: body.kind, members, mirrorMode },
             existing?.id,
           );
@@ -4915,7 +4915,7 @@ export function startApiServer(
       // Newest-first swap history of one stack, paged by an opaque cursor.
       "/harness-stacks/:id/history": {
         GET: authed(async (req) => {
-          if (!harnessStacks.get(req.params.id)) {
+          if (!(await harnessStacks.get(req.params.id))) {
             return json({ error: "not found" }, { status: 404, headers: corsHeaders(req) });
           }
           const params = new URL(req.url).searchParams;
@@ -4933,16 +4933,16 @@ export function startApiServer(
       },
 
       "/harness-stacks/:id": {
-        GET: authed((req) => {
+        GET: authed(async (req) => {
           // The detail read is what `agetor harness stack show` prints, so it
           // carries the member warnings; the runtime lookups skip them.
-          const stack = harnessStacks.get(req.params.id, { warnings: true });
+          const stack = await harnessStacks.get(req.params.id, { warnings: true });
           return stack
-            ? json({ stack, limitStates: harnessStacks.listLimitStates() }, { headers: corsHeaders(req) })
+            ? json({ stack, limitStates: await harnessStacks.listLimitStates() }, { headers: corsHeaders(req) })
             : json({ error: "not found" }, { status: 404, headers: corsHeaders(req) });
         }),
         PATCH: authed(async (req) => {
-          const current = harnessStacks.get(req.params.id);
+          const current = await harnessStacks.get(req.params.id);
           if (!current) return json({ error: "not found" }, { status: 404, headers: corsHeaders(req) });
           const body = await parseStackBody(req, { partial: true });
           if ("error" in body) return json({ error: body.error }, { status: 400, headers: corsHeaders(req) });
@@ -4954,7 +4954,7 @@ export function startApiServer(
           );
           if (rootRefusal) return rootRefusal;
           try {
-            const stack = harnessStacks.update(req.params.id, body.input);
+            const stack = await harnessStacks.update(req.params.id, body.input);
             // A label-only rename changes nothing the mirror reads. Re-running
             // the full config copy (hundreds of files, possibly hooks) for a
             // cosmetic edit is wasted work and a needless write window.
@@ -4967,7 +4967,7 @@ export function startApiServer(
               ? await mirrorStack(stack, {})
               : { copied: [], warnings: [] };
             return json(
-              { stack: harnessStacks.get(stack.id, { warnings: true }) ?? stack, warnings: stack.warnings, mirror },
+              { stack: (await harnessStacks.get(stack.id, { warnings: true })) ?? stack, warnings: stack.warnings, mirror },
               { headers: corsHeaders(req) },
             );
           } catch (err) {
@@ -4985,8 +4985,8 @@ export function startApiServer(
             return json({ error: (err as Error).message }, { status: 400, headers: corsHeaders(req) });
           }
         }),
-        DELETE: authed((req) => {
-          const stack = harnessStacks.get(req.params.id);
+        DELETE: authed(async (req) => {
+          const stack = await harnessStacks.get(req.params.id);
           if (!stack) {
             return json({ error: "not found" }, { status: 404, headers: corsHeaders(req) });
           }
@@ -4997,24 +4997,24 @@ export function startApiServer(
           // Resolved BEFORE the delete: a task whose account was edited into
           // this stack after its last state write still names the old stack
           // id, so the stored-id filter alone would miss it (review S10).
-          const affected = failoverTaskIdsForStack(stack.id);
+          const affected = await failoverTaskIdsForStack(stack.id);
           // A task whose account has since moved into another stack still
           // records this id until its next write: re-point it first, so the
           // delete neither cancels its retry or scheduled switch nor wipes the
           // state it now carries for the other stack.
-          repointTaskStatesAwayFromStack(stack.id);
+          await repointTaskStatesAwayFromStack(stack.id);
           // An armed quota-reset retry or an all-exhausted block would
           // otherwise lose its countdown silently: cancel it first so the card
           // says why (the cancel also hands held follow-ups back to the
           // backlog), then drop the rest of the failover state.
           for (const taskId of affected) {
             if (tasks.get(taskId)?.harnessState?.scheduledSwitch) {
-              cancelScheduledAccountSwitch(taskId, "scheduled account switch cancelled — the stack was deleted");
+              await cancelScheduledAccountSwitch(taskId, "scheduled account switch cancelled — the stack was deleted");
             }
-            cancelHarnessRetryForTask(taskId, "automatic account retry cancelled — the stack was deleted");
+            await cancelHarnessRetryForTask(taskId, "automatic account retry cancelled — the stack was deleted");
           }
-          harnessStacks.delete(stack.id);
-          for (const taskId of affected) clearFailoverState(taskId);
+          await harnessStacks.delete(stack.id);
+          for (const taskId of affected) await clearFailoverState(taskId);
           return json({ removed: true }, { headers: corsHeaders(req) });
         }),
       },
@@ -5144,7 +5144,7 @@ export function startApiServer(
           // stack save checks this once; a later edit is checked here
           // (docs/architecture/harness-stacks.md).
           if (patch.home !== undefined || patch.env !== undefined) {
-            const rootError = harnessStacks.validateMemberRoot(req.params.id, {
+            const rootError = await harnessStacks.validateMemberRoot(req.params.id, {
               kind: current.kind,
               home: patch.home !== undefined ? patch.home : current.home,
               env: patch.env ?? current.env,
@@ -5217,7 +5217,7 @@ export function startApiServer(
             // succeeded. `harnesses.delete` re-checks in-use atomically with
             // the row delete, so a task assigned in this window still gets a
             // 409 with its conversation untouched (review R13-S2).
-            const copies = collectHarnessSessionCopies(req.params.id);
+            const copies = await collectHarnessSessionCopies(req.params.id);
             harnesses.delete(req.params.id);
             await removeHarnessSessionCopies(copies);
             // The row (and, with it, its provenance rows) is gone, so the
@@ -5875,19 +5875,19 @@ export function startApiServer(
       // Clear an account's cooldown rows (D13): all of them, or just the one
       // for `?model=`. Touches no files, so no path gate.
       "/harnesses/:id/limit-state": {
-        DELETE: authed((req) => {
+        DELETE: authed(async (req) => {
           const harness = harnesses.getByIdOrKind(req.params.id);
           if (!harness) return json({ error: "not found" }, { status: 404, headers: corsHeaders(req) });
           const params = new URL(req.url).searchParams;
           const model = params.get("model")?.trim().toLowerCase();
-          if (model) harnessStacks.clearLimitState(harness.id, { model });
-          else if (params.get("scope") === "account") harnessStacks.clearLimitState(harness.id, { accountWideOnly: true });
-          else harnessStacks.clearLimitState(harness.id);
+          if (model) await harnessStacks.clearLimitState(harness.id, { model });
+          else if (params.get("scope") === "account") await harnessStacks.clearLimitState(harness.id, { accountWideOnly: true });
+          else await harnessStacks.clearLimitState(harness.id);
           // A task waiting out the cooldown must not keep waiting for a reset
           // that no longer applies.
-          const rearmed = rearmRetriesAfterCooldownClear(harness.id);
+          const rearmed = await rearmRetriesAfterCooldownClear(harness.id);
           return json(
-            { cleared: true, rearmed, limitStates: harnessStacks.listLimitStates() },
+            { cleared: true, rearmed, limitStates: await harnessStacks.listLimitStates() },
             { headers: corsHeaders(req) },
           );
         }),
@@ -6494,10 +6494,10 @@ export function startApiServer(
           // them to stop first. A switch outside the stack keeps today's
           // kill-and-reset behavior and its existing guards.
           const beforeStack = typeof patch.agent === "string" && patch.agent !== before.agent
-            ? harnessStacks.getByMember(before.agent)
+            ? await harnessStacks.getByMember(before.agent)
             : null;
           const afterStack = beforeStack && typeof patch.agent === "string"
-            ? harnessStacks.getByMember(patch.agent)
+            ? await harnessStacks.getByMember(patch.agent)
             : null;
           const sameStackAccountSwitch = Boolean(
             beforeStack && afterStack && beforeStack.id === afterStack.id,
@@ -6602,12 +6602,12 @@ export function startApiServer(
           // starting a fresh conversation on the backup (review R15-S3). The
           // automatic swap already persists its own `pendingSwap`.
           if (sameStackAccountSwitch && typeof patch.agent === "string") {
-            beginManualAccountSwitch(before.id, before.agent, patch.agent);
+            await beginManualAccountSwitch(before.id, before.agent, patch.agent);
           }
           try {
             const updated = tasks.update(req.params.id, patch);
             if (!updated) {
-              clearManualAccountSwitch(before.id);
+              await clearManualAccountSwitch(before.id);
               return json({ error: "not found" }, { status: 404, headers: corsHeaders(req) });
             }
             // A manual move (drag, `agetor move`) emits no global `column` event,
@@ -6627,7 +6627,7 @@ export function startApiServer(
               && updated.column !== "blocked"
               && (before.column === "blocked" || before.harnessState?.allExhausted)
             ) {
-              cancelHarnessRetryForTask(req.params.id);
+              await cancelHarnessRetryForTask(req.params.id);
             }
             // Mirror behavioural changes onto a live claude session via slash
             // commands so the conversation context survives a model/mode/effort
@@ -6711,7 +6711,7 @@ export function startApiServer(
               { status: 409, headers: corsHeaders(req) },
             );
           }
-          const resolved = harnessStacks.resolveForTask(task);
+          const resolved = await harnessStacks.resolveForTask(task);
           const rootRefusal = await gateStackMemberRoots(req, [
             task.agent,
             ...(resolved ? resolved.stack.members.map((m) => m.harnessId) : []),
@@ -6733,7 +6733,7 @@ export function startApiServer(
             return json({ error: (err as Error).message }, { status: 500, headers: corsHeaders(req) });
           }
         }),
-        DELETE: authed((req) => {
+        DELETE: authed(async (req) => {
           if (!tasks.get(req.params.id)) {
             return json({ error: "not found" }, { status: 404, headers: corsHeaders(req) });
           }
@@ -6753,7 +6753,7 @@ export function startApiServer(
           // `cancelled` says whether a switch was actually scheduled, so a
           // caller can tell a cancel from a no-op.
           const cancelled = tasks.get(req.params.id)?.harnessState?.scheduledSwitch != null;
-          const task = cancelScheduledAccountSwitch(req.params.id);
+          const task = await cancelScheduledAccountSwitch(req.params.id);
           return json({ task: withRunningSubagents(task), cancelled }, { headers: corsHeaders(req) });
         }),
       },

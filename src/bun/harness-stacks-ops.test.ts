@@ -93,6 +93,40 @@ describe("stack membership ops", () => {
   });
 });
 
+describe("harnessState.cas", () => {
+  test("writes only while the stored state is still the one the caller read", async () => {
+    const stackId = await mkStack(["ops-cas1"]);
+    const id = mkTask(stackId);
+    const read = dbm.tasks.get(id)!.harnessState!;
+    const next = { ...read, position: 1 };
+    expect(await op("harnessState.cas", [id, JSON.stringify(read), next])).toBe(true);
+    expect(dbm.tasks.get(id)?.harnessState?.position).toBe(1);
+    // The same stale read again: the state moved on, so nothing is written.
+    expect(await op("harnessState.cas", [id, JSON.stringify(read), { ...read, position: 2 }])).toBe(false);
+    expect(dbm.tasks.get(id)?.harnessState?.position).toBe(1);
+  });
+
+  test("a stack delete that cleared the state wins over a write computed from the old read", async () => {
+    const stackId = await mkStack(["ops-cas2"]);
+    const id = mkTask(stackId);
+    const read = dbm.tasks.get(id)!.harnessState!;
+    await op("stacks.delete", [stackId]);
+    expect(await op("harnessState.cas", [id, JSON.stringify(read), { ...read, tried: ["x"] }])).toBe(false);
+    expect(dbm.tasks.get(id)?.harnessState).toBeNull();
+  });
+
+  test("clears with null, reports a missing task, and never bumps updated_at", async () => {
+    const stackId = await mkStack(["ops-cas3"]);
+    const id = mkTask(stackId);
+    const before = dbm.tasks.get(id)!;
+    expect(await op("harnessState.cas", [id, JSON.stringify(before.harnessState), null])).toBe(true);
+    const after = dbm.tasks.get(id)!;
+    expect(after.harnessState).toBeNull();
+    expect(after.updatedAt).toBe(before.updatedAt);
+    expect(await op("harnessState.cas", ["task-nope", "null", null])).toBe(false);
+  });
+});
+
 describe("limit-state ops", () => {
   const set = (harness: string, model: string, reset: number | null, now: number, reason = "quota") =>
     op("limit.set", [harness, model, reason, "claude-api-error", null, reset, 600_000, now]);

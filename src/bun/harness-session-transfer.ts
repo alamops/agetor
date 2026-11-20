@@ -34,7 +34,7 @@ import {
   runs,
   type HarnessSessionHandoff,
   type SessionIdColumn,
-} from "./db.ts";
+} from "./db-async.ts";
 import {
   copyRegularFileDetailed,
   copyTreeCooperative,
@@ -248,7 +248,13 @@ function transferInFlight(harnessId: string, column: SessionIdColumn, sessionId:
   return (transfersInFlight.get(flightKey(harnessId, column, sessionId)) ?? 0) > 0;
 }
 
+/** Bumped by every `holdFlight`. An async check of "is anything about to touch
+ *  this session" reads it before and after its database hop: a transfer that
+ *  started and finished inside the hop changed it, so the check runs again. */
+let flightEpoch = 0;
+
 function holdFlight(key: string): () => void {
+  flightEpoch++;
   transfersInFlight.set(key, (transfersInFlight.get(key) ?? 0) + 1);
   let released = false;
   return () => {
@@ -301,22 +307,22 @@ async function heldTransfer(
 
 /** Keep a handoff row's session id and timestamp as they were, after a failed
  *  attempt recorded its intended paths. */
-function restoreHandoff(
+async function restoreHandoff(
   prior: HarnessSessionHandoff | null,
   taskId: string,
   harnessId: string,
   column: SessionIdColumn,
-): void {
+): Promise<void> {
   // No earlier row: the stamped-0 intent row is abandoned, its paths orphaned
   // under the new session. A row for another session was never touched (the
   // intended paths are already pending orphans), and one for the same session
   // keeps its paths. `heldTransfer` sweeps the new session once the transfer
   // is no longer in flight.
   if (!prior) {
-    harnessSessionHandoffs.abandon(taskId, harnessId, column);
+    await harnessSessionHandoffs.abandon(taskId, harnessId, column);
     return;
   }
-  harnessSessionHandoffs.upsert(prior);
+  await harnessSessionHandoffs.upsert(prior);
 }
 
 /**
@@ -336,20 +342,20 @@ function restoreHandoff(
  *   instead: the final upsert re-keys the row and reclaims them, a failed
  *   copy leaves them for the sweep, and so does a crash, at boot.
  */
-function recordIntended(
+async function recordIntended(
   taskId: string,
   harnessId: string,
   column: SessionIdColumn,
   sessionId: string,
   prior: HarnessSessionHandoff | null,
   intended: readonly string[],
-): void {
+): Promise<void> {
   if (intended.length === 0) return;
   if (prior && prior.sessionId !== sessionId) {
-    harnessOrphanedCopies.add(harnessId, column, sessionId, intended);
+    await harnessOrphanedCopies.add(harnessId, column, sessionId, intended);
     return;
   }
-  harnessSessionHandoffs.upsert({
+  await harnessSessionHandoffs.upsert({
     taskId,
     harnessId,
     columnName: column,
@@ -425,7 +431,7 @@ async function claudeTransferUnheld(
   const trees = claudeSessionTrees(fromRoot, toRoot, located, sessionId);
 
   const warnings: string[] = [];
-  const prior = harnessSessionHandoffs.get(taskId, toHarness.id, CLAUDE_SESSION_COLUMN);
+  const prior = await harnessSessionHandoffs.get(taskId, toHarness.id, CLAUDE_SESSION_COLUMN);
   // Only files this transfer will CREATE go on the cleanup allowlist. A
   // pre-existing destination is the account's own file (e.g. its original
   // transcript after an A→B→A wrap): the copy still updates it, but deleting
@@ -441,7 +447,7 @@ async function claudeTransferUnheld(
       warnings.push(`${tree.label}: could not be scanned (${errMessage(err)})`);
     }
   }
-  recordIntended(taskId, toHarness.id, CLAUDE_SESSION_COLUMN, sessionId, prior, intended);
+  await recordIntended(taskId, toHarness.id, CLAUDE_SESSION_COLUMN, sessionId, prior, intended);
 
   const copied: string[] = [];
   try {
@@ -450,7 +456,7 @@ async function claudeTransferUnheld(
   } catch (err) {
     // Whatever this transfer recorded is swept by `heldTransfer` once the
     // transfer is no longer in flight.
-    if (intended.length > 0) restoreHandoff(prior, taskId, toHarness.id, CLAUDE_SESSION_COLUMN);
+    if (intended.length > 0) await restoreHandoff(prior, taskId, toHarness.id, CLAUDE_SESSION_COLUMN);
     return { ok: false, reason: "io", message: errMessage(err) };
   }
 
@@ -475,7 +481,7 @@ async function claudeTransferUnheld(
     }
   }
 
-  harnessSessionHandoffs.upsert({
+  await harnessSessionHandoffs.upsert({
     taskId,
     harnessId: toHarness.id,
     columnName: CLAUDE_SESSION_COLUMN,
@@ -517,13 +523,13 @@ async function cleanupHandoff(
   kind: HarnessStackKind,
   rootFor: (harness: Harness) => string,
 ): Promise<string[]> {
-  const handoff = harnessSessionHandoffs.get(taskId, harnessId, column);
+  const handoff = await harnessSessionHandoffs.get(taskId, harnessId, column);
   if (!handoff) return [];
-  const harness = harnesses.getByIdOrKind(harnessId);
+  const harness = await harnesses.getByIdOrKind(harnessId);
   // A row whose column is not the account's kind was never written by a
   // transfer (`columnMatchesHarness`): dropped, its paths never acted on.
   if (!harness || !columnMatchesHarness(harness, column)) {
-    harnessSessionHandoffs.deleteOne(taskId, harnessId, column);
+    await harnessSessionHandoffs.deleteOne(taskId, harnessId, column);
     return [];
   }
   const result = await removeCopiedPathsDetailed(handoff.copiedPaths, rootFor(harness), kind, handoff.sessionId);
@@ -532,7 +538,7 @@ async function cleanupHandoff(
       `${result.retained.length} copied session file(s) for task ${taskId} were left in place (account ${harnessId}: its config directory changed or a file could not be removed); the record is kept so a later cleanup can remove them`,
     ];
   }
-  harnessSessionHandoffs.deleteOne(taskId, harnessId, column);
+  await harnessSessionHandoffs.deleteOne(taskId, harnessId, column);
   return [];
 }
 
@@ -667,26 +673,26 @@ async function codexTransferUnheld(
     return unsafeReason("the rollout is not in Codex's sessions/YYYY/MM/DD layout");
   }
   const dest = path.join(toRoot, rel);
-  const prior = harnessSessionHandoffs.get(taskId, toHarness.id, CODEX_SESSION_COLUMN);
+  const prior = await harnessSessionHandoffs.get(taskId, toHarness.id, CODEX_SESSION_COLUMN);
   // Same rules as the Claude adapter: a rollout the destination already had
   // is its own, never put on the cleanup allowlist (contract C5), and the
   // new path is recorded BEFORE it is created.
   const destState = destinationState(toRoot, dest);
   if (destState === "unsafe") return unsafeReason("the destination path traverses a symlinked directory");
   const intended = destState === "absent" ? [dest] : [];
-  recordIntended(taskId, toHarness.id, CODEX_SESSION_COLUMN, sessionId, prior, intended);
+  await recordIntended(taskId, toHarness.id, CODEX_SESSION_COLUMN, sessionId, prior, intended);
   const copiedPaths: string[] = [];
   try {
     const result = await copyRegularFileDetailed(source, dest, { maxBytes: NO_SIZE_LIMIT, root: toRoot });
     if (result.created) copiedPaths.push(dest);
   } catch (err) {
-    if (intended.length > 0) restoreHandoff(prior, taskId, toHarness.id, CODEX_SESSION_COLUMN);
+    if (intended.length > 0) await restoreHandoff(prior, taskId, toHarness.id, CODEX_SESSION_COLUMN);
     return { ok: false, reason: "io", message: errMessage(err) };
   }
   const warnings: string[] = [];
   const migrationWarning = await migrateCodexRollouts(toHarness);
   if (migrationWarning) warnings.push(migrationWarning);
-  harnessSessionHandoffs.upsert({
+  await harnessSessionHandoffs.upsert({
     taskId,
     harnessId: toHarness.id,
     columnName: CODEX_SESSION_COLUMN,
@@ -735,26 +741,54 @@ const ADAPTERS: SessionTransferAdapter[] = [claudeSessionTransfer, codexSessionT
  * kind is resolved through the harness lookup so the built-in kind id and the
  * built-in harness id compare equal.
  */
-export function findSessionIdForHarness(
+export async function findSessionIdForHarness(
   taskId: string,
   column: SessionIdColumn,
   harnessId: string,
-): string | null {
-  const handoff = harnessSessionHandoffs.get(taskId, harnessId, column);
-  // A row stamped 0 is a pre-recorded intent whose copy never completed (the
-  // final upsert stamps the real time): never resume it.
+): Promise<string | null> {
+  const handoff = await harnessSessionHandoffs.get(taskId, harnessId, column);
   if (handoff && handoff.createdAt > 0) {
-    const own = runs.newestSessionForHarness(taskId, column, harnessId);
-    if (!own || handoff.createdAt >= own.startedAt) return handoff.sessionId;
+    const won = handoffSessionWins(handoff, await runs.newestSessionForHarness(taskId, column, harnessId));
+    if (won !== null) return won;
   }
+  const rows = await runs.sessionIdsForTask(taskId, column);
+  return sessionFromRuns(rows, harnessId, await harnessIdsOfAgents(rows));
+}
+
+/** Each distinct `agent` of `rows` resolved to its harness id (a legacy bare
+ *  kind to the built-in's id, an account that no longer exists to itself). */
+async function harnessIdsOfAgents(rows: readonly { agent: string }[]): Promise<Map<string, string>> {
   const resolved = new Map<string, string>();
-  for (const row of runs.sessionIdsForTask(taskId, column)) {
-    let rowHarnessId = resolved.get(row.agent);
-    if (rowHarnessId === undefined) {
-      rowHarnessId = harnesses.getByIdOrKind(row.agent)?.id ?? row.agent;
-      resolved.set(row.agent, rowHarnessId);
-    }
-    if (rowHarnessId === harnessId) return row.sessionId;
+  for (const { agent } of rows) {
+    if (!resolved.has(agent)) resolved.set(agent, (await harnesses.getByIdOrKind(agent))?.id ?? agent);
+  }
+  return resolved;
+}
+
+/** The pure half of {@link findSessionIdForHarness}, shared with the
+ *  orchestrator's synchronous paths so the rule has one implementation: the
+ *  handoff's session when it is newer than any run the account itself recorded
+ *  (`own`, the account's newest session row, or null), else null. A row
+ *  stamped 0 is a pre-recorded intent whose copy never completed (the final
+ *  upsert stamps the real time): never resumed. */
+export function handoffSessionWins(
+  handoff: HarnessSessionHandoff | null,
+  own: { startedAt: number } | null,
+): string | null {
+  if (!handoff || handoff.createdAt <= 0) return null;
+  return !own || handoff.createdAt >= own.startedAt ? handoff.sessionId : null;
+}
+
+/** The pure other half: the newest of `rows` (newest first) whose `agent`
+ *  resolves, through `harnessIdOf`, to `harnessId`. */
+export function sessionFromRuns(
+  rows: readonly { agent: string; sessionId: string }[],
+  harnessId: string,
+  harnessIdOf: ReadonlyMap<string, string> | ((agent: string) => string),
+): string | null {
+  for (const row of rows) {
+    const id = typeof harnessIdOf === "function" ? harnessIdOf(row.agent) : (harnessIdOf.get(row.agent) ?? row.agent);
+    if (id === harnessId) return row.sessionId;
   }
   return null;
 }
@@ -792,22 +826,14 @@ function columnMatchesHarness(harness: Harness, column: string): boolean {
  * turn (no tool call, only its own freshly-minted session id) still takes the
  * documented clean retry.
  */
-export function hasPriorSessionForHarness(
+export async function hasPriorSessionForHarness(
   taskId: string,
   column: SessionIdColumn,
   harnessId: string,
   excludeRunId: string,
-): boolean {
-  const resolved = new Map<string, string>();
-  for (const row of runs.sessionIdsForTask(taskId, column, { excludeRunId })) {
-    let rowHarnessId = resolved.get(row.agent);
-    if (rowHarnessId === undefined) {
-      rowHarnessId = harnesses.getByIdOrKind(row.agent)?.id ?? row.agent;
-      resolved.set(row.agent, rowHarnessId);
-    }
-    if (rowHarnessId === harnessId) return true;
-  }
-  return false;
+): Promise<boolean> {
+  const rows = await runs.sessionIdsForTask(taskId, column, { excludeRunId });
+  return sessionFromRuns(rows, harnessId, await harnessIdsOfAgents(rows)) !== null;
 }
 
 /**
@@ -827,8 +853,8 @@ export interface HarnessSessionCopies {
 
 /** Capture (never remove) the copied files a harness owns as a handoff
  *  DESTINATION. Empty for a missing harness or an account with no handoffs. */
-export function collectHarnessSessionCopies(harnessId: string): HarnessSessionCopies[] {
-  const harness = harnesses.getByIdOrKind(harnessId);
+export async function collectHarnessSessionCopies(harnessId: string): Promise<HarnessSessionCopies[]> {
+  const harness = await harnesses.getByIdOrKind(harnessId);
   if (!harness) return [];
   const toCopies = (column: SessionIdColumn, sessionId: string, paths: readonly string[]): HarnessSessionCopies => {
     const codex = column === CODEX_SESSION_COLUMN;
@@ -842,10 +868,9 @@ export function collectHarnessSessionCopies(harnessId: string): HarnessSessionCo
   // The orphaned copies (migration 088) are this account's files too. A
   // record whose column is not this account's kind is never acted on; the
   // delete drops its row with the account's other rows.
-  const orphans = groupOrphans(harnessOrphanedCopies.list({ harnessId: harness.id }));
+  const orphans = groupOrphans(await harnessOrphanedCopies.list({ harnessId: harness.id }));
   return [
-    ...harnessSessionHandoffs
-      .listForHarness(harnessId)
+    ...(await harnessSessionHandoffs.listForHarness(harnessId))
       .filter((h) => columnMatchesHarness(harness, h.columnName))
       .map((h) => toCopies(h.columnName, h.sessionId, h.copiedPaths)),
     ...orphans
@@ -876,11 +901,11 @@ export async function removeHarnessSessionCopies(copies: readonly HarnessSession
  */
 export async function cleanupHarnessSessionCopies(taskId: string): Promise<string[]> {
   const warnings: string[] = [];
-  for (const handoff of harnessSessionHandoffs.listForTask(taskId)) {
+  for (const handoff of await harnessSessionHandoffs.listForTask(taskId)) {
     const adapter = sessionTransferAdapter(handoff.columnName === CODEX_SESSION_COLUMN ? "codex" : "claude-code");
-    const harness = harnesses.getByIdOrKind(handoff.harnessId);
+    const harness = await harnesses.getByIdOrKind(handoff.harnessId);
     if (adapter) warnings.push(...(await adapter.cleanup(taskId, handoff.harnessId)));
-    else if (!harness) harnessSessionHandoffs.deleteOne(taskId, handoff.harnessId, handoff.columnName);
+    else if (!harness) await harnessSessionHandoffs.deleteOne(taskId, handoff.harnessId, handoff.columnName);
   }
   for (const warning of warnings) console.warn(`[harness-stacks] ${warning}`);
   return warnings;
@@ -959,9 +984,9 @@ export function resetOrphanSweepPauseForTests(): void {
  * are untrusted rows, so one naming such a session is never acted on. A
  * session only an older run used, superseded since, is not live.
  */
-function liveOnRunsOfHarness(harnessId: string, column: SessionIdColumn, sessionId: string): boolean {
-  for (const taskId of runs.taskIdsWithSession(column, sessionId)) {
-    if (findSessionIdForHarness(taskId, column, harnessId) === sessionId) return true;
+async function liveOnRunsOfHarness(harnessId: string, column: SessionIdColumn, sessionId: string): Promise<boolean> {
+  for (const taskId of await runs.taskIdsWithSession(column, sessionId)) {
+    if ((await findSessionIdForHarness(taskId, column, harnessId)) === sessionId) return true;
   }
   return false;
 }
@@ -1004,18 +1029,17 @@ async function sweepOnce(
   // of the same session that started while this sweep yielded (its pending
   // path, possibly one this sweep had just unlinked and the copy is about to
   // recreate). Only records stamped at or before the mark are forgotten.
-  const mark = harnessOrphanedCopies.sweepMark();
+  const mark = await harnessOrphanedCopies.sweepMark();
   // A record under a column no handoff writes was planted: never listed, and
   // dropped here.
-  out.forgotten += harnessOrphanedCopies.forgetForeignColumns(filter.harnessId);
-  const rows = harnessOrphanedCopies
-    .list(filter.harnessId !== undefined ? { harnessId: filter.harnessId } : {})
+  out.forgotten += await harnessOrphanedCopies.forgetForeignColumns(filter.harnessId);
+  const rows = (await harnessOrphanedCopies.list(filter.harnessId !== undefined ? { harnessId: filter.harnessId } : {}))
     .filter((r) => (filter.columnName === undefined || r.columnName === filter.columnName)
       && (filter.sessionId === undefined || r.sessionId === filter.sessionId));
   for (const group of groupOrphans(rows)) {
-    const harness = harnesses.getByIdOrKind(group.harnessId);
+    const harness = await harnesses.getByIdOrKind(group.harnessId);
     if (!harness) {
-      harnessOrphanedCopies.forget(group.harnessId, group.columnName, group.sessionId, group.paths, { notAfter: mark });
+      await harnessOrphanedCopies.forget(group.harnessId, group.columnName, group.sessionId, group.paths, { notAfter: mark });
       out.forgotten += group.paths.length;
       continue;
     }
@@ -1024,17 +1048,27 @@ async function sweepOnce(
     // (`columnMatchesHarness`). No transfer writes one, so the records are
     // forgotten whatever their stamp, never acted on.
     if (!columnMatchesHarness(harness, group.columnName)) {
-      harnessOrphanedCopies.forget(group.harnessId, group.columnName, group.sessionId, group.paths);
+      await harnessOrphanedCopies.forget(group.harnessId, group.columnName, group.sessionId, group.paths);
       out.forgotten += group.paths.length;
       continue;
     }
-    const busy = () =>
-      transferInFlight(group.harnessId, group.columnName, group.sessionId)
-      || harnessSessionHandoffs.hasLiveSession(group.harnessId, group.columnName, group.sessionId);
+    // A transfer of this session is checked in memory (synchronously) and a
+    // live handoff row in the database (a thread hop). A transfer that starts
+    // and ends inside that hop bumps `flightEpoch`, so the pair is re-asked
+    // until nothing started meanwhile: the answer is never older than the
+    // last synchronous look.
+    const busy = async (): Promise<boolean> => {
+      for (;;) {
+        if (transferInFlight(group.harnessId, group.columnName, group.sessionId)) return true;
+        const epoch = flightEpoch;
+        if (await harnessSessionHandoffs.hasLiveSession(group.harnessId, group.columnName, group.sessionId)) return true;
+        if (epoch === flightEpoch && !transferInFlight(group.harnessId, group.columnName, group.sessionId)) return false;
+      }
+    };
     // The runs lookup is asked once per group, not between files: a run
     // cannot start resuming this session on the account mid-sweep without a
     // live handoff row or a transfer, which `busy` re-checks.
-    if (busy() || liveOnRunsOfHarness(harness.id, group.columnName, group.sessionId)) {
+    if ((await busy()) || (await liveOnRunsOfHarness(harness.id, group.columnName, group.sessionId))) {
       out.retained += group.paths.length;
       continue;
     }
@@ -1056,7 +1090,7 @@ async function sweepOnce(
     }
     const keep = new Set(result.retained);
     const done = group.paths.filter((p) => !keep.has(p));
-    harnessOrphanedCopies.forget(group.harnessId, group.columnName, group.sessionId, done, { notAfter: mark });
+    await harnessOrphanedCopies.forget(group.harnessId, group.columnName, group.sessionId, done, { notAfter: mark });
     out.removed += result.removed.length;
     out.forgotten += done.length - result.removed.length;
     out.retained += keep.size;
@@ -1078,14 +1112,14 @@ async function sweepOnce(
 export async function adoptMismatchedHandoffPaths(): Promise<number> {
   let moved = 0;
   let lastYield = Date.now();
-  for (const row of harnessSessionHandoffs.listAll()) {
+  for (const row of await harnessSessionHandoffs.listAll()) {
     if (Date.now() - lastYield >= ROLLOUT_WALK_YIELD_MS) {
       await Bun.sleep(0);
       lastYield = Date.now();
     }
     // Re-read and rewritten atomically by the store: the listing above is a
     // snapshot and a transfer may have changed the row while this pass yielded.
-    moved += harnessSessionHandoffs.orphanMismatchedPaths(row.taskId, row.harnessId, row.columnName);
+    moved += await harnessSessionHandoffs.orphanMismatchedPaths(row.taskId, row.harnessId, row.columnName);
   }
   return moved;
 }

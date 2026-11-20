@@ -38,7 +38,8 @@ import {
 } from "./harness-config-root.ts";
 import { getDiscoveredModels, getHarnessDiscoveredModels } from "./agent-discovery.ts";
 import { readAccountFileText } from "./no-follow.ts";
-import { db, harnesses, tasks } from "./db.ts";
+import { harnesses, op } from "./db-async.ts";
+import type { LimitDbRow as LimitRow, StackDbRow as StackRow, StackMemberDbRow as MemberRow } from "./db-core/ops/harness-stacks-ops.ts";
 
 /** Fallback cooldown for a rate limit when the provider gave no reset time. */
 export const HARNESS_RATE_LIMIT_COOLDOWN_MS = 60_000;
@@ -47,27 +48,19 @@ export const HARNESS_QUOTA_COOLDOWN_MS = 10 * 60_000;
 
 const MAX_MEMBERS = 10;
 
-type StackRow = {
-  id: string;
-  label: string;
-  kind: string;
-  mirror_mode: string;
-  created_at: number;
-  updated_at: number;
-};
-type MemberRow = { stack_id: string; harness_id: string; position: number };
-type LimitRow = {
-  harness_id: string;
-  model: string;
-  reason: string;
-  source: string;
-  message: string | null;
-  exhausted_until_ms: number;
-  updated_at: number;
-};
-
-function resolveHarness(id: string): Harness | null {
+function resolveHarness(id: string): Promise<Harness | null> {
   return harnesses.getByIdOrKind(id);
+}
+
+/** The harness behind each id (a kind name resolves to its built-in row), read
+ *  with one list rather than a round-trip per member. */
+async function resolveMany(ids: Iterable<string>): Promise<Map<string, Harness | null>> {
+  const byId = new Map((await harnesses.list()).map((h) => [h.id, h] as const));
+  const out = new Map<string, Harness | null>();
+  for (const id of new Set(ids)) {
+    out.set(id, byId.get(id) ?? (await resolveHarness(id)));
+  }
+  return out;
 }
 
 /**
@@ -569,20 +562,6 @@ function modelCatalogFor(harness: Harness): string[] {
   return models.map((m) => m.id);
 }
 
-function stackRows(): StackRow[] {
-  return db.query<StackRow, []>(`SELECT * FROM harness_stacks ORDER BY created_at ASC`).all();
-}
-
-function memberRows(stackId?: string): MemberRow[] {
-  return stackId
-    ? db
-        .query<MemberRow, [string]>(
-          `SELECT * FROM harness_stack_members WHERE stack_id = ? ORDER BY position ASC`,
-        )
-        .all(stackId)
-    : db.query<MemberRow, []>(`SELECT * FROM harness_stack_members ORDER BY stack_id ASC, position ASC`).all();
-}
-
 /**
  * Map a stored membership row to its API shape. `position` is the caller's
  * contiguous rank, NOT the stored `harness_stack_members.position`: deleting
@@ -593,8 +572,7 @@ function memberRows(stackId?: string): MemberRow[] {
  * keeps every reader correct even against a database written before the
  * renumber-on-delete fix.
  */
-function toMember(row: MemberRow, position: number): HarnessStackMember | null {
-  const harness = resolveHarness(row.harness_id);
+function toMember(harness: Harness | null, position: number): HarnessStackMember | null {
   if (!harness) return null;
   if (!isV1Kind(harness.kind)) return null;
   return {
@@ -606,7 +584,12 @@ function toMember(row: MemberRow, position: number): HarnessStackMember | null {
   };
 }
 
-function stackWarnings(members: HarnessStackMember[], mirrorMode: HarnessMirrorMode, kind: HarnessStackKind): HarnessStackWarning[] {
+function stackWarnings(
+  members: HarnessStackMember[],
+  mirrorMode: HarnessMirrorMode,
+  kind: HarnessStackKind,
+  harnessOf: (id: string) => Harness | null,
+): HarnessStackWarning[] {
   const warnings: HarnessStackWarning[] = [];
   if (members.length < 2) {
     warnings.push({ code: "too-few-members", message: "A stack needs at least two accounts to fail over." });
@@ -632,7 +615,7 @@ function stackWarnings(members: HarnessStackMember[], mirrorMode: HarnessMirrorM
       warnings.push({ code: "member-disabled", harnessId: member.harnessId, message: `${member.label} is disabled.` });
       continue;
     }
-    const harness = resolveHarness(member.harnessId);
+    const harness = harnessOf(member.harnessId);
     if (!harness) continue;
     if (!isInstalled(harness)) {
       warnings.push({ code: "member-not-installed", harnessId: member.harnessId, message: `${member.label}'s CLI is not installed.` });
@@ -655,7 +638,12 @@ function stackWarnings(members: HarnessStackMember[], mirrorMode: HarnessMirrorM
  * on every swap, retry, start and send) get `warnings: []` and stay a plain
  * database read (review C6).
  */
-function toStack(row: StackRow, opts: { warnings?: boolean } = {}): HarnessStack {
+function toStack(
+  row: StackRow,
+  memberRows: MemberRow[],
+  harnessById: ReadonlyMap<string, Harness | null>,
+  opts: { warnings?: boolean } = {},
+): HarnessStack {
   const kind = isV1Kind(row.kind) ? row.kind : "claude-code";
   const mirrorMode: HarnessMirrorMode = row.mirror_mode === "safe" ? "safe" : "full";
   // Re-rank from the surviving order: dropping an unresolvable row (or a gap
@@ -663,8 +651,8 @@ function toStack(row: StackRow, opts: { warnings?: boolean } = {}): HarnessStack
   // the displayed position away from the array index every consumer
   // (`pickNextMember`, the notice, the badge) reads.
   const members: HarnessStackMember[] = [];
-  for (const membership of memberRows(row.id)) {
-    const member = toMember(membership, members.length);
+  for (const membership of memberRows) {
+    const member = toMember(harnessById.get(membership.harness_id) ?? null, members.length);
     if (member) members.push(member);
   }
   return {
@@ -675,8 +663,17 @@ function toStack(row: StackRow, opts: { warnings?: boolean } = {}): HarnessStack
     members,
     createdAt: row.created_at,
     updatedAt: row.updated_at,
-    warnings: opts.warnings ? stackWarnings(members, mirrorMode, kind) : [],
+    warnings: opts.warnings ? stackWarnings(members, mirrorMode, kind, (id) => harnessById.get(id) ?? null) : [],
   };
+}
+
+/** Build stacks from stored rows, resolving every member account in one pass. */
+async function buildStacks(
+  rows: { stack: StackRow; members: MemberRow[] }[],
+  opts: { warnings?: boolean } = {},
+): Promise<HarnessStack[]> {
+  const harnessById = await resolveMany(rows.flatMap((r) => r.members.map((m) => m.harness_id)));
+  return rows.map((r) => toStack(r.stack, r.members, harnessById, opts));
 }
 
 function normalizeLabel(raw: unknown): string {
@@ -721,7 +718,7 @@ export interface StackValidation {
  * and saved. `stackId` is the stack being edited, so its own members aren't
  * treated as a second membership.
  */
-export function validateInput(input: HarnessStackInput, stackId?: string): StackValidation {
+export async function validateInput(input: HarnessStackInput, stackId?: string): Promise<StackValidation> {
   const blockers: HarnessStackWarning[] = [];
   if (!isV1Kind(input.kind)) {
     return {
@@ -742,12 +739,14 @@ export function validateInput(input: HarnessStackInput, stackId?: string): Stack
   }
   const rows: Harness[] = [];
   const homes = new Map<string, string>();
+  // One read for every member's current stack (the check below), not one each.
+  const memberships = await op("stacks.memberships", [ids.filter((id): id is string => typeof id === "string" && id.length > 0)]);
   for (const id of ids) {
     if (typeof id !== "string" || !id) {
       blockers.push({ code: "invalid-member", message: "member ids must be non-empty strings" });
       continue;
     }
-    const harness = resolveHarness(id);
+    const harness = await resolveHarness(id);
     if (!harness) {
       blockers.push({ code: "unknown-harness", harnessId: id, message: `unknown account "${id}"` });
       continue;
@@ -767,12 +766,8 @@ export function validateInput(input: HarnessStackInput, stackId?: string): Stack
     } else {
       homes.set(home, harness.label);
     }
-    const existing = db
-      .query<{ stack_id: string }, [string]>(
-        `SELECT stack_id FROM harness_stack_members WHERE harness_id = ?`,
-      )
-      .get(id);
-    if (existing && existing.stack_id !== stackId) {
+    const existing = memberships[id];
+    if (existing !== undefined && existing !== stackId) {
       blockers.push({ code: "already-in-stack", harnessId: id, message: `${harness.label} is already in another stack.` });
     }
     rows.push(harness);
@@ -785,102 +780,70 @@ export function validateInput(input: HarnessStackInput, stackId?: string): Stack
     kind: h.kind === "claude-code" ? "claude-code" : "codex",
     enabled: h.enabled,
   }));
-  const warnings = stackWarnings(members, mirrorMode, input.kind);
+  const byId = new Map(rows.map((h) => [h.id, h] as const));
+  const warnings = stackWarnings(members, mirrorMode, input.kind, (id) => byId.get(id) ?? null);
   return { blockers, warnings, harnesses: rows };
-}
-
-function memberIdsOf(stackId: string): string[] {
-  return memberRows(stackId).map((m) => m.harness_id);
 }
 
 export const harnessStacks = {
   /** Every stack, with its warnings (the Settings/CLI listing). */
-  list(): HarnessStack[] {
-    return stackRows().map((row) => toStack(row, { warnings: true }));
+  async list(): Promise<HarnessStack[]> {
+    const { stacks, members } = await op("stacks.snapshot", []);
+    const byStack = new Map<string, MemberRow[]>();
+    for (const m of members) {
+      const list = byStack.get(m.stack_id);
+      if (list) list.push(m);
+      else byStack.set(m.stack_id, [m]);
+    }
+    return buildStacks(stacks.map((stack) => ({ stack, members: byStack.get(stack.id) ?? [] })), { warnings: true });
   },
   /** One stack. `warnings` stays `[]` unless `{ warnings: true }` is passed:
    *  the runtime reads this on every swap and must not probe accounts. */
-  get(id: string, opts: { warnings?: boolean } = {}): HarnessStack | null {
-    const row = db.query<StackRow, [string]>(`SELECT * FROM harness_stacks WHERE id = ?`).get(id);
-    return row ? toStack(row, opts) : null;
+  async get(id: string, opts: { warnings?: boolean } = {}): Promise<HarnessStack | null> {
+    const row = await op("stacks.get", [id]);
+    return row ? (await buildStacks([row], opts))[0]! : null;
   },
   /** The stack an account belongs to, or null. */
-  getByMember(harnessId: string): HarnessStack | null {
-    const row = db
-      .query<{ stack_id: string }, [string]>(
-        `SELECT stack_id FROM harness_stack_members WHERE harness_id = ?`,
-      )
-      .get(harnessId);
-    return row ? this.get(row.stack_id) : null;
+  async getByMember(harnessId: string): Promise<HarnessStack | null> {
+    const row = await op("stacks.getByMember", [harnessId]);
+    return row ? (await buildStacks([row]))[0]! : null;
   },
   /** Create a stack and its ordered memberships in one transaction. The
    *  result carries the draft's warnings. */
-  create(input: HarnessStackInput): HarnessStack {
+  async create(input: HarnessStackInput): Promise<HarnessStack> {
     const label = normalizeLabel(input.label);
-    const validation = validateInput({ ...input, label });
+    const validation = await validateInput({ ...input, label });
     if (validation.blockers.length > 0) throw new StackInputError(validation.blockers[0]!.message, validation.blockers);
     const id = randomUUID();
     const now = Date.now();
-    db.transaction(() => {
-      db.run(
-        `INSERT INTO harness_stacks (id, label, kind, mirror_mode, created_at, updated_at)
-         VALUES (?, ?, ?, ?, ?, ?)`,
-        [id, label, input.kind, input.mirrorMode === "safe" ? "safe" : "full", now, now],
-      );
-      input.members.forEach((harnessId, position) => {
-        db.run(
-          `INSERT INTO harness_stack_members (stack_id, harness_id, position) VALUES (?, ?, ?)`,
-          [id, harnessId, position],
-        );
-      });
-    })();
-    return { ...(this.get(id) as HarnessStack), warnings: validation.warnings };
+    await op("stacks.create", [id, label, input.kind, input.mirrorMode === "safe" ? "safe" : "full", now, input.members]);
+    return { ...((await this.get(id)) as HarnessStack), warnings: validation.warnings };
   },
   /**
    * Edit a stack. The result carries the edited stack's warnings. `members` defines the FULL ordered list; omit it to keep
    * membership and order. Reorders are applied inside one transaction so
    * `UNIQUE(stack_id, position)` never sees a transient duplicate.
    */
-  update(id: string, patch: Partial<HarnessStackInput>): HarnessStack {
-    const current = this.get(id);
+  async update(id: string, patch: Partial<HarnessStackInput>): Promise<HarnessStack> {
+    const current = await this.get(id);
     if (!current) throw new StackInputError(`stack not found: ${id}`);
     // Fast path so a stale draft reports the conflict, not a validation error
-    // about its own stale content; the authoritative check is in the
-    // transaction below.
+    // about its own stale content; the authoritative check is in the op below.
     if (patch.expectedUpdatedAt !== undefined && patch.expectedUpdatedAt !== current.updatedAt) {
       throw new StackChangedError(current);
     }
     const label = patch.label === undefined ? current.label : normalizeLabel(patch.label);
-    const members = patch.members ?? memberIdsOf(id);
+    const members = patch.members ?? current.members.map((m) => m.harnessId);
     const kind = patch.kind ?? current.kind;
     const mirrorMode = patch.mirrorMode ?? current.mirrorMode;
-    const validation = validateInput({ label, kind, members, mirrorMode }, id);
+    const validation = await validateInput({ label, kind, members, mirrorMode }, id);
     if (validation.blockers.length > 0) throw new StackInputError(validation.blockers[0]!.message, validation.blockers);
-    const now = Date.now();
-    db.transaction(() => {
-      const stored = db
-        .query<{ updated_at: number }, [string]>(`SELECT updated_at FROM harness_stacks WHERE id = ?`)
-        .get(id);
-      if (!stored) throw new StackInputError(`stack not found: ${id}`);
-      if (patch.expectedUpdatedAt !== undefined && stored.updated_at !== patch.expectedUpdatedAt) {
-        throw new StackChangedError(this.get(id) as HarnessStack);
-      }
-      // Strictly increasing, so two edits inside one millisecond still differ
-      // and the second editor's `expectedUpdatedAt` conflicts.
-      const stamp = Math.max(now, stored.updated_at + 1);
-      db.run(
-        `UPDATE harness_stacks SET label = ?, kind = ?, mirror_mode = ?, updated_at = ? WHERE id = ?`,
-        [label, kind, mirrorMode === "safe" ? "safe" : "full", stamp, id],
-      );
-      db.run(`DELETE FROM harness_stack_members WHERE stack_id = ?`, [id]);
-      members.forEach((harnessId, position) => {
-        db.run(
-          `INSERT INTO harness_stack_members (stack_id, harness_id, position) VALUES (?, ?, ?)`,
-          [id, harnessId, position],
-        );
-      });
-    })();
-    return { ...(this.get(id) as HarnessStack), warnings: validation.warnings };
+    const outcome = await op("stacks.update", [
+      id, label, kind, mirrorMode === "safe" ? "safe" : "full", Date.now(), members, patch.expectedUpdatedAt ?? null,
+    ]);
+    if (outcome === "missing") throw new StackInputError(`stack not found: ${id}`);
+    if (outcome === "changed") throw new StackChangedError((await this.get(id)) as HarnessStack);
+    return { ...((await this.get(id)) as HarnessStack), warnings: validation.warnings };
   },
   /**
    * Would saving `candidate` as harness `harnessId`'s home/env make it share a
@@ -890,13 +853,13 @@ export const harnessStacks = {
    * member, since the same-root check at stack save cannot see a later edit
    * (review S5). Roots compare by realpath, falling back to `path.resolve`.
    */
-  validateMemberRoot(
+  async validateMemberRoot(
     harnessId: string,
     candidate: { kind: string; home: string | null; env?: Record<string, string> | null },
-  ): string | null {
-    const stack = this.getByMember(harnessId);
+  ): Promise<string | null> {
+    const stack = await this.getByMember(harnessId);
     if (!stack) return null;
-    const self = resolveHarness(harnessId);
+    const self = await resolveHarness(harnessId);
     const selfLabel = self?.label ?? harnessId;
     if (candidate.kind !== stack.kind) {
       return `${selfLabel} is in the ${stack.kind} stack "${stack.label}"; remove it from the stack before changing its kind.`;
@@ -908,7 +871,7 @@ export const harnessStacks = {
     }));
     for (const member of stack.members) {
       if (member.harnessId === harnessId || member.harnessId === self?.id) continue;
-      const other = resolveHarness(member.harnessId);
+      const other = await resolveHarness(member.harnessId);
       if (!other) continue;
       if (comparableHome(effectiveHome(other)) === root) {
         return `${selfLabel} would share its config directory with ${other.label} in the stack "${stack.label}"; every account in a stack needs its own.`;
@@ -918,13 +881,11 @@ export const harnessStacks = {
   },
   /** Delete a stack; its task failover state becomes inert. Cooldowns and
    *  copied session files stay account-scoped. */
-  delete(id: string): void {
-    const current = this.get(id);
+  async delete(id: string): Promise<void> {
+    const current = await this.get(id);
     if (!current) return;
-    db.transaction(() => {
-      db.run(`DELETE FROM harness_stacks WHERE id = ?`, [id]);
-      clearTaskStateForStack(id);
-    })();
+    // The delete and the failover-state clear are one named op (one transaction).
+    await op("stacks.delete", [id]);
   },
   /** The stack a task belongs to. The CURRENT account's membership wins: an
    *  account edited into another stack must fail over (and run) inside that
@@ -932,17 +893,17 @@ export const harnessStacks = {
    *  would transfer the conversation into the train the account left. The
    *  recorded stack is a fallback for an account removed from every stack
    *  mid-flight, so the task still resolves until the next move. */
-  resolveForTask(task: Pick<Task, "id" | "agent" | "harnessState">): {
+  async resolveForTask(task: Pick<Task, "id" | "agent" | "harnessState">): Promise<{
     stack: HarnessStack;
     current: string;
     position: number;
     orphaned: boolean;
-  } | null {
-    const memberStack = this.getByMember(task.agent);
+  } | null> {
+    const memberStack = await this.getByMember(task.agent);
     const stateStack = memberStack
       ? null
       : task.harnessState?.stackId
-        ? this.get(task.harnessState.stackId)
+        ? await this.get(task.harnessState.stackId)
         : null;
     const stack = memberStack ?? stateStack;
     if (!stack) return null;
@@ -961,31 +922,13 @@ export const harnessStacks = {
    *  that is still active on the same row — an API-error/rate-limit fallback
    *  arriving after a quota signal would otherwise unblock the account too
    *  early. Writes are also the safe place to sweep expired rows. */
-  setLimitState(harnessId: string, signal: HarnessLimitSignal, now = Date.now()): HarnessLimitState {
-    this.pruneExpired(now);
+  async setLimitState(harnessId: string, signal: HarnessLimitSignal, now = Date.now()): Promise<HarnessLimitState> {
     const model = signal.model ? signal.model : "";
     const fallback = signal.reason === "rate_limit" ? HARNESS_RATE_LIMIT_COOLDOWN_MS : HARNESS_QUOTA_COOLDOWN_MS;
-    const nextUntil = signal.resetAtMs ?? now + fallback;
-    const existing = db
-      .query<LimitRow, [string, string]>(`SELECT * FROM harness_limit_state WHERE harness_id = ? AND model = ?`)
-      .get(harnessId, model);
-    const exhaustedUntilMs = signal.resetAtMs === null
-      && existing !== null
-      && existing.exhausted_until_ms > nextUntil
-      ? existing.exhausted_until_ms
-      : nextUntil;
-    db.run(
-      `INSERT INTO harness_limit_state
-         (harness_id, model, reason, source, message, exhausted_until_ms, updated_at)
-       VALUES (?, ?, ?, ?, ?, ?, ?)
-       ON CONFLICT(harness_id, model) DO UPDATE SET
-         reason = excluded.reason,
-         source = excluded.source,
-         message = excluded.message,
-         exhausted_until_ms = excluded.exhausted_until_ms,
-         updated_at = excluded.updated_at`,
-      [harnessId, model, signal.reason, signal.source, signal.message || null, exhaustedUntilMs, now],
-    );
+    // Sweep, read and upsert in one transaction inside the worker.
+    const exhaustedUntilMs = await op("limit.set", [
+      harnessId, model, signal.reason, signal.source, signal.message || null, signal.resetAtMs, fallback, now,
+    ]);
     return {
       harnessId,
       reason: signal.reason,
@@ -1000,18 +943,10 @@ export const harnessStacks = {
    *  account-wide row and (when a model is given) that model's row, whichever
    *  expires later. Without `opts.model` only the account-wide row counts.
    *  Expired rows are ignored (`opts.now`, default the clock). Read-only. */
-  getLimitState(harnessId: string, opts: { model?: string | null; now?: number } = {}): HarnessLimitState | null {
+  async getLimitState(harnessId: string, opts: { model?: string | null; now?: number } = {}): Promise<HarnessLimitState | null> {
     const now = opts.now ?? Date.now();
     const model = opts.model ? opts.model : "";
-    const rows = model
-      ? db
-          .query<LimitRow, [string, string]>(
-            `SELECT * FROM harness_limit_state WHERE harness_id = ? AND model IN ('', ?)`,
-          )
-          .all(harnessId, model)
-      : db
-          .query<LimitRow, [string]>(`SELECT * FROM harness_limit_state WHERE harness_id = ? AND model = ''`)
-          .all(harnessId);
+    const rows = await op("limit.rowsFor", [harnessId, model]);
     let best: LimitRow | null = null;
     for (const row of rows) {
       if (row.exhausted_until_ms <= now) continue;
@@ -1021,12 +956,10 @@ export const harnessStacks = {
   },
   /** Every ACTIVE row, account-wide and per-model, soonest reset first.
    *  `model` is null for an account-wide row. */
-  listLimitStates(now = Date.now()): HarnessLimitState[] {
+  async listLimitStates(now = Date.now()): Promise<HarnessLimitState[]> {
     // Read-only: a GET/poll must not DELETE. Expired rows are filtered out of
     // the payload; `pruneExpired` runs on boot and on every write.
-    return db
-      .query<LimitRow, []>(`SELECT * FROM harness_limit_state ORDER BY exhausted_until_ms ASC, harness_id ASC, model ASC`)
-      .all()
+    return (await op("limit.list", []))
       .map(toLimitState)
       .filter((state) => state.exhaustedUntilMs > now);
   },
@@ -1036,32 +969,20 @@ export const harnessStacks = {
    *    before the limit was recorded must not erase that limit), limited to
    *    the account-wide row and `opts.model`'s row;
    *  - `model` alone: that model's row only. */
-  clearLimitState(
+  async clearLimitState(
     harnessId: string,
     opts: { startedAtMs?: number; model?: string | null; accountWideOnly?: boolean } = {},
-  ): void {
+  ): Promise<void> {
     const model = opts.model ? opts.model : "";
-    if (opts.startedAtMs !== undefined) {
-      db.run(
-        `DELETE FROM harness_limit_state WHERE harness_id = ? AND updated_at <= ? AND model IN ('', ?)`,
-        [harnessId, opts.startedAtMs, model],
-      );
-      return;
-    }
-    if (opts.accountWideOnly) {
-      db.run(`DELETE FROM harness_limit_state WHERE harness_id = ? AND model = ''`, [harnessId]);
-      return;
-    }
-    if (opts.model !== undefined) {
-      db.run(`DELETE FROM harness_limit_state WHERE harness_id = ? AND model = ?`, [harnessId, model]);
-      return;
-    }
-    db.run(`DELETE FROM harness_limit_state WHERE harness_id = ?`, [harnessId]);
+    if (opts.startedAtMs !== undefined) await op("limit.clear", [harnessId, "startedAt", model, opts.startedAtMs]);
+    else if (opts.accountWideOnly) await op("limit.clear", [harnessId, "accountWide", "", 0]);
+    else if (opts.model !== undefined) await op("limit.clear", [harnessId, "model", model, 0]);
+    else await op("limit.clear", [harnessId, "all", "", 0]);
   },
-  pruneExpired(now = Date.now()): void {
-    db.run(`DELETE FROM harness_limit_state WHERE exhausted_until_ms <= ?`, [now]);
+  async pruneExpired(now = Date.now()): Promise<void> {
+    await op("limit.prune", [now]);
   },
-  isCooling(harnessId: string, now = Date.now(), model?: string | null): HarnessLimitState | null {
+  isCooling(harnessId: string, now = Date.now(), model?: string | null): Promise<HarnessLimitState | null> {
     return this.getLimitState(harnessId, { model, now });
   },
 };
@@ -1082,19 +1003,7 @@ function toLimitState(row: LimitRow): HarnessLimitState {
 }
 
 /** Clear every task's harness state that names `stackId`, without bumping
- *  `updated_at` (see `tasks.setHarnessState`). */
-export function clearTaskStateForStack(stackId: string): number {
-  const rows = db
-    .query<{ id: string }, []>(
-      `SELECT id FROM tasks WHERE harness_state IS NOT NULL`,
-    )
-    .all();
-  let cleared = 0;
-  for (const row of rows) {
-    const state = tasks.get(row.id)?.harnessState;
-    if (state?.stackId !== stackId) continue;
-    tasks.setHarnessState(row.id, null);
-    cleared++;
-  }
-  return cleared;
+ *  `updated_at` (see `tasks.setHarnessState`). One named op in the worker. */
+export function clearTaskStateForStack(stackId: string): Promise<number> {
+  return op("stacks.clearTaskState", [stackId]);
 }

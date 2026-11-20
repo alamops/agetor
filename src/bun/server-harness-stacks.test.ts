@@ -1227,8 +1227,8 @@ describe("fix-round routes: cooldown clear, history, preview, restore, switch, c
     expect((await call("DELETE", "/harnesses/nope-acct/limit-state")).status).toBe(404);
     const { harnessStacks } = await import("./harness-stacks.ts");
     const base = { reason: "quota" as const, source: "claude-api-error" as const, message: "limit", resetAtMs: Date.now() + 3_600_000 };
-    harnessStacks.setLimitState("api-x", base);
-    harnessStacks.setLimitState("api-x", { ...base, model: "gpt-x" });
+    await harnessStacks.setLimitState("api-x", base);
+    await harnessStacks.setLimitState("api-x", { ...base, model: "gpt-x" });
     const rows = (await call("GET", "/harnesses")).body.limitStates as { harnessId: string; model: string | null }[];
     expect(rows.filter((r) => r.harnessId === "api-x").map((r) => r.model).sort()).toEqual([null, "gpt-x"].sort());
 
@@ -1245,8 +1245,8 @@ describe("fix-round routes: cooldown clear, history, preview, restore, switch, c
   test("DELETE /harnesses/:id/limit-state?scope=account clears only the account-wide row; the response carries rearmed", async () => {
     const { harnessStacks } = await import("./harness-stacks.ts");
     const base = { reason: "quota" as const, source: "claude-api-error" as const, message: "limit", resetAtMs: Date.now() + 3_600_000 };
-    harnessStacks.setLimitState("api-x", base);
-    harnessStacks.setLimitState("api-x", { ...base, model: "gpt-x" });
+    await harnessStacks.setLimitState("api-x", base);
+    await harnessStacks.setLimitState("api-x", { ...base, model: "gpt-x" });
     const res = await call("DELETE", "/harnesses/api-x/limit-state?scope=account");
     expect(res.status).toBe(200);
     expect(typeof res.body.rearmed).toBe("number");
@@ -1431,8 +1431,8 @@ describe("TT-E: fix-round routes (shapes, gates, 22b, finding 19)", () => {
     const id = makeAccount("ls");
     const { harnessStacks } = await import("./harness-stacks.ts");
     const base = { reason: "quota" as const, source: "claude-api-error" as const, message: "m", resetAtMs: Date.now() + 3_600_000 };
-    harnessStacks.setLimitState(id, base);
-    harnessStacks.setLimitState(id, { ...base, model: "sonnet-x" });
+    await harnessStacks.setLimitState(id, base);
+    await harnessStacks.setLimitState(id, { ...base, model: "sonnet-x" });
     const res = await call("DELETE", `/harnesses/${id}/limit-state?scope=account&model=SONNET-X`);
     expect(res.status).toBe(200);
     const left = (res.body.limitStates as { harnessId: string; model: string | null }[]).filter((r) => r.harnessId === id);
@@ -1449,7 +1449,7 @@ describe("TT-E: fix-round routes (shapes, gates, 22b, finding 19)", () => {
     const other = await makeStack([c, d], "rearm-other");
     const { harnessStacks } = await import("./harness-stacks.ts");
     const failover = await import("./harness-failover.ts");
-    harnessStacks.setLimitState(b, { reason: "quota", source: "claude-api-error", message: "m", resetAtMs: Date.now() + 36_000_000 });
+    await harnessStacks.setLimitState(b, { reason: "quota", source: "claude-api-error", message: "m", resetAtMs: Date.now() + 36_000_000 });
     const far = Date.now() + 36_000_000;
 
     const waiting = seedTaskRow({ agent: a, column: "blocked" });
@@ -1729,7 +1729,7 @@ describe("TT-E: fix-round routes (shapes, gates, 22b, finding 19)", () => {
 
     // Every other member cooling: refused up front with per-member reasons.
     const t = seedTaskRow({ agent: a });
-    harnessStacks.setLimitState(b, { reason: "quota", source: "claude-api-error", message: "m", resetAtMs: Date.now() + 3_600_000 });
+    await harnessStacks.setLimitState(b, { reason: "quota", source: "claude-api-error", message: "m", resetAtMs: Date.now() + 3_600_000 });
     try {
       const cooling = await call("POST", `/tasks/${t}/switch-account`);
       expect(cooling.status).toBe(409);
@@ -1740,7 +1740,7 @@ describe("TT-E: fix-round routes (shapes, gates, 22b, finding 19)", () => {
       expect(db.tasks.get(t)!.agent).toBe(a);
       expect(db.tasks.get(t)!.harnessState?.scheduledSwitch ?? null).toBeNull();
     } finally {
-      harnessStacks.clearLimitState(b);
+      await harnessStacks.clearLimitState(b);
     }
 
     // Background agents hold the task.

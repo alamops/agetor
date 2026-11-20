@@ -69,87 +69,87 @@ function makeTask(agent: string): string {
 }
 
 describe("planNextMember", () => {
-  test("walks forward, skips a cooling member, wraps once", () => {
+  test("walks forward, skips a cooling member, wraps once", async () => {
     const a = account();
     const b = account();
     const c = account();
-    const stack = stacks.harnessStacks.create({ label: "fo", kind: "claude-code", members: [a, b, c] });
+    const stack = await stacks.harnessStacks.create({ label: "fo", kind: "claude-code", members: [a, b, c] });
     const task = dbm.tasks.get(makeTask(a))!;
-    stacks.harnessStacks.setLimitState(b, {
+    await stacks.harnessStacks.setLimitState(b, {
       reason: "quota", resetAtMs: Date.now() + 60_000, message: "x", source: "claude-pane",
     });
-    const plan = fo.planNextMember(task);
+    const plan = await fo.planNextMember(task);
     expect(plan.kind).toBe("next");
     if (plan.kind === "next") expect(plan.member.harnessId).toBe(c);
-    stacks.harnessStacks.clearLimitState(b);
-    stacks.harnessStacks.delete(stack.id);
+    await stacks.harnessStacks.clearLimitState(b);
+    await stacks.harnessStacks.delete(stack.id);
   });
 
-  test("a non-stack task has no usable member", () => {
-    const plan = fo.planNextMember(dbm.tasks.get(makeTask(account()))!);
+  test("a non-stack task has no usable member", async () => {
+    const plan = await fo.planNextMember(dbm.tasks.get(makeTask(account()))!);
     expect(plan.kind).toBe("none-usable");
   });
 
-  test("a retry skips a still-cooling current account and resumes the current one after its reset", () => {
+  test("a retry skips a still-cooling current account and resumes the current one after its reset", async () => {
     const a = account();
     const b = account();
-    const stack = stacks.harnessStacks.create({ label: "retry-target", kind: "claude-code", members: [a, b] });
+    const stack = await stacks.harnessStacks.create({ label: "retry-target", kind: "claude-code", members: [a, b] });
     const taskId = makeTask(a);
     const now = Date.now();
     const resetAt = now + 60_000;
-    stacks.harnessStacks.setLimitState(a, {
+    await stacks.harnessStacks.setLimitState(a, {
       reason: "quota", resetAtMs: resetAt, message: "x", source: "claude-pane",
     }, now);
 
     // The reset has not arrived: never target A again; walk to B.
-    const cooling = fo.planRetryMember(dbm.tasks.get(taskId)!, { now: now + 1000 });
+    const cooling = await fo.planRetryMember(dbm.tasks.get(taskId)!, { now: now + 1000 });
     expect(cooling.kind).toBe("next");
     if (cooling.kind === "next") expect(cooling.member.harnessId).toBe(b);
 
     // After the reset, the current account is the preferred retry target so
     // the existing provider session can be resumed in place.
-    const reset = fo.planRetryMember(dbm.tasks.get(taskId)!, { now: resetAt + 1 });
+    const reset = await fo.planRetryMember(dbm.tasks.get(taskId)!, { now: resetAt + 1 });
     expect(reset.kind).toBe("next");
     if (reset.kind === "next") expect(reset.member.harnessId).toBe(a);
 
-    stacks.harnessStacks.clearLimitState(a);
-    stacks.harnessStacks.delete(stack.id);
+    await stacks.harnessStacks.clearLimitState(a);
+    await stacks.harnessStacks.delete(stack.id);
   });
 
-  test("two accounts hitting a limit in sequence schedule an all-exhausted retry", () => {
+  test("two accounts hitting a limit in sequence schedule an all-exhausted retry", async () => {
     // Regression: marking both accounts tried used to yield none-usable with
     // no reset time, so planExhausted armed no timer and the task blocked
     // permanently instead of showing the promised countdown.
     const a = account();
     const b = account();
-    const stack = stacks.harnessStacks.create({ label: "two-limit", kind: "claude-code", members: [a, b] });
+    const stack = await stacks.harnessStacks.create({ label: "two-limit", kind: "claude-code", members: [a, b] });
     const taskId = makeTask(a);
     const now = Date.now();
 
-    fo.recordTried(taskId, a);
-    stacks.harnessStacks.setLimitState(a, {
+    await fo.recordTried(taskId, a);
+    await stacks.harnessStacks.setLimitState(a, {
       reason: "quota", resetAtMs: now + 60_000, message: "x", source: "claude-pane",
     }, now);
-    const first = fo.planNextMember(dbm.tasks.get(taskId)!, { now });
+    const first = await fo.planNextMember(dbm.tasks.get(taskId)!, { now });
     expect(first.kind).toBe("next");
     if (first.kind === "next") expect(first.member.harnessId).toBe(b);
 
-    fo.recordTried(taskId, b);
-    stacks.harnessStacks.setLimitState(b, {
+    await fo.recordTried(taskId, b);
+    await stacks.harnessStacks.setLimitState(b, {
       reason: "quota", resetAtMs: now + 120_000, message: "x", source: "claude-pane",
     }, now);
-    const second = fo.planNextMember(dbm.tasks.get(taskId)!, { now });
+    const second = await fo.planNextMember(dbm.tasks.get(taskId)!, { now });
     expect(second.kind).toBe("all-exhausted");
     if (second.kind !== "all-exhausted") return;
     expect(second.earliestResetAtMs).toBe(now + 60_000);
 
-    const state = fo.planExhausted(taskId, second, now, { startedThisAttempt: false });
+    const state = await fo.planExhausted(taskId, second, now, { startedThisAttempt: false });
     expect(state?.allExhausted?.attempts).toBe(0);
     expect(state?.allExhausted?.nextAttemptAt).toBeGreaterThan(now);
     fo.cancelAutoRetry(taskId);
-    stacks.harnessStacks.clearLimitState(a);
-    stacks.harnessStacks.clearLimitState(b);
-    stacks.harnessStacks.delete(stack.id);
+    await stacks.harnessStacks.clearLimitState(a);
+    await stacks.harnessStacks.clearLimitState(b);
+    await stacks.harnessStacks.delete(stack.id);
   });
 });
 
@@ -157,10 +157,10 @@ describe("cooldown and boot recovery", () => {
   test("a manual prepare resets the lap but keeps the account-global cooldown", async () => {
     const a = account();
     const b = account();
-    const stack = stacks.harnessStacks.create({ label: "manual-cool", kind: "claude-code", members: [a, b] });
+    const stack = await stacks.harnessStacks.create({ label: "manual-cool", kind: "claude-code", members: [a, b] });
     const taskId = makeTask(a);
     const now = Date.now();
-    stacks.harnessStacks.setLimitState(a, {
+    await stacks.harnessStacks.setLimitState(a, {
       reason: "quota", resetAtMs: now + 60_000, message: "x", source: "claude-pane",
     }, now);
 
@@ -168,17 +168,17 @@ describe("cooldown and boot recovery", () => {
     expect(result.ok).toBe(true);
     // Forcing this task through the account must not un-cool it for every
     // other task: only a successful turn or the reset clears it.
-    expect(stacks.harnessStacks.isCooling(a, now + 1000)).not.toBeNull();
+    expect(await stacks.harnessStacks.isCooling(a, now + 1000)).not.toBeNull();
     expect(dbm.tasks.get(taskId)!.harnessState?.allExhausted ?? null).toBeNull();
 
-    stacks.harnessStacks.clearLimitState(a);
-    stacks.harnessStacks.delete(stack.id);
+    await stacks.harnessStacks.clearLimitState(a);
+    await stacks.harnessStacks.delete(stack.id);
   });
 
   test("a forced pre-flight move skips the current account and lands on the backup", async () => {
     const a = account();
     const b = account();
-    const stack = stacks.harnessStacks.create({ label: "forced-move", kind: "claude-code", members: [a, b] });
+    const stack = await stacks.harnessStacks.create({ label: "forced-move", kind: "claude-code", members: [a, b] });
     const taskId = makeTask(a);
 
     // Both accounts look usable to the cached member check; the start
@@ -192,15 +192,15 @@ describe("cooldown and boot recovery", () => {
     expect(result).toEqual({ ok: true, moved: { from: a, to: b } });
     expect(dbm.tasks.get(taskId)!.agent).toBe(b);
     expect(dbm.tasks.get(taskId)!.harnessState?.lastMove?.to).toBe(b);
-    stacks.harnessStacks.delete(stack.id);
+    await stacks.harnessStacks.delete(stack.id);
   });
 
-  test("a persisted lapse re-points the failover state at the account's current stack", () => {
+  test("a persisted lapse re-points the failover state at the account's current stack", async () => {
     const a = account();
     const b = account();
     const c = account();
-    const first = stacks.harnessStacks.create({ label: "first-train", kind: "claude-code", members: [a, b] });
-    const second = stacks.harnessStacks.create({ label: "second-train", kind: "claude-code", members: [c] });
+    const first = await stacks.harnessStacks.create({ label: "first-train", kind: "claude-code", members: [a, b] });
+    const second = await stacks.harnessStacks.create({ label: "second-train", kind: "claude-code", members: [c] });
     const taskId = makeTask(a);
     dbm.tasks.setHarnessState(taskId, {
       stackId: first.id,
@@ -212,26 +212,26 @@ describe("cooldown and boot recovery", () => {
       lastMove: null,
     });
     // The user edits A into the second train; the recorded stackId is stale.
-    stacks.harnessStacks.update(first.id, { members: [b] });
-    stacks.harnessStacks.update(second.id, { members: [c, a] });
+    await stacks.harnessStacks.update(first.id, { members: [b] });
+    await stacks.harnessStacks.update(second.id, { members: [c, a] });
 
-    fo.recordTried(taskId, a);
+    await fo.recordTried(taskId, a);
     const state = dbm.tasks.get(taskId)!.harnessState!;
     expect(state.stackId).toBe(second.id);
     expect(state.position).toBe(1);
     expect(state.count).toBe(2);
     expect(state.tried).toEqual([a]);
 
-    stacks.harnessStacks.delete(first.id);
-    stacks.harnessStacks.delete(second.id);
+    await stacks.harnessStacks.delete(first.id);
+    await stacks.harnessStacks.delete(second.id);
   });
 
-  test("failover plans inside the current stack after the account moves trains", () => {
+  test("failover plans inside the current stack after the account moves trains", async () => {
     const a = account();
     const b = account();
     const c = account();
-    const first = stacks.harnessStacks.create({ label: "old-train", kind: "claude-code", members: [a, b] });
-    const second = stacks.harnessStacks.create({ label: "new-train", kind: "claude-code", members: [c] });
+    const first = await stacks.harnessStacks.create({ label: "old-train", kind: "claude-code", members: [a, b] });
+    const second = await stacks.harnessStacks.create({ label: "new-train", kind: "claude-code", members: [c] });
     const taskId = makeTask(a);
     const now = Date.now();
     dbm.tasks.setHarnessState(taskId, {
@@ -243,30 +243,30 @@ describe("cooldown and boot recovery", () => {
       allExhausted: null,
       lastMove: null,
     });
-    stacks.harnessStacks.update(first.id, { members: [b] });
-    stacks.harnessStacks.update(second.id, { members: [c, a] });
-    stacks.harnessStacks.setLimitState(a, {
+    await stacks.harnessStacks.update(first.id, { members: [b] });
+    await stacks.harnessStacks.update(second.id, { members: [c, a] });
+    await stacks.harnessStacks.setLimitState(a, {
       reason: "quota", resetAtMs: now + 60_000, message: "x", source: "claude-pane",
     }, now);
 
     // A is last in its new train, so the lap wraps to C. Walking the recorded
     // (old) stack would have sent the task to B — a different conversation
     // home — while the UI already showed the new train.
-    const plan = fo.planNextMember(dbm.tasks.get(taskId)!, { now, currentId: a });
+    const plan = await fo.planNextMember(dbm.tasks.get(taskId)!, { now, currentId: a });
     expect(plan.kind).toBe("next");
     if (plan.kind === "next") expect(plan.member.harnessId).toBe(c);
 
-    stacks.harnessStacks.clearLimitState(a);
-    stacks.harnessStacks.delete(first.id);
-    stacks.harnessStacks.delete(second.id);
+    await stacks.harnessStacks.clearLimitState(a);
+    await stacks.harnessStacks.delete(first.id);
+    await stacks.harnessStacks.delete(second.id);
   });
 
   test("a manual Run moves inside the account's current stack after a membership move", async () => {
     const a = account();
     const b = account();
     const c = account();
-    const first = stacks.harnessStacks.create({ label: "manual-old", kind: "claude-code", members: [a, b] });
-    const second = stacks.harnessStacks.create({ label: "manual-new", kind: "claude-code", members: [c] });
+    const first = await stacks.harnessStacks.create({ label: "manual-old", kind: "claude-code", members: [a, b] });
+    const second = await stacks.harnessStacks.create({ label: "manual-new", kind: "claude-code", members: [c] });
     const taskId = makeTask(a);
     dbm.tasks.setHarnessState(taskId, {
       stackId: first.id,
@@ -277,8 +277,8 @@ describe("cooldown and boot recovery", () => {
       allExhausted: null,
       lastMove: null,
     });
-    stacks.harnessStacks.update(first.id, { members: [b] });
-    stacks.harnessStacks.update(second.id, { members: [c, a] });
+    await stacks.harnessStacks.update(first.id, { members: [b] });
+    await stacks.harnessStacks.update(second.id, { members: [c, a] });
     // A can no longer serve the turn, so the next manual Run must move — but
     // to C in the account's CURRENT train, never to B in the train it left.
     dbm.harnesses.setEnabled(a, false);
@@ -291,14 +291,14 @@ describe("cooldown and boot recovery", () => {
     expect(state.position).toBe(0);
     expect(state.lastMove).toMatchObject({ from: a, to: c, reason: "member-disabled" });
 
-    stacks.harnessStacks.delete(first.id);
-    stacks.harnessStacks.delete(second.id);
+    await stacks.harnessStacks.delete(first.id);
+    await stacks.harnessStacks.delete(second.id);
   });
 
-  test("boot re-arms a retry interrupted while its spawn was in flight", () => {
+  test("boot re-arms a retry interrupted while its spawn was in flight", async () => {
     const a = account();
     const b = account();
-    const stack = stacks.harnessStacks.create({ label: "in-flight", kind: "claude-code", members: [a, b] });
+    const stack = await stacks.harnessStacks.create({ label: "in-flight", kind: "claude-code", members: [a, b] });
     const taskId = makeTask(a);
     const now = Date.now();
     dbm.tasks.setHarnessState(taskId, {
@@ -319,7 +319,7 @@ describe("cooldown and boot recovery", () => {
       lastMove: null,
     });
 
-    const armed = fo.rearmAutoRetries(now);
+    const armed = await fo.rearmAutoRetries(now);
     expect(armed).toBeGreaterThanOrEqual(1);
     const state = dbm.tasks.get(taskId)!.harnessState!.allExhausted!;
     expect(state.inFlight ?? false).toBe(false);
@@ -327,13 +327,13 @@ describe("cooldown and boot recovery", () => {
     // A crash mid-spawn is not a started retry, so the attempt count is kept.
     expect(state.attempts).toBe(1);
     fo.cancelAutoRetry(taskId);
-    stacks.harnessStacks.delete(stack.id);
+    await stacks.harnessStacks.delete(stack.id);
   });
 
-  test("boot keeps a live retry run in flight so its settle can end the loop", () => {
+  test("boot keeps a live retry run in flight so its settle can end the loop", async () => {
     const a = account();
     const b = account();
-    const stack = stacks.harnessStacks.create({ label: "in-flight-live", kind: "claude-code", members: [a, b] });
+    const stack = await stacks.harnessStacks.create({ label: "in-flight-live", kind: "claude-code", members: [a, b] });
     const taskId = makeTask(a);
     const now = Date.now();
     const retryRunId = randomUUID();
@@ -373,7 +373,7 @@ describe("cooldown and boot recovery", () => {
       lastMove: null,
     });
 
-    fo.rearmAutoRetries(now);
+    await fo.rearmAutoRetries(now);
     // The reattached retry run still owns the marker: clearing `inFlight`
     // here would disarm `settleHarnessStateAndFollowUps`'s non-limit-failure
     // guard and leave the UI on "Retrying…" forever.
@@ -382,13 +382,13 @@ describe("cooldown and boot recovery", () => {
     expect(state.nextAttemptAt).toBe(0);
     expect(state.attempts).toBe(1);
     fo.cancelAutoRetry(taskId);
-    stacks.harnessStacks.delete(stack.id);
+    await stacks.harnessStacks.delete(stack.id);
   });
 
-  test("boot ends the loop when the retry run settled for a non-limit reason", () => {
+  test("boot ends the loop when the retry run settled for a non-limit reason", async () => {
     const a = account();
     const b = account();
-    const stack = stacks.harnessStacks.create({ label: "settled-retry", kind: "claude-code", members: [a, b] });
+    const stack = await stacks.harnessStacks.create({ label: "settled-retry", kind: "claude-code", members: [a, b] });
     const taskId = makeTask(a);
     const now = Date.now();
     const retryRunId = randomUUID();
@@ -428,18 +428,18 @@ describe("cooldown and boot recovery", () => {
       lastMove: null,
     });
 
-    fo.rearmAutoRetries(now);
+    await fo.rearmAutoRetries(now);
     // A terminal non-limit failure is the retry's real outcome: re-arming
     // would loop on the same error forever.
     expect(dbm.tasks.get(taskId)!.harnessState!.allExhausted).toBeNull();
     fo.cancelAutoRetry(taskId);
-    stacks.harnessStacks.delete(stack.id);
+    await stacks.harnessStacks.delete(stack.id);
   });
 
-  test("boot re-arms when the recorded retry run was orphaned by the crash", () => {
+  test("boot re-arms when the recorded retry run was orphaned by the crash", async () => {
     const a = account();
     const b = account();
-    const stack = stacks.harnessStacks.create({ label: "orphan-retry", kind: "claude-code", members: [a, b] });
+    const stack = await stacks.harnessStacks.create({ label: "orphan-retry", kind: "claude-code", members: [a, b] });
     const taskId = makeTask(a);
     const now = Date.now();
     const retryRunId = randomUUID();
@@ -479,19 +479,19 @@ describe("cooldown and boot recovery", () => {
       lastMove: null,
     });
 
-    fo.rearmAutoRetries(now);
+    await fo.rearmAutoRetries(now);
     const state = dbm.tasks.get(taskId)!.harnessState!.allExhausted!;
     expect(state.inFlight ?? false).toBe(false);
     expect(state.nextAttemptAt).toBeGreaterThan(now);
     expect(state.attempts).toBe(1);
     fo.cancelAutoRetry(taskId);
-    stacks.harnessStacks.delete(stack.id);
+    await stacks.harnessStacks.delete(stack.id);
   });
 
-  test("boot does not re-arm a capped in-flight retry", () => {
+  test("boot does not re-arm a capped in-flight retry", async () => {
     const a = account();
     const b = account();
-    const stack = stacks.harnessStacks.create({ label: "in-flight-cap", kind: "claude-code", members: [a, b] });
+    const stack = await stacks.harnessStacks.create({ label: "in-flight-cap", kind: "claude-code", members: [a, b] });
     const taskId = makeTask(a);
     const now = Date.now();
     dbm.tasks.setHarnessState(taskId, {
@@ -511,11 +511,11 @@ describe("cooldown and boot recovery", () => {
       },
       lastMove: null,
     });
-    fo.rearmAutoRetries(now);
+    await fo.rearmAutoRetries(now);
     const state = dbm.tasks.get(taskId)!.harnessState!.allExhausted!;
     expect(state.inFlight ?? false).toBe(false);
     expect(state.nextAttemptAt).toBe(0);
-    stacks.harnessStacks.delete(stack.id);
+    await stacks.harnessStacks.delete(stack.id);
   });
   test("a manual move with a recorded but missing transcript refuses instead of starting fresh", async () => {
     const a = account();
@@ -523,7 +523,7 @@ describe("cooldown and boot recovery", () => {
     // A is disabled so the manual prepare really has to move. Build the stack
     // AFTER disabling so the member snapshot carries enabled: false.
     dbm.harnesses.setEnabled(a, false);
-    const stack = stacks.harnessStacks.create({ label: "missing-transcript", kind: "claude-code", members: [a, b] });
+    const stack = await stacks.harnessStacks.create({ label: "missing-transcript", kind: "claude-code", members: [a, b] });
     const taskId = makeTask(a);
     const now = Date.now();
     const runId = randomUUID();
@@ -554,13 +554,13 @@ describe("cooldown and boot recovery", () => {
     expect(result.error ?? "").toContain("could not move the conversation");
     expect(dbm.tasks.get(taskId)!.agent).toBe(a);
 
-    stacks.harnessStacks.delete(stack.id);
+    await stacks.harnessStacks.delete(stack.id);
   });
 
-  test("boot staggers a missed retry instant and persists it so the armed timer matches (S9)", () => {
+  test("boot staggers a missed retry instant and persists it so the armed timer matches (S9)", async () => {
     const a = account();
     const b = account();
-    const stack = stacks.harnessStacks.create({ label: "missed-retry", kind: "claude-code", members: [a, b] });
+    const stack = await stacks.harnessStacks.create({ label: "missed-retry", kind: "claude-code", members: [a, b] });
     const taskId = makeTask(a);
     const now = Date.now();
     dbm.tasks.setHarnessState(taskId, {
@@ -584,7 +584,7 @@ describe("cooldown and boot recovery", () => {
     });
     const prev = fo.setHarnessFailoverHooks({ onAutoRetry: async () => {}, onReconcileSwap: async () => {} });
     try {
-      const armed = fo.rearmAutoRetries(now);
+      const armed = await fo.rearmAutoRetries(now);
       expect(armed).toBeGreaterThanOrEqual(1);
       const state = dbm.tasks.get(taskId)!.harnessState!.allExhausted!;
       // Overdue retries are staggered (`now + 5 s + i × 2 s`), never all
@@ -597,14 +597,14 @@ describe("cooldown and boot recovery", () => {
     } finally {
       fo.cancelAutoRetry(taskId);
       fo.setHarnessFailoverHooks(prev);
-      stacks.harnessStacks.delete(stack.id);
+      await stacks.harnessStacks.delete(stack.id);
     }
   });
 
-  test("boot leaves a capped or timer-less retry untouched", () => {
+  test("boot leaves a capped or timer-less retry untouched", async () => {
     const a = account();
     const b = account();
-    const stack = stacks.harnessStacks.create({ label: "retry-guards", kind: "claude-code", members: [a, b] });
+    const stack = await stacks.harnessStacks.create({ label: "retry-guards", kind: "claude-code", members: [a, b] });
     const now = Date.now();
     const capped = makeTask(a);
     const unscheduled = makeTask(a);
@@ -619,7 +619,7 @@ describe("cooldown and boot recovery", () => {
     });
     const prev = fo.setHarnessFailoverHooks({ onAutoRetry: async () => {}, onReconcileSwap: async () => {} });
     try {
-      fo.rearmAutoRetries(now);
+      await fo.rearmAutoRetries(now);
       // The cap is terminal until a manual run; a zero instant is "no timer",
       // not "due now". Re-arming either would loop the task or wake it forever.
       expect(dbm.tasks.get(capped)!.harnessState!.allExhausted).toMatchObject({ attempts: 3, nextAttemptAt: now + 60_000 });
@@ -628,7 +628,7 @@ describe("cooldown and boot recovery", () => {
       fo.cancelAutoRetry(capped);
       fo.cancelAutoRetry(unscheduled);
       fo.setHarnessFailoverHooks(prev);
-      stacks.harnessStacks.delete(stack.id);
+      await stacks.harnessStacks.delete(stack.id);
     }
   });
 
@@ -672,13 +672,13 @@ describe("cooldown and boot recovery", () => {
 });
 
 describe("planExhausted", () => {
-  test("persists the schedule and increments the attempt", () => {
+  test("persists the schedule and increments the attempt", async () => {
     const a = account();
     const b = account();
-    const stack = stacks.harnessStacks.create({ label: "fo-ex", kind: "claude-code", members: [a, b] });
+    const stack = await stacks.harnessStacks.create({ label: "fo-ex", kind: "claude-code", members: [a, b] });
     const taskId = makeTask(a);
     const now = Date.now();
-    const state = fo.planExhausted(
+    const state = await fo.planExhausted(
       taskId,
       { kind: "all-exhausted", earliestResetAtMs: now + 120_000, skipped: [] },
       now,
@@ -687,19 +687,19 @@ describe("planExhausted", () => {
     expect(state?.allExhausted?.nextAttemptAt).toBeGreaterThanOrEqual(now + 10_000);
     expect(state?.allExhausted?.max).toBe(3);
     fo.cancelAutoRetry(taskId);
-    stacks.harnessStacks.delete(stack.id);
+    await stacks.harnessStacks.delete(stack.id);
   });
 
-  test("the cap stops the schedule without incrementing forever", () => {
+  test("the cap stops the schedule without incrementing forever", async () => {
     const a = account();
     const b = account();
-    const stack = stacks.harnessStacks.create({ label: "fo-cap", kind: "claude-code", members: [a, b] });
+    const stack = await stacks.harnessStacks.create({ label: "fo-cap", kind: "claude-code", members: [a, b] });
     const taskId = makeTask(a);
     const now = Date.now();
     for (let i = 0; i < 3; i++) {
-      fo.planExhausted(taskId, { kind: "all-exhausted", earliestResetAtMs: now + 60_000, skipped: [] }, now);
+      await fo.planExhausted(taskId, { kind: "all-exhausted", earliestResetAtMs: now + 60_000, skipped: [] }, now);
     }
-    const capped = fo.planExhausted(
+    const capped = await fo.planExhausted(
       taskId,
       { kind: "all-exhausted", earliestResetAtMs: now + 60_000, skipped: [] },
       now,
@@ -708,22 +708,22 @@ describe("planExhausted", () => {
     expect(capped?.allExhausted?.attempts).toBe(3);
     expect(capped?.allExhausted?.nextAttemptAt).toBe(0);
     fo.cancelAutoRetry(taskId);
-    stacks.harnessStacks.delete(stack.id);
+    await stacks.harnessStacks.delete(stack.id);
   });
 
-  test("a none-usable member with no reset schedules nothing", () => {
+  test("a none-usable member with no reset schedules nothing", async () => {
     const a = account();
     const b = account();
-    const stack = stacks.harnessStacks.create({ label: "fo-none", kind: "claude-code", members: [a, b] });
+    const stack = await stacks.harnessStacks.create({ label: "fo-none", kind: "claude-code", members: [a, b] });
     const taskId = makeTask(a);
-    const state = fo.planExhausted(
+    const state = await fo.planExhausted(
       taskId,
       { kind: "none-usable", reasons: [{ harnessId: b, reason: "disabled" }], earliestResetAtMs: null, skipped: [] },
     );
     expect(state?.allExhausted?.reason).toBe("no-usable-member");
     expect(state?.allExhausted?.nextAttemptAt).toBe(0);
     fo.cancelAutoRetry(taskId);
-    stacks.harnessStacks.delete(stack.id);
+    await stacks.harnessStacks.delete(stack.id);
   });
 });
 
@@ -741,9 +741,9 @@ describe("auto-retry timer claim", () => {
   test("a timer firing while another start holds the claim re-arms instead of being consumed (R17-S3)", async () => {
     const a = account();
     const b = account();
-    const stack = stacks.harnessStacks.create({ label: "fo-defer", kind: "claude-code", members: [a, b] });
+    const stack = await stacks.harnessStacks.create({ label: "fo-defer", kind: "claude-code", members: [a, b] });
     const taskId = makeTask(a);
-    fo.planExhausted(
+    await fo.planExhausted(
       taskId,
       { kind: "all-exhausted", earliestResetAtMs: Date.now() + 60_000, skipped: [] },
       Date.now(),
@@ -770,16 +770,16 @@ describe("auto-retry timer claim", () => {
     } finally {
       fo.setHarnessFailoverHooks(prev);
       fo.cancelAutoRetry(taskId);
-      stacks.harnessStacks.delete(stack.id);
+      await stacks.harnessStacks.delete(stack.id);
     }
   });
 
   test("a timer fires once the claim is free", async () => {
     const a = account();
     const b = account();
-    const stack = stacks.harnessStacks.create({ label: "fo-fire", kind: "claude-code", members: [a, b] });
+    const stack = await stacks.harnessStacks.create({ label: "fo-fire", kind: "claude-code", members: [a, b] });
     const taskId = makeTask(a);
-    fo.planExhausted(
+    await fo.planExhausted(
       taskId,
       { kind: "all-exhausted", earliestResetAtMs: Date.now() + 60_000, skipped: [] },
       Date.now(),
@@ -800,16 +800,16 @@ describe("auto-retry timer claim", () => {
     } finally {
       fo.setHarnessFailoverHooks(prev);
       fo.cancelAutoRetry(taskId);
-      stacks.harnessStacks.delete(stack.id);
+      await stacks.harnessStacks.delete(stack.id);
     }
   });
 });
 
 describe("review fixes (fix round)", () => {
-  test("two overdue retries are staggered apart, not fired in one tick (S9)", () => {
+  test("two overdue retries are staggered apart, not fired in one tick (S9)", async () => {
     const a = account();
     const b = account();
-    const stack = stacks.harnessStacks.create({ label: "stagger", kind: "claude-code", members: [a, b] });
+    const stack = await stacks.harnessStacks.create({ label: "stagger", kind: "claude-code", members: [a, b] });
     const now = Date.now();
     const first = makeTask(a);
     const second = makeTask(a);
@@ -820,7 +820,7 @@ describe("review fixes (fix round)", () => {
       });
     }
     try {
-      fo.rearmAutoRetries(now);
+      await fo.rearmAutoRetries(now);
       const at1 = dbm.tasks.get(first)!.harnessState!.allExhausted!.nextAttemptAt;
       const at2 = dbm.tasks.get(second)!.harnessState!.allExhausted!.nextAttemptAt;
       expect(at1).not.toBe(at2);
@@ -830,7 +830,7 @@ describe("review fixes (fix round)", () => {
         fo.cancelAutoRetry(id);
         dbm.tasks.setHarnessState(id, null);
       }
-      stacks.harnessStacks.delete(stack.id);
+      await stacks.harnessStacks.delete(stack.id);
     }
   });
 
@@ -838,7 +838,7 @@ describe("review fixes (fix round)", () => {
     const a = account();
     const b = account();
     dbm.harnesses.setEnabled(a, false);
-    const stack = stacks.harnessStacks.create({ label: "held", kind: "claude-code", members: [a, b] });
+    const stack = await stacks.harnessStacks.create({ label: "held", kind: "claude-code", members: [a, b] });
     const taskId = makeTask(a);
     const prev = fo.setHarnessFailoverHooks({
       onAutoRetry: async () => {},
@@ -857,7 +857,7 @@ describe("review fixes (fix round)", () => {
     // Once the hold is gone the same prepare does move.
     const moved = await fo.prepareTaskHarness(taskId, { manual: true });
     expect(moved.moved).toEqual({ from: a, to: b });
-    stacks.harnessStacks.delete(stack.id);
+    await stacks.harnessStacks.delete(stack.id);
   });
 
   test("a manual prepare move mirrors the destination's config and returns the warnings (S11)", async () => {
@@ -870,47 +870,47 @@ describe("review fixes (fix round)", () => {
     writeFileSync(path.join(homeA, "settings.json"), "{}\n");
     writeFileSync(path.join(homeB, "settings.json"), "[]\n");
     dbm.harnesses.setEnabled(a, false);
-    const stack = stacks.harnessStacks.create({ label: "prepare-mirror", kind: "claude-code", members: [a, b] });
+    const stack = await stacks.harnessStacks.create({ label: "prepare-mirror", kind: "claude-code", members: [a, b] });
     const taskId = makeTask(a);
     const result = await fo.prepareTaskHarness(taskId, { manual: true });
     expect(result.moved).toEqual({ from: a, to: b });
     expect((result.warnings ?? []).some((w) => w.startsWith("config mirror:") && w.includes("not a JSON object"))).toBe(true);
-    stacks.harnessStacks.delete(stack.id);
+    await stacks.harnessStacks.delete(stack.id);
   });
 
-  test("state writes re-point stackId, and stack delete finds tasks by resolved membership (S10)", () => {
+  test("state writes re-point stackId, and stack delete finds tasks by resolved membership (S10)", async () => {
     const a = account();
     const b = account();
     const c = account();
-    const old = stacks.harnessStacks.create({ label: "s10-old", kind: "claude-code", members: [a, b] });
-    const fresh = stacks.harnessStacks.create({ label: "s10-new", kind: "claude-code", members: [c] });
+    const old = await stacks.harnessStacks.create({ label: "s10-old", kind: "claude-code", members: [a, b] });
+    const fresh = await stacks.harnessStacks.create({ label: "s10-new", kind: "claude-code", members: [c] });
     const taskId = makeTask(a);
     dbm.tasks.setHarnessState(taskId, {
       stackId: old.id, position: 0, count: 2, tried: [], pendingSwap: null, allExhausted: null, lastMove: null,
     });
-    stacks.harnessStacks.update(old.id, { members: [b] });
-    stacks.harnessStacks.update(fresh.id, { members: [c, a] });
+    await stacks.harnessStacks.update(old.id, { members: [b] });
+    await stacks.harnessStacks.update(fresh.id, { members: [c, a] });
     // Before any write the recorded id is stale; the resolved stack still
     // claims the task for a delete.
-    expect(fo.failoverTaskIdsForStack(fresh.id)).toContain(taskId);
+    expect(await fo.failoverTaskIdsForStack(fresh.id)).toContain(taskId);
     // Any write through the engine re-points it.
-    fo.patchTaskState(taskId, { tried: [a] });
+    await fo.patchTaskState(taskId, { tried: [a] });
     const state = dbm.tasks.get(taskId)!.harnessState!;
     expect(state.stackId).toBe(fresh.id);
     expect(state.position).toBe(1);
-    expect(fo.failoverTaskIdsForStack(old.id)).not.toContain(taskId);
+    expect(await fo.failoverTaskIdsForStack(old.id)).not.toContain(taskId);
     // A task without state is never created by a patch.
     const bare = makeTask(b);
-    expect(fo.patchTaskState(bare, { tried: [b] })).toBeNull();
+    expect(await fo.patchTaskState(bare, { tried: [b] })).toBeNull();
     expect(dbm.tasks.get(bare)!.harnessState ?? null).toBeNull();
-    stacks.harnessStacks.delete(old.id);
-    stacks.harnessStacks.delete(fresh.id);
+    await stacks.harnessStacks.delete(old.id);
+    await stacks.harnessStacks.delete(fresh.id);
   });
 
-  test("a busy task defers its fired retry instead of consuming the timer (Q7)", () => {
+  test("a busy task defers its fired retry instead of consuming the timer (Q7)", async () => {
     const a = account();
     const b = account();
-    const stack = stacks.harnessStacks.create({ label: "q7", kind: "claude-code", members: [a, b] });
+    const stack = await stacks.harnessStacks.create({ label: "q7", kind: "claude-code", members: [a, b] });
     const taskId = makeTask(a);
     const firedAt = Date.now() - 10;
     dbm.tasks.setHarnessState(taskId, {
@@ -918,7 +918,7 @@ describe("review fixes (fix round)", () => {
       allExhausted: { at: firedAt, attempts: 1, max: 3, nextAttemptAt: firedAt, earliestResetAtMs: null, reason: "quota" },
     });
     try {
-      expect(fo.deferAutoRetryNow(taskId)).toBe(true);
+      expect(await fo.deferAutoRetryNow(taskId)).toBe(true);
       const ex = dbm.tasks.get(taskId)!.harnessState!.allExhausted!;
       expect(ex.nextAttemptAt).toBeGreaterThan(firedAt);
       expect(ex.attempts).toBe(1);
@@ -926,11 +926,11 @@ describe("review fixes (fix round)", () => {
       // An in-flight marker is owned by its run: never deferred.
       dbm.tasks.setHarnessState(taskId, { ...dbm.tasks.get(taskId)!.harnessState!, allExhausted: { ...ex, inFlight: true, nextAttemptAt: 0 } });
       fo.cancelAutoRetry(taskId);
-      expect(fo.deferAutoRetryNow(taskId)).toBe(false);
+      expect(await fo.deferAutoRetryNow(taskId)).toBe(false);
     } finally {
       fo.cancelAutoRetry(taskId);
       dbm.tasks.setHarnessState(taskId, null);
-      stacks.harnessStacks.delete(stack.id);
+      await stacks.harnessStacks.delete(stack.id);
     }
   });
 });
@@ -962,39 +962,39 @@ describe("retry-wait seam (D20)", () => {
 });
 
 describe("memberReasonsFor and the 1-member early return", () => {
-  test("includeCurrent prefixes the current account; a tried, non-cooling member reads 'tried this lap'", () => {
+  test("includeCurrent prefixes the current account; a tried, non-cooling member reads 'tried this lap'", async () => {
     const a = account();
     const b = account();
-    const stack = stacks.harnessStacks.create({ label: "reasons", kind: "claude-code", members: [a, b] });
+    const stack = await stacks.harnessStacks.create({ label: "reasons", kind: "claude-code", members: [a, b] });
     const taskId = makeTask(a);
     const now = Date.now();
-    stacks.harnessStacks.setLimitState(a, { reason: "quota", resetAtMs: now + 60_000, message: "x", source: "claude-pane" }, now);
-    fo.recordTried(taskId, b);
+    await stacks.harnessStacks.setLimitState(a, { reason: "quota", resetAtMs: now + 60_000, message: "x", source: "claude-pane" }, now);
+    await fo.recordTried(taskId, b);
     const task = dbm.tasks.get(taskId)!;
-    const withoutCurrent = fo.memberReasonsFor(stack, task, now);
+    const withoutCurrent = await fo.memberReasonsFor(stack, task, now);
     expect(withoutCurrent.map((r) => r.harnessId)).toEqual([b]);
     expect(withoutCurrent[0]!.reason).toBe("tried this lap");
-    const all = fo.memberReasonsFor(stack, task, now, { includeCurrent: true });
+    const all = await fo.memberReasonsFor(stack, task, now, { includeCurrent: true });
     expect(all.map((r) => r.harnessId)).toEqual([a, b]);
     expect(all[0]!.reason.startsWith("current — cooling until ")).toBe(true);
-    stacks.harnessStacks.clearLimitState(a);
-    stacks.harnessStacks.delete(stack.id);
+    await stacks.harnessStacks.clearLimitState(a);
+    await stacks.harnessStacks.delete(stack.id);
   });
 
   test("a stack cut to one member clears a stale exhausted state and its timer", async () => {
     const a = account();
     const b = account();
-    const stack = stacks.harnessStacks.create({ label: "shrunk", kind: "claude-code", members: [a, b] });
+    const stack = await stacks.harnessStacks.create({ label: "shrunk", kind: "claude-code", members: [a, b] });
     const taskId = makeTask(a);
-    fo.recordTried(taskId, a);
-    fo.planExhausted(taskId, { kind: "all-exhausted", earliestResetAtMs: Date.now() + 60_000, skipped: [] });
+    await fo.recordTried(taskId, a);
+    await fo.planExhausted(taskId, { kind: "all-exhausted", earliestResetAtMs: Date.now() + 60_000, skipped: [] });
     expect(fo.hasArmedAutoRetry(taskId)).toBe(true);
-    stacks.harnessStacks.update(stack.id, { members: [a] } as never);
+    await stacks.harnessStacks.update(stack.id, { members: [a] } as never);
     const res = await fo.prepareTaskHarness(taskId, { manual: true });
     expect(res.ok).toBe(true);
     expect(dbm.tasks.get(taskId)!.harnessState).toBeNull();
     expect(fo.hasArmedAutoRetry(taskId)).toBe(false);
-    stacks.harnessStacks.delete(stack.id);
+    await stacks.harnessStacks.delete(stack.id);
   });
 });
 
@@ -1005,29 +1005,29 @@ describe("memberReasonsFor and the 1-member early return", () => {
 
 describe("per-model cooldowns in selection (D5, W1 review S2)", () => {
   /** The member selection lands on for `task`, or null when none is usable. */
-  const pick = (task: object, now: number): string | null => {
-    const plan = fo.planNextMember(task as never, { now });
+  const pick = async (task: object, now: number): Promise<string | null> => {
+    const plan = await fo.planNextMember(task as never, { now });
     return plan.kind === "next" ? plan.member.harnessId : null;
   };
 
-  test("a per-model row for model X does not block a task on model Y; an account-wide row blocks both", () => {
+  test("a per-model row for model X does not block a task on model Y; an account-wide row blocks both", async () => {
     const a = account();
     const b = account();
     const c = account();
-    const stack = stacks.harnessStacks.create({ label: "permodel", kind: "claude-code", members: [a, b, c] });
+    const stack = await stacks.harnessStacks.create({ label: "permodel", kind: "claude-code", members: [a, b, c] });
     const taskId = makeTask(a);
     const now = Date.now();
     // The cooldown on b is for one model only.
-    stacks.harnessStacks.setLimitState(b, { reason: "quota", resetAtMs: now + 3_600_000, message: "x", source: "codex-error", model: "model-x" } as never, now);
+    await stacks.harnessStacks.setLimitState(b, { reason: "quota", resetAtMs: now + 3_600_000, message: "x", source: "codex-error", model: "model-x" } as never, now);
     const onX = { ...dbm.tasks.get(taskId)!, model: "model-x" };
     const onY = { ...dbm.tasks.get(taskId)!, model: "model-y" };
-    expect(pick(onX, now)).toBe(c);
-    expect(pick(onY, now)).toBe(b);
+    expect(await pick(onX, now)).toBe(c);
+    expect(await pick(onY, now)).toBe(b);
     // An account-wide row blocks every model.
-    stacks.harnessStacks.setLimitState(b, { reason: "quota", resetAtMs: now + 3_600_000, message: "all", source: "claude-pane" } as never, now);
-    expect(pick(onY, now)).toBe(c);
-    stacks.harnessStacks.clearLimitState(b);
-    stacks.harnessStacks.delete(stack.id);
+    await stacks.harnessStacks.setLimitState(b, { reason: "quota", resetAtMs: now + 3_600_000, message: "all", source: "claude-pane" } as never, now);
+    expect(await pick(onY, now)).toBe(c);
+    await stacks.harnessStacks.clearLimitState(b);
+    await stacks.harnessStacks.delete(stack.id);
   });
 
   test("model matching is case-insensitive and a default-model task resolves to DEFAULT_MODEL", async () => {
@@ -1035,24 +1035,24 @@ describe("per-model cooldowns in selection (D5, W1 review S2)", () => {
     const a = account();
     const b = account();
     const c = account();
-    const stack = stacks.harnessStacks.create({ label: "permodel-default", kind: "claude-code", members: [a, b, c] });
+    const stack = await stacks.harnessStacks.create({ label: "permodel-default", kind: "claude-code", members: [a, b, c] });
     const taskId = makeTask(a);
     const now = Date.now();
     const defaultModel = DEFAULT_MODEL["claude-code"];
-    stacks.harnessStacks.setLimitState(b, {
+    await stacks.harnessStacks.setLimitState(b, {
       reason: "quota", resetAtMs: now + 3_600_000, message: "x", source: "codex-error", model: defaultModel.toLowerCase(),
     } as never, now);
     const nullModel = { ...dbm.tasks.get(taskId)!, model: null as never };
-    expect(fo.cooldownModelFor(nullModel, b)).toBe(defaultModel.toLowerCase());
+    expect(await fo.cooldownModelFor(nullModel, b)).toBe(defaultModel.toLowerCase());
     // A default-model task meets the row for the default model...
-    expect(pick(nullModel, now)).toBe(c);
+    expect(await pick(nullModel, now)).toBe(c);
     // ...and the same task pinned to another model does not.
-    expect(pick({ ...nullModel, model: "some-other-model" }, now)).toBe(b);
+    expect(await pick({ ...nullModel, model: "some-other-model" }, now)).toBe(b);
     // The match is on the lower-cased id.
-    expect(fo.cooldownModelFor({ model: defaultModel.toUpperCase() } as never, b)).toBe(defaultModel.toLowerCase());
-    expect(pick({ ...nullModel, model: defaultModel.toUpperCase() }, now)).toBe(c);
-    stacks.harnessStacks.clearLimitState(b);
-    stacks.harnessStacks.delete(stack.id);
+    expect(await fo.cooldownModelFor({ model: defaultModel.toUpperCase() } as never, b)).toBe(defaultModel.toLowerCase());
+    expect(await pick({ ...nullModel, model: defaultModel.toUpperCase() }, now)).toBe(c);
+    await stacks.harnessStacks.clearLimitState(b);
+    await stacks.harnessStacks.delete(stack.id);
   });
 });
 
@@ -1080,21 +1080,21 @@ describe("a default-model task is checked against the backup's CLI floor (findin
       const a = codex("a", "9.9.9");
       const b = codex("b", "0.100.0");
       const c = codex("c", "9.9.9");
-      const stack = stacks.harnessStacks.create({ label: "floor", kind: "codex", members: [a, b, c] });
+      const stack = await stacks.harnessStacks.create({ label: "floor", kind: "codex", members: [a, b, c] });
       for (const id of [a, b, c]) await agentStatus.cachedCliVersion(dbm.harnesses.get(id)!);
       expect(agentStatus.peekCachedCliVersion(dbm.harnesses.get(b)!)).toContain("0.100.0");
       const task = { id: "t", agent: a, model: null as string | null, harnessState: null } as never;
       const member = (id: string) => ({ harnessId: id, enabled: true, label: id });
       // The default-model task cannot run on the old CLI...
-      expect(fo.memberUnusableReason(member(b), task)).toBe(`CLI older than ${floor}`);
-      expect(fo.memberUnusableReason(member(c), task)).toBeNull();
+      expect(await fo.memberUnusableReason(member(b), task)).toBe(`CLI older than ${floor}`);
+      expect(await fo.memberUnusableReason(member(c), task)).toBeNull();
       // ...so selection lands on the next member that can.
-      const plan = fo.planNextMember({ id: "t", agent: a, model: null, harnessState: null } as never);
+      const plan = await fo.planNextMember({ id: "t", agent: a, model: null, harnessState: null } as never);
       expect(plan.kind).toBe("next");
       if (plan.kind === "next") expect(plan.member.harnessId).toBe(c);
       // A model without a floor is fine on the old CLI.
-      expect(fo.memberUnusableReason(member(b), { model: "fixture-codex-model" } as never)).toBeNull();
-      stacks.harnessStacks.delete(stack.id);
+      expect(await fo.memberUnusableReason(member(b), { model: "fixture-codex-model" } as never)).toBeNull();
+      await stacks.harnessStacks.delete(stack.id);
     } finally {
       if (prevBin === undefined) delete process.env.AGETOR_CODEX_BIN; else process.env.AGETOR_CODEX_BIN = prevBin;
       rmSync(binDirLocal, { recursive: true, force: true });
@@ -1126,9 +1126,9 @@ describe("discovery first: a CLI catalog decides model availability, the frozen 
       const member = { harnessId: id, enabled: true, label: id };
       const task = { model } as never;
       discovery.__testing.resetForTests();
-      expect(fo.memberUnusableReason(member, task)).toBe(`CLI older than ${floor}`);
+      expect(await fo.memberUnusableReason(member, task)).toBe(`CLI older than ${floor}`);
       discovery.seedDiscoveryCache({ scope: "harness", kind: "codex", harnessId: id }, [{ id: model }]);
-      expect(fo.memberUnusableReason(member, task)).toBeNull();
+      expect(await fo.memberUnusableReason(member, task)).toBeNull();
       discovery.seedDiscoveryCache({ scope: "harness", kind: "codex", harnessId: id }, [{ id: model }]);
     } finally {
       discovery.__testing.resetForTests();
@@ -1161,7 +1161,7 @@ describe("discovery first: a CLI catalog decides model availability, the frozen 
       discovery.__testing.resetForTests();
       // The built-in account's list does not carry the model; this account has none yet.
       discovery.seedDiscoveryCache({ scope: "kind", kind: "codex" }, [{ id: "some-other-model" }]);
-      expect(fo.memberUnusableReason(member, { model } as never)).toBe(`CLI older than ${floor}`);
+      expect(await fo.memberUnusableReason(member, { model } as never)).toBe(`CLI older than ${floor}`);
     } finally {
       discovery.__testing.resetForTests();
       if (prevBin === undefined) delete process.env.AGETOR_CODEX_BIN; else process.env.AGETOR_CODEX_BIN = prevBin;
@@ -1200,7 +1200,7 @@ describe("discovery first: a CLI catalog decides model availability, the frozen 
       discovery.seedDiscoveryCache({ scope: "harness", kind: "codex", harnessId: id }, [{ id: "some-other-model" }]);
       await scheduler.__testing.hydrateFromStore();
       // Judged by neither list nor "not offered": only the frozen floor speaks.
-      expect(fo.memberUnusableReason(member, { model } as never)).toBe(`CLI older than ${floor}`);
+      expect(await fo.memberUnusableReason(member, { model } as never)).toBe(`CLI older than ${floor}`);
     } finally {
       dbm.preferences.delete(prefKey);
       scheduler.__testing.resetForTests();
@@ -1219,9 +1219,9 @@ describe("a 1-member stack is inert (22a) and prepare moves record `unavailable`
   test("an unusable lone member gets the normal pre-flight: ok, no move, no state, no history", async () => {
     const a = account();
     const b = account();
-    const stack = stacks.harnessStacks.create({ label: "inert", kind: "claude-code", members: [a, b] });
+    const stack = await stacks.harnessStacks.create({ label: "inert", kind: "claude-code", members: [a, b] });
     const taskId = makeTask(a);
-    stacks.harnessStacks.update(stack.id, { members: [a] } as never);
+    await stacks.harnessStacks.update(stack.id, { members: [a] } as never);
     dbm.harnesses.setEnabled(a, false);
     try {
       const res = await fo.prepareTaskHarness(taskId, { manual: false });
@@ -1231,14 +1231,14 @@ describe("a 1-member stack is inert (22a) and prepare moves record `unavailable`
       expect((await harnessSwapEvents.page(stack.id, { limit: 10 })).events).toHaveLength(0);
     } finally {
       dbm.harnesses.setEnabled(a, true);
-      stacks.harnessStacks.delete(stack.id);
+      await stacks.harnessStacks.delete(stack.id);
     }
   });
 
   test("an unavailable current account moves to the backup with exactly one `unavailable` row", async () => {
     const a = account();
     const b = account();
-    const stack = stacks.harnessStacks.create({ label: "unavail", kind: "claude-code", members: [a, b] });
+    const stack = await stacks.harnessStacks.create({ label: "unavail", kind: "claude-code", members: [a, b] });
     const taskId = makeTask(a);
     dbm.harnesses.setEnabled(a, false);
     try {
@@ -1250,7 +1250,112 @@ describe("a 1-member stack is inert (22a) and prepare moves record `unavailable`
       expect(rows[0]).toMatchObject({ trigger: "unavailable", fromHarnessId: a, toHarnessId: b });
     } finally {
       dbm.harnesses.setEnabled(a, true);
-      stacks.harnessStacks.delete(stack.id);
+      await stacks.harnessStacks.delete(stack.id);
     }
+  });
+});
+
+// ---------------------------------------------------------------------------
+// The harness_state read-modify-write is atomic per task (non-blocking-core
+// T10b-1): a per-task mutex plus a compare-and-set at the write.
+// ---------------------------------------------------------------------------
+describe("harness_state read-modify-write atomicity", () => {
+  async function stackedTask(): Promise<{ taskId: string; stackId: string }> {
+    const a = account();
+    const b = account();
+    const stack = await stacks.harnessStacks.create({ label: "atomic", kind: "claude-code", members: [a, b] });
+    const taskId = makeTask(a);
+    await fo.updateTaskState(taskId, () => ({
+      stackId: stack.id, position: 0, count: 2, tried: [], pendingSwap: null, allExhausted: null, lastMove: null,
+    }));
+    return { taskId, stackId: stack.id };
+  }
+
+  test("concurrent mutations of one task all land: no lost update", async () => {
+    const { taskId, stackId } = await stackedTask();
+    // Each mutation reads the state, yields (a database hop), then returns
+    // the state plus its own mark. Without the per-task lock they would all
+    // read the same base and the last write would win alone.
+    await Promise.all(Array.from({ length: 12 }, (_, i) =>
+      fo.updateTaskState(taskId, async (state) => {
+        await stacks.harnessStacks.getByMember("fo-none");
+        return { ...state!, tried: [...state!.tried, `m${i}`] };
+      })));
+    const tried = dbm.tasks.get(taskId)!.harnessState!.tried;
+    expect([...tried].sort()).toEqual(Array.from({ length: 12 }, (_, i) => `m${i}`).sort());
+    await stacks.harnessStacks.delete(stackId);
+  });
+
+  test("patchTaskState with a function patch reads the live state, and is a no-op without one", async () => {
+    const { taskId, stackId } = await stackedTask();
+    await Promise.all([
+      fo.patchTaskState(taskId, (s) => ({ tried: [...s.tried, "x"] })),
+      fo.patchTaskState(taskId, (s) => ({ tried: [...s.tried, "y"] })),
+    ]);
+    expect([...dbm.tasks.get(taskId)!.harnessState!.tried].sort()).toEqual(["x", "y"]);
+    // No state at all: nothing is created from nothing.
+    const bare = makeTask(account());
+    expect(await fo.patchTaskState(bare, { tried: ["z"] })).toBeNull();
+    expect(dbm.tasks.get(bare)!.harnessState ?? null).toBeNull();
+    await stacks.harnessStacks.delete(stackId);
+  });
+
+  test("a stack delete that lands mid-mutation wins: the stale result is not written, the mutation re-reads", async () => {
+    const { taskId, stackId } = await stackedTask();
+    const { op } = await import("./db-async.ts");
+    const seen: Array<string | null> = [];
+    let deleted = false;
+    const result = await fo.updateTaskState(taskId, async (state) => {
+      seen.push(state?.stackId ?? null);
+      if (!deleted) {
+        deleted = true;
+        // Outside the task lock, as the stack route's delete is: clears the
+        // state of every task naming the stack, in its own transaction.
+        await op("stacks.delete", [stackId]);
+      }
+      return state ? { ...state, tried: ["stale"] } : null;
+    });
+    // The first attempt computed from a state the delete then cleared, so its
+    // write was refused; the second attempt saw no state and wrote none.
+    expect(seen).toEqual([stackId, null]);
+    expect(result).toBeNull();
+    expect(dbm.tasks.get(taskId)!.harnessState ?? null).toBeNull();
+  });
+
+  test("a mutation may keep the stored state untouched", async () => {
+    const { taskId, stackId } = await stackedTask();
+    const before = dbm.tasks.get(taskId)!;
+    const kept = await fo.updateTaskState(taskId, () => fo.KEEP_TASK_STATE);
+    expect(kept).toEqual(before.harnessState ?? null);
+    expect(dbm.tasks.get(taskId)!.updatedAt).toBe(before.updatedAt);
+    await stacks.harnessStacks.delete(stackId);
+  });
+
+  test("clearFailoverState waits its turn behind a queued mutation and then wins", async () => {
+    const { taskId, stackId } = await stackedTask();
+    const queued = fo.updateTaskState(taskId, async (state) => {
+      await Bun.sleep(5);
+      return { ...state!, tried: ["queued"] };
+    });
+    const cleared = fo.clearFailoverState(taskId);
+    await Promise.all([queued, cleared]);
+    expect(dbm.tasks.get(taskId)!.harnessState ?? null).toBeNull();
+    await stacks.harnessStacks.delete(stackId);
+  });
+
+  test("deferAutoRetryNow moves only the schedule it read", async () => {
+    const { taskId, stackId } = await stackedTask();
+    const soon = Date.now() + 120_000;
+    await fo.patchTaskState(taskId, {
+      allExhausted: { at: Date.now(), attempts: 1, max: 3, nextAttemptAt: soon, earliestResetAtMs: null, reason: "quota" },
+    });
+    expect(await fo.deferAutoRetryNow(taskId)).toBe(true);
+    const after = dbm.tasks.get(taskId)!.harnessState!.allExhausted!;
+    expect(after.nextAttemptAt).toBeLessThan(soon);
+    expect(fo.hasArmedAutoRetry(taskId)).toBe(true);
+    // A task with no countdown has nothing to defer.
+    expect(await fo.deferAutoRetryNow(makeTask(account()))).toBe(false);
+    fo.cancelAutoRetry(taskId);
+    await stacks.harnessStacks.delete(stackId);
   });
 });

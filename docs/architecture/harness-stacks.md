@@ -1324,6 +1324,60 @@ the table. `snapshotHarnessState`
 `harness_mirror_sources` whole-row, so one test file's rows never reach the
 next ([testing-seams.md](testing-seams.md)).
 
+## Database access and atomic state writes
+
+The stack store, the failover engine and the session-transfer store read and
+write through the async database facade (`db-async.ts`), so every function in
+`harness-stacks.ts`, `harness-failover.ts` and `harness-session-transfer.ts`
+that touches the database returns a promise. The pure halves stay synchronous
+and shared: `pickNextMember`, `handoffSessionWins` and `sessionFromRuns` (the
+session-id rule, which the orchestrator's still-synchronous spawn paths call
+too, so the rule has one implementation).
+
+- **Named ops** own what must be one transaction: stack create / update /
+  delete (`stacks.*`, the delete clears every naming task's state in the same
+  transaction), the cooldown row writes (`limit.set` sweeps, reads and upserts
+  together; a fallback never shortens a later provider reset) and
+  `harnessState.cas`.
+- **Every `harness_state` write is a read-modify-write made atomic per task**
+  (`updateTaskState` / `patchTaskState` / `clearFailoverState`):
+  1. a per-task async mutex (`withTaskLock`) runs the whole read, the mutation
+     and the write, so two flows of this process (a settle and a timer, a
+     retry and a manual Run) never interleave;
+  2. the write is a compare-and-set (`harnessState.cas`): it lands only while
+     the stored state still serializes to what the mutation read, so a writer
+     outside the mutex (a stack delete clearing the state) is never overwritten
+     with a stale result; the step then re-reads and decides again (at most
+     five attempts). A mutation may therefore run more than once: its side
+     effects (arming a timer) must be idempotent.
+
+  There is no single op for the decision because it needs main-thread-only
+  state (the retry timers, the cached CLI version and model catalog, the live
+  hooks). A mutation must not call a locked function of the module (the lock is
+  not re-entrant). A mutation may return `KEEP_TASK_STATE` to leave the stored
+  state untouched (no write). Every check-then-write on the state (drop a
+  scheduled switch, defer a fired retry, spend an attempt, clear a manual
+  intent) is one mutation on the state read inside the step, never a read
+  followed by a patch.
+- **Retry timers.** `armAutoRetry`/`cancelAutoRetry` bump a per-task epoch. A
+  fired timer reads the persisted schedule across a database hop and stands
+  down when the epoch moved meanwhile (a re-arm or a cancel owns the retry).
+- **Orphan sweeps.** The sweep's "is this session being transferred or live on
+  a handoff row" check pairs an in-memory look (`transferInFlight`) with a
+  database read; a transfer that starts and ends inside the read bumps
+  `flightEpoch`, so the pair is asked again until nothing started meanwhile.
+  `removeCopiedPathsDetailed`'s `shouldStop` may be async.
+- **Chunk-handler work.** The per-run chunk handler is synchronous. The two
+  things in it that need the database (recording a limit signal, deciding
+  whether an API error belongs to a stack's swap) are queued on the run
+  (`queueChunkWork`) and the done handler waits for them (`settleChunkWork`)
+  before it reads `apiError`, `limitHit` or `limitRecorded`. The cooldown row
+  is therefore visible a database hop after the chunk, not within it.
+- **"Switch to next account" claims first.** An idle task's switch takes the
+  account-switch claim (and the switch-now marker) before planning the target,
+  so a message arriving while the plan reads the database is held behind the
+  move instead of starting a turn that makes the switch refuse as busy.
+
 ## Crash safety and boot
 
 - **`reconcileOrphans` does not orphan a swap's old run.** A `running` run that

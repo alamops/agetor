@@ -32,7 +32,7 @@ import { preflightCatalogFor } from "./model-discovery.ts";
 import { CLI_AUTHORITATIVE_CATALOG_KINDS, modelCatalogVerdict } from "../shared/model-catalog.ts";
 import { peekCachedCliVersion } from "./agent-status.ts";
 import { cliVersionSatisfies } from "../shared/cli-version.ts";
-import { harnesses, harnessUsage, runs, tasks, type SessionIdColumn } from "./db.ts";
+import { harnesses, harnessUsage, op, runs, tasks, type SessionIdColumn } from "./db-async.ts";
 import { harnessStacks, loginEvidence, memberInstalled } from "./harness-stacks.ts";
 import { findSessionIdForHarness, sessionTransferAdapter } from "./harness-session-transfer.ts";
 import { mirrorForSwap } from "./harness-mirror.ts";
@@ -78,45 +78,123 @@ export function setHarnessFailoverHooks(next: FailoverHooks | null): FailoverHoo
 
 const retryTimers = new Map<string, ReturnType<typeof setTimeout>>();
 
+/** Per-task epoch, bumped by every arm and cancel of that task's retry timer.
+ *  A fired timer reads the persisted schedule across a database hop; if the
+ *  epoch moved meanwhile, a newer arm or a cancel owns the retry and the stale
+ *  fire stands down. One small number per task that ever armed a retry. */
+const retryEpochs = new Map<string, number>();
+const bumpRetryEpoch = (taskId: string): void => {
+  retryEpochs.set(taskId, (retryEpochs.get(taskId) ?? 0) + 1);
+};
+
+// ---------------------------------------------------------------------------
+// The `harness_state` read-modify-write
+// ---------------------------------------------------------------------------
+//
+// Every write of a task's failover state is "read the task, decide the next
+// state from it, write it". With the database on another thread the read and
+// the write are separate hops, so two flows on one task (a settle and a timer,
+// a retry and a manual Run, a switch and a stack edit) could both read the same
+// state and the second write would drop the first one's change. Two layers keep
+// each such step atomic:
+//
+//  1. a per-task async mutex (`withTaskLock`) around the whole
+//     read-decide-write, so every flow of THIS process runs one after another;
+//  2. a compare-and-set at the write (`harnessState.cas`, one transaction in
+//     the worker): the write lands only while the stored state is still the one
+//     the decision was made from, so a writer outside the mutex (a stack delete
+//     clearing the state in its own transaction) is never overwritten with a
+//     stale result; the step then re-reads and decides again.
+//
+// There is no single op for the decision because it needs main-thread-only
+// state: the retry timers and swap bookkeeping armed from inside the mutation,
+// the cached CLI version, the discovered model catalog and the live hooks.
+// A mutation callback must not call a locked function of this module
+// (`updateTaskState`, `patchTaskState`, `clearFailoverState`): the lock is not
+// re-entrant and that would wait on itself.
+
+const taskLocks = new Map<string, Promise<void>>();
+
+function withTaskLock<T>(taskId: string, fn: () => Promise<T>): Promise<T> {
+  const prev = taskLocks.get(taskId) ?? Promise.resolve();
+  const result = prev.then(fn);
+  const tail = result.then(
+    () => undefined,
+    () => undefined,
+  );
+  taskLocks.set(taskId, tail);
+  void tail.then(() => {
+    // Only the latest holder clears the entry, so the map is empty when idle.
+    if (taskLocks.get(taskId) === tail) taskLocks.delete(taskId);
+  });
+  return result;
+}
+
+/** Return this from a mutation to leave the stored state as it is (no write). */
+export const KEEP_TASK_STATE = Symbol("keep-task-state");
+type StateMutation = TaskHarnessState | null | typeof KEEP_TASK_STATE;
+
+/** How many times a write that lost the compare-and-set re-reads and decides
+ *  again before giving up. Inside the mutex only an outside writer can cause a
+ *  retry, so more than one is already rare. */
+const STATE_WRITE_ATTEMPTS = 5;
+
+async function applyStateUpdate(
+  taskId: string,
+  mutate: (state: TaskHarnessState | null, task: Task) => StateMutation | Promise<StateMutation>,
+  opts: { requireState?: boolean } = {},
+): Promise<TaskHarnessState | null> {
+  for (let attempt = 0; attempt < STATE_WRITE_ATTEMPTS; attempt++) {
+    const task = await tasks.get(taskId);
+    if (!task) return null;
+    if (opts.requireState && !task.harnessState) return null;
+    const expected = JSON.stringify(task.harnessState ?? null);
+    const next = await mutate(task.harnessState ?? null, task);
+    if (next === KEEP_TASK_STATE) return task.harnessState ?? null;
+    const written = next === null
+      ? null
+      : stateBase(next, await harnessStacks.resolveForTask({ ...task, harnessState: next }));
+    if (await op("harnessState.cas", [taskId, expected, written])) return written;
+  }
+  throw new Error(`harness state of task ${taskId} kept changing; gave up after ${STATE_WRITE_ATTEMPTS} attempts`);
+}
+
 /**
  * The one write path for `tasks.harness_state` (review S10). `mutate` gets the
- * persisted state (or null) and returns the next one; a non-null result is
- * re-pointed at the stack the task's CURRENT account belongs to (see
- * {@link stateBase}), so no caller can write back a `stackId`/position the
- * account already left — the orchestrator's settle/retry/swap writes used to
- * spread the stale value back in and stack delete then missed the task.
+ * persisted state (or null) and returns the next one (or
+ * {@link KEEP_TASK_STATE}); a non-null result is re-pointed at the stack the
+ * task's CURRENT account belongs to (see {@link stateBase}), so no caller can
+ * write back a `stackId`/position the account already left — the
+ * orchestrator's settle/retry/swap writes used to spread the stale value back
+ * in and stack delete then missed the task. The read, `mutate` and the write
+ * are one atomic step per task (see the section comment above); `mutate` may
+ * be async and may run more than once, so side effects in it must be idempotent.
  */
 export function updateTaskState(
   taskId: string,
-  mutate: (state: TaskHarnessState | null, task: Task) => TaskHarnessState | null,
-): TaskHarnessState | null {
-  const task = tasks.get(taskId);
-  if (!task) return null;
-  const next = mutate(task.harnessState ?? null, task);
-  if (next === null) {
-    tasks.setHarnessState(taskId, null);
-    return null;
-  }
-  const repointed = stateBase(next, harnessStacks.resolveForTask({ ...task, harnessState: next }));
-  tasks.setHarnessState(taskId, repointed);
-  return repointed;
+  mutate: (state: TaskHarnessState | null, task: Task) => StateMutation | Promise<StateMutation>,
+): Promise<TaskHarnessState | null> {
+  return withTaskLock(taskId, () => applyStateUpdate(taskId, mutate));
 }
 
 /**
  * Merge `patch` into the persisted state (re-pointed like
  * {@link updateTaskState}). A no-op returning null when the task has no state:
  * every caller patches a field of an existing failover state, and creating one
- * from nothing would turn a lone account into a "stacked" task.
+ * from nothing would turn a lone account into a "stacked" task. A function
+ * patch receives the state read inside the atomic step, so it never works from
+ * a stale copy.
  */
 export function patchTaskState(
   taskId: string,
   patch: Partial<TaskHarnessState> | ((state: TaskHarnessState) => Partial<TaskHarnessState>),
-): TaskHarnessState | null {
-  if (!tasks.get(taskId)?.harnessState) return null;
-  return updateTaskState(taskId, (state) => {
-    if (!state) return null;
-    return { ...state, ...(typeof patch === "function" ? patch(state) : patch) };
-  });
+): Promise<TaskHarnessState | null> {
+  return withTaskLock(taskId, () =>
+    applyStateUpdate(
+      taskId,
+      (state) => (state ? { ...state, ...(typeof patch === "function" ? patch(state) : patch) } : null),
+      { requireState: true },
+    ));
 }
 
 /**
@@ -130,11 +208,13 @@ export function patchTaskState(
  * Call BEFORE the stack row is deleted (the resolution needs the membership),
  * together with {@link repointTaskStatesAwayFromStack}.
  */
-export function failoverTaskIdsForStack(stackId: string): string[] {
+export async function failoverTaskIdsForStack(stackId: string): Promise<string[]> {
   const ids: string[] = [];
-  for (const task of tasks.list()) {
+  // Only tasks that carry a state (or an armed timer) can belong to a stack,
+  // so the per-task resolution runs for those few, not for every task.
+  for (const task of await tasks.list()) {
     if (!task.harnessState && !retryTimers.has(task.id)) continue;
-    if (harnessStacks.resolveForTask(task)?.stack.id === stackId) ids.push(task.id);
+    if ((await harnessStacks.resolveForTask(task))?.stack.id === stackId) ids.push(task.id);
   }
   return ids;
 }
@@ -145,15 +225,15 @@ export function failoverTaskIdsForStack(stackId: string): string[] {
  * every state recording the deleted id) leaves it alone. Call BEFORE the
  * delete. Returns the re-pointed ids.
  */
-export function repointTaskStatesAwayFromStack(stackId: string): string[] {
+export async function repointTaskStatesAwayFromStack(stackId: string): Promise<string[]> {
   const ids: string[] = [];
-  for (const task of tasks.list()) {
+  for (const task of await tasks.list()) {
     if (task.harnessState?.stackId !== stackId) continue;
-    const resolved = harnessStacks.resolveForTask(task);
+    const resolved = await harnessStacks.resolveForTask(task);
     if (!resolved || resolved.stack.id === stackId) continue;
     // An identity mutation: `updateTaskState` re-points the base at the
     // stack the task resolves to now.
-    updateTaskState(task.id, (state) => state);
+    await updateTaskState(task.id, (state) => state);
     ids.push(task.id);
   }
   return ids;
@@ -169,7 +249,7 @@ export function repointTaskStatesAwayFromStack(stackId: string): string[] {
  */
 function stateBase(
   state: TaskHarnessState | null,
-  resolved: ReturnType<typeof harnessStacks.resolveForTask>,
+  resolved: Awaited<ReturnType<typeof harnessStacks.resolveForTask>>,
 ): TaskHarnessState {
   const base: TaskHarnessState = state ?? {
     stackId: resolved?.stack.id ?? "",
@@ -206,14 +286,14 @@ export function retryMinMs(): number {
 
 /** Record the cooldown for a limit signal: account-wide, or one model's row
  *  when `signal.model` is set (the store keys the row on it). */
-export function recordLimitSignal(harnessId: string, signal: HarnessLimitSignal): HarnessLimitState {
+export function recordLimitSignal(harnessId: string, signal: HarnessLimitSignal): Promise<HarnessLimitState> {
   return harnessStacks.setLimitState(harnessId, signal);
 }
 
 /** Mark an account as tried in the current lap. */
-export function recordTried(taskId: string, harnessId: string): void {
-  updateTaskState(taskId, (state, task) => {
-    const resolved = harnessStacks.resolveForTask(task);
+export async function recordTried(taskId: string, harnessId: string): Promise<void> {
+  await updateTaskState(taskId, async (state, task) => {
+    const resolved = await harnessStacks.resolveForTask(task);
     const base = stateBase(state, resolved);
     const tried = base.tried.includes(harnessId) ? base.tried : [...base.tried, harnessId];
     return { ...base, tried };
@@ -221,13 +301,18 @@ export function recordTried(taskId: string, harnessId: string): void {
 }
 
 /** A successful (or cancelled) terminal turn ends the lap. */
-export function resetLap(taskId: string): void {
-  patchTaskState(taskId, { tried: [], allExhausted: null });
+export async function resetLap(taskId: string): Promise<void> {
+  await patchTaskState(taskId, { tried: [], allExhausted: null });
 }
 
 /** Clear all failover state (a non-stack switch, archive, or stack delete). */
-export function clearFailoverState(taskId: string): void {
-  tasks.setHarnessState(taskId, null);
+export async function clearFailoverState(taskId: string): Promise<void> {
+  // Cancel first so a timer cannot fire into the window, and again after the
+  // clear in case a mutation queued ahead of it armed one.
+  cancelAutoRetry(taskId);
+  await withTaskLock(taskId, async () => {
+    await tasks.setHarnessState(taskId, null);
+  });
   cancelAutoRetry(taskId);
 }
 
@@ -238,9 +323,9 @@ export type { NextMemberPlan };
  * Deliberately cheap: no fresh CLI probe on the hot path — the cached version
  * from the last /harnesses poll is enough, and an unknown version fails open.
  */
-export function memberUnusableReason(member: { harnessId: string; enabled: boolean; label: string }, task: Pick<Task, "model">): string | null {
+export async function memberUnusableReason(member: { harnessId: string; enabled: boolean; label: string }, task: Pick<Task, "model">): Promise<string | null> {
   if (!member.enabled) return "disabled";
-  const harness = harnesses.getByIdOrKind(member.harnessId);
+  const harness = await harnesses.getByIdOrKind(member.harnessId);
   if (!harness) return "account no longer exists";
   if (!memberInstalled(harness)) return "CLI not installed";
   if (loginEvidence(harness) === false) return "logged out";
@@ -288,10 +373,46 @@ export function memberUnusableReason(member: { harnessId: string; enabled: boole
 
 /** The lower-cased model a task's turn would run on `harnessId`, which keys
  *  per-model cooldown rows (`parseLimitedModel` also yields lower-case). */
-export function cooldownModelFor(task: Pick<Task, "model">, harnessId: string): string | null {
-  const harness = harnesses.getByIdOrKind(harnessId);
+export async function cooldownModelFor(task: Pick<Task, "model">, harnessId: string): Promise<string | null> {
+  const harness = await harnesses.getByIdOrKind(harnessId);
   const model = task.model ?? (harness ? DEFAULT_MODEL[harness.kind] : null) ?? null;
   return model ? model.toLowerCase() : null;
+}
+
+/** What the synchronous {@link pickNextMember} walk asks about each member,
+ *  read ahead (the reads are database hops, the walk is pure). */
+interface MemberFacts {
+  cooling: Map<string, HarnessLimitState | null>;
+  exhausted: Map<string, boolean>;
+  resetAt: Map<string, number | null>;
+  unusable: Map<string, string | null>;
+}
+
+async function loadMemberFacts(
+  members: readonly HarnessStackMember[],
+  task: Pick<Task, "model">,
+  now: number,
+  opts: { ignoreLimits?: boolean } = {},
+): Promise<MemberFacts> {
+  const facts: MemberFacts = { cooling: new Map(), exhausted: new Map(), resetAt: new Map(), unusable: new Map() };
+  await Promise.all(members.map(async (member) => {
+    const id = member.harnessId;
+    if (opts.ignoreLimits) {
+      facts.cooling.set(id, null);
+      facts.exhausted.set(id, false);
+      facts.resetAt.set(id, null);
+    } else {
+      const [cool, usage] = await Promise.all([
+        cooldownModelFor(task, id).then((model) => harnessStacks.isCooling(id, now, model)),
+        harnessUsage.get(id),
+      ]);
+      facts.cooling.set(id, cool);
+      facts.exhausted.set(id, harnessQuotaLooksExhausted(usage, now, HARNESS_QUOTA_STALE_MS));
+      facts.resetAt.set(id, harnessQuotaResetAt(usage, now, HARNESS_QUOTA_STALE_MS));
+    }
+    facts.unusable.set(id, await memberUnusableReason(member, task));
+  }));
+  return facts;
 }
 
 /**
@@ -299,12 +420,12 @@ export function cooldownModelFor(task: Pick<Task, "model">, harnessId: string): 
  * tried, disabled, cooling, quota-exhausted and unusable members. `cooling`
  * is ignored when `force` is set (a manual Run).
  */
-export function planNextMember(
+export async function planNextMember(
   task: Pick<Task, "id" | "agent" | "model" | "harnessState">,
   opts: { now?: number; force?: boolean; currentId?: string } = {},
-): NextMemberPlan {
+): Promise<NextMemberPlan> {
   const now = opts.now ?? Date.now();
-  const resolved = harnessStacks.resolveForTask(task);
+  const resolved = await harnessStacks.resolveForTask(task);
   if (!resolved) {
     return { kind: "none-usable", reasons: [{ harnessId: task.agent, reason: "not in a stack" }], earliestResetAtMs: null, skipped: [] };
   }
@@ -314,15 +435,16 @@ export function planNextMember(
   // manual/manual-failover move changed the task's account.
   const current = opts.currentId ?? resolved.current;
   const state = task.harnessState;
+  const facts = await loadMemberFacts(stack.members, task, now, { ignoreLimits: opts.force });
   return pickNextMember({
     members: stack.members,
     currentId: current,
     tried: state?.tried ?? [],
     now,
-    cooling: (id) => (opts.force ? null : harnessStacks.isCooling(id, now, cooldownModelFor(task, id))),
-    exhaustedByQuota: (id) => (opts.force ? false : harnessQuotaLooksExhausted(harnessUsage.get(id), now, HARNESS_QUOTA_STALE_MS)),
-    quotaResetAt: (id) => (opts.force ? null : harnessQuotaResetAt(harnessUsage.get(id), now, HARNESS_QUOTA_STALE_MS)),
-    usable: (member) => memberUnusableReason(member, task),
+    cooling: (id) => facts.cooling.get(id) ?? null,
+    exhaustedByQuota: (id) => facts.exhausted.get(id) ?? false,
+    quotaResetAt: (id) => facts.resetAt.get(id) ?? null,
+    usable: (member) => facts.unusable.get(member.harnessId) ?? null,
   });
 }
 
@@ -335,22 +457,25 @@ export function planNextMember(
  * waits, and retrying there would fail immediately and throw away the
  * conversation.
  */
-export function planRetryMember(
+export async function planRetryMember(
   task: Pick<Task, "id" | "agent" | "model" | "harnessState">,
   opts: { now?: number } = {},
-): NextMemberPlan {
+): Promise<NextMemberPlan> {
   const now = opts.now ?? Date.now();
-  const resolved = harnessStacks.resolveForTask(task);
+  const resolved = await harnessStacks.resolveForTask(task);
   if (!resolved) {
     return { kind: "none-usable", reasons: [{ harnessId: task.agent, reason: "not in a stack" }], earliestResetAtMs: null, skipped: [] };
   }
   const { stack, current } = resolved;
   const currentMember = stack.members.find((m) => m.harnessId === current);
-  const currentUsable = currentMember
-    ? memberUnusableReason(currentMember, task) === null
-      && harnessStacks.isCooling(current, now, cooldownModelFor(task, current)) === null
-      && !harnessQuotaLooksExhausted(harnessUsage.get(current), now, HARNESS_QUOTA_STALE_MS)
-    : false;
+  let currentUsable = false;
+  if (currentMember && (await memberUnusableReason(currentMember, task)) === null) {
+    const [cool, usage] = await Promise.all([
+      cooldownModelFor(task, current).then((model) => harnessStacks.isCooling(current, now, model)),
+      harnessUsage.get(current),
+    ]);
+    currentUsable = cool === null && !harnessQuotaLooksExhausted(usage, now, HARNESS_QUOTA_STALE_MS);
+  }
   if (currentUsable) return { kind: "next", member: currentMember!, skipped: [] };
   // A retry starts a fresh lap: accounts tried in the previous lap are
   // eligible again once their reset has expired.
@@ -383,13 +508,13 @@ export function planExhausted(
      *  clears it. */
     cleanRetryOf?: string | null;
   } = {},
-): TaskHarnessState | null {
-  return updateTaskState(taskId, (state, task) => {
-    const resolved = harnessStacks.resolveForTask(task);
+): Promise<TaskHarnessState | null> {
+  return updateTaskState(taskId, async (state, task) => {
+    const resolved = await harnessStacks.resolveForTask(task);
     const base = stateBase(state, resolved);
     // Why each member could not take the task (banners, `agetor show`),
     // including the account that was running it.
-    const memberReasons = resolved ? memberReasonsFor(resolved.stack, task, now, { includeCurrent: true }) : [];
+    const memberReasons = resolved ? await memberReasonsFor(resolved.stack, task, now, { includeCurrent: true }) : [];
     const reasonsField = memberReasons.length > 0 ? { memberReasons } : {};
     const cleanRetryOf = opts.cleanRetryOf === undefined ? base.allExhausted?.cleanRetryOf : opts.cleanRetryOf ?? undefined;
     const priorAttempts = base.allExhausted?.attempts ?? 0;
@@ -454,13 +579,19 @@ export function planExhausted(
  * ever wakes (R17-S3). Guards against a concurrent re-arm/clear: only the
  * exact schedule that fired is moved.
  */
-function deferAutoRetry(taskId: string, firedAt: number): boolean {
-  const persisted = tasks.get(taskId)?.harnessState?.allExhausted;
-  if (!persisted) return false;
-  if (persisted.nextAttemptAt !== firedAt || persisted.inFlight) return false;
-  if (persisted.attempts >= HARNESS_STACK_RETRY_MAX) return false;
-  const at = Date.now() + retryMinMs();
-  patchTaskState(taskId, { allExhausted: { ...persisted, nextAttemptAt: at } });
+async function deferAutoRetry(taskId: string, firedAt: number): Promise<boolean> {
+  let at = 0;
+  // The guard and the write are one atomic step: the persisted schedule is
+  // checked against `firedAt` in the same read the new instant is written from.
+  await updateTaskState(taskId, (state) => {
+    const persisted = state?.allExhausted;
+    if (!state || !persisted) return KEEP_TASK_STATE;
+    if (persisted.nextAttemptAt !== firedAt || persisted.inFlight) return KEEP_TASK_STATE;
+    if (persisted.attempts >= HARNESS_STACK_RETRY_MAX) return KEEP_TASK_STATE;
+    at = Date.now() + retryMinMs();
+    return { ...state, allExhausted: { ...persisted, nextAttemptAt: at } };
+  });
+  if (at === 0) return false;
   armAutoRetry(taskId, at);
   return true;
 }
@@ -473,9 +604,11 @@ function deferAutoRetry(taskId: string, firedAt: number): boolean {
  * clears the exhausted state (and this timer), a limit re-plans it. Returns
  * whether a timer was re-armed.
  */
-export function deferAutoRetryNow(taskId: string): boolean {
-  const persisted = tasks.get(taskId)?.harnessState?.allExhausted;
+export async function deferAutoRetryNow(taskId: string): Promise<boolean> {
+  const persisted = (await tasks.get(taskId))?.harnessState?.allExhausted;
   if (!persisted || persisted.inFlight || persisted.nextAttemptAt <= 0) return false;
+  // `deferAutoRetry` re-checks `nextAttemptAt` inside its atomic step, so a
+  // schedule that moved since this read is left alone.
   return deferAutoRetry(taskId, persisted.nextAttemptAt);
 }
 
@@ -489,6 +622,8 @@ export function stopAllAutoRetryTimers(): number {
     stopped++;
   }
   retryTimers.clear();
+  // A timer already firing (past its handle) stands down too.
+  for (const taskId of retryEpochs.keys()) bumpRetryEpoch(taskId);
   return stopped;
 }
 
@@ -500,23 +635,10 @@ export function hasArmedAutoRetry(taskId: string): boolean {
 /** Arm (or re-arm) the all-exhausted retry timer. Re-arming replaces the old one. */
 export function armAutoRetry(taskId: string, at: number): void {
   cancelAutoRetry(taskId);
+  bumpRetryEpoch(taskId);
   const delay = Math.max(0, at - Date.now());
   const timer = setTimeout(() => {
-    retryTimers.delete(taskId);
-    if (!hooks) return;
-    // Identity check: a timer whose callback was already queued when the
-    // schedule was re-armed (or cleared by a manual run) must not start a
-    // turn against the newer state.
-    const persisted = tasks.get(taskId)?.harnessState?.allExhausted;
-    if (!persisted || persisted.nextAttemptAt !== at) return;
-    // Another start/swap owns the task right now. Consuming the timer here
-    // would strand the persisted countdown if that start's prepare fails;
-    // re-arm a short backoff and let the claim holder's own settle decide.
-    if (hooks.canAutoRetry && !hooks.canAutoRetry(taskId)) {
-      deferAutoRetry(taskId, at);
-      return;
-    }
-    void hooks.onAutoRetry(taskId).catch((err) => {
+    void fireAutoRetry(taskId, at).catch((err) => {
       console.warn(`[agetor] harness auto-retry failed for task ${taskId}:`, err);
     });
   }, Math.min(delay, 2_147_483_647));
@@ -526,10 +648,34 @@ export function armAutoRetry(taskId: string, at: number): void {
   retryTimers.set(taskId, timer);
 }
 
+async function fireAutoRetry(taskId: string, at: number): Promise<void> {
+  retryTimers.delete(taskId);
+  if (!hooks) return;
+  const epoch = retryEpochs.get(taskId) ?? 0;
+  // Identity check: a timer whose callback was already queued when the
+  // schedule was re-armed (or cleared by a manual run) must not start a
+  // turn against the newer state. The read is a database hop, so an arm or a
+  // cancel that landed during it (the epoch moved) also stands this fire down.
+  const persisted = (await tasks.get(taskId))?.harnessState?.allExhausted;
+  if (!persisted || persisted.nextAttemptAt !== at) return;
+  if ((retryEpochs.get(taskId) ?? 0) !== epoch || !hooks) return;
+  // Another start/swap owns the task right now. Consuming the timer here
+  // would strand the persisted countdown if that start's prepare fails;
+  // re-arm a short backoff and let the claim holder's own settle decide.
+  if (hooks.canAutoRetry && !hooks.canAutoRetry(taskId)) {
+    await deferAutoRetry(taskId, at);
+    return;
+  }
+  await hooks.onAutoRetry(taskId);
+}
+
 export function cancelAutoRetry(taskId: string): void {
   const timer = retryTimers.get(taskId);
   if (timer) clearTimeout(timer);
   retryTimers.delete(taskId);
+  // Only a task that ever armed a retry has an epoch to move (and one whose
+  // fire may be in flight past its handle).
+  if (timer || retryEpochs.has(taskId)) bumpRetryEpoch(taskId);
 }
 
 /** Boot: re-arm every persisted all-exhausted retry still in the future, and
@@ -538,69 +684,79 @@ export function cancelAutoRetry(taskId: string): void {
  *  `now + 5 s + i × 2 s` per overdue entry, persisted so the armed timer's
  *  identity check matches — instead of every overdue task firing in the same
  *  tick and mirroring into one backup concurrently (review S9). */
-export function rearmAutoRetries(now = Date.now()): number {
+export async function rearmAutoRetries(now = Date.now()): Promise<number> {
   let armed = 0;
   let overdue = 0;
-  for (const task of tasks.list()) {
-    const state = task.harnessState;
-    const exhausted = state?.allExhausted;
-    if (!state || !exhausted) continue;
-    if (exhausted.inFlight) {
-      // The retry's run row is minted before its spawn, so a live row means
-      // the successor really started: let its own settle own the outcome.
-      // Anything else (crash mid-spawn, a non-limit failure before the
-      // settle hook ran) would otherwise keep `nextAttemptAt: 0` and never
-      // retry again. Re-arm without spending an attempt: a crash is not a
-      // started retry, and the spawn-failure path still spends one so a
-      // permanently broken destination reaches the visible cap.
-      const attemptRunId = exhausted.attemptRunId;
-      const live = attemptRunId
-        ? runs.get(attemptRunId)
-        : task.runId
-          ? runs.get(task.runId)
-          : null;
-      const attempts = exhausted.attempts;
-      if (live && live.status === "running") {
-        // The retry run is still live (re-attached, or the core is answering
-        // again after a handoff): keep `inFlight` so its own settle stays
-        // armed to end the loop on a non-limit failure. Clearing it here set
-        // `nextAttemptAt: 0` with no timer, which the UI reads as
-        // "Retrying…" forever.
-        continue;
+  for (const listed of await tasks.list()) {
+    // The listing only picks the few tasks with a countdown; every decision is
+    // made from the state read again inside the atomic step below.
+    if (!listed.harnessState?.allExhausted) continue;
+    const out: { arm: number | null; staggered: boolean } = { arm: null, staggered: false };
+    await updateTaskState(listed.id, async (state, task) => {
+      out.arm = null;
+      out.staggered = false;
+      const exhausted = state?.allExhausted;
+      if (!state || !exhausted) return KEEP_TASK_STATE;
+      if (exhausted.inFlight) {
+        // The retry's run row is minted before its spawn, so a live row means
+        // the successor really started: let its own settle own the outcome.
+        // Anything else (crash mid-spawn, a non-limit failure before the
+        // settle hook ran) would otherwise keep `nextAttemptAt: 0` and never
+        // retry again. Re-arm without spending an attempt: a crash is not a
+        // started retry, and the spawn-failure path still spends one so a
+        // permanently broken destination reaches the visible cap.
+        const attemptRunId = exhausted.attemptRunId;
+        const live = attemptRunId
+          ? await runs.get(attemptRunId)
+          : task.runId
+            ? await runs.get(task.runId)
+            : null;
+        const attempts = exhausted.attempts;
+        if (live && live.status === "running") {
+          // The retry run is still live (re-attached, or the core is answering
+          // again after a handoff): keep `inFlight` so its own settle stays
+          // armed to end the loop on a non-limit failure. Clearing it here set
+          // `nextAttemptAt: 0` with no timer, which the UI reads as
+          // "Retrying…" forever.
+          return KEEP_TASK_STATE;
+        }
+        if (attemptRunId && live && live.status !== "orphaned") {
+          // The retry run genuinely settled (succeeded/failed/cancelled) but the
+          // in-flight marker survived: the crash landed between the terminal run
+          // write and this bookkeeping. A non-limit failure must never be
+          // re-armed — that would loop on the same error — and a succeeded run
+          // already proved the account works. Drop the exhausted state and let
+          // the run's own visible outcome stand.
+          return { ...state, allExhausted: null };
+        }
+        if (attempts >= HARNESS_STACK_RETRY_MAX) {
+          return { ...state, allExhausted: { ...exhausted, inFlight: false, nextAttemptAt: 0 } };
+        }
+        const at = now + HARNESS_STACK_RETRY_BACKOFF_MS;
+        out.arm = at;
+        return { ...state, allExhausted: { ...exhausted, inFlight: false, nextAttemptAt: at } };
       }
-      if (attemptRunId && live && live.status !== "orphaned") {
-        // The retry run genuinely settled (succeeded/failed/cancelled) but the
-        // in-flight marker survived: the crash landed between the terminal run
-        // write and this bookkeeping. A non-limit failure must never be
-        // re-armed — that would loop on the same error — and a succeeded run
-        // already proved the account works. Drop the exhausted state and let
-        // the run's own visible outcome stand.
-        patchTaskState(task.id, { allExhausted: null });
-        continue;
+      if (exhausted.attempts >= HARNESS_STACK_RETRY_MAX) return KEEP_TASK_STATE;
+      if (exhausted.nextAttemptAt <= 0) return KEEP_TASK_STATE;
+      // A missed timer is staggered (see the doc above) AND the new instant is
+      // persisted, so the armed timer's identity check matches the state it
+      // reads on fire.
+      out.staggered = exhausted.nextAttemptAt <= now;
+      const at = out.staggered
+        ? now + HARNESS_STACK_REARM_OVERDUE_BASE_MS + overdue * HARNESS_STACK_REARM_OVERDUE_STEP_MS
+        : exhausted.nextAttemptAt;
+      out.arm = at;
+      if (at !== exhausted.nextAttemptAt) {
+        return { ...state, allExhausted: { ...exhausted, nextAttemptAt: at } };
       }
-      if (attempts >= HARNESS_STACK_RETRY_MAX) {
-        patchTaskState(task.id, { allExhausted: { ...exhausted, inFlight: false, nextAttemptAt: 0 } });
-        continue;
-      }
-      const at = now + HARNESS_STACK_RETRY_BACKOFF_MS;
-      patchTaskState(task.id, { allExhausted: { ...exhausted, inFlight: false, nextAttemptAt: at } });
-      armAutoRetry(task.id, at);
+      return KEEP_TASK_STATE;
+    });
+    if (out.arm !== null) {
+      armAutoRetry(listed.id, out.arm);
       armed++;
-      continue;
+      // Counted once the write landed (the step above may run more than once).
+      if (out.staggered) overdue++;
     }
-    if (exhausted.attempts >= HARNESS_STACK_RETRY_MAX) continue;
-    if (exhausted.nextAttemptAt <= 0) continue;
-    // A missed timer is staggered (see the doc above) AND the new instant is
-    // persisted, so the armed timer's identity check matches the state it
-    // reads on fire.
-    const at = exhausted.nextAttemptAt > now
-      ? exhausted.nextAttemptAt
-      : now + HARNESS_STACK_REARM_OVERDUE_BASE_MS + overdue++ * HARNESS_STACK_REARM_OVERDUE_STEP_MS;
-    if (at !== exhausted.nextAttemptAt) {
-      patchTaskState(task.id, { allExhausted: { ...exhausted, nextAttemptAt: at } });
-    }
-    armAutoRetry(task.id, at);
-    armed++;
   }
   return armed;
 }
@@ -608,7 +764,7 @@ export function rearmAutoRetries(now = Date.now()): number {
 /** Boot: complete or visibly block swaps persisted before a crash/handoff. */
 export async function reconcilePendingSwaps(): Promise<number> {
   let reconciled = 0;
-  for (const task of tasks.list()) {
+  for (const task of await tasks.list()) {
     if (!task.harnessState?.pendingSwap) continue;
     reconciled++;
     if (hooks) {
@@ -642,7 +798,7 @@ function latestSessionForAccount(
   task: Task,
   kind: string,
   harnessId: string,
-): string | null {
+): Promise<string | null> {
   const column: SessionIdColumn = kind === "codex" ? "codex_session_id" : "claude_session_id";
   return findSessionIdForHarness(task.id, column, harnessId);
 }
@@ -683,7 +839,7 @@ export interface MoveTaskToMemberArgs {
   writeAgent?: boolean;
   /** The failover state written with the commit, through
    *  {@link updateTaskState} (re-pointed at the current stack). */
-  state?: (current: TaskHarnessState | null, task: Task) => TaskHarnessState | null;
+  state?: (current: TaskHarnessState | null, task: Task) => TaskHarnessState | null | Promise<TaskHarnessState | null>;
   /** When set AND the move commits (`moved`), exactly one swap-history row is
    *  recorded with the real from/to. Omitted ⇒ nothing is recorded (the
    *  orchestrator records limit/retry/boot swaps itself, where both run ids
@@ -734,8 +890,8 @@ export async function moveTaskToMember(args: MoveTaskToMemberArgs): Promise<Move
       // The transcript never moved: resume the existing provider session.
       transferredSessionId = sessionId;
     } else {
-      const fromHarness = harnesses.getByIdOrKind(from);
-      const toHarness = harnesses.getByIdOrKind(to);
+      const fromHarness = await harnesses.getByIdOrKind(from);
+      const toHarness = await harnesses.getByIdOrKind(to);
       if (!fromHarness || !toHarness) {
         return { kind: "transfer-failed", message: "the account no longer exists", warnings };
       }
@@ -753,10 +909,10 @@ export async function moveTaskToMember(args: MoveTaskToMemberArgs): Promise<Move
   if (args.beforeCommit && !(await args.beforeCommit())) {
     return { kind: "aborted", transferredSessionId, warnings };
   }
-  if (args.writeAgent !== false && tasks.get(taskId)?.agent !== to) tasks.update(taskId, { agent: to });
-  if (args.state) updateTaskState(taskId, args.state);
+  if (args.writeAgent !== false && (await tasks.get(taskId))?.agent !== to) await tasks.update(taskId, { agent: to });
+  if (args.state) await updateTaskState(taskId, args.state);
   if (args.history) {
-    const row = tasks.get(taskId);
+    const row = await tasks.get(taskId);
     if (row) {
       await recordHarnessSwapEvent({
         ...args.history,
@@ -793,11 +949,11 @@ export async function prepareTaskHarness(
   taskId: string,
   opts: { manual: boolean; forceOffCurrent?: boolean; forceReason?: string } = { manual: true },
 ): Promise<PrepareResult> {
-  const task = tasks.get(taskId);
+  const task = await tasks.get(taskId);
   if (!task) return { ok: false, error: "task not found" };
-  const resolved = harnessStacks.resolveForTask(task);
+  const resolved = await harnessStacks.resolveForTask(task);
   if (!resolved) return { ok: true };
-  if (runs.hasRunning(taskId) || hooks?.isTaskHeld?.(taskId)) return { ok: true };
+  if ((await runs.hasRunning(taskId)) || hooks?.isTaskHeld?.(taskId)) return { ok: true };
   const { stack, current } = resolved;
   // A stack of fewer than two accounts behaves exactly like a lone account:
   // no failover state, and the normal pre-flight error (with its login help)
@@ -806,7 +962,7 @@ export async function prepareTaskHarness(
     // A stack cut down to one account may still carry a stale exhausted
     // countdown and armed timer from when it had two: drop both.
     const hadScheduledSwitch = Boolean(task.harnessState?.scheduledSwitch);
-    if (task.harnessState) clearFailoverState(taskId);
+    if (task.harnessState) await clearFailoverState(taskId);
     if (hadScheduledSwitch) {
       hooks?.onScheduledSwitchDropped?.(taskId, "scheduled account switch dropped — the stack has fewer than two accounts");
     }
@@ -816,7 +972,7 @@ export async function prepareTaskHarness(
   const unusable = opts.forceOffCurrent
     ? (opts.forceReason ?? "unavailable")
     : member
-      ? memberUnusableReason(member, task)
+      ? await memberUnusableReason(member, task)
       : "account left the stack";
   if (!unusable) {
     if (opts.manual) {
@@ -824,7 +980,7 @@ export async function prepareTaskHarness(
       // deliberately does NOT clear the account-global cooldown: forcing one
       // task through a still-limited account must not make every other task
       // retry there. The cooldown ends on a successful turn or its reset.
-      updateTaskState(taskId, (state) => ({
+      await updateTaskState(taskId, (state) => ({
         stackId: stack.id,
         position: resolved.position,
         count: stack.members.length,
@@ -840,24 +996,26 @@ export async function prepareTaskHarness(
     return { ok: true };
   }
 
+  const now = Date.now();
+  const facts = await loadMemberFacts(stack.members, task, now, { ignoreLimits: true });
   const plan = pickNextMember({
     members: stack.members,
     currentId: current,
     // A forced move must never pick the account that just failed pre-flight.
     tried: opts.forceOffCurrent ? [current] : [],
-    now: Date.now(),
+    now,
     // A manual start may force a member whose cooldown is still running —
     // the user explicitly asked to run now.
     cooling: () => null,
     exhaustedByQuota: () => false,
-    usable: (m) => memberUnusableReason(m, task),
+    usable: (m) => facts.unusable.get(m.harnessId) ?? null,
   });
   if (plan.kind !== "next") {
     return { ok: false, error: "no usable account in this stack — enable, install or log in to one" };
   }
   const to = plan.member.harnessId;
-  const fromHarness = harnesses.getByIdOrKind(current);
-  const toHarness = harnesses.getByIdOrKind(to);
+  const fromHarness = await harnesses.getByIdOrKind(current);
+  const toHarness = await harnesses.getByIdOrKind(to);
   if (!fromHarness || !toHarness) return { ok: false, error: "account no longer exists" };
 
   const reason: NonNullable<TaskHarnessState["lastMove"]>["reason"] = unusable.includes("disabled")
@@ -868,7 +1026,7 @@ export async function prepareTaskHarness(
     stack,
     from: current,
     to,
-    sessionId: latestSessionForAccount(task, fromHarness.kind, current),
+    sessionId: await latestSessionForAccount(task, fromHarness.kind, current),
     cwd: task.worktreePath ?? task.workdir,
     history: { trigger: "unavailable", reason },
     state: () => ({
@@ -907,37 +1065,40 @@ function formatClock(ms: number): string {
  * Why each member other than the task's current account cannot take the task
  * right now, one entry per member ("available" when it can). Same rules and
  * order as {@link pickNextMember}: disabled, cooling (model-aware), quota
- * exhausted, then {@link memberUnusableReason}. Pure: reads only.
+ * exhausted, then {@link memberUnusableReason}. Reads only; writes nothing.
  */
-export function memberReasonsFor(
+export async function memberReasonsFor(
   stack: HarnessStack,
   task: Task,
   now = Date.now(),
   opts: { includeCurrent?: boolean } = {},
-): HarnessMemberReason[] {
-  const current = harnessStacks.resolveForTask(task)?.current ?? task.agent;
+): Promise<HarnessMemberReason[]> {
+  const current = (await harnessStacks.resolveForTask(task))?.current ?? task.agent;
   const tried = task.harnessState?.tried ?? [];
-  const out: HarnessMemberReason[] = [];
-  for (const member of stack.members) {
-    const isCurrent = member.harnessId === current;
-    if (isCurrent && !opts.includeCurrent) continue;
-    const text = memberReasonFor(member, task, now, tried.includes(member.harnessId));
-    out.push({ harnessId: member.harnessId, label: member.label, reason: isCurrent ? `current — ${text}` : text });
-  }
-  return out;
+  const members = stack.members.filter((m) => opts.includeCurrent || m.harnessId !== current);
+  // One read per member, all in flight together; the order of `members` stays.
+  const texts = await Promise.all(
+    members.map((member) => memberReasonFor(member, task, now, tried.includes(member.harnessId))),
+  );
+  return members.map((member, i) => ({
+    harnessId: member.harnessId,
+    label: member.label,
+    reason: member.harnessId === current ? `current — ${texts[i]}` : texts[i]!,
+  }));
 }
 
-function memberReasonFor(member: HarnessStackMember, task: Task, now: number, tried: boolean): string {
-  if (!member.enabled) return memberUnusableReason(member, task) ?? "disabled";
-  const cool = harnessStacks.isCooling(member.harnessId, now, cooldownModelFor(task, member.harnessId));
+async function memberReasonFor(member: HarnessStackMember, task: Task, now: number, tried: boolean): Promise<string> {
+  if (!member.enabled) return (await memberUnusableReason(member, task)) ?? "disabled";
+  const cool = await harnessStacks.isCooling(member.harnessId, now, await cooldownModelFor(task, member.harnessId));
   if (cool && cool.exhaustedUntilMs > now) {
     return `cooling until ${formatClock(cool.exhaustedUntilMs)}${cool.model ? ` for ${cool.model}` : ""}`;
   }
-  if (harnessQuotaLooksExhausted(harnessUsage.get(member.harnessId), now, HARNESS_QUOTA_STALE_MS)) {
-    const reset = harnessQuotaResetAt(harnessUsage.get(member.harnessId), now, HARNESS_QUOTA_STALE_MS);
+  const usage = await harnessUsage.get(member.harnessId);
+  if (harnessQuotaLooksExhausted(usage, now, HARNESS_QUOTA_STALE_MS)) {
+    const reset = harnessQuotaResetAt(usage, now, HARNESS_QUOTA_STALE_MS);
     return reset !== null && reset > now ? `quota exhausted until ${formatClock(reset)}` : "quota exhausted";
   }
-  const unusable = memberUnusableReason(member, task);
+  const unusable = await memberUnusableReason(member, task);
   if (unusable) return unusable;
   return tried ? "tried this lap" : "available";
 }
@@ -948,13 +1109,14 @@ function memberReasonFor(member: HarnessStackMember, task: Task, now: number, tr
  * A PURE planner: it ignores `tried` and never writes a cooldown, `tried` or
  * any other state (invariant: a manual move never cools or marks tried).
  */
-export function planManualSwitchTarget(
+export async function planManualSwitchTarget(
   task: Task,
   now = Date.now(),
-):
+): Promise<
   | { kind: "next"; stack: HarnessStack; member: HarnessStackMember }
-  | { kind: "refused"; code: "not-in-stack" | "no-usable-member"; reasons: HarnessMemberReason[] } {
-  const resolved = harnessStacks.resolveForTask(task);
+  | { kind: "refused"; code: "not-in-stack" | "no-usable-member"; reasons: HarnessMemberReason[] }
+> {
+  const resolved = await harnessStacks.resolveForTask(task);
   // An account that left every stack still resolves to the stack it was in
   // (`orphaned`), but it is not a member any more: a move from it is not a
   // same-stack switch, so it would take the outside-stack reset path (no
@@ -963,6 +1125,7 @@ export function planManualSwitchTarget(
     return { kind: "refused", code: "not-in-stack", reasons: [] };
   }
   const { stack, current } = resolved;
+  const facts = await loadMemberFacts(stack.members, task, now);
   const plan = pickNextMember({
     members: stack.members,
     currentId: current,
@@ -970,15 +1133,15 @@ export function planManualSwitchTarget(
     // switch from "landing" on the account the task is already on.
     tried: [current],
     now,
-    cooling: (id) => harnessStacks.isCooling(id, now, cooldownModelFor(task, id)),
-    exhaustedByQuota: (id) => harnessQuotaLooksExhausted(harnessUsage.get(id), now, HARNESS_QUOTA_STALE_MS),
-    quotaResetAt: (id) => harnessQuotaResetAt(harnessUsage.get(id), now, HARNESS_QUOTA_STALE_MS),
-    usable: (m) => memberUnusableReason(m, task),
+    cooling: (id) => facts.cooling.get(id) ?? null,
+    exhaustedByQuota: (id) => facts.exhausted.get(id) ?? false,
+    quotaResetAt: (id) => facts.resetAt.get(id) ?? null,
+    usable: (m) => facts.unusable.get(m.harnessId) ?? null,
   });
   if (plan.kind === "next" && plan.member.harnessId !== current) {
     return { kind: "next", stack, member: plan.member };
   }
-  return { kind: "refused", code: "no-usable-member", reasons: memberReasonsFor(stack, task, now) };
+  return { kind: "refused", code: "no-usable-member", reasons: await memberReasonsFor(stack, task, now) };
 }
 
 /**
@@ -1000,16 +1163,16 @@ export async function recordHarnessSwapEvent(args: {
   continuation?: HarnessSwapEvent["continuation"];
 }): Promise<HarnessSwapEvent | null> {
   try {
-    const label = (id: string | null) => (id === null ? null : harnesses.getByIdOrKind(id)?.label ?? id);
+    const label = async (id: string | null) => (id === null ? null : (await harnesses.getByIdOrKind(id))?.label ?? id);
     const signal = args.signal ?? null;
     return await harnessSwapEvents.insert({
       stackId: args.stackId,
       taskId: args.task.id,
       taskTitle: args.task.title ?? null,
       fromHarnessId: args.fromHarnessId,
-      fromLabel: label(args.fromHarnessId),
+      fromLabel: await label(args.fromHarnessId),
       toHarnessId: args.toHarnessId,
-      toLabel: label(args.toHarnessId),
+      toLabel: await label(args.toHarnessId),
       trigger: args.trigger,
       reason: args.reason ?? signal?.reason ?? null,
       source: signal?.source ?? null,
