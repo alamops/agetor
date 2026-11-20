@@ -64,6 +64,7 @@ Each doc below is the reference for its subsystem. A code comment cites the doc 
 | [session-import.md](docs/architecture/session-import.md) | importing Claude Code and OpenCode sessions started outside Agetor | `claude-session*.ts`, `opencode-session-*.ts`, `ImportSessionsDialog` |
 | [messages-backlog.md](docs/architecture/messages-backlog.md) | the saved-drafts tray and compose-from-diff | the `backlog` module in `db.ts`, `BacklogTray`, `DiffDialog` |
 | [unread-indicator.md](docs/architecture/unread-indicator.md) | the unread watermarks | `noteAssistantEvent`, `markSeen`, `TaskCard` |
+| [task-card.md](docs/architecture/task-card.md) | the board card (layout C1): the 262/233 px width budget, the order title → identity → status → preview → `repo · branch` → actions, the chip-versus-stat rule, the pipeline hat, per-state buttons and `⋯`, keyboard drag, the hooks e2e relies on, and the bounds spec | `TaskCard*.tsx`, `PipelineHat.tsx`, `CardChip.tsx`, `StackBadge.tsx`, `task-card-actions.ts`, `prompt-preview.ts`, `board-keyboard.ts` |
 | [task-context-menu.md](docs/architecture/task-context-menu.md) | the right-click menu and where the native menu is kept | `task-context-menu.ts`, `context-menu.ts`, `ui/context-menu.tsx` |
 | [issue-tasks.md](docs/architecture/issue-tasks.md) | tasks seeded from a Git issue, including `agetor add --issue` | `src/shared/issue-task.ts`, the git-host adapters, `CreateTaskFromIssueDialog` |
 | [prompt-composer.md](docs/architecture/prompt-composer.md) | `PromptComposer`, `WorktreeOptions`, branch-scoped capability discovery, the dialog Escape/Tab `data-popover-open` contract | `PromptComposer.tsx`, `WorktreeOptions.tsx`, `dialog.tsx`, any popover |
@@ -112,6 +113,7 @@ These are the rules a change most often breaks without a test noticing. Each sub
 
 - **A popover inside a dialog carries `data-popover-open=""` only while it is open, and closes itself on Escape** (or when the key event arrives already `defaultPrevented`). `dialog.tsx` yields Escape to it; a carrier that breaks the rule makes the dialog impossible to close from the keyboard ([prompt-composer.md](docs/architecture/prompt-composer.md)).
 - **An overlay positioned `fixed` portals to `document.body`.** A transformed ancestor (RunPanel's `<aside>`, the animated Pipelines page) rebases `fixed` onto itself.
+- **A `TaskCard` change keeps every child inside the card in every state.** Run `e2e/task-card-bounds.spec.ts` (worst-case names, every badge, every action state, light and dark, Chromium and WebKit) before merging; it fails on any overflow. Layout contract: [task-card.md](docs/architecture/task-card.md).
 - **`RunPanel` is one long-lived instance** (`App.tsx` passes no `key`). Switching tasks is a prop change, so any new per-task state in `RunPanelBody` needs a reset line in its `[task.id]` reset effect, and no two children of `RunPanelBody`'s fragment may share a `key` (keyed children carry their component's name, as in `backlog-${task.id}`). Details: [run-panel.md](docs/architecture/run-panel.md).
 
 ## Agent kinds at a glance

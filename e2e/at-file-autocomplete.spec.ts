@@ -715,7 +715,8 @@ test.describe("@ file references", () => {
     await gotoApp(page, backend.bootBase);
     const card = taskCard(page, startedTaskTitle);
     await expect(card).toBeVisible();
-    await card.getByTitle("View changes (git diff)").click();
+    await card.getByTestId("task-card-more").click();
+    await page.getByTestId("task-context-menu").getByRole("menuitem", { name: "View changes" }).click();
     const dialog = page.getByRole("dialog");
     await expect(dialog).toBeVisible({ timeout: CONVERGE_TIMEOUT });
 

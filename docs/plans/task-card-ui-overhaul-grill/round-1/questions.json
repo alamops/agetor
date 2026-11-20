@@ -1,0 +1,621 @@
+{
+  "version": 1,
+  "id": "task-card-ui-overhaul-grill-r1",
+  "title": "Grill — Task card UI overhaul",
+  "skill": "grill",
+  "slug": "task-card-ui-overhaul",
+  "round": 1,
+  "summary": "The investigation found **why** the card in your screenshot breaks (all of it is settled under *What's already proven*). What's left are your calls: **14 questions** plus a short confirm-or-override list.\n\nStart with the **Blocking** ones: scope, header layout, pipeline progress semantics and the action row. They decide the plan's shape. Everything else adjusts parts of it.\n\nFixed geometry to keep in mind: a card's content box is **225 px wide** in every window size (`w-72` column). Source brief: `docs/plans/task-card-ui-overhaul-investigation.md`.",
+  "proven": [
+    {
+      "text": "**Header overflow root cause.** `TaskCard` passes `shrink-0` to `PipelineBadge` (and to the profile badge and `StackBadge`), cancelling the badge's own `min-w-0 truncate`. In the 225 px row, `justify-between` falls back to `flex-start`: the left cluster collapses to 0 px, the pill covers the type icon by 6 px, and the stack chip lands 27 px past the card's edge. Reproduced exactly in Chromium with the repo's Tailwind config.",
+      "evidence": [
+        {
+          "label": "PipelineBadge call site",
+          "path": "src/mainview/components/kanban/TaskCard.tsx",
+          "line": 306,
+          "lang": "tsx",
+          "code": "          {task.pipelineRun ? (\n            <PipelineBadge run={task.pipelineRun} className=\"shrink-0\" />"
+        },
+        {
+          "label": "the badge is built to truncate",
+          "path": "src/mainview/components/pipelines/PipelineBadge.tsx",
+          "line": 35,
+          "lang": "tsx",
+          "code": "      className={cn(\"inline-flex min-w-0 max-w-full items-center gap-1.5 border-transparent font-normal\", STATUS_CLASSES[run.status], className)}\n    >\n      <Workflow className=\"size-3 shrink-0\" aria-hidden />\n      <span className=\"min-w-0 truncate\">{run.pipelineName}</span>"
+        }
+      ]
+    },
+    {
+      "text": "**`13/10` is a counting bug.** `pipelineStepProgress` counts *executions*, not steps. Your screenshot task ran Code Review 3× and Bug Fix 2× on a 10-step graph → 13 succeeded executions. 107 of 120 done pipeline runs in your prod DB over-count (max: 79 on a 9-step graph).",
+      "evidence": [
+        {
+          "path": "src/shared/pipeline.ts",
+          "line": 1682,
+          "lang": "ts",
+          "code": "  const completed = run.history.filter((h) => h.outcome === \"succeeded\" || h.outcome === \"advanced-manually\").length;\n  const active = run.active.length;\n  const total = run.snapshot?.graph.steps.length ?? 0;"
+        }
+      ]
+    },
+    "**Gate-pending action row overflows by 48 px** (Open + Review + Stop + Diff + Delete; Delete sits 31 px outside the card). The `Answer (N) →` row fits with 0 px spare, so `Answer (12)` overflows.",
+    "**The dark-mode `Done` hole** is `variant=\"outline\"` painting `bg-background`, which is darker than `--card` in dark mode only.",
+    "**Raw markdown preview:** 355 of 399 active tasks have markdown-looking prompts (`# Spec…`, tables, fences).",
+    "**No server, DB, route or migration change is needed** for any option below. The progress fix is one pure function in `src/shared/`, which also fixes the run view, `agetor ls/show/pipeline` and the TUI (they show the same wrong number today).",
+    "**The existing tests would not catch any of this:** the header e2e seeds only a plain harness badge, and no progress test repeats a step."
+  ],
+  "sections": [
+    {
+      "id": "scope",
+      "title": "Scope",
+      "questions": [
+        {
+          "id": "scope",
+          "type": "single",
+          "title": "How far does this change go?",
+          "impact": "blocking",
+          "why": "Fix-only is ~5 targeted edits; the redesign touches the header, action row, preview, chips and accessibility, and re-baselines ~20 e2e specs that locate the card.",
+          "context": "Your goal said *\"improve the Card UI following the best UI/UX practices\"*, not just *\"fix the overflow\"*. Questions 3–14 below only matter in full (or partial) form; if you pick **Fix only**, answer them anyway where you have a view — they'll be recorded as out of scope.",
+          "options": [
+            {
+              "id": "full",
+              "label": "Full redesign",
+              "description": "Fix every breakage **and** rework the card: header layout, action row with overflow menu, plain-text preview, title clamp, one chip system, consistent button sizes, focus/keyboard, density.",
+              "consequence": "Bigger plan; every card state gets a geometry e2e check; supersedes the 2026-09-01 header decision where you say so below."
+            },
+            {
+              "id": "fix",
+              "label": "Fix the breakage only",
+              "description": "Header overflow, `13/10`, gate-pending overflow, dark `Done` hole, the amber literal.",
+              "consequence": "Small and safe; the raw-markdown preview, 5 chip styles, button height mismatch and a11y gaps stay."
+            },
+            {
+              "id": "fix-plus",
+              "label": "Fix + the items I tick below",
+              "description": "Fix the breakage, and take only the redesign items you pick in the later questions.",
+              "consequence": "Plan scope is whatever the later answers add."
+            }
+          ],
+          "recommendation": {
+            "value": "full",
+            "reason": "Your goal asks for best-practice UI, and most of the 'not broken' findings (raw markdown, 4 px button mismatch, no focus ring) are visible on every card."
+          }
+        },
+        {
+          "id": "mockup",
+          "type": "single",
+          "title": "Do you want to see a visual mockup before code is written?",
+          "impact": "shape",
+          "why": "Adds a sign-off gate between planning and coding.",
+          "options": [
+            {
+              "id": "mockup-plan",
+              "label": "Yes: Planning publishes an HTML mockup of the chosen layout",
+              "description": "Every card state (idle, running, awaiting, gate-pending, review, done, archived, pipeline + stack + long names), light and dark, at the real 262 px width.",
+              "consequence": "One extra round with you before coding; layout surprises get caught there instead of in review."
+            },
+            {
+              "id": "mockup-options",
+              "label": "Yes, with 2–3 layout alternatives to pick from",
+              "consequence": "Your header/action answers below become a starting point, not final."
+            },
+            {
+              "id": "no-mockup",
+              "label": "No, go straight from these answers to the plan",
+              "consequence": "First visual check is the running dev build."
+            }
+          ],
+          "recommendation": {
+            "value": "mockup-plan",
+            "reason": "It's a visual change; one mockup of the layout you choose here is cheap and catches what words miss, without reopening every decision."
+          }
+        }
+      ]
+    },
+    {
+      "id": "header",
+      "title": "Header & pipeline pill",
+      "intro": "Today: row 1 = type icon + count badges … identity chip (pipeline / profile / harness) + stack chip; row 2 = right-aligned `model · mode` alone; row 3 = title, unclamped. That shape was your decision on 2026-09-01 (`docs/plans/task-card-header-rows.md`, PR #206); the pipeline pill (#244) and stack chip (#295) arrived later and broke it.",
+      "questions": [
+        {
+          "id": "header-layout",
+          "type": "single",
+          "title": "Which header layout should the card use?",
+          "impact": "blocking",
+          "why": "Decides whether the 2026-09-01 decision is superseded and whether `e2e/task-card-header.spec.ts`'s row-2 geometry block is rewritten.",
+          "evidence": [
+            {
+              "label": "row 2 today: model · mode alone, right-aligned",
+              "path": "src/mainview/components/kanban/TaskCard.tsx",
+              "line": 332,
+              "lang": "tsx",
+              "code": "        {(task.model || task.mode) && (\n          <span className=\"self-end text-[10px] font-mono text-muted-foreground\">"
+            }
+          ],
+          "options": [
+            {
+              "id": "keep-3",
+              "label": "Keep the 3 rows, fix overflow and truncation only",
+              "consequence": "Honors 2026-09-01 as-is; the lone `model · mode` line stays.",
+              "preview": "┌───────────────────────────────┐\n│ ▣ 🤖2 ☐3/5   ⧉ Zebra Pip… 10/10 1/2│\n│                 opus-5.5 · auto │\n│ Acme Sync - Keep the inbox      │\n│ watched for the whole session   │\n│ Keep the inbox watched while…   │\n│ ~/Projects/acme/acme-sync        │\n│ ⑂ feature/acme-sync-inb… drifted│\n└───────────────────────────────┘"
+            },
+            {
+              "id": "meta-footer",
+              "label": "Fold `model · mode` into a bottom meta block with repo and branch",
+              "description": "Row 1 keeps identity + status chips; the title moves up; one muted meta block at the bottom holds `model · mode`, repo · branch and the drift chip.",
+              "consequence": "Supersedes 2026-09-01 row 2; header spec rewritten. Title is the first thing you read after the chips.",
+              "preview": "┌───────────────────────────────┐\n│ ▣ 🤖2 ☐3/5   ⧉ Zebra Pip… 10/10 1/2│\n│ Acme Sync - Keep the inbox      │\n│ watched for the whole session   │\n│ Keep the inbox watched while…   │\n│ opus-5.5 · auto                 │\n│ acme-sync · ⑂ feature/jub… drifted│\n└───────────────────────────────┘"
+            },
+            {
+              "id": "two-row",
+              "label": "2-row header: identity line, then status chips + title",
+              "description": "Row 1 = type icon + identity chip + `model · mode` muted; count badges move to a status strip above the actions.",
+              "consequence": "Biggest change; count badges relocate (e2e selectors for them keep their test ids).",
+              "preview": "┌───────────────────────────────┐\n│ ▣ ⧉ Zebra Pip… 10/10  opus·auto 1/2│\n│ Acme Sync - Keep the inbox      │\n│ watched for the whole session   │\n│ Keep the inbox watched while…   │\n│ acme-sync · ⑂ feature/jub… drifted│\n│ 🤖2 ☐3/5 📎1                    │\n└───────────────────────────────┘"
+            }
+          ],
+          "recommendation": {
+            "value": "meta-footer",
+            "reason": "A full line for 15 chars of metadata is wasted height; grouping model, repo and branch as 'where/how it runs' is the standard card hierarchy (identity → title → summary → meta → actions)."
+          }
+        },
+        {
+          "id": "pipeline-pill",
+          "type": "single",
+          "title": "Pipeline cards: where do the pipeline name, progress and active step go?",
+          "impact": "shape",
+          "why": "The pill today reads `⧉ <pipeline name> 3/10 · <active step>` in one line; in 225 px something must give.",
+          "context": "Real names in your DB: pipelines up to 26 chars (`My Implementation Pipeline`), step names like `Implementing`, `Code Review`. A stack chip (`1/2`) may share the row.",
+          "options": [
+            {
+              "id": "own-line-step",
+              "label": "Pill keeps name + progress (name truncates, progress never does); active step gets its own line under the title",
+              "consequence": "The step you'd glance for is never truncated; one extra line while a step is active or a gate is pending.",
+              "preview": "│ ▣          ⧉ Zebra Pipel… 3/10  1/2│\n│ Acme Sync - Keep the inbox…     │\n│ ▶ Implementing                  │"
+            },
+            {
+              "id": "name-gives",
+              "label": "One pill; the pipeline name truncates first, step name kept",
+              "preview": "│ ▣   ⧉ Ala… 3/10 · Implementing 1/2│"
+            },
+            {
+              "id": "step-gives",
+              "label": "One pill; the step name truncates first, pipeline name kept",
+              "preview": "│ ▣   ⧉ Zebra Pipeline (No… 3/10 · Im… 1/2│"
+            }
+          ],
+          "recommendation": {
+            "value": "own-line-step",
+            "reason": "The active step is the live status (what is it doing now?); squeezing two variable-length names into one pill guarantees one of them is unreadable."
+          }
+        },
+        {
+          "id": "title-clamp",
+          "type": "single",
+          "title": "Should long titles be clamped?",
+          "impact": "shape",
+          "why": "Reopens the 2026-09-01 'no title clamp' decision. Titles reach 128 chars in your DB (≈5 lines at 225 px; average is 33).",
+          "options": [
+            {
+              "id": "clamp-3",
+              "label": "Clamp to 3 lines, full title in the tooltip and the run panel",
+              "consequence": "Cards stay a predictable height; the rare long title is cut."
+            },
+            {
+              "id": "clamp-2",
+              "label": "Clamp to 2 lines"
+            },
+            {
+              "id": "no-clamp",
+              "label": "Keep full wrap (the 2026-09-01 decision)",
+              "consequence": "Long titles still make 5-line cards."
+            }
+          ],
+          "recommendation": {
+            "value": "clamp-3",
+            "reason": "3 lines covers ~95-char titles in full, so only the outliers are cut, and the board stays scannable."
+          }
+        }
+      ]
+    },
+    {
+      "id": "progress",
+      "title": "Pipeline progress semantics",
+      "intro": "This changes the number everywhere: board pill, run-view header, `agetor ls`, `agetor show`, `agetor pipeline` and the TUI dashboard, all through `pipelineStepProgress`.",
+      "questions": [
+        {
+          "id": "progress-semantics",
+          "type": "single",
+          "title": "What should `n/total` mean for a pipeline with loops and branches?",
+          "impact": "blocking",
+          "why": "Picks the counting rule and its unit tests; every surface changes at once.",
+          "context": "Counting **distinct** completed steps fixes `13/10` → `10/10`, but **15 of your 120 done runs** would read `9/10`, because a branch was never taken (review passed the first time, so Bug Fix never ran).",
+          "options": [
+            {
+              "id": "distinct-done",
+              "label": "Distinct completed steps / total; a finished run reads `✓ Done`",
+              "description": "Running: `3/10`. Done: `✓ Done` (the skipped branch can't make a finished run look unfinished). Failed / cancelled: distinct `n/total` in the status colour, as today.",
+              "consequence": "Never exceeds the total; finished runs never look short."
+            },
+            {
+              "id": "distinct",
+              "label": "Distinct completed steps / total, always",
+              "consequence": "Done runs with an untaken branch read `9/10`."
+            },
+            {
+              "id": "path-position",
+              "label": "Position along the path actually taken",
+              "description": "Only steps on the taken path count toward the total.",
+              "consequence": "Total can change mid-run as branches resolve; harder to explain and test."
+            }
+          ],
+          "recommendation": {
+            "value": "distinct-done",
+            "reason": "Fixes both the over-count and the misleading 9/10, with a simple rule that's easy to unit-test."
+          }
+        },
+        {
+          "id": "exec-count",
+          "type": "multi",
+          "title": "Where should the execution/loop count (e.g. \"13 step runs · 2 loops\") still appear?",
+          "impact": "minor",
+          "why": "The executions are real information (how many review cycles it took); the fix removes them from the headline number.",
+          "options": [
+            {
+              "id": "tooltip",
+              "label": "Board pill tooltip"
+            },
+            {
+              "id": "run-view",
+              "label": "Pipeline run-view header"
+            },
+            {
+              "id": "cli-show",
+              "label": "`agetor show` / `agetor pipeline` output"
+            },
+            {
+              "id": "nowhere",
+              "label": "Nowhere; drop it"
+            }
+          ],
+          "recommendation": {
+            "value": [
+              "tooltip",
+              "run-view",
+              "cli-show"
+            ],
+            "reason": "Loop count is how you see a review/bug-fix cycle went long; keep it one hover or one command away, off the headline."
+          }
+        }
+      ]
+    },
+    {
+      "id": "actions",
+      "title": "Action row",
+      "intro": "The row is `flex gap-1`, no wrap, no overflow handling. Icon buttons are `h-9`, text buttons `h-8`. The right-click menu (`buildTaskContextMenu`) already offers Open/Review/Run/Stop/Mark done/Archive, View changes, Open in Finder, PR/issue links, copy branch/path and Delete…, and mirrors the card's button precedence.",
+      "questions": [
+        {
+          "id": "action-row",
+          "type": "single",
+          "title": "How should the action row fit in 225 px?",
+          "impact": "blocking",
+          "why": "Decides the button set per state, whether a `⋯` menu exists, and which e2e selectors move (`getByTitle(\"View changes (git diff)\")` in 2 specs; `button[title=\"Stop\"]` count in 1).",
+          "context": "An earlier grill (pipeline human gate) decided: **Review primary, Open visible, Stop a visually secondary danger action.** Options below keep that unless noted.",
+          "options": [
+            {
+              "id": "primary-diff-more",
+              "label": "Primary (+ one secondary) + Diff icon + `⋯` menu",
+              "description": "State's primary button, plus `Done`/`Open` where relevant; Diff stays one click; `⋯` opens the existing context menu at the button with Archive, Stop-extra and Delete… inside. Gate-pending: Review · Open · Stop (icon, danger) · ⋯.",
+              "consequence": "Always fits; Delete and Archive become two clicks; one menu to maintain (already exists).",
+              "preview": "[▶ Review] [Open] ■ ⇄ ⋯\n[✋ Answer (2) →] ■ ⇄ ⋯\n[Open] [✓ Done] ⇄ ⋯"
+            },
+            {
+              "id": "primary-more",
+              "label": "Primary only + `⋯` menu (Diff goes in the menu too)",
+              "consequence": "Cleanest row; Diff becomes two clicks.",
+              "preview": "[▶ Review] [Open] ⋯\n[Open] [✓ Done] ⋯"
+            },
+            {
+              "id": "compact-wrap",
+              "label": "Keep every icon visible, compact (`h-7`), allow wrapping to a 2nd line",
+              "consequence": "Nothing hidden; some states get a 2-line action row.",
+              "preview": "[Review] [Open] [Stop] ⇄\n🗑"
+            },
+            {
+              "id": "hover-reveal",
+              "label": "Reveal secondary icons on hover / keyboard focus",
+              "consequence": "Clean at rest; actions invisible until hover — poor discoverability, no hover on the mobile companion."
+            }
+          ],
+          "recommendation": {
+            "value": "primary-diff-more",
+            "reason": "Diff is the most-used secondary action; Delete/Archive are rare and destructive, so one extra click is a feature. Reusing the context menu keeps the precedence mirror in one place."
+          }
+        }
+      ]
+    },
+    {
+      "id": "content",
+      "title": "Prompt preview",
+      "questions": [
+        {
+          "id": "preview",
+          "type": "single",
+          "title": "What should the 2-line prompt preview show?",
+          "impact": "shape",
+          "why": "Decides whether a markdown-to-text helper is written (none exists) and what it extracts.",
+          "context": "Your screenshot card shows `# Spec — Keep the inbox watched for the whole session | Field | Value | | --- |…`. Plain stripping would give `Spec — Keep the inbox watched… Field Value …`, which repeats the title. Persisted prompts stay raw either way (rendering-only, client-side).",
+          "options": [
+            {
+              "id": "first-prose",
+              "label": "First prose paragraph as plain text",
+              "description": "Skip headings, tables, rules, code fences and front-matter-like blocks; strip emphasis/link syntax; if no prose remains, fall back to stripped text; empty → no preview line.",
+              "consequence": "New pure helper + unit tests; the preview shows the actual request."
+            },
+            {
+              "id": "strip-all",
+              "label": "Strip markdown syntax only, keep everything in order",
+              "consequence": "Simpler helper; spec-style prompts still preview as `Spec — … Field Value …`."
+            },
+            {
+              "id": "hide-pipeline",
+              "label": "First-prose plain text, and hide the preview on pipeline parents",
+              "consequence": "Pipeline cards are shorter; their spec isn't previewed at all."
+            },
+            {
+              "id": "hide",
+              "label": "Remove the preview entirely"
+            }
+          ],
+          "recommendation": {
+            "value": "first-prose",
+            "reason": "The preview's job is 'what was asked'; headings and tables are structure, not content."
+          }
+        }
+      ]
+    },
+    {
+      "id": "a11y",
+      "title": "Accessibility & keyboard",
+      "intro": "Today the card root gets dnd-kit's `role=\"button\"` + `tabIndex=0` while containing real buttons (axe `nested-interactive`), has no `focus-visible` style, and Enter/Space does nothing (only `PointerSensor`, `distance: 6`).",
+      "questions": [
+        {
+          "id": "a11y-items",
+          "type": "multi",
+          "title": "Which accessibility items are in this change?",
+          "impact": "shape",
+          "why": "Each is a separate piece of work and test; keyboard dragging is the large one.",
+          "options": [
+            {
+              "id": "focus-ring",
+              "label": "Visible `focus-visible` ring on the card (semantic `ring` token)"
+            },
+            {
+              "id": "enter-open",
+              "label": "Enter / Space on a focused card opens it (same as click)"
+            },
+            {
+              "id": "nested",
+              "label": "Fix the button-inside-a-button: card keeps whole-surface pointer drag, but its role becomes a labelled group instead of `button`",
+              "description": "Alternative (drag handle via `setActivatorNodeRef`) would change what's draggable — only the handle — so not offered as default."
+            },
+            {
+              "id": "aria-labels",
+              "label": "`aria-label` on every icon-only button"
+            },
+            {
+              "id": "keyboard-drag",
+              "label": "Keyboard dragging between columns (`KeyboardSensor`)",
+              "description": "Move a focused card with Space + arrows. A board feature more than a card one; touches App.tsx's DnD setup and drop handling."
+            }
+          ],
+          "recommendation": {
+            "value": [
+              "focus-ring",
+              "enter-open",
+              "nested",
+              "aria-labels"
+            ],
+            "reason": "The first four are card-local and cheap; keyboard dragging is a board-level feature that deserves its own ticket."
+          }
+        },
+        {
+          "id": "keyboard-drag-disposition",
+          "type": "single",
+          "title": "If keyboard dragging is not in this change: out of scope, or deferred by you?",
+          "impact": "minor",
+          "why": "Every remainder needs a disposition; nothing gets silently dropped.",
+          "context": "If you **did** tick keyboard dragging above, pick *It's in* here.",
+          "options": [
+            {
+              "id": "deferred",
+              "label": "Owner-deferred: a later ticket"
+            },
+            {
+              "id": "out",
+              "label": "Out of scope: not wanted"
+            },
+            {
+              "id": "in",
+              "label": "It's in (I ticked it above)"
+            }
+          ],
+          "recommendation": {
+            "value": "deferred",
+            "reason": "Worth doing, but it's a board feature with its own drop/precedence rules."
+          }
+        }
+      ]
+    },
+    {
+      "id": "look",
+      "title": "Density & visual system",
+      "questions": [
+        {
+          "id": "density",
+          "type": "multi",
+          "title": "Which density/consistency changes are in?",
+          "impact": "shape",
+          "why": "Each changes measured geometry the e2e checks will pin.",
+          "context": "Today: five chip styles (pipeline pill `text-xs rounded-full filled`, agent badge `text-xs font-semibold`, count badges `text-[10px] outline`, stack chip `text-[10px] rounded` 4 px, drifted chip `rounded filled`); buttons `h-8` vs icon `h-9`; card padding `p-4`; workdir and branch on two 10 px mono lines.",
+          "options": [
+            {
+              "id": "chips",
+              "label": "One chip system: one height (`h-5`), `text-[10px]`, `rounded-full`, same padding; colour carries the meaning"
+            },
+            {
+              "id": "buttons",
+              "label": "One button height on the card (`h-7` text and icon buttons)"
+            },
+            {
+              "id": "padding",
+              "label": "Card padding `p-4` → `p-3` (content 225 → 233 px)"
+            },
+            {
+              "id": "meta-line",
+              "label": "Workdir + branch on one line: repo folder name · branch (full path and branch in the tooltip)"
+            }
+          ],
+          "recommendation": {
+            "value": [
+              "chips",
+              "buttons",
+              "padding",
+              "meta-line"
+            ],
+            "reason": "Each removes a visible inconsistency or a wasted line; all are card-local (the shared Badge/Button primitives stay untouched)."
+          }
+        }
+      ]
+    },
+    {
+      "id": "acceptance",
+      "title": "Acceptance & verification",
+      "questions": [
+        {
+          "id": "verification",
+          "type": "multi",
+          "title": "What has to pass before this is done?",
+          "impact": "shape",
+          "why": "Today nothing would catch a regression of the screenshot.",
+          "options": [
+            {
+              "id": "e2e-bounds",
+              "label": "e2e: every child of the card stays inside the card's box, for each state (pipeline + profile + stack + long names; gate-pending; awaiting `Answer (12)`; all count badges)"
+            },
+            {
+              "id": "unit-progress",
+              "label": "Unit: progress with a loop history (repeated stepIds), an untaken branch, and done/failed/cancelled runs; CLI `ls`/`show` tests updated"
+            },
+            {
+              "id": "unit-preview",
+              "label": "Unit: markdown-to-preview helper (headings, tables, fences, emphasis, links, empty)"
+            },
+            {
+              "id": "themes",
+              "label": "Screenshots of the card states in light and dark, attached to the PR"
+            },
+            {
+              "id": "owner-eyeball",
+              "label": "You eyeball it in `bun run dev:hmr` before merge"
+            }
+          ],
+          "recommendation": {
+            "value": [
+              "e2e-bounds",
+              "unit-progress",
+              "unit-preview",
+              "themes"
+            ],
+            "reason": "The bounds check is the regression test for your screenshot; the theme screenshots catch the dark-only class of bug (`Done` today)."
+          }
+        },
+        {
+          "id": "done-means",
+          "type": "text",
+          "title": "Anything else that must be true before you'd call this done?",
+          "required": false,
+          "placeholder": "e.g. the companion app's card should match"
+        }
+      ]
+    },
+    {
+      "id": "confirm",
+      "title": "Confirm or override",
+      "intro": "Defaults I'd bet on. One click each, or write what it should be.",
+      "questions": [
+        {
+          "id": "amber",
+          "type": "confirm",
+          "title": "Answer button colour",
+          "recommendation": {
+            "value": "Replace `bg-amber-500 text-amber-950 …` with `bg-warning-solid` plus a new `--warning-solid-foreground` token (dark amber text, added to both `index.css` themes and `tailwind.config.js`). Card-local; the shared awaiting ring/glow and `StepNode` look stay unchanged.",
+            "reason": "Repo rule: semantic tokens only. `--warning-solid` exists in both themes, but it has no foreground pair yet."
+          }
+        },
+        {
+          "id": "done-dark",
+          "type": "confirm",
+          "title": "Done button in dark mode",
+          "recommendation": {
+            "value": "Card-local `bg-transparent` on the outline `Done` (no change to the shared Button variant).",
+            "reason": "Fixes the dark-only hole without touching every other outline button in the app."
+          }
+        },
+        {
+          "id": "no-overflow-hidden",
+          "type": "confirm",
+          "title": "No `overflow-hidden` on the card",
+          "recommendation": {
+            "value": "Fix the flex layout instead of clipping; the card stays `overflow-visible`.",
+            "reason": "Clipping would hide the unread dot and awaiting glow, and would hide future overflow bugs instead of exposing them."
+          }
+        },
+        {
+          "id": "column-width",
+          "type": "confirm",
+          "title": "Column width",
+          "recommendation": {
+            "value": "Columns stay `w-72`; resizable/wider columns are a different ticket.",
+            "reason": "A wider column would hide the overflow without fixing it."
+          }
+        },
+        {
+          "id": "primitives",
+          "type": "confirm",
+          "title": "Shared UI primitives",
+          "recommendation": {
+            "value": "`ui/badge`, `ui/button`, `ui/card` variants are not changed; the card uses card-local classes (or a new, card-only chip component).",
+            "reason": "They're used app-wide."
+          }
+        },
+        {
+          "id": "preview-helper-home",
+          "type": "confirm",
+          "title": "Where the preview helper lives",
+          "recommendation": {
+            "value": "`src/mainview/lib/prompt-preview.ts` + sibling test (webview only; the CLI/TUI don't show prompt previews).",
+            "reason": "No second consumer today; moving it to `src/shared/` later is a cheap move."
+          }
+        },
+        {
+          "id": "docs",
+          "type": "confirm",
+          "title": "Docs",
+          "recommendation": {
+            "value": "Update `task-context-menu.md` (card ↔ menu precedence, `⋯` entry), `pipelines.md` (progress rule), `PipelineBadge` doc comment, the header e2e spec comment; add a 'superseded by' note to `docs/plans/task-card-header-rows.md`.",
+            "reason": "Each describes behaviour this change alters."
+          }
+        },
+        {
+          "id": "mobile",
+          "type": "confirm",
+          "title": "Companion (mobile) app card",
+          "recommendation": {
+            "value": "Out of scope: this change is the desktop webview card only.",
+            "reason": "Separate codebase and layout; only the shared progress rule reaches it if it uses `pipelineStepProgress`."
+          }
+        }
+      ]
+    }
+  ]
+}

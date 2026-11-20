@@ -1,4 +1,5 @@
 import { cn } from "@/lib/utils";
+import { CardChip } from "./CardChip";
 import { stackPositionFor } from "@/lib/stack-badge";
 import { modelDisplayName } from "../../../shared/model-display.ts";
 import type { HarnessStack } from "../../../shared/types.ts";
@@ -116,23 +117,20 @@ export function StackBadge({
                 ? "switch scheduled"
                 : "cooling";
   return (
-    <span
+    <CardChip
+      tone={exhausted || cooling ? "warning" : "info"}
       data-testid="task-card-stack-badge"
       role="img"
       aria-label={`${label}: ${title}`}
       title={title}
-      className={cn(
-        "inline-flex items-center gap-1 rounded border px-1.5 py-0.5 text-[10px] font-medium",
-        exhausted || cooling
-          ? "border-warning/40 text-warning"
-          : "border-info/40 text-info",
-        className,
-      )}
+      className={className}
     >
-      {pending || retrying || scheduled ? "⇄ " : ""}
-      {cooling ? "⏳ " : ""}
-      {label}
-    </span>
+      <span className="truncate">
+        {pending || retrying || scheduled ? "⇄ " : ""}
+        {cooling ? "⏳ " : ""}
+        {label}
+      </span>
+    </CardChip>
   );
 }
 

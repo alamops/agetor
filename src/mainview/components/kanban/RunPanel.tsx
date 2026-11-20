@@ -171,6 +171,7 @@ import {
 } from "../../../shared/model-catalog.ts";
 import { modelDisplayName } from "../../../shared/model-display.ts";
 import { parseIssueUrl } from "../../../shared/issue-task.ts";
+import { BOARD_DRAG_SELECTOR } from "@/lib/board-keyboard";
 import { draftsEqual, normalizeDraft } from "@/lib/draft";
 import { createEventDeduper } from "@/lib/event-dedup";
 import { collapseRepeatedStatusChips } from "@/lib/status-collapse";
@@ -210,6 +211,10 @@ import { AssistantHandoffMessage, UserHandoffMarkdown } from "@/components/hando
 import { handoffCardsEnabled, handoffUsage, indexLastHandoffEventByRun } from "@/lib/handoff-view";
 import { SpeedPicker } from "./SpeedPicker";
 import { importedSessionOf } from "../../../shared/imported-session.ts";
+
+/** Layers that own an Escape before the panel or its search bar do: a modal
+ *  dialog, an open popover, the floating quote pill. */
+const ESCAPE_HIGHER_LAYERS = '[role="dialog"][aria-modal="true"], [data-popover-open], [data-quote-open]';
 
 /**
  * Resolve a task's harness id to its underlying kind. Falls back to
@@ -581,7 +586,7 @@ export function RunPanel({ task, stickyUserMessages, agents, harnesses, stacks =
     const onKey = (e: KeyboardEvent) => {
       if (e.key !== "Escape") return;
       if (e.defaultPrevented) return;
-      if (document.querySelector('[role="dialog"][aria-modal="true"], [data-popover-open], [data-quote-open], [data-search-open]')) return;
+      if (document.querySelector(`${ESCAPE_HIGHER_LAYERS}, [data-search-open], ${BOARD_DRAG_SELECTOR}`)) return;
       e.preventDefault();
       onCloseRef.current();
     };
@@ -2319,7 +2324,8 @@ function RunPanelBody({
       if (e.key !== "Escape") return;
       // Already handled by a layer above (see the panel-close listener).
       if (e.defaultPrevented) return;
-      if (document.querySelector('[role="dialog"][aria-modal="true"], [data-popover-open], [data-quote-open]')) return;
+      // A held board card owns this Escape (dnd-kit puts it back).
+      if (document.querySelector(`${ESCAPE_HIGHER_LAYERS}, ${BOARD_DRAG_SELECTOR}`)) return;
       e.preventDefault();
       closeSearch();
     };

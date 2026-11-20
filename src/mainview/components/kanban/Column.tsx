@@ -19,7 +19,6 @@ interface Props {
   limitStates?: HarnessLimitState[];
   onStart: (t: Task) => void;
   onCancel: (t: Task) => void;
-  onDelete: (t: Task) => void;
   onOpen: (t: Task) => void;
   /** Forwarded to each `TaskCard` as its amber "waiting on you" button's
    *  callback — see `TaskCard`'s own doc for why it's separate from
@@ -29,10 +28,7 @@ interface Props {
    *  the gate focused (`TaskCard`'s Review button). Must be
    *  `useCallback`-stable (compared below). */
   onReviewPipeline: (t: Task) => void;
-  onDiff: (t: Task) => void;
   onMarkDone: (t: Task) => void;
-  onArchive: (t: Task) => void;
-  onUnarchive: (t: Task) => void;
   /** Muted one-line hint shown in place of the (empty) task list, while
    *  onboarding's checklist is visible. Only rendered when `tasks.length ===
    *  0` — never overlays real cards. Non-interactive (`pointer-events-none`)
@@ -47,6 +43,10 @@ interface Props {
   /** Right-click on a card within this column — forwarded verbatim to every
    *  `TaskCard`. See `TaskCard`'s doc comment for the payload shape. */
   onContextMenu?: (t: Task, pos: { x: number; y: number }) => void;
+  /** Id of the task whose menu is open (App's `taskMenu`), so that card's `⋯`
+   *  button reads `aria-expanded`. Compared below: opening or closing a menu
+   *  re-renders each column, and only the affected card re-renders its DOM. */
+  menuTaskId?: string | null;
 }
 
 /** Array is considered unchanged when same length and every element is the
@@ -61,7 +61,7 @@ function sameTasks(a: Task[], b: Task[]): boolean {
   return a.every((t, i) => t === b[i]);
 }
 
-function ColumnImpl({ id, label, tasks, homeDir, stacks = [], limitStates = [], onStart, onCancel, onDelete, onOpen, onOpenAttention, onReviewPipeline, onDiff, onMarkDone, onArchive, onUnarchive, emptyHint, selectedTaskId, onContextMenu }: Props) {
+function ColumnImpl({ id, label, tasks, homeDir, stacks = [], limitStates = [], onStart, onCancel, onOpen, onOpenAttention, onReviewPipeline, onMarkDone, emptyHint, selectedTaskId, onContextMenu, menuTaskId }: Props) {
   const { setNodeRef, isOver } = useDroppable({ id });
   return (
     <div
@@ -90,16 +90,13 @@ function ColumnImpl({ id, label, tasks, homeDir, stacks = [], limitStates = [], 
             limitStates={limitStates}
             onStart={onStart}
             onCancel={onCancel}
-            onDelete={onDelete}
             onOpen={onOpen}
             onOpenAttention={onOpenAttention}
             onReviewPipeline={onReviewPipeline}
-            onDiff={onDiff}
             onMarkDone={onMarkDone}
-            onArchive={onArchive}
-            onUnarchive={onUnarchive}
             isOpen={t.id === selectedTaskId}
             onContextMenu={onContextMenu}
+            menuOpen={t.id === menuTaskId}
           />
         ))}
       </div>
@@ -129,16 +126,13 @@ export const Column = memo(ColumnImpl, (prev, next) => (
   prev.limitStates === next.limitStates &&
   prev.onStart === next.onStart &&
   prev.onCancel === next.onCancel &&
-  prev.onDelete === next.onDelete &&
   prev.onOpen === next.onOpen &&
   prev.onOpenAttention === next.onOpenAttention &&
   prev.onReviewPipeline === next.onReviewPipeline &&
-  prev.onDiff === next.onDiff &&
   prev.onMarkDone === next.onMarkDone &&
-  prev.onArchive === next.onArchive &&
-  prev.onUnarchive === next.onUnarchive &&
   prev.emptyHint === next.emptyHint &&
   prev.selectedTaskId === next.selectedTaskId &&
   prev.onContextMenu === next.onContextMenu &&
+  prev.menuTaskId === next.menuTaskId &&
   sameTasks(prev.tasks, next.tasks)
 ));

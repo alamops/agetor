@@ -1,0 +1,79 @@
+{
+  "version": 1,
+  "formId": "task-card-ui-overhaul-grill-r2",
+  "title": "Grill — Task card UI overhaul (round 2)",
+  "round": 2,
+  "mode": "served",
+  "specFile": "questions.json",
+  "specSha256": "de66c483577fbd29a9eb71bbb2e8de5674118ba1eadb5a8010e311b1ecefd23c",
+  "submittedAt": "2026-11-18T21:28:15.948Z",
+  "receivedAt": "2026-11-18T21:28:15.960Z",
+  "answeredBy": null,
+  "summary": {
+    "total": 5,
+    "answered": 5,
+    "skipped": 0,
+    "unanswered": 0,
+    "optionalLeftBlank": 0,
+    "notApplicable": 0,
+    "acceptedRecommendations": 5,
+    "overrodeRecommendations": [],
+    "oneWayDoorsNotAnswered": [],
+    "withNotes": [],
+    "needsAnswer": [],
+    "complete": true
+  },
+  "answers": {
+    "design-process": {
+      "n": 1,
+      "title": "How should the designs be explored before one is picked?",
+      "type": "single",
+      "status": "answered",
+      "impact": "blocking",
+      "value": "alts-measured",
+      "display": "Planning publishes 2–3 whole-card alternatives, each measured; you pick one",
+      "acceptedRecommendation": true
+    },
+    "pipeline-name": {
+      "n": 2,
+      "title": "Pipeline cards: how is the full pipeline name shown?",
+      "type": "single",
+      "status": "answered",
+      "impact": "blocking",
+      "value": "hat",
+      "display": "A pipeline \"hat\": a full-width band at the top of the card",
+      "acceptedRecommendation": true
+    },
+    "card-rule": {
+      "n": 3,
+      "title": "Where does the 'don't break the card' rule live?",
+      "type": "single",
+      "status": "answered",
+      "impact": "shape",
+      "value": "rule-and-doc",
+      "display": "A short rule in CLAUDE.md's *Webview* rules + a new `docs/architecture/task-card.md` + a Topic map row",
+      "acceptedRecommendation": true
+    },
+    "action-states": {
+      "n": 4,
+      "title": "With 'Primary only + ⋯', confirm the per-state buttons, in particular Stop on a pending human gate",
+      "type": "single",
+      "status": "answered",
+      "impact": "shape",
+      "value": "table-menu-stop",
+      "display": "Table as shown: Stop goes into ⋯ on a pending gate",
+      "acceptedRecommendation": true
+    },
+    "keyboard-keys": {
+      "n": 5,
+      "title": "Keyboard: Enter/Space open the card AND start a keyboard drag. Which key does what?",
+      "type": "single",
+      "status": "answered",
+      "impact": "shape",
+      "value": "enter-open-space-drag",
+      "display": "Enter opens; Space picks up / drops; ← → move between columns; Esc cancels",
+      "acceptedRecommendation": true
+    }
+  },
+  "generalNotes": null
+}

@@ -289,6 +289,34 @@ test("show: a pipeline (parent) task prints a 'pipeline:' line with name/id/stat
   expect(rendered).toContain("no <handoff> block found");
 });
 
+test("show: a looping done pipeline prints ✓ Done with its step-run and re-run counts, never 13/10", async () => {
+  outputs.length = 0;
+  const steps = Array.from({ length: 10 }, (_, i) => newStep({ id: `s${i + 1}`, name: `Step ${i + 1}` }));
+  const ids = ["s1", "s2", "s3", "s4", "s5", "s6", "s7", "s8", "s9", "s10", "s3", "s3", "s9"];
+  const base = pipelineRun();
+  currentClient = makeClient(
+    task({
+      pipelineId: "pipe-1",
+      pipelineRun: {
+        ...base,
+        status: "done",
+        active: [],
+        blocked: [],
+        snapshot: { graph: { steps, edges: [], startStepId: "s1" }, maxSteps: 25, profiles: {}, capturedAt: 0 },
+        history: ids.map((stepId, i) => ({
+          seq: i + 1, stepId, taskId: `t${i}`, startedAt: i, endedAt: i + 1, outcome: "succeeded" as const, handoff: null, nextStepIds: [],
+        })),
+      },
+    }),
+  );
+
+  await cmdShow([TASK_ID], flags);
+
+  const rendered = outputs.join("\n");
+  expect(rendered).toContain("steps: ✓ Done (13 step runs · 3 re-runs)");
+  expect(rendered).not.toContain("13/10");
+});
+
 test("show: a pipeline task with no blocked entries prints no '⚠' lines", async () => {
   outputs.length = 0;
   currentClient = makeClient(
