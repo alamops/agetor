@@ -40,6 +40,10 @@ let previousFloor: string | undefined;
 let db: typeof import("./db.ts");
 let orch: typeof import("./orchestrator.ts");
 let restoreHarnesses: () => void;
+// Only the tasks this file made: `bun test` shares one db.ts singleton across
+// files, so sweeping `db.tasks.list()` in afterAll would delete (and tear down
+// worktrees of) every other file's leftovers and can outlast the hook timeout.
+const createdTaskIds: string[] = [];
 
 beforeAll(async () => {
   db = await import("./db.ts");
@@ -58,7 +62,7 @@ afterAll(async () => {
   const codexFloors = MODEL_MIN_CLI_VERSION.codex as Record<string, string>;
   if (previousFloor === undefined) delete codexFloors[MODEL];
   else codexFloors[MODEL] = previousFloor;
-  for (const t of db.tasks.list()) await orch.deleteTask(t.id).catch(() => {});
+  for (const id of createdTaskIds) await orch.deleteTask(id).catch(() => {});
   await Bun.sleep(150);
   restoreHarnesses();
   for (const key of ENV_KEYS) {
@@ -67,7 +71,7 @@ afterAll(async () => {
   }
   rmSync(BIN_DIR, { recursive: true, force: true });
   rmTestDataDir(DATA_DIR);
-});
+}, 20_000);
 
 async function waitFor(fn: () => boolean | Promise<boolean>, ms = 8000): Promise<boolean> {
   const deadline = Date.now() + ms;
@@ -80,6 +84,7 @@ async function waitFor(fn: () => boolean | Promise<boolean>, ms = 8000): Promise
 
 test("Stop on a failed card with running background agents, while a Run holds the start claim, cancels the turn that start mints (A2)", async () => {
   const taskId = randomUUID();
+  createdTaskIds.push(taskId);
   const workdir = mkdtempSync(path.join(DATA_DIR, "wd-"));
   db.tasks.insert({
     id: taskId, title: "hold scope claim", prompt: "work", agent: "codex", workdir, isolation: "none", taskType: "task",

@@ -2721,7 +2721,9 @@ async function makeFakeAgent(
       // (review R-S15).
       const signal = classifyHarnessLimitSignal(fakeOpts.kind ?? "claude-code", {
         text: fakeOpts.kind === "codex"
-          ? "You've hit your usage limit. Upgrade to Plus to continue using Codex (https://chatgpt.com/explore/plus), or try again at 3:00 PM."
+          // The reset time is a test seam: a fixed "3:00 PM" is unparseable
+          // (a just-passed time reads as null) for an hour after 3 PM local.
+          ? `You've hit your usage limit. Upgrade to Plus to continue using Codex (https://chatgpt.com/explore/plus), or try again at ${process.env.AGETOR_FAKE_CODEX_LIMIT_RESET ?? "3:00 PM"}.`
           : "Usage limit reached · continuing automatically when it resets",
       });
       if (!signal) {

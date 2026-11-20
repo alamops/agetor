@@ -226,6 +226,15 @@ describe("harness-stack swap", () => {
     const prevBin = process.env.AGETOR_CODEX_BIN;
     process.env.AGETOR_CODEX_DRIVER = "fake";
     process.env.AGETOR_CODEX_BIN = "/bin/echo";
+    // The real prose's reset is a wall-clock time, so build it relative to the
+    // test's clock: the top of the hour three hours ahead is always future
+    // (never a "just passed" 3 PM, which the parser reads as null).
+    const prevReset = process.env.AGETOR_FAKE_CODEX_LIMIT_RESET;
+    const resetDate = new Date();
+    resetDate.setMinutes(0, 0, 0);
+    resetDate.setHours(resetDate.getHours() + 3);
+    const expectedResetHour = resetDate.getHours();
+    process.env.AGETOR_FAKE_CODEX_LIMIT_RESET = `${expectedResetHour % 12 === 0 ? 12 : expectedResetHour % 12}:00 ${expectedResetHour >= 12 ? "PM" : "AM"}`;
     const prompts: string[] = [];
     let taskId = "";
     const prevPrompt = orch.__setHarnessSwapPromptHookForTest((hooked, prompt) => {
@@ -282,7 +291,7 @@ describe("harness-stack swap", () => {
       const resetsAtMs = parseHarnessSwapNotice(noticeRaw ?? "")?.resetsAtMs;
       expect(typeof resetsAtMs).toBe("number");
       expect(resetsAtMs!).toBeGreaterThan(Date.now());
-      expect(new Date(resetsAtMs!).getHours()).toBe(15);
+      expect(new Date(resetsAtMs!).getHours()).toBe(expectedResetHour);
       expect(new Date(resetsAtMs!).getMinutes()).toBe(0);
       // The provider-reported reset is the account's cooldown, not a fallback.
       expect(cooldown?.exhaustedUntilMs).toBe(resetsAtMs!);
@@ -296,6 +305,8 @@ describe("harness-stack swap", () => {
       else process.env.AGETOR_CODEX_DRIVER = prevDriver;
       if (prevBin === undefined) delete process.env.AGETOR_CODEX_BIN;
       else process.env.AGETOR_CODEX_BIN = prevBin;
+      if (prevReset === undefined) delete process.env.AGETOR_FAKE_CODEX_LIMIT_RESET;
+      else process.env.AGETOR_FAKE_CODEX_LIMIT_RESET = prevReset;
     }
   }, 20_000);
 

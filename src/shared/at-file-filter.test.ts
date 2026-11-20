@@ -279,22 +279,29 @@ function buildPerfFixture(): FileEntry[] {
   return buildFileEntries(files);
 }
 
-function medianMs(fn: () => void, runs = 5): number {
+/** Best-of-N CPU time (user + system) of `fn`, in ms. CPU time, not wall-clock:
+ *  these budgets guard the algorithm's cost, and wall-clock timing on a loaded
+ *  machine (a full `bun test` run, CI) measures how long the scheduler kept the
+ *  process off the CPU instead. The minimum of several runs (the standard
+ *  noise-resistant estimator) because contention only ever adds time: a real
+ *  algorithmic regression raises every sample, a noisy neighbour only some. */
+function bestMs(fn: () => void, runs = 15): number {
   const samples: number[] = [];
   for (let i = 0; i < runs; i++) {
-    const start = performance.now();
+    const before = process.cpuUsage();
     fn();
-    samples.push(performance.now() - start);
+    const used = process.cpuUsage(before);
+    samples.push((used.user + used.system) / 1000);
   }
   samples.sort((a, b) => a - b);
-  return samples[Math.floor(samples.length / 2)]!;
+  return samples[0]!;
 }
 
 test("filters a 20k-entry listing within a tight per-keystroke budget", () => {
   const entries = buildPerfFixture();
   expect(entries.length).toBeGreaterThan(20_000);
 
-  // Soft target from the design: median ≤ 15ms on a healthy machine. Not
+  // Soft target from the design: best-of-N CPU time ≤ 15ms on a healthy machine. Not
   // asserted directly (CI/dev-machine load makes single-digit-ms timing
   // flaky) — only logged so a real regression is visible without failing
   // the suite on noise. The assertion below is the hard, skip-safe ceiling.
@@ -302,13 +309,13 @@ test("filters a 20k-entry listing within a tight per-keystroke budget", () => {
   const hardCeilingMs = 60;
 
   for (const query of ["d", "db", "src/bun/d"]) {
-    const elapsed = medianMs(() => {
+    const elapsed = bestMs(() => {
       const result = filterFileEntries(entries, query, 50);
       expect(result.length).toBeLessThanOrEqual(50);
     });
     if (elapsed > softTargetMs) {
       console.warn(
-        `filterFileEntries("${query}") median ${elapsed.toFixed(2)}ms exceeds the ${softTargetMs}ms soft target (still under the ${hardCeilingMs}ms hard ceiling)`,
+        `filterFileEntries("${query}") best ${elapsed.toFixed(2)}ms exceeds the ${softTargetMs}ms soft target (still under the ${hardCeilingMs}ms hard ceiling)`,
       );
     }
     expect(elapsed).toBeLessThan(hardCeilingMs);
@@ -327,12 +334,12 @@ test("blank query over a 20k-entry listing stays O(n)-ish — no full sort of th
   expect(entries.length).toBeGreaterThan(20_000);
 
   const hardCeilingMs = 15;
-  const elapsed = medianMs(() => {
+  const elapsed = bestMs(() => {
     const result = filterFileEntries(entries, "", 50);
     expect(result.length).toBe(50);
   });
   if (elapsed > 3) {
-    console.warn(`filterFileEntries(entries, "", 50) median ${elapsed.toFixed(2)}ms over the 20k fixture`);
+    console.warn(`filterFileEntries(entries, "", 50) best ${elapsed.toFixed(2)}ms over the 20k fixture`);
   }
   expect(elapsed).toBeLessThan(hardCeilingMs);
 });

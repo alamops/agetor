@@ -2,10 +2,10 @@
 // (URL, method, headers, body, pagination, error mapping) via the fetch-mock
 // harness in github-test-util.ts. Complements github.test.ts, which unit-tests
 // the pure helpers in isolation.
-import { mkdtempSync } from "node:fs";
+import { chmodSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import path from "node:path";
-import { test, expect, beforeAll } from "bun:test";
+import { test, expect, beforeAll, afterAll } from "bun:test";
 import { makeAliasGitHubRepo, makeGitHubRepo, mockGitHubFetch } from "./github-test-util.ts";
 import { setGitHubToken } from "./github-tokens.ts";
 import {
@@ -64,10 +64,35 @@ import {
 
 let REPO_DIR = "";
 
+// Hermetic credentials: the "unauthenticated" tests delete GITHUB_TOKEN /
+// GH_TOKEN, after which githubToken() falls through to the stored-token file
+// under the data dir and then to `gh auth token`. On a developer machine both
+// can hold a real credential, so point the data dir at an empty temp dir and
+// put a `gh` stub that always fails first on PATH.
+const priorPath = process.env.PATH;
+const priorDataDirTop = process.env.AGETOR_DATA_DIR;
+let stubDir = "";
+let isolatedDataDir = "";
+
 beforeAll(async () => {
+  stubDir = mkdtempSync(path.join("/tmp", "agetor-gh-stub-"));
+  const ghStub = path.join(stubDir, "gh");
+  writeFileSync(ghStub, "#!/bin/sh\nexit 1\n");
+  chmodSync(ghStub, 0o755);
+  process.env.PATH = `${stubDir}:${priorPath ?? ""}`;
+  isolatedDataDir = mkdtempSync(path.join(tmpdir(), "agetor-gh-net-data-"));
+  process.env.AGETOR_DATA_DIR = isolatedDataDir;
   // Force a deterministic token so githubToken() doesn't shell out to `gh`.
   process.env.GITHUB_TOKEN = "test-token";
   REPO_DIR = await makeGitHubRepo("acme", "widgets");
+});
+
+afterAll(() => {
+  if (priorPath !== undefined) process.env.PATH = priorPath;
+  if (priorDataDirTop !== undefined) process.env.AGETOR_DATA_DIR = priorDataDirTop;
+  else delete process.env.AGETOR_DATA_DIR;
+  rmSync(stubDir, { recursive: true, force: true });
+  rmSync(isolatedDataDir, { recursive: true, force: true });
 });
 
 test("getGitHubViewer hits /user with the bearer token and returns the login", async () => {
