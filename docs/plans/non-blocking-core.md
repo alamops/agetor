@@ -7,7 +7,7 @@
 | Config | AGENTS_CONFIG.yml (balanced, schema v1; host claude_code) |
 | Flags | none |
 | Gates | grilled via decision form (round-1 + round-2 answers.json, both `complete: true`); owner overrode two recommendations (full async DB worker, all of it in this run; one PR); plan approved by owner in chat ("approved", 2026-11-19) |
-| Status | wave 1 (e686cc14), wave 2 (515feaa5), wave 2b boot wiring + review fixes (dc5e31f1) landed; wave 3 in progress |
+| Status | waves 0–5 landed: W1 e686cc14, W2 515feaa5 + dc5e31f1, W3 7a6a68c0 · ba33fa22 · 6a45a89c · aa69a966 · a7d8751a · d519bc27 · debb6402 (+ review fixes b0119b77, 9e1d635f), W4 682de003 · 36991bf0 · 7a41ea81, W5 34cf96e8 · fc1abbe5; Phase 5 review, Phase 6 e2e and Phase 7 runs/benchmark in progress |
 | Branch | perf/non-blocking-core (worktree `.claude/worktrees/perf-non-blocking-core`) |
 | Base SHA | 26b0069c (main, includes #305) |
 
