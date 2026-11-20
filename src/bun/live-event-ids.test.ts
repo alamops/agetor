@@ -336,8 +336,9 @@ test("a monitor event stores and sends the line's own time", async () => {
   );
 
   const w = attachSubagentWatcher({ taskId, jsonlPath, manual: true });
+  await w.ready;
   try {
-    w.pump(t0);
+    await w.pump(t0);
     const content = `<task-notification>\n<task-id>${monitorId}</task-id>\n<summary>Monitor event: "ids"</summary>\n<event>3 passed</event>\n</task-notification>`;
     appendFileSync(
       jsonlPath,
@@ -357,7 +358,7 @@ test("a monitor event stores and sends the line's own time", async () => {
           message: { role: "user", content },
         }),
     );
-    w.pump(t0 + 1);
+    await w.pump(t0 + 1);
 
     const row = dbmod.db
       .query<StoredRow, [string]>(

@@ -117,7 +117,8 @@ test("discovers a subagent file, tags its events, and emits lifecycle", async ()
   writeFileSync(path.join(subagentsDir, `agent-${agentId}.jsonl`), sidechainLines());
 
   const w = attachSubagentWatcher({ taskId, jsonlPath, manual: true });
-  w.pump(Date.now());
+  await w.ready;
+  await w.pump(Date.now());
 
   // Registry row created from the meta sidecar, still running.
   const list = subagents.listForTask(taskId);
@@ -163,14 +164,15 @@ test("tailed subagent lines are sent with their stored id and ts; a line already
   writeFileSync(file, "");
 
   const w = attachSubagentWatcher({ taskId, jsonlPath, manual: true });
+  await w.ready;
   const t0 = Date.now();
-  w.pump(t0); // discovers the row with an empty dedup set
+  await w.pump(t0); // discovers the row with an empty dedup set
 
   // Another path already saved the user line under its uuid ("u1") after the
   // row was discovered, so the tail's insert of that line is a dedup hit.
   const pre = runs.appendEvent(runId, "user", "already saved", "u1", agentId)!;
   writeFileSync(file, sidechainLines());
-  w.pump(t0 + 1);
+  await w.pump(t0 + 1);
 
   const rows = db.query<{ id: number; ts: number; stream: string; data: string }, [string]>(
     `SELECT id, ts, stream, data FROM run_events WHERE subagent_id = ? ORDER BY id`,
@@ -208,17 +210,18 @@ test("marks a subagent completed after end_turn + idle, without double-emitting 
   writeFileSync(path.join(subagentsDir, `agent-${agentId}.jsonl`), sidechainLines());
 
   const w = attachSubagentWatcher({ taskId, jsonlPath, manual: true });
+  await w.ready;
   const t0 = Date.now();
-  w.pump(t0);
+  await w.pump(t0);
   expect(subagents.get(agentId)!.status).toBe("running");
 
   // Append the terminal end_turn line, then pump again far enough in the
   // future that the idle threshold elapses → completed.
   appendFileSync(path.join(subagentsDir, `agent-${agentId}.jsonl`),
     JSON.stringify({ type: "assistant", isSidechain: true, uuid: "a2", message: { role: "assistant", stop_reason: "end_turn", content: [{ type: "text", text: "done" }] } }) + "\n");
-  w.pump(t0 + 1);          // reads the end_turn (sawEndOfTurn=true), still running (not idle yet)
+  await w.pump(t0 + 1);          // reads the end_turn (sawEndOfTurn=true), still running (not idle yet)
   expect(subagents.get(agentId)!.status).toBe("running");
-  w.pump(t0 + 10_000);     // now idle past DONE_IDLE_MS → completed
+  await w.pump(t0 + 10_000);     // now idle past DONE_IDLE_MS → completed
   const done = subagents.get(agentId)!;
   expect(done.status).toBe("completed");
   expect(done.endedAt).not.toBeNull();
@@ -234,7 +237,8 @@ test("marks a subagent completed after end_turn + idle, without double-emitting 
   // Reattach: a fresh watcher re-tails the same file from offset 0, seeded from
   // the DB dedup set — it must NOT re-insert the already-persisted events.
   const w2 = attachSubagentWatcher({ taskId, jsonlPath, manual: true });
-  w2.pump(Date.now());
+  await w2.ready;
+  await w2.pump(Date.now());
   const countAfter = db.query<{ c: number }, [string]>(
     `SELECT COUNT(*) c FROM run_events WHERE subagent_id = ?`,
   ).get(agentId)!.c;
@@ -266,25 +270,26 @@ test("a resumed (re-running) subagent is not re-completed until its new turn end
   });
 
   const w = attachSubagentWatcher({ taskId, jsonlPath, manual: true });
+  await w.ready;
   const t0 = Date.now();
   // Resume: a NEW turn that has NOT ended yet (a tool_use, stop_reason
   // "tool_use"), written strictly after attach. Beyond the replay floor, this
   // flips the settled row back to running and resets `sawEndOfTurn`.
   writeFileSync(file,
     JSON.stringify({ type: "assistant", isSidechain: true, uuid: "rB", message: { role: "assistant", stop_reason: "tool_use", content: [{ type: "tool_use", id: "t9", name: "Bash", input: { command: "ls" } }] } }) + "\n");
-  w.pump(t0);
+  await w.pump(t0);
   expect(subagents.get(agentId)!.status).toBe("running");
   // Idle WITHOUT a fresh end_turn: the reset `sawEndOfTurn` must keep it
   // running (the bug this guards against would re-complete it here on the
   // stale latch from the row's prior, pre-resume completion).
-  w.pump(t0 + 40_000);
+  await w.pump(t0 + 40_000);
   expect(subagents.get(agentId)!.status).toBe("running");
 
   // The resumed turn finally ends → completes again.
   appendFileSync(file,
     JSON.stringify({ type: "assistant", isSidechain: true, uuid: "rC", message: { role: "assistant", stop_reason: "end_turn", content: [{ type: "text", text: "done turn 2" }] } }) + "\n");
-  w.pump(t0 + 40_001);
-  w.pump(t0 + 80_000);
+  await w.pump(t0 + 40_001);
+  await w.pump(t0 + 80_000);
   expect(subagents.get(agentId)!.status).toBe("completed");
 
   w.detach();
@@ -301,7 +306,8 @@ test("AGETOR_TRACK_SUBAGENTS=0 yields an inert no-op watcher", async () => {
   writeFileSync(path.join(subagentsDir, `agent-zzz.meta.json`), JSON.stringify({ agentType: "Explore", description: "x", spawnDepth: 1 }));
   writeFileSync(path.join(subagentsDir, `agent-zzz.jsonl`), sidechainLines());
   const w = mod.attachSubagentWatcher({ taskId, jsonlPath, manual: true });
-  w.pump(Date.now());
+  await w.ready;
+  await w.pump(Date.now());
   expect(subagents.listForTask(taskId).length).toBe(0);
   w.detach();
   if (prev === undefined) delete process.env.AGETOR_TRACK_SUBAGENTS;
@@ -340,22 +346,23 @@ test("setSubagentSettleHook fires exactly once, after the DB row already reads '
   });
 
   const w = attachSubagentWatcher({ taskId, jsonlPath, manual: true });
+  await w.ready;
   const t0 = Date.now();
-  w.pump(t0);
+  await w.pump(t0);
   expect(settleCalls.length).toBe(0); // mere discovery never settles
 
   appendFileSync(path.join(subagentsDir, `agent-${agentId}.jsonl`),
     JSON.stringify({ type: "assistant", isSidechain: true, uuid: "sA", message: { role: "assistant", stop_reason: "end_turn", content: [{ type: "text", text: "done" }] } }) + "\n");
-  w.pump(t0 + 1);
+  await w.pump(t0 + 1);
   expect(settleCalls.length).toBe(0); // end_turn observed but not idle yet — not done
 
-  w.pump(t0 + 10_000); // idle past DONE_IDLE_MS → completes → fires settle
+  await w.pump(t0 + 10_000); // idle past DONE_IDLE_MS → completes → fires settle
   expect(settleCalls).toEqual([taskId]);
   expect(statusesInsideHook).toEqual(["completed"]);
   expect(subagents.get(agentId)!.status).toBe("completed");
 
   // A further pump with nothing new to complete must not re-fire the hook.
-  w.pump(t0 + 20_000);
+  await w.pump(t0 + 20_000);
   expect(settleCalls).toEqual([taskId]);
 
   w.detach();
@@ -381,13 +388,14 @@ test("a throwing settle hook does not crash the poll cycle, and the DB write sti
   });
 
   const w = attachSubagentWatcher({ taskId, jsonlPath, manual: true });
+  await w.ready;
   const t0 = Date.now();
-  w.pump(t0);
+  await w.pump(t0);
   appendFileSync(path.join(subagentsDir, `agent-${agentId}.jsonl`),
     JSON.stringify({ type: "assistant", isSidechain: true, uuid: "tB", message: { role: "assistant", stop_reason: "end_turn", content: [{ type: "text", text: "done" }] } }) + "\n");
-  w.pump(t0 + 1);
+  await w.pump(t0 + 1);
 
-  expect(() => w.pump(t0 + 10_000)).not.toThrow();
+  await expect(w.pump(t0 + 10_000)).resolves.toBeUndefined();
   expect(hookCalls).toBe(1);
   // The hook throwing must not have rolled back (or prevented) the DB write
   // that happened just before `fireSettle` was called.
@@ -431,7 +439,7 @@ test("orphanRunningSubagents flips only running rows to orphaned, emits one life
   const settleCalls: string[] = [];
   setSubagentSettleHook((tid) => settleCalls.push(tid));
 
-  orphanRunningSubagents(taskId);
+  await orphanRunningSubagents(taskId);
 
   const r1 = subagents.get(running1.id)!;
   const r2 = subagents.get(running2.id)!;
@@ -464,7 +472,7 @@ test("orphanRunningSubagents on a task with no rows is a silent no-op: no events
   const settleCalls: string[] = [];
   setSubagentSettleHook((tid) => settleCalls.push(tid));
 
-  expect(() => orphanRunningSubagents(taskId)).not.toThrow();
+  await expect(orphanRunningSubagents(taskId)).resolves.toBeUndefined();
 
   expect(captured.length).toBe(0);
   // Real contract (read from the implementation): `orphanRunning` returns []
@@ -486,22 +494,25 @@ test("attachSubagentWatcher detaches a prior handle for the same taskId; differe
   const { taskId: taskB, jsonlPath: jsonlB, subagentsDir: dirB } = await seed();
 
   const h1 = attachSubagentWatcher({ taskId: taskA, jsonlPath: jsonlA, manual: true });
+  await h1.ready;
   const hB = attachSubagentWatcher({ taskId: taskB, jsonlPath: jsonlB, manual: true });
+  await hB.ready;
 
   // Re-attach for taskA — must silently detach h1 (structurally impossible to
   // double-attach the same taskId per the module comment on `watchers`).
   const h2 = attachSubagentWatcher({ taskId: taskA, jsonlPath: jsonlA, manual: true });
+  await h2.ready;
 
   // h1 is now inert: writing a new subagent file and pumping h1 must NOT
   // discover it.
   const idOld = `old-${randomUUID()}`;
   writeFileSync(path.join(dirA, `agent-${idOld}.meta.json`), JSON.stringify({ agentType: "Explore", description: "x", spawnDepth: 1 }));
   writeFileSync(path.join(dirA, `agent-${idOld}.jsonl`), sidechainLines());
-  h1.pump(Date.now());
+  await h1.pump(Date.now());
   expect(subagents.listForTask(taskA).length).toBe(0);
 
   // h2 — the live, currently-registered handle — DOES discover it.
-  h2.pump(Date.now());
+  await h2.pump(Date.now());
   expect(subagents.listForTask(taskA).length).toBe(1);
   expect(subagents.listForTask(taskA)[0]!.id).toBe(idOld);
 
@@ -510,7 +521,7 @@ test("attachSubagentWatcher detaches a prior handle for the same taskId; differe
   const idB = `b-${randomUUID()}`;
   writeFileSync(path.join(dirB, `agent-${idB}.meta.json`), JSON.stringify({ agentType: "Explore", description: "y", spawnDepth: 1 }));
   writeFileSync(path.join(dirB, `agent-${idB}.jsonl`), sidechainLines());
-  hB.pump(Date.now());
+  await hB.pump(Date.now());
   expect(subagents.listForTask(taskB).length).toBe(1);
 
   h2.detach();
@@ -523,7 +534,9 @@ test("a stale handle's detach() cannot evict a newer handle for the same taskId"
   const { taskId, jsonlPath, subagentsDir } = await seed();
 
   const h1 = attachSubagentWatcher({ taskId, jsonlPath, manual: true });
+  await h1.ready;
   const h2 = attachSubagentWatcher({ taskId, jsonlPath, manual: true }); // auto-detaches h1
+  await h2.ready;
 
   // Calling detach() on the now-stale h1 must be a no-op w.r.t. the registry —
   // it must NOT evict h2 (identity-compared inside detach()).
@@ -532,7 +545,7 @@ test("a stale handle's detach() cannot evict a newer handle for the same taskId"
   const id1 = `stale-${randomUUID()}`;
   writeFileSync(path.join(subagentsDir, `agent-${id1}.meta.json`), JSON.stringify({ agentType: "Explore", description: "x", spawnDepth: 1 }));
   writeFileSync(path.join(subagentsDir, `agent-${id1}.jsonl`), sidechainLines());
-  h2.pump(Date.now()); // h2 must still be live/functional after h1.detach()
+  await h2.pump(Date.now()); // h2 must still be live/functional after h1.detach()
   expect(subagents.listForTask(taskId).length).toBe(1);
 
   // Now tear down via the registry helper — this SHOULD reach h2, since it's
@@ -541,7 +554,7 @@ test("a stale handle's detach() cannot evict a newer handle for the same taskId"
   const id2 = `stale2-${randomUUID()}`;
   writeFileSync(path.join(subagentsDir, `agent-${id2}.meta.json`), JSON.stringify({ agentType: "Explore", description: "y", spawnDepth: 1 }));
   writeFileSync(path.join(subagentsDir, `agent-${id2}.jsonl`), sidechainLines());
-  h2.pump(Date.now()); // now inert
+  await h2.pump(Date.now()); // now inert
   expect(subagents.listForTask(taskId).length).toBe(1); // unchanged — h2 didn't discover id2
 });
 
@@ -575,7 +588,8 @@ test("subagent JSONL with no system/permission-mode marker lines: repeated user-
   writeFileSync(path.join(subagentsDir, `agent-${agentId}.jsonl`), lines);
 
   const w = attachSubagentWatcher({ taskId, jsonlPath, manual: true });
-  w.pump(Date.now());
+  await w.ready;
+  await w.pump(Date.now());
 
   const statusChunks = captured.filter((e) =>
     e.stream === "status" && e.data.startsWith("permission-mode: ") && e.subagentId === agentId);
@@ -605,7 +619,8 @@ test("subagent JSONL with no marker lines: a user-line permissionMode CHANGE sti
   writeFileSync(path.join(subagentsDir, `agent-${agentId}.jsonl`), lines);
 
   const w = attachSubagentWatcher({ taskId, jsonlPath, manual: true });
-  w.pump(Date.now());
+  await w.ready;
+  await w.pump(Date.now());
 
   const statusChunks = captured.filter((e) =>
     e.stream === "status" && e.data.startsWith("permission-mode: ") && e.subagentId === agentId);
@@ -632,7 +647,8 @@ test("a symlinked subagents folder is never listed", async () => {
   symlinkSync(outside, subagentsDir);
 
   const w = attachSubagentWatcher({ taskId, jsonlPath, manual: true });
-  w.pump(Date.now());
+  await w.ready;
+  await w.pump(Date.now());
   expect(subagents.listForTask(taskId)).toEqual([]);
   w.detach();
   rmSync(outside, { recursive: true, force: true });

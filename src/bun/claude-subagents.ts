@@ -358,11 +358,20 @@ import {
   type FSWatcher,
 } from "node:fs";
 import path from "node:path";
-import { runs, subagents as subagentsDb, tasks, type AppendedEvent } from "./db.ts";
-import { formatApiErrorDetail, mapJsonlEventToChunks } from "./claude-tmux.ts";
+import { runs, subagents as subagentsDb, tasks, type AppendedEvent } from "./db-async.ts";
+import { appendAndEmit } from "./run-emit-queue.ts";
+import { formatApiErrorDetail, mapParsedEventToChunks } from "./claude-tmux.ts";
+import {
+  createTranscriptClient,
+  TranscriptClientError,
+  type ParsedLine,
+  type TranscriptClient,
+} from "./transcript-client.ts";
+import { TOO_LARGE_ERROR } from "./transcript-parse.ts";
+import { transcriptWorkerFactory } from "./worker-entry.ts";
 import { beginLagLabel } from "./event-loop-lag.ts";
 import type { RunEvent, Subagent, SubagentEvent, SubagentStatus } from "../shared/types.ts";
-import { isPlainDirBelow, openReadNoFollow, readTextNoFollow } from "./no-follow.ts";
+import { isPlainDirBelow, openReadNoFollow } from "./no-follow.ts";
 
 /** Off only when explicitly disabled. The watcher is cheap when idle, but the
  *  flag lets us kill it entirely if a future claude layout change breaks the
@@ -688,19 +697,110 @@ interface SubagentMeta {
  *  the transcript is the source of truth; the sidecar is just a nicer label
  *  (except `toolUseId`, which has no transcript equivalent — it's the only
  *  place the tool_result correlation key exists on disk). */
-function readMeta(subagentsDir: string, id: string): SubagentMeta {
+async function readMeta(dir: string, id: string, allowedRoot: string): Promise<SubagentMeta> {
   try {
-    const raw = readTextNoFollow(path.join(subagentsDir, `agent-${id}.meta.json`));
-    const o = JSON.parse(raw) as Record<string, unknown>;
-    return {
-      agentType: typeof o.agentType === "string" ? o.agentType : null,
-      description: typeof o.description === "string" ? o.description : null,
-      spawnDepth: typeof o.spawnDepth === "number" ? o.spawnDepth : 1,
-      toolUseId: typeof o.toolUseId === "string" ? o.toolUseId : null,
-    };
+    // The sidecar is read and parsed in the transcript worker (the handler
+    // validates `dir` under `allowedRoot`, caps the size and defaults on any
+    // failure), so the main thread never touches the file.
+    return await getTranscriptClient().readMeta(dir, id, allowedRoot);
   } catch {
     return { agentType: null, description: null, spawnDepth: 1, toolUseId: null };
   }
+}
+
+/** One chunk the mapper produced for a tailed line, waiting to be inserted. */
+interface PendingChunk {
+  stream: RunEvent["stream"];
+  data: string;
+  lineUuid: string | null;
+}
+
+type ChunkSink = Parameters<typeof mapParsedEventToChunks>[1];
+
+/** The mapper step for one already-parsed transcript line: exactly what
+ *  `mapJsonlEventToChunks(rawLine, ...)` did (it parsed the raw line itself),
+ *  minus the `JSON.parse`, which the transcript worker already did. */
+function mapTailedLine(
+  pl: ParsedLine,
+  onChunk: ChunkSink,
+  includeUuidForApiError: boolean,
+  lastPermissionMode: string | null,
+): { endOfTurn: boolean } {
+  if (pl.error !== undefined) {
+    onChunk("stderr", `jsonl parse error: ${pl.error}`);
+    return { endOfTurn: false };
+  }
+  // A literal `null` line has nothing to map (the old path threw on it and
+  // aborted the pass).
+  if (pl.parsed === null) return { endOfTurn: false };
+  return mapParsedEventToChunks(
+    pl.parsed as Parameters<typeof mapParsedEventToChunks>[0],
+    onChunk,
+    includeUuidForApiError,
+    lastPermissionMode,
+  );
+}
+
+/** Insert a chunk of a transcript's events with ONE `runs.appendEvents` call
+ *  (one transaction, `INSERT OR IGNORE` dedup by line uuid) and send each saved
+ *  row live, in id order, right after the insert (`appendAndEmit`).
+ *
+ *  A batch is all-or-nothing, so when it fails nothing was saved: the events
+ *  are then inserted one by one, each failure costing only its own event (as
+ *  the old per-event inserts did) instead of the whole chunk. Items without a
+ *  line uuid have no dedup key, so a batch that committed but whose reply was
+ *  lost could repeat them in that fallback; uuid-bearing items cannot repeat. */
+async function persistSubagentChunks(
+  runId: string,
+  taskId: string,
+  subagentId: string,
+  chunks: PendingChunk[],
+): Promise<void> {
+  if (chunks.length === 0) return;
+  const toItems = (list: PendingChunk[]) =>
+    list.map((c) => ({ stream: c.stream, data: c.data, lineUuid: c.lineUuid, subagentId }));
+  const emitRows = (list: PendingChunk[], rows: Array<AppendedEvent | null>): void => {
+    rows.forEach((row, i) => {
+      const c = list[i];
+      if (row && c) emitFn?.({ id: row.id, runId, taskId, stream: c.stream, data: c.data, ts: row.ts, subagentId });
+    });
+  };
+  try {
+    await appendAndEmit(
+      runId,
+      () => {
+        if (injectedBatchFailures > 0) {
+          injectedBatchFailures--;
+          return Promise.reject(new Error("injected batch failure"));
+        }
+        return runs.appendEvents(runId, toItems(chunks));
+      },
+      (rows) => emitRows(chunks, rows),
+    );
+    return;
+  } catch (e) {
+    console.error(`[claude-subagents] batch insert of ${chunks.length} events failed for ${subagentId}; retrying one by one:`, e);
+  }
+  let failed = 0;
+  for (const c of chunks) {
+    try {
+      await appendAndEmit(runId, () => runs.appendEvents(runId, toItems([c])), (rows) => emitRows([c], rows));
+    } catch {
+      failed++; // already logged by the queue
+    }
+  }
+  if (failed > 0) console.error(`[claude-subagents] ${failed} of ${chunks.length} events for ${subagentId} could not be saved`);
+}
+
+// ── Transcript client ─────────────────────────────────────────────────────
+// ONE client per core (a lazy module singleton): worker mode in production, in
+// process under `bun test` (the client's own default). Every transcript read
+// and every `JSON.parse` of a transcript line goes through it, so neither runs
+// on the main thread. See transcript-client.ts for the wire contract.
+let transcriptClient: TranscriptClient | null = null;
+function getTranscriptClient(): TranscriptClient {
+  transcriptClient ??= createTranscriptClient({ workerFactory: transcriptWorkerFactory });
+  return transcriptClient;
 }
 
 /** Read bytes appended to a file since `offset`. Sync (like the main stream's
@@ -924,7 +1024,7 @@ interface FileState {
  *  progress — and returns `true` once the job is complete. `Infinity` drains it
  *  in one synchronous call (the `manual`-mode path). */
 interface CoopJob {
-  step(deadlineMs: number): boolean;
+  step(deadlineMs: number): Promise<boolean>;
 }
 
 /** Work budget of one cooperative slice before the job yields to the event
@@ -937,25 +1037,27 @@ const MAIN_SCAN_LINES_PER_CHECK = 32;
 
 /** Most bytes one read of a subagent transcript (`tailFile`) or of the main
  *  session JSONL (the main-signal scan) pulls in before its lines are
- *  dispatched — the granularity at which the first-cycle job can yield
- *  MID-file. Before this bound, one transcript was read, split, parsed and
- *  dispatched as a single block (≈2.5 ms/MB on a dedupe-only replay, an
- *  order of magnitude more when the lines are new and every one is an
- *  INSERT + emit), so a 50 MB transcript alone held the loop well past the
- *  100 ms bar. Sized on `subagent-watcher-drift.test.ts` (3 MB transcripts
- *  whose last ~360 KB is new): the max loop gap read 75–101 ms with 1 MB
- *  chunks, 39–53 ms with 256 KB and 37–46 ms with 128 KB — below 256 KB the
- *  gap is set by the rest of the slice, not the chunk, so 256 KB takes that
- *  floor at half the reads of 128 KB (400 reads for a 100 MB file — nothing
- *  measurable). Only the cooperative first cycle checks a deadline between
- *  chunks; every other caller drains all chunks in one call, so steady-state
- *  outcomes are unchanged. A single line longer than this is still read
- *  whole (see `readAppendedLinesSync`). */
-const TAIL_READ_CHUNK_BYTES = 256 * 1024;
+ *  dispatched — the granularity at which a job can yield MID-file.
+ *
+ *  64 KB, not 256 KB: a transcript read goes through the transcript worker,
+ *  which returns the chunk's lines already `JSON.parse`d, and the main thread
+ *  pays to deserialize that reply. A 256 KB reply of parsed lines cost 127–139
+ *  ms of main-thread time under load (measured); 64 KB keeps one reply to a
+ *  few ms, so the deadline check between chunks is what bounds a slice. A
+ *  single line longer than this is still read whole (and one over the worker's
+ *  per-line cap is skipped, see `dispatchTailedLines`). */
+const TAIL_READ_CHUNK_BYTES = 64 * 1024;
 
 /** Live values of the two knobs above that tests may shrink (`__forTest`). */
 let readChunkBytes = TAIL_READ_CHUNK_BYTES;
 let jobSliceMs = JOB_SLICE_MS;
+
+/** Test seam: how many upcoming batch inserts to fail (see `__forTest`). */
+let injectedBatchFailures = 0;
+
+/** Pass counters (tests): how many passes of each kind ran, and the most that
+ *  ever ran at once (the contract is one per watcher). */
+const passStatsState = { counts: { first: 0, steady: 0, dir: 0 }, active: 0, maxActive: 0 };
 
 /** Test-only seams. `setReadChunkBytes` shrinks the transcript / main-JSONL
  *  read chunk so a small fixture spans many chunks; `setJobSliceMs(0)` makes
@@ -963,6 +1065,26 @@ let jobSliceMs = JOB_SLICE_MS;
  *  can observe the job between pieces deterministically. `null` restores the
  *  production value. Read at use time — affects watchers already attached. */
 export const __forTest = {
+  /** Counters of the passes run since the last `resetPassStats`. `maxActive`
+   *  is the highest number of passes running at the same instant across ALL
+   *  watchers, so a test with one watcher expects at most 1. */
+  passStats(): { first: number; steady: number; dir: number; maxActive: number } {
+    return { ...passStatsState.counts, maxActive: passStatsState.maxActive };
+  },
+  /** Make the next `n` batch inserts of a transcript chunk fail, to prove the
+   *  one-by-one fallback neither drops nor duplicates events. */
+  failNextBatchInserts(n: number): void {
+    injectedBatchFailures = n;
+  },
+  resetPassStats(): void {
+    passStatsState.counts = { first: 0, steady: 0, dir: 0 };
+    passStatsState.maxActive = passStatsState.active;
+  },
+  /** Replace the module's transcript client (tests: an in-process or fake
+   *  client); `null` drops it so the next read builds the default one. */
+  setTranscriptClient(client: TranscriptClient | null): void {
+    transcriptClient = client;
+  },
   setReadChunkBytes(bytes: number | null): void {
     readChunkBytes = bytes === null ? TAIL_READ_CHUNK_BYTES : Math.max(1, Math.floor(bytes));
   },
@@ -1022,7 +1144,7 @@ export interface SubagentWatcherHandle {
    *  to be pulled back by the orchestrator's `pullBackParkedTask` once the
    *  first cycle (or a later tick) registers the row — the same visible
    *  bounce the pump exists to avoid, confined to that start-up window. */
-  pump(now?: number): void;
+  pump(now?: number): Promise<void>;
   /** Reflect an externally-driven settle (see `settleSubagentById`) into this
    *  watcher's in-memory `FileState`, if it's tracking `id` — a no-op
    *  otherwise. The DB write already happened before this is called; this
@@ -1052,7 +1174,7 @@ export interface SubagentWatcherHandle {
    *  line, the live dispatch forwards the one claude-tmux parsed — so both
    *  paths bucket the same event under the same dedup key; `undefined`/
    *  `null` falls back to the hash-only key. */
-  applyMonitorNotification(id: string, body: string, lineTimestampMs?: number | null): boolean;
+  applyMonitorNotification(id: string, body: string, lineTimestampMs?: number | null): Promise<boolean>;
   /** True when this watcher tracks AT LEAST ONE monitor at all (running or
    *  already settled) — finding #8 (code review): lets
    *  `handleBackgroundTaskNotification` skip its `subagents.get(id)` DB probe
@@ -1087,10 +1209,10 @@ export function detachWatcherFor(taskId: string): void {
  *  current run if one is live, else its most recent run. `task.runId` survives
  *  the resolve-to-`review` transition, so this is reliably set while the
  *  session is alive — but fall back defensively. */
-function resolveRunId(taskId: string): string | null {
-  const t = tasks.get(taskId);
+async function resolveRunId(taskId: string): Promise<string | null> {
+  const t = await tasks.get(taskId);
   if (t?.runId) return t.runId;
-  return runs.listForTask(taskId)[0]?.id ?? null;
+  return (await runs.listForTask(taskId))[0]?.id ?? null;
 }
 
 function toSubagentShape(fs: FileState, taskId: string): Subagent {
@@ -1488,7 +1610,7 @@ function extractLineTimestampMs(line: string): number | null {
  *  `handleBackgroundTaskNotification` — which is what keeps the two paths
  *  deriving the SAME key for the same line; the fallback exists only for a
  *  line with no parseable timestamp at all. */
-function persistMonitorEvent(
+async function persistMonitorEvent(
   runId: string,
   taskId: string,
   id: string,
@@ -1496,7 +1618,7 @@ function persistMonitorEvent(
   eventText: string,
   isTerminal: boolean,
   lineTimestampMs?: number | null,
-): boolean {
+): Promise<boolean> {
   const hasLineTs = typeof lineTimestampMs === "number" && Number.isFinite(lineTimestampMs);
   // Stamp the tab line, the stored row and the emitted frame with when claude
   // WROTE the notification, not when this scan happened to read it — a restart
@@ -1514,7 +1636,16 @@ function persistMonitorEvent(
       : `monitor:${id}:${hash}`;
   let inserted: AppendedEvent | null;
   try {
-    inserted = runs.appendEvent(runId, "stdout", text, lineUuid, id, at);
+    // The insert and its live send go through the per-run queue, so the frame
+    // leaves in id order right after its row exists, however many flows are
+    // appending to this run.
+    inserted = await appendAndEmit(
+      runId,
+      () => runs.appendEvent(runId, "stdout", text, lineUuid, id, at),
+      (row) => {
+        if (row !== null) emitFn?.({ id: row.id, runId, taskId, stream: "stdout", data: text, ts: row.ts, subagentId: id });
+      },
+    );
   } catch (e) {
     // A throw here (the run row cascade-deleted out from under a live scan —
     // INSERT OR IGNORE does not cover a foreign-key failure) must cost one
@@ -1524,9 +1655,7 @@ function persistMonitorEvent(
     console.error(`[claude-subagents] failed to persist monitor event for ${id}:`, e);
     return false;
   }
-  if (inserted === null) return false;
-  emitFn?.({ id: inserted.id, runId, taskId, stream: "stdout", data: text, ts: inserted.ts, subagentId: id });
-  return true;
+  return inserted !== null;
 }
 
 /**
@@ -1568,7 +1697,7 @@ function persistMonitorEvent(
  *     the exact same trailing event would resurrect an already-correctly-
  *     settled row forever.
  */
-function applyMonitorNotificationForRow(row: Subagent, body: string, lineTimestampMs?: number | null): void {
+async function applyMonitorNotificationForRow(row: Subagent, body: string, lineTimestampMs?: number | null): Promise<void> {
   // No `runId` at all — nowhere to persist the event line, regardless of
   // status. Mirrors every other kind's defensive posture in this file.
   if (!row.runId) return;
@@ -1577,14 +1706,14 @@ function applyMonitorNotificationForRow(row: Subagent, body: string, lineTimesta
   const { isTerminal, eventText } = parseMonitorNotificationBlock(block);
 
   if (row.status === "running") {
-    if (eventText) persistMonitorEvent(row.runId, row.taskId, row.id, block, eventText, isTerminal, lineTimestampMs);
-    if (isTerminal) settleSubagentById(row.id, "completed", "receipt");
+    if (eventText) await persistMonitorEvent(row.runId, row.taskId, row.id, block, eventText, isTerminal, lineTimestampMs);
+    if (isTerminal) await settleSubagentById(row.id, "completed", "receipt");
     return;
   }
 
   // Non-running, no attached watcher — the flip-back half of finding #3(c).
   if (isTerminal) {
-    if (eventText) persistMonitorEvent(row.runId, row.taskId, row.id, block, eventText, isTerminal, lineTimestampMs);
+    if (eventText) await persistMonitorEvent(row.runId, row.taskId, row.id, block, eventText, isTerminal, lineTimestampMs);
     return;
   }
   if (!eventText) return;
@@ -1595,11 +1724,11 @@ function applyMonitorNotificationForRow(row: Subagent, body: string, lineTimesta
   // reconciliation) and every other terminal status were closed by a path
   // that knows better than a stray later event, mirroring the rehydration
   // branch's "don't presume resurrectable" posture for those statuses.
-  const isNew = persistMonitorEvent(row.runId, row.taskId, row.id, block, eventText, isTerminal, lineTimestampMs);
+  const isNew = await persistMonitorEvent(row.runId, row.taskId, row.id, block, eventText, isTerminal, lineTimestampMs);
   if (row.status !== "completed" || !isNew) return; // not a ceiling settle, or a replayed line
-  if (runs.hasLineUuidPrefixForSubagent(row.taskId, row.id, `monitor:${row.id}:terminal:`)) return; // receipt-closed — never resurrect
+  if (await runs.hasLineUuidPrefixForSubagent(row.taskId, row.id, `monitor:${row.id}:terminal:`)) return; // receipt-closed — never resurrect
 
-  subagentsDb.setStatus(row.id, "running", null);
+  await subagentsDb.setStatus(row.id, "running", null);
   emitLifecycleForRow({ ...row, status: "running", endedAt: null }, "started");
   fireParkedDiscovery(row.taskId);
 }
@@ -1632,10 +1761,10 @@ function emitLifecycleForRow(sub: Subagent, phase: "started" | "finished" = "fin
  * already past the stall threshold (the rare tick). A row whose file/dir
  * can't be stat'ed counts as not-fresh rather than throwing.
  */
-export function subagentActivityWithin(taskId: string, withinMs: number): boolean {
+export async function subagentActivityWithin(taskId: string, withinMs: number): Promise<boolean> {
   let rows: Subagent[];
   try {
-    rows = subagentsDb.listForTask(taskId);
+    rows = await subagentsDb.listForTask(taskId);
   } catch {
     return false;
   }
@@ -1657,10 +1786,10 @@ export function subagentActivityWithin(taskId: string, withinMs: number): boolea
  * hold the task hostage forever. Safe to call with no watcher attached, no
  * rows to orphan, or mid-shutdown — this never touches tmux and never throws.
  */
-export function orphanRunningSubagents(taskId: string): void {
+export async function orphanRunningSubagents(taskId: string): Promise<void> {
   let rows: Subagent[];
   try {
-    rows = subagentsDb.orphanRunning(taskId, Date.now());
+    rows = await subagentsDb.orphanRunning(taskId, Date.now());
   } catch (e) {
     console.error(`[claude-subagents] orphanRunning failed for task ${taskId}:`, e);
     return;
@@ -1708,12 +1837,12 @@ export function orphanRunningSubagents(taskId: string): void {
  * before the predicate reads them. A no-op when the task has no watcher (codex,
  * grok, tracking disabled) — never an error the caller has to handle.
  */
-export function pumpWatcherForHoldCheck(taskId: string): void {
+export async function pumpWatcherForHoldCheck(taskId: string): Promise<void> {
   if (!ENABLED) return;
   const handle = watchers.get(taskId);
   if (!handle) return;
   try {
-    handle.pump();
+    await handle.pump();
   } catch (e) {
     // `pump` → `cycle` already swallows its own failures; this is the
     // belt-and-braces guard so a future throw can never reach run settlement.
@@ -1746,16 +1875,16 @@ export function pumpWatcherForHoldCheck(taskId: string): void {
  * `settleSubagentById(id, "completed", "receipt")` unconditionally, since a
  * notification for a subagent/workflow/bg-shell row is always terminal.
  */
-export function handleBackgroundTaskNotification(
+export async function handleBackgroundTaskNotification(
   taskId: string,
   id: string,
   body: string,
   lineTimestampMs: number | null = null,
-): void {
+): Promise<void> {
   const watcher = watchers.get(taskId);
   if (watcher?.hasMonitor(id)) {
     try {
-      watcher.applyMonitorNotification(id, body, lineTimestampMs);
+      await watcher.applyMonitorNotification(id, body, lineTimestampMs);
     } catch (e) {
       console.error(`[claude-subagents] monitor notification apply failed for ${id}:`, e);
     }
@@ -1776,26 +1905,26 @@ export function handleBackgroundTaskNotification(
   // `hasAnyMonitor()` true does not imply `hasMonitor(id)` true and the probe
   // still earns its keep there.
   if (watcher && !watcher.hasAnyMonitor()) {
-    settleSubagentById(id, "completed", "receipt");
+    await settleSubagentById(id, "completed", "receipt");
     return;
   }
   if (MONITORS_ENABLED) {
     let row: Subagent | null = null;
     try {
-      row = subagentsDb.get(id);
+      row = await subagentsDb.get(id);
     } catch (e) {
       console.error(`[claude-subagents] DB lookup failed for background-task id ${id}:`, e);
     }
     if (row?.parentKind === "monitor") {
       try {
-        applyMonitorNotificationForRow(row, body, lineTimestampMs);
+        await applyMonitorNotificationForRow(row, body, lineTimestampMs);
       } catch (e) {
         console.error(`[claude-subagents] monitor notification (DB fallback) failed for ${id}:`, e);
       }
       return;
     }
   }
-  settleSubagentById(id, "completed", "receipt");
+  await settleSubagentById(id, "completed", "receipt");
 }
 
 /**
@@ -1841,10 +1970,10 @@ export function attachSubagentWatcher(opts: {
       ready: Promise.resolve(),
       settled: Promise.resolve(),
       detach() { /* disabled */ },
-      pump() { /* disabled */ },
+      pump() { return Promise.resolve(); },
       syncSettled() { /* disabled */ },
       hasMonitor() { return false; },
-      applyMonitorNotification() { return false; },
+      applyMonitorNotification() { return Promise.resolve(false); },
       hasAnyMonitor() { return false; },
     };
   }
@@ -1890,6 +2019,8 @@ export function attachSubagentWatcher(opts: {
   // Mirrors `bgShellPending` exactly, including the `MONITOR_PENDING_MAX` cap.
   const monitorPending = new Map<string, { description: string | null; timeoutMs: number | null; persistent: boolean | null }>();
   let timer: ReturnType<typeof setTimeout> | null = null;
+  let dirPassTimer: ReturnType<typeof setTimeout> | null = null;
+  let dirDirty = false;
   let dirWatcher: FSWatcher | null = null;
   let detached = false;
   // Byte cursor into the MAIN session JSONL for `scanMainSignals` below —
@@ -1963,7 +2094,7 @@ export function attachSubagentWatcher(opts: {
   /** Rehydrate ONE persisted subagent row into the in-memory maps. The body of
    *  the old synchronous `for (const row of listForTask(taskId))` loop, moved
    *  verbatim — each `return` below is the old `continue`. */
-  function seedRow(row: Subagent): void {
+  async function seedRow(row: Subagent): Promise<void> {
     // OpenCode child sessions: `sourcePath` is not a file, and
     // opencode-subagents.ts owns their status — never rehydrate them here.
     if (row.parentKind === "opencode_subagent" || row.sourcePath.startsWith("opencode-session:")) return;
@@ -1984,7 +2115,7 @@ export function attachSubagentWatcher(opts: {
           id: row.id,
           dir: row.sourcePath,
           description: row.description,
-          runId: row.runId ?? resolveRunId(taskId) ?? row.id,
+          runId: row.runId ?? (await resolveRunId(taskId)) ?? row.id,
           status: row.status,
           startedAt: row.startedAt,
           endedAt: row.endedAt,
@@ -2019,7 +2150,7 @@ export function attachSubagentWatcher(opts: {
         }
         bgShells.set(row.id, {
           id: row.id,
-          runId: row.runId ?? resolveRunId(taskId) ?? row.id,
+          runId: row.runId ?? (await resolveRunId(taskId)) ?? row.id,
           toolUseId: row.toolUseId ?? null,
           description: row.description,
           // Not persisted — a restart loses the specific Bash `timeout`;
@@ -2075,10 +2206,10 @@ export function attachSubagentWatcher(opts: {
         //     resurrected by a stray later event, matching this module's
         //     "don't presume resurrectable" default for a status this
         //     rule doesn't otherwise recognise.
-        const receiptSettled = runs.hasLineUuidPrefixForSubagent(taskId, row.id, `monitor:${row.id}:terminal:`);
+        const receiptSettled = await runs.hasLineUuidPrefixForSubagent(taskId, row.id, `monitor:${row.id}:terminal:`);
         monitors.set(row.id, {
           id: row.id,
-          runId: row.runId ?? resolveRunId(taskId) ?? row.id,
+          runId: row.runId ?? (await resolveRunId(taskId)) ?? row.id,
           toolUseId: row.toolUseId ?? null,
           description: row.description,
           // Neither is persisted — a restart loses the specific
@@ -2103,10 +2234,10 @@ export function attachSubagentWatcher(opts: {
     // rows too. This is what repairs already-stuck prod rows on restart.
     let toolUseId = row.toolUseId ?? null;
     if (!toolUseId) {
-      const meta = readMeta(subagentsDir, row.id);
+      const meta = await readMeta(subagentsDir, row.id, subagentsDir);
       if (meta.toolUseId) {
         toolUseId = meta.toolUseId;
-        subagentsDb.setToolUseId(row.id, meta.toolUseId);
+        await subagentsDb.setToolUseId(row.id, meta.toolUseId);
       }
     }
     // Replay floor (W1): the source file's size RIGHT NOW, before this
@@ -2136,13 +2267,14 @@ export function attachSubagentWatcher(opts: {
         replayFloor = Number.MAX_SAFE_INTEGER;
       }
     }
+    const seen = await runs.seenLineUuidsForSubagent(taskId, row.id);
     files.set(row.id, {
       subagentId: row.id,
       parentKind: row.parentKind,
-      runId: row.runId ?? resolveRunId(taskId) ?? row.id,
+      runId: row.runId ?? (await resolveRunId(taskId)) ?? row.id,
       offset: 0,
       replayFloor,
-      seen: runs.seenLineUuidsForSubagent(taskId, row.id),
+      seen,
       sawEndOfTurn: false,
       lastAppendAt: attachedAt,
       status: row.status,
@@ -2210,26 +2342,29 @@ export function attachSubagentWatcher(opts: {
    *  Runs the replay-window clamp when the last row is done (also after a
    *  logged failure, as the old inline sequence did). */
   function createSeedJob(): CoopJob {
-    let rows: Subagent[] | null = null;
+    // Ids in the order of the first `listForTask` snapshot. The snapshot can be
+    // several slices old, so each slice re-reads the task's rows ONCE (not one
+    // primary-key read per row) and seeds each row as it is NOW: a row settled
+    // (or deleted) while the seed yielded must not come back as running.
+    let order: string[] | null = null;
     let idx = 0;
     let finished = false;
     return {
-      step(deadlineMs: number): boolean {
+      async step(deadlineMs: number): Promise<boolean> {
         if (finished) return true;
         if (detached) { finished = true; return true; }
         try {
-          if (rows === null) rows = subagentsDb.listForTask(taskId);
-          while (idx < rows.length) {
-            const listed = rows[idx++]!;
-            if (!files.has(listed.id) && !workflows.has(listed.id) && !bgShells.has(listed.id) && !monitors.has(listed.id)) {
-              // The snapshot can be several slices old: a row settled (or
-              // deleted) while the seed yielded must be seeded as it is NOW,
-              // or a receipt-closed monitor / settled subagent would come
-              // back as running. One primary-key read per row.
-              const row = subagentsDb.get(listed.id);
-              if (row && row.taskId === taskId) seedRow(row);
+          const current = await subagentsDb.listForTask(taskId);
+          if (order === null) order = current.map((r) => r.id);
+          const byId = new Map(current.map((r) => [r.id, r] as const));
+          while (idx < order.length) {
+            if (detached) { finished = true; return true; }
+            const id = order[idx++]!;
+            if (!files.has(id) && !workflows.has(id) && !bgShells.has(id) && !monitors.has(id)) {
+              const row = byId.get(id);
+              if (row && row.taskId === taskId) await seedRow(row);
             }
-            if (idx < rows.length && performance.now() >= deadlineMs) return false;
+            if (idx < order.length && performance.now() >= deadlineMs) return false;
           }
         } catch (e) {
           // degrade gracefully — a bad rehydration row must not crash reattach —
@@ -2270,7 +2405,7 @@ export function attachSubagentWatcher(opts: {
   }
 
   /** Pick up newly-created `agent-*.jsonl` files. */
-  function discover(): void {
+  async function discover(): Promise<void> {
     let entries: string[];
     if (!isPlainDirBelow(projectDir, subagentsDir)) return;
     try { entries = readdirSync(subagentsDir); } catch { return; }
@@ -2279,12 +2414,13 @@ export function attachSubagentWatcher(opts: {
       if (!m) continue;
       const id = m[1]!;
       if (files.has(id)) continue;
-      const runId = resolveRunId(taskId);
+      const runId = await resolveRunId(taskId);
       // Without a run to attach to we can't persist (run_events.run_id is NOT
       // NULL). In practice a live session always has a run; skip defensively
       // and retry on a later tick if that ever isn't true.
       if (!runId) continue;
-      const meta = readMeta(subagentsDir, id);
+      const meta = await readMeta(subagentsDir, id, subagentsDir);
+      if (files.has(id) || detached) continue; // registered (or torn down) while we awaited
       const startedAt = Date.now();
       const fs: FileState = {
         subagentId: id,
@@ -2314,7 +2450,7 @@ export function attachSubagentWatcher(opts: {
       };
       files.set(id, fs);
       lastChangeAt = Date.now();
-      subagentsDb.insertIfAbsent(toSubagentShape(fs, taskId));
+      await subagentsDb.insertIfAbsent(toSubagentShape(fs, taskId));
       // A new correlation key may have a tool_result the scan already read
       // past (its lines were consumed while only siblings were pending) —
       // rewind for one full rescan rather than strand the row until reboot.
@@ -2354,13 +2490,12 @@ export function attachSubagentWatcher(opts: {
    *  flip-back guard (fix 1). Same path-normalization posture as
    *  `workflowForDir` (fix 10) — `path.resolve` both sides of the DB fallback
    *  comparison too. */
-  function containerStatusForDir(dir: string): SubagentStatus | null {
+  async function containerStatusForDir(dir: string): Promise<SubagentStatus | null> {
     const w = workflowForDir(dir);
     if (w) return w.status;
     try {
       const resolved = path.resolve(dir);
-      const row = subagentsDb
-        .listForTask(taskId)
+      const row = (await subagentsDb.listForTask(taskId))
         .find((r) => r.parentKind === "workflow" && path.resolve(r.sourcePath) === resolved);
       return row?.status ?? null;
     } catch {
@@ -2404,16 +2539,16 @@ export function attachSubagentWatcher(opts: {
    * reattach can never resurrect a settled workflow. `insertIfAbsent` is the
    * only write.
    */
-  function registerWorkflowContainer(
+  async function registerWorkflowContainer(
     id: string,
     dir: string,
     description: string | null,
     toolUseId: string | null,
-  ): void {
+  ): Promise<void> {
     if (workflows.has(id)) return;
     if (!wfJournals.has(dir)) wfJournals.set(dir, 0);
 
-    const existing = subagentsDb.get(id);
+    const existing = await subagentsDb.get(id);
     // An id that already belongs to a row of a DIFFERENT kind is left entirely
     // alone: adopting it here would let the workflow completion notification
     // settle someone else's agent. (Harness ids collide only if claude's own
@@ -2424,7 +2559,7 @@ export function attachSubagentWatcher(opts: {
         id,
         dir: existing.sourcePath || dir,
         description: existing.description,
-        runId: existing.runId ?? resolveRunId(taskId) ?? id,
+        runId: existing.runId ?? (await resolveRunId(taskId)) ?? id,
         status: existing.status,
         startedAt: existing.startedAt,
         endedAt: existing.endedAt,
@@ -2434,7 +2569,7 @@ export function attachSubagentWatcher(opts: {
       return;
     }
 
-    const runId = resolveRunId(taskId);
+    const runId = await resolveRunId(taskId);
     // No run to attach to — same defensive skip `discover()` makes; a later
     // tick re-sees the same launch line only if the offset was rewound, so
     // rather than rely on that, leave the id untracked and let the next
@@ -2459,7 +2594,7 @@ export function attachSubagentWatcher(opts: {
     };
     workflows.set(id, w);
     lastChangeAt = Date.now();
-    subagentsDb.insertIfAbsent(toWorkflowShape(w, taskId));
+    await subagentsDb.insertIfAbsent(toWorkflowShape(w, taskId));
     emitLifecycleForRow(toWorkflowShape(w, taskId), "started");
     // A workflow launched on a follow-up turn must pull a parked (`review`)
     // card back to `running`, exactly like a freshly-discovered subagent.
@@ -2472,7 +2607,7 @@ export function attachSubagentWatcher(opts: {
    *  a workflow). Each agent file becomes an ordinary tailed `FileState`, so
    *  its events land subagentId-tagged and it settles through the existing
    *  end_turn-idle path with no special casing downstream. */
-  function discoverWorkflowAgents(): void {
+  async function discoverWorkflowAgents(): Promise<void> {
     if (!WORKFLOWS_ENABLED) return;
     let dirs: string[];
     if (!isPlainDirBelow(projectDir, workflowsDir)) return;
@@ -2493,7 +2628,7 @@ export function attachSubagentWatcher(opts: {
       // many agents into the same dir in one pass; the container's status
       // cannot change mid-loop (nothing in this loop settles anything), so
       // recomputing it per file was pure waste.
-      const containerStatus = containerStatusForDir(dir);
+      const containerStatus = await containerStatusForDir(dir);
       const bornSettled = containerStatus !== null && containerStatus !== "running";
       // Fix 11 — rewind this dir's journal cursor AT MOST ONCE per pass, only
       // if the pass actually discovered ≥1 new agent file here — not once per
@@ -2504,9 +2639,10 @@ export function attachSubagentWatcher(opts: {
         if (!m) continue;
         const id = m[1]!;
         if (files.has(id)) continue;
-        const runId = resolveRunId(taskId);
+        const runId = await resolveRunId(taskId);
         if (!runId) continue; // same defensive skip as `discover()`
-        const meta = readMeta(dir, id);
+        const meta = await readMeta(dir, id, workflowsDir);
+        if (files.has(id) || detached) continue; // registered (or torn down) while we awaited
         const now = Date.now();
         const filePath = path.join(dir, name);
         // W7 — settle-on-discovery under an already-settled container.
@@ -2565,7 +2701,7 @@ export function attachSubagentWatcher(opts: {
         files.set(id, fs);
         lastChangeAt = Date.now();
         discoveredAny = true;
-        subagentsDb.insertIfAbsent(toSubagentShape(fs, taskId));
+        await subagentsDb.insertIfAbsent(toSubagentShape(fs, taskId));
         if (bornSettled) {
           emitLifecycle(fs, "finished");
         } else {
@@ -2599,7 +2735,7 @@ export function attachSubagentWatcher(opts: {
    * `settleSubagentById` is idempotent, so a receipt for a row the idle path
    * already completed is a free no-op.
    */
-  function tailJournals(): void {
+  async function tailJournals(): Promise<void> {
     if (!WORKFLOWS_ENABLED) return;
     for (const [dir, offset] of wfJournals) {
       try {
@@ -2617,7 +2753,7 @@ export function attachSubagentWatcher(opts: {
             if (o.type !== "result" || typeof o.agentId !== "string") continue;
             // Fix 4 — this is the harness's own authoritative completion
             // receipt, so it settles with `source: "receipt"`.
-            settleSubagentById(o.agentId, "completed", "receipt");
+            await settleSubagentById(o.agentId, "completed", "receipt");
           } catch { /* one malformed receipt must not abort the rest */ }
         }
       } catch (e) {
@@ -2659,7 +2795,7 @@ export function attachSubagentWatcher(opts: {
    * `tailFile`'s "a batch straddling the replay floor is conservatively
    * treated as replay for one extra tick" trade-off.
    */
-  function tailBgShells(): void {
+  async function tailBgShells(): Promise<void> {
     for (const b of bgShells.values()) {
       if (b.status !== "running" || !b.outputPath) continue;
       const batchStart = b.offset;
@@ -2667,8 +2803,19 @@ export function attachSubagentWatcher(opts: {
       if (!text) continue;
       b.offset = next;
       b.lastAppendAt = Date.now();
-      const row = runs.appendEvent(b.runId, "stdout", text, `bgshell:${b.id}:${batchStart}`, b.id);
-      if (row) emitFn?.({ id: row.id, runId: b.runId, taskId, stream: "stdout", data: text, ts: row.ts, subagentId: b.id });
+      const runId = b.runId;
+      const bgId = b.id;
+      try {
+        await appendAndEmit(
+          runId,
+          () => runs.appendEvent(runId, "stdout", text, `bgshell:${bgId}:${batchStart}`, bgId),
+          (row) => {
+            if (row) emitFn?.({ id: row.id, runId, taskId, stream: "stdout", data: text, ts: row.ts, subagentId: bgId });
+          },
+        );
+      } catch (e) {
+        console.error(`[claude-subagents] failed to persist bg-shell output for ${bgId}:`, e);
+      }
     }
   }
 
@@ -2700,19 +2847,34 @@ export function attachSubagentWatcher(opts: {
    *  is judged against the drain's starting offset, so chunking (and a
    *  drain spread over several slices) never changes which bytes count as
    *  replay. */
-  function tailFile(fs: FileState, deadlineMs = Infinity, batchStart = fs.offset): boolean {
+  async function tailFile(fs: FileState, deadlineMs = Infinity, batchStart = fs.offset): Promise<boolean> {
+    // The directory the transcript worker validates the path against: the
+    // subagents dir, or the workflows tree for a workflow agent.
+    const root = fs.parentKind === "workflow_agent" ? workflowsDir : subagentsDir;
     for (;;) {
-      const { lines, next, more } = readAppendedLinesSync(fs.sourcePath, fs.offset, readChunkBytes);
-      if (next === fs.offset) return true; // nothing complete appended
-      fs.offset = next;
-      dispatchTailedLines(fs, lines, batchStart);
-      if (!more) return true;
+      let chunk;
+      try {
+        chunk = await idle(getTranscriptClient().readChunk(fs.sourcePath, fs.offset, readChunkBytes, root));
+      } catch (e) {
+        // The worker refused the path (not a plain location under `root`: the
+        // old read treated that as "nothing here") or failed. Either way the
+        // cursor stays put and a later pass retries.
+        if (!(e instanceof TranscriptClientError && e.code === "EINVAL")) {
+          console.error(`[claude-subagents] transcript read failed for ${fs.subagentId}:`, e);
+        }
+        return true;
+      }
+      if (detached) return true; // torn down while the read was in flight: touch nothing
+      if (chunk.nextOffset === fs.offset) return true; // nothing complete appended
+      fs.offset = chunk.nextOffset;
+      await dispatchTailedLines(fs, chunk.lines, batchStart);
+      if (chunk.eof) return true;
       if (performance.now() >= deadlineMs) return false;
     }
   }
 
   /** The per-chunk half of `tailFile`: dispatch one chunk's complete lines. */
-  function dispatchTailedLines(fs: FileState, lines: string[], batchStart: number): void {
+  async function dispatchTailedLines(fs: FileState, lines: ParsedLine[], batchStart: number): Promise<void> {
     // Fix 1 (general guard) — a workflow agent whose CONTAINER is settled must
     // never flip back to `running`, independent of `replayFloor`. The floor
     // covers the discovery-time case (a row born under an already-settled
@@ -2726,14 +2888,36 @@ export function attachSubagentWatcher(opts: {
     // per drain only makes it more current when a drain spans several
     // cooperative slices. Cheap — a plain map lookup, falling back to one DB
     // scan only when this watcher never saw the launch line.
-    const containerSettled =
-      fs.parentKind === "workflow_agent" &&
-      (() => {
-        const status = containerStatusForDir(path.dirname(fs.sourcePath));
-        return status !== null && status !== "running";
-      })();
-    for (const line of lines) {
-      if (!line) continue;
+    let containerSettled = false;
+    if (fs.parentKind === "workflow_agent") {
+      const status = await containerStatusForDir(path.dirname(fs.sourcePath));
+      containerSettled = status !== null && status !== "running";
+    }
+    // The chunk's events, inserted with ONE `appendEvents` call per flush (one
+    // transaction, ids in order) instead of an autocommit insert per event.
+    // Flushed before any status write that, in the old per-event order, came
+    // AFTER the earlier lines' events and BEFORE this line's (the flip-back
+    // and the api-error settle), and once more when the chunk ends.
+    let chunks: PendingChunk[] = [];
+    const flushChunks = async (): Promise<void> => {
+      if (chunks.length === 0) return;
+      const batch = chunks;
+      chunks = [];
+      // Not wrapped in `idle`: the live sends run inside this await (right
+      // after the insert), and that is main-thread attach work the lag label
+      // must cover. The database hop itself is short.
+      await persistSubagentChunks(fs.runId, taskId, fs.subagentId, batch);
+    };
+    try {
+    for (const pl of lines) {
+      if (pl.error === TOO_LARGE_ERROR) {
+        // A single line over the worker's per-line cap: skipped (the cursor is
+        // already past it), counted once here rather than read into memory.
+        tooLargeSkipped++;
+        console.error(`[claude-subagents] skipped an over-long line in ${fs.sourcePath} (${tooLargeSkipped} so far for task ${taskId})`);
+        continue;
+      }
+      if (!pl.raw) continue;
       // Line-level dedup (the mapper can fire onChunk several times per line —
       // one per content block — all sharing the line uuid, so we must gate on
       // the line, not per onChunk call). Peek the uuid + end_turn first.
@@ -2756,7 +2940,10 @@ export function attachSubagentWatcher(opts: {
       // resumed agent) may resurrect a `receiptSettled` row.
       let lineType: string | undefined;
       try {
-        const o = JSON.parse(line) as {
+        // The worker already parsed the line; a parse failure arrives as
+        // `pl.error` and falls through to the mapper's stderr chunk below.
+        if (pl.error !== undefined) throw new Error(pl.error);
+        const o = pl.parsed as {
           uuid?: unknown;
           type?: unknown;
           message?: { stop_reason?: unknown };
@@ -2889,15 +3076,15 @@ export function attachSubagentWatcher(opts: {
         fs.apiErrored = false;
         fs.staleSettled = false;
         fs.receiptSettled = false;
-        subagentsDb.setStatus(fs.subagentId, "running", null);
+        await flushChunks();
+        await subagentsDb.setStatus(fs.subagentId, "running", null);
         emitLifecycle(fs, "started");
         fireParkedDiscovery(taskId);
       }
-      const { endOfTurn } = mapJsonlEventToChunks(
-        line,
+      const { endOfTurn } = mapTailedLine(
+        pl,
         (stream, data, lineUuid) => {
-          const row = runs.appendEvent(fs.runId, stream, data, lineUuid ?? null, fs.subagentId);
-          if (row) emitFn?.({ id: row.id, runId: fs.runId, taskId, stream, data, ts: row.ts, subagentId: fs.subagentId });
+          chunks.push({ stream, data, lineUuid: lineUuid ?? null });
         },
         // Ask the mapper to carry this line's uuid on its own api-error
         // `status` chunk too (unlike the MAIN stream's `dispatchLine`,
@@ -2934,21 +3121,25 @@ export function attachSubagentWatcher(opts: {
         fs.status = "failed";
         fs.endedAt = fs.lastAppendAt;
         fs.apiErrored = true;
-        subagentsDb.setStatus(fs.subagentId, "failed", fs.endedAt);
+        await flushChunks();
+        await subagentsDb.setStatus(fs.subagentId, "failed", fs.endedAt);
         emitLifecycle(fs, "finished");
         fireSettle(taskId);
         fireApiError({ subagentId: fs.subagentId, detail: apiErrorInfo.detail, runId: fs.runId });
       }
     }
+    } finally {
+      await flushChunks();
+    }
   }
 
   /** Flip subagents to `completed` once their transcript ends + goes quiet. */
-  function checkDone(now: number): void {
+  async function checkDone(now: number): Promise<void> {
     for (const fs of files.values()) {
       if (fs.status === "running" && fs.sawEndOfTurn && now - fs.lastAppendAt > DONE_IDLE_MS) {
         fs.status = "completed";
         fs.endedAt = now;
-        subagentsDb.setStatus(fs.subagentId, "completed", now);
+        await subagentsDb.setStatus(fs.subagentId, "completed", now);
         emitLifecycle(fs, "finished");
         // The DB write above must land before the orchestrator's release
         // predicate (which reads subagentsDb.hasRunning) can see it as done.
@@ -2986,7 +3177,7 @@ export function attachSubagentWatcher(opts: {
    * default (10 minutes) keeps that bounce rare; `AGETOR_SUBAGENT_STALE_MS`
    * exists for the operator/test who needs a different threshold.
    */
-  function checkStale(now: number): void {
+  async function checkStale(now: number): Promise<void> {
     for (const fs of files.values()) {
       if (
         fs.status === "running" &&
@@ -3000,7 +3191,7 @@ export function attachSubagentWatcher(opts: {
         // stale-settled synchronous subagent has no other fallback settle
         // signal left (see `FileState.staleSettled`'s doc).
         fs.staleSettled = true;
-        subagentsDb.setStatus(fs.subagentId, "completed", now);
+        await subagentsDb.setStatus(fs.subagentId, "completed", now);
         emitLifecycle(fs, "finished");
         fireSettle(taskId);
       }
@@ -3051,7 +3242,7 @@ export function attachSubagentWatcher(opts: {
    * settle never will, so it permanently drops out of this per-tick
    * `statSync` watch instead of paying it forever.
    */
-  function checkBgShellCeiling(now: number): void {
+  async function checkBgShellCeiling(now: number): Promise<void> {
     for (const b of bgShells.values()) {
       if (b.status === "running") {
         const ceiling = (b.timeoutMs ?? BG_SHELL_DEFAULT_TIMEOUT_MS) + BG_SHELL_TIMEOUT_MARGIN_MS;
@@ -3059,7 +3250,7 @@ export function attachSubagentWatcher(opts: {
           b.status = "completed";
           b.endedAt = now;
           b.settleFloor = b.offset;
-          subagentsDb.setStatus(b.id, "completed", now);
+          await subagentsDb.setStatus(b.id, "completed", now);
           emitLifecycleForRow(toBgShellShape(b, taskId), "finished");
           fireSettle(taskId);
         }
@@ -3093,7 +3284,7 @@ export function attachSubagentWatcher(opts: {
         // `lastAppendAt` at its stale pre-settle value (which would make it
         // instantly re-eligible for the ceiling on the very next pass).
         b.lastAppendAt = now;
-        subagentsDb.setStatus(b.id, "running", null);
+        await subagentsDb.setStatus(b.id, "running", null);
         emitLifecycleForRow(toBgShellShape(b, taskId), "started");
         fireParkedDiscovery(taskId);
       }
@@ -3142,7 +3333,7 @@ export function attachSubagentWatcher(opts: {
    * this batch) falls through to normal settle handling instead of being
    * wrongly marked async.
    */
-  function scanLineForToolResult(line: string, pending: FileState[]): void {
+  async function scanLineForToolResult(line: string, pending: FileState[]): Promise<void> {
     // Cheap prefilter before any JSON.parse: the launching `tool_use` line
     // and a `<tool-use-id>` notification tag also contain this id string,
     // so a substring hit is NOT sufficient on its own — it only narrows
@@ -3184,7 +3375,7 @@ export function attachSubagentWatcher(opts: {
           fs.isAsync = true;
           fs.toolUseId = null;
         } else {
-          settleSubagentById(fs.subagentId, "completed");
+          await settleSubagentById(fs.subagentId, "completed");
         }
       }
     }
@@ -3197,7 +3388,7 @@ export function attachSubagentWatcher(opts: {
    * the completion notification will carry), `transcriptDir` (where its agents
    * write), and a human label (`workflowName`, falling back to `summary`).
    */
-  function scanLineForWorkflowLaunch(line: string): void {
+  async function scanLineForWorkflowLaunch(line: string): Promise<void> {
     // Two cheap substring prefilters before the parse — the overwhelming
     // majority of main-JSONL lines have neither.
     if (!line.includes("local_workflow") || !line.includes("async_launched")) return;
@@ -3238,7 +3429,7 @@ export function attachSubagentWatcher(opts: {
         }
       }
     }
-    registerWorkflowContainer(id, dir, description, toolUseId);
+    await registerWorkflowContainer(id, dir, description, toolUseId);
   }
 
   /**
@@ -3317,7 +3508,7 @@ export function attachSubagentWatcher(opts: {
    * containers, plain rows, and bg shells still skip (and log) on an
    * unrecognised `<status>` exactly as before.
    */
-  function scanLineForTaskNotification(line: string): void {
+  async function scanLineForTaskNotification(line: string): Promise<void> {
     if (!line.includes("<task-notification>") || !line.includes("<task-id>")) return;
     // Finding #5 — the enclosing line's own `timestamp`, read once per line
     // (not once per notification block — every block on one batched line
@@ -3348,7 +3539,7 @@ export function attachSubagentWatcher(opts: {
       if (mon) {
         // The scan works on raw line text; decode the fragment so the hash
         // and the persisted event text match what the live path sees.
-        applyMonitorNotification(id, decodeJsonStringFragment(body), lineTimestampMs);
+        await applyMonitorNotification(id, decodeJsonStringFragment(body), lineTimestampMs);
         continue;
       }
 
@@ -3363,7 +3554,7 @@ export function attachSubagentWatcher(opts: {
 
       const w = workflows.get(id);
       if (w) {
-        if (w.status === "running") settleSubagentById(id, "completed", "receipt");
+        if (w.status === "running") await settleSubagentById(id, "completed", "receipt");
         continue;
       }
       // Not a container id this watcher knows — check whether it names an
@@ -3373,7 +3564,7 @@ export function attachSubagentWatcher(opts: {
       // the id matches neither.
       const fs = files.get(id);
       if (fs && fs.status === "running") {
-        settleSubagentById(id, "completed", "receipt");
+        await settleSubagentById(id, "completed", "receipt");
         continue;
       }
       // Nor a `files` row — check `bgShells` (a bg shell's `backgroundTaskId`
@@ -3394,7 +3585,7 @@ export function attachSubagentWatcher(opts: {
       if (b) {
         b.receiptSettled = true;
         b.settleFloor = null;
-        if (b.status === "running") settleSubagentById(id, "completed", "receipt");
+        if (b.status === "running") await settleSubagentById(id, "completed", "receipt");
       }
     }
   }
@@ -3505,7 +3696,7 @@ export function attachSubagentWatcher(opts: {
    * doesn't parse to a sane past instant (defensive — not expected to fail
    * on the verified live shape).
    */
-  function scanLineForBgShellStub(line: string): void {
+  async function scanLineForBgShellStub(line: string): Promise<void> {
     if (!line.includes("backgroundTaskId")) return;
     let parsed: {
       type?: unknown;
@@ -3563,7 +3754,7 @@ export function attachSubagentWatcher(opts: {
       : null;
     const outputPath = pathMatch ? pathMatch[1]! : null;
 
-    const runId = resolveRunId(taskId);
+    const runId = await resolveRunId(taskId);
     // Same defensive skip `discover()`/`registerWorkflowContainer` make — no
     // run to attach events to. In practice a live session always has one.
     if (!runId) return;
@@ -3590,7 +3781,7 @@ export function attachSubagentWatcher(opts: {
     };
     bgShells.set(id, b);
     lastChangeAt = Date.now();
-    subagentsDb.insertIfAbsent(toBgShellShape(b, taskId));
+    await subagentsDb.insertIfAbsent(toBgShellShape(b, taskId));
     emitLifecycleForRow(toBgShellShape(b, taskId), "started");
     fireParkedDiscovery(taskId);
   }
@@ -3685,7 +3876,7 @@ export function attachSubagentWatcher(opts: {
    * replay early-return, so a replayed stub can't permanently strand a slot
    * of the pending map's cap.
    */
-  function scanLineForMonitorStub(line: string): void {
+  async function scanLineForMonitorStub(line: string): Promise<void> {
     if (!line.includes('"taskId"') || !line.includes("Monitor started")) return;
     let parsed: {
       type?: unknown;
@@ -3731,7 +3922,7 @@ export function attachSubagentWatcher(opts: {
 
     if (monitors.has(id)) return; // replay of an already-known id
 
-    const runId = resolveRunId(taskId);
+    const runId = await resolveRunId(taskId);
     if (!runId) return; // same defensive skip every other launch scan makes
 
     const now = Date.now();
@@ -3757,7 +3948,7 @@ export function attachSubagentWatcher(opts: {
     };
     monitors.set(id, m);
     lastChangeAt = Date.now();
-    subagentsDb.insertIfAbsent(toMonitorShape(m, taskId));
+    await subagentsDb.insertIfAbsent(toMonitorShape(m, taskId));
     emitLifecycleForRow(toMonitorShape(m, taskId), "started");
     fireParkedDiscovery(taskId);
   }
@@ -3782,13 +3973,13 @@ export function attachSubagentWatcher(opts: {
    * through to `persistMonitorEvent`; `undefined`/`null` falls back to that
    * function's hash-only key.
    */
-  function applyMonitorNotification(id: string, body: string, lineTimestampMs?: number | null): boolean {
+  async function applyMonitorNotification(id: string, body: string, lineTimestampMs?: number | null): Promise<boolean> {
     const m = monitors.get(id);
     if (!m) return false;
     const block = extractNotificationBlockForId(body, id);
     if (block === null) return false;
     const { isTerminal, eventText } = parseMonitorNotificationBlock(block);
-    if (eventText) persistMonitorEvent(m.runId, taskId, id, block, eventText, isTerminal, lineTimestampMs);
+    if (eventText) await persistMonitorEvent(m.runId, taskId, id, block, eventText, isTerminal, lineTimestampMs);
 
     if (isTerminal) {
       // Unconditional receipt latch, mirroring `scanLineForTaskNotification`'s
@@ -3797,7 +3988,7 @@ export function attachSubagentWatcher(opts: {
       // `receiptSettled` here keeps a later stray line from ever flipping it
       // back — the harness's own authoritative receipt outranks the guess.
       m.receiptSettled = true;
-      if (m.status === "running") settleSubagentById(id, "completed", "receipt");
+      if (m.status === "running") await settleSubagentById(id, "completed", "receipt");
       return true;
     }
 
@@ -3825,7 +4016,7 @@ export function attachSubagentWatcher(opts: {
       // within the same tick (the oscillation this finding is about).
       m.timeoutMs = null;
       m.persistent = null;
-      subagentsDb.setStatus(id, "running", null);
+      await subagentsDb.setStatus(id, "running", null);
       emitLifecycleForRow(toMonitorShape(m, taskId), "started");
       fireParkedDiscovery(taskId);
     }
@@ -3872,7 +4063,7 @@ export function attachSubagentWatcher(opts: {
    * TIMED branch entirely on its very next check), this closes the
    * oscillation for good rather than just narrowing its window.
    */
-  function checkMonitorCeiling(now: number): void {
+  async function checkMonitorCeiling(now: number): Promise<void> {
     for (const m of monitors.values()) {
       if (m.status !== "running") continue;
       const timed = m.persistent === false && m.timeoutMs != null;
@@ -3884,7 +4075,7 @@ export function attachSubagentWatcher(opts: {
       m.status = "completed";
       m.endedAt = now;
       m.ceilingSettled = true;
-      subagentsDb.setStatus(m.id, "completed", now);
+      await subagentsDb.setStatus(m.id, "completed", now);
       emitLifecycleForRow(toMonitorShape(m, taskId), "finished");
       fireSettle(taskId);
     }
@@ -3981,13 +4172,13 @@ export function attachSubagentWatcher(opts: {
    *  chunk of it — is exhausted. Each call makes progress before it can
    *  return `false`: a call that finds the current chunk spent reads the next
    *  one and starts on its lines before the first deadline check. */
-  function stepMainScan(scan: MainScan, deadlineMs: number): boolean {
+  async function stepMainScan(scan: MainScan, deadlineMs: number): Promise<boolean> {
     for (;;) {
       if (scan.idx >= scan.lines.length && (!scan.more || !readMainChunk(scan))) return true;
       const { lines, pending } = scan;
       while (scan.idx < lines.length) {
         const line = lines[scan.idx++]!;
-        if (line) scanMainLine(line, pending);
+        if (line) await scanMainLine(line, pending);
         if (scan.idx % MAIN_SCAN_LINES_PER_CHECK === 0 && scan.idx < lines.length && performance.now() >= deadlineMs) {
           return false;
         }
@@ -3996,8 +4187,8 @@ export function attachSubagentWatcher(opts: {
     }
   }
 
-  function scanMainLine(line: string, pending: FileState[]): void {
-    if (pending.length > 0) scanLineForToolResult(line, pending);
+  async function scanMainLine(line: string, pending: FileState[]): Promise<void> {
+    if (pending.length > 0) await scanLineForToolResult(line, pending);
     if (WORKFLOWS_ENABLED) {
       // Launch before completion: on a replay-from-0 both lines are in this
       // same batch, and in file order the launch always precedes its
@@ -4005,31 +4196,29 @@ export function attachSubagentWatcher(opts: {
       // was down is registered and then settled within one pass, never left
       // holding the card. Same ordering argument applies to the bg-shell
       // and monitor pairs below.
-      scanLineForWorkflowLaunch(line);
+      await scanLineForWorkflowLaunch(line);
     }
     if (BG_SHELLS_ENABLED) {
       scanLineForBgShellLaunch(line);
-      scanLineForBgShellStub(line);
+      await scanLineForBgShellStub(line);
     }
     if (MONITORS_ENABLED) {
       scanLineForMonitorLaunch(line);
-      scanLineForMonitorStub(line);
+      await scanLineForMonitorStub(line);
     }
     if (
       WORKFLOWS_ENABLED ||
       (BG_SHELLS_ENABLED && bgShells.size > 0) ||
       (MONITORS_ENABLED && monitors.size > 0)
     ) {
-      scanLineForTaskNotification(line);
+      await scanLineForTaskNotification(line);
     }
   }
 
-  /** Synchronous whole-batch scan (steady-state cycles). The first cycle uses
-   *  `beginMainScan` + `stepMainScan` directly so it can yield mid-batch. */
-  function scanMainSignals(): void {
-    const scan = beginMainScan();
-    if (scan) stepMainScan(scan, Infinity);
-  }
+  /** Coalescing window of a dir-watcher burst: every event inside it (and every
+   *  event that lands while the pass it schedules is running) folds into ONE
+   *  pass. */
+  const DIR_PASS_COALESCE_MS = 50;
 
   function armDirWatcher(): void {
     if (dirWatcher || !isPlainDirBelow(projectDir, subagentsDir)) return;
@@ -4040,19 +4229,42 @@ export function attachSubagentWatcher(opts: {
         // independent of whether it turns out to be a new subagent file.
         lastChangeAt = Date.now();
         // The watcher is armed by the first cycle's head, which is still
-        // replaying every transcript cooperatively. Tailing all files here
-        // would be one big synchronous block (and race the job's per-file
-        // pass); skip — the first cycle drains every file, and later cycles'
-        // `discover()` + never-read/settled-growth backstops pick up anything
-        // this notification announced.
+        // replaying every transcript cooperatively; its pass drains every
+        // file, and later cycles' `discover()` + never-read/settled-growth
+        // backstops pick up anything this notification announced.
         if (!firstCycleDone) return;
-        try {
-          discover();
-          discoverWorkflowAgents();
-          for (const fs of files.values()) tailFile(fs);
-        } catch { /* never crash the watcher */ }
+        // The callback does no work itself: it marks the watcher dirty and
+        // makes sure one pass is scheduled. A burst of appends (a transcript
+        // is appended many times a second) is one pass, not one per event.
+        dirDirty = true;
+        scheduleDirPass();
       });
     } catch { /* fs.watch unsupported on this FS — the poll backstop covers it */ }
+  }
+
+  /** Schedule the one coalesced dir-watcher pass, unless one is already
+   *  scheduled. Never runs a pass inline. */
+  function scheduleDirPass(): void {
+    if (detached || dirPassTimer !== null || !dirDirty || !firstCycleDone) return;
+    dirPassTimer = setTimeout(() => {
+      dirPassTimer = null;
+      void runDirPass();
+    }, DIR_PASS_COALESCE_MS);
+  }
+
+  /** The coalesced pass: discover, then tail EVERY known file (settled ones
+   *  too, which is how a resume is noticed), as a cooperative job. Yields to a
+   *  pass already in flight — whichever finishes re-schedules this one if more
+   *  events arrived (`withPass`). */
+  async function runDirPass(): Promise<void> {
+    if (detached || !dirDirty || !seedDone || !firstCycleDone) return;
+    if (passesInFlight > 0) return; // the pass that is running re-schedules us when it ends
+    dirDirty = false; // events that arrive from here on belong to the NEXT pass
+    try {
+      await withPass(() => executeJob(createCycleJob("dir", Date.now)), "dir");
+    } catch (e) {
+      console.error(`[claude-subagents] dir-watcher pass failed for task ${taskId}:`, e);
+    }
   }
 
   /** One discover → tail → done-check cycle as a resumable job. Phases, in
@@ -4065,13 +4277,17 @@ export function attachSubagentWatcher(opts: {
    *   2. journals + bg shells
    *   3. main-JSONL signal scan (sliced by line, read chunk by chunk)
    *   4. `checkDone` / `checkStale` / ceilings, stamped with `nowFn()`
-   *  `tailAll` marks the FIRST cycle, which tails every file (even completed
-   *  ones) to drain a reattach backlog. A throw anywhere abandons the rest of
-   *  the cycle — the old `cycle()`'s "swallow — never crash the timer" — and a
-   *  `detach()` between slices abandons it too. The files phase walks the live
-   *  `files.values()` iterator (like the old `for...of`), so a row added during
-   *  the walk is visited and a deleted one skipped. */
-  function createCycleJob(tailAll: boolean, nowFn: () => number): CoopJob {
+   *  `kind`: `"first"` is the FIRST cycle, which tails every file (even
+   *  completed ones) to drain a reattach backlog; `"steady"` is the ordinary
+   *  tick; `"dir"` is the dir-watcher pass: phases 0 and 1 only, tailing every
+   *  file. A throw anywhere abandons the rest of the cycle — the old
+   *  `cycle()`'s "swallow — never crash the timer" — and a `detach()` between
+   *  slices abandons it too. The files phase walks the live `files.values()`
+   *  iterator (like the old `for...of`), so a row added during the walk is
+   *  visited and a deleted one skipped. */
+  type CycleKind = "first" | "steady" | "dir";
+  function createCycleJob(kind: CycleKind, nowFn: () => number): CoopJob {
+    const tailAll = kind === "first" || kind === "dir";
     let phase = 0;
     let fileIter: IterableIterator<FileState> | null = null;
     // The file phase 1 is draining, when a deadline cut its drain short:
@@ -4081,14 +4297,14 @@ export function attachSubagentWatcher(opts: {
     let mainScan: MainScan | null = null;
     let mainScanBegun = false;
     return {
-      step(deadlineMs: number): boolean {
+      async step(deadlineMs: number): Promise<boolean> {
         if (phase >= 5) return true;
         if (detached) { phase = 5; return true; }
         try {
           if (phase === 0) {
-            armDirWatcher();
-            discover();
-            discoverWorkflowAgents();
+            if (kind !== "dir") armDirWatcher();
+            await discover();
+            await discoverWorkflowAgents();
             fileIter = files.values();
             phase = 1;
           }
@@ -4096,28 +4312,29 @@ export function attachSubagentWatcher(opts: {
             // Steady-state: only re-stat/re-read `running` files (plus a couple of
             // narrow exceptions below). Completed ones keep no per-tick cost beyond
             // fix 3's cheap `statSync` backstop; a resume also re-opens them via the
-            // dir watcher's append notification (see `armDirWatcher`, which tails
-            // ALL files) where available. The first cycle is the exception — it
+            // dir watcher's coalesced pass (see `armDirWatcher`, which tails ALL
+            // files) where available. The first cycle is the exception — it
             // tails everything to drain a reattach backlog — as is a settled
             // workflow agent whose workflow is still live (`tailPastSettle`), which
             // the non-recursive dir watcher cannot cover.
             for (;;) {
+              if (detached) { phase = 5; return true; }
               if (curTail) {
                 // Resume the file a previous slice's deadline cut short, with
                 // its drain's original `batchStart` (see `tailFile`).
                 const t = curTail;
                 let drained = true;
                 if (t.guarded) {
-                  try { drained = tailFile(t.fs, deadlineMs, t.batchStart); } catch { /* see fix 3 below */ }
+                  try { drained = await tailFile(t.fs, deadlineMs, t.batchStart); } catch { /* see fix 3 below */ }
                 } else {
-                  drained = tailFile(t.fs, deadlineMs, t.batchStart);
+                  drained = await tailFile(t.fs, deadlineMs, t.batchStart);
                 }
                 if (!drained) return false;
                 curTail = null;
                 if (performance.now() >= deadlineMs) return false;
               }
               const nx = fileIter!.next();
-              if (nx.done) { phase = 2; break; }
+              if (nx.done) { phase = kind === "dir" ? 5 : 2; break; }
               const fs = nx.value;
               // Fix 2 — `fs.offset === 0` drains a row that has NEVER been read,
               // even though it isn't `running` — the born-settled (W7) case: its
@@ -4127,28 +4344,25 @@ export function attachSubagentWatcher(opts: {
               // tab would render permanently empty.
               if (tailAll || fs.status === "running" || tailPastSettle(fs) || fs.offset === 0) {
                 const batchStart = fs.offset;
-                if (!tailFile(fs, deadlineMs, batchStart)) {
+                if (!(await tailFile(fs, deadlineMs, batchStart))) {
                   curTail = { fs, batchStart, guarded: false };
                   return false;
                 }
               } else {
-                // Fix 3 — poll backstop for post-settle resume detection. Before
-                // this, a settled regular row's later growth was only ever seen via
-                // the `fs.watch` dir watcher (steady-state polling above only
-                // re-tails `running`/never-read/`tailPastSettle` rows), which makes
-                // resume detection watcher-only: non-deterministic under manual
-                // `pump()`-driven tests, and silently unavailable on filesystems
-                // where `fs.watch` isn't supported (the dir watcher's own `armDirWatcher`
-                // already tolerates that — "the poll backstop covers it" — but until
-                // now there wasn't one for this specific case). A `statSync` per
-                // non-running row is microsecond-cheap, so doing it every cycle for
-                // every settled row is not a meaningful cost even on a task with many
-                // subagents. Guarded: a file that vanished (or is momentarily
-                // unreadable) is skipped, not treated as an error — the dir watcher
-                // or a later tick picks it up if it reappears.
+                // Fix 3 — poll backstop for post-settle resume detection. A
+                // settled regular row's later growth is otherwise only seen via
+                // the `fs.watch` dir watcher, which makes resume detection
+                // watcher-only: non-deterministic under manual `pump()`-driven
+                // tests, and silently unavailable on filesystems where
+                // `fs.watch` isn't supported. A `statSync` per non-running row
+                // is microsecond-cheap, so doing it every cycle for every
+                // settled row is not a meaningful cost. Guarded: a file that
+                // vanished (or is momentarily unreadable) is skipped, not
+                // treated as an error — the dir watcher or a later tick picks it
+                // up if it reappears.
                 try {
                   const batchStart = fs.offset;
-                  if (statSync(fs.sourcePath).size > batchStart && !tailFile(fs, deadlineMs, batchStart)) {
+                  if (statSync(fs.sourcePath).size > batchStart && !(await tailFile(fs, deadlineMs, batchStart))) {
                     curTail = { fs, batchStart, guarded: true };
                     return false;
                   }
@@ -4158,8 +4372,8 @@ export function attachSubagentWatcher(opts: {
             }
           }
           if (phase === 2) {
-            tailJournals();
-            if (BG_SHELLS_ENABLED) tailBgShells();
+            await tailJournals();
+            if (BG_SHELLS_ENABLED) await tailBgShells();
             phase = 3;
             if (performance.now() >= deadlineMs) return false;
           }
@@ -4168,37 +4382,89 @@ export function attachSubagentWatcher(opts: {
               mainScanBegun = true;
               mainScan = beginMainScan();
             }
-            if (mainScan && !stepMainScan(mainScan, deadlineMs)) return false;
+            if (mainScan && !(await stepMainScan(mainScan, deadlineMs))) return false;
             phase = 4;
             if (performance.now() >= deadlineMs) return false;
           }
           if (phase === 4) {
             const now = nowFn();
-            checkDone(now);
-            checkStale(now);
-            if (BG_SHELLS_ENABLED) checkBgShellCeiling(now);
-            if (MONITORS_ENABLED) checkMonitorCeiling(now);
+            await checkDone(now);
+            await checkStale(now);
+            if (BG_SHELLS_ENABLED) await checkBgShellCeiling(now);
+            if (MONITORS_ENABLED) await checkMonitorCeiling(now);
             phase = 5;
           }
-        } catch { phase = 5; /* swallow — never crash the timer */ }
+        } catch (e) {
+          phase = 5; // never crash the timer: abandon this cycle; the next pass retries
+          console.error(`[claude-subagents] watcher pass failed for task ${taskId}:`, e);
+        }
         return phase >= 5;
       },
     };
   }
 
-  /** One discover → tail → done-check pass, with no scheduling side effects.
-   *  A no-op while the seed / first cycle is still pending: those own the
-   *  watcher's state until they finish (see the cooperative-jobs comment). */
-  function cycle(now: number): void {
-    if (detached || !seedDone || !firstCycleDone) return;
-    createCycleJob(false, () => now).step(Infinity);
+  // ── Pass scheduling ──────────────────────────────────────────────────────
+  // At most ONE pass (a tick, a dir-watcher pass or a `pump`) runs per watcher
+  // at a time. `withPass` serializes them; a tick that finds one in flight is
+  // skipped (the next is armed when the pass ends), and a dir-watcher burst is
+  // merged into a single scheduled pass (`dirDirty`).
+  let passTail: Promise<void> = Promise.resolve();
+  let passesInFlight = 0;
+  async function withPass<T>(fn: () => Promise<T>, kind: CycleKind = "steady"): Promise<T> {
+    const prev = passTail;
+    let release!: () => void;
+    passTail = new Promise<void>((resolve) => { release = resolve; });
+    passesInFlight++;
+    try {
+      await prev;
+      passStatsState.counts[kind]++;
+      passStatsState.active++;
+      passStatsState.maxActive = Math.max(passStatsState.maxActive, passStatsState.active);
+      try {
+        return await fn();
+      } finally {
+        passStatsState.active--;
+      }
+    } finally {
+      passesInFlight--;
+      release();
+      if (passesInFlight === 0 && dirDirty) scheduleDirPass();
+    }
   }
 
-  function tick(): void {
+  /** Run a job to completion: one synchronous drain in `manual` (test) mode,
+   *  else in `jobSliceMs` slices with a yield to the event loop between them. */
+  async function executeJob(job: CoopJob): Promise<void> {
+    if (opts.manual) {
+      await job.step(Infinity);
+      return;
+    }
+    await runJob(job);
+  }
+
+  /** One discover → tail → done-check pass. A no-op while the seed / first
+   *  cycle is still pending: those own the watcher's state until they finish
+   *  (see the cooperative-jobs comment). Always a cooperative job in
+   *  production, queued behind any pass already running. */
+  async function cycle(now: number): Promise<void> {
+    if (detached || !seedDone || !firstCycleDone) return;
+    await withPass(() => executeJob(createCycleJob("steady", () => now)));
+  }
+
+  async function tick(): Promise<void> {
+    timer = null;
     if (detached) return;
     const now = Date.now();
-    cycle(now);
-    scheduleNext(now);
+    // A pass already in flight (a `pump`, a dir-watcher pass) covers this tick:
+    // skip it rather than queue a second one behind it.
+    if (passesInFlight === 0) {
+      try {
+        await cycle(now);
+      } catch (e) {
+        console.error(`[claude-subagents] tick failed for task ${taskId}:`, e);
+      }
+    }
+    if (!detached) scheduleNext(Date.now());
   }
 
   /** Arm the next steady-state tick: fast while anything is running, deep-idle
@@ -4227,42 +4493,78 @@ export function attachSubagentWatcher(opts: {
     } else {
       delay = SLOW_POLL_MS;
     }
-    timer = setTimeout(tick, delay);
+    timer = setTimeout(() => { void tick(); }, delay);
   }
 
   // ── Job state + driver ───────────────────────────────────────────────────
   let seedDone = false;
   let firstCycleDone = false;
+  let seedPromise: Promise<void> = Promise.resolve();
   let delayResolve: (() => void) | null = null;
   let resolveReady!: () => void;
   let resolveSettled!: () => void;
   const ready = new Promise<void>((resolve) => { resolveReady = resolve; });
   const settled = new Promise<void>((resolve) => { resolveSettled = resolve; });
 
-  /** The run a stall during the cooperative seed / first pass is attributed to
-   *  (`beginLagLabel` context): the caller's, else the task's current run. */
+  /** The run a stall is attributed to (`beginLagLabel` context): the caller's,
+   *  else the task's current run, looked up once at the first job. */
+  let lagRunId: string | undefined = opts.runId;
+  let lagRunResolved = opts.runId !== undefined;
+  async function resolveLagRun(): Promise<void> {
+    if (lagRunResolved) return;
+    lagRunResolved = true;
+    try { lagRunId = (await tasks.get(taskId))?.runId ?? undefined; } catch { /* attribution is best-effort */ }
+  }
   function lagContext(): { taskId: string; runId?: string } {
-    let runId = opts.runId;
-    if (!runId) {
-      try { runId = tasks.get(taskId)?.runId ?? undefined; } catch { /* attribution is best-effort */ }
-    }
-    return runId ? { taskId, runId } : { taskId };
+    return lagRunId ? { taskId, runId: lagRunId } : { taskId };
   }
 
-  /** Step `job` in `JOB_SLICE_MS` slices, yielding to the loop between them,
-   *  until it finishes or the watcher is detached. The lag label is held for the
-   *  whole job (including the yields) on purpose: the monitor's sampler fires on
-   *  a later loop turn than the slice that stalled it, so a label disposed
-   *  before each yield would already be gone when the stall is reported and it
-   *  would read "idle". The price — a stall from unrelated code landing inside
-   *  a yield is also attributed here — is mild next to an unattributable one,
-   *  and the label names an operation that genuinely is in flight. */
-  async function runJob(job: CoopJob): Promise<void> {
-    const endLag = beginLagLabel(`attach subagent watcher · task ${taskId}`, lagContext());
+  // The lag label covers ONLY actual attach work: begun at the start of a work
+  // slice, ended when the slice ends, and also ended while the slice awaits
+  // the transcript worker (`idle`). A stall is attributed to
+  // this watcher only when it overlaps a slice, never because it landed in a
+  // yield or between ticks. The monitor's sampler reports a stall on a later
+  // loop turn, but it attributes by each label's recorded [begin, end]
+  // interval, so a label disposed before the yield still names the slice that
+  // stalled the loop.
+  let endLag: (() => void) | null = null;
+  function lagBegin(): void {
+    if (endLag === null) endLag = beginLagLabel(`attach subagent watcher · task ${taskId}`, lagContext());
+  }
+  function lagEnd(): void {
+    const end = endLag;
+    endLag = null;
+    end?.();
+  }
+  /** Await `p` outside the lag label (an `await` on the worker or the database
+   *  is not main-thread work), restoring it after when a slice is active. */
+  async function idle<T>(p: Promise<T>): Promise<T> {
+    const wasActive = endLag !== null;
+    lagEnd();
     try {
-      while (!detached && !job.step(performance.now() + jobSliceMs)) await yieldToLoop();
+      return await p;
     } finally {
-      endLag();
+      if (wasActive && !detached) lagBegin();
+    }
+  }
+  /** Over-long transcript lines skipped by `dispatchTailedLines`. */
+  let tooLargeSkipped = 0;
+
+  /** Step `job` in `JOB_SLICE_MS` slices, yielding to the loop between them,
+   *  until it finishes or the watcher is detached. The lag label is held per
+   *  slice only (see above). */
+  async function runJob(job: CoopJob): Promise<void> {
+    await resolveLagRun();
+    while (!detached) {
+      let done: boolean;
+      lagBegin();
+      try {
+        done = await job.step(performance.now() + jobSliceMs);
+      } finally {
+        lagEnd();
+      }
+      if (done) return;
+      await yieldToLoop();
     }
   }
 
@@ -4284,7 +4586,7 @@ export function attachSubagentWatcher(opts: {
         timer = setTimeout(() => { timer = null; delayResolve = null; resolve(); }, FAST_POLL_MS);
       });
       if (detached) return;
-      await runJob(createCycleJob(true, Date.now));
+      await withPass(() => runJob(createCycleJob("first", Date.now)), "first");
       if (detached) return;
       firstCycleDone = true;
       resolveSettled();
@@ -4310,6 +4612,9 @@ export function attachSubagentWatcher(opts: {
       detached = true;
       if (timer) clearTimeout(timer);
       timer = null;
+      if (dirPassTimer) clearTimeout(dirPassTimer);
+      dirPassTimer = null;
+      lagEnd();
       dirWatcher?.close();
       dirWatcher = null;
       // Abort a job paused between slices / the pre-first-cycle beat, and
@@ -4326,22 +4631,25 @@ export function attachSubagentWatcher(opts: {
       // never stop the agent — other tasks (and the user's own session) share
       // the tmux server.
     },
-    pump(now?: number): void {
+    async pump(now?: number): Promise<void> {
       if (detached) return;
       const t = now ?? Date.now();
       if (opts.manual) {
-        // Tests: the seed already ran inside attach; the first pump IS the old
-        // first cycle (drained in one synchronous step, same phases, same order).
+        // Tests: the seed is awaited here; the first pump IS the old first
+        // cycle (drained in one step, same phases, same order).
+        await seedPromise;
+        if (detached) return;
         if (!firstCycleDone) {
-          createCycleJob(true, () => t).step(Infinity);
+          await withPass(() => createCycleJob("first", () => t).step(Infinity).then(() => undefined), "first");
           firstCycleDone = true;
           resolveSettled();
           return;
         }
       }
       // Production: `cycle` itself is a no-op while the seed / first cycle is
-      // pending (see the handle's `pump` doc).
-      cycle(t);
+      // pending (see the handle's `pump` doc). It queues behind a pass already
+      // running, so the cycle it awaits started after this call.
+      await cycle(t);
     },
     syncSettled(id: string, status: SubagentStatus, endedAt: number, source?: "receipt" | "inferred"): void {
       const fs = files.get(id);
@@ -4404,7 +4712,7 @@ export function attachSubagentWatcher(opts: {
     hasMonitor(id: string): boolean {
       return monitors.has(id);
     },
-    applyMonitorNotification(id: string, body: string, lineTimestampMs?: number | null): boolean {
+    applyMonitorNotification(id: string, body: string, lineTimestampMs?: number | null): Promise<boolean> {
       return applyMonitorNotification(id, body, lineTimestampMs);
     },
     hasAnyMonitor(): boolean {
@@ -4413,10 +4721,19 @@ export function attachSubagentWatcher(opts: {
   };
   watchers.set(taskId, handle);
   if (opts.manual) {
-    // Tests: seed synchronously, exactly where the old inline loop ran.
-    createSeedJob().step(Infinity);
-    seedDone = true;
-    resolveReady();
+    // Tests: the seed runs to completion without yielding (`Infinity`); `ready`
+    // resolves when it is done, and the first `pump()` waits for it.
+    seedPromise = createSeedJob()
+      .step(Infinity)
+      .then(() => {
+        seedDone = true;
+        resolveReady();
+      })
+      .catch((e: unknown) => {
+        console.error(`[claude-subagents] seed failed for task ${taskId}:`, e);
+        seedDone = true;
+        resolveReady();
+      });
   } else {
     void runProduction();
   }
@@ -4445,11 +4762,11 @@ export function attachSubagentWatcher(opts: {
  * `scanLineForToolResult`, and orphaning. See `FileState.receiptSettled`'s doc
  * for what the distinction buys.
  */
-export function settleSubagentById(
+export async function settleSubagentById(
   id: string,
   status: "completed" | "orphaned",
   source: "receipt" | "inferred" = "inferred",
-): boolean {
+): Promise<boolean> {
   return settleSubagent(id, status, 0, source);
 }
 
@@ -4477,14 +4794,14 @@ export function settleSubagentById(
  * so the orchestrator's release predicate runs a single time against a
  * fully-settled workflow instead of N+1 times with siblings still running.
  */
-function cascadeWorkflowAgents(taskId: string, container: Subagent, depth: number): void {
+async function cascadeWorkflowAgents(taskId: string, container: Subagent, depth: number): Promise<void> {
   if (!container.sourcePath) return;
   try {
-    for (const row of subagentsDb.listForTask(taskId)) {
+    for (const row of await subagentsDb.listForTask(taskId)) {
       if (row.status !== "running") continue;
       if (row.parentKind !== "workflow_agent") continue;
       if (!isInsideDir(row.sourcePath, container.sourcePath)) continue;
-      settleSubagent(row.id, "completed", depth + 1);
+      await settleSubagent(row.id, "completed", depth + 1);
     }
   } catch (e) {
     console.error(`[claude-subagents] workflow cascade failed for container ${container.id}:`, e);
@@ -4509,15 +4826,15 @@ function cascadeWorkflowAgents(taskId: string, container: Subagent, depth: numbe
  *  invariant-driven settle (the container guard in `tailFile` independently
  *  blocks a cascaded row from flipping back for as long as its container
  *  stays settled), so it doesn't need the extra receipt latch to be safe. */
-function settleSubagent(
+async function settleSubagent(
   id: string,
   status: "completed" | "orphaned",
   depth: number,
   source: "receipt" | "inferred" = "inferred",
-): boolean {
+): Promise<boolean> {
   let result: { changed: boolean; taskId: string | null };
   try {
-    result = subagentsDb.markSettledById(id, status);
+    result = await subagentsDb.markSettledById(id, status);
   } catch (e) {
     console.error(`[claude-subagents] markSettledById failed for subagent ${id}:`, e);
     return false;
@@ -4525,7 +4842,7 @@ function settleSubagent(
   if (!result.changed || !result.taskId) return false;
   const taskId = result.taskId;
   const now = Date.now();
-  const row = subagentsDb.get(id);
+  const row = await subagentsDb.get(id);
   if (row) {
     try {
       emitLifecycleForRow(row);
@@ -4537,7 +4854,7 @@ function settleSubagent(
   // Cascade BEFORE the hook (and the hook only at depth 0), so the
   // orchestrator's release predicate (`subagents.hasRunning`) runs exactly once
   // per settle event, against a workflow that is settled in full.
-  if (row?.parentKind === "workflow" && depth < 1) cascadeWorkflowAgents(taskId, row, depth);
+  if (row?.parentKind === "workflow" && depth < 1) await cascadeWorkflowAgents(taskId, row, depth);
   if (depth === 0) fireSettle(taskId);
   return true;
 }

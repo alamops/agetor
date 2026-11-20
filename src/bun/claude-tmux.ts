@@ -288,12 +288,16 @@ function activeRunProbeSafe(taskId: string): string | null {
  * again for its terminal one — the callee needs the body to tell the two
  * apart instead of treating every naming of the id as a completion receipt.
  */
-let backgroundTaskSettledFn:
-  | ((taskId: string, agentId: string, body: string, lineTimestampMs?: number | null) => void)
-  | null = null;
+type BackgroundTaskSettledFn = (
+  taskId: string,
+  agentId: string,
+  body: string,
+  lineTimestampMs?: number | null,
+) => void | Promise<void>;
+let backgroundTaskSettledFn: BackgroundTaskSettledFn | null = null;
 export function setBackgroundTaskSettledHandler(
-  fn: ((taskId: string, agentId: string, body: string, lineTimestampMs?: number | null) => void) | null,
-): ((taskId: string, agentId: string, body: string, lineTimestampMs?: number | null) => void) | null {
+  fn: BackgroundTaskSettledFn | null,
+): BackgroundTaskSettledFn | null {
   const prev = backgroundTaskSettledFn;
   backgroundTaskSettledFn = fn;
   return prev;
@@ -310,7 +314,14 @@ function fireBackgroundTaskSettled(
   lineTimestampMs: number | null = null,
 ): void {
   try {
-    backgroundTaskSettledFn?.(taskId, agentId, body, lineTimestampMs);
+    // The handler's DB work is async: the tailer does not wait for it (and its
+    // own ordering is the handler's concern), but a rejection must be logged.
+    const pending = backgroundTaskSettledFn?.(taskId, agentId, body, lineTimestampMs);
+    if (pending) {
+      void pending.catch((e: unknown) => {
+        console.error(`[claude-tmux] background-task-settled hook rejected for task ${taskId}:`, e);
+      });
+    }
   } catch (e) {
     console.error(`[claude-tmux] background-task-settled hook threw for task ${taskId}:`, e);
   }
@@ -1273,7 +1284,7 @@ export function mapJsonlEventToChunks(
  * the previous value lets that case suppress the chunk when nothing
  * actually changed.
  */
-function mapParsedEventToChunks(
+export function mapParsedEventToChunks(
   evt: ParsedJsonlEvent,
   onChunk: ChunkHandler,
   includeUuidForApiError = false,
@@ -2063,15 +2074,22 @@ function resetStallClock(state: SessionState): void {
  *  alive, so the check keeps running even when fs.watch goes quiet. Emits on
  *  the active turn's chunk handler (falling back to the last known one), the
  *  same routing `signalSessionDeath` uses. */
-function checkTurnStall(state: SessionState): void {
+async function checkTurnStall(state: SessionState): Promise<void> {
   const thresholdMs = turnStallMs();
   const quietMs = Date.now() - Math.max(state.lastJsonlAppendAt, state.stallFloorAt);
+  const inFlight = turnInFlight(state);
+  // The subagent probe (an async DB read plus a stat per running row) runs only
+  // when the outcome could depend on it: a turn in flight whose transcript has
+  // been quiet past the threshold. Same laziness as the old thunk.
+  const subagentsFresh = inFlight && quietMs >= thresholdMs
+    ? await subagentActivityWithin(state.taskId, thresholdMs)
+    : false;
   const outcome = stallTickOutcome({
-    turnInFlight: turnInFlight(state),
+    turnInFlight: inFlight,
     quietMs,
     thresholdMs,
     fired: state.stallFired,
-    subagentsFresh: () => subagentActivityWithin(state.taskId, thresholdMs),
+    subagentsFresh: () => subagentsFresh,
   });
   if (outcome === "none") return;
   if (outcome === "clear-silent") {
@@ -7999,7 +8017,11 @@ function signalSessionDeath(state: SessionState): void {
   // would otherwise hold the task in `running` forever waiting on an agent
   // that no longer exists. Release it the same way the run itself is
   // released above.
-  orphanRunningSubagents(state.taskId);
+  // Sync context (a death handler): the DB flip and the settle hook it fires
+  // need no ordering against anything after this line, so run it detached.
+  void orphanRunningSubagents(state.taskId).catch((e: unknown) => {
+    console.error(`[claude-tmux] orphaning subagents failed for task ${state.taskId}:`, e);
+  });
 }
 
 /**
@@ -8584,12 +8606,16 @@ function armPollTimer(state: SessionState, delayMs: number = POLL_FAST_MS): void
     // way, if `state.pollTimer` isn't this handle anymore, this chain is
     // stale — don't run its flush.
     if (state.pollTimer !== handle) return;
-    void flush(state).finally(() => {
+    void flush(state).finally(async () => {
       // Watchdog tick before the superseded-chain guard: a stalled session's
       // stall/resume transitions must not depend on which poll chain
       // survives a rearm race. Cheap when nothing is wrong (pure arithmetic;
       // the subagent statSync probe only runs past the threshold).
-      checkTurnStall(state);
+      try {
+        await checkTurnStall(state);
+      } catch (e) {
+        console.error(`[claude-tmux] stall check failed for task ${state.taskId}:`, e);
+      }
       if (state.pollTimer !== handle) return;
       const idleMs = Date.now() - state.lastActivityAt;
       armPollTimer(state, idleMs >= POLL_IDLE_AFTER_MS ? POLL_SLOW_MS : POLL_FAST_MS);
@@ -10782,7 +10808,7 @@ export async function dropSession(taskId: string): Promise<void> {
     // reattached). Without this the boot-armed watcher outlives the task it
     // belongs to, polling a directory that delete/archive is about to remove.
     detachWatcherFor(taskId);
-    orphanRunningSubagents(taskId);
+    await orphanRunningSubagents(taskId);
   }
   await killTaskSession(taskId);
 }
@@ -10839,7 +10865,12 @@ function disposeSessionState(state: SessionState | undefined, orphanSubagents = 
   // this stops us TAILING the subagent files, never the agent itself.
   state.subagentWatcher?.detach();
   state.subagentWatcher = null;
-  if (orphanSubagents) orphanRunningSubagents(state.taskId);
+  // Sync context (session teardown): detached, nothing after it depends on the flip.
+  if (orphanSubagents) {
+    void orphanRunningSubagents(state.taskId).catch((e: unknown) => {
+      console.error(`[claude-tmux] orphaning subagents failed for task ${state.taskId}:`, e);
+    });
+  }
   state.onEndOfTurn = null;
   state.pendingEndTurn = null;
   state.lastLocalCommandName = null;

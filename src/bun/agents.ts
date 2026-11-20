@@ -2634,7 +2634,7 @@ async function makeFakeAgent(
   const after = (ms: number, fn: () => void) => { timers.push(setTimeout(fn, ms)); };
   // `after`, but the callback also waits for `gate` (an async DB insert a
   // scenario started earlier), so the row exists before what depends on it runs.
-  const afterGated = (ms: number, gate: Promise<unknown>, fn: () => void) => {
+  const afterGated = (ms: number, gate: Promise<unknown>, fn: () => void | Promise<void>) => {
     after(ms, () => { void gate.then(fn).catch((e: unknown) => { console.error("[agents] fake driver callback failed", e); }); });
   };
   // Set only by the AGETOR_FAKE_FX_PERMISSION scenario below — `kill()`
@@ -2923,8 +2923,8 @@ async function makeFakeAgent(
         }).catch((e: unknown) => { console.error("[agents] fake subagent insert failed", e); }).finally(() => { subagentInsertDone(); });
         record.push(`subagent:spawned:${subagentId}`);
       });
-      afterGated(8 + subagentSpec.runMs, subagentInserted, () => {
-        settleSubagentById(subagentId, "completed", "receipt");
+      afterGated(8 + subagentSpec.runMs, subagentInserted, async () => {
+        await settleSubagentById(subagentId, "completed", "receipt");
         onChunk(
           "tool_result",
           JSON.stringify({ toolUseId: "fake-subagent-1", content: "delegated part done", isError: false }),
@@ -3148,14 +3148,14 @@ async function makeFakeAgent(
       onChunk("status", "turn complete");
       resolveDone(0);
     });
-    afterGated(settleMs, monitorInserted, () => {
+    afterGated(settleMs, monitorInserted, async () => {
       // Mirrors the live path's receipt settle
       // (`setBackgroundTaskSettledHandler` → `settleSubagentById(id,
       // "completed", "receipt")`) that fires when a `<task-notification>`
       // carries the monitor's terminal event — this is what flips
       // `subagents.hasRunning(taskId)` false and releases the orchestrator's
       // hold, moving the card from `running` to `review`.
-      settleSubagentById(monitorId, "completed", "receipt");
+      await settleSubagentById(monitorId, "completed", "receipt");
       record.push(`monitor:settled:${monitorId}`);
     });
   } else if (

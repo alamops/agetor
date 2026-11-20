@@ -488,7 +488,7 @@ describe("wave 3 review fixes", () => {
       stackId: stack.id, position: 0, count: 2, tried: [], pendingSwap: null, allExhausted: null, lastMove: null,
       scheduledSwitch: { requestedAt: Date.now() },
     });
-    expect(settleSubagentById(subagentId, "completed", "receipt")).toBe(true);
+    expect(await settleSubagentById(subagentId, "completed", "receipt")).toBe(true);
     await waitFor(() => db.tasks.get(task.id)?.agent === b && !orch.isTaskRunLive(task.id));
     expect(db.tasks.get(task.id)!.agent).toBe(b);
     expect(db.tasks.get(task.id)!.harnessState?.scheduledSwitch ?? null).toBeNull();
@@ -723,7 +723,7 @@ describe("a scheduled switch left waiting after its turn ended (S7)", () => {
       stackId: stack.id, position: 0, count: 2, tried: [], pendingSwap: null, allExhausted: null, lastMove: null,
       scheduledSwitch: { requestedAt: Date.now() },
     });
-    expect(settleSubagentById(subagentId, "completed", "receipt")).toBe(true);
+    expect(await settleSubagentById(subagentId, "completed", "receipt")).toBe(true);
     await waitFor(() => db.tasks.get(task.id)?.agent === b && !orch.isTaskRunLive(task.id));
     const after = db.tasks.get(task.id)!;
     expect(after.agent).toBe(b);
@@ -896,10 +896,10 @@ describe("a background agent settling inside the turn-end pump (S7 race)", () =>
     // had applied the switch there, it would hold the claim (without the
     // turn-end ordering) and the turn end could not claim it.
     let claimFreeAfterRelease: boolean | null = null;
-    const prev = orch.__setTurnSettlePumpHookForTest((hooked) => {
+    const prev = orch.__setTurnSettlePumpHookForTest(async (hooked) => {
       if (hooked !== task.id) return;
       orch.__setTurnSettlePumpHookForTest(null);
-      settleSubagentById(subagentId, "completed", "receipt");
+      await settleSubagentById(subagentId, "completed", "receipt");
       claimFreeAfterRelease = orch.claimTaskForAccountSwitch(task.id);
       if (claimFreeAfterRelease) orch.releaseTaskAccountSwitch(task.id);
     });
@@ -963,7 +963,7 @@ describe("a FAILED turn's background agents hold a scheduled switch at boot (M2,
     }
     expect((refusal as InstanceType<typeof orch.SwitchAccountRefusedError>).body.code).toBe("background-agents");
 
-    expect(settleSubagentById(subagentId, "completed", "receipt")).toBe(true);
+    expect(await settleSubagentById(subagentId, "completed", "receipt")).toBe(true);
     await waitFor(() => db.tasks.get(task.id)?.agent === b && !orch.isTaskRunLive(task.id));
     const after = db.tasks.get(task.id)!;
     expect(after.agent).toBe(b);
@@ -1125,7 +1125,7 @@ describe("waiting-switch settle edges (N1, N6)", () => {
     const subagentId = `agent-${randomUUID()}`;
     let atDrain: { agent: string; deferred: boolean } | null = null;
     const prev = orch.__setScheduledSwitchHooksForTest({
-      turnDrain: (id, runId) => {
+      turnDrain: async (id, runId) => {
         if (id !== task.id) return;
         // The turn end deferred the switch to the agent; it finishes now,
         // inside the settling window, where every other edge must wait.
@@ -1133,7 +1133,7 @@ describe("waiting-switch settle edges (N1, N6)", () => {
           agent: db.tasks.get(id)!.agent,
           deferred: db.runs.events(runId).some((e) => e.stream === "status" && e.data.includes("once the background agents finish")),
         };
-        settleSubagentById(subagentId, "completed", "receipt");
+        await settleSubagentById(subagentId, "completed", "receipt");
       },
     });
     process.env.AGETOR_FAKE_CLAUDE_TURN_MS = "500";

@@ -249,7 +249,8 @@ describe("workflow container discovery (launch line)", () => {
     setParkedDiscoveryHandler((tid) => parked.push(tid));
 
     const w = attachSubagentWatcher({ taskId, jsonlPath, manual: true });
-    w.pump(Date.now());
+    await w.ready;
+    await w.pump(Date.now());
 
     const row = subagents.get(wtaskId);
     expect(row).not.toBeNull();
@@ -289,10 +290,11 @@ describe("workflow agent discovery (agent-*.jsonl + meta.json inside the wf dir)
     setSubagentEmitter((e) => captured.push(e));
 
     const w = attachSubagentWatcher({ taskId, jsonlPath, manual: true });
+    await w.ready;
     // Cycle 1: registers the container. No agent files exist yet, so
     // `discoverWorkflowAgents` (which runs BEFORE `scanMainSignals` inside
     // one cycle) finds nothing this pass.
-    w.pump(Date.now());
+    await w.pump(Date.now());
     expect(subagents.get(wtaskId)!.parentKind).toBe("workflow");
 
     // Now the agent file appears — after the container is already known, so
@@ -304,7 +306,7 @@ describe("workflow agent discovery (agent-*.jsonl + meta.json inside the wf dir)
       sidechainUserLine(agentId, `u-${agentId}`) + sidechainToolUseLine(agentId, `t-${agentId}`),
     );
 
-    w.pump(Date.now());
+    await w.pump(Date.now());
 
     const row = subagents.get(agentId);
     expect(row).not.toBeNull();
@@ -339,7 +341,8 @@ describe("workflow agent discovery (agent-*.jsonl + meta.json inside the wf dir)
     writeFileSync(path.join(dir, `agent-${agentId}.jsonl`), sidechainUserLine(agentId, `u-${agentId}`));
 
     const w = attachSubagentWatcher({ taskId, jsonlPath, manual: true });
-    w.pump(Date.now());
+    await w.ready;
+    await w.pump(Date.now());
 
     const row = subagents.get(agentId);
     expect(row).not.toBeNull();
@@ -377,13 +380,14 @@ describe("journal.jsonl receipts settle an agent row without a terminal end_turn
     );
 
     const w = attachSubagentWatcher({ taskId, jsonlPath, manual: true });
+    await w.ready;
     const t0 = Date.now();
-    w.pump(t0);
+    await w.pump(t0);
     expect(subagents.get(agentId)!.status).toBe("running");
 
     // The harness's own completion receipt lands in the wf dir's journal.
     writeFileSync(path.join(dir, "journal.jsonl"), journalLine("started", "k1", agentId) + journalLine("result", "k1", agentId, "ok"));
-    w.pump(t0 + 1); // no DONE_IDLE_MS wait needed — the journal settle is immediate
+    await w.pump(t0 + 1); // no DONE_IDLE_MS wait needed — the journal settle is immediate
 
     const row = subagents.get(agentId)!;
     expect(row.status).toBe("completed");
@@ -410,11 +414,12 @@ describe("journal.jsonl receipts settle an agent row without a terminal end_turn
     writeFileSync(path.join(dir, `agent-${agentId}.jsonl`), sidechainUserLine(agentId, `u-${agentId}`));
 
     const w = attachSubagentWatcher({ taskId, jsonlPath, manual: true });
+    await w.ready;
     const t0 = Date.now();
-    w.pump(t0);
+    await w.pump(t0);
 
     writeFileSync(path.join(dir, "journal.jsonl"), journalLine("started", "k1", agentId));
-    w.pump(t0 + 1);
+    await w.pump(t0 + 1);
 
     expect(subagents.get(agentId)!.status).toBe("running");
 
@@ -447,13 +452,14 @@ describe("tailPastSettle: an agent settled early by its journal keeps tailing wh
     writeFileSync(path.join(dir, `agent-${agentId}.jsonl`), sidechainUserLine(agentId, `u-${agentId}`));
 
     const w = attachSubagentWatcher({ taskId, jsonlPath, manual: true });
+    await w.ready;
     const t0 = Date.now();
-    w.pump(t0); // registers container + agent
+    await w.pump(t0); // registers container + agent
 
     // Settle via journal receipt WITHOUT a terminal end_turn — the container
     // itself is untouched and stays running.
     writeFileSync(path.join(dir, "journal.jsonl"), journalLine("result", "k1", agentId, "ok"));
-    w.pump(t0 + 1);
+    await w.pump(t0 + 1);
     expect(subagents.get(agentId)!.status).toBe("completed");
     expect(subagents.get(wtaskId)!.status).toBe("running");
 
@@ -461,7 +467,7 @@ describe("tailPastSettle: an agent settled early by its journal keeps tailing wh
 
     // More of the agent's own transcript flushes late — must not be lost.
     appendFileSync(path.join(dir, `agent-${agentId}.jsonl`), sidechainEndTurnLine(agentId, `e-${agentId}`, "late text"));
-    w.pump(t0 + 2);
+    await w.pump(t0 + 2);
 
     const lateEvents = captured.filter((e) => e.subagentId === agentId);
     expect(lateEvents.length).toBeGreaterThan(0);
@@ -512,14 +518,15 @@ describe("workflow completion notification (queue-operation enqueue)", () => {
     setSubagentSettleHook((tid) => settleCalls.push(tid));
 
     const w = attachSubagentWatcher({ taskId, jsonlPath, manual: true });
+    await w.ready;
     const t0 = Date.now();
-    w.pump(t0);
+    await w.pump(t0);
     expect(subagents.get(wtaskId)!.status).toBe("running");
     expect(subagents.get(agentId)!.status).toBe("running");
     expect(settleCalls.length).toBe(0);
 
     appendFileSync(jsonlPath, notificationLine({ wtaskId, toolUseId }));
-    w.pump(t0 + 1);
+    await w.pump(t0 + 1);
 
     expect(subagents.get(wtaskId)!.status).toBe("completed");
     expect(subagents.get(agentId)!.status).toBe("completed"); // cascade
@@ -542,12 +549,13 @@ describe("workflow completion notification (queue-operation enqueue)", () => {
     writeFileSync(jsonlPath, launchLine({ wtaskId, workflowName: "kill-wf", wfRunId, transcriptDir: dir, toolUseId }));
 
     const w = attachSubagentWatcher({ taskId, jsonlPath, manual: true });
+    await w.ready;
     const t0 = Date.now();
-    w.pump(t0);
+    await w.pump(t0);
     expect(subagents.get(wtaskId)!.status).toBe("running");
 
     appendFileSync(jsonlPath, notificationLine({ wtaskId, toolUseId, status: "killed" }));
-    w.pump(t0 + 1);
+    await w.pump(t0 + 1);
 
     expect(subagents.get(wtaskId)!.status).toBe("completed");
 
@@ -573,12 +581,13 @@ describe("notification anchoring: a bare <task-id> mention is not a settle signa
     writeFileSync(jsonlPath, launchLine({ wtaskId, workflowName: "quote-wf", wfRunId, transcriptDir: dir, toolUseId }));
 
     const w = attachSubagentWatcher({ taskId, jsonlPath, manual: true });
+    await w.ready;
     const t0 = Date.now();
-    w.pump(t0);
+    await w.pump(t0);
     expect(subagents.get(wtaskId)!.status).toBe("running");
 
     appendFileSync(jsonlPath, quoteOnlyLine(wtaskId));
-    w.pump(t0 + 1);
+    await w.pump(t0 + 1);
 
     expect(subagents.get(wtaskId)!.status).toBe("running");
     expect(subagents.hasRunning(taskId)).toBe(true);
@@ -611,12 +620,13 @@ describe("replay idempotency across reattach", () => {
     writeFileSync(jsonlPath, launchLine({ wtaskId, workflowName: "replay-wf", wfRunId, transcriptDir: dir, toolUseId }));
 
     const w = attachSubagentWatcher({ taskId, jsonlPath, manual: true });
+    await w.ready;
     const t0 = Date.now();
-    w.pump(t0);
+    await w.pump(t0);
     expect(parked).toEqual([taskId]);
 
     appendFileSync(jsonlPath, notificationLine({ wtaskId, toolUseId }));
-    w.pump(t0 + 1);
+    await w.pump(t0 + 1);
     expect(subagents.get(wtaskId)!.status).toBe("completed");
 
     w.detach();
@@ -627,7 +637,8 @@ describe("replay idempotency across reattach", () => {
     // clamp applies — this replays the FULL main JSONL from offset 0 and
     // re-sees BOTH the launch line and the notification line.
     const w2 = attachSubagentWatcher({ taskId, jsonlPath, manual: true });
-    w2.pump(t0 + 2);
+    await w2.ready;
+    await w2.pump(t0 + 2);
 
     expect(subagents.get(wtaskId)!.status).toBe("completed"); // not resurrected to running
     expect(parked.length).toBe(0); // no duplicate parked-discovery fire
@@ -659,9 +670,10 @@ describe("pumpWatcherForHoldCheck", () => {
     // `manual: true` suppresses the self-scheduling poll timer entirely —
     // nothing discovers the launch line unless something pumps explicitly.
     const w = attachSubagentWatcher({ taskId, jsonlPath, manual: true });
+    await w.ready;
     writeFileSync(jsonlPath, launchLine({ wtaskId, workflowName: "hold-wf", wfRunId, transcriptDir: dir, toolUseId }));
 
-    pumpWatcherForHoldCheck(taskId);
+    await pumpWatcherForHoldCheck(taskId);
 
     const row = subagents.get(wtaskId);
     expect(row).not.toBeNull();
@@ -673,7 +685,7 @@ describe("pumpWatcherForHoldCheck", () => {
 
   test("no-ops on an unknown taskId", async () => {
     const { pumpWatcherForHoldCheck } = await import("./claude-subagents.ts");
-    expect(() => pumpWatcherForHoldCheck(`no-such-task-${randomUUID()}`)).not.toThrow();
+    await expect(pumpWatcherForHoldCheck(`no-such-task-${randomUUID()}`)).resolves.toBeUndefined();
   });
 });
 
@@ -703,7 +715,8 @@ describe("AGETOR_TRACK_WORKFLOWS=0 kill switch", () => {
     writeFileSync(path.join(dir, `agent-${agentId}.jsonl`), sidechainUserLine(agentId, `u-${agentId}`));
 
     const w = mod.attachSubagentWatcher({ taskId, jsonlPath, manual: true });
-    w.pump(Date.now());
+    await w.ready;
+    await w.pump(Date.now());
 
     expect(subagents.get(wtaskId)).toBeNull();
     expect(subagents.get(agentId)).toBeNull();
@@ -750,7 +763,8 @@ describe("REPLAY_WINDOW_BYTES clamp on attach", () => {
     writeFileSync(jsonlPath, oldLine + gap + recentLine);
 
     const w = attachSubagentWatcher({ taskId, jsonlPath, manual: true });
-    w.pump(Date.now());
+    await w.ready;
+    await w.pump(Date.now());
 
     expect(subagents.get(oldWtaskId)).toBeNull(); // outside the replay window — never seen
     const recentRow = subagents.get(recentWtaskId);
@@ -786,8 +800,9 @@ describe("W6: journal cursor rewind on late agent discovery", () => {
     const agentId = `rwagent-${randomUUID().slice(0, 8)}`;
 
     const w = attachSubagentWatcher({ taskId, jsonlPath, manual: true });
+    await w.ready;
     const t0 = Date.now();
-    w.pump(t0); // registers the container; arms this dir's journal cursor at 0
+    await w.pump(t0); // registers the container; arms this dir's journal cursor at 0
 
     // The harness's own completion receipt for `agentId` lands in the journal
     // BEFORE its own `agent-<id>.jsonl` ever becomes readdir-visible — the
@@ -796,13 +811,13 @@ describe("W6: journal cursor rewind on late agent discovery", () => {
     // doesn't exist yet in the DB, so `settleSubagentById` is a silent no-op —
     // but the journal cursor has already moved past this line.
     writeFileSync(path.join(dir, "journal.jsonl"), journalLine("result", "k1", agentId, "ok"));
-    w.pump(t0 + 1);
+    await w.pump(t0 + 1);
     expect(subagents.get(agentId)).toBeNull(); // nothing to settle yet — the row doesn't exist
 
     // The agent's transcript materializes late (readdir-visibility race).
     writeFileSync(path.join(dir, `agent-${agentId}.meta.json`), wfAgentMeta());
     writeFileSync(path.join(dir, `agent-${agentId}.jsonl`), sidechainUserLine(agentId, `u-${agentId}`));
-    w.pump(t0 + 2);
+    await w.pump(t0 + 2);
 
     // `discoverWorkflowAgents` rewound this dir's journal cursor back to 0 the
     // moment it registered the new file, so the already-consumed receipt was
@@ -843,8 +858,9 @@ describe("W7: settle-on-discovery under an already-settled container", () => {
     writeFileSync(jsonlPath, launchLine({ wtaskId, workflowName: "late-wf", wfRunId, transcriptDir: dir, toolUseId }));
 
     const w = attachSubagentWatcher({ taskId, jsonlPath, manual: true });
+    await w.ready;
     const t0 = Date.now();
-    w.pump(t0);
+    await w.pump(t0);
     expect(parked).toEqual([taskId]);
     expect(subagents.hasRunning(taskId)).toBe(true);
 
@@ -853,7 +869,7 @@ describe("W7: settle-on-discovery under an already-settled container", () => {
     // pins is: nothing under a settled container may ever read as running,
     // including a row discovered after the fact.
     appendFileSync(jsonlPath, notificationLine({ wtaskId, toolUseId }));
-    w.pump(t0 + 1);
+    await w.pump(t0 + 1);
     expect(subagents.get(wtaskId)!.status).toBe("completed");
     expect(subagents.hasRunning(taskId)).toBe(false);
     parked.length = 0;
@@ -864,7 +880,7 @@ describe("W7: settle-on-discovery under an already-settled container", () => {
     const agentId = `lateagent-${randomUUID().slice(0, 8)}`;
     writeFileSync(path.join(dir, `agent-${agentId}.meta.json`), wfAgentMeta());
     writeFileSync(path.join(dir, `agent-${agentId}.jsonl`), sidechainUserLine(agentId, `u-${agentId}`));
-    w.pump(t0 + 2);
+    await w.pump(t0 + 2);
 
     const row = subagents.get(agentId)!;
     expect(row).not.toBeNull();
@@ -899,8 +915,8 @@ describe("W7: settle-on-discovery under an already-settled container", () => {
     // backstop is what would otherwise re-tail it, finding nothing new).
     captured.length = 0;
     parked.length = 0;
-    w.pump(t0 + 3);
-    w.pump(t0 + 4);
+    await w.pump(t0 + 3);
+    await w.pump(t0 + 4);
     expect(subagents.get(agentId)!.status).toBe("completed");
     expect(subagents.hasRunning(taskId)).toBe(false);
     expect(parked.length).toBe(0);

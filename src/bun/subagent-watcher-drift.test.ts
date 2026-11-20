@@ -41,7 +41,9 @@ process.env.AGETOR_DATA_DIR = DATA_DIR;
 // never touch the live sqlite.
 const FIXTURE_DIR = mkdtempSync(path.join(tmpdir(), "agetor-drift-fixture-"));
 
-const MAX_GAP_MS = 150;
+/** The bar: no loop gap over 100 ms, or 3x the idle-loop gap measured in the
+ *  same run when the machine itself is that slow (`budgetFor`). */
+const MAX_GAP_MS = 100;
 const SAMPLE_MS = 5;
 
 const TASK_ID = `task-drift-${randomUUID()}`;
@@ -113,6 +115,17 @@ function startGapSampler() {
       return Math.max(max, onCpuGap(performance.now()));
     },
   };
+}
+
+/** Longest gap of an idle loop right now, so a heavily loaded machine does not
+ *  turn its own jitter into a failure: the budget is `max(100, 3 x baseline)`. */
+async function measureBaselineGap(): Promise<number> {
+  const s = startGapSampler();
+  await Bun.sleep(400);
+  return s.stop();
+}
+function budgetFor(baseline: number): number {
+  return Math.max(MAX_GAP_MS, 3 * baseline);
 }
 
 async function waitFor(pred: () => boolean, timeoutMs: number, what: string): Promise<void> {
@@ -258,6 +271,8 @@ test(
     expect(subBefore).toBe(SUB_COUNT * SEEDED_EVENTS_PER_SUB);
     expect(totalBefore).toBe(SUB_COUNT * SEEDED_EVENTS_PER_SUB + MAIN_EVENT_COUNT);
 
+    const baseline = await measureBaselineGap();
+    const budget = budgetFor(baseline);
     const sampler = startGapSampler();
     const attachedAt = performance.now();
     // Timer mode on purpose (`manual` unset): this is the production code path.
@@ -276,11 +291,11 @@ test(
     const maxGap = sampler.stop();
     console.log(
       `[drift] ready ${readyMs.toFixed(0)} ms, settled ${settledMs.toFixed(0)} ms, ` +
-        `max loop gap ${maxGap.toFixed(1)} ms on-CPU / ${sampler.wallMax.toFixed(1)} ms wall (budget ${MAX_GAP_MS} ms)`,
+        `baseline gap ${baseline.toFixed(1)} ms, max loop gap ${maxGap.toFixed(1)} ms on-CPU / ${sampler.wallMax.toFixed(1)} ms wall (budget ${budget.toFixed(1)} ms)`,
     );
     handle.detach();
 
-    expect(maxGap).toBeLessThan(MAX_GAP_MS);
+    expect(maxGap).toBeLessThanOrEqual(budget);
 
     // The first pass replayed every transcript from offset 0: the 2200 seeded
     // uuids per file must dedupe through the task-scoped seen-set, so only the
@@ -314,6 +329,8 @@ test(
     const runningId = subIds[7]!;
     subagents.setStatus(runningId, "running", null);
 
+    const baseline = await measureBaselineGap();
+    const budget = budgetFor(baseline);
     const sampler = startGapSampler();
     const t0 = performance.now();
     try {
@@ -323,9 +340,9 @@ test(
       detachWatcherFor(TASK_ID); // before the first cycle (600 ms later) starts replaying 180 MB
       console.log(
         `[drift] reconcileOrphans (re-arm) took ${(performance.now() - t0).toFixed(0)} ms, ` +
-          `max loop gap ${maxGap.toFixed(1)} ms on-CPU / ${sampler.wallMax.toFixed(1)} ms wall (budget ${MAX_GAP_MS} ms)`,
+          `baseline ${baseline.toFixed(1)} ms, max loop gap ${maxGap.toFixed(1)} ms on-CPU / ${sampler.wallMax.toFixed(1)} ms wall (budget ${budget.toFixed(1)} ms)`,
       );
-      expect(maxGap).toBeLessThan(MAX_GAP_MS);
+      expect(maxGap).toBeLessThanOrEqual(budget);
     }
 
     // Re-armed, not orphaned: the orphan path would have flipped the row.

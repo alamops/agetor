@@ -143,7 +143,8 @@ test("manual mode: a transcript spanning many chunks is ingested exactly once â€
   expect(huge.length).toBeGreaterThan(CHUNK * 10);
 
   const w = attachSubagentWatcher({ taskId, jsonlPath, manual: true });
-  w.pump(Date.now());
+  await w.ready;
+  await w.pump(Date.now());
   await expectExactlyOnce(taskId, agentId, [...uuids("c1", 40), "c1-huge", ...uuids("c1", 10, 40)]);
   const hugeRow = (await subagentEvents(taskId, agentId)).find((r) => r.line_uuid === "c1-huge")!;
   expect(hugeRow.data.includes("æ—¥æœ¬èªž".repeat(2000))).toBe(true);
@@ -156,10 +157,10 @@ test("manual mode: a transcript spanning many chunks is ingested exactly once â€
   expect((tailBytes[cut]! & 0xc0) === 0x80).toBe(true); // a UTF-8 continuation byte
   appendFileSync(file, sidechainLines("c1", 30, 50));
   appendFileSync(file, tailBytes.subarray(0, cut));
-  w.pump(Date.now());
+  await w.pump(Date.now());
   await expectExactlyOnce(taskId, agentId, [...uuids("c1", 40), "c1-huge", ...uuids("c1", 40, 40)]);
   appendFileSync(file, tailBytes.subarray(cut));
-  w.pump(Date.now());
+  await w.pump(Date.now());
   await expectExactlyOnce(taskId, agentId, [...uuids("c1", 40), "c1-huge", ...uuids("c1", 40, 40), "c1-tail"]);
   w.detach();
 });
@@ -172,7 +173,8 @@ test("manual mode: a transcript that is one single line longer than a chunk is i
   writeFileSync(path.join(subagentsDir, `agent-${agentId}.jsonl`), sidechainLine("c2-only", "z".repeat(50_000)) + "\n");
 
   const w = attachSubagentWatcher({ taskId, jsonlPath, manual: true });
-  w.pump(Date.now());
+  await w.ready;
+  await w.pump(Date.now());
   await expectExactlyOnce(taskId, agentId, ["c2-only"]);
   w.detach();
 });

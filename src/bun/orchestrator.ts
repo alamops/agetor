@@ -817,9 +817,11 @@ setLocalSettingChangedHandler((taskId, info) => {
 // its completion, so a `monitor` row settles only on a terminal receipt and
 // records everything else as activity. Tolerant by design: an id matching no
 // row, or a duplicate fired again on reattach replay, is a no-op.
-setBackgroundTaskSettledHandler((taskId, agentId, body, lineTimestampMs) => {
-  handleBackgroundTaskNotification(taskId, agentId, body, lineTimestampMs);
-});
+setBackgroundTaskSettledHandler((taskId, agentId, body, lineTimestampMs) =>
+  // Returns the promise: the claude-tmux dispatch does not wait for it but logs
+  // a rejection, and tests await it.
+  handleBackgroundTaskNotification(taskId, agentId, body, lineTimestampMs),
+);
 
 /**
  * Subscribe to the app-wide lifecycle stream — terminal run-status
@@ -1649,7 +1651,7 @@ export async function reconcileOrphans(): Promise<number> {
           released++;
         }
       } else {
-        orphanRunningSubagents(heldId);
+        await orphanRunningSubagents(heldId);
         released++;
       }
       continue;
@@ -1668,7 +1670,7 @@ export async function reconcileOrphans(): Promise<number> {
         // ever observe these agents finishing. Treat it exactly like a dead
         // session and release, rather than leaving the card held forever.
         if (!run?.claudeSessionId) {
-          orphanRunningSubagents(heldId);
+          await orphanRunningSubagents(heldId);
           released++;
           continue;
         }
@@ -1687,7 +1689,7 @@ export async function reconcileOrphans(): Promise<number> {
         // Session gone: no watcher could ever observe these agents finishing, so
         // flip the rows now. `orphanRunningSubagents` fires the settle hook →
         // `maybeReleaseHeldTask` → the card advances to `review`.
-        orphanRunningSubagents(heldId);
+        await orphanRunningSubagents(heldId);
         released++;
       }
       continue;
@@ -1705,7 +1707,7 @@ export async function reconcileOrphans(): Promise<number> {
     if (await sessionExistsByName(sessionNameFor(heldId))) {
       const run = task.runId ? runs.get(task.runId) : null;
       if (!run?.claudeSessionId) {
-        orphanRunningSubagents(heldId);
+        await orphanRunningSubagents(heldId);
         released++;
         continue;
       }
@@ -1723,7 +1725,7 @@ export async function reconcileOrphans(): Promise<number> {
       // isn't `running`), so this only clears the stale subagent rows — it
       // does not move the card, which is already sitting wherever the user
       // (or the earlier normal completion) left it.
-      orphanRunningSubagents(heldId);
+      await orphanRunningSubagents(heldId);
       released++;
     }
   }
@@ -5379,7 +5381,7 @@ async function settleHarnessLimitInClaim(
   }
   const abandoned = subagents.runningCountForTask(taskId);
   if (abandoned > 0) {
-    orphanRunningSubagents(taskId);
+    await orphanRunningSubagents(taskId);
     saveStatusLineQuietly(
       runId,
       taskId,
@@ -6242,7 +6244,7 @@ function attachDoneHandler(
         // already on disk and makes the hold decision deterministic.
         try {
           turnSettlePumpHook?.(taskId, runId);
-          pumpWatcherForHoldCheck(taskId);
+          await pumpWatcherForHoldCheck(taskId);
         } catch {
           // Belt-and-braces: the callee already swallows its own errors, but a
           // watcher problem must never derail run settlement.
@@ -6798,7 +6800,7 @@ export async function reconcileTaskSession(
         // never landed) would otherwise hold the card forever under the next
         // harness: the claude watcher skips `copilot_subagent` rows and
         // `subagents.hasRunning` is task-wide.
-        orphanRunningSubagents(taskId);
+        await orphanRunningSubagents(taskId);
       }
       else if (beforeKind === "fx") dropFxSession(taskId); // fx has no tmux session — stays sync
       // Same reasoning for a pending fx auto-resume schedule: it belongs to
@@ -8127,7 +8129,7 @@ async function stopHeldTask(taskId: string, reason: string): Promise<void> {
   // `enqueueArchiveTeardown`'s kill-before-teardown discipline. Awaited here
   // rather than left as a bare call now that `interruptTaskSession` is async.
   await interruptTaskSession(taskId);
-  orphanRunningSubagents(taskId);
+  await orphanRunningSubagents(taskId);
 }
 
 export async function cancelRun(runId: string): Promise<boolean> {

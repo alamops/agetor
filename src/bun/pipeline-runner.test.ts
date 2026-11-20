@@ -3323,7 +3323,7 @@ test("M-R3: a step held by background subagents stays active (not advanced) unti
     // The last helper settles → `maybeReleaseHeldTask` releases the card
     // to `review` → the runner's `review` column branch performs the real
     // advance off the (already succeeded) run row.
-    expect(settleSubagentById(helperId, "completed", "receipt")).toBe(true);
+    expect(await settleSubagentById(helperId, "completed", "receipt")).toBe(true);
     const done = await waitFor(() => {
       const t = tasks.get(parentId);
       return t?.pipelineRun?.status === "done" ? t : undefined;

@@ -103,19 +103,19 @@ function freshSession() {
   return { taskId, jsonlPath, state };
 }
 
-test("checkTurnStall: fires the sentinel once on a quiet in-flight turn, resumes on activity", () => {
+test("checkTurnStall: fires the sentinel once on a quiet in-flight turn, resumes on activity", async () => {
   process.env.AGETOR_TURN_STALL_MS = "50";
   const { taskId, state } = freshSession();
   const rec = recorder();
   void __forTest.pushTurnSlot(state, rec.onChunk);
 
   // Fresh turn — quiet clock floored at install time, still under threshold.
-  __forTest.checkTurnStall(state);
+  await __forTest.checkTurnStall(state);
   expect(rec.out).toHaveLength(0);
 
   // Age the clock past the threshold.
   state.stallFloorAt = Date.now() - 60;
-  __forTest.checkTurnStall(state);
+  await __forTest.checkTurnStall(state);
   expect(rec.out).toHaveLength(1);
   expect(rec.out[0]!.stream).toBe("status");
   expect(rec.out[0]!.data.startsWith(TURN_STALLED_STATUS_PREFIX)).toBe(true);
@@ -123,55 +123,55 @@ test("checkTurnStall: fires the sentinel once on a quiet in-flight turn, resumes
   expect(rec.out[0]!.data).toContain(state.sessionName);
 
   // Latched — a second tick on the same stall stays quiet.
-  __forTest.checkTurnStall(state);
+  await __forTest.checkTurnStall(state);
   expect(rec.out).toHaveLength(1);
 
   // Transcript activity returns (what `flush` stamps on real appended
   // bytes) → one resume sentinel, then quiet again.
   state.lastJsonlAppendAt = Date.now();
-  __forTest.checkTurnStall(state);
+  await __forTest.checkTurnStall(state);
   expect(rec.out).toHaveLength(2);
   expect(rec.out[1]!.data.startsWith(TURN_STALL_RESUMED_STATUS_PREFIX)).toBe(true);
-  __forTest.checkTurnStall(state);
+  await __forTest.checkTurnStall(state);
   expect(rec.out).toHaveLength(2);
 
   __forTest.uninstallSession(taskId);
 });
 
-test("checkTurnStall: includes the last scraped pane lines when available", () => {
+test("checkTurnStall: includes the last scraped pane lines when available", async () => {
   process.env.AGETOR_TURN_STALL_MS = "1";
   const { taskId, state } = freshSession();
   const rec = recorder();
   void __forTest.pushTurnSlot(state, rec.onChunk);
   state.stallFloorAt = Date.now() - 10;
   state.scrapeLastPaneText = "Set up auto mode for your environment?\n  Continue\n  Esc to cancel";
-  __forTest.checkTurnStall(state);
+  await __forTest.checkTurnStall(state);
   expect(rec.out).toHaveLength(1);
   expect(rec.out[0]!.data).toContain("last screen:");
   expect(rec.out[0]!.data).toContain("Set up auto mode");
   __forTest.uninstallSession(taskId);
 });
 
-test("checkTurnStall: a turn that ends while marked unlatches silently, and an idle session never fires", () => {
+test("checkTurnStall: a turn that ends while marked unlatches silently, and an idle session never fires", async () => {
   process.env.AGETOR_TURN_STALL_MS = "1";
   const { taskId, state } = freshSession();
   const rec = recorder();
   void __forTest.pushTurnSlot(state, rec.onChunk);
   state.stallFloorAt = Date.now() - 10;
-  __forTest.checkTurnStall(state);
+  await __forTest.checkTurnStall(state);
   expect(rec.out).toHaveLength(1);
 
   // Turn settles (what popEndOfTurn does to the queue) — the next tick must
   // reset the latch WITHOUT emitting a resume banner after the fact.
   const slot = state.turnQueue.shift()!;
   slot.resolve?.(0);
-  __forTest.checkTurnStall(state);
+  await __forTest.checkTurnStall(state);
   expect(rec.out).toHaveLength(1);
   expect(state.stallFired).toBe(false);
 
   // Idle session (no turn in flight), however quiet — never fires.
   state.stallFloorAt = Date.now() - 60_000;
-  __forTest.checkTurnStall(state);
+  await __forTest.checkTurnStall(state);
   expect(rec.out).toHaveLength(1);
 
   __forTest.uninstallSession(taskId);
@@ -205,21 +205,21 @@ function seedSubagent(taskId: string, opts: { status: "running" | "completed"; m
   });
 }
 
-test("subagentActivityWithin: fresh running subagent → true; stale or settled → false", () => {
+test("subagentActivityWithin: fresh running subagent → true; stale or settled → false", async () => {
   const freshTask = seedTask();
   seedSubagent(freshTask, { status: "running", mtimeAgoMs: 0 });
-  expect(subagentActivityWithin(freshTask, 60_000)).toBe(true);
+  expect(await subagentActivityWithin(freshTask, 60_000)).toBe(true);
 
   const staleTask = seedTask();
   seedSubagent(staleTask, { status: "running", mtimeAgoMs: 120_000 });
-  expect(subagentActivityWithin(staleTask, 60_000)).toBe(false);
+  expect(await subagentActivityWithin(staleTask, 60_000)).toBe(false);
 
   // A settled subagent's file may be fresh (it just finished writing) but it
   // isn't ongoing work — must not veto.
   const settledTask = seedTask();
   seedSubagent(settledTask, { status: "completed", mtimeAgoMs: 0 });
-  expect(subagentActivityWithin(settledTask, 60_000)).toBe(false);
+  expect(await subagentActivityWithin(settledTask, 60_000)).toBe(false);
 
   // No rows at all.
-  expect(subagentActivityWithin(randomUUID(), 60_000)).toBe(false);
+  expect(await subagentActivityWithin(randomUUID(), 60_000)).toBe(false);
 });

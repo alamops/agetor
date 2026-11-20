@@ -393,11 +393,11 @@ test("the Claude subagent watcher never seeds opencode_subagent rows", async () 
   const dir = mkdtempSync(path.join(tmpdir(), "agetor-ocsub-watch-"));
   const handle = attachSubagentWatcher({ taskId, jsonlPath: path.join(dir, "session.jsonl"), manual: true });
   await handle.ready;
-  handle.pump();
+  await handle.pump();
   await handle.settled;
   // Untouched: still running, still pointing at its pseudo path.
   expect(row(child)).toMatchObject({ status: "running", sourcePath: `opencode-session:${child}` });
-  expect(subagentActivityWithin(taskId, 60_000)).toBe(false);
+  expect(await subagentActivityWithin(taskId, 60_000)).toBe(false);
   handle.detach();
 });
 

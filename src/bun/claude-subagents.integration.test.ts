@@ -128,8 +128,9 @@ test.skipIf(!HAVE_REAL)(
 
     // Drive the real watcher exactly as attachTailer does, then settle it.
     const w = attachSubagentWatcher({ taskId, jsonlPath, manual: true });
-    w.pump(Date.now());            // discover + tail real transcripts
-    w.pump(Date.now() + 60_000);   // idle past the done threshold → completed
+    await w.ready;
+    await w.pump(Date.now());            // discover + tail real transcripts
+    await w.pump(Date.now() + 60_000);   // idle past the done threshold → completed
 
     // 1) HTTP snapshot route returns every real subagent with its meta label.
     const snap = await authed(`/tasks/${taskId}/subagents`);

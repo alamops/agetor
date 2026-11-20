@@ -171,7 +171,7 @@ test("RC1: a task-notification line already on disk is adopted by the release dr
 
     // The subagent watcher wins the race: it settles the last running
     // subagent, which reaches `maybeReleaseHeldTask` via the settle hook.
-    expect(settleSubagentById(f.subagentId, "completed", "receipt")).toBe(true);
+    expect(await settleSubagentById(f.subagentId, "completed", "receipt")).toBe(true);
     expect(subagents.hasRunning(f.taskId)).toBe(false);
 
     // The drain dispatched the line first: the continuation is adopted and is
@@ -205,7 +205,7 @@ test("RC1 negative: with no notification line on disk the release still goes to 
     if ("taskId" in e && e.taskId === f.taskId) events.push(e);
   });
   try {
-    expect(settleSubagentById(f.subagentId, "completed", "receipt")).toBe(true);
+    expect(await settleSubagentById(f.subagentId, "completed", "receipt")).toBe(true);
     expect(subagents.hasRunning(f.taskId)).toBe(false);
 
     const task = tasks.get(f.taskId)!;
