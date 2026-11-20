@@ -83,6 +83,26 @@ db.exec("PRAGMA journal_mode = WAL;");
 db.exec("PRAGMA synchronous = NORMAL;");
 db.exec("PRAGMA foreign_keys = ON;");
 
+/** Page-cache ceiling, in KiB (a negative `cache_size` is KiB, not pages). */
+export const DB_CACHE_SIZE_KIB = 64 * 1024;
+/** Most of the database file SQLite reads through a memory map. */
+export const DB_MMAP_SIZE_BYTES = 256 * 1024 * 1024;
+// Read-side tuning (docs/architecture/persistence.md). SQLite's default page
+// cache is ~2,000 pages (≈8 MB) against a multi-GB file whose `tasks` table
+// alone runs tens of MB (rows of ~10 KB spill into overflow pages), so every
+// full task-list read evicted the pages the previous one loaded and re-read
+// them with `pread` on the core's only thread: measured on a 4.6 GB owner DB,
+// the 3,363-row list took ~1 s at the default and ~0.22 s with both settings
+// below. `cache_size` is a ceiling, so memory grows only with pages actually
+// touched. `mmap_size` serves reads from the OS file cache without the extra
+// copy, and macOS reclaims those pages under pressure; the trade-off is that
+// a disk read error surfaces as a crash (SIGBUS) rather than SQLITE_IOERR.
+// `temp_store = MEMORY` keeps the list's GROUP BY / ORDER BY scratch b-trees
+// off disk.
+db.exec(`PRAGMA cache_size = -${DB_CACHE_SIZE_KIB};`);
+db.exec(`PRAGMA mmap_size = ${DB_MMAP_SIZE_BYTES};`);
+db.exec("PRAGMA temp_store = MEMORY;");
+
 const applied = migrate(db, migrations);
 if (applied.length) console.log(`[agetor] applied migrations: ${applied.join(", ")}`);
 
