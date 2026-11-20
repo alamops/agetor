@@ -172,9 +172,12 @@ export const USAGE: Record<string, string> = {
 
   Move a task between columns (mark done = move <id> done).`,
 
-  archive: `usage: agetor archive <task-id>
+  archive: `usage: agetor archive <task-id> [--discard-changes]
 
-  Archive a done task (unarchive <id> to restore).`,
+  Archive a done task (unarchive <id> to restore). Archiving removes the
+  task's worktree; its branch and commits are kept. When the worktree has
+  uncommitted changes the archive is refused, unless --discard-changes says
+  to throw them away.`,
 
   unarchive: `usage: agetor unarchive <task-id>
 

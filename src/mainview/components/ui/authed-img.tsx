@@ -35,8 +35,10 @@ export type AuthedImgProps = Omit<React.ImgHTMLAttributes<HTMLImageElement>, "sr
   /** The token-less core URL (`api.filePreviewUrl(…)` and friends). */
   url: string;
   /** Called once per settled outcome for `url` (`ok` / `missing` /
-   *  `too-large` / `error`) — never for `loading`. A decode failure of the
-   *  fetched bytes reports `error`. */
+   *  `too-large` / `denied` / `error`) — never for `loading`. `denied` is a
+   *  403: the core could not read the file (on macOS, a privacy-protected
+   *  folder), which says nothing about whether it exists. A decode failure of
+   *  the fetched bytes reports `error`. */
   onStatus?: (status: Exclude<AuthedBlobStatus, "loading">) => void;
   /** Rendered in place of the image until it is `ok` (default: nothing). */
   placeholder?: React.ReactNode;

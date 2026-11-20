@@ -38,3 +38,29 @@ test("coalesce: a second set before consume overwrites the first", () => {
   setPendingOpenTask("b");
   expect(consumePendingOpenTask()).toBe("b");
 });
+
+// The native-menu slot shares the 10 s TTL and the consume-clears rule.
+import { consumePendingMenuAction, setPendingMenuAction } from "./pending-open.ts";
+
+test("menu action: set then consume returns it, and consume clears", () => {
+  consumePendingMenuAction();
+  setPendingMenuAction("git");
+  expect(consumePendingMenuAction()).toBe("git");
+  expect(consumePendingMenuAction()).toBeNull();
+});
+
+test("menu action: exactly at the TTL is deliverable, one ms past is dropped", () => {
+  setPendingMenuAction("settings", 1000);
+  expect(consumePendingMenuAction(1000 + PENDING_OPEN_TTL_MS)).toBe("settings");
+  setPendingMenuAction("settings", 1000);
+  expect(consumePendingMenuAction(1000 + PENDING_OPEN_TTL_MS + 1)).toBeNull();
+});
+
+test("menu action: a second set before consume replaces the first, and the open-task slot is separate", () => {
+  consumePendingMenuAction();
+  setPendingMenuAction("git");
+  setPendingMenuAction("worktrees");
+  setPendingOpenTask("t9");
+  expect(consumePendingMenuAction()).toBe("worktrees");
+  expect(consumePendingOpenTask()).toBe("t9");
+});

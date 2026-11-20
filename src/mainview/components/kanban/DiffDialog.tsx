@@ -1019,6 +1019,9 @@ function BinaryDiffPreview({ taskId, repo, file }: { taskId: string | null; repo
         fileName={binaryFileBasename(file.path)}
         oldUrl={oldUrl}
         newUrl={newUrl}
+        // The task's own diff reads files from this machine's disk, so a 403
+        // is the core being blocked by macOS privacy, not a git-host refusal.
+        localFiles
       />
     </div>
   );

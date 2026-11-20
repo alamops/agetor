@@ -22,12 +22,14 @@
 //     `useSyncExternalStore`.
 //
 // The status vocabulary replaces the old `api.probeBlobStatus` re-probe: the
-// hook already saw the response, so a 404 is "missing" and a 413 is
-// "too-large" without a second request.
+// hook already saw the response, so a 404 is "missing", a 413 is "too-large"
+// and a 403 is "denied" (the core could not read the file — on macOS, a
+// privacy-protected folder) without a second request. Only "missing" proves the
+// file is gone; every other failure leaves the file openable.
 import { useCallback, useSyncExternalStore } from "react";
 import { authedFetch } from "./api.ts";
 
-export type AuthedBlobStatus = "loading" | "ok" | "missing" | "too-large" | "error";
+export type AuthedBlobStatus = "loading" | "ok" | "missing" | "too-large" | "denied" | "error";
 
 export interface AuthedBlobState {
   /** `blob:` object URL once `status === "ok"`, otherwise `null`. */
@@ -42,10 +44,11 @@ export const REVOKE_GRACE_MS = 30_000;
  *  snapshot `useSyncExternalStore` needs before a subscription exists. */
 export const LOADING_STATE: AuthedBlobState = Object.freeze({ src: null, status: "loading" });
 
-/** Maps a non-2xx status to the pane vocabulary (404 / 413 / everything else). */
+/** Maps a non-2xx status to the pane vocabulary (404 / 413 / 403 / everything else). */
 export function statusForHttp(status: number): Exclude<AuthedBlobStatus, "loading" | "ok"> {
   if (status === 404) return "missing";
   if (status === 413) return "too-large";
+  if (status === 403) return "denied";
   return "error";
 }
 

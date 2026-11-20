@@ -345,8 +345,14 @@ export class AgetorClient {
   retryOpencodeSessionImport(taskId: string): Promise<{ ok: true }> {
     return this.req("POST", `/tasks/${encodeURIComponent(taskId)}/opencode-session/retry`, undefined, CLONE_TIMEOUT_MS);
   }
-  archiveTask(id: string): Promise<Task> {
-    return this.req("POST", `/tasks/${encodeURIComponent(id)}/archive`);
+  /** `forceWorktree` discards uncommitted changes in the worktree; without it
+   *  a dirty worktree makes the core answer 409 `ArchiveUncommittedChanges`. */
+  archiveTask(id: string, opts: { forceWorktree?: boolean } = {}): Promise<Task> {
+    return this.req(
+      "POST",
+      `/tasks/${encodeURIComponent(id)}/archive`,
+      opts.forceWorktree ? { forceWorktree: true } : undefined,
+    );
   }
   unarchiveTask(id: string): Promise<Task> {
     return this.req("POST", `/tasks/${encodeURIComponent(id)}/unarchive`);

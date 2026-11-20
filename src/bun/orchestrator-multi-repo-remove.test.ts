@@ -646,6 +646,39 @@ test("a start that arrives while a removal is detaching waits for it and prepare
   }
 });
 
+// ── archive with uncommitted changes ────────────────────────────────────
+
+test("archive of a multi task names the dirty repository and changes nothing; a confirmed archive removes every checkout", async () => {
+  const { archiveTask } = await import("./orchestrator.ts");
+  const { tasks } = await import("./db.ts");
+  const a = await makeRepo("frontend");
+  const b = await makeRepo("backend");
+  let id = "";
+  try {
+    const task = await materialize(await createMulti("archive dirty repo", [a, b]));
+    id = task.id;
+    const [dirty, clean] = task.repositories!;
+    writeFileSync(path.join(dirty!.worktreePath!, "wip.txt"), "uncommitted\n");
+
+    const refused = await archiveTask(id, { awaitTeardown: true });
+    expect(refused).toMatchObject({ code: "uncommitted-changes", repositories: [dirty!.name] });
+    expect((refused as { error: string }).error).toContain(`uncommitted changes in ${dirty!.name}`);
+    expect(tasks.get(id)!.archivedAt).toBeNull();
+    expect(existsSync(path.join(dirty!.worktreePath!, "wip.txt"))).toBe(true);
+    expect(existsSync(clean!.worktreePath!)).toBe(true);
+
+    const archived = await archiveTask(id, { awaitTeardown: true, forceWorktree: true });
+    if ("error" in archived) throw new Error(archived.error);
+    expect(tasks.get(id)!.archivedAt).not.toBeNull();
+    expect(existsSync(dirty!.worktreePath!)).toBe(false);
+    expect(existsSync(clean!.worktreePath!)).toBe(false);
+    expect(await branchExists(a, dirty!.branch!)).toBe(true);
+    expect(await branchExists(b, clean!.branch!)).toBe(true);
+  } finally {
+    cleanup(id ? await workspaceOf(id) : undefined, a, b);
+  }
+});
+
 // ── teardown with a deleted source repository ───────────────────────────
 
 test("archive of a multi task whose first source repository was deleted detaches the other and reaches archived", async () => {

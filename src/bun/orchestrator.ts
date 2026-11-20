@@ -292,6 +292,7 @@ import {
   resolveWorktreeRef,
   removeWorktree,
   detachWorktree,
+  findUncommittedCheckouts,
   repoRoot,
   resolveRef,
   resolveBaseRefAndBranch,
@@ -345,8 +346,9 @@ import type {
   WorktreeInfo,
   WorktreeStaleReason,
   WorktreeTeardownResult,
+  ArchiveUncommittedChanges,
 } from "../shared/types.ts";
-import { CONTINUATION_STATUS_TEXT, WORKTREE_STALE_AFTER_MS } from "../shared/types.ts";
+import { ARCHIVE_UNCOMMITTED_CHANGES_CODE, CONTINUATION_STATUS_TEXT, WORKTREE_STALE_AFTER_MS } from "../shared/types.ts";
 import { CLAUDE_AUTO_TRUST_PREF, isClaudeAutoTrustOn } from "../shared/claude-auto-trust.ts";
 import type { AutoTrustDirectory } from "./claude-prompt-screens.ts";
 import {
@@ -13327,11 +13329,14 @@ function enqueueArchiveTeardown(
  * before the already-archived return and before any later await, so a submit
  * during cascade or teardown cannot race it.
  *
- * Pass `{ forceWorktree: true }` to have the detach discard uncommitted
- * changes in the checkout rather than leaving it in place (threaded straight
- * through to `detachWorktree`'s `force` option) — an explicit, user-confirmed
- * opt-in from the Worktrees page, since it's a destructive, unrecoverable
- * discard of anything not committed.
+ * Archive always removes the worktree. When a checkout holds uncommitted
+ * changes (or its status can't be read), the archive is refused before
+ * anything changes, with `code: "uncommitted-changes"` and the affected
+ * repositories (`ArchiveUncommittedChanges`), so every client asks the user
+ * first. Pass `{ forceWorktree: true }` once they have confirmed: the detach
+ * then discards those changes (threaded straight through to
+ * `detachWorktree`'s `force` option), a destructive, unrecoverable discard of
+ * anything not committed. Committed work survives on the kept branch.
  *
  * Pass `{ awaitTeardown: true }` to block until the deferred teardown above
  * has actually run and get its real `WorktreeTeardownResult` back as
@@ -13342,7 +13347,7 @@ function enqueueArchiveTeardown(
 export async function archiveTask(
   taskId: string,
   opts?: { force?: boolean; stopRun?: boolean; forceWorktree?: boolean; awaitTeardown?: boolean; fromPipeline?: boolean },
-): Promise<{ task: Task; teardown?: WorktreeTeardownResult } | { error: string }> {
+): Promise<{ task: Task; teardown?: WorktreeTeardownResult } | { error: string } | ArchiveUncommittedChanges> {
   const task = tasks.get(taskId);
   if (!task) return { error: "task not found" };
   // Pipeline step tasks can't be archived individually (D9, docs/plans/pipelines.md)
@@ -13370,6 +13375,24 @@ export async function archiveTask(
   // the Stop button does before proceeding.
   if (task.runId && active.has(task.runId) && !opts?.stopRun) {
     return { error: "task is still running — cancel the run before archiving" };
+  }
+  // Archive removes the worktree, so uncommitted work in it would be lost:
+  // refuse until the caller confirms (`forceWorktree`). Checked before any
+  // state changes, so a refusal leaves the task, its run and its cards as
+  // they were. A pipeline step has no worktree of its own (it shares the
+  // parent's), so its cascade archive never asks.
+  if (!opts?.forceWorktree && !task.pipelineParentId && task.isolation === "worktree") {
+    const uncommitted = await findUncommittedCheckouts(task);
+    if (uncommitted) {
+      const where = uncommitted.repositories.length > 0
+        ? `uncommitted changes in ${uncommitted.repositories.join(", ")}`
+        : "uncommitted changes in its worktree";
+      return {
+        error: `task has ${where} — archiving removes the worktree and discards them; confirm with forceWorktree`,
+        code: ARCHIVE_UNCOMMITTED_CHANGES_CODE,
+        repositories: uncommitted.repositories,
+      };
+    }
   }
   // Only now that the archive will actually happen: end the lap and any retry
   // timer. Clearing failover state before the refusal guards above used to

@@ -30,6 +30,12 @@ export function stalledSince(taskId: string): number | null {
   return stalled.get(taskId) ?? null;
 }
 
+/** Every current mark, for the `GET /tasks` answer cache's version
+ *  (`task-list-cache.ts`): a mark set or cleared changes the list. */
+export function stalledMarks(): ReadonlyMap<string, number> {
+  return stalled;
+}
+
 /** Test-only reset so cases can't leak marks into each other. */
 export function __clearAllStalled(): void {
   stalled.clear();

@@ -46,10 +46,38 @@ function isTaskListGet(req: Request): boolean {
   return new URL(req.url()).pathname === "/tasks";
 }
 
-/** Resolves with the next board-poll response's body and its query. */
-async function nextTaskList(page: Page): Promise<{ params: URLSearchParams; tasks: TaskRow[] }> {
-  const res = await page.waitForResponse((r) => isTaskListGet(r.request()) && r.ok());
-  return { params: new URL(res.url()).searchParams, tasks: (await res.json()) as TaskRow[] };
+interface ListResponse {
+  params: URLSearchParams;
+  status: number;
+  ifNoneMatch: string | undefined;
+  /** The parsed list for a 200; null for a 304 (the conditional poll's
+   *  "unchanged", which has no body). */
+  tasks: TaskRow[] | null;
+}
+
+/** Records every board-poll response from now on, 200 and 304 alike. Install
+ *  it before `gotoApp` so the boot poll is seen too. */
+function recordTaskLists(page: Page): ListResponse[] {
+  const seen: ListResponse[] = [];
+  page.on("response", async (res) => {
+    if (!isTaskListGet(res.request())) return;
+    const entry: ListResponse = {
+      params: new URL(res.url()).searchParams,
+      status: res.status(),
+      ifNoneMatch: (await res.request().allHeaders())["if-none-match"],
+      tasks: null,
+    };
+    if (entry.status === 200) {
+      try { entry.tasks = (await res.json()) as TaskRow[]; } catch { return; }
+    }
+    seen.push(entry);
+  });
+  return seen;
+}
+
+/** The most recent recorded response that carried a list. */
+function lastList(seen: ListResponse[]): (ListResponse & { tasks: TaskRow[] }) | undefined {
+  return [...seen].reverse().find((e): e is ListResponse & { tasks: TaskRow[] } => e.tasks !== null);
 }
 
 /** The board card for a task id. By `data-task-id`, not `.cursor-grab`: an
@@ -79,13 +107,14 @@ test.describe("board poll archive filter", () => {
 
     const listUrls: string[] = [];
     page.on("request", (req) => { if (isTaskListGet(req)) listUrls.push(req.url()); });
+    const seen = recordTaskLists(page);
 
     await gotoApp(page, backend.bootBase);
     await expect(taskCard(page, liveId)).toBeVisible();
 
-    // A steady-state poll on the Active view leaves the archive server-side.
-    const poll = await nextTaskList(page);
-    expect(poll.params.get("archived")).toBe("exclude");
+    // A poll on the Active view leaves the archive server-side.
+    await expect.poll(() => lastList(seen)?.params.get("archived")).toBe("exclude");
+    const poll = lastList(seen)!;
     expect(poll.tasks.some((t) => t.id === archivedId)).toBe(false);
     expect(poll.tasks.every((t) => t.archivedAt == null)).toBe(true);
     // Every list request so far, the boot poll included, was an exclude one.
@@ -95,18 +124,40 @@ test.describe("board poll archive filter", () => {
 
     // Switching to All asks for the full list right away (no `archived`
     // param), and the archived card renders from it.
-    const full = nextTaskList(page);
     await page.getByTitle("Filter by archive state").selectOption("all");
-    const fullPoll = await full;
-    expect(fullPoll.params.has("archived")).toBe(false);
-    expect(fullPoll.tasks.some((t) => t.id === archivedId)).toBe(true);
+    await expect.poll(() => {
+      const last = lastList(seen);
+      return !!last && !last.params.has("archived") && last.tasks.some((t) => t.id === archivedId);
+    }).toBe(true);
     await expect(taskCard(page, archivedId)).toBeVisible();
     await expect(taskCard(page, liveId)).toBeVisible();
 
     // Back to Active: the poll drops the archive again.
     await page.getByTitle("Filter by archive state").selectOption("active");
     await expect(taskCard(page, archivedId)).toHaveCount(0);
-    await expect.poll(async () => (await nextTaskList(page)).params.get("archived")).toBe("exclude");
+    await expect.poll(() => seen.at(-1)?.params.get("archived")).toBe("exclude");
+  });
+
+  test("an unchanged board answers 304 to the conditional poll, and a change still reaches the board", async ({
+    page,
+    request,
+    backend,
+  }) => {
+    test.setTimeout(60_000);
+    const seen = recordTaskLists(page);
+    await gotoApp(page, backend.bootBase);
+
+    // After the first full answer the poll sends its ETag back and, with
+    // nothing changed, gets an empty 304.
+    await expect.poll(() => seen.some((e) => e.status === 304), { timeout: 15_000 }).toBe(true);
+    const notModified = seen.find((e) => e.status === 304)!;
+    expect(notModified.ifNoneMatch).toMatch(/^"[0-9a-z]+"$/);
+
+    // A task created elsewhere changes the list: the next poll is a full
+    // answer and the card shows up.
+    const id = await createTask(request, backend, `poll-304-${randomUUID()}`);
+    await expect(taskCard(page, id)).toBeVisible({ timeout: 15_000 });
+    expect(lastList(seen)!.tasks.some((t) => t.id === id)).toBe(true);
   });
 
   test("the open task is kept while it is archived, and leaves the list once the panel closes", async ({
@@ -118,6 +169,7 @@ test.describe("board poll archive filter", () => {
     const title = `poll-keep-${randomUUID()}`;
     const id = await createTask(request, backend, title);
 
+    const seen = recordTaskLists(page);
     await gotoApp(page, backend.bootBase);
     await taskCard(page, id).click();
     const panel = runPanel(page);
@@ -126,11 +178,11 @@ test.describe("board poll archive filter", () => {
     // Another client archives the open task. The Active view's poll names it
     // in `keep`, so it is still listed and the panel stays open on it.
     await archiveTask(request, backend, id);
-    await expect.poll(async () => {
-      const { params, tasks } = await nextTaskList(page);
-      return params.get("archived") === "exclude"
-        && (params.get("keep") ?? "").split(",").includes(id)
-        && tasks.some((t) => t.id === id && t.archivedAt != null);
+    await expect.poll(() => {
+      const last = lastList(seen);
+      return !!last && last.params.get("archived") === "exclude"
+        && (last.params.get("keep") ?? "").split(",").includes(id)
+        && last.tasks.some((t) => t.id === id && t.archivedAt != null);
     }, { timeout: 15_000 }).toBe(true);
     await expect(panel).toHaveClass(/translate-x-0/);
     await expect(panel.getByText(title, { exact: true }).first()).toBeVisible();
@@ -146,9 +198,9 @@ test.describe("board poll archive filter", () => {
         { timeout: 10_000, message: "task panel did not close" },
       )
       .toBe(true);
-    await expect.poll(async () => {
-      const { params, tasks } = await nextTaskList(page);
-      return !(params.get("keep") ?? "").split(",").includes(id) && !tasks.some((t) => t.id === id);
+    await expect.poll(() => {
+      const last = lastList(seen);
+      return !!last && !(last.params.get("keep") ?? "").split(",").includes(id) && !last.tasks.some((t) => t.id === id);
     }, { timeout: 15_000 }).toBe(true);
     await expect(taskCard(page, id)).toHaveCount(0);
   });
@@ -186,7 +238,8 @@ test.describe("board poll archive filter", () => {
     expect(seen.length).toBeGreaterThan(0);
     expect(seen.filter((v) => v.endsWith(":false"))).toEqual([]);
     // While the checklist can show, the poll carries the full list.
-    const poll = await nextTaskList(page);
-    expect(poll.params.has("archived")).toBe(false);
+    const lists = recordTaskLists(page);
+    await expect.poll(() => lists.length, { timeout: 15_000 }).toBeGreaterThan(0);
+    expect(lists.at(-1)!.params.has("archived")).toBe(false);
   });
 });

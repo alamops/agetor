@@ -521,9 +521,12 @@ follow-up or start prepares only what remains. `ROUTE_POLICY` makes it
 
 ## Teardown, Worktrees page and ids
 
-Archive/delete are per repository and best-effort: a dirty checkout is kept
-(with its branch and the workspace directory), clean ones are detached, and the
-workspace is removed only when it holds nothing else. Before detaching, archive
+Archive/delete are per repository and best-effort, and the workspace is removed
+only when it holds nothing else. Delete removes every checkout. A plain archive
+of a task with a dirty (or unreadable) checkout is refused with 409
+`uncommitted-changes` naming those repositories; once the user confirms,
+`forceWorktree` detaches them all, branches kept
+([task-lifecycle.md](task-lifecycle.md) item 7). Before detaching, archive
 records each repository's live checkout with `tasks.setRepositoryCheckout` so
 unarchive re-attaches onto the same branches.
 

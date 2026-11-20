@@ -3,6 +3,15 @@
 // thumbnail for an image path, an icon chip (matching the existing
 // command-branch idiom in RunPanel.tsx) for everything else.
 //
+// An image chip tells three failures apart, because only one of them means the
+// file is gone: a 404 (`missing`) draws the amber "Image not found" chip and a
+// click goes straight to the not-found dialog; any other failure — a 403 where
+// the core can't read the file for a preview (on macOS, a privacy-protected
+// folder), a 413, a network or decode error — draws a neutral chip with an
+// honest tooltip and a click still opens the file through `/open-path`
+// (LaunchServices has the access the core lacks). Copy and style live in
+// `lib/preview-copy.ts`.
+//
 // Kept dumb on purpose: the only state here is "which paths have proven to be
 // missing" (so a broken thumbnail doesn't re-fetch on every render) and
 // "which path's not-found dialog is open." All path-shape logic
@@ -15,6 +24,7 @@ import { iconForRef, refBasename } from "@/lib/file-icons";
 import { isImagePath } from "../../../shared/attachments.ts";
 import { parseHandoffFilePath } from "../../../shared/pipeline.ts";
 import { AuthedImg } from "@/components/ui/authed-img";
+import { NEUTRAL_CHIP_CLASS, previewFailureTitle, type PreviewFailure } from "@/lib/preview-copy";
 import { AttachmentNotFoundDialog, AttachmentOpenErrorDialog } from "./AttachmentDialogs";
 import { HandoffFileChip } from "@/components/handoff/HandoffFileChip";
 import { useHandoffView } from "@/components/handoff/handoff-context";
@@ -113,7 +123,7 @@ export function AttachmentChips({
               type="button"
               title={path}
               onClick={() => void handleClick(path)}
-              className="inline-flex max-w-full items-center gap-1 rounded border border-border/60 bg-muted/40 px-1.5 py-0.5 font-mono text-[10px] text-muted-foreground hover:bg-muted/60"
+              className={NEUTRAL_CHIP_CLASS}
             >
               <Icon className="size-3 shrink-0" />
               <span className="truncate">{refBasename(path)}</span>
@@ -158,12 +168,18 @@ function ImageChip({
   onClick: () => void;
 }) {
   const base = refBasename(path);
+  // The thumbnail's outcome, other than a proven 404. Local to the chip: a
+  // failure here never touches the parent's `missing` set, so a click still goes
+  // to `/open-path` and the file opens.
+  const [preview, setPreview] = useState<"loading" | "ok" | Exclude<PreviewFailure, "missing">>("loading");
 
   if (isMissing) {
     return (
       <button
         type="button"
-        title={`Image not found: ${path}`}
+        data-testid="attachment-image-chip"
+        data-preview-state="missing"
+        title={previewFailureTitle("missing", path)}
         onClick={onClick}
         className="inline-flex max-w-full items-center gap-1 rounded border border-warning/40 bg-warning/10 px-1.5 py-0.5 font-mono text-[10px] text-warning"
       >
@@ -173,13 +189,39 @@ function ImageChip({
     );
   }
 
+  if (preview !== "loading" && preview !== "ok") {
+    return (
+      <button
+        type="button"
+        data-testid="attachment-image-chip"
+        data-preview-state={preview}
+        title={previewFailureTitle(preview, path)}
+        onClick={onClick}
+        className={NEUTRAL_CHIP_CLASS}
+      >
+        <ImageOff className="size-3 shrink-0" />
+        <span className="truncate">{base}</span>
+      </button>
+    );
+  }
+
   return (
-    <button type="button" title={path} onClick={onClick} className="group">
+    <button
+      type="button"
+      data-testid="attachment-image-chip"
+      data-preview-state={preview}
+      title={path}
+      onClick={onClick}
+      className="group"
+    >
       <AuthedImg
         url={api.filePreviewUrl(path)}
         alt={base}
         onStatus={(status) => {
-          if (status !== "ok") onMissing();
+          // Only a 404 proves the file is gone; anything else keeps the chip
+          // openable.
+          if (status === "missing") onMissing();
+          else setPreview(status);
         }}
         decoding="async"
         className="h-16 max-w-40 rounded-md border border-border/60 object-cover transition group-hover:ring-2 group-hover:ring-primary/40"

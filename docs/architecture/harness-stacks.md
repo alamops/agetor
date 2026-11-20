@@ -1817,6 +1817,7 @@ account move and every blocked outcome. The trigger per path is the table under
   identifiers, `escapeFreeText` for provider messages and titles) — a
   switch/continue line cannot repaint the log. A hidden continuation prints
   nothing (not even a blank line).
+- **App bar.** One **Harnesses** button (worst-state dot, enabled count, the tightest quota meter, a failover badge, "until HH:MM" when nothing can run) opens a panel grouped by stack: each live stack shows its members' state dots, headroom meter, earliest reset, the tasks failing over (click opens the task), Refresh, Manage stack… and Swap history (Settings → Harnesses on that stack's history). The rules live once in `src/mainview/lib/harness-bar.ts`; see [app-bar.md](app-bar.md).
 - **Webview.** *Settings → Harnesses* is the one page for accounts and stacks (the
   "Stacks" sidebar entry is gone; an old `stacks` deep link opens Harnesses).
   Each stack is a card of its accounts, primary first, with Edit, History and
@@ -1885,7 +1886,9 @@ account move and every blocked outcome. The trigger per path is the table under
   surface shows an `n/m` position or "fails over" copy for it (webview, CLI,
   TUI, notifications); the card badge shows only a live state word. The rule
   lives once in `stackPositionText` (`src/shared/harness-stack.ts`), which the
-  CLI and the webview's `stackPositionFor` both use.
+  CLI and the webview's `stackPositionFor` both use. The app bar is stricter:
+  it treats a stack as live only with two or more **enabled** members
+  (`buildHarnessBarModel`, [app-bar.md](app-bar.md)).
 - **Notifications**: `harness-swap` is a quiet kind and its text omits the
   `(n/m)` position for a stack of fewer than two accounts (webview toast,
   headless core and CLI `--notify`, all by the one-account rule above);

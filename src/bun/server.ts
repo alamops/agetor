@@ -36,6 +36,7 @@ import {
   clampWindowByBytes,
   isHiddenContinuationUserText,
   resolveAnchoredMinId,
+  taskListDataVersion,
 } from "./db.ts";
 import { refreshOne } from "./usage/poller.ts";
 import { beginLagLabel } from "./event-loop-lag.ts";
@@ -87,7 +88,8 @@ import { discoverClaudeAccounts } from "./harness-discovery.ts";
 import { cancelClone, cloneAuthHeader, cloneRepo, defaultCloneDest, resolveCloneRepo } from "./clone.ts";
 import { buildEli5Prompt, eli5TaskTitle } from "../shared/clone-eli5.ts";
 import { CLONE_PROVIDERS, isGitProvider } from "../shared/clone-input.ts";
-import { stalledSince } from "./stall-registry.ts";
+import { stalledMarks, stalledSince } from "./stall-registry.ts";
+import { countsFingerprint, createTaskListCache, ifNoneMatchMatches } from "./task-list-cache.ts";
 import { readDragPasteboardPaths } from "./drag-pasteboard.ts";
 import { listGitHubTokens, setGitHubToken, deleteGitHubToken } from "./github-tokens.ts";
 import {
@@ -151,6 +153,7 @@ import {
   listTerminals,
   writeTerminal,
   resizeTerminal,
+  terminalCountsByTask,
   type TerminalSocketData,
 } from "./terminals.ts";
 import { listAgentCapabilities } from "./commands.ts";
@@ -246,6 +249,7 @@ import {
   listPendingForTask,
   TMUX_CODE_ANSWER,
   TMUX_ENTER_ANSWER,
+  pendingCountsByTask,
   type AskQuestionsAnswer,
 } from "./interactions.ts";
 import {
@@ -269,6 +273,7 @@ import {
   parseArchivedHistoryRetentionDays,
   supportedEfforts,
   validateBranchConfig,
+  isArchiveUncommittedChanges,
 } from "../shared/types.ts";
 import type {
   AgentKind,
@@ -321,13 +326,15 @@ import {
   turnOffBackground,
   turnOnBackground,
 } from "./background.ts";
-import { consumePendingOpenTask } from "./pending-open.ts";
+import { consumePendingMenuAction, consumePendingOpenTask } from "./pending-open.ts";
 import {
   binaryPreviewKind,
   contentTypeForPreviewPath,
   isImagePath,
+  isScreenshotUploadablePath,
   MAX_FILE_PREVIEW_BYTES,
 } from "../shared/attachments.ts";
+import { previewTwinPath, writePreviewTwinsForRefs } from "./preview-twins.ts";
 import { AGENT_PROFILE_LIMITS, normalizeSkillName } from "../shared/agent-profile.ts";
 import { LONE_SURROGATE_RE, PIPELINE_CONTROL_CHAR_RE, validatePipelineGraph } from "../shared/pipeline.ts";
 import { BUNDLE_MAX_BYTES, findInvisibleChar } from "../shared/bundle.ts";
@@ -409,6 +416,9 @@ function withRunningSubagents(t: Task): Task & { runningSubagents: number } {
   return { ...t, runningSubagents, stalledSince: stalledSince(t.id) };
 }
 
+/** `GET /tasks` answers, reused while nothing they are built from changed. */
+const taskListCache = createTaskListCache();
+
 /** `GET /tasks`'s `archived` and `keep` params (`TaskListArchived`). An
  *  absent `archived` is `include`, the route's original answer, so an older
  *  CLI or webview gets every task as before. `keep` is a comma-separated id
@@ -477,6 +487,13 @@ async function taskGitStatusForDir(
     branch: headState.branch,
     isDefaultBranch: headState.isDefaultBranch,
   };
+}
+
+/** The basenames of the `File`s a drop or paste carried, as the webview sent
+ *  them (`names`): strings only, at most 256. A preview twin is written only
+ *  for a path one of these vouches for. */
+function fileNameSet(raw: unknown): Set<string> {
+  return new Set(Array.isArray(raw) ? raw.filter((n): n is string => typeof n === "string").slice(0, 256) : []);
 }
 
 function refsFromPaths(rawPaths: unknown[]): TaskReference[] {
@@ -644,7 +661,10 @@ function corsHeaders(req: Request): Record<string, string> {
     // `last-event-id`: the task event stream's reconnects send it (SSE resume
     // cursor); without it in the allow list the browser fails that
     // preflight and the stream could never reconnect.
-    "access-control-allow-headers": "content-type,authorization,last-event-id",
+    // `if-none-match`: the board's conditional `/tasks` poll sends the last
+    // ETag back (`task-list-cache.ts`), and must be allowed to read `etag`.
+    "access-control-allow-headers": "content-type,authorization,last-event-id,if-none-match",
+    "access-control-expose-headers": "etag",
     "access-control-allow-credentials": "true",
     // The Authorization header makes every webview request preflight; let the
     // browser cache each answer (WebKit caps this at 600 s) so a transcript's
@@ -4535,7 +4555,7 @@ export function startApiServer(
           json({ version: pkg.version }, { headers: corsHeaders(req) })),
       },
 
-      // Double-clicking the custom app bar in App.tsx hits this route to
+      // Double-clicking the custom app bar (components/app-bar/AppBar.tsx) hits this route to
       // toggle the macOS "zoom" affordance. Electrobun's drag region only
       // wires startWindowMove/stopWindowMove on mousedown/mouseup, so the
       // native double-click-to-zoom gesture never reaches AppKit — the
@@ -6191,7 +6211,15 @@ export function startApiServer(
             return json({ error: query.error }, { status: 400, headers: corsHeaders(req) });
           }
           const counts = subagents.runningCountsByTask();
-          return json(
+          // The answer is rebuilt only when something it is built from changed
+          // (`task-list-cache.ts`): written rows of tasks/runs/subagents, and
+          // the in-memory pending, terminal, running-subagent and stall maps.
+          const version = [
+            taskListDataVersion(),
+            countsFingerprint([pendingCountsByTask(), terminalCountsByTask(), counts, stalledMarks()]),
+          ].join("|");
+          const key = `${query.archived}|${[...query.keepIds].sort().join(",")}`;
+          const answer = taskListCache.get(key, version, () => JSON.stringify(
             tasks.list(query).map((t) => ({
               ...t,
               // M-S3: the list route ships the trimmed pipelineRun variant
@@ -6200,8 +6228,13 @@ export function startApiServer(
               runningSubagents: counts.get(t.id) ?? 0,
               stalledSince: stalledSince(t.id),
             })),
-            { headers: corsHeaders(req) },
-          );
+          ));
+          const headers = { ...corsHeaders(req), etag: answer.etag, "cache-control": "no-cache" };
+          // The client already holds this exact list: nothing to send.
+          if (ifNoneMatchMatches(req.headers.get("if-none-match"), answer.etag)) {
+            return new Response(null, { status: 304, headers });
+          }
+          return new Response(answer.body, { headers: { "content-type": "application/json", ...headers } });
         }),
         POST: authed(async (req) => {
           const body = (await req.json()) as Partial<Task> & {
@@ -6949,7 +6982,11 @@ export function startApiServer(
             awaitTeardown: body.awaitTeardown === true,
           });
           if ("error" in result) {
-            return json(result, { status: 400, headers: corsHeaders(req) });
+            // Uncommitted work would be discarded: 409 with the affected
+            // repositories, so the client can confirm and retry with
+            // `forceWorktree` (`ArchiveUncommittedChanges`).
+            const status = isArchiveUncommittedChanges(result) ? 409 : 400;
+            return json(result, { status, headers: corsHeaders(req) });
           }
           // Archived from any client → its notification goes (D6c). Own id
           // only: a pipeline Restart's internal step archives never reach this
@@ -7680,17 +7717,19 @@ export function startApiServer(
             if (mode === "folder") {
               return json({ refs: refsFromPaths([fakeDir]) }, { headers: corsHeaders(req) });
             }
+            let fakeRefs: TaskReference[];
             try {
               const entries = readdirSync(fakeDir, { withFileTypes: true })
                 .filter((e) => e.isFile())
                 .sort((a, b) => a.name.localeCompare(b.name));
-              return json(
-                { refs: refsFromPaths(entries.map((e) => path.join(fakeDir, e.name))) },
-                { headers: corsHeaders(req) },
-              );
+              fakeRefs = refsFromPaths(entries.map((e) => path.join(fakeDir, e.name)));
             } catch {
               return json({ refs: [] }, { headers: corsHeaders(req) }); // gone / unreadable — cancelled pick
             }
+            // The seam stands in for the panel, so it writes the same preview
+            // twins the native branch does.
+            await writePreviewTwinsForRefs(dataDir, fakeRefs);
+            return json({ refs: fakeRefs }, { headers: corsHeaders(req) });
           }
           if (!native) return notAvailableHeadless(req);
           const paths = await openFileDialogLabelled(native, {
@@ -7702,7 +7741,15 @@ export function startApiServer(
           // Electrobun splits the panel's answer on ",", so a path with a
           // comma arrives in pieces — put them back together; nothing at all
           // means the user cancelled.
-          return json({ refs: refsFromPaths(pickedPaths(paths)) }, { headers: corsHeaders(req) });
+          const picked = refsFromPaths(pickedPaths(paths));
+          // The panel just ran in this process, so the user's pick carries the
+          // intent grant for exactly these files: copy each image into the
+          // preview-twin cache NOW, while this process may read it, so its
+          // thumbnail survives macOS's privacy block on the folder later
+          // (preview-twins.ts; docs/architecture/security.md, "Preview twins").
+          // Folder mode has no files to twin.
+          if (mode === "files") await writePreviewTwinsForRefs(dataDir, picked);
+          return json({ refs: picked }, { headers: corsHeaders(req) });
         }),
       },
 
@@ -7712,9 +7759,30 @@ export function startApiServer(
       // than trusting the webview's view of directory-ness.
       "/refs/resolve": {
         POST: authed(async (req) => {
-          const body = (await req.json().catch(() => ({}))) as { paths?: unknown };
+          const body = (await req.json().catch(() => ({}))) as {
+            paths?: unknown;
+            names?: unknown;
+            previewTwins?: unknown;
+          };
           const raw = Array.isArray(body.paths) ? body.paths : [];
-          return json({ refs: await refsFromPathsForCaller(raw, callerOf(req)) }, { headers: corsHeaders(req) });
+          const caller = callerOf(req);
+          const refs = await refsFromPathsForCaller(raw, caller);
+          // `previewTwins: true` marks the user's own drop or paste
+          // (`api.resolveCapturedRefs`, sent by `capture-refs` only). The other
+          // callers of this route (`SentFilesCard`, handoff artifact chips, `@`
+          // scope) stat paths an AGENT chose, with the app token and no user
+          // action, so they never send it, and the core never reads those in
+          // its own process. The CLI token never gets a twin either way.
+          // Even then a twin is written only for a path whose basename one of
+          // the dropped/pasted `File`s (`names`) vouches for: a `file://` line
+          // in plain text dragged out of the transcript carries no `File`, so
+          // an agent's text can't make the core copy a file the user never
+          // dropped (same check as `/refs/drag`).
+          if (caller === "app" && body.previewTwins === true) {
+            const names = fileNameSet(body.names);
+            await writePreviewTwinsForRefs(dataDir, refs, (ref) => names.has(path.basename(ref.path)));
+          }
+          return json({ refs }, { headers: corsHeaders(req) });
         }),
       },
 
@@ -7724,8 +7792,24 @@ export function startApiServer(
       // drag pasteboard directly instead — it always reflects the drag that
       // just ended, since a drop event fires the instant that drag ends.
       "/refs/drag": {
-        POST: authed((req) => {
-          return json({ refs: refsFromPaths(readDragPasteboardPaths()) }, { headers: corsHeaders(req) });
+        POST: authed(async (req) => {
+          const body = (await req.json().catch(() => ({}))) as { names?: unknown };
+          // Basenames of the `File`s the drop actually carried. The drag
+          // pasteboard is shared state an agent could rewrite mid-drag, so a
+          // preview twin is written only for a pasteboard path one of these
+          // names vouches for.
+          const names = fileNameSet(body.names);
+          const refs = refsFromPaths(readDragPasteboardPaths());
+          // Images `POST /screenshots` can take are uploaded by the webview
+          // (their bytes are copied to a file Agetor owns), so only the other
+          // image types (heic, svg, bmp, ico, avif), which attach by their
+          // original path, need a twin.
+          await writePreviewTwinsForRefs(
+            dataDir,
+            refs,
+            (ref) => !isScreenshotUploadablePath(ref.path) && names.has(path.basename(ref.path)),
+          );
+          return json({ refs }, { headers: corsHeaders(req) });
         }),
       },
 
@@ -7912,11 +7996,29 @@ export function startApiServer(
           // in the core's own process under Agetor's TCC identity (D26(j)).
           // Only regular files (a FIFO named `*.png` would hang the stream).
           // `maxBytes` bounds the memory `settleFileBytes` holds below.
-          const opened = await openFileBytes(raw, {
+          let opened = await openFileBytes(raw, {
             followSymlinks: true,
             ifNoneMatch: req.headers.get("if-none-match"),
             maxBytes: MAX_FILE_PREVIEW_BYTES,
           });
+          // Only when the original is DENIED (on macOS, a TCC-protected
+          // folder the disclaimed reader may not enter) fall back to the
+          // preview twin written when the user picked, dropped or pasted this
+          // path (preview-twins.ts). A readable original always wins, and a
+          // missing, too-large or errored one never falls back. The twin read
+          // is the same disclaimed reader and never follows a symlink, so a
+          // twin an agent planted can only show a regular, non-protected file.
+          if (opened.kind === "denied") {
+            const twin = previewTwinPath(dataDir, raw);
+            if (twin !== null) {
+              const viaTwin = await openFileBytes(twin, {
+                followSymlinks: false,
+                ifNoneMatch: req.headers.get("if-none-match"),
+                maxBytes: MAX_FILE_PREVIEW_BYTES,
+              });
+              if (viaTwin.kind === "ok" || viaTwin.kind === "not-modified") opened = viaTwin;
+            }
+          }
           if (opened.kind === "missing") {
             return json({ error: `not found: ${raw}` }, { status: 404, headers: corsHeaders(req) });
           }
@@ -9504,6 +9606,12 @@ export function startApiServer(
             const pendingTaskId = consumePendingOpenTask();
             if (pendingTaskId) {
               send({ type: "open_task", taskId: pendingTaskId, ts: Date.now() });
+            }
+            // Same for a native menu click made with no webview attached
+            // (app-menu.ts parks it for the TTL).
+            const pendingMenuAction = consumePendingMenuAction();
+            if (pendingMenuAction) {
+              send({ type: "menu_action", action: pendingMenuAction, ts: Date.now() });
             }
             // Same for the boot-time "Claude Code sessions found" notice: the
             // launch scan usually finishes before the webview connects.
