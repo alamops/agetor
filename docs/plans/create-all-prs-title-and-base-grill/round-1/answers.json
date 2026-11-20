@@ -1,0 +1,254 @@
+{
+  "version": 1,
+  "formId": "create-all-prs-title-and-base-grill-r1",
+  "title": "Grill — Create all PRs: right title/body, right base, base-aware PR link",
+  "round": 1,
+  "mode": "served",
+  "specFile": "questions.json",
+  "specSha256": "44b3a143e8af2d7294d7592818e54526d3207c19e26a43d608124b5867745b67",
+  "submittedAt": "2026-11-17T14:33:15.867Z",
+  "receivedAt": "2026-11-17T14:33:15.877Z",
+  "answeredBy": null,
+  "summary": {
+    "total": 21,
+    "answered": 21,
+    "skipped": 0,
+    "unanswered": 0,
+    "optionalLeftBlank": 0,
+    "notApplicable": 0,
+    "acceptedRecommendations": 17,
+    "overrodeRecommendations": [
+      "base-precedence",
+      "base-line",
+      "multi-pr-per-repo",
+      "owner-pipeline"
+    ],
+    "oneWayDoorsNotAnswered": [],
+    "withNotes": [
+      "no-proposal"
+    ],
+    "needsAnswer": [],
+    "complete": true
+  },
+  "answers": {
+    "real-prs": {
+      "n": 1,
+      "title": "The goal says Create all PRs \"is not creating the PR\" when the target isn't the default branch. What actually happened to the two real PRs?",
+      "type": "single",
+      "status": "answered",
+      "impact": "blocking",
+      "value": "wrong-base",
+      "display": "Both opened, but against `main` with the step title and an empty body",
+      "acceptedRecommendation": true
+    },
+    "base-precedence": {
+      "n": 2,
+      "title": "Rank the sources Create all PRs should take a repository's base branch from, first match wins.",
+      "type": "rank",
+      "status": "answered",
+      "impact": "blocking",
+      "value": [
+        "stored",
+        "link",
+        "origin-head"
+      ],
+      "display": "1. The base branch recorded when the task was created  2. The base in the agent's newest matching PR link  3. The remote's default branch (`origin/HEAD`, then the provider's default)",
+      "acceptedRecommendation": false,
+      "recommended": [
+        "link",
+        "stored",
+        "origin-head"
+      ]
+    },
+    "store-base": {
+      "n": 3,
+      "title": "Record the base branch's name when a task is created?",
+      "type": "single",
+      "status": "answered",
+      "oneWayDoor": true,
+      "impact": "blocking",
+      "value": "store",
+      "display": "Store it (migration 092 plus `repositories[].baseBranch`)",
+      "acceptedRecommendation": true
+    },
+    "head-base": {
+      "n": 4,
+      "title": "When the task's base is `HEAD` (no branch picked), what should be recorded as its base branch?",
+      "type": "single",
+      "status": "answered",
+      "impact": "shape",
+      "value": "checked-out-if-remote",
+      "display": "The checked-out branch, but only if it exists on the remote",
+      "acceptedRecommendation": true
+    },
+    "missing-base": {
+      "n": 5,
+      "title": "The chosen base doesn't exist on the remote (deleted, never pushed, typo in the agent's link). What happens to that repository?",
+      "type": "single",
+      "status": "answered",
+      "impact": "shape",
+      "value": "fail-clear",
+      "display": "Fail that repository with a clear message",
+      "acceptedRecommendation": true
+    },
+    "attribution": {
+      "n": 6,
+      "title": "How should Create all PRs match a proposal to a repository?",
+      "type": "single",
+      "status": "answered",
+      "impact": "blocking",
+      "value": "link-or-label",
+      "display": "Link match OR a `Repository:` label; drop the blind single-target fallback",
+      "acceptedRecommendation": true
+    },
+    "proposal-scope": {
+      "n": 7,
+      "title": "Which run's proposal counts for each repository?",
+      "type": "single",
+      "status": "answered",
+      "impact": "shape",
+      "value": "per-repo-newest",
+      "display": "Per repository: its newest matching proposal from any run",
+      "acceptedRecommendation": true
+    },
+    "no-proposal": {
+      "n": 8,
+      "title": "No proposal matches a repository. What should its PR get?",
+      "type": "single",
+      "status": "answered",
+      "impact": "shape",
+      "value": "root-title-flagged",
+      "display": "The root task's title (the pipeline parent's, for a step) and an empty body, marked \"no proposal\" in the confirm list",
+      "acceptedRecommendation": true,
+      "note": "For the sake of a comparison, current behavior is using Pipeline name in the PR title (wrong)"
+    },
+    "confirm-list": {
+      "n": 9,
+      "title": "Keep Create all PRs one-click, or show a short confirm list first?",
+      "type": "single",
+      "status": "answered",
+      "impact": "shape",
+      "value": "editable",
+      "display": "Confirm list, editable",
+      "acceptedRecommendation": true
+    },
+    "single-chip-base": {
+      "n": 10,
+      "title": "Should the single-repo \"Create PR\" chip also prefill the composer's base from the proposal?",
+      "type": "single",
+      "status": "answered",
+      "impact": "shape",
+      "value": "yes",
+      "display": "Yes, same base rules as Create all PRs",
+      "acceptedRecommendation": true
+    },
+    "link-format": {
+      "n": 11,
+      "title": "Which link should the prompt ask the agent to print?",
+      "type": "single",
+      "status": "answered",
+      "impact": "shape",
+      "value": "per-forge",
+      "display": "Per-forge destination links: GitHub `compare/…?quick_pull=1`, GitLab `target_branch`, Bitbucket `dest`",
+      "acceptedRecommendation": true
+    },
+    "prompt-names-base": {
+      "n": 12,
+      "title": "Should the prompt name the base agetor already knows?",
+      "type": "single",
+      "status": "answered",
+      "impact": "shape",
+      "value": "name-with-escape",
+      "display": "Name the known base, with \"unless you moved the branch onto another base\"",
+      "acceptedRecommendation": true
+    },
+    "base-line": {
+      "n": 13,
+      "title": "Should the agent also print an explicit `Base: <branch>` line?",
+      "type": "single",
+      "status": "answered",
+      "impact": "minor",
+      "value": "base-line",
+      "display": "Yes, plus the link",
+      "acceptedRecommendation": false,
+      "recommended": "link-only"
+    },
+    "multi-pr-per-repo": {
+      "n": 14,
+      "title": "The real reply proposed two PRs for the app repo (a second branch). Support more than one PR per repository?",
+      "type": "single",
+      "status": "answered",
+      "impact": "shape",
+      "value": "in",
+      "display": "In scope: one PR per matching proposal",
+      "acceptedRecommendation": false,
+      "recommended": "out"
+    },
+    "owner-pipeline": {
+      "n": 15,
+      "title": "Your pipeline's \"Commit And Push\" step text is an old copy of the single-repo prompt. What do we do about it?",
+      "type": "single",
+      "status": "answered",
+      "impact": "minor",
+      "value": "rely",
+      "display": "Nothing in code; link attribution covers it. I'll update my own step text myself.",
+      "acceptedRecommendation": false,
+      "recommended": "rely-and-note"
+    },
+    "c-no-backfill": {
+      "n": 16,
+      "title": "Existing tasks",
+      "type": "confirm",
+      "status": "answered",
+      "impact": "minor",
+      "value": "No backfill. Existing tasks have no stored base and fall through to the next source in the Q2 order.",
+      "acceptedRecommendation": true
+    },
+    "c-normalize": {
+      "n": 17,
+      "title": "Base name normalization",
+      "type": "confirm",
+      "status": "answered",
+      "impact": "minor",
+      "value": "A picked `origin/develop` is stored as `develop` (the remote prefix is stripped when it names a configured remote). Links are URL-decoded (`release%2F1.2` → `release/1.2`).",
+      "acceptedRecommendation": true
+    },
+    "c-legacy-links": {
+      "n": 18,
+      "title": "Old transcripts",
+      "type": "confirm",
+      "status": "answered",
+      "impact": "minor",
+      "value": "Old `pull/new/<branch>` links still attribute a proposal (by owner/repo and head), with no base taken from them.",
+      "acceptedRecommendation": true
+    },
+    "c-tests": {
+      "n": 19,
+      "title": "Acceptance tests",
+      "type": "confirm",
+      "status": "answered",
+      "impact": "minor",
+      "value": "Unit tests for link parsing, attribution and base precedence. Updated prompt tests. A new `FAKE_CLAUDE_*_PROMPT_MARKER` that emits proposal text on the assistant stream, plus an e2e that drives Create all PRs and asserts each PR's **title, body and base** through the GitHub stub's recorded POST bodies, including a repository with a non-default base.",
+      "acceptedRecommendation": true
+    },
+    "c-docs": {
+      "n": 20,
+      "title": "Docs updated in the same change",
+      "type": "confirm",
+      "status": "answered",
+      "impact": "minor",
+      "value": "`docs/architecture/multi-repo-tasks.md` (pull-create section), `docs/architecture/run-panel.md` (Create all PRs), `docs/architecture/persistence.md` (new server-managed column, if Q3 = store), the CLAUDE.md server-managed list, the `commitPushPrompt` and `pr-proposal.ts` header comments, and the Commit & push tooltip. `docs/plans/multi-repo-tasks.md` A10 marked superseded.",
+      "acceptedRecommendation": true
+    },
+    "c-pipeline-step-stamp": {
+      "n": 21,
+      "title": "PRs opened from a pipeline step's panel",
+      "type": "confirm",
+      "status": "answered",
+      "impact": "minor",
+      "value": "Unchanged: a PR opened from a step is stamped on the step only (already documented). Out of scope.",
+      "acceptedRecommendation": true
+    }
+  },
+  "generalNotes": null
+}

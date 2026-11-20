@@ -2061,6 +2061,27 @@ export function branchCommitType(
 }
 
 /**
+ * One pull request opened from a task, recorded by `POST /github/pull-create`
+ * when the request carries the task's id. `head` and `base` are null only on
+ * an entry converted from a legacy `prUrl` (migration 092's backfill, or the
+ * read-time conversion of an old `repositories[]` entry), which never knew
+ * them. See `docs/architecture/multi-repo-tasks.md`.
+ */
+export interface TaskPr {
+  url: string;
+  head: string | null;
+  base: string | null;
+  number: number | null;
+  createdAt: number;
+}
+
+/** One branch as a forge lists it. `sha` is the tip when the forge reports it. */
+export interface ForgeBranch {
+  name: string;
+  sha: string | null;
+}
+
+/**
  * One repository a task was created against (issue #291). A multi-repository
  * task stores two or more of these in `tasks.repositories` (migration 091) —
  * one or more once repositories were removed (`Task.multiRepo` stays true);
@@ -2099,8 +2120,25 @@ export interface TaskRepository {
   baseRef: string | null;
   /** Last-seen live checkout in this worktree (drift is recorded, never corrected). */
   checkoutBranch: string | null;
-  /** First PR opened from this repository; never overwritten. */
+  /**
+   * Deprecated and derived: the URL of `prs[0]`, kept so older clients keep
+   * working. Agetor code reads {@link TaskRepository.prs} through
+   * `taskPrsOf` (`src/shared/task-prs.ts`), never this field.
+   */
   prUrl: string | null;
+  /**
+   * Every pull request opened from this repository, oldest first. Append-only
+   * and server-managed (`tasks.appendRepositoryPr`). Optional at the type
+   * level only for fixture compatibility (same reason as `Task.issueUrl`);
+   * `parseTaskRepositories` always sets it.
+   */
+  prs?: TaskPr[];
+  /**
+   * The branch NAME this repository was based on at create time (the sha is
+   * `baseRef`), or null when it wasn't a local or remote branch (a tag, a sha,
+   * isolation `none`, `existingBranch`). Same optionality as `prs`.
+   */
+  baseBranch?: string | null;
 }
 
 /**
@@ -2111,6 +2149,35 @@ export interface TaskRepository {
 export interface TaskRepositoryInput {
   path: string;
   baseRef?: string;
+}
+
+/**
+ * `GET /tasks?archived=` — which tasks the list returns by archive state.
+ * `include` (the default when the param is absent) returns every task, as the
+ * route always did; `exclude` returns only unarchived tasks; `only` returns
+ * only archived ones. `keep=<id>,<id>` names tasks returned regardless of
+ * this filter. The 2 s board poll and the TUI ask for `exclude`, so a DB with
+ * thousands of archived tasks isn't re-serialized and re-parsed every tick
+ * (docs/architecture/core-responsiveness.md).
+ */
+export type TaskListArchived = "include" | "exclude" | "only";
+export const TASK_LIST_ARCHIVED_VALUES: readonly TaskListArchived[] = ["include", "exclude", "only"];
+/** Most ids one `GET /tasks?keep=` may name; a longer list is a 400. */
+export const TASK_LIST_KEEP_MAX = 50;
+export interface TaskListOptions {
+  archived?: TaskListArchived;
+  keep?: readonly string[];
+}
+/** The `GET /tasks` path for `opts`, shared by the webview and CLI clients.
+ *  `include` and an empty `keep` add nothing, so the default stays the bare
+ *  `/tasks` older cores understand. */
+export function taskListPath(opts: TaskListOptions = {}): string {
+  const params = new URLSearchParams();
+  if (opts.archived && opts.archived !== "include") params.set("archived", opts.archived);
+  const keep = [...new Set((opts.keep ?? []).filter((id) => id.length > 0))].slice(0, TASK_LIST_KEEP_MAX);
+  if (params.has("archived") && keep.length > 0) params.set("keep", keep.join(","));
+  const qs = params.toString();
+  return qs ? `/tasks?${qs}` : "/tasks";
 }
 
 export interface Task {
@@ -2154,14 +2221,29 @@ export interface Task {
    */
   baseRef: string | null;
   /**
-   * URL of the pull request opened for this task's branch, or null if none
-   * has been created yet. Set server-side, atomically with creation, by
-   * `POST /github/pull-create` when the request carries this task's id —
-   * never patchable directly (kept out of the PATCH allow-list, same
-   * treatment as `branch`/`worktreePath`/`baseRef`). Once set, the UI shows
-   * a durable "View PR" link instead of re-offering "Open PR".
+   * Deprecated and derived: the URL of `prs[0]` (null for a multi-repository
+   * task, whose PRs live on `repositories[].prs`). Kept in the JSON so older
+   * clients keep working; agetor code reads {@link Task.prs} through
+   * `taskPrsOf` (`src/shared/task-prs.ts`) and never this field.
    */
   prUrl: string | null;
+  /**
+   * Every pull request opened for this task's branch, oldest first. Appended
+   * server-side, atomically with creation, by `POST /github/pull-create` when
+   * the request carries this task's id (`tasks.appendPr`), never patchable
+   * (kept out of the PATCH allow-list, same treatment as
+   * `branch`/`worktreePath`/`baseRef`). Always `[]` for a multi-repository
+   * task. Optional at the type level only for fixture compatibility (same
+   * reason as `issueUrl`) — `toTask` always sets it.
+   */
+  prs?: TaskPr[];
+  /**
+   * The branch NAME `baseRef` was resolved from at create time (`develop`,
+   * `release/1.2`), or null when it was a tag, a sha, a non-git directory, an
+   * `existingBranch` task or a task created before migration 092. Written only
+   * by `tasks.insert`, never patchable. Same optionality as `prs`.
+   */
+  baseBranch?: string | null;
   /**
    * URL of the issue this task was created from, or null. Set only at create
    * time by `createTask` (validated with `parseIssueUrl` and same-repo-
@@ -6847,12 +6929,15 @@ export interface ToolResultEventData {
  * prefix. The branch is shell-quoted because git ref names may legally contain
  * shell metacharacters; `'\''` is the POSIX escape for an embedded quote.
  *
- * After the commit/push, the prompt first asks for the full link to open a
- * pull request for the branch — as plain text above the code blocks, not
- * fenced, so react-markdown's GFM autolinking renders it clickable (git prints
- * the link in the push output for GitHub/GitLab/Bitbucket; otherwise it can be
- * built from the remote URL). It then asks the agent to propose a pull
- * request title and description, each emitted in its own fenced code block so
+ * After the commit/push, the prompt first asks for a `Base: <branch>` line
+ * (the task's stored `baseBranch`, with an escape clause for work the agent
+ * moved onto another base) and then the full link to open a pull request from
+ * the branch into that base — as plain text above the code blocks, not fenced,
+ * so react-markdown's GFM autolinking renders it clickable. The link is built
+ * by the agent per forge (`PR_LINK_FORMS`), because the one git prints in the
+ * push output always targets the default branch. The Create-all-PRs planner
+ * (`src/mainview/lib/pr-plan.ts`) reads the `Base:` line and the link back. It
+ * then asks the agent to propose a pull request title and description, each emitted in its own fenced code block so
  * agetor renders a one-click copy button per field — the user copies the title
  * into the New PR composer's Title field and the description into its
  * Description field without a second turn. Two blocks (not one) because the
@@ -6866,7 +6951,8 @@ export interface ToolResultEventData {
  * 4-tick outer -> one <pre>; 3-tick outer -> two, split at the inner fence).
  */
 export function commitPushPrompt(
-  task: Pick<Task, "branch" | "taskType"> & Pick<Partial<Task>, "repositories" | "issueRepoPath" | "multiRepo">,
+  task: Pick<Task, "branch" | "taskType"> &
+    Pick<Partial<Task>, "repositories" | "issueRepoPath" | "multiRepo" | "baseBranch">,
 ): string {
   const ccType = branchCommitType(task.branch, task.taskType);
   // Same decision as `isMultiRepoTask` (src/shared/multi-repo.ts), inlined
@@ -6876,7 +6962,10 @@ export function commitPushPrompt(
   const repos = multi && task.repositories && task.repositories.length > 0 ? task.repositories : null;
   if (repos) {
     const repoLines = repos
-      .map((r) => `- ${r.name}: branch ${r.branch ? `'${r.branch.replace(/'/g, "'\\''")}'` : "<branch>"}`)
+      .map((r) => {
+        const branch = r.branch ? `'${shellQuoteInner(r.branch)}'` : "<branch>";
+        return `- ${r.name}: branch ${branch}${r.baseBranch ? `, base '${shellQuoteInner(r.baseBranch)}'` : ""}`;
+      })
       .join("\n");
     return (
       `Commit all changes in every repository with a clear commit message ` +
@@ -6884,40 +6973,80 @@ export function commitPushPrompt(
       `then push each repository's current branch to origin. ` +
       `If a branch has no upstream yet, set it with \`git push -u origin <branch>\` in that repository. ` +
       `Repositories:\n${repoLines}\n` +
-      `After pushing, for each repository first print a "Repository: <name>" line, then below it ` +
-      `print the full link to open a pull request for that repository's branch as plain text on its ` +
-      `own line — not inside a code block. ` +
+      `After pushing, for each repository print, in this order and each on its own line as plain ` +
+      `text — not inside a code block: a "Repository: <name>" line; a "Base: <branch>" line naming ` +
+      `the branch the pull request should merge into (the base listed for that repository above, ` +
+      `unless you moved the work onto a different base — then that one; if none is listed, the ` +
+      `branch the work started from, or the repository's default branch if unsure); then the full ` +
+      `link to open a pull request from that repository's branch into that base. ${PR_LINK_FORMS} ` +
+      `Build the link yourself from the remote URL: the link git prints in the push output always ` +
+      `targets the default branch, so do not use it when the base is another branch. ` +
       `Below each link, propose that pull request as two fenced code blocks so each can be ` +
       `copied with one click: first a "PR title:" line followed by a \`\`\` block containing ` +
       `only the concise one-line title, then a "PR description:" line followed by a ` +
       `\`\`\`\` four-backtick block containing the description in markdown (what changed and ` +
       `why) — use four backticks so any \`\`\` code fences inside the description don't ` +
       `close the block early. ` +
+      `If you propose more than one pull request for a repository, repeat the block for each pull request ` +
+      `(Repository, Base, link, PR title, PR description). ` +
       `Do not include any AI attribution in the commit message, PR title, or PR description — ` +
       `no "Generated with Claude Code" / "Generated by AI" footers, robot emoji, or ` +
       `Co-Authored-By trailers crediting an AI tool.`
     );
   }
-  const branchLabel = task.branch ? `'${task.branch.replace(/'/g, "'\\''")}'` : "<branch>";
+  const branchLabel = task.branch ? `'${shellQuoteInner(task.branch)}'` : "<branch>";
+  const baseHint = task.baseBranch
+    ? `the base recorded for this task, '${shellQuoteInner(task.baseBranch)}', unless you moved the work onto a different base — then that one`
+    : `the branch this work started from, or the repository's default branch if unsure`;
   return (
     `Commit all changes with a clear commit message ` +
     `(prefix the subject with "${ccType}:", e.g. "${ccType}: ...") summarizing the work, ` +
     `then push the current branch to origin. ` +
     `If the branch has no upstream yet, set it with \`git push -u origin ${branchLabel}\`. ` +
-    `After pushing, first print the full link to open a pull request for the branch ` +
-    `(git prints one in the push output; otherwise build it from the remote URL) as ` +
-    `plain text on its own line — not inside a code block. ` +
+    `After pushing, print a "Base: <branch>" line on its own line as plain text naming the branch ` +
+    `the pull request should merge into (${baseHint}), and then print the full link to open a ` +
+    `pull request from the branch into that base (build it from the remote URL) as plain text on its ` +
+    `own line — not inside a code block. ${PR_LINK_FORMS} ` +
+    `The link git prints in the push output always targets the default branch, so do not use it when ` +
+    `the base is another branch. ` +
     `Below the link, propose the pull request as two fenced code blocks so each can be ` +
     `copied with one click: first a "PR title:" line followed by a \`\`\` block containing ` +
     `only the concise one-line title, then a "PR description:" line followed by a ` +
     `\`\`\`\` four-backtick block containing the description in markdown (what changed and ` +
     `why) — use four backticks so any \`\`\` code fences inside the description don't ` +
     `close the block early. ` +
+    `If you propose more than one pull request, repeat the block for each pull request ` +
+    `(Base, link, PR title, PR description). ` +
     `Do not include any AI attribution in the commit message, PR title, or PR description — ` +
     `no "Generated with Claude Code" / "Generated by AI" footers, robot emoji, or ` +
     `Co-Authored-By trailers crediting an AI tool.`
   );
 }
+
+/** POSIX escape for text placed between single quotes (`'\''`). */
+function shellQuoteInner(s: string): string {
+  return s.replace(/'/g, "'\\''");
+}
+
+/**
+ * The per-forge link shapes the Commit & push prompt asks for. The Create-all-
+ * PRs parser (`src/mainview/lib/pr-link.ts`) reads exactly these, plus GitHub's
+ * legacy `pull/new/<head>`. Names are URL-encoded; `<base>...<head>` is split on
+ * the three dots (git forbids `..` in a ref name). The host may be an ssh alias
+ * or its real web host: `linkMatchesRepo` canonicalizes both sides, so either
+ * attributes, but only the web host opens when clicked in the transcript. The
+ * forges' documented SSH-over-443 endpoints (`ssh.github.com`,
+ * `altssh.gitlab.com`, `altssh.bitbucket.org`) are named so the agent maps
+ * them to the web host instead of copying them from a HostName line.
+ */
+const PR_LINK_FORMS =
+  `For GitHub use https://<host>/<owner>/<repo>/compare/<base>...<head>?quick_pull=1; ` +
+  `for GitLab use https://<host>/<namespace>/<project>/-/merge_requests/new?merge_request[source_branch]=<head>&merge_request[target_branch]=<base>; ` +
+  `for Bitbucket use https://<host>/<workspace>/<repo>/pull-requests/new?source=<head>&dest=<base>. ` +
+  `<host> is the forge's web host: when the remote uses an ssh host alias from ~/.ssh/config, ` +
+  `use the HostName that alias points to, so the link opens in a browser. ` +
+  `A forge's SSH-only endpoint is not its web host: ssh.github.com means github.com, ` +
+  `altssh.gitlab.com means gitlab.com, and altssh.bitbucket.org means bitbucket.org.`;
 
 /**
  * A working directory the user has registered as a "project". Surfaced in the
@@ -6975,7 +7104,7 @@ export type AgentStatus = HarnessStatus;
 
 /**
  * Multi-provider git-forge support (docs/plans/multi-provider-git-modal.md).
- * `canonicalGitHost` in `src/bun/github.ts` already maps any host containing
+ * `canonicalGitHost` in `src/shared/git-host.ts` already maps any host containing
  * "github"/"gitlab"/"bitbucket" to the provider's cloud hostname — this is
  * the provider identifier that maps to that canonical host 1:1.
  */
@@ -6997,6 +7126,31 @@ export interface ProviderRepoInfo {
   remoteHost: string;
   owner: string;
   name: string;
+}
+
+/**
+ * Answer of `GET /github/pull-targets` (`src/bun/pr-targets.ts`): everything the
+ * Create-all-PRs planner needs to know about one repository's remote, read from
+ * the forge's REST API (never `git ls-remote`, no `git fetch`).
+ */
+export interface PullTargetsResult {
+  provider: GitProvider;
+  host: string;
+  owner: string;
+  name: string;
+  /** The git remote the identity came from. */
+  remote: string;
+  /** Every configured remote name. */
+  remotes: string[];
+  /** `<remote>/HEAD`, else the forge default; never a guessed "main". */
+  defaultBranch: string | null;
+  /** Forge branch names (capped at 1000). */
+  branches: string[];
+  branchesTruncated: boolean;
+  /** Listing failed; existence below is then `null` (unknown). */
+  branchesError: string | null;
+  heads: Array<{ name: string; onRemote: boolean | null }>;
+  storedBase: { name: string; onRemote: boolean | null; stale: boolean | null } | null;
 }
 
 /**

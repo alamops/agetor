@@ -1,6 +1,7 @@
 import type { Task } from "../../shared/types.ts";
 import { isTaskFxPaused } from "../../shared/fx-recovery.ts";
 import { isMultiRepoTask } from "../../shared/multi-repo.ts";
+import { taskPrsOf } from "../../shared/task-prs.ts";
 import { taskActionFlags } from "./task-card-actions.ts";
 
 /** Every action the task context menu can offer. A subset of App.tsx's
@@ -51,7 +52,17 @@ export interface TaskMenuEntry {
   /** For `copy-repo-*` / `view-repo-pr` on a multi-repository task: which
    *  repository entry the action targets. */
   repoName?: string;
+  /** Item id when it differs from the action (`view-pr-<n>`, `view-prs`): a
+   *  task can list several PRs, so the action alone isn't unique. */
+  id?: string;
+  /** For `view-pr` / `view-repo-pr`: the pull request this entry opens. */
+  prUrl?: string;
+  /** Present on the `view-prs` entry: the PRs it groups into a submenu. */
+  children?: TaskMenuEntry[];
 }
+
+/** More pull requests than this collapse into one "View pull requests" submenu. */
+export const MAX_FLAT_PR_ENTRIES = 3;
 
 /**
  * Builds the task card's right-click quick-action list, in display order,
@@ -131,24 +142,49 @@ export function buildTaskContextMenu(task: Task, ctx: { isOpen: boolean }): Task
   // inspect
   entries.push({ action: "diff", label: "View changes", group: "inspect" });
   entries.push({ action: "open-in-finder", label: "Open in Finder", group: "inspect" });
-  if (task.prUrl) {
-    entries.push({ action: "view-pr", label: "View pull request", group: "inspect" });
-  }
+  // One entry per pull request the task opened (a task can open several, one
+  // per branch and per repository). A legacy PR converted from the old single
+  // `prUrl` has no head and keeps the plain label. Past MAX_FLAT_PR_ENTRIES the
+  // entries move into one submenu.
+  const prEntries: TaskMenuEntry[] = [];
   if (isMultiRepoTask(task)) {
-    // Per-repository PRs (issue #291): a multi row has no single `prUrl` —
-    // each repository stamps its own — so name every repository that opened
-    // one. The board handler resolves `repoName` back to that entry's URL and
-    // worktree path.
-    for (const repo of task.repositories!) {
-      if (repo.prUrl) {
-        entries.push({
+    // Per-repository PRs (issue #291): a multi row has no task-level PRs; each
+    // repository records its own. The board handler resolves `repoName` back to
+    // that entry's worktree path.
+    for (const repo of task.repositories ?? []) {
+      for (const pr of taskPrsOf(repo)) {
+        prEntries.push({
           action: "view-repo-pr",
-          label: `View ${repo.name} pull request`,
+          label: pr.head ? `View ${repo.name} PR: ${pr.head}` : `View ${repo.name} pull request`,
           group: "inspect",
           repoName: repo.name,
+          prUrl: pr.url,
         });
       }
     }
+  } else {
+    for (const pr of taskPrsOf(task)) {
+      prEntries.push({
+        action: "view-pr",
+        label: pr.head ? `View PR: ${pr.head}` : "View pull request",
+        group: "inspect",
+        prUrl: pr.url,
+      });
+    }
+  }
+  prEntries.forEach((e, n) => {
+    e.id = `view-pr-${n}`;
+  });
+  if (prEntries.length > MAX_FLAT_PR_ENTRIES) {
+    entries.push({
+      action: prEntries[0]!.action,
+      id: "view-prs",
+      label: "View pull requests",
+      group: "inspect",
+      children: prEntries,
+    });
+  } else {
+    entries.push(...prEntries);
   }
   if (task.issueUrl) {
     entries.push({ action: "view-issue", label: "View issue", group: "inspect" });

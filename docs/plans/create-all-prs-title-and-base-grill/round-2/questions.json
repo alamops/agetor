@@ -1,0 +1,145 @@
+{
+  "version": 1,
+  "id": "create-all-prs-title-and-base-grill-r2",
+  "title": "Grill round 2: follow-ups on base precedence, the Base line and multiple PRs per repository",
+  "skill": "grill",
+  "slug": "create-all-prs-title-and-base",
+  "round": 2,
+  "summary": "Thanks, round 1 is complete. Three of your answers raise follow-ups the plan can't settle by itself:\n\n- **Q2 (base precedence):** you put the stored base first. Against the real app-repo case, that picks a stale base.\n- **Q13 (Base line):** you want a `Base:` line *and* the link. That needs a rule for when they disagree.\n- **Q14 (multiple PRs per repository):** now in scope. It raises a trust question, a data question and a few edges.\n\nThe last section is defaults derived from your answers. Confirm or override.",
+  "proven": [
+    "Accepted as you answered: create-time base stored (migration 092), HEAD records the checked-out branch only if it's on the remote, a missing base fails that repo clearly, attribution by link or label with the blind fallback dropped, newest matching proposal per repository across runs, root-task title as the no-proposal fallback (flagged), an editable confirm list, the single Create PR chip prefills the base, per-forge destination links, the prompt names the known base with an escape clause, and you'll update your own pipeline step text.",
+    {
+      "text": "**How PRs are stamped today.** One URL per repository entry (`repositories[].prUrl`), or `tasks.pr_url` for a single-repo task. First write wins, and Create all PRs skips any entry that already has one.",
+      "evidence": [
+        { "path": "src/bun/server.ts", "line": 3399, "lang": "ts", "code": "                if (isMultiRepoTask(task)) {\n                  ...\n                  const entry = (task.repositories ?? []).find(\n                    (r) => r.worktreePath === dir || r.path === dir,\n                  );\n                  if (entry && !entry.prUrl) {\n                    tasks.setRepositoryPrUrl(task.id, entry.name, result.item.htmlUrl);\n                  }\n                } else if (!task.prUrl && task.workdir === dir) {\n                  tasks.update(task.id, { prUrl: result.item.htmlUrl });\n                }" }
+      ]
+    }
+  ],
+  "sections": [
+    {
+      "id": "base",
+      "title": "Base precedence, revisited",
+      "questions": [
+        {
+          "id": "stale-stored-base",
+          "type": "single",
+          "title": "The stored base is first. What happens when the agent moved the branch onto another base?",
+          "impact": "blocking",
+          "why": "Your Q2 order (stored base → agent's base → default) would have opened the real **app** PR against the stale feature branch. It also makes the escape clause you chose for the prompt (Q12: \"unless you moved the branch onto another base\") have no effect on Create all PRs.",
+          "context": "Your round-1 answer to Q2: **1. stored base, 2. agent's link, 3. remote default.**\n\nIn the real run, the agent reset the app repo's task branch onto `origin/main`. The stored base (a feature branch) is no longer an ancestor of the head (`git merge-base --is-ancestor` fails). The agent's reply said the PR should target `main`.\n\nThe editable confirm list (Q9) will show the base either way. The question is what it **preselects**.",
+          "options": [
+            { "id": "stale-aware", "label": "Stored base first, unless git proves it stale; then the agent's base", "description": "\"Stale\" means the stored base's remote tip isn't an ancestor of the head. The confirm list shows both when they differ.", "consequence": "Gets both real repos right with no manual edit. One extra `git merge-base` per repository." },
+            { "id": "stored-always", "label": "Stored base always first; the confirm list flags a different agent base", "description": "e.g. \"agent suggests `main`\", and you change it by hand.", "consequence": "Simple and predictable. The real app PR needs a manual base change every time." },
+            { "id": "agent-first", "label": "Switch to the agent's base first (my round-1 recommendation)", "consequence": "The agent can override a correct stored base with a wrong one. The confirm list is the safety net." }
+          ],
+          "recommendation": { "value": "stale-aware", "reason": "It keeps your stored-first order, and still gets the real app repo right without trusting the agent when git agrees with the stored base." }
+        },
+        {
+          "id": "base-line-conflict",
+          "type": "single",
+          "title": "The agent's `Base:` line and its link name different branches. Which is \"the agent's base\"?",
+          "impact": "shape",
+          "why": "You chose both a `Base:` line and a destination link (Q13). They can disagree, for example an agent that writes `Base: develop` but pastes git's `pull/new/` link.",
+          "context": "Your round-1 answer to Q13: **\"Yes, plus the link.\"**",
+          "options": [
+            { "id": "line-wins-flag", "label": "The `Base:` line wins; the confirm list flags the mismatch", "consequence": "The explicit statement beats a URL the agent may have copied from git's output." },
+            { "id": "link-wins-flag", "label": "The link wins; flag the mismatch", "consequence": "The link is what the user would actually click." },
+            { "id": "neither", "label": "Ignore both (no agent base) and flag it", "consequence": "Falls to the next source. Safest, but it wastes a usable signal." }
+          ],
+          "recommendation": { "value": "line-wins-flag", "reason": "A link is often pasted from git's push output (default-branch link) even when the agent knows the right base. The line is the deliberate statement." }
+        }
+      ]
+    },
+    {
+      "id": "multi-pr",
+      "title": "More than one PR per repository (now in scope)",
+      "intro": "You moved Q14 in scope: one PR per matching proposal. Today a repository's only PR head is its live checkout. A second proposal names **another branch**, and that changes who decides what gets opened.",
+      "questions": [
+        {
+          "id": "extra-heads-trust",
+          "type": "single",
+          "title": "Which branches may Create all PRs open a PR *from*, besides each repository's live checkout?",
+          "impact": "blocking",
+          "oneWayDoor": true,
+          "why": "The head would come from agent-written text. A confused or prompt-injected agent could name any branch on that remote, a teammate's included, and agetor would open a public PR for it under your forge token.",
+          "context": "The real reply proposed a second branch in the app repo. The link already proves it's on that repository's remote. It does *not* prove the branch belongs to this task.",
+          "options": [
+            { "id": "remote-unchecked", "label": "Any branch on that repository's remote that a proposal names; shown in the confirm list **unchecked** by default", "consequence": "Every extra PR takes your explicit tick. The live-head PR stays checked." },
+            { "id": "remote-checked", "label": "Same, but **checked** by default", "consequence": "One click opens them all. A stray branch name becomes a public PR unless you notice and untick it." },
+            { "id": "task-commits", "label": "Only branches that contain commits made during this task (an author/time check against the task's runs)", "consequence": "Tighter, but a heuristic with its own edge cases (rebased or squashed commits). More code and tests." }
+          ],
+          "recommendation": { "value": "remote-unchecked", "reason": "You get every proposed PR, and the one decision agent text can't make on its own (opening a PR from a branch it named) stays yours." }
+        },
+        {
+          "id": "extra-pr-stamping",
+          "type": "single",
+          "title": "How are the extra PRs recorded on the task?",
+          "impact": "blocking",
+          "oneWayDoor": true,
+          "why": "Recording them changes the task's data shape, which the run panel, task card, context menu, pipelines and the API all read. Not recording them means a second press opens duplicates.",
+          "context": "`prUrl` is read today by about 15 webview, core and shared modules (the PR link, the button gate, the context menu, pipeline copy, repo removal). Repository entries live in JSON, so a new field there needs no column. A single-repo task's PRs live in `tasks.pr_url`.",
+          "options": [
+            { "id": "additive-list", "label": "Keep `prUrl` as the live-head PR. Add a list of extra PRs (`{head, base, url}`) per repository entry, and for a single-repo task in migration 092", "consequence": "Existing readers don't change. The run panel lists the extra PRs. Duplicates are skipped by head." },
+            { "id": "replace-list", "label": "Replace `prUrl` with a list everywhere", "consequence": "Cleaner model, but every `prUrl` reader and the API shape change, and the CLI and TUI follow." },
+            { "id": "no-stamp", "label": "Don't record them; report their links in the toast only", "consequence": "No data change. A second press opens them again, unless the forge's \"PR already exists\" answer is turned into a skip." }
+          ],
+          "recommendation": { "value": "additive-list", "reason": "Every existing reader keeps working and duplicates are still prevented. Same migration, one more field." }
+        },
+        {
+          "id": "single-repo-multi",
+          "type": "single",
+          "title": "A **single-repository** task whose reply proposes two PRs: does it get this too?",
+          "impact": "shape",
+          "why": "Single-repo tasks have no Create all PRs button, only the one Create PR chip, which opens the composer for the live-head proposal.",
+          "options": [
+            { "id": "out", "label": "No: multi-repo Create all PRs only. The single chip keeps one PR (the live-head proposal)", "consequence": "The second PR on a single-repo task stays manual, through the link in the reply." },
+            { "id": "chip-picker", "label": "Yes: when the reply has more than one proposal, the single chip lets you pick which one to open in the composer", "consequence": "A small picker on the chip, plus the extra-PR stamping for single-repo tasks." },
+            { "id": "create-all", "label": "Yes: show Create all PRs (with the same confirm list) on single-repo tasks with more than one proposal", "consequence": "The same flow everywhere. Larger UI change on the single-repo panel." }
+          ],
+          "recommendation": { "value": "out", "reason": "The bug and the button are multi-repo. A single-repo multi-PR flow is a new surface, so it's a different ticket unless you want it now." }
+        }
+      ]
+    },
+    {
+      "id": "confirm",
+      "title": "Confirm or override (derived from your answers)",
+      "questions": [
+        {
+          "id": "c-extra-base",
+          "type": "confirm",
+          "title": "Base for an extra (non-live-head) PR",
+          "impact": "minor",
+          "recommendation": { "value": "The stored create-time base belongs to the task branch only. An extra PR's base is the agent's base (`Base:` line, then link), then the remote default. It's editable in the confirm list.", "reason": "The task's stored base says nothing about another branch." }
+        },
+        {
+          "id": "c-extra-head-pushed",
+          "type": "confirm",
+          "title": "An extra head that isn't on the remote",
+          "impact": "minor",
+          "recommendation": { "value": "Shown disabled in the confirm list: \"branch `<x>` isn't on origin\". No PR is attempted.", "reason": "Same rule as a missing base: fail clearly, never guess." }
+        },
+        {
+          "id": "c-proposal-key",
+          "type": "confirm",
+          "title": "Which proposal is current",
+          "impact": "minor",
+          "recommendation": { "value": "The newest matching proposal per (repository, head) across runs, extending your round-1 Q7 answer from per-repository.", "reason": "With several PRs per repository, the head is what tells two proposals apart." }
+        },
+        {
+          "id": "c-duplicate",
+          "type": "confirm",
+          "title": "Duplicate PRs",
+          "impact": "minor",
+          "recommendation": { "value": "A head already stamped (live or extra) is skipped. A forge \"a pull request already exists\" answer is shown as \"already open\" (with the URL when the forge returns one), not as a failure.", "reason": "Makes a second press safe, as today." }
+        },
+        {
+          "id": "c-base-line-prompt",
+          "type": "confirm",
+          "title": "Where the `Base:` line goes",
+          "impact": "minor",
+          "recommendation": { "value": "Both prompts (single and multi) ask for a `Base: <branch>` line right above the link, inside each repository's block for multi.", "reason": "The parser then finds the line, the link, the title and the description in a fixed order." }
+        }
+      ]
+    }
+  ]
+}

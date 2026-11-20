@@ -157,6 +157,8 @@ describe("S22: a single-repository row derives its entry through repositoriesFor
       baseRef: "abc",
       checkoutBranch: "drifted/b",
       prUrl: "https://gh/pr/9",
+      prs: [{ url: "https://gh/pr/9", head: "drifted/b", base: null, number: null, createdAt: t.updatedAt }],
+      baseBranch: null,
     });
     tasks.delete(t.id);
   });

@@ -4,6 +4,7 @@ import { tmpdir } from "node:os";
 import path from "node:path";
 import {
   providerForHost,
+  providerRemoteForDir,
   providerRepoForDir,
   remoteHostsForDirs,
   __clearRemoteHostsCacheForTest,
@@ -177,6 +178,48 @@ test("providerRepoForDir falls through to another remote when origin is unsuppor
     owner: "acme",
     name: "app",
   });
+});
+
+// ---------------------------------------------------------------------------
+// providerRemoteForDir (Create all PRs reads `<remote>/HEAD` and strips a
+// `<remote>/` prefix off an agent's base, so it needs the remote's NAME too —
+// docs/plans/create-all-prs-title-and-base.md T9)
+// ---------------------------------------------------------------------------
+
+test("providerRemoteForDir names the remote the identity came from: origin first, whatever the add order", async () => {
+  const dir = await makeRepoWithRemotes([
+    { name: "aaa-upstream", url: "git@gitlab-work.io:acme/other.git" },
+    { name: "origin", url: "https://github.com/acme/main.git" },
+  ]);
+  const res = await providerRemoteForDir(dir);
+  expect(res).toEqual({
+    remote: "origin",
+    info: { provider: "github", host: "github.com", remoteHost: "github.com", owner: "acme", name: "main" },
+  });
+  // providerRepoForDir is the same walk, identity only.
+  expect(await providerRepoForDir(dir)).toEqual(res!.info);
+});
+
+test("providerRemoteForDir names a non-origin remote when origin's host is unsupported", async () => {
+  const dir = await makeRepoWithRemotes([
+    { name: "origin", url: "git@example.com:x/y.git" },
+    { name: "upstream", url: "git@bitbucket-work.org:ws/repo.git" },
+  ]);
+  expect(await providerRemoteForDir(dir)).toEqual({
+    remote: "upstream",
+    info: { provider: "bitbucket", host: "bitbucket.org", remoteHost: "bitbucket-work.org", owner: "ws", name: "repo" },
+  });
+});
+
+test("providerRemoteForDir is null with no supported remote, outside a repo, and for a missing directory", async () => {
+  const unsupported = await makeRepoWithRemotes([{ name: "origin", url: "git@example.com:x/y.git" }]);
+  const noRemotes = await makeRepoWithRemotes([]);
+  const plain = mkdtempSync(path.join(tmpdir(), "agetor-provider-remote-plain-"));
+  createdDirs.push(plain);
+  expect(await providerRemoteForDir(unsupported)).toBeNull();
+  expect(await providerRemoteForDir(noRemotes)).toBeNull();
+  expect(await providerRemoteForDir(plain)).toBeNull();
+  expect(await providerRemoteForDir(path.join(plain, "does-not-exist"))).toBeNull();
 });
 
 // ---------------------------------------------------------------------------

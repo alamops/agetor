@@ -119,6 +119,8 @@ describe("repositoriesForTask", () => {
       baseRef: "abc123",
       checkoutBranch: null,
       prUrl: null,
+      prs: [],
+      baseBranch: null,
     });
   });
 
@@ -181,6 +183,25 @@ describe("formatRepositoriesPrompt", () => {
   });
 });
 
+describe("repositoriesForTask derived entry", () => {
+  test("carries prs, baseBranch and a derived prUrl for a single-repo task", () => {
+    const pr = { url: "https://x/1", head: "feature/auth", base: "develop", number: 1, createdAt: 1 };
+    const [entry] = repositoriesForTask(task({ prs: [pr], baseBranch: "develop" }));
+    expect(entry!.prs).toEqual([pr]);
+    expect(entry!.baseBranch).toBe("develop");
+    expect(entry!.prUrl).toBe("https://x/1");
+  });
+  test("an older core's JSON (prUrl only) still yields its PR", () => {
+    const [entry] = repositoriesForTask(task({ prUrl: "https://x/legacy" }));
+    expect(entry!.prs).toEqual([{ url: "https://x/legacy", head: null, base: null, number: null, createdAt: 0 }]);
+    expect(entry!.prUrl).toBe("https://x/legacy");
+  });
+  test("a multi task's stored entries come back unchanged", () => {
+    const stored = [repo({ name: "a" }), repo({ name: "b" })];
+    expect(repositoriesForTask(task({ repositories: stored }))).toBe(stored);
+  });
+});
+
 describe("commitPushPrompt", () => {
   test("single-repo prompt is unchanged and has no Repositories block", () => {
     const text = commitPushPrompt({ branch: "feature/x", taskType: "task" });
@@ -208,6 +229,24 @@ describe("commitPushPrompt", () => {
     expect(text).toContain("Repositories:\n- frontend: branch 'feature/auth'\n- backend: branch 'feature/auth-2'");
     expect(text).toContain('Repository: <name>');
     expect(text).toContain("four-backtick block");
+  });
+
+  test("multi prompt carries each stored base and asks for Repository, Base, then the link", () => {
+    const text = commitPushPrompt({
+      branch: null,
+      taskType: "task",
+      repositories: [
+        repo({ name: "frontend", branch: "feature/auth", baseBranch: "develop" }),
+        repo({ name: "backend", branch: "feature/auth-2" }),
+      ],
+    });
+    expect(text).toContain("- frontend: branch 'feature/auth', base 'develop'\n- backend: branch 'feature/auth-2'\n");
+    expect(text.indexOf('"Repository: <name>"')).toBeLessThan(text.indexOf('"Base: <branch>"'));
+    expect(text.indexOf('"Base: <branch>"')).toBeLessThan(text.indexOf("full link to open a pull request"));
+    expect(text).toContain("compare/<base>...<head>?quick_pull=1");
+    expect(text).toContain("always targets the default branch");
+    expect(text).toContain("repeat the block for each pull request");
+    expect(text.toLowerCase()).not.toContain("agetor");
   });
 
   test("a one-repository multi task keeps the per-repository prompt", () => {

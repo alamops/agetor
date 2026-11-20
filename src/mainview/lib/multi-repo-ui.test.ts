@@ -9,11 +9,11 @@ import {
   endPrBatch,
   isPrBatchRunning,
   keepUserPickedRefs,
-  markRepositoryPrOpened,
+  markPrOpened,
   mergeSelectionsByRoot,
   multiRepoDeleteFallback,
   openFolderUnavailableReason,
-  repositoriesForPrBatch,
+  prOpenedInSession,
   resetPrBatchesForTest,
   repositoryCountLabel,
   resolveConflictsKey,
@@ -264,13 +264,17 @@ describe("Create all PRs registry (S12)", () => {
     expect(calls).toBe(2);
   });
 
-  test("a repository opened by an earlier walk is skipped before the poll stamps it", () => {
-    const repos = [repo({ name: "fe" }), repo({ name: "be" }), repo({ name: "db", prUrl: "https://x/pull/1" })];
-    expect(repositoriesForPrBatch("t", repos).map((r) => r.name)).toEqual(["fe", "be"]);
-    markRepositoryPrOpened("t", "fe");
-    expect(repositoriesForPrBatch("t", repos).map((r) => r.name)).toEqual(["be"]);
-    // Scoped to its task.
-    expect(repositoriesForPrBatch("other", repos).map((r) => r.name)).toEqual(["fe", "be"]);
+  test("a head opened by an earlier walk is remembered per task, repository and head", () => {
+    expect(prOpenedInSession("t", "fe", "feature/a")).toBe(false);
+    markPrOpened("t", "fe", "feature/a");
+    expect(prOpenedInSession("t", "fe", "feature/a")).toBe(true);
+    // Keyed by head: a second branch of the same repository is still open to a PR.
+    expect(prOpenedInSession("t", "fe", "feature/b")).toBe(false);
+    // Scoped to its repository and its task.
+    expect(prOpenedInSession("t", "be", "feature/a")).toBe(false);
+    expect(prOpenedInSession("other", "fe", "feature/a")).toBe(false);
+    resetPrBatchesForTest();
+    expect(prOpenedInSession("t", "fe", "feature/a")).toBe(false);
   });
 });
 
