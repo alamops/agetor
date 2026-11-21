@@ -9,6 +9,11 @@ import path from "node:path";
  *  when the dir was removed, false when it was kept because `agetor.sqlite` lives there. */
 export function rmTestDataDir(dir: string): boolean {
   if (existsSync(path.join(dir, "agetor.sqlite"))) return false;
+  // db-path.ts freezes the data dir at first import, before db.ts opens the
+  // sqlite. A file that only loaded db-path (via any module needing `dataDir`)
+  // must not delete that dir: a later db.ts import would fail SQLITE_CANTOPEN.
+  const pinned = (globalThis as { __agetorPinnedDataDir?: string }).__agetorPinnedDataDir;
+  if (pinned && pinned === path.resolve(dir)) return false;
   rmSync(dir, { recursive: true, force: true });
   return true;
 }

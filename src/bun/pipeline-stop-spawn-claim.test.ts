@@ -81,10 +81,10 @@ afterAll(async () => {
 
 writeFileSync(VERSION_FILE, PASSING_VERSION);
 
-async function waitFor<T>(fn: () => T | null | undefined | false, timeoutMs = 6000, intervalMs = 10): Promise<T> {
+async function waitFor<T>(fn: () => T | null | undefined | false | Promise<T | null | undefined | false>, timeoutMs = 6000, intervalMs = 10): Promise<T> {
   const start = Date.now();
   for (;;) {
-    const v = fn();
+    const v = await fn();
     if (v) return v;
     if (Date.now() - start > timeoutMs) throw new Error(`waitFor timed out after ${timeoutMs}ms`);
     await new Promise((r) => setTimeout(r, intervalMs));
@@ -98,9 +98,9 @@ const tick = (ms: number) => new Promise((r) => setTimeout(r, ms));
 async function waitForClaimWithoutRun(taskId: string, runCount: number): Promise<void> {
   const { isAnyRunOfTaskLive } = await import("./orchestrator.ts");
   const { runs } = await import("./db.ts");
-  await waitFor(() => {
+  await waitFor(async () => {
     const listed = runs.listForTask(taskId);
-    return listed.length === runCount && listed.every((r) => r.status !== "running") && isAnyRunOfTaskLive(taskId);
+    return listed.length === runCount && listed.every((r) => r.status !== "running") && await isAnyRunOfTaskLive(taskId);
   });
 }
 

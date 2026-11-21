@@ -21,7 +21,7 @@ afterAll(() => {
 });
 
 const SCRIPT = `
-const { subscribeGlobal } = await import("./src/bun/orchestrator.ts");
+const { subscribeGlobal, __globalEventsSettledForTest } = await import("./src/bun/orchestrator.ts");
 const { registerTmuxPrompt, cancelPendingForTask } = await import("./src/bun/interactions.ts");
 const seen = [];
 subscribeGlobal((e) => {
@@ -35,6 +35,9 @@ const { id } = registerTmuxPrompt({
   fingerprint: "fp-wiring",
 });
 cancelPendingForTask("wiring-task", "test");
+// A per-task global event is stamped with its pipeline parent (a database read)
+// before it reaches the subscribers.
+await __globalEventsSettledForTest();
 console.log("ID=" + id);
 console.log("SEEN=" + seen.join(","));
 process.exit(0);

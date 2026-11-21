@@ -36,7 +36,7 @@ import {
 import { spawnCodexViaTmux } from "./codex-tmux.ts";
 import { createCursorMapCtx, flushCursorThinking, mapCursorEvent } from "./cursor-tmux.ts";
 import { FAKE_CURSOR_ASK_PROMPT_MARKER, spawnCursorViaAcp, spawnFakeCursorAsk } from "./cursor-acp.ts";
-import { dataDir, subagents as subagentsDb, tasks } from "./db.ts";
+import { dataDir, subagents as subagentsDb, tasks } from "./db-async.ts";
 import { FX_STEER_DROPPED_STATUS, fxRefusedStatusLine, fxSpeedNotOfferedLine, mapFxUpdate, spawnFxViaAcp, type FxLaunchOptions, type FxMode, type FxUpdateCtx } from "./fx-acp.ts";
 import { spawnGeminiViaTmux } from "./gemini-tmux.ts";
 import { spawnAntigravityViaTmux } from "./antigravity-tmux.ts";
@@ -1334,11 +1334,11 @@ export function opencodeDriverHooks(a: {
   const { taskId, runId, harness, cwd, major, standalone } = a;
   return {
     onSubagent: (notice) => {
-      try {
-        registerOpencodeSubagent({ taskId, runId, notice });
-      } catch (err) {
+      // The driver's hook is synchronous; the row write is queued per task, so a
+      // later refresh of the task's rows (`beforeSettle`) sees it.
+      registerOpencodeSubagent({ taskId, runId, notice }).catch((err: unknown) => {
         console.warn(`[agetor] opencode: couldn't register subagent ${notice.childSessionId} for task ${taskId}:`, err);
-      }
+      });
     },
     beforeSettle: async () => {
       const env = harnessEnv(harness);
@@ -1682,9 +1682,8 @@ function parseFakeRealWatcherMarker(prompt: string): FakeRealWatcherSpec | null 
 /** The CURRENT turn's prompt when it carries the marker, else the task's own
  *  stored (turn-1) prompt when THAT does — the same fallback
  *  `resolveFakeHandoffPromptSource` uses, for the marker-less follow-up turn. */
-function resolveFakeRealWatcherSpec(taskId: string, prompt: string): FakeRealWatcherSpec | null {
+function resolveFakeRealWatcherSpec(prompt: string, stored: string | undefined): FakeRealWatcherSpec | null {
   if (prompt.includes(FAKE_CLAUDE_REAL_WATCHER_PROMPT_MARKER)) return parseFakeRealWatcherMarker(prompt);
-  const stored = tasks.get(taskId)?.prompt;
   return stored && stored.includes(FAKE_CLAUDE_REAL_WATCHER_PROMPT_MARKER) ? parseFakeRealWatcherMarker(stored) : null;
 }
 /** Filesystem-safe form of a task id (a uuid in practice) — the paths below
@@ -1763,7 +1762,7 @@ async function writeFakeRealWatcherFixture(
       path.join(paths.subagentsDir, `agent-${agentId}.meta.json`),
       JSON.stringify({ agentType: "general-purpose", description: `Fake real-watcher subagent ${i}`, toolUseId, spawnDepth: 1 }),
     );
-    subagentsDb.insertIfAbsent({
+    await subagentsDb.insertIfAbsent({
       id: agentId,
       taskId,
       runId,
@@ -1807,9 +1806,8 @@ function lastFakeHandoffSuffix(prompt: string): string | null {
  * `null` when neither carries the marker at all, i.e. this isn't a handoff
  * scenario.
  */
-function resolveFakeHandoffPromptSource(taskId: string, prompt: string): string | null {
+function resolveFakeHandoffPromptSource(prompt: string, stored: string | undefined): string | null {
   if (prompt.includes(FAKE_CLAUDE_HANDOFF_PROMPT_MARKER)) return prompt;
-  const stored = tasks.get(taskId)?.prompt;
   if (stored && stored.includes(FAKE_CLAUDE_HANDOFF_PROMPT_MARKER)) return stored;
   return null;
 }
@@ -2162,10 +2160,9 @@ const FAKE_FX_STEER_DEFAULT_HOLD_MS = 4000;
 /** The steer scenario this spawn runs, from the current prompt or (for a
  *  marker-less follow-up) the task's stored prompt; `null` when neither
  *  carries a well-formed `:absorbed`/`:dropped` marker. */
-function resolveFakeFxSteerMode(taskId: string, prompt: string): "absorbed" | "dropped" | null {
+function resolveFakeFxSteerMode(prompt: string, stored: string | undefined): "absorbed" | "dropped" | null {
   const own = FAKE_FX_STEER_SUFFIX_RE.exec(prompt);
   if (own) return own[1] as "absorbed" | "dropped";
-  const stored = tasks.get(taskId)?.prompt;
   const fromStored = stored ? FAKE_FX_STEER_SUFFIX_RE.exec(stored) : null;
   return fromStored ? (fromStored[1] as "absorbed" | "dropped") : null;
 }
@@ -2498,14 +2495,14 @@ export const FAKE_CLAUDE_PR_PROPOSAL_PROMPT_MARKER = "__agetor_fake_claude_pr_pr
  * for, with its branch placeholders resolved from the task row, or `null` when
  * the template is missing or isn't valid base64url UTF-8. Exported for tests.
  */
-export function renderFakePrProposalReply(taskId: string, prompt: string): string | null {
+export async function renderFakePrProposalReply(taskId: string, prompt: string): Promise<string | null> {
   const m = new RegExp(`${FAKE_CLAUDE_PR_PROPOSAL_PROMPT_MARKER}:([A-Za-z0-9_-]+)`).exec(prompt);
   if (!m) return null;
   const encoded = m[1]!;
   const template = Buffer.from(encoded, "base64url").toString("utf8");
   // Buffer's base64url decoder is lenient; a lossless round trip proves it was valid.
   if (!template || Buffer.from(template, "utf8").toString("base64url") !== encoded.replace(/=+$/, "")) return null;
-  const task = tasks.get(taskId);
+  const task = await tasks.get(taskId);
   return template.replace(/\{\{branch(?::([^}]+))?\}\}/g, (whole, repo: string | undefined) => {
     if (repo === undefined) return task?.branch ?? whole;
     const entry = task?.repositories?.find((r) => r.name === repo);
@@ -2635,7 +2632,7 @@ export const FAKE_CLAUDE_DONE_REJECT_PROMPT_MARKER = "__agetor_fake_claude_done_
 const FAKE_PNG_1X1_BASE64 =
   "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR42mNkYPhfDwAChwGA60e6kgAAAABJRU5ErkJggg==";
 
-function makeFakeAgent(
+async function makeFakeAgent(
   taskId: string,
   prompt: string,
   onChunk: ChunkHandler,
@@ -2656,7 +2653,10 @@ function makeFakeAgent(
     onSessionId?: (id: string) => void;
     resumeSessionId?: string | null;
   } = {},
-): SpawnedAgent {
+): Promise<SpawnedAgent> {
+  // The task's stored (turn-1) prompt, read once: the marker resolvers below
+  // fall back to it for a marker-less follow-up turn (they stay synchronous).
+  const storedPrompt = (await tasks.get(taskId))?.prompt;
   const record: string[] = [`spawn:${prompt}`];
   // Record the cwd so integration tests can prove a multi-repository task
   // spawns at the workspace root (issue #291).
@@ -2671,6 +2671,11 @@ function makeFakeAgent(
   // `SQLITE_CONSTRAINT_FOREIGNKEY` against the cascade-deleted row.
   const timers: ReturnType<typeof setTimeout>[] = [];
   const after = (ms: number, fn: () => void) => { timers.push(setTimeout(fn, ms)); };
+  // `after`, but the callback also waits for `gate` (an async DB insert a
+  // scenario started earlier), so the row exists before what depends on it runs.
+  const afterGated = (ms: number, gate: Promise<unknown>, fn: () => void | Promise<void>) => {
+    after(ms, () => { void gate.then(fn).catch((e: unknown) => { console.error("[agents] fake driver callback failed", e); }); });
+  };
   // Set only by the AGETOR_FAKE_FX_PERMISSION scenario below — `kill()`
   // needs it to settle a still-open card the same way `dropFxSession` →
   // `settleFx` does in the real driver (see interactions.ts's "Settlement
@@ -2755,7 +2760,9 @@ function makeFakeAgent(
       // (review R-S15).
       const signal = classifyHarnessLimitSignal(fakeOpts.kind ?? "claude-code", {
         text: fakeOpts.kind === "codex"
-          ? "You've hit your usage limit. Upgrade to Plus to continue using Codex (https://chatgpt.com/explore/plus), or try again at 3:00 PM."
+          // The reset time is a test seam: a fixed "3:00 PM" is unparseable
+          // (a just-passed time reads as null) for an hour after 3 PM local.
+          ? `You've hit your usage limit. Upgrade to Plus to continue using Codex (https://chatgpt.com/explore/plus), or try again at ${process.env.AGETOR_FAKE_CODEX_LIMIT_RESET ?? "3:00 PM"}.`
           : "Usage limit reached · continuing automatically when it resets",
       });
       if (!signal) {
@@ -2822,13 +2829,13 @@ function makeFakeAgent(
       );
     });
     after(resolveDelayMs, () => { resolveDone(0); });
-  } else if (resolveFakeRealWatcherSpec(taskId, prompt) !== null) {
+  } else if (resolveFakeRealWatcherSpec(prompt, storedPrompt) !== null) {
     // Test hook: attach the REAL subagent watcher over real on-disk
     // transcripts — see FAKE_CLAUDE_REAL_WATCHER_PROMPT_MARKER's doc comment
     // for the layout, the turn-1-vs-later split and why it exists. Checked
     // ahead of the handoff scenario (and every marker below) so it wins when
     // a prompt carries more than one marker.
-    const realWatcherSpec = resolveFakeRealWatcherSpec(taskId, prompt) as FakeRealWatcherSpec;
+    const realWatcherSpec = resolveFakeRealWatcherSpec(prompt, storedPrompt) as FakeRealWatcherSpec;
     const rwPaths = fakeRealWatcherPaths(fakeOpts.cwd ?? process.cwd(), taskId);
     after(5, () => {
       void (async () => {
@@ -2837,7 +2844,7 @@ function makeFakeAgent(
           // Turn 1 == the fake session's main JSONL doesn't exist yet. Stateless
           // (survives a process restart) and needs no per-task counter.
           if (!existsSync(rwPaths.jsonlPath)) {
-            const rowRunId = fakeOpts.runId ?? tasks.get(taskId)?.runId ?? null;
+            const rowRunId = fakeOpts.runId ?? (await tasks.get(taskId))?.runId ?? null;
             await writeFakeRealWatcherFixture(taskId, rowRunId, realWatcherSpec, rwPaths);
           }
           if (killed) return;
@@ -2867,7 +2874,7 @@ function makeFakeAgent(
         }
       })();
     });
-  } else if (resolveFakeHandoffPromptSource(taskId, prompt) !== null) {
+  } else if (resolveFakeHandoffPromptSource(prompt, storedPrompt) !== null) {
     // Test hook: simulate a pipeline step's turn ending with a `<handoff>`
     // block (see docs/plans/pipelines.md D3, `src/shared/pipeline.ts`'s
     // `parseHandoff`) so `pipeline-runner.test.ts` can drive the runner's
@@ -2901,7 +2908,7 @@ function makeFakeAgent(
     // resolved" — lets a test (`cancelRun`/`cancelPipelineRun` mid-step)
     // reliably fire a Stop while the step is still genuinely `running`.
     // Defaults to 30ms, same as this branch's original fixed delay.
-    const handoffPromptSource = resolveFakeHandoffPromptSource(taskId, prompt) as string;
+    const handoffPromptSource = resolveFakeHandoffPromptSource(prompt, storedPrompt) as string;
     const turn = bumpFakeHandoffTurn(taskId);
     const suffix = resolveFakeHandoffTurnSuffix(lastFakeHandoffSuffix(handoffPromptSource), turn);
     // A `FAKE_CLAUDE_SUBAGENT_PROMPT_MARKER` in the same source prompt (turn
@@ -2916,9 +2923,13 @@ function makeFakeAgent(
     // A `FAKE_CLAUDE_PR_PROPOSAL_PROMPT_MARKER` in the same source prompt
     // (turn 1 only) prints its PR proposal ahead of the handoff, so a
     // pipeline step can propose PRs the way a real Commit & push step does.
-    const prProposalReply = turn <= 1 ? renderFakePrProposalReply(taskId, handoffPromptSource) : null;
+    const prProposalReply = turn <= 1 ? await renderFakePrProposalReply(taskId, handoffPromptSource) : null;
     after(5, () => onChunk("status", "fake: working"));
     if (prProposalReply !== null) after(6, () => onChunk("assistant", prProposalReply));
+    let subagentInsertDone: () => void = () => undefined;
+    const subagentInserted = subagentSpec
+      ? new Promise<void>((resolveInsert) => { subagentInsertDone = resolveInsert; })
+      : Promise.resolve();
     if (subagentSpec) {
       // Keyed on the RUN (same reasoning as the Monitor scenario's id):
       // `insertIfAbsent` is INSERT OR IGNORE, so a task-keyed id would
@@ -2935,7 +2946,9 @@ function makeFakeAgent(
           }),
           "fake-subagent-1-tu",
         );
-        subagentsDb.insertIfAbsent({
+        // The insert is async: the settle and the handoff below wait for it, so
+        // the row exists before the settle runs and the orchestrator's hold sees it.
+        void subagentsDb.insertIfAbsent({
           id: subagentId,
           taskId,
           runId: fakeOpts.runId ?? null,
@@ -2948,11 +2961,11 @@ function makeFakeAgent(
           status: "running",
           startedAt: Date.now(),
           endedAt: null,
-        });
+        }).catch((e: unknown) => { console.error("[agents] fake subagent insert failed", e); }).finally(() => { subagentInsertDone(); });
         record.push(`subagent:spawned:${subagentId}`);
       });
-      after(8 + subagentSpec.runMs, () => {
-        settleSubagentById(subagentId, "completed", "receipt");
+      afterGated(8 + subagentSpec.runMs, subagentInserted, async () => {
+        await settleSubagentById(subagentId, "completed", "receipt");
         onChunk(
           "tool_result",
           JSON.stringify({ toolUseId: "fake-subagent-1", content: "delegated part done", isError: false }),
@@ -2961,7 +2974,7 @@ function makeFakeAgent(
         record.push(`subagent:settled:${subagentId}`);
       });
     }
-    after(subagentSpec ? subagentSpec.runMs + 30 : Math.min(20, resolveDelayMs - 10), () => {
+    afterGated(subagentSpec ? subagentSpec.runMs + 30 : Math.min(20, resolveDelayMs - 10), subagentInserted, () => {
       if (
         suffix === "missing"
         || ((suffix === "continue-then-done" || suffix === "continue-overlap") && turn <= 1)
@@ -3126,6 +3139,8 @@ function makeFakeAgent(
     // of the marker prompt) and silently degrade to a plain fake turn with no
     // hold. Same reasoning as `fakePlanCallCounter` in the cursor fake.
     const monitorId = `fake-monitor-${fakeOpts.runId ?? taskId}`;
+    let monitorInsertDone: () => void = () => undefined;
+    const monitorInserted = new Promise<void>((resolveInsert) => { monitorInsertDone = resolveInsert; });
     after(5, () => {
       onChunk(
         "tool_use",
@@ -3151,7 +3166,7 @@ function makeFakeAgent(
       // The real discovery path (claude-subagents.ts) would insert this row
       // off the same two lines just emitted above; this fake driver writes
       // no JSONL for that watcher to tail, so it inserts directly.
-      subagentsDb.insertIfAbsent({
+      void subagentsDb.insertIfAbsent({
         id: monitorId,
         taskId,
         runId: fakeOpts.runId ?? null,
@@ -3164,22 +3179,24 @@ function makeFakeAgent(
         status: "running",
         startedAt: Date.now(),
         endedAt: null,
-      });
+      }).catch((e: unknown) => { console.error("[agents] fake monitor insert failed", e); }).finally(() => { monitorInsertDone(); });
       record.push(`monitor:armed:${monitorId}`);
     });
-    after(12, () => {
+    // The row's insert is async: the turn's end (which the orchestrator's hold
+    // predicate reads) and the settle wait for it.
+    afterGated(12, monitorInserted, () => {
       onChunk("assistant", "Armed a monitor; waiting for events.");
       onChunk("status", "turn complete");
       resolveDone(0);
     });
-    after(settleMs, () => {
+    afterGated(settleMs, monitorInserted, async () => {
       // Mirrors the live path's receipt settle
       // (`setBackgroundTaskSettledHandler` → `settleSubagentById(id,
       // "completed", "receipt")`) that fires when a `<task-notification>`
       // carries the monitor's terminal event — this is what flips
       // `subagents.hasRunning(taskId)` false and releases the orchestrator's
       // hold, moving the card from `running` to `review`.
-      settleSubagentById(monitorId, "completed", "receipt");
+      await settleSubagentById(monitorId, "completed", "receipt");
       record.push(`monitor:settled:${monitorId}`);
     });
   } else if (
@@ -3203,7 +3220,7 @@ function makeFakeAgent(
   } else if (
     fakeOpts.kind === "fx"
     && fakeOpts.continueRecovery !== true
-    && resolveFakeFxSteerMode(taskId, prompt) !== null
+    && resolveFakeFxSteerMode(prompt, storedPrompt) !== null
   ) {
     // Test hook: fx 0.0.14 mid-turn steering — see FAKE_FX_STEER_PROMPT_MARKER's
     // doc comment. The turn holds so a follow-up can arrive while it runs;
@@ -3213,7 +3230,7 @@ function makeFakeAgent(
     // real driver's cancel and `dropFxSession` paths — a tick later, since
     // the real drop arrives asynchronously after the kill too — but emits no
     // status chunk, since a kill can land after a deleted run's row is gone.
-    const steerMode = resolveFakeFxSteerMode(taskId, prompt) as "absorbed" | "dropped";
+    const steerMode = resolveFakeFxSteerMode(prompt, storedPrompt) as "absorbed" | "dropped";
     const steered: string[] = [];
     let steerSettled = false;
     steer = (line) => {
@@ -3455,7 +3472,7 @@ function makeFakeAgent(
     // Test hook: see FAKE_CLAUDE_PR_PROPOSAL_PROMPT_MARKER's doc comment. The
     // reply goes out as one `assistant` chunk: proposals are read from the
     // assistant stream only, and the generic fake turn prints on stdout.
-    const reply = renderFakePrProposalReply(taskId, prompt);
+    const reply = await renderFakePrProposalReply(taskId, prompt);
     after(5, () => {
       if (reply === null) onChunk("status", "fake pr proposal: bad template");
       else onChunk("assistant", reply);
@@ -3499,7 +3516,7 @@ function makeFakeAgent(
       resolveDone(0);
     };
     after(20, () => {
-      registerFakePromptPane(taskId, {
+      void registerFakePromptPane(taskId, {
         text: wantsCode ? FAKE_PASTE_CODE_PANE : FAKE_ENTER_ONLY_PANE,
         onKeys: (keys) => {
           for (const key of keys) {
@@ -3507,7 +3524,7 @@ function makeFakeAgent(
             else typed.push(key); // the OAuth code text: counted, never emitted
           }
         },
-      });
+      }).catch((err: unknown) => console.warn("[agetor] fake prompt pane failed:", err));
     });
   } else if (prompt.includes(FAKE_CLAUDE_DONE_REJECT_PROMPT_MARKER)) {
     // Test hook: reject `done` (see FAKE_CLAUDE_DONE_REJECT_PROMPT_MARKER's

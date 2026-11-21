@@ -100,6 +100,27 @@ A Reject with no reason is relayed with a one-space `message`, because OpenCode 
 Residual (D20): "Open terminal" runs the harness `bin` in Terminal.app under Terminal's identity; the user triggers it from the app and sees the command.
 See `docs/plans/stop-agetor-tcc-appdata-spam.md` for the original agent-only change and `docs/qa/master-token-agent-read-qa.md` for the manual pass.
 
+## core.log contents and redaction
+
+`<dataDir>/logs/core.log` (`src/bun/core-log.ts`; behavior in [core-responsiveness.md](core-responsiveness.md#corelog)) holds everything the core, the database worker and the transcript worker print through `console.*`, and every event-loop stall of 1 s or more (the lag line names a label, a task id and a run id, never a message body). It exists because the packaged app sends the core's stdio to `/dev/null`. A log is a file any same-user process can read, so:
+
+- **The file is 0600 in a 0700 directory** (`logs/`, with an explicit `chmod` because `mkdir`'s mode is masked by the umask and ignored for an existing directory). Rotation keeps three files, all created 0600.
+- **Every line is redacted before it is queued** (`redactLogText`): first the registered literal secrets, then `Bearer <anything>` of any length, `token=…` / `access_token: …` values, then `redactSecrets` from `opencode-http.ts` (the password forms: `password=`, `OPENCODE_PASSWORD`, `Authorization`, `Basic <b64>`, URL userinfo, quoted keys and values). Boot registers the master token and the CLI token (`registerLogSecret`, `index.ts` and `headless.ts`), and the OpenCode server manager registers each server's password when it generates or reads one. A secret under 6 characters is not registered.
+- **A secret registered late is still removed.** A line remembers the secret generation it was redacted under. When a new secret was registered since, the literal pass runs again over the batch at flush time, before the write. So a token that appears in a line queued just before its registration never reaches the disk.
+- **Redaction runs before truncation.** A line is cut at 16 KB after redaction, so a secret that straddles the cap is already `[redacted]` and cannot leak its prefix. Text over 256 KB is cut before redaction only to bound its cost, backing off to the last whitespace so a token is not split.
+- **The OpenCode password never reaches it**: it is registered as a literal secret, so even a line that dumps it, in its raw or its base64 `opencode:<password>` form, is replaced. This is the second line of defense, not permission to log it. The rule in [Rules that apply everywhere](../../CLAUDE.md#rules-that-apply-everywhere) stands: the password lives only in the 0600 state file, the server's env file and the `Authorization` header, and never in argv, a log, a URL or an error message.
+- The worker threads' console output is forwarded to the main thread and goes through the same redactor, so a worker cannot write around it.
+
+Do not log a credential, a prompt or a transcript line on the strength of the redactor. It catches the shapes above; it cannot know every secret.
+
+## Worker threads: same process, same identity
+
+The database worker and the transcript worker (`core-worker.ts`) are threads of the core process, not child processes. They are not spawned through `coreSpawn`, they inherit the process's macOS TCC responsible-process identity, and they run no external program. So nothing about the disclaim rules changes: a TCC prompt still names Agetor, a spawn of an agent or a core helper still goes through `coreSpawn` / `coreSpawnSync` with the disclaim helper, and the allowlist test is unchanged. A new thread that read a user's protected folder in its own process would need the same care as the main thread (D25, D26 above).
+
+- **`AGETOR_CORE_WORKER_ENTRY` is honored only under test or e2e.** `worker-entry.ts` uses it only when `NODE_ENV=test` or `AGETOR_E2E_HARNESS_SEAMS=1`. In a release run the variable is ignored, because the path it names is run as code inside the core process.
+- **The transcript worker's `allowedRoot` is a confinement boundary.** It reads files whose paths come from the main thread, and the paths are built from agent-writable directories. So every call carries the subagents or workflows directory the watcher already validated, and the handler refuses, with no read attempted, unless the path is absolute, NUL-free, has no `..` segment, lies directly under that root, and every directory component below the root is a real directory and not a symlink (`isPlainDirBelow`). The file itself is opened with `O_NOFOLLOW` (the no-follow rules in **No-follow reads (D26)** above), and a symlink, FIFO or other non-regular file reads as nothing. A caller that omits `allowedRoot` gets the legacy behavior (any absolute path) and is a bug: the watcher always passes it.
+- **Message validation.** The database worker resolves a module and a method only as own properties of the module table, with the method a function, so `constructor` and `__proto__` never resolve, and an op name only as an own key of the op registry. Test-only ops (`__test.*`) and the test-only crash and migrate-delay hooks are refused outside `NODE_ENV=test`. Nothing in either worker evaluates code from a message.
+
 ## Harness-stack mirror and session transfer
 
 Every source is an agent-writable harness home, so mirror/transfer reads open

@@ -55,6 +55,14 @@ export interface LagStall {
   ctx: LagContext | null;
 }
 
+/** A label that overlapped a stall, with how long it did. */
+export interface LagOverlap {
+  label: string;
+  overlapMs: number;
+  taskId?: string;
+  runId?: string;
+}
+
 interface LabelEntry {
   label: string;
   ctx: LagContext | null;
@@ -83,6 +91,9 @@ const MAX_ENDED_PER_TICK = 256;
  *  begun now gets depth 1 while C keeps depth 2). For properly nested labels
  *  the two orders agree. */
 const NEAR_BEST_FRACTION = 0.5;
+/** Most overlapping labels written into one stall line (longest overlap first),
+ *  so a hot loop of labels can't turn a stall into a multi-kilobyte log line. */
+const MAX_LOGGED_OVERLAPS = 10;
 
 /** Live labels, outermost first. */
 const stack: LabelEntry[] = [];
@@ -211,7 +222,7 @@ function schedule(): void {
  * just-ended labels are candidates; the best overlap wins, near-ties go to the
  * most recently begun (see {@link NEAR_BEST_FRACTION}).
  */
-function attribute(now: number): LabelEntry | null {
+function attribute(now: number): { pick: LabelEntry | null; overlapping: LagOverlap[] } {
   const lateStart = lastTickAt + sampleMs;
   const candidates = [...ended, ...stack];
   let best = 0;
@@ -224,13 +235,23 @@ function attribute(now: number): LabelEntry | null {
     overlaps.set(entry, overlap);
     if (overlap > best) best = overlap;
   }
-  if (best <= 0) return null;
+  if (best <= 0) return { pick: null, overlapping: [] };
   let pick: LabelEntry | null = null;
   for (const [entry, overlap] of overlaps) {
     if (overlap < best * NEAR_BEST_FRACTION) continue;
     if (pick === null || entry.seq > pick.seq) pick = entry;
   }
-  return pick;
+  // Every label that overlapped, so the persistent core log (core-log.ts tees
+  // console.warn) shows the whole picture and not just the blamed one.
+  const overlapping = [...overlaps]
+    .sort((a, b) => b[1] - a[1])
+    .slice(0, MAX_LOGGED_OVERLAPS)
+    .map(([entry, overlap]) => ({
+      label: entry.label,
+      overlapMs: Math.round(overlap),
+      ...(entry.ctx ? { taskId: entry.ctx.taskId, runId: entry.ctx.runId } : {}),
+    }));
+  return { pick, overlapping };
 }
 
 function tick(): void {
@@ -240,7 +261,8 @@ function tick(): void {
   const elapsed = now - lastTickAt;
   const lagMs = elapsed - sampleMs;
   const stalled = lagMs >= stallMs;
-  const culprit = stalled ? attribute(now) : null;
+  const attributed = stalled ? attribute(now) : null;
+  const culprit = attributed?.pick ?? null;
 
   lastTickAt = now;
   ended = [];
@@ -268,8 +290,20 @@ function tick(): void {
     label: culprit?.label ?? null,
     ctx: culprit?.ctx ?? null,
   };
+  // Written for EVERY stall, labelled or not and with or without a runId: the
+  // sink below only reaches a run's status line when a label carries a runId,
+  // and stdio is /dev/null in the packaged app, so this line (teed into
+  // `<dataDir>/logs/core.log` by core-log.ts) is the only trace of an idle or
+  // unlabelled stall. The human-readable head is unchanged; the JSON tail adds
+  // the detail.
+  const detail = {
+    lagMs: Math.round(lagMs),
+    label: stall.label ?? "idle",
+    ...(stall.ctx ? { taskId: stall.ctx.taskId, runId: stall.ctx.runId } : {}),
+    overlaps: attributed?.overlapping ?? [],
+  };
   console.warn(
-    `[agetor] core was unresponsive for ${(lagMs / 1000).toFixed(1)}s during ${stall.label ?? "idle"}`,
+    `[agetor] core was unresponsive for ${(lagMs / 1000).toFixed(1)}s during ${stall.label ?? "idle"} ${JSON.stringify(detail)}`,
   );
   if (sink) {
     try {

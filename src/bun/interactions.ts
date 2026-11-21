@@ -1,11 +1,13 @@
 import { randomUUID } from "node:crypto";
-// Lazy cycle: db.ts imports `countPendingForTask`/`pendingCountsByTask` from
-// this module, and this module reads `tasks` back — safe ONLY because both
-// sides touch the other's exports from function bodies (never at module
-// scope). See the matching note at the top of db.ts before adding any
-// top-level use of `tasks` here.
-import { insertCursorAsk, resolveCursorAsk, runs, tasks } from "./db.ts";
+// The registry stays synchronous (the count functions below are read by db.ts's
+// badge-count thunks, and `register*` / `answer*` return values callers use at
+// once). Its database calls go through the async facade: writes whose order
+// matters are posted in call order (the worker answers FIFO) and not awaited,
+// and a failure is logged, never thrown into a registration or an answer.
+import { insertCursorAsk, op, resolveCursorAsk, runs, tasks } from "./db-async.ts";
+import { appendAndEmit } from "./run-emit-queue.ts";
 import { questionText } from "../shared/cursor-ask.ts";
+import { noteDecorationChanged } from "./task-decoration-rev.ts";
 import { redactPaneSecrets } from "./claude-prompt-screens.ts";
 import type { RunEvent } from "../shared/types.ts";
 
@@ -476,24 +478,49 @@ export function recordCursorAskToolResult(args: {
     isError: false,
   });
   const lineUuid = `tool_call:${args.toolCallId}:completed`;
-  let inserted: ReturnType<typeof runs.appendEvent>;
+  // Fire-and-forget by design: callers are sync (cancelPendingForTask, a route
+  // that does not need the row). `appendAndEmit` keeps this run's live sends in
+  // id order; a missing run row (insert throws) is ignored like before.
+  void appendAndEmit(
+    args.runId,
+    () => runs.appendEvent(args.runId, "tool_result", data, lineUuid),
+    (inserted) => {
+      if (inserted == null) return;
+      emitRunEvent({
+        runId: args.runId,
+        taskId: args.taskId,
+        stream: "tool_result",
+        data,
+        ts: inserted.ts,
+        id: inserted.id,
+      });
+    },
+  ).catch(() => { /* a run row that is gone: the card still resolves */ });
+}
+
+function logCursorAskWriteError(err: unknown): void {
+  console.error("[interactions] cursor ask write failed", err);
+}
+
+let cardRegisteredListener: ((taskId: string) => void) | null = null;
+
+/**
+ * A listener called synchronously each time a card is registered for a task
+ * (any kind), so a module that needs the task's harness in a synchronous check
+ * can load it. Returns the previous listener (tests restore it).
+ */
+export function setCardRegisteredListener(fn: ((taskId: string) => void) | null): ((taskId: string) => void) | null {
+  const prev = cardRegisteredListener;
+  cardRegisteredListener = fn;
+  return prev;
+}
+
+function noteCardRegistered(taskId: string): void {
+  noteDecorationChanged(taskId, pipelineParentCache.get(taskId)); // pending count moved (task delta + push)
   try {
-    inserted = runs.appendEvent(args.runId, "tool_result", data, lineUuid);
-  } catch {
-    return;
-  }
-  if (inserted == null) return;
-  try {
-    emitRunEvent({
-      runId: args.runId,
-      taskId: args.taskId,
-      stream: "tool_result",
-      data,
-      ts: inserted.ts,
-      id: inserted.id,
-    });
-  } catch {
-    /* the row is already the record */
+    cardRegisteredListener?.(taskId);
+  } catch (e) {
+    console.error("[interactions] card listener failed", e);
   }
 }
 
@@ -535,6 +562,7 @@ export function setResolvedBroadcaster(fn: ResolveBroadcastFn): ResolveBroadcast
  *  of the maps should call this with the request it removed so the UI
  *  hears about it. */
 function fanoutResolved(req: AnyRequest): void {
+  noteDecorationChanged(req.taskId, req.pipelineParentId ?? pipelineParentCache.get(req.taskId)); // card gone
   broadcastResolved({
     id: req.id,
     taskId: req.taskId,
@@ -544,18 +572,76 @@ function fanoutResolved(req: AnyRequest): void {
   });
 }
 
-/** `tasks.get(taskId)?.pipelineParentId`, as the optional-field spread every
- *  `register*` below stamps onto its request — `undefined` (key omitted, so
- *  existing JSON shapes stay byte-identical) for an ordinary task, an
- *  unknown task id, or when the db can't answer (never throws: a
- *  registration must not fail because of a parent lookup). */
-function pipelineParentFor(taskId: string): { pipelineParentId?: string } {
-  try {
-    const parentId = tasks.get(taskId)?.pipelineParentId;
-    return typeof parentId === "string" && parentId.length > 0 ? { pipelineParentId: parentId } : {};
-  } catch {
-    return {};
-  }
+/** Step task id -> its pipeline parent. A task's `pipelineParentId` is fixed at
+ *  creation, so an entry never goes stale. It is authoritative for every live
+ *  step: the pipeline runner notes each step as it creates it
+ *  (`notePipelineParent`), boot preloads every stored one
+ *  (`preloadPipelineParents`), and a deleted step is dropped
+ *  (`forgetPipelineParent`). Entries of archived steps stay until delete (the
+ *  orchestrator's archive path would have to call `forgetPipelineParent`; an
+ *  unarchive then re-learns the parent by the fallback lookup below). */
+const pipelineParentCache = new Map<string, string>();
+let warnedParentFallback = false;
+
+/** Record a step task's parent. Call before anything can register a card for it. */
+export function notePipelineParent(taskId: string, parentId: string): void {
+  pipelineParentCache.set(taskId, parentId);
+}
+
+/** Every known (step task id, pipeline parent id) pair, for the delta route's
+ *  fold of a step's pending count into its parent's. */
+export function pipelineParentPairs(): IterableIterator<[string, string]> {
+  return pipelineParentCache.entries();
+}
+
+/** Drop a deleted step task's entry. */
+export function forgetPipelineParent(taskId: string): void {
+  pipelineParentCache.delete(taskId);
+}
+
+/** Load every non-archived step -> parent mapping (one query). Boot awaits this
+ *  before the gate opens. */
+export async function preloadPipelineParents(): Promise<number> {
+  const pairs = await op("pipeline.stepParents", []);
+  for (const [stepId, parentId] of pairs) pipelineParentCache.set(stepId, parentId);
+  return pairs.length;
+}
+
+/** Test seam: forget every noted parent. */
+export function clearPipelineParentCacheForTests(): void {
+  pipelineParentCache.clear();
+  warnedParentFallback = false;
+}
+
+/** The optional-field spread every `register*` below stamps onto its request:
+ *  the task's `pipelineParentId` from the cache, synchronously (key omitted, so
+ *  existing JSON shapes stay byte-identical, for an ordinary task).
+ *
+ *  A task the cache does not know is looked up in the database as a FALLBACK
+ *  only: it should not happen (every step is noted at creation or preloaded at
+ *  boot), so it logs once. If the lookup finds a parent, the live card (found by
+ *  `cardId`) is stamped and republished as an "update". Never throws: a
+ *  registration must not fail because of a parent lookup. */
+function pipelineParentFor(taskId: string, cardId: string): { pipelineParentId?: string } {
+  const cached = pipelineParentCache.get(taskId);
+  if (cached !== undefined) return { pipelineParentId: cached };
+  void tasks.get(taskId).then((task) => {
+    const parentId = task?.pipelineParentId;
+    if (typeof parentId !== "string" || parentId.length === 0) return;
+    if (!warnedParentFallback) {
+      warnedParentFallback = true;
+      console.warn("[interactions] a pipeline step registered a card before its parent was noted; stamped by lookup");
+    }
+    pipelineParentCache.set(taskId, parentId);
+    // The card was registered while the parent was unknown, so the pending-count
+    // hook above marked only the step: the parent's folded badge needs a nudge.
+    noteDecorationChanged(taskId, parentId);
+    const live = askQuestions.get(cardId)?.req ?? tmuxPrompts.get(cardId)?.req ?? fxPermissions.get(cardId)?.req;
+    if (!live || live.pipelineParentId !== undefined) return;
+    live.pipelineParentId = parentId;
+    broadcast(live, "update");
+  }).catch(() => { /* a registration must not fail because of a parent lookup */ });
+  return {};
 }
 
 /* ────────────────────────────────────────────────────────────────────────── *
@@ -582,7 +668,7 @@ export function registerScrapedAskQuestions(args: {
     id,
     taskId: args.taskId,
     runId: args.runId,
-    ...pipelineParentFor(args.taskId),
+    ...pipelineParentFor(args.taskId, id),
     questions: args.questions,
     createdAt: Date.now(),
     source: "scraper",
@@ -590,6 +676,7 @@ export function registerScrapedAskQuestions(args: {
   };
   // No awaiter — the answer is driven via send-keys, not a promise resolve.
   askQuestions.set(id, { req, resolve: () => { /* scraper-sourced: no hook promise */ } });
+  noteCardRegistered(req.taskId);
   // The orchestrator's `emit` fan-out has no per-listener try/catch, so a
   // throwing listener must not strand this entry as a phantom pending card.
   try {
@@ -694,7 +781,7 @@ export function registerCursorAskQuestions(args: RegisterCursorAskArgs): {
     id,
     taskId: args.taskId,
     runId: args.runId,
-    ...pipelineParentFor(args.taskId),
+    ...pipelineParentFor(args.taskId, id),
     questions,
     createdAt: Date.now(),
     source: "cursor",
@@ -704,7 +791,9 @@ export function registerCursorAskQuestions(args: RegisterCursorAskArgs): {
     ...(title !== undefined ? { title } : {}),
   };
   if (args.persist !== false) {
-    insertCursorAsk({
+    // Posted now, not awaited: `register*` is sync. The worker answers in call
+    // order, so a later `resolveCursorAsk` always lands after this insert.
+    void insertCursorAsk({
       taskId: args.taskId,
       toolCallId: args.toolCallId,
       runId: args.runId,
@@ -717,13 +806,14 @@ export function registerCursorAskQuestions(args: RegisterCursorAskArgs): {
           options: q.options.map((o) => ({ id: o.id, label: o.label })),
         })),
       },
-    });
+    }).catch(logCursorAskWriteError);
   }
   let resolveCursor!: (answer: CursorAskAnswer) => void;
   const cursorAnswer = new Promise<CursorAskAnswer>((resolve) => {
     resolveCursor = resolve;
   });
   askQuestions.set(id, { req, resolve: () => { /* cursor: the awaiter is resolveCursor */ }, resolveCursor, cursorAnswer });
+  noteCardRegistered(req.taskId);
   cursorAskByTool.set(key, id);
   try {
     broadcast(req);
@@ -740,13 +830,13 @@ export function registerCursorAskQuestions(args: RegisterCursorAskArgs): {
   return { id, req, answer: cursorAnswer };
 }
 
-/** Write the outcome, then resolve the Cursor awaiter. Returns false when
+/** Post the outcome write (the worker applies it in call order), then resolve the Cursor awaiter. Returns false when
  *  the id is unknown or is not a Cursor card. */
 export function answerCursorAsk(id: string, answer: CursorAskAnswer): boolean {
   const entry = askQuestions.get(id);
   if (!entry?.resolveCursor) return false;
   const toolCallId = entry.req.toolCallId;
-  if (toolCallId) resolveCursorAsk(entry.req.taskId, toolCallId, answer.outcome);
+  if (toolCallId) void resolveCursorAsk(entry.req.taskId, toolCallId, answer.outcome).catch(logCursorAskWriteError);
   askQuestions.delete(id);
   cursorAskByTool.delete(cursorAskKey(entry.req.taskId, toolCallId ?? ""));
   entry.resolveCursor(answer);
@@ -851,7 +941,7 @@ export function registerTmuxPrompt(args: {
     id,
     taskId: args.taskId,
     runId: args.runId,
-    ...pipelineParentFor(args.taskId),
+    ...pipelineParentFor(args.taskId, id),
     // The ONE point every card's pane text passes through: a code typed into
     // the OAuth prompt (in the terminal, or echoed back by the pane) must
     // never be stored, broadcast over SSE or shown on a card.
@@ -870,6 +960,7 @@ export function registerTmuxPrompt(args: {
   };
   const answer = new Promise<TmuxPromptAnswer>((resolve) => {
     tmuxPrompts.set(id, { req, resolve });
+    noteCardRegistered(req.taskId);
   });
   // The orchestrator's `emit` fan-out has no per-listener try/catch, so a
   // throwing listener must not strand this entry as a phantom pending card.
@@ -949,7 +1040,7 @@ export function registerFxPermission(args: {
     id,
     taskId: args.taskId,
     runId: args.runId,
-    ...pipelineParentFor(args.taskId),
+    ...pipelineParentFor(args.taskId, id),
     createdAt: Date.now(),
     toolCall: args.toolCall,
     options: args.options,
@@ -957,6 +1048,7 @@ export function registerFxPermission(args: {
   };
   const answer = new Promise<FxPermissionAnswer>((resolve) => {
     fxPermissions.set(id, { req, resolve });
+    noteCardRegistered(req.taskId);
   });
   // The orchestrator's `emit` fan-out has no per-listener try/catch, so a
   // throwing listener must not strand this entry as a phantom pending card.
@@ -1079,7 +1171,7 @@ export function registerOpencodePermission(args: {
     id,
     taskId: args.taskId,
     runId: args.runId,
-    ...pipelineParentFor(args.taskId),
+    ...pipelineParentFor(args.taskId, id),
     createdAt: Date.now(),
     toolCall: args.toolCall,
     options: opencodePermissionOptions(),
@@ -1102,6 +1194,7 @@ export function registerOpencodePermission(args: {
   };
   fxPermissions.set(id, entry);
   opencodePermByRequest.set(key, id);
+  noteCardRegistered(entry.req.taskId);
   try {
     broadcast(req);
   } catch (err) {
@@ -1175,7 +1268,7 @@ export function registerOpencodeAskQuestions(args: {
     id,
     taskId: args.taskId,
     runId: args.runId,
-    ...pipelineParentFor(args.taskId),
+    ...pipelineParentFor(args.taskId, id),
     questions,
     createdAt: Date.now(),
     source: "opencode",
@@ -1195,6 +1288,7 @@ export function registerOpencodeAskQuestions(args: {
   };
   askQuestions.set(id, entry);
   opencodeAskByForm.set(key, id);
+  noteCardRegistered(entry.req.taskId);
   try {
     broadcast(req);
   } catch (err) {
@@ -1358,7 +1452,7 @@ export function cancelPendingForTask(taskId: string, reason: string): void {
       const toolCallId = entry.req.toolCallId;
       if (toolCallId) {
         cursorAskByTool.delete(cursorAskKey(taskId, toolCallId));
-        resolveCursorAsk(taskId, toolCallId, "cancelled");
+        void resolveCursorAsk(taskId, toolCallId, "cancelled").catch(logCursorAskWriteError);
         recordCursorAskToolResult({
           taskId,
           runId: entry.req.runId,

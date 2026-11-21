@@ -105,7 +105,7 @@ test("POST /tasks/:id/start answers 503 launches-frozen while frozen, and starts
   const { runs } = await import("./db.ts");
   const taskId = await makeClaudeTask();
 
-  freezeLaunches();
+  await freezeLaunches();
   const refused = await post(`/tasks/${taskId}/start`);
   expect(refused.status).toBe(503);
   expect(refused.json).toEqual({ error: LAUNCHES_FROZEN_REASON, code: "launches-frozen" });
@@ -131,7 +131,7 @@ test("a frozen core refuses a follow-up message without creating a run, and an f
   const before = runs.listForTask(taskId).length;
   const eventsBefore = runs.eventsForTask(taskId).length;
 
-  freezeLaunches();
+  await freezeLaunches();
   const sent = await post(`/runs/${started.runId}/input`, { line: "one more thing" });
   expect(sent.status).toBe(200);
   expect(sent.json).toEqual({ delivered: false, reason: LAUNCHES_FROZEN_REASON });
@@ -178,7 +178,7 @@ test("a frozen core refuses pipeline start, restart, advance and retry with the 
   const parentId = created.task.id;
   const runBefore = JSON.stringify(tasks.get(parentId)?.pipelineRun ?? null);
 
-  freezeLaunches();
+  await freezeLaunches();
   const start = await post(`/tasks/${parentId}/start`);
   expect(start.status).toBe(503);
   expect(start.json.code).toBe("launches-frozen");

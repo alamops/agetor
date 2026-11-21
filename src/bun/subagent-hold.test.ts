@@ -197,7 +197,7 @@ test("release: the last subagent leaving running fires the settle hook and moves
   // no exported "mark completed and settle" helper, so `orphanRunningSubagents`
   // (which flips every running row and THEN calls the settle hook) is the
   // documented, supported way to trigger this from a test.
-  orphanRunningSubagents(taskId);
+  await orphanRunningSubagents(taskId);
 
   expect(subagents.hasRunning(taskId)).toBe(false);
   const task = tasks.get(taskId);
@@ -262,7 +262,7 @@ test("release: settling a bg_session row via settleSubagentById releases the tas
   // Drive the same externally-detected-completion path a live `<task-
   // notification>` (or restart-safe journal scan) takes: settleSubagentById
   // settles the single row and fires the orchestrator's release hook itself.
-  const changed = settleSubagentById(bgId, "completed");
+  const changed = await settleSubagentById(bgId, "completed");
   expect(changed).toBe(true);
 
   expect(subagents.hasRunning(taskId)).toBe(false);
@@ -288,14 +288,14 @@ test("hasRunning treats subagent and bg_session rows alike: settling only the su
 
   // Settle only the "subagent" row — the bg_session row is still running, so
   // the mixed-kind hold must stay intact and the task must not release.
-  const subagentChanged = settleSubagentById(subagentId, "completed");
+  const subagentChanged = await settleSubagentById(subagentId, "completed");
   expect(subagentChanged).toBe(true);
 
   expect(subagents.hasRunning(taskId)).toBe(true);
   expect(tasks.get(taskId)?.column).toBe("running");
 
   // Now settle the bg_session row too — the last hold clears, task releases.
-  const bgChanged = settleSubagentById(bgId, "completed");
+  const bgChanged = await settleSubagentById(bgId, "completed");
   expect(bgChanged).toBe(true);
 
   expect(subagents.hasRunning(taskId)).toBe(false);
@@ -422,7 +422,7 @@ test("maybeReleaseHeldTask does not misfire when the user dragged the card out o
 
   // Fires the settle hook (there's still a running subagent row) — the
   // release predicate must see column !== 'running' and bail.
-  orphanRunningSubagents(taskId);
+  await orphanRunningSubagents(taskId);
 
   const task = tasks.get(taskId);
   expect(task?.column).toBe("done");
@@ -463,7 +463,7 @@ test("maybeReleaseHeldTask does not misfire when a newer run is already in fligh
 
   // Fires the settle hook — the release predicate must see the pointed-at
   // run isn't `succeeded` yet and bail, leaving the card in `running`.
-  orphanRunningSubagents(taskId);
+  await orphanRunningSubagents(taskId);
 
   const task = tasks.get(taskId);
   expect(task?.column).toBe("running");
@@ -544,7 +544,7 @@ test("hold: a succeeded run with a running monitor row keeps the task in running
   expect(runs.events(runId).some((e) => e.stream === "status" && e.data === "background agents still running (1) — holding in running")).toBe(true);
 });
 
-test("release: settleSubagentById(id, \"completed\", \"receipt\") on a monitor row releases the task to review", async () => {
+test("release: await settleSubagentById(id, \"completed\", \"receipt\") on a monitor row releases the task to review", async () => {
   const { startTask } = await import("./orchestrator.ts");
   const { tasks, subagents } = await import("./db.ts");
   const { settleSubagentById } = await import("./claude-subagents.ts");
@@ -564,7 +564,7 @@ test("release: settleSubagentById(id, \"completed\", \"receipt\") on a monitor r
   // terminal `<task-notification>` (or the restart-safe journal scan) takes:
   // `settleSubagentById(..., "receipt")` settles the row and fires the
   // orchestrator's release hook (`maybeReleaseHeldTask`) itself.
-  const changed = settleSubagentById(monitorId, "completed", "receipt");
+  const changed = await settleSubagentById(monitorId, "completed", "receipt");
   expect(changed).toBe(true);
 
   expect(subagents.hasRunning(taskId)).toBe(false);
@@ -591,7 +591,7 @@ test("hasRunning treats monitor and bg_session rows alike: settling one leaves t
 
   // Settle only the monitor row — the bg_session row is still running, so
   // the mixed-kind hold must stay intact and the task must not release.
-  const monitorChanged = settleSubagentById(monitorId, "completed", "receipt");
+  const monitorChanged = await settleSubagentById(monitorId, "completed", "receipt");
   expect(monitorChanged).toBe(true);
 
   expect(subagents.hasRunning(taskId)).toBe(true);
@@ -599,7 +599,7 @@ test("hasRunning treats monitor and bg_session rows alike: settling one leaves t
 
   // Now settle the bg_session row too — the last hold clears, task releases,
   // regardless of how many rows or which kinds were involved.
-  const bgChanged = settleSubagentById(bgId, "completed");
+  const bgChanged = await settleSubagentById(bgId, "completed");
   expect(bgChanged).toBe(true);
 
   expect(subagents.hasRunning(taskId)).toBe(false);

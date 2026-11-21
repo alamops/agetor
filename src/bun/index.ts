@@ -1,11 +1,12 @@
 // MUST stay the first import: it sets the channel's default AGETOR_DATA_DIR /
 // API port as a side effect, and ESM evaluates imports in order — anything below
-// that reaches db.ts (which opens and migrates SQLite on import) would otherwise
-// open the wrong data dir (docs/plans/always-on-host.md §3.6).
+// that reaches db-path.ts (which resolves the data dir on import, and from it the
+// database file the worker opens) would otherwise use the wrong data dir
+// (docs/plans/always-on-host.md §3.6).
 import "./channel-defaults.ts";
 // Second, right after the data dir is settled: copies every console line of
-// the desktop core to `<dataDir>/core.log` (the packaged app's stdout/stderr
-// go to /dev/null), so it must be in place before db.ts logs its migrations.
+// the desktop core to `<dataDir>/logs/core.log` (the packaged app's
+// stdout/stderr go to /dev/null), so module-load logging is captured too.
 import "./core-log-boot.ts";
 import { writeFileSync, existsSync } from "node:fs";
 import { isAbsolute } from "node:path";
@@ -13,13 +14,20 @@ import Electrobun, { ApplicationMenu, BrowserWindow, Screen, Updater, Utils } fr
 import { rehydratePath } from "./login-path.ts";
 import { startApiServer, API_PORT, API_TOKEN, type ApiNative } from "./server.ts";
 import { CLI_TOKEN, DEFAULT_API_HOST, resolveApiHost } from "./api-config.ts";
-import { db, harnesses, pidFilePath, tasks, dataDir, preferences } from "./db.ts";
+import { installCoreLog, registerLogSecret } from "./core-log.ts";
+import { onRevChanged, runs, preferences, setTaskDecorations } from "./db-async.ts";
+import { awaitDbReady, createQuitSequencer, runQuitSequence } from "./boot-db.ts";
+import { countPendingForTask, pendingCountsByTask, preloadPipelineParents } from "./interactions.ts";
+import { countTerminals, terminalCountsByTask } from "./terminals.ts";
+import { pidFilePath, dataDir } from "./db-path.ts";
+import { createRunningTasksSnapshot, quitRunningTasks } from "./running-tasks-snapshot.ts";
 import {
   freezeLaunches,
   startOpencodeServerDriver,
   stopOpencodeServersOnQuit,
   stopOpencodeServerDriver,
   launchesInFlight,
+  liveRunTaskIds,
   reconcileHarnessFailover,
   reconcileOrphans,
   reconcilePendingHarnessSwaps,
@@ -59,6 +67,7 @@ import {
 import { liveSupervisor, requestSupervisorStop } from "./login-daemon-state.ts";
 import { acquireApiPort } from "./app-takeover.ts";
 import { bootReadySignal } from "./boot-gate.ts";
+import { startTasksChangedPush } from "./task-change-push.ts";
 import { runRemoteAccessBox } from "./remote-access-box.ts";
 import {
   getBackgroundStatus,
@@ -91,6 +100,21 @@ import { installNotificationRemovalHooks } from "./notification-hooks.ts";
 import { setPendingMenuAction, setPendingOpenTask } from "./pending-open.ts";
 import { buildAppMenu, deliverMenuAction, menuActionFromClick } from "./app-menu.ts";
 import pkg from "../../package.json" with { type: "json" };
+
+// First statement of the module body (static imports have run, so the channel
+// default data dir is set): console output from here on is teed to
+// <dataDir>/logs/core.log. Both tokens are registered so no line carries them.
+installCoreLog();
+registerLogSecret(API_TOKEN);
+registerLogSecret(CLI_TOKEN);
+// Worker-mode Task results carry the same badge counts the main-thread
+// connection computes (lazy: these registries live in other modules).
+setTaskDecorations({
+  countPendingForTask: (taskId) => countPendingForTask(taskId),
+  countTerminals: (taskId) => countTerminals(taskId),
+  pendingCountsByTask: () => pendingCountsByTask(),
+  terminalCountsByTask: () => terminalCountsByTask(),
+});
 
 /** Drop a pid file in the data dir so out-of-process tools (notably
  *  `bun run wipe:dev`) can tell whether an agetor instance is using this
@@ -149,7 +173,7 @@ async function getMainViewUrl(): Promise<string> {
 // `Bun.which("claude")` / "codex" / "tmux" can find what's there. Has to run
 // before the API server starts handling /agents probes. Idempotent and safe
 // in dev runs — the merge dedupes.
-rehydratePath();
+await rehydratePath();
 
 // Boot order (boot-gate.ts): bind the API port first — taking it over from a
 // live background/CLI core — then restore (`reconcileOrphans` and friends),
@@ -365,6 +389,12 @@ async function confirmKeepOff(): Promise<boolean> {
 // probes against agetor's tmux socket, and the first tmux command to touch
 // a socket auto-starts its server — un-disclaimed, if ensureDisclaimedServer()
 // didn't run first — leaving every session that server ever hosts un-disclaimed too.
+// The db worker opens the database and runs migrations while the rest of boot
+// proceeds; the gate stays shut until it is ready (awaited before
+// reconcileOrphans below). /health and /info answer meanwhile. A failure is
+// logged and retried with a capped backoff, never skipped.
+const dbBoot = awaitDbReady();
+
 /** A boot restore that throws must not leave a bound server whose routes wait
  *  forever on a ready signal that never comes. */
 function failBoot(err: unknown): never {
@@ -392,6 +422,9 @@ try {
   // adopted after the port bind (this process is the owner) and before the
   // reconcile, whose reattach of a `server=agetor` run needs the adopted server.
   await adoptOpencodeServers();
+  await dbBoot;
+  // Before the gate opens: every live step's parent is known when its first card registers.
+  await preloadPipelineParents();
   await reconcileOrphans();
 
   // M16: reconcile every pipeline parent whose `pipelineRun` was left mid-flight
@@ -431,7 +464,7 @@ try {
 // detach) that was deferred to the in-memory teardown queue but never ran
 // because agetor quit or crashed before the job fired. Fire-and-forget — it
 // only enqueues jobs onto that queue, keyed to this instance's own task ids.
-sweepArchivedTeardowns();
+await sweepArchivedTeardowns();
 
 // Idle-session reaper (docs/plans/reduce-cpu-and-memory.md §3.1, T4): kills
 // claude REPL tmux sessions that have sat idle (no turn in flight, nothing
@@ -539,6 +572,22 @@ startPeriodicDiscovery();
 // The boot restore above is done: let the routes through (boot-gate.ts).
 markBootReady();
 
+// The quit prompt's running tasks, kept fresh in memory: the `before-quit`
+// hook below is synchronous and cannot await a database read. Re-read on task
+// revision changes, at most every 250 ms.
+const RUNNING_TASKS_SNAPSHOT_MIN_INTERVAL_MS = 250;
+const runningTasksSnapshot = createRunningTasksSnapshot({
+  read: () => runs.runningTasks(),
+  onChange: (cb) => onRevChanged(() => cb()),
+  minIntervalMs: RUNNING_TASKS_SNAPSHOT_MIN_INTERVAL_MS,
+  log: (m) => console.warn(m),
+});
+runningTasksSnapshot.start();
+
+// Task-list push: every task revision or decoration change becomes one throttled
+// `tasks-changed` event on the global SSE stream (task-change-push.ts).
+startTasksChangedPush();
+
 // Complete (or visibly block) harness-stack swaps a restart interrupted. After
 // the gate: a completion mirrors config and copies a transcript, which must not
 // hold every route. Each task is claimed first, so a Run or message cannot race
@@ -614,16 +663,71 @@ setTimeout(() => {
 // for agent launches this process is in the middle of — a claude session that
 // hasn't taken its first prompt yet would otherwise die with the app, which
 // breaks "they'll keep running in the background" (quit-launch-gate.ts).
+// `freezeLaunches` stops taking work at the call; the follow-ups it moves to
+// their backlog trays are database writes, which the quit sequence awaits
+// before the database worker is closed.
+let launchesFreezing: Promise<void> = Promise.resolve();
+const freezeLaunchesForQuit = (): void => {
+  const freezing = freezeLaunches().catch((err: unknown) => {
+    console.warn("[agetor] freezing launches failed:", err);
+  });
+  launchesFreezing = Promise.all([launchesFreezing, freezing]).then(() => undefined);
+};
 const quitLaunchGate = createQuitLaunchGate({
   launchesInFlight,
   waitForLaunchesToSettle,
-  freezeLaunches,
+  freezeLaunches: freezeLaunchesForQuit,
   requeueQuit: ({ completely }) => {
     armForceQuit({ completely });
     Utils.quit();
   },
   timeoutMs: HANDOFF_LAUNCH_SETTLE_MS,
   log: (m) => console.log(m),
+});
+// The quit effects read the decision of the pass that starts the sequence, so
+// the handler records it before its first `allowQuit` call.
+let quitDecision = { completely: false, stopSupervisor: false, backgroundArmed: false };
+const quitSequencer = createQuitSequencer({
+  run: () =>
+    runQuitSequence({
+      // Every effect is synchronous today; the sequence awaits whatever one
+      // returns, so an effect that becomes async (a db-async write) is awaited
+      // here before the worker is closed.
+      effects: async () => {
+        // The follow-ups a freeze moved to the backlog land before the worker closes.
+        // Bounded like headless's SHUTDOWN_FREEZE_WAIT_MS, so a wedged database
+        // worker can't hold this past the sequence cap with the creds file still
+        // on disk (removeCoreCreds below must always run).
+        await Promise.race([launchesFreezing, Bun.sleep(3_000)]);
+        const { completely, stopSupervisor, backgroundArmed } = quitDecision;
+        // Only when a supervisor is alive to read it (`stopSupervisor`): a request
+        // written with none running would otherwise linger for the next supervisor
+        // to start (the background turned on later, or the next login).
+        // takeSupervisorStop also ignores a stale request, as a second line of
+        // defense. The supervisor would otherwise take the port back when this
+        // process dies; this asks it to stay down until the next login (D6).
+        if (stopSupervisor) {
+          try {
+            requestSupervisorStop(dataDir);
+          } catch (err) {
+            console.warn("[agetor] failed to write the supervisor stop request:", err);
+          }
+        }
+        // A real quit (the background host is not taking over) stops the OpenCode
+        // servers nothing is using; a hand-over to the background core leaves them
+        // running for it to adopt.
+        try {
+          stopOpencodeServersOnQuit({ completely, backgroundArmed });
+        } catch (err) {
+          console.warn("[agetor] stopping idle OpenCode servers on quit failed:", err);
+        }
+        removeCoreCreds(dataDir);
+      },
+    }),
+  requeue: ({ completely }) => {
+    armForceQuit({ completely });
+    Utils.quit();
+  },
 });
 Electrobun.events.on("before-quit", (event: { response?: { allow: boolean } }) => {
   // Background host armed = a live login-item supervisor is parked under this
@@ -639,18 +743,12 @@ Electrobun.events.on("before-quit", (event: { response?: { allow: boolean } }) =
     consumeQuitCompletely,
     gate: quitLaunchGate,
     hasSupervisor: supervisor !== null,
-    runningTaskIds: () => {
-      try {
-        return db
-          .query<{ task_id: string }, []>(`SELECT DISTINCT task_id FROM runs WHERE status = 'running'`)
-          .all()
-          .map((r) => r.task_id);
-      } catch {
-        // If the DB is unavailable for any reason, allow the quit — the cost
-        // of a missed warning is small; the cost of trapping the user is high.
-        return [];
-      }
-    },
+    // This hook cannot await. The database snapshot (`runningTasksSnapshot`)
+    // trails a fresh start by up to one read and keeps its last good answer
+    // while the database is unreadable, so it is unioned with the runs this
+    // process is driving or starting right now (`liveRunTaskIds`, read
+    // synchronously): a run started just before Quit is always named.
+    runningTaskIds: () => quitRunningTasks(runningTasksSnapshot.current(), liveRunTaskIds()).map((t) => t.taskId),
   });
   if (decision.kind === "veto") {
     event.response = { allow: false };
@@ -660,8 +758,9 @@ Electrobun.events.on("before-quit", (event: { response?: { allow: boolean } }) =
     broadcastAppEvent({
       type: "quit_request",
       runningRunCount: decision.runningTaskIds.length,
-      runningTaskTitles: decision.runningTaskIds
-        .map((id) => tasks.get(id)?.title ?? "")
+      runningTaskTitles: quitRunningTasks(runningTasksSnapshot.current(), liveRunTaskIds())
+        .filter((t) => decision.runningTaskIds.includes(t.taskId))
+        .map((t) => t.title)
         .filter((t) => t.length > 0)
         .slice(0, 10),
       backgroundArmed,
@@ -671,30 +770,17 @@ Electrobun.events.on("before-quit", (event: { response?: { allow: boolean } }) =
     event.response = { allow: false };
     return;
   }
-  // Only when a supervisor is alive to read it (`stopSupervisor`): a request
-  // written with none running would otherwise linger for the next supervisor
-  // to start (the background turned on later, or the next login).
-  // takeSupervisorStop also ignores a stale request, as a second line of
-  // defense. The supervisor would otherwise take the port back when this
-  // process dies; this asks it to stay down until the next login (D6).
-  if (decision.stopSupervisor) {
-    try {
-      requestSupervisorStop(dataDir);
-    } catch (err) {
-      console.warn("[agetor] failed to write the supervisor stop request:", err);
-    }
-  }
-  // A real quit (the background host is not taking over) stops the OpenCode
-  // servers nothing is using; a hand-over to the background core leaves them
-  // running for it to adopt. Synchronous on purpose: Electrobun's quit() runs a
-  // forced exit right after this hook returns, so nothing here may await.
-  try {
-    stopOpencodeServersOnQuit({ completely: decision.completely, backgroundArmed });
-  } catch (err) {
-    console.warn("[agetor] stopping idle OpenCode servers on quit failed:", err);
-  }
-  removeCoreCreds(dataDir);
-  event.response = { allow: true };
+  // This hook is synchronous (Electrobun forces the exit as soon as it
+  // returns), so the first allowed pass vetoes the quit, runs the quit effects
+  // (which may touch the database) and only then drains core.log and closes the
+  // db worker, all bounded, and re-issues the quit. The second pass finds the
+  // sequence done, allows at once and applies nothing again.
+  quitDecision = {
+    completely: decision.completely,
+    stopSupervisor: decision.stopSupervisor,
+    backgroundArmed,
+  };
+  event.response = { allow: quitSequencer.allowQuit(decision.completely) };
 });
 
 // Stop the fx auto-resume engine's in-memory timers on the way out (Phase 8
@@ -745,8 +831,8 @@ const windowLifecycle = makeWindowLifecycle({
   setMainWindow,
   buildWindow: async (frame: Frame) => {
     const url = await getMainViewUrl();
-    const theme = resolveThemePreference();
-    const fontSize = resolveFontSizePreference();
+    const theme = await resolveThemePreference();
+    const fontSize = await resolveFontSizePreference();
     // The native views:// scheme handler refuses URLs that carry a fragment
     // or query — it treats the part after the scheme as a literal file path,
     // so `views://mainview/index.html#api=…` resolves to a non-existent file

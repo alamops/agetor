@@ -1,4 +1,5 @@
-import { OPENCODE_CHILD_SOURCE_PREFIX, opencodeStoppedChildren, runs, subagents, type AppendedEvent } from "./db.ts";
+import { OPENCODE_CHILD_SOURCE_PREFIX, opencodeStoppedChildren, runs, subagents } from "./db-async.ts";
+import { appendAndEmit } from "./run-emit-queue.ts";
 import { FX_USAGE_STATUS_PREFIX, type RunEvent, type RunEventStream, type Subagent, type SubagentEvent, type SubagentStatus } from "../shared/types.ts";
 import type { OpencodeSubagentNotice } from "./opencode-tmux.ts";
 import { exportOutcome, exportToEvents, runOpencodeExport, type OpencodeExport } from "./opencode-export.ts";
@@ -70,23 +71,59 @@ export function setOpencodeSubagentEmitter(fn: ((e: RunEvent) => void) | null): 
   return prev;
 }
 
-let settleFn: ((taskId: string) => void) | null = null;
+/** May be async (the orchestrator's release reads and writes the database);
+ *  every caller here awaits it. */
+type OpencodeSettleHook = (taskId: string) => unknown;
+let settleFn: OpencodeSettleHook | null = null;
 
 /** Held-task release hook (the orchestrator registers `maybeReleaseHeldTask`,
  *  same as Claude's `setSubagentSettleHook`). Fired after a row leaves
  *  `running`. Returns the previous hook (tests restore it). */
-export function setOpencodeSubagentSettleHook(fn: ((taskId: string) => void) | null): ((taskId: string) => void) | null {
+export function setOpencodeSubagentSettleHook(fn: OpencodeSettleHook | null): OpencodeSettleHook | null {
   const prev = settleFn;
   settleFn = fn;
   return prev;
 }
 
-function fireSettle(taskId: string): void {
+async function fireSettle(taskId: string): Promise<void> {
   try {
-    settleFn?.(taskId);
+    await settleFn?.(taskId);
   } catch (e) {
     console.error(`[opencode-subagents] settle hook failed for task ${taskId}:`, e);
   }
+}
+
+/**
+ * Per-task write queue. The driver reports a child's life as a run of
+ * synchronous calls (register, then chunks, then settle) and the database is
+ * asynchronous, so each task's subagent-row work is chained here: a call starts
+ * after every earlier call of the same task has finished, whatever order the
+ * worker thread answers in. Reads that must see those writes go through it too.
+ * Different tasks never wait on each other. A queued step that throws rejects
+ * only its own caller (the exported functions catch their own errors); the
+ * chain moves on, and its entry is dropped when idle. Work inside a queued step
+ * calls the `…Raw` functions below, never an exported (queued) one: queuing
+ * from inside the queue would wait on itself.
+ */
+const taskTails = new Map<string, Promise<void>>();
+
+function serial<T>(taskId: string, step: () => Promise<T>): Promise<T> {
+  const prev = taskTails.get(taskId) ?? Promise.resolve();
+  const result = prev.then(step);
+  const tail = result.then(
+    () => undefined,
+    () => undefined,
+  );
+  taskTails.set(taskId, tail);
+  void tail.then(() => {
+    if (taskTails.get(taskId) === tail) taskTails.delete(taskId);
+  });
+  return result;
+}
+
+/** Resolves once every subagent-row call queued so far for the task has finished (tests, shutdown). */
+export function flushOpencodeSubagentWrites(taskId: string): Promise<void> {
+  return serial(taskId, () => Promise.resolve());
 }
 
 export const OPENCODE_SUBAGENT_SOURCE_PREFIX = OPENCODE_CHILD_SOURCE_PREFIX;
@@ -128,10 +165,14 @@ function emitLifecycle(sub: Subagent, phase: SubagentEvent["phase"]): void {
 
 /** Insert the `running` row for a newly seen child session. Idempotent —
  *  a replayed tool line (reattach) re-reports the same child and is a no-op. */
-export function registerOpencodeSubagent(a: { taskId: string; runId: string; notice: OpencodeSubagentNotice }): void {
+export function registerOpencodeSubagent(a: { taskId: string; runId: string; notice: OpencodeSubagentNotice }): Promise<void> {
+  return serial(a.taskId, () => registerOpencodeSubagentRaw(a));
+}
+
+async function registerOpencodeSubagentRaw(a: { taskId: string; runId: string; notice: OpencodeSubagentNotice }): Promise<void> {
   const id = opencodeSubagentId(a.notice.childSessionId);
   try {
-    if (subagents.get(id)) return;
+    if (await subagents.get(id)) return;
     const row: Subagent = {
       id,
       taskId: a.taskId,
@@ -146,40 +187,68 @@ export function registerOpencodeSubagent(a: { taskId: string; runId: string; not
       startedAt: Date.now(),
       endedAt: null,
     };
-    subagents.insertIfAbsent(row);
+    await subagents.insertIfAbsent(row);
     emitLifecycle(row, "started");
   } catch (e) {
     console.error(`[opencode-subagents] failed to register ${id}:`, e);
   }
 }
 
-function runIdFor(row: Subagent): string | null {
+async function runIdFor(row: Subagent): Promise<string | null> {
   if (row.runId) return row.runId;
   try {
-    return runs.listForTask(row.taskId)[0]?.id ?? null;
+    return (await runs.listForTask(row.taskId))[0]?.id ?? null;
   } catch {
     return null;
   }
 }
 
-function append(row: Subagent, runId: string, stream: RunEventStream, data: string, lineUuid: string, subagentId: string | null): void {
-  let inserted: AppendedEvent | null;
+/** Persist one event of a child's tab and send it live, in id order with every
+ *  other event of the run (`appendAndEmit`). Never throws. */
+async function append(row: Subagent, runId: string, stream: RunEventStream, data: string, lineUuid: string, subagentId: string | null): Promise<void> {
   try {
-    inserted = runs.appendEvent(runId, stream, data, lineUuid, subagentId);
+    await appendAndEmit(
+      runId,
+      () => runs.appendEvent(runId, stream, data, lineUuid, subagentId),
+      (inserted) => {
+        if (inserted === null) return; // already persisted (re-check of an orphaned row)
+        emitFn?.({ id: inserted.id, runId, taskId: row.taskId, stream, data, ts: inserted.ts, subagentId });
+      },
+    );
   } catch (e) {
     console.error(`[opencode-subagents] failed to persist an event for ${row.id}:`, e);
-    return;
-  }
-  if (inserted === null) return; // already persisted (re-check of an orphaned row)
-  try {
-    emitFn?.({ id: inserted.id, runId, taskId: row.taskId, stream, data, ts: inserted.ts, subagentId });
-  } catch (e) {
-    console.error("[opencode-subagents] emit failed:", e);
   }
 }
 
-function appendExportEvents(row: Subagent, runId: string, exp: OpencodeExport): void {
-  for (const e of exportToEvents(exp)) append(row, runId, e.stream, e.data, e.lineUuid, row.id);
+/** The events of a child's `session export`, in one transaction (one hop, not one per row). Never throws. */
+async function appendExportEvents(row: Subagent, runId: string, exp: OpencodeExport): Promise<void> {
+  await appendBatch(row, runId, exportToEvents(exp).map((e) => ({ stream: e.stream, data: e.data, lineUuid: e.lineUuid })), row.id);
+}
+
+/** Persist a batch of one child's events in a single transaction and send each
+ *  stored one live, in order (`appendAndEmit`). Deduped by line uuid. Never throws. */
+async function appendBatch(
+  row: Subagent,
+  runId: string,
+  items: ReadonlyArray<{ stream: RunEventStream; data: string; lineUuid: string }>,
+  subagentId: string | null,
+): Promise<void> {
+  if (items.length === 0) return;
+  try {
+    await appendAndEmit(
+      runId,
+      () => runs.appendEvents(runId, items.map((it) => ({ stream: it.stream, data: it.data, lineUuid: it.lineUuid, subagentId }))),
+      (stored) => {
+        stored.forEach((inserted, i) => {
+          if (inserted === null) return;
+          const it = items[i]!;
+          emitFn?.({ id: inserted.id, runId, taskId: row.taskId, stream: it.stream, data: it.data, ts: inserted.ts, subagentId });
+        });
+      },
+    );
+  } catch (e) {
+    console.error(`[opencode-subagents] failed to persist events for ${row.id}:`, e);
+  }
 }
 
 function label(row: Subagent): string {
@@ -192,19 +261,39 @@ function label(row: Subagent): string {
  * `task.opencodeServer` may have changed since and a boot has no memory of
  * the launch. Null when the run has no such line (or the read fails).
  */
-export function opencodeTurnOfRun(runId: string | null): { major: 1 | 2; server: OpencodeTurnServer | null } | null {
+export async function opencodeTurnOfRun(runId: string | null): Promise<{ major: 1 | 2; server: OpencodeTurnServer | null } | null> {
   if (!runId) return null;
   try {
     // Per-major prefixes: `LIKE` is case-insensitive, and a bare `opencode `
     // prefix would also match this module's own `OpenCode subagent …` lines.
     for (const major of [2, 1] as const) {
-      const turn = parseOpencodeTurnBreadcrumb(runs.lastStatusDataWithPrefix(runId, opencodeTurnBreadcrumbPrefix(major)));
+      const turn = parseOpencodeTurnBreadcrumb(await runs.lastStatusDataWithPrefix(runId, opencodeTurnBreadcrumbPrefix(major)));
       if (turn) return turn;
     }
   } catch (e) {
     console.error(`[opencode-subagents] failed to read the turn breadcrumb of ${runId}:`, e);
   }
   return null;
+}
+
+/**
+ * {@link opencodeTurnOfRun} for many runs in one database call (the wake watch
+ * refresh looks at every task that ever had an OpenCode session). One entry per
+ * run id, in the order given; null where the run has no turn line or the read
+ * fails. Never throws.
+ */
+export async function opencodeTurnsOfRuns(
+  runIds: readonly string[],
+): Promise<Array<{ major: 1 | 2; server: OpencodeTurnServer | null } | null>> {
+  if (runIds.length === 0) return [];
+  try {
+    // Per-major prefixes, newest major first, as `opencodeTurnOfRun` reads them.
+    const lines = await runs.firstStatusDataWithPrefixes(runIds, [opencodeTurnBreadcrumbPrefix(2), opencodeTurnBreadcrumbPrefix(1)]);
+    return lines.map((line) => parseOpencodeTurnBreadcrumb(line));
+  } catch (e) {
+    console.error("[opencode-subagents] failed to read the turn breadcrumbs:", e);
+    return runIds.map(() => null);
+  }
 }
 
 /** How long an `orphaned` row keeps being re-checked at turn ends. A
@@ -219,10 +308,15 @@ export const ORPHAN_RECHECK_MAX_AGE_MS = 24 * 60 * 60 * 1000;
  * predates this server): offering it to the driver's relist / catch-up / boot
  * linger would keep a linger and the server alive on every boot. Never throws.
  */
-export function listOpenOpencodeChildSessions(taskId: string, now: number = Date.now()): string[] {
+export function listOpenOpencodeChildSessions(taskId: string, now: number = Date.now()): Promise<string[]> {
+  // Queued, so it sees every register / settle the driver already reported.
+  return serial(taskId, () => listOpenOpencodeChildSessionsRaw(taskId, now));
+}
+
+async function listOpenOpencodeChildSessionsRaw(taskId: string, now: number): Promise<string[]> {
   const out: string[] = [];
   try {
-    for (const row of subagents.listForTask(taskId)) {
+    for (const row of await subagents.listForTask(taskId)) {
       if (!isOpencodeSubagentRow(row) || (row.status !== "running" && row.status !== "orphaned")) continue;
       if (row.status === "orphaned" && now - (row.endedAt ?? row.startedAt) >= ORPHAN_RECHECK_MAX_AGE_MS) continue;
       const id = opencodeChildSessionOf(row);
@@ -241,14 +335,16 @@ export function listOpenOpencodeChildSessions(taskId: string, now: number = Date
  * status-filtered, indexed query (`subagents.settledOpencodeChildSessionIds`),
  * not a load of every row of the task. Never throws.
  */
-export function listSettledOpencodeChildSessions(taskId: string, now: number = Date.now()): string[] {
-  try {
-    // Open while `now - orphanedAt < MAX`, so settled from `orphanedAt <= now - MAX`.
-    return subagents.settledOpencodeChildSessionIds(taskId, now - ORPHAN_RECHECK_MAX_AGE_MS + 1);
-  } catch (e) {
-    console.error("[opencode-subagents] could not list settled subagent rows:", e);
-    return [];
-  }
+export function listSettledOpencodeChildSessions(taskId: string, now: number = Date.now()): Promise<string[]> {
+  return serial(taskId, async () => {
+    try {
+      // Open while `now - orphanedAt < MAX`, so settled from `orphanedAt <= now - MAX`.
+      return await subagents.settledOpencodeChildSessionIds(taskId, now - ORPHAN_RECHECK_MAX_AGE_MS + 1);
+    } catch (e) {
+      console.error("[opencode-subagents] could not list settled subagent rows:", e);
+      return [];
+    }
+  });
 }
 
 /* ── children agetor itself stopped (decision R4) ─────────────────────────── */
@@ -268,10 +364,10 @@ export const OPENCODE_STOPPED_CHILD_TTL_MS = 24 * 60 * 60 * 1000;
  * than {@link OPENCODE_STOPPED_CHILD_TTL_MS} are pruned on each write. Never
  * throws.
  */
-export function noteOpencodeChildStoppedByAgetor(a: { taskId: string; childSessionId: string }, now: number = Date.now()): void {
+export async function noteOpencodeChildStoppedByAgetor(a: { taskId: string; childSessionId: string }, now: number = Date.now()): Promise<void> {
   if (!a.childSessionId) return;
   try {
-    opencodeStoppedChildren.note(a.childSessionId, a.taskId, now, now - OPENCODE_STOPPED_CHILD_TTL_MS);
+    await opencodeStoppedChildren.note(a.childSessionId, a.taskId, now, now - OPENCODE_STOPPED_CHILD_TTL_MS);
   } catch (e) {
     console.error(`[opencode-subagents] could not record that ${a.childSessionId} was stopped:`, e);
   }
@@ -280,10 +376,10 @@ export function noteOpencodeChildStoppedByAgetor(a: { taskId: string; childSessi
 /** Whether agetor noted this child session as stopped within the last
  *  {@link OPENCODE_STOPPED_CHILD_TTL_MS} (see {@link noteOpencodeChildStoppedByAgetor}).
  *  One primary-key lookup; false on any read error. */
-export function wasOpencodeChildStoppedByAgetor(childSessionId: string, now: number = Date.now()): boolean {
+export async function wasOpencodeChildStoppedByAgetor(childSessionId: string, now: number = Date.now()): Promise<boolean> {
   if (!childSessionId) return false;
   try {
-    const at = opencodeStoppedChildren.stoppedAt(childSessionId);
+    const at = await opencodeStoppedChildren.stoppedAt(childSessionId);
     return at !== null && now - at < OPENCODE_STOPPED_CHILD_TTL_MS;
   } catch (e) {
     console.error(`[opencode-subagents] could not read whether ${childSessionId} was stopped:`, e);
@@ -291,17 +387,16 @@ export function wasOpencodeChildStoppedByAgetor(childSessionId: string, now: num
   }
 }
 
-function settleRow(row: Subagent, status: SubagentStatus): void {
+async function settleRow(row: Subagent, status: SubagentStatus): Promise<void> {
   const endedAt = Date.now();
-  subagents.setStatus(row.id, status, endedAt);
+  await subagents.setStatus(row.id, status, endedAt);
   emitLifecycle({ ...row, status, endedAt }, "finished");
-  fireSettle(row.taskId);
+  await fireSettle(row.taskId);
 }
 
-async function refreshRow(
-  row: Subagent,
-  a: { bin: string; env: Record<string, string>; cwd: string; major: 1 | 2; standalone: boolean; final: boolean },
-): Promise<void> {
+type RefreshArgs = { bin: string; env: Record<string, string>; cwd: string; major: 1 | 2; standalone: boolean; final: boolean };
+
+async function refreshRow(row: Subagent, a: RefreshArgs): Promise<void> {
   const child = opencodeChildSessionOf(row);
   let exp: OpencodeExport | null = null;
   if (child) {
@@ -320,12 +415,17 @@ async function refreshRow(
       exp = null;
     }
   }
-  const runId = runIdFor(row);
+  // The export read above is slow and unqueued; what it decided is written in order.
+  await serial(row.taskId, () => finishRefreshRow(row, a, exp));
+}
+
+async function finishRefreshRow(row: Subagent, a: RefreshArgs, exp: OpencodeExport | null): Promise<void> {
+  const runId = await runIdFor(row);
   const outcome = exp ? exportOutcome(exp) : "unfinished";
 
   if (outcome !== "unfinished") {
-    if (runId && exp) appendExportEvents(row, runId, exp);
-    settleRow(row, outcome === "succeeded" ? "completed" : "failed");
+    if (runId && exp) await appendExportEvents(row, runId, exp);
+    await settleRow(row, outcome === "succeeded" ? "completed" : "failed");
     return;
   }
   if (!a.final) return;
@@ -336,9 +436,9 @@ async function refreshRow(
   if (row.status === "orphaned") {
     const orphanedAt = row.endedAt ?? row.startedAt;
     if (Date.now() - orphanedAt < ORPHAN_RECHECK_MAX_AGE_MS) return;
-    if (runId && exp) appendExportEvents(row, runId, exp);
+    if (runId && exp) await appendExportEvents(row, runId, exp);
     if (runId) {
-      append(
+      await append(
         row,
         runId,
         "status",
@@ -347,21 +447,21 @@ async function refreshRow(
         null,
       );
     }
-    settleRow(row, "failed");
+    await settleRow(row, "failed");
     return;
   }
 
   if (a.standalone || a.major === 1) {
     // The child died with the turn's private server (A6a); show what it got done.
-    if (runId && exp) appendExportEvents(row, runId, exp);
+    if (runId && exp) await appendExportEvents(row, runId, exp);
     if (runId) {
-      append(row, runId, "status", `OpenCode subagent "${label(row)}" stopped when the turn ended`, `opencode:subagent:${row.id}:stopped`, null);
+      await append(row, runId, "status", `OpenCode subagent "${label(row)}" stopped when the turn ended`, `opencode:subagent:${row.id}:stopped`, null);
     }
-    settleRow(row, "failed");
+    await settleRow(row, "failed");
     return;
   }
   if (runId) {
-    append(
+    await append(
       row,
       runId,
       "status",
@@ -370,7 +470,7 @@ async function refreshRow(
       null,
     );
   }
-  settleRow(row, "orphaned");
+  await settleRow(row, "orphaned");
 }
 
 /**
@@ -385,19 +485,21 @@ async function refreshRow(
  * turn re-checks — as is a row whose turn mode isn't recorded. Fires the
  * settle hook once. Returns how many rows it settled; never throws.
  */
-export function orphanRunningOpencodeSubagents(taskId: string, reason: string): number {
+export function orphanRunningOpencodeSubagents(taskId: string, reason: string): Promise<number> {
+  return serial(taskId, () => orphanRunningOpencodeSubagentsRaw(taskId, reason));
+}
+
+async function orphanRunningOpencodeSubagentsRaw(taskId: string, reason: string): Promise<number> {
   let rows: Subagent[];
   try {
-    rows = subagents
-      .listForTask(taskId)
-      .filter((r) => isOpencodeSubagentRow(r) && r.status === "running");
+    rows = (await subagents.listForTask(taskId)).filter((r) => isOpencodeSubagentRow(r) && r.status === "running");
   } catch (e) {
     console.error("[opencode-subagents] failed to list subagents:", e);
     return 0;
   }
   let flipped = 0;
-  for (const row of rows) if (orphanRow(row, reason)) flipped++;
-  if (flipped > 0) fireSettle(taskId);
+  for (const row of rows) if (await orphanRow(row, reason)) flipped++;
+  if (flipped > 0) await fireSettle(taskId);
   return flipped;
 }
 
@@ -406,19 +508,19 @@ export function orphanRunningOpencodeSubagents(taskId: string, reason: string): 
  * does (the row's turn decides `failed` vs `orphaned`, with its status line).
  * Does not fire the settle hook. True when it flipped the row; never throws.
  */
-function orphanRow(row: Subagent, reason: string): boolean {
+async function orphanRow(row: Subagent, reason: string): Promise<boolean> {
   try {
-    const runId = runIdFor(row);
-    const turn = opencodeTurnOfRun(runId);
+    const runId = await runIdFor(row);
+    const turn = await opencodeTurnOfRun(runId);
     const status: SubagentStatus = turn && opencodeChildrenDieWithTurn(turn) ? "failed" : "orphaned";
     const endedAt = Date.now();
-    subagents.setStatus(row.id, status, endedAt);
+    await subagents.setStatus(row.id, status, endedAt);
     emitLifecycle({ ...row, status, endedAt }, "finished");
     if (runId) {
       const text = status === "failed"
         ? `OpenCode subagent "${label(row)}" stopped — ${reason}`
         : `OpenCode subagent "${label(row)}" was left unfinished — ${reason}`;
-      append(row, runId, "status", text, `opencode:subagent:${row.id}:left`, null);
+      await append(row, runId, "status", text, `opencode:subagent:${row.id}:left`, null);
     }
     return true;
   } catch (e) {
@@ -437,7 +539,7 @@ function orphanRow(row: Subagent, reason: string): boolean {
  * idle tail) or revives it (listed active). Returns how many rows it flipped;
  * never throws.
  */
-export function orphanRunningOpencodeChildrenOfTask(taskId: string): number {
+export function orphanRunningOpencodeChildrenOfTask(taskId: string): Promise<number> {
   return orphanRunningOpencodeSubagents(taskId, "the OpenCode server stopped");
 }
 
@@ -452,18 +554,20 @@ export function orphanRunningOpencodeChildrenOfTask(taskId: string): number {
  * flipped the row. Idempotent: a row that is not `running` (or not this task's,
  * or not an OpenCode row) is left as it is and false returned. Never throws.
  */
-export function orphanOpencodeChild(taskId: string, childSessionId: string): boolean {
-  let row: Subagent | null | undefined;
-  try {
-    row = subagents.get(opencodeSubagentId(childSessionId));
-  } catch (e) {
-    console.error("[opencode-subagents] failed to read a subagent row:", e);
-    return false;
-  }
-  if (!row || row.taskId !== taskId || !isOpencodeSubagentRow(row) || row.status !== "running") return false;
-  if (!orphanRow(row, "the OpenCode server stopped")) return false;
-  fireSettle(taskId);
-  return true;
+export function orphanOpencodeChild(taskId: string, childSessionId: string): Promise<boolean> {
+  return serial(taskId, async () => {
+    let row: Subagent | null | undefined;
+    try {
+      row = await subagents.get(opencodeSubagentId(childSessionId));
+    } catch (e) {
+      console.error("[opencode-subagents] failed to read a subagent row:", e);
+      return false;
+    }
+    if (!row || row.taskId !== taskId || !isOpencodeSubagentRow(row) || row.status !== "running") return false;
+    if (!(await orphanRow(row, "the OpenCode server stopped"))) return false;
+    await fireSettle(taskId);
+    return true;
+  });
 }
 
 const REFRESH_EXPORT_TIMEOUT_MS = 10_000;
@@ -485,13 +589,13 @@ export async function refreshOpencodeSubagents(a: {
 }): Promise<void> {
   let rows: Subagent[];
   try {
-    rows = subagents
-      .listForTask(a.taskId)
-      .filter((r) => isOpencodeSubagentRow(r) && (r.status === "running" || r.status === "orphaned"))
-      // A child of a turn the agetor-owned server carried is filled live and
-      // settled on its own terminal (see the header): there is no `session
-      // export` to run for it, and no turn end may decide its fate.
-      .filter((r) => opencodeTurnOfRun(runIdFor(r))?.server !== "agetor");
+    const open = (await serial(a.taskId, () => subagents.listForTask(a.taskId)))
+      .filter((r) => isOpencodeSubagentRow(r) && (r.status === "running" || r.status === "orphaned"));
+    // A child of a turn the agetor-owned server carried is filled live and
+    // settled on its own terminal (see the header): there is no `session
+    // export` to run for it, and no turn end may decide its fate.
+    rows = [];
+    for (const r of open) if ((await opencodeTurnOfRun(await runIdFor(r)))?.server !== "agetor") rows.push(r);
   } catch (e) {
     console.error("[opencode-subagents] failed to list subagents:", e);
     return;
@@ -506,7 +610,7 @@ export async function refreshOpencodeSubagents(a: {
         console.error(`[opencode-subagents] refresh of ${row.id} failed:`, e);
         if (a.final && row.status === "running") {
           // Never leave a row `running` past a final refresh (A6).
-          try { settleRow(row, a.standalone || a.major === 1 ? "failed" : "orphaned"); } catch { /* noop */ }
+          try { await serial(row.taskId, () => settleRow(row, a.standalone || a.major === 1 ? "failed" : "orphaned")); } catch { /* noop */ }
         }
       }
     }
@@ -548,10 +652,23 @@ export function registerOpencodeChildSession(a: {
   agent?: string;
   depth: number;
   background?: boolean;
-}): void {
+}): Promise<void> {
+  return serial(a.taskId, () => registerOpencodeChildSessionRaw(a));
+}
+
+async function registerOpencodeChildSessionRaw(a: {
+  taskId: string;
+  runId: string;
+  parentSessionId: string;
+  childSessionId: string;
+  title?: string;
+  agent?: string;
+  depth: number;
+  background?: boolean;
+}): Promise<void> {
   const id = opencodeSubagentId(a.childSessionId);
   try {
-    if (subagents.get(id)) return;
+    if (await subagents.get(id)) return;
     const row: Subagent = {
       id,
       taskId: a.taskId,
@@ -566,7 +683,7 @@ export function registerOpencodeChildSession(a: {
       startedAt: Date.now(),
       endedAt: null,
     };
-    subagents.insertIfAbsent(row);
+    await subagents.insertIfAbsent(row);
     emitLifecycle(row, "started");
   } catch (e) {
     console.error(`[opencode-subagents] failed to register ${id}:`, e);
@@ -575,10 +692,10 @@ export function registerOpencodeChildSession(a: {
 
 /** A child the server is evidently still running, but whose row an earlier
  *  teardown or boot sweep parked as `orphaned`, is `running` again. */
-function reviveIfOrphaned(row: Subagent): Subagent {
+async function reviveIfOrphaned(row: Subagent): Promise<Subagent> {
   if (row.status !== "orphaned") return row;
   try {
-    subagents.setStatus(row.id, "running", null);
+    await subagents.setStatus(row.id, "running", null);
     const revived: Subagent = { ...row, status: "running", endedAt: null };
     emitLifecycle(revived, "started");
     return revived;
@@ -602,31 +719,53 @@ function reviveIfOrphaned(row: Subagent): Subagent {
  * (`IFNULL(subagent_id,'') = ?` against `run_events_run_sub_line_uuid`) would
  * replace this lookup and keep the original `ts`.
  */
-function replaceChildEventData(row: Subagent, runId: string, chunk: OpencodeMappedChunk): boolean {
+async function replaceChildEventData(row: Subagent, runId: string, chunk: OpencodeMappedChunk): Promise<boolean> {
   if (chunk.stream !== "tool_use") return false;
   try {
     const callId = (JSON.parse(chunk.data) as { id?: unknown }).id;
     if (typeof callId !== "string") return false;
-    const hit = runs.findToolUseEvent(runId, callId);
-    if (!hit) return false;
-    if (hit.data !== chunk.data) {
-      runs.replaceEventData(hit.id, chunk.data);
-      emitFn?.({ id: hit.id, runId, taskId: row.taskId, stream: chunk.stream, data: chunk.data, ts: Date.now(), subagentId: row.id });
-    }
-    return true;
+    // Through the run's emit queue: the rewrite's live send keeps its place among the run's appends.
+    const hit = await appendAndEmit(
+      runId,
+      async () => {
+        const found = await runs.findToolUseEvent(runId, callId);
+        if (found && found.data !== chunk.data) await runs.replaceEventData(found.id, chunk.data);
+        return found && found.data !== chunk.data ? { id: found.id, changed: true } : found ? { id: found.id, changed: false } : null;
+      },
+      (res) => {
+        if (res?.changed) emitFn?.({ id: res.id, runId, taskId: row.taskId, stream: chunk.stream, data: chunk.data, ts: Date.now(), subagentId: row.id });
+      },
+    );
+    return hit !== null;
   } catch (e) {
     console.error(`[opencode-subagents] failed to replace an event of ${row.id}:`, e);
     return false;
   }
 }
 
-function ingestChunk(row: Subagent, runId: string, chunk: OpencodeMappedChunk): void {
-  // A child's usage line is not the task's: the run-level readers of the
-  // `fx-usage` status line know nothing of subagent ids (the export path
-  // never wrote one either).
-  if (chunk.stream === "status" && chunk.data.startsWith(FX_USAGE_STATUS_PREFIX)) return;
-  if (chunk.replace && replaceChildEventData(row, runId, chunk)) return;
-  append(row, runId, chunk.stream, chunk.data, chunk.lineUuid, row.id);
+/** Store a list of mapped chunks in order. Plain chunks go to the database a
+ *  batch at a time (one transaction per run of consecutive plain chunks, not one
+ *  per chunk); a `replace` chunk is flushed behind the batch before it, so the
+ *  order is exactly the chunks' order. */
+async function ingestChunks(row: Subagent, runId: string, chunks: readonly OpencodeMappedChunk[]): Promise<void> {
+  let pending: Array<{ stream: RunEventStream; data: string; lineUuid: string }> = [];
+  const flush = async (): Promise<void> => {
+    const batch = pending;
+    pending = [];
+    await appendBatch(row, runId, batch, row.id);
+  };
+  for (const chunk of chunks) {
+    // A child's usage line is not the task's: the run-level readers of the
+    // `fx-usage` status line know nothing of subagent ids (the export path
+    // never wrote one either).
+    if (chunk.stream === "status" && chunk.data.startsWith(FX_USAGE_STATUS_PREFIX)) continue;
+    if (chunk.replace) {
+      await flush();
+      if (await replaceChildEventData(row, runId, chunk)) continue;
+    }
+    pending.push({ stream: chunk.stream, data: chunk.data, lineUuid: chunk.lineUuid });
+  }
+  await flush();
 }
 
 /**
@@ -636,23 +775,24 @@ function ingestChunk(row: Subagent, runId: string, chunk: OpencodeMappedChunk): 
  * parked `orphaned` comes back to `running` — events arriving prove the child
  * is alive. A settled row still takes new lines (a late tool result), but its
  * status is never reopened. Unknown child or a row of another task: dropped.
- * Synchronous and cheap per chunk; a caller with a big batch uses
- * {@link syncOpencodeChildFromServer}, which yields between slices. Never throws.
+ * Queued per task (see `serial`), one transaction per batch; a caller with a
+ * big batch uses {@link syncOpencodeChildFromServer}, which yields between
+ * slices. Never throws.
  */
-export function ingestOpencodeChildChunks(a: { taskId: string; childSessionId: string; chunks: OpencodeMappedChunk[] }): void {
-  ingestChildChunks(a, true);
+export function ingestOpencodeChildChunks(a: { taskId: string; childSessionId: string; chunks: OpencodeMappedChunk[] }): Promise<void> {
+  return serial(a.taskId, () => ingestChildChunks(a, true));
 }
 
 /** `revive: false` is for a catch-up replaying history, which proves nothing about the child being alive now. */
-function ingestChildChunks(a: { taskId: string; childSessionId: string; chunks: OpencodeMappedChunk[] }, revive: boolean): void {
+async function ingestChildChunks(a: { taskId: string; childSessionId: string; chunks: OpencodeMappedChunk[] }, revive: boolean): Promise<void> {
   if (a.chunks.length === 0) return;
   try {
-    const found = subagents.get(opencodeSubagentId(a.childSessionId));
+    const found = await subagents.get(opencodeSubagentId(a.childSessionId));
     if (!found || found.taskId !== a.taskId) return;
-    const runId = runIdFor(found);
+    const runId = await runIdFor(found);
     if (!runId) return;
-    const row = revive ? reviveIfOrphaned(found) : found;
-    for (const chunk of a.chunks) ingestChunk(row, runId, chunk);
+    const row = revive ? await reviveIfOrphaned(found) : found;
+    await ingestChunks(row, runId, a.chunks);
   } catch (e) {
     console.error(`[opencode-subagents] failed to ingest chunks of ${a.childSessionId}:`, e);
   }
@@ -680,18 +820,27 @@ export function settleOpencodeChild(a: {
   childSessionId: string;
   outcome: "completed" | "failed" | "interrupted";
   error?: string;
-}): void {
+}): Promise<void> {
+  return serial(a.taskId, () => settleOpencodeChildRaw(a));
+}
+
+async function settleOpencodeChildRaw(a: {
+  taskId: string;
+  childSessionId: string;
+  outcome: "completed" | "failed" | "interrupted";
+  error?: string;
+}): Promise<void> {
   try {
-    const row = subagents.get(opencodeSubagentId(a.childSessionId));
+    const row = await subagents.get(opencodeSubagentId(a.childSessionId));
     if (!row || row.taskId !== a.taskId || CHILD_TERMINAL.has(row.status)) return;
-    const runId = runIdFor(row);
+    const runId = await runIdFor(row);
     if (runId && a.outcome === "failed" && a.error) {
       const text = flatErrorText(a.error);
-      if (text && !runs.hasLineUuidPrefixForSubagent(row.taskId, row.id, `opencode:${a.childSessionId}:error:`)) {
-        append(row, runId, "status", `opencode: ${text}`, `opencode:${a.childSessionId}:error:settle`, row.id);
+      if (text && !(await runs.hasLineUuidPrefixForSubagent(row.taskId, row.id, `opencode:${a.childSessionId}:error:`))) {
+        await append(row, runId, "status", `opencode: ${text}`, `opencode:${a.childSessionId}:error:settle`, row.id);
       }
     }
-    settleRow(row, a.outcome === "completed" ? "completed" : a.outcome === "failed" ? "failed" : "cancelled");
+    await settleRow(row, a.outcome === "completed" ? "completed" : a.outcome === "failed" ? "failed" : "cancelled");
   } catch (e) {
     console.error(`[opencode-subagents] failed to settle ${a.childSessionId}:`, e);
   }
@@ -713,7 +862,7 @@ async function ingestSliced(a: { taskId: string; childSessionId: string; chunks:
     const deadline = performance.now() + INGEST_SLICE_MS;
     let to = from;
     while (to < a.chunks.length && (to === from || performance.now() < deadline)) to++;
-    ingestChildChunks({ taskId: a.taskId, childSessionId: a.childSessionId, chunks: a.chunks.slice(from, to) }, false);
+    await serial(a.taskId, () => ingestChildChunks({ taskId: a.taskId, childSessionId: a.childSessionId, chunks: a.chunks.slice(from, to) }, false));
     from = to;
     if (from < a.chunks.length) await yieldToLoop();
   }
@@ -762,7 +911,8 @@ export function syncOpencodeChildFromServer(a: {
 async function syncChild(a: { taskId: string; runId: string; client: OpencodeClient; childSessionId: string }): Promise<void> {
   // A row that turns `orphaned` while the pass runs had no activity read
   // ahead of its messages, so it gets one more pass that has one.
-  if ((await syncChildPass(a, subagents.get(opencodeSubagentId(a.childSessionId))?.status === "orphaned")) === "again") {
+  const first = await serial(a.taskId, () => subagents.get(opencodeSubagentId(a.childSessionId)));
+  if ((await syncChildPass(a, first?.status === "orphaned")) === "again") {
     await syncChildPass(a, true);
   }
 }
@@ -782,11 +932,11 @@ async function syncChildPass(
 ): Promise<"done" | "again"> {
   const id = opencodeSubagentId(a.childSessionId);
   const activity = activityFirst ? await childActivity(a.client, a.childSessionId) : null;
-  if (!subagents.get(id)) {
+  if (!(await serial(a.taskId, () => subagents.get(id)))) {
     // eslint-disable-next-line @typescript-eslint/no-explicit-any
     const session: any = await a.client.getSession(a.childSessionId);
     if (!session) return "done"; // the server no longer has it: nothing to show
-    registerOpencodeChildSession({
+    await registerOpencodeChildSession({
       taskId: a.taskId,
       runId: a.runId,
       parentSessionId: typeof session.parentID === "string" ? session.parentID : "",
@@ -811,8 +961,10 @@ async function syncChildPass(
       res = await a.client.listMessages(a.childSessionId, { limit: SYNC_PAGE_LIMIT, ...(cursor ? { cursor } : { order: "desc" as const }) });
     } catch (e) {
       if (e instanceof OpencodeHttpError && e.status === 404) {
-        const gone = subagents.get(id);
-        if (gone) settleGoneChild(gone);
+        await serial(a.taskId, async () => {
+          const gone = await subagents.get(id);
+          if (gone) await settleGoneChild(gone);
+        });
         return "done";
       }
       throw e;
@@ -826,7 +978,7 @@ async function syncChildPass(
   if (pages.length === 0) {
     // No messages yet: a `running` child exists but hasn't started, so it is
     // left as it is; an `orphaned` one is alive only if the server lists it.
-    return settleOrReviveOrphan(id, activity);
+    return serial(a.taskId, () => settleOrReviveOrphan(id, activity));
   }
   // Ascending pages, each ascending.
   const asc = pages.reverse().map((p) => p.slice().reverse());
@@ -843,10 +995,10 @@ async function syncChildPass(
   seed.end();
 
   if (tail) {
-    settleOpencodeChild({ taskId: a.taskId, childSessionId: a.childSessionId, outcome: tail.outcome, error: tail.error });
+    await settleOpencodeChild({ taskId: a.taskId, childSessionId: a.childSessionId, outcome: tail.outcome, error: tail.error });
     return "done";
   }
-  return settleOrReviveOrphan(id, activity);
+  return serial(a.taskId, () => settleOrReviveOrphan(id, activity));
 }
 
 /**
@@ -860,13 +1012,13 @@ async function syncChildPass(
  * left alone (the live stream owns it). A row that became `orphaned` during a
  * pass that read no activity asks for another pass ("again").
  */
-function settleOrReviveOrphan(id: string, activity: "active" | "inactive" | "unknown" | null): "done" | "again" {
+async function settleOrReviveOrphan(id: string, activity: "active" | "inactive" | "unknown" | null): Promise<"done" | "again"> {
   // Re-read: a live event may have revived or settled the row during the pass.
-  const row = subagents.get(id);
+  const row = await subagents.get(id);
   if (!row || row.status !== "orphaned") return "done";
   if (activity === null) return "again";
-  if (activity === "active") reviveIfOrphaned(row);
-  else if (activity === "inactive") settleDeadChild(row, "is no longer running on the OpenCode server", "dead");
+  if (activity === "active") await reviveIfOrphaned(row);
+  else if (activity === "inactive") await settleDeadChild(row, "is no longer running on the OpenCode server", "dead");
   return "done";
 }
 
@@ -887,9 +1039,9 @@ async function childActivity(client: OpencodeClient, childSessionId: string): Pr
  * era child, a wiped or replaced server). A `running` or `orphaned` row is
  * settled for good ({@link settleDeadChild}); a terminal row is untouched.
  */
-function settleGoneChild(row: Subagent): void {
+async function settleGoneChild(row: Subagent): Promise<void> {
   if (row.status !== "running" && row.status !== "orphaned") return;
-  settleDeadChild(row, "is no longer known to the OpenCode server", "gone");
+  await settleDeadChild(row, "is no longer known to the OpenCode server", "gone");
 }
 
 /**
@@ -899,11 +1051,11 @@ function settleGoneChild(row: Subagent): void {
  * hook (the held-task release). Never revived later: a sync only revives an
  * `orphaned` row.
  */
-function settleDeadChild(row: Subagent, what: string, tag: "gone" | "dead"): void {
+async function settleDeadChild(row: Subagent, what: string, tag: "gone" | "dead"): Promise<void> {
   const child = opencodeChildSessionOf(row);
-  const runId = runIdFor(row);
+  const runId = await runIdFor(row);
   if (runId) {
-    append(row, runId, "status", `OpenCode subagent "${label(row)}" ${what}`, `opencode:subagent:${row.id}:${tag}`, null);
+    await append(row, runId, "status", `OpenCode subagent "${label(row)}" ${what}`, `opencode:subagent:${row.id}:${tag}`, null);
   }
-  settleRow(row, child && wasOpencodeChildStoppedByAgetor(child) ? "cancelled" : "failed");
+  await settleRow(row, child && (await wasOpencodeChildStoppedByAgetor(child)) ? "cancelled" : "failed");
 }

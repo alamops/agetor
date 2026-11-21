@@ -1,5 +1,6 @@
 import { test, expect, mock, afterAll } from "bun:test";
-import { render } from "ink-testing-library";
+import { render as inkRender } from "ink-testing-library";
+import { cloneElement, type ReactElement } from "react";
 import { Dashboard, activeAccountLine, buildSentFilesLines, buildFxRecoveryLines, buildHandoffLines, dashboardRows } from "./Dashboard.tsx";
 import type { PipelineRunState } from "../../shared/types.ts";
 import { eventKey } from "./useCoalescedStream.ts";
@@ -13,6 +14,15 @@ import {
   HARNESS_SWAP_STATUS_PREFIX,
   PERMISSION_MODE_STATUS_PREFIX,
 } from "../../shared/types.ts";
+
+// The dashboard fetches through `listTaskDelta`; these stubs only define
+// `listTasks`, so give each stub client a legacy-style `listTaskDelta` (a bare
+// array, which the feed treats as a full list).
+function render(el: ReactElement<{ client: AgetorClient }>) {
+  const c = el.props.client as AgetorClient & { listTaskDelta?: unknown };
+  if (!c.listTaskDelta) c.listTaskDelta = () => c.listTasks();
+  return inkRender(cloneElement(el));
+}
 
 // Snapshot the real `sse.ts` exports before mocking so the mock can be
 // reverted after this file's tests finish — `mock.module` overwrites the
@@ -31,7 +41,7 @@ let onTaskEvents: ((e: RunEvent) => void) | null = null;
 // resume tests below.
 let onTaskNamed: ((event: string, data: string) => void) | undefined;
 
-mock.module("../sse.ts", () => ({
+void mock.module("../sse.ts", () => ({
   ...realSseSnapshot,
   streamSse: (
     pathname: string,
@@ -47,7 +57,7 @@ mock.module("../sse.ts", () => ({
 }));
 
 afterAll(() => {
-  mock.module("../sse.ts", () => realSseSnapshot);
+  void mock.module("../sse.ts", () => realSseSnapshot);
 });
 
 const ENTER = "\r";
@@ -1820,7 +1830,7 @@ test("selecting an expanded step row opens ITS transcript stream (the parent nev
     listTasks: async () => [parentTask(), stepTask("stepA")],
   } as unknown as AgetorClient;
   // Track every `/tasks/:id/events` subscription the dashboard opens.
-  mock.module("../sse.ts", () => ({
+  void mock.module("../sse.ts", () => ({
     ...realSseSnapshot,
     streamSse: (pathname: string, onEvent: (e: unknown) => void) => {
       const m = /^\/tasks\/([^/]+)\/events/.exec(pathname);
@@ -1844,7 +1854,7 @@ test("selecting an expanded step row opens ITS transcript stream (the parent nev
     expect(opened).toEqual(["stepA"]);
     unmount();
   } finally {
-    mock.module("../sse.ts", () => ({
+    void mock.module("../sse.ts", () => ({
       ...realSseSnapshot,
       streamSse: (pathname: string, onEvent: (e: unknown) => void) => {
         if (pathname.startsWith("/tasks/") && pathname.includes("/events")) {

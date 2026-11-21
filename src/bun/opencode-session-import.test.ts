@@ -1,4 +1,4 @@
-import { afterAll, beforeEach, expect, test } from "bun:test";
+import { afterAll, beforeEach, expect, spyOn, test } from "bun:test";
 import { chmodSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import path from "node:path";
@@ -448,7 +448,7 @@ test("the launch scan holds an OpenCode notice until a client connects, sends it
   expect(seenIds().has(fresh.id)).toBe(false);
 
   const sent: AppEvent[] = [];
-  flushPendingClaudeSessionsNotice((e) => sent.push(e));
+  await flushPendingClaudeSessionsNotice((e) => sent.push(e));
   const notices = sent.filter((e) => e.type === "opencode_sessions_found");
   expect(notices.length).toBe(1);
   const notice = notices[0] as Extract<AppEvent, { type: "opencode_sessions_found" }>;
@@ -459,7 +459,7 @@ test("the launch scan holds an OpenCode notice until a client connects, sends it
 
   // Sent once: the next client gets nothing, and the next launch skips seen ids.
   const again: AppEvent[] = [];
-  flushPendingClaudeSessionsNotice((e) => again.push(e));
+  await flushPendingClaudeSessionsNotice((e) => again.push(e));
   expect(again).toEqual([]);
   clearOpencodeSessionScanCache();
   const live: AppEvent[] = [];
@@ -494,7 +494,7 @@ test("a connected client gets the OpenCode notice live; a held id imported meanw
   await withEmptyClaudeHome(() => startClaudeSessionLaunchScan());
   await importOne(held.id);
   const sent: AppEvent[] = [];
-  flushPendingClaudeSessionsNotice((e) => sent.push(e));
+  await flushPendingClaudeSessionsNotice((e) => sent.push(e));
   expect(sent.filter((e) => e.type === "opencode_sessions_found")).toEqual([]);
   expect(seenIds().has(held.id)).toBe(false);
 });
@@ -507,10 +507,33 @@ test("the scan preference off skips the OpenCode scan too", async () => {
   try {
     await withEmptyClaudeHome(() => startClaudeSessionLaunchScan());
     const sent: AppEvent[] = [];
-    flushPendingClaudeSessionsNotice((e) => sent.push(e));
+    await flushPendingClaudeSessionsNotice((e) => sent.push(e));
     expect(sent).toEqual([]);
     expect(seenIds().size).toBe(0);
   } finally {
     preferences.set(CLAUDE_SESSIONS_LAUNCH_SCAN_PREF, "1");
   }
+});
+
+test("the history is stored a batch at a time: one appendEvents call for a short export, never one appendEvent per row", async () => {
+  const { id, exp } = plant();
+  const rpc = (await import("./db-rpc.ts")).getDbRpc();
+  const seen: string[] = [];
+  const realCall = rpc.call.bind(rpc);
+  const spy = spyOn(rpc, "call").mockImplementation(((module: string, method: string, args: unknown[]) => {
+    seen.push(`${module}.${method}`);
+    return realCall(module as never, method, args);
+  }) as never);
+  let r;
+  try {
+    r = await importOne(id);
+  } finally {
+    spy.mockRestore();
+  }
+  expect(r.error).toBeUndefined();
+  const rows = exportToEvents(parseOpencodeExport(JSON.stringify(exp), 2)!).length;
+  expect(rows).toBeGreaterThan(1);
+  expect(seen.filter((c) => c === "runs.appendEvents")).toHaveLength(1);
+  expect(seen).not.toContain("runs.appendEvent");
+  expect(eventsFor(tasks.get(r.taskId!)!.runId!)).toHaveLength(rows);
 });

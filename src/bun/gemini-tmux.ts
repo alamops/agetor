@@ -11,7 +11,7 @@ import {
 } from "node:fs";
 import { StringDecoder } from "node:string_decoder";
 import path from "node:path";
-import { dataDir } from "./db.ts";
+import { dataDir } from "./db-path.ts";
 import { resolveTmuxBin, tmuxSocketArgs, spawnTmuxNewSession } from "./tmux-resolution.ts";
 import { createDeathProbe } from "./session-liveness.ts";
 import { SESSION_DIED_STATUS_PREFIX } from "../shared/types.ts";

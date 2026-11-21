@@ -162,7 +162,8 @@ test("an isApiErrorMessage line settles the subagent row failed on the same pump
     taskId, jsonlPath, manual: true,
     onApiError: (info) => apiErrorCalls.push(info),
   });
-  w.pump(Date.now());
+  await w.ready;
+  await w.pump(Date.now());
 
   const row = subagents.get(agentId)!;
   expect(row.status).toBe("failed");
@@ -209,7 +210,8 @@ test("an isApiErrorMessage line with no uuid does not settle the row or fire onA
     taskId, jsonlPath, manual: true,
     onApiError: (info) => apiErrorCalls.push(info),
   });
-  w.pump(Date.now());
+  await w.ready;
+  await w.pump(Date.now());
 
   const row = subagents.get(agentId)!;
   expect(row.status).toBe("running");
@@ -243,7 +245,8 @@ test("reattaching a fresh watcher over an already-settled api-error transcript d
     taskId, jsonlPath, manual: true,
     onApiError: (info) => firstCalls.push(info),
   });
-  w.pump(Date.now());
+  await w.ready;
+  await w.pump(Date.now());
   expect(subagents.get(agentId)!.status).toBe("failed");
   expect(firstCalls.length).toBe(1);
   w.detach();
@@ -258,7 +261,8 @@ test("reattaching a fresh watcher over an already-settled api-error transcript d
     taskId, jsonlPath, manual: true,
     onApiError: (info) => secondCalls.push(info),
   });
-  w2.pump(Date.now());
+  await w2.ready;
+  await w2.pump(Date.now());
 
   expect(secondCalls.length).toBe(0);
   const row = subagents.get(agentId)!;
@@ -300,13 +304,14 @@ test("a retry after an api-error settle flips the row back to running and preser
   });
 
   const w = attachSubagentWatcher({ taskId, jsonlPath, manual: true });
+  await w.ready;
   const t0 = Date.now();
   // Retry: a resumed background agent appends a fresh (non-terminal) turn,
   // written strictly after attach — beyond the replay floor, so it flips the
   // `failed` row back to running.
   writeFileSync(file,
     JSON.stringify({ type: "assistant", isSidechain: true, uuid: "retryA", message: { role: "assistant", stop_reason: "tool_use", content: [{ type: "tool_use", id: "t2", name: "Bash", input: { command: "pwd" } }] } }) + "\n");
-  w.pump(t0);
+  await w.pump(t0);
   expect(subagents.get(agentId)!.status).toBe("running");
 
   // Prove `toolUseId` survived the flip-back (the `apiErrored` latch's whole
@@ -317,7 +322,7 @@ test("a retry after an api-error settle flips the row back to running and preser
   // matched and the row would stay stuck `running` forever.
   writeFileSync(jsonlPath,
     JSON.stringify({ type: "user", message: { content: [{ type: "tool_result", tool_use_id: toolUseId, content: "ok" }] } }) + "\n");
-  w.pump(t0 + 1);
+  await w.pump(t0 + 1);
 
   expect(subagents.get(agentId)!.status).toBe("completed");
 
@@ -341,16 +346,17 @@ test("an ordinary subagent (no api error) still completes via the end_turn + DON
   writeFileSync(path.join(subagentsDir, `agent-${agentId}.jsonl`), sidechainLines());
 
   const w = attachSubagentWatcher({ taskId, jsonlPath, manual: true });
+  await w.ready;
   const t0 = Date.now();
-  w.pump(t0);
+  await w.pump(t0);
   expect(subagents.get(agentId)!.status).toBe("running");
 
   appendFileSync(path.join(subagentsDir, `agent-${agentId}.jsonl`),
     JSON.stringify({ type: "assistant", isSidechain: true, uuid: "a2", message: { role: "assistant", stop_reason: "end_turn", content: [{ type: "text", text: "done" }] } }) + "\n");
-  w.pump(t0 + 1); // sawEndOfTurn=true, but not idle yet
+  await w.pump(t0 + 1); // sawEndOfTurn=true, but not idle yet
   expect(subagents.get(agentId)!.status).toBe("running");
 
-  w.pump(t0 + 10_000); // idle past DONE_IDLE_MS -> completed
+  await w.pump(t0 + 10_000); // idle past DONE_IDLE_MS -> completed
   const row = subagents.get(agentId)!;
   expect(row.status).toBe("completed");
   expect(row.endedAt).not.toBeNull();
@@ -388,7 +394,7 @@ test("a throwing onApiError callback does not crash the pump, and the row still 
     },
   });
 
-  expect(() => w.pump(Date.now())).not.toThrow();
+  await expect(w.pump(Date.now())).resolves.toBeUndefined();
   expect(hookCalls).toBe(1);
   // The settle hook (a DIFFERENT injected callback, fired before onApiError)
   // still ran, and the DB write landed before onApiError was even invoked —

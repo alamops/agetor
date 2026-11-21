@@ -143,7 +143,8 @@ test("manual mode: a transcript spanning many chunks is ingested exactly once �
   expect(huge.length).toBeGreaterThan(CHUNK * 10);
 
   const w = attachSubagentWatcher({ taskId, jsonlPath, manual: true });
-  w.pump(Date.now());
+  await w.ready;
+  await w.pump(Date.now());
   await expectExactlyOnce(taskId, agentId, [...uuids("c1", 40), "c1-huge", ...uuids("c1", 10, 40)]);
   const hugeRow = (await subagentEvents(taskId, agentId)).find((r) => r.line_uuid === "c1-huge")!;
   expect(hugeRow.data.includes("日本語".repeat(2000))).toBe(true);
@@ -156,10 +157,10 @@ test("manual mode: a transcript spanning many chunks is ingested exactly once �
   expect((tailBytes[cut]! & 0xc0) === 0x80).toBe(true); // a UTF-8 continuation byte
   appendFileSync(file, sidechainLines("c1", 30, 50));
   appendFileSync(file, tailBytes.subarray(0, cut));
-  w.pump(Date.now());
+  await w.pump(Date.now());
   await expectExactlyOnce(taskId, agentId, [...uuids("c1", 40), "c1-huge", ...uuids("c1", 40, 40)]);
   appendFileSync(file, tailBytes.subarray(cut));
-  w.pump(Date.now());
+  await w.pump(Date.now());
   await expectExactlyOnce(taskId, agentId, [...uuids("c1", 40), "c1-huge", ...uuids("c1", 40, 40), "c1-tail"]);
   w.detach();
 });
@@ -172,7 +173,8 @@ test("manual mode: a transcript that is one single line longer than a chunk is i
   writeFileSync(path.join(subagentsDir, `agent-${agentId}.jsonl`), sidechainLine("c2-only", "z".repeat(50_000)) + "\n");
 
   const w = attachSubagentWatcher({ taskId, jsonlPath, manual: true });
-  w.pump(Date.now());
+  await w.ready;
+  await w.pump(Date.now());
   await expectExactlyOnce(taskId, agentId, ["c2-only"]);
   w.detach();
 });
@@ -306,4 +308,35 @@ test("production mode: the main-JSONL scan reads chunk by chunk — it settles t
   expect(subagents.get(ids.c)!.status).toBe("completed");
   expect(subagents.get(ids.b)!.status).toBe("completed");
   w.detach();
+});
+
+test("a rehydrated row whose stored path is outside the watcher's dirs is logged once and settles orphaned (review S5)", async () => {
+  const { attachSubagentWatcher } = await import("./claude-subagents.ts");
+  const { subagents } = await import("./db.ts");
+  const { taskId, runId, jsonlPath, now } = await seed();
+  const agentId = "s5dddddddddd";
+  const outside = path.join(FIXTURE_DIR, "elsewhere", `agent-${agentId}.jsonl`);
+  mkdirSync(path.dirname(outside), { recursive: true });
+  writeFileSync(outside, sidechainLines("s5", 3));
+  subagents.insertIfAbsent({
+    id: agentId, taskId, runId, parentKind: "subagent", agentType: "general-purpose", description: "stale",
+    spawnDepth: 1, sourcePath: outside, status: "running", startedAt: now - 1000, endedAt: null,
+  } as never);
+  const { spyOn } = await import("bun:test");
+  const warn = spyOn(console, "warn").mockImplementation(() => {});
+  try {
+    const w = attachSubagentWatcher({ taskId, jsonlPath, manual: true });
+    await w.ready;
+    await w.pump(Date.now());
+    await w.pump(Date.now());
+    await w.pump(Date.now());
+    const refused = warn.mock.calls.filter((c) => String(c[0]).includes("transcript path refused"));
+    expect(refused).toHaveLength(1);
+    expect(String(refused[0]![0])).toContain(agentId);
+    expect(String(refused[0]![0])).not.toContain(FIXTURE_DIR);
+    expect(subagents.get(agentId)?.status).toBe("orphaned");
+    w.detach();
+  } finally {
+    warn.mockRestore();
+  }
 });

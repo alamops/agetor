@@ -6,7 +6,7 @@ import { opencodeMajor } from "../shared/opencode.ts";
 import { cliVersionSatisfies } from "../shared/cli-version.ts";
 import { resolveBin, harnessEnv } from "./agents.ts";
 import { accountUsageSummary } from "./account-usage.ts";
-import { harnesses } from "./db.ts";
+import { harnesses } from "./db-async.ts";
 import { readClaudeAccount } from "./harness-discovery.ts";
 import { claudeRootFor } from "./harness-config-root.ts";
 import { loginEvidence } from "./harness-stacks.ts";
@@ -868,7 +868,9 @@ const TMUX_INSTALL_HINT = "brew install tmux (macOS) or apt install tmux (Debian
  * utilization is a separate concern — this is purely the local, historical,
  * no-network token rollup.
  */
-function claudeAccountFields(harness: Harness): { account: ClaudeAccount | null; usage: HarnessStatus["usage"] } {
+async function claudeAccountFields(
+  harness: Harness,
+): Promise<{ account: ClaudeAccount | null; usage: HarnessStatus["usage"] }> {
   if (harness.kind !== "claude-code") return { account: null, usage: null };
   // Read where the spawned claude reads (`claudeConfigDirFor`), not the spawn
   // pin: an account whose env map sets only `HOME` pins nothing yet keeps its
@@ -878,7 +880,7 @@ function claudeAccountFields(harness: Harness): { account: ClaudeAccount | null;
   const root = claudeRootFor(harness);
   return {
     account: readClaudeAccount(root.configDir, { homeDir: root.spawnHome }),
-    usage: accountUsageSummary(root.configDir),
+    usage: await accountUsageSummary(root.configDir),
   };
 }
 
@@ -900,7 +902,7 @@ function claudeAccountFields(harness: Harness): { account: ClaudeAccount | null;
 export async function checkHarness(harness: Harness, opts?: { freshAuth?: boolean }): Promise<HarnessStatus> {
   const bin = resolveBin(harness);
   const path = resolveBinPath(bin);
-  const accountFields = claudeAccountFields(harness);
+  const accountFields = await claudeAccountFields(harness);
   if (!path) {
     return {
       harnessId: harness.id,
@@ -1058,8 +1060,8 @@ export async function checkHarness(harness: Harness, opts?: { freshAuth?: boolea
  * `/agents` (legacy) and `/harnesses` (preferred) endpoints. Concurrent;
  * each probe times out independently after VERSION_PROBE_TIMEOUT_MS.
  */
-export function checkAllHarnesses(): Promise<HarnessStatus[]> {
-  return Promise.all(harnesses.list().map((h) => checkHarness(h)));
+export async function checkAllHarnesses(): Promise<HarnessStatus[]> {
+  return Promise.all((await harnesses.list()).map((h) => checkHarness(h)));
 }
 
 // Exposed for tests: clears the fx auth-status memoization (see

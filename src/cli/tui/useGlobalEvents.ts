@@ -24,7 +24,13 @@ const TOAST_MS = 4000;
  * `column`/`pipeline`-run events cover the same information at the level the
  * user actually sees.
  */
-export function useGlobalEvents(dataDir?: string, hiddenTaskIds?: ReadonlySet<string>): Toast | null {
+export function useGlobalEvents(
+  dataDir?: string,
+  hiddenTaskIds?: ReadonlySet<string>,
+  /** Every event, before toast filtering: the dashboard's one stream also
+   *  carries `tasks-changed`, which `useTasks` answers with an early fetch. */
+  onEvent?: (e: GlobalEvent) => void,
+): Toast | null {
   const [toast, setToast] = useState<Toast | null>(null);
   const timer = useRef<ReturnType<typeof setTimeout> | null>(null);
   // Read via a ref inside the subscription callback so a `tasks` poll tick
@@ -32,11 +38,14 @@ export function useGlobalEvents(dataDir?: string, hiddenTaskIds?: ReadonlySet<st
   // re-establish the SSE connection.
   const hiddenRef = useRef(hiddenTaskIds);
   hiddenRef.current = hiddenTaskIds;
+  const onEventRef = useRef(onEvent);
+  onEventRef.current = onEvent;
 
   useEffect(() => {
     const handle = streamSse<GlobalEvent>(
       "/events",
       (e) => {
+        onEventRef.current?.(e);
         const t = toastFor(e, hiddenRef.current);
         if (!t) return;
         setToast(t);

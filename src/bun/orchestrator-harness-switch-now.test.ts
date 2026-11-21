@@ -92,15 +92,25 @@ function insertRun(taskId: string, agent: string, patch: Record<string, unknown>
   return id;
 }
 
-async function waitFor(fn: () => boolean, ms = 8000): Promise<void> {
+/** The death watch's held-session probe answers from its last completed read
+ *  and starts the next one: ask, let that read land, and ask again. */
+async function probeNow(probe: ((taskId: string) => boolean) | null, taskId: string): Promise<boolean | undefined> {
+  // A read started before the state the test just wrote must not answer.
+  await orch.__heldProbeSettledForTest(taskId);
+  probe?.(taskId);
+  await orch.__heldProbeSettledForTest(taskId);
+  return probe?.(taskId);
+}
+
+async function waitFor(fn: () => boolean | Promise<boolean>, ms = 8000): Promise<void> {
   const deadline = Date.now() + ms;
   while (Date.now() < deadline) {
-    if (fn()) return;
+    if (await fn()) return;
     await Bun.sleep(15);
   }
 }
 
-const events = (stackId: string) => history.harnessSwapEvents.page(stackId, { limit: 50 }).events;
+const events = async (stackId: string) => (await history.harnessSwapEvents.page(stackId, { limit: 50 })).events;
 
 describe("switchTaskAccountNow", () => {
   test("a lone account is refused up front", async () => {
@@ -119,7 +129,7 @@ describe("switchTaskAccountNow", () => {
   test("an idle task moves now: one history row, no cooldown, not tried", async () => {
     const a = alias("idle-a");
     const b = alias("idle-b");
-    const stack = stacks.harnessStacks.create({ label: "idle", kind: "claude-code", members: [a, b] });
+    const stack = await stacks.harnessStacks.create({ label: "idle", kind: "claude-code", members: [a, b] });
     const task = makeTask(a, "work", { column: "review" });
     // The persisted intent names the action, so a restart mid-move keeps the
     // switch-now label (the boot completion reads it).
@@ -142,20 +152,20 @@ describe("switchTaskAccountNow", () => {
     expect(after.harnessState?.lastMove?.reason).toBe("switch-now");
     expect(after.harnessState?.tried ?? []).toEqual([]);
     expect(after.harnessState?.scheduledSwitch ?? null).toBeNull();
-    expect(stacks.harnessStacks.getLimitState(a)).toBeNull();
-    const rows = events(stack.id).filter((e) => e.taskId === task.id);
+    expect(await stacks.harnessStacks.getLimitState(a)).toBeNull();
+    const rows = (await events(stack.id)).filter((e) => e.taskId === task.id);
     expect(rows).toHaveLength(1);
     expect(rows[0]!.trigger).toBe("manual");
     expect(rows[0]!.reason).toBe("user");
     expect(rows[0]!.fromHarnessId).toBe(a);
     expect(rows[0]!.toHarnessId).toBe(b);
-    stacks.harnessStacks.delete(stack.id);
+    await stacks.harnessStacks.delete(stack.id);
   });
 
   test("a live run schedules (idempotent) and cancel clears it", async () => {
     const a = alias("live-a");
     const b = alias("live-b");
-    const stack = stacks.harnessStacks.create({ label: "live", kind: "claude-code", members: [a, b] });
+    const stack = await stacks.harnessStacks.create({ label: "live", kind: "claude-code", members: [a, b] });
     const task = makeTask(a, "work", { column: "running" });
     const runId = insertRun(task.id, a, { status: "running", endedAt: null, exitCode: null });
     db.tasks.update(task.id, { runId });
@@ -167,18 +177,18 @@ describe("switchTaskAccountNow", () => {
     expect(second.status).toBe("scheduled");
     expect(db.tasks.get(task.id)!.harnessState?.scheduledSwitch?.requestedAt).toBe(requestedAt);
     expect(db.tasks.get(task.id)!.agent).toBe(a);
-    const cancelled = orch.cancelScheduledAccountSwitch(task.id);
+    const cancelled = await orch.cancelScheduledAccountSwitch(task.id);
     expect(cancelled.harnessState?.scheduledSwitch ?? null).toBeNull();
     // Nothing scheduled: a no-op that still returns the task.
-    expect(orch.cancelScheduledAccountSwitch(task.id).id).toBe(task.id);
+    expect((await orch.cancelScheduledAccountSwitch(task.id)).id).toBe(task.id);
     db.runs.update(runId, { status: "failed", endedAt: Date.now() });
-    stacks.harnessStacks.delete(stack.id);
+    await stacks.harnessStacks.delete(stack.id);
   });
 
   test("a scheduled switch is performed when the turn succeeds, before the next turn", async () => {
     const a = alias("sched-a");
     const b = alias("sched-b");
-    const stack = stacks.harnessStacks.create({ label: "sched", kind: "claude-code", members: [a, b] });
+    const stack = await stacks.harnessStacks.create({ label: "sched", kind: "claude-code", members: [a, b] });
     const task = makeTask(a, "plain work");
     process.env.AGETOR_FAKE_CLAUDE_TURN_MS = "400";
     try {
@@ -193,17 +203,17 @@ describe("switchTaskAccountNow", () => {
     expect(after.agent).toBe(b);
     expect(after.harnessState?.scheduledSwitch ?? null).toBeNull();
     expect(after.harnessState?.lastMove?.reason).toBe("switch-now");
-    const rows = events(stack.id).filter((e) => e.taskId === task.id);
+    const rows = (await events(stack.id)).filter((e) => e.taskId === task.id);
     expect(rows).toHaveLength(1);
     expect(rows[0]!.trigger).toBe("scheduled");
-    expect(stacks.harnessStacks.getLimitState(a)).toBeNull();
-    stacks.harnessStacks.delete(stack.id);
+    expect(await stacks.harnessStacks.getLimitState(a)).toBeNull();
+    await stacks.harnessStacks.delete(stack.id);
   }, 20_000);
 
   test("a Stop drops the scheduled switch", async () => {
     const a = alias("stop-a");
     const b = alias("stop-b");
-    const stack = stacks.harnessStacks.create({ label: "stop", kind: "claude-code", members: [a, b] });
+    const stack = await stacks.harnessStacks.create({ label: "stop", kind: "claude-code", members: [a, b] });
     const task = makeTask(a, "plain work");
     process.env.AGETOR_FAKE_CLAUDE_TURN_MS = "3000";
     try {
@@ -218,15 +228,15 @@ describe("switchTaskAccountNow", () => {
     const after = db.tasks.get(task.id)!;
     expect(after.agent).toBe(a);
     expect(after.harnessState?.scheduledSwitch ?? null).toBeNull();
-    expect(events(stack.id).filter((e) => e.taskId === task.id)).toHaveLength(0);
-    stacks.harnessStacks.delete(stack.id);
+    expect((await events(stack.id)).filter((e) => e.taskId === task.id)).toHaveLength(0);
+    await stacks.harnessStacks.delete(stack.id);
   }, 20_000);
 
   test("a provider limit consumes the request: failover moves once, no second move", async () => {
     const a = alias("lim-a");
     const b = alias("lim-b");
     const c = alias("lim-c");
-    const stack = stacks.harnessStacks.create({ label: "lim", kind: "claude-code", members: [a, b, c] });
+    const stack = await stacks.harnessStacks.create({ label: "lim", kind: "claude-code", members: [a, b, c] });
     const task = makeTask(a, `work ${FAKE_CLAUDE_LIMIT_PROMPT_MARKER}`);
     process.env.AGETOR_FAKE_CLAUDE_TURN_MS = "300";
     try {
@@ -242,9 +252,9 @@ describe("switchTaskAccountNow", () => {
     const after = db.tasks.get(task.id)!;
     expect(after.agent).toBe(b);
     expect(after.harnessState?.scheduledSwitch ?? null).toBeNull();
-    const rows = events(stack.id).filter((e) => e.taskId === task.id);
+    const rows = (await events(stack.id)).filter((e) => e.taskId === task.id);
     expect(rows.map((r) => r.trigger)).toEqual(["limit"]);
-    stacks.harnessStacks.delete(stack.id);
+    await stacks.harnessStacks.delete(stack.id);
   }, 20_000);
 });
 
@@ -261,7 +271,7 @@ describe("refusals during a swap, retry or launch freeze (review S1, S3)", () =>
   test("an in-flight retry or a limit swap refuses 409 busy and schedules nothing", async () => {
     const a = alias("busy-a");
     const b = alias("busy-b");
-    const stack = stacks.harnessStacks.create({ label: "busy", kind: "claude-code", members: [a, b] });
+    const stack = await stacks.harnessStacks.create({ label: "busy", kind: "claude-code", members: [a, b] });
     const base = { stackId: stack.id, position: 0, count: 2, tried: [] as string[], lastMove: null };
     const retrying = makeTask(a, "work", { column: "blocked" });
     db.tasks.setHarnessState(retrying.id, {
@@ -281,34 +291,51 @@ describe("refusals during a swap, retry or launch freeze (review S1, S3)", () =>
     expect(await refusalCode(swapping.id)).toBe("busy");
     expect(db.tasks.get(swapping.id)!.harnessState?.scheduledSwitch ?? null).toBeNull();
     db.runs.update(oldRun, { status: "failed", endedAt: Date.now() });
-    stacks.harnessStacks.delete(stack.id);
+    await stacks.harnessStacks.delete(stack.id);
   });
 
   test("a launch freeze refuses an idle switch with launches-frozen and blocks the claim", async () => {
     const a = alias("frozen-a");
     const b = alias("frozen-b");
-    const stack = stacks.harnessStacks.create({ label: "frozen", kind: "claude-code", members: [a, b] });
+    const stack = await stacks.harnessStacks.create({ label: "frozen", kind: "claude-code", members: [a, b] });
     const task = makeTask(a, "work", { column: "review" });
-    orch.freezeLaunches();
+    await orch.freezeLaunches();
     try {
       expect(await refusalCode(task.id)).toBe("launches-frozen");
-      expect(orch.claimTaskForAccountSwitch(task.id)).toBe(false);
+      expect(await orch.claimTaskForAccountSwitch(task.id)).toBe(false);
       expect(db.tasks.get(task.id)!.agent).toBe(a);
     } finally {
       orch.__resetLaunchFreezeForTest();
     }
-    expect(orch.claimTaskForAccountSwitch(task.id)).toBe(true);
-    orch.releaseTaskAccountSwitch(task.id);
-    stacks.harnessStacks.delete(stack.id);
+    expect(await orch.claimTaskForAccountSwitch(task.id)).toBe(true);
+    await orch.releaseTaskAccountSwitch(task.id);
+    await stacks.harnessStacks.delete(stack.id);
+  });
+
+  test("a run that registers after the route's running check makes the claim refuse (review S3)", async () => {
+    const a = alias("live-a");
+    const b = alias("live-b");
+    const stack = await stacks.harnessStacks.create({ label: "live", kind: "claude-code", members: [a, b] });
+    const task = makeTask(a, "work", { column: "review" });
+    orch.__testing.registerActiveRunForTest("s3-live-run", task.id);
+    try {
+      expect(await orch.claimTaskForAccountSwitch(task.id)).toBe(false);
+      expect(orch.isAccountSwitchUnderway(task.id)).toBe(false);
+    } finally {
+      orch.__testing.dropActiveRunForTest("s3-live-run");
+    }
+    expect(await orch.claimTaskForAccountSwitch(task.id)).toBe(true);
+    await orch.releaseTaskAccountSwitch(task.id);
+    await stacks.harnessStacks.delete(stack.id);
   });
 
   test("an archived task is refused with code archived", async () => {
     const a = alias("arch-a");
     const b = alias("arch-b");
-    const stack = stacks.harnessStacks.create({ label: "arch", kind: "claude-code", members: [a, b] });
+    const stack = await stacks.harnessStacks.create({ label: "arch", kind: "claude-code", members: [a, b] });
     const task = makeTask(a, "work", { column: "review", archivedAt: Date.now() });
     expect(await refusalCode(task.id)).toBe("archived");
-    stacks.harnessStacks.delete(stack.id);
+    await stacks.harnessStacks.delete(stack.id);
   });
 });
 
@@ -316,7 +343,7 @@ describe("boot", () => {
   test("a scheduled switch whose turn ended during downtime is performed", async () => {
     const a = alias("boot-a");
     const b = alias("boot-b");
-    const stack = stacks.harnessStacks.create({ label: "boot", kind: "claude-code", members: [a, b] });
+    const stack = await stacks.harnessStacks.create({ label: "boot", kind: "claude-code", members: [a, b] });
     const task = makeTask(a, "work", { column: "ready" });
     db.tasks.setHarnessState(task.id, {
       stackId: stack.id, position: 0, count: 2, tried: [], pendingSwap: null, allExhausted: null, lastMove: null,
@@ -326,14 +353,14 @@ describe("boot", () => {
     const after = db.tasks.get(task.id)!;
     expect(after.agent).toBe(b);
     expect(after.harnessState?.scheduledSwitch ?? null).toBeNull();
-    expect(events(stack.id).filter((e) => e.taskId === task.id).map((e) => e.trigger)).toEqual(["scheduled"]);
-    stacks.harnessStacks.delete(stack.id);
+    expect((await events(stack.id)).filter((e) => e.taskId === task.id).map((e) => e.trigger)).toEqual(["scheduled"]);
+    await stacks.harnessStacks.delete(stack.id);
   });
 
   test("a crash mid-swap resumes at boot: the limited run is failed, not orphaned", async () => {
     const a = alias("resume-a");
     const b = alias("resume-b");
-    const stack = stacks.harnessStacks.create({ label: "resume", kind: "claude-code", members: [a, b] });
+    const stack = await stacks.harnessStacks.create({ label: "resume", kind: "claude-code", members: [a, b] });
     const task = makeTask(a, "work", { column: "running" });
     const oldRun = insertRun(task.id, a, { status: "running", endedAt: null, exitCode: null });
     db.tasks.update(task.id, { runId: oldRun });
@@ -357,8 +384,8 @@ describe("boot", () => {
     expect(rows[1]!.agent).toBe(b);
     expect(rows[1]!.origin).toBe("harness-swap");
     expect(db.tasks.get(task.id)!.agent).toBe(b);
-    expect(events(stack.id).filter((e) => e.taskId === task.id).map((e) => e.trigger)).toEqual(["boot-resume"]);
-    stacks.harnessStacks.delete(stack.id);
+    expect((await events(stack.id)).filter((e) => e.taskId === task.id).map((e) => e.trigger)).toEqual(["boot-resume"]);
+    await stacks.harnessStacks.delete(stack.id);
   }, 20_000);
 });
 
@@ -366,9 +393,9 @@ describe("clean retry follow-ups", () => {
   test("a cancelled clean retry stashes the follow-ups after the original prompt, once", async () => {
     const a = alias("clean-a");
     const b = alias("clean-b");
-    const stack = stacks.harnessStacks.create({ label: "clean", kind: "claude-code", members: [a, b] });
+    const stack = await stacks.harnessStacks.create({ label: "clean", kind: "claude-code", members: [a, b] });
     // The backup is cooling, so the limit on A blocks the task with an armed retry.
-    stacks.harnessStacks.setLimitState(b, {
+    await stacks.harnessStacks.setLimitState(b, {
       reason: "quota", resetAtMs: Date.now() + 3_600_000, message: "usage limit", source: "claude-api-error",
     });
     const task = makeTask(a, `no tools yet ${FAKE_CLAUDE_LIMIT_CLEAN_PROMPT_MARKER}`);
@@ -390,16 +417,16 @@ describe("clean retry follow-ups", () => {
     expect(ex.memberReasons?.map((r) => r.harnessId).sort()).toEqual([a, b].sort());
     expect(db.tasks.get(task.id)!.backlog).toHaveLength(0);
 
-    expect(orch.cancelHarnessRetryForTask(task.id, "cancelled for test")).toBe(true);
+    expect(await orch.cancelHarnessRetryForTask(task.id, "cancelled for test")).toBe(true);
     expect(db.tasks.get(task.id)!.backlog.map((i) => i.text)).toEqual([folded]);
     expect(db.tasks.get(task.id)!.harnessState?.allExhausted ?? null).toBeNull();
     // Nothing left to stash a second time.
-    expect(orch.cancelHarnessRetryForTask(task.id)).toBe(false);
+    expect(await orch.cancelHarnessRetryForTask(task.id)).toBe(false);
     expect(db.tasks.get(task.id)!.backlog).toHaveLength(1);
     // The blocked outcome wrote exactly one history row.
-    expect(events(stack.id).filter((e) => e.taskId === task.id).map((e) => e.trigger)).toEqual(["blocked"]);
-    stacks.harnessStacks.clearLimitState(b);
-    stacks.harnessStacks.delete(stack.id);
+    expect((await events(stack.id)).filter((e) => e.taskId === task.id).map((e) => e.trigger)).toEqual(["blocked"]);
+    await stacks.harnessStacks.clearLimitState(b);
+    await stacks.harnessStacks.delete(stack.id);
   }, 20_000);
 });
 
@@ -407,7 +434,7 @@ describe("wave 3 review fixes", () => {
   test("M2: a throw while resuming an interrupted swap at boot blocks the card instead of leaving it running", async () => {
     const a = alias("m2-a");
     const b = alias("m2-b");
-    const stack = stacks.harnessStacks.create({ label: "m2", kind: "claude-code", members: [a, b] });
+    const stack = await stacks.harnessStacks.create({ label: "m2", kind: "claude-code", members: [a, b] });
     const task = makeTask(a, "work", { column: "running" });
     const oldRun = insertRun(task.id, a, { status: "running", endedAt: null, exitCode: null });
     db.tasks.update(task.id, { runId: oldRun });
@@ -429,20 +456,20 @@ describe("wave 3 review fixes", () => {
     expect(after.column).toBe("blocked");
     expect(after.harnessState?.pendingSwap ?? null).toBeNull();
     expect(db.runs.get(oldRun)!.status).toBe("failed");
-    expect(events(stack.id).filter((e) => e.taskId === task.id).map((e) => e.trigger)).toEqual(["blocked"]);
-    stacks.harnessStacks.delete(stack.id);
+    expect((await events(stack.id)).filter((e) => e.taskId === task.id).map((e) => e.trigger)).toEqual(["blocked"]);
+    await stacks.harnessStacks.delete(stack.id);
   });
 
   test("S1: a Stop during an account switch copy does not leak into the next limit swap", async () => {
     const a = alias("s1-a");
     const b = alias("s1-b");
-    const stack = stacks.harnessStacks.create({ label: "s1", kind: "claude-code", members: [a, b] });
+    const stack = await stacks.harnessStacks.create({ label: "s1", kind: "claude-code", members: [a, b] });
     const task = makeTask(a, `work ${FAKE_CLAUDE_LIMIT_PROMPT_MARKER}`, { column: "review" });
     const prior = insertRun(task.id, a);
     db.tasks.update(task.id, { runId: prior });
-    expect(orch.claimTaskForAccountSwitch(task.id)).toBe(true);
+    expect(await orch.claimTaskForAccountSwitch(task.id)).toBe(true);
     expect(await orch.cancelRun(prior)).toBe(true);
-    orch.releaseTaskAccountSwitch(task.id);
+    await orch.releaseTaskAccountSwitch(task.id);
     process.env.AGETOR_FAKE_CLAUDE_TURN_MS = "100";
     try {
       expect(await orch.startTask(task.id)).toHaveProperty("runId");
@@ -458,14 +485,14 @@ describe("wave 3 review fixes", () => {
     expect(rows[2]!.agent).toBe(b);
     expect(rows[2]!.origin).toBe("harness-swap");
     expect(rows[1]!.status).toBe("failed");
-    stacks.harnessStacks.delete(stack.id);
+    await stacks.harnessStacks.delete(stack.id);
   }, 20_000);
 
   test("S4: a scheduled switch waits for background agents, then applies; Stop drops it", async () => {
     const { settleSubagentById } = await import("./claude-subagents.ts");
     const a = alias("s4-a");
     const b = alias("s4-b");
-    const stack = stacks.harnessStacks.create({ label: "s4", kind: "claude-code", members: [a, b] });
+    const stack = await stacks.harnessStacks.create({ label: "s4", kind: "claude-code", members: [a, b] });
     const task = makeTask(a, "p");
     const runId = insertRun(task.id, a, { status: "succeeded", claudeSessionId: `s4-${task.id}` });
     db.tasks.update(task.id, { runId, column: "running" });
@@ -488,17 +515,17 @@ describe("wave 3 review fixes", () => {
       stackId: stack.id, position: 0, count: 2, tried: [], pendingSwap: null, allExhausted: null, lastMove: null,
       scheduledSwitch: { requestedAt: Date.now() },
     });
-    expect(settleSubagentById(subagentId, "completed", "receipt")).toBe(true);
-    await waitFor(() => db.tasks.get(task.id)?.agent === b && !orch.isTaskRunLive(task.id));
+    expect(await settleSubagentById(subagentId, "completed", "receipt")).toBe(true);
+    await waitFor(async () => db.tasks.get(task.id)?.agent === b && !await orch.isTaskRunLive(task.id));
     expect(db.tasks.get(task.id)!.agent).toBe(b);
     expect(db.tasks.get(task.id)!.harnessState?.scheduledSwitch ?? null).toBeNull();
-    stacks.harnessStacks.delete(stack.id);
+    await stacks.harnessStacks.delete(stack.id);
   }, 20_000);
 
   test("S5: a message arriving during a switch-now move is held and delivered, not refused", async () => {
     const a = alias("s5-a");
     const b = alias("s5-b");
-    const stack = stacks.harnessStacks.create({ label: "s5", kind: "claude-code", members: [a, b] });
+    const stack = await stacks.harnessStacks.create({ label: "s5", kind: "claude-code", members: [a, b] });
     const task = makeTask(a, "work", { column: "review" });
     const prior = insertRun(task.id, a);
     db.tasks.update(task.id, { runId: prior });
@@ -514,7 +541,7 @@ describe("wave 3 review fixes", () => {
     expect(rowsAfter.length >= 2 || backlog.some((i) => i.text === "handoff reminder")).toBe(true);
     expect(db.tasks.get(task.id)!.agent).toBe(b);
     await waitFor(() => db.runs.listForTask(task.id).every((r) => r.status !== "running"));
-    stacks.harnessStacks.delete(stack.id);
+    await stacks.harnessStacks.delete(stack.id);
   }, 20_000);
 });
 
@@ -536,7 +563,7 @@ describe("refusals with per-member reasons and in-memory windows (TT-D)", () => 
   test("no-usable-member: every other account is unusable, and the reasons name them", async () => {
     const a = alias("nu-a");
     const b = alias("nu-b");
-    const stack = stacks.harnessStacks.create({ label: "nu", kind: "claude-code", members: [a, b] });
+    const stack = await stacks.harnessStacks.create({ label: "nu", kind: "claude-code", members: [a, b] });
     const task = makeTask(a, "work", { column: "review" });
     db.harnesses.setEnabled(b, false);
     try {
@@ -548,17 +575,17 @@ describe("refusals with per-member reasons and in-memory windows (TT-D)", () => 
       // Refused up front: nothing scheduled, nothing moved, no history.
       expect(db.tasks.get(task.id)!.agent).toBe(a);
       expect(db.tasks.get(task.id)!.harnessState?.scheduledSwitch ?? null).toBeNull();
-      expect(events(stack.id).filter((e) => e.taskId === task.id)).toHaveLength(0);
+      expect((await events(stack.id)).filter((e) => e.taskId === task.id)).toHaveLength(0);
     } finally {
       db.harnesses.setEnabled(b, true);
     }
-    stacks.harnessStacks.delete(stack.id);
+    await stacks.harnessStacks.delete(stack.id);
   });
 
   test("busy while the limit settlement's swap window is open, and nothing is scheduled", async () => {
     const a = alias("busyw-a");
     const b = alias("busyw-b");
-    const stack = stacks.harnessStacks.create({ label: "busyw", kind: "claude-code", members: [a, b] });
+    const stack = await stacks.harnessStacks.create({ label: "busyw", kind: "claude-code", members: [a, b] });
     const task = makeTask(a, `work ${FAKE_CLAUDE_LIMIT_PROMPT_MARKER}`);
     let inWindow: InstanceType<typeof orch.SwitchAccountRefusedError> | null = null;
     const prev = orch.__setHarnessSwapSettleHookForTest(async (hooked, _runId, phase) => {
@@ -579,14 +606,14 @@ describe("refusals with per-member reasons and in-memory windows (TT-D)", () => 
     expect(inWindow).not.toBeNull();
     expect((inWindow as unknown as InstanceType<typeof orch.SwitchAccountRefusedError>).body.code).toBe("busy");
     expect(db.tasks.get(task.id)!.harnessState?.scheduledSwitch ?? null).toBeNull();
-    stacks.harnessStacks.clearLimitState(a);
-    stacks.harnessStacks.delete(stack.id);
+    await stacks.harnessStacks.clearLimitState(a);
+    await stacks.harnessStacks.delete(stack.id);
   }, 20_000);
 
   test("busy while the boot swap claim is held", async () => {
     const a = alias("busyb-a");
     const b = alias("busyb-b");
-    const stack = stacks.harnessStacks.create({ label: "busyb", kind: "claude-code", members: [a, b] });
+    const stack = await stacks.harnessStacks.create({ label: "busyb", kind: "claude-code", members: [a, b] });
     const task = makeTask(a, "work", { column: "running" });
     const oldRun = insertRun(task.id, a, { status: "running", endedAt: null, exitCode: null });
     db.tasks.update(task.id, { runId: oldRun });
@@ -610,7 +637,7 @@ describe("refusals with per-member reasons and in-memory windows (TT-D)", () => 
     }
     expect(during).not.toBeNull();
     expect((during as unknown as InstanceType<typeof orch.SwitchAccountRefusedError>).body.code).toBe("busy");
-    stacks.harnessStacks.delete(stack.id);
+    await stacks.harnessStacks.delete(stack.id);
   }, 20_000);
 });
 
@@ -618,7 +645,7 @@ describe("a scheduled switch is performed when the turn FAILS (TT-D)", () => {
   test("a turn that ends failed moves the task to the next account, as a `scheduled` row", async () => {
     const a = alias("fail-a");
     const b = alias("fail-b");
-    const stack = stacks.harnessStacks.create({ label: "fail", kind: "claude-code", members: [a, b] });
+    const stack = await stacks.harnessStacks.create({ label: "fail", kind: "claude-code", members: [a, b] });
     const task = makeTask(a, "plain work");
     process.env.AGETOR_FAKE_CLAUDE_SESSION_DIED = "1";
     process.env.AGETOR_FAKE_CLAUDE_RESOLVE_DELAY_MS = "400";
@@ -635,12 +662,12 @@ describe("a scheduled switch is performed when the turn FAILS (TT-D)", () => {
     const after = db.tasks.get(task.id)!;
     expect(after.agent).toBe(b);
     expect(after.harnessState?.scheduledSwitch ?? null).toBeNull();
-    const rows = events(stack.id).filter((e) => e.taskId === task.id);
+    const rows = (await events(stack.id)).filter((e) => e.taskId === task.id);
     expect(rows.map((r) => r.trigger)).toEqual(["scheduled"]);
     // Not a limit: no cooldown, nothing marked tried.
-    expect(stacks.harnessStacks.getLimitState(a)).toBeNull();
+    expect(await stacks.harnessStacks.getLimitState(a)).toBeNull();
     expect(after.harnessState?.tried ?? []).toEqual([]);
-    stacks.harnessStacks.delete(stack.id);
+    await stacks.harnessStacks.delete(stack.id);
   }, 20_000);
 });
 
@@ -650,11 +677,11 @@ describe("a scheduled switch is performed when the turn FAILS (TT-D)", () => {
 // ---------------------------------------------------------------------------
 
 describe("an account removed from its stack (S6)", () => {
-  function orphanedTask(prefix: string, extra: Partial<Task> = {}) {
+  async function orphanedTask(prefix: string, extra: Partial<Task> = {}) {
     const a = alias(`${prefix}-a`);
     const b = alias(`${prefix}-b`);
     const c = alias(`${prefix}-c`);
-    const stack = stacks.harnessStacks.create({ label: prefix, kind: "claude-code", members: [a, b, c] });
+    const stack = await stacks.harnessStacks.create({ label: prefix, kind: "claude-code", members: [a, b, c] });
     const task = makeTask(a, "work", { column: "review", ...extra });
     const prior = insertRun(task.id, a);
     db.tasks.update(task.id, { runId: prior });
@@ -663,13 +690,13 @@ describe("an account removed from its stack (S6)", () => {
     });
     // The task's account leaves the stack; the task still resolves to it
     // through its recorded state.
-    stacks.harnessStacks.update(stack.id, { members: [b, c] });
-    expect(stacks.harnessStacks.resolveForTask(db.tasks.get(task.id)!)?.orphaned).toBe(true);
+    await stacks.harnessStacks.update(stack.id, { members: [b, c] });
+    expect((await stacks.harnessStacks.resolveForTask(db.tasks.get(task.id)!))?.orphaned).toBe(true);
     return { a, b, c, stack, task, prior };
   }
 
   test("a switch is refused not-in-stack instead of a silent fresh start", async () => {
-    const { a, stack, task } = orphanedTask("s6");
+    const { a, stack, task } = await orphanedTask("s6");
     let refusal: unknown = null;
     try {
       await orch.switchTaskAccountNow(task.id);
@@ -681,12 +708,12 @@ describe("an account removed from its stack (S6)", () => {
     const after = db.tasks.get(task.id)!;
     expect(after.agent).toBe(a);
     expect(after.harnessState?.pendingSwap ?? null).toBeNull();
-    expect(events(stack.id).filter((e) => e.taskId === task.id)).toHaveLength(0);
-    stacks.harnessStacks.delete(stack.id);
+    expect((await events(stack.id)).filter((e) => e.taskId === task.id)).toHaveLength(0);
+    await stacks.harnessStacks.delete(stack.id);
   });
 
   test("a scheduled switch is dropped with a status line, not applied", async () => {
-    const { a, stack, task, prior } = orphanedTask("s6sched");
+    const { a, stack, task, prior } = await orphanedTask("s6sched");
     db.tasks.setHarnessState(task.id, {
       ...db.tasks.get(task.id)!.harnessState!, scheduledSwitch: { requestedAt: Date.now() },
     });
@@ -695,8 +722,8 @@ describe("an account removed from its stack (S6)", () => {
     expect(after.agent).toBe(a);
     expect(after.harnessState?.scheduledSwitch ?? null).toBeNull();
     expect(db.runs.events(prior).some((e) => e.stream === "status" && e.data.includes("no longer in a stack with a backup account"))).toBe(true);
-    expect(events(stack.id).filter((e) => e.taskId === task.id)).toHaveLength(0);
-    stacks.harnessStacks.delete(stack.id);
+    expect((await events(stack.id)).filter((e) => e.taskId === task.id)).toHaveLength(0);
+    await stacks.harnessStacks.delete(stack.id);
   });
 });
 
@@ -707,7 +734,7 @@ describe("a scheduled switch left waiting after its turn ended (S7)", () => {
     const { settleSubagentById } = await import("./claude-subagents.ts");
     const a = alias("s7bg-a");
     const b = alias("s7bg-b");
-    const stack = stacks.harnessStacks.create({ label: "s7bg", kind: "claude-code", members: [a, b] });
+    const stack = await stacks.harnessStacks.create({ label: "s7bg", kind: "claude-code", members: [a, b] });
     const task = makeTask(a, "p");
     // The turn ended in an API error (failed, card blocked) while a background
     // agent kept running, so its turn end deferred the switch to the agents.
@@ -723,13 +750,13 @@ describe("a scheduled switch left waiting after its turn ended (S7)", () => {
       stackId: stack.id, position: 0, count: 2, tried: [], pendingSwap: null, allExhausted: null, lastMove: null,
       scheduledSwitch: { requestedAt: Date.now() },
     });
-    expect(settleSubagentById(subagentId, "completed", "receipt")).toBe(true);
-    await waitFor(() => db.tasks.get(task.id)?.agent === b && !orch.isTaskRunLive(task.id));
+    expect(await settleSubagentById(subagentId, "completed", "receipt")).toBe(true);
+    await waitFor(async () => db.tasks.get(task.id)?.agent === b && !await orch.isTaskRunLive(task.id));
     const after = db.tasks.get(task.id)!;
     expect(after.agent).toBe(b);
     expect(after.harnessState?.scheduledSwitch ?? null).toBeNull();
-    expect(events(stack.id).filter((e) => e.taskId === task.id).map((e) => e.trigger)).toEqual(["scheduled"]);
-    stacks.harnessStacks.delete(stack.id);
+    expect((await events(stack.id)).filter((e) => e.taskId === task.id).map((e) => e.trigger)).toEqual(["scheduled"]);
+    await stacks.harnessStacks.delete(stack.id);
   }, 20_000);
 
   /** Run a fake turn, schedule a switch, and hold a claim on the task across
@@ -737,7 +764,7 @@ describe("a scheduled switch left waiting after its turn ended (S7)", () => {
   async function turnEndsUnderClaim(prefix: string) {
     const a = alias(`${prefix}-a`);
     const b = alias(`${prefix}-b`);
-    const stack = stacks.harnessStacks.create({ label: prefix, kind: "claude-code", members: [a, b] });
+    const stack = await stacks.harnessStacks.create({ label: prefix, kind: "claude-code", members: [a, b] });
     const task = makeTask(a, "plain work");
     let runId = "";
     process.env.AGETOR_FAKE_CLAUDE_TURN_MS = "600";
@@ -745,15 +772,9 @@ describe("a scheduled switch left waiting after its turn ended (S7)", () => {
       const started = await orch.startTask(task.id);
       runId = (started as { runId: string }).runId;
       expect((await orch.switchTaskAccountNow(task.id)).status).toBe("scheduled");
-      // The start's own claim is released once its spawn returns; take one as
-      // soon as it is free (the turn is still running).
-      let claimed = false;
-      const deadline = Date.now() + 5000;
-      while (!claimed && Date.now() < deadline) {
-        claimed = orch.claimTaskForAccountSwitch(task.id);
-        if (!claimed) await Bun.sleep(5);
-      }
-      expect(claimed).toBe(true);
+      // The real claim refuses while the run is live (review S3), so stand in
+      // for the claim holder with a seam taken while the turn is running.
+      expect(orch.__testing.holdSwitchClaimForTest(task.id)).toBe(true);
       expect(db.runs.get(runId)!.status).toBe("running");
       await waitFor(() => db.runs.get(runId)?.status !== "running");
     } finally {
@@ -771,14 +792,14 @@ describe("a scheduled switch left waiting after its turn ended (S7)", () => {
 
   test("the start holding the task at the turn end ends without a run: the switch is applied then", async () => {
     const { b, stack, task } = await turnEndsUnderClaim("s7claim");
-    orch.releaseTaskAccountSwitch(task.id);
-    await waitFor(() => db.tasks.get(task.id)?.agent === b && !orch.isTaskRunLive(task.id));
+    await orch.releaseTaskAccountSwitch(task.id);
+    await waitFor(async () => db.tasks.get(task.id)?.agent === b && !await orch.isTaskRunLive(task.id));
     const after = db.tasks.get(task.id)!;
     expect(after.agent).toBe(b);
     expect(after.harnessState?.scheduledSwitch ?? null).toBeNull();
     expect(after.harnessState?.lastMove?.reason).toBe("switch-now");
-    expect(events(stack.id).filter((e) => e.taskId === task.id).map((e) => e.trigger)).toEqual(["scheduled"]);
-    stacks.harnessStacks.delete(stack.id);
+    expect((await events(stack.id)).filter((e) => e.taskId === task.id).map((e) => e.trigger)).toEqual(["scheduled"]);
+    await stacks.harnessStacks.delete(stack.id);
   }, 20_000);
 
   test("a start holding the task that fails before minting a run applies it; a Stop on that start drops it", async () => {
@@ -792,7 +813,7 @@ describe("a scheduled switch left waiting after its turn ended (S7)", () => {
       // Worktree isolation on a folder that is no git repo: the start fails
       // its workdir pre-flight, after the claim and before any run exists.
       db.tasks.update(task.id, { isolation: "worktree" });
-      orch.releaseTaskAccountSwitch(task.id);
+      await orch.releaseTaskAccountSwitch(task.id);
       const starting = orch.startTask(task.id);
       // Nothing is live, so a Stop lands on the start's claim.
       if (stop) expect(await orch.cancelLiveRunOfTask(task.id)).toBe(true);
@@ -805,14 +826,14 @@ describe("a scheduled switch left waiting after its turn ended (S7)", () => {
         await waitFor(() => db.tasks.get(task.id)?.harnessState?.scheduledSwitch == null);
         expect(db.tasks.get(task.id)!.agent).toBe(a);
         expect(statusOf(runId).some((l) => l.includes("scheduled account switch cancelled (stopped)"))).toBe(true);
-        expect(events(stack.id).filter((e) => e.taskId === task.id && e.trigger === "scheduled")).toHaveLength(0);
+        expect((await events(stack.id)).filter((e) => e.taskId === task.id && e.trigger === "scheduled")).toHaveLength(0);
       } else {
-        await waitFor(() => db.tasks.get(task.id)?.agent === b && !orch.isTaskRunLive(task.id));
+        await waitFor(async () => db.tasks.get(task.id)?.agent === b && !await orch.isTaskRunLive(task.id));
         expect(db.tasks.get(task.id)!.agent).toBe(b);
-        expect(events(stack.id).filter((e) => e.taskId === task.id && e.trigger === "scheduled")).toHaveLength(1);
+        expect((await events(stack.id)).filter((e) => e.taskId === task.id && e.trigger === "scheduled")).toHaveLength(1);
       }
       expect(db.tasks.get(task.id)!.harnessState?.scheduledSwitch ?? null).toBeNull();
-      stacks.harnessStacks.delete(stack.id);
+      await stacks.harnessStacks.delete(stack.id);
     }
   }, 40_000);
 });
@@ -822,7 +843,7 @@ describe("boot completion of an interrupted switch-now (label)", () => {
     for (const switchNow of ["manual", undefined] as const) {
       const a = alias(`bootlbl-${switchNow ?? "plain"}-a`);
       const b = alias(`bootlbl-${switchNow ?? "plain"}-b`);
-      const stack = stacks.harnessStacks.create({ label: "bootlbl", kind: "claude-code", members: [a, b] });
+      const stack = await stacks.harnessStacks.create({ label: "bootlbl", kind: "claude-code", members: [a, b] });
       // The row update landed on the destination before the restart.
       const task = makeTask(b, "work", { column: "review" });
       const prior = insertRun(task.id, a);
@@ -842,9 +863,9 @@ describe("boot completion of an interrupted switch-now (label)", () => {
         from: a, to: b, reason: switchNow ? "switch-now" : "manual-switch",
       });
       expect(after.harnessState?.tried ?? []).toEqual([]);
-      expect(events(stack.id).filter((e) => e.taskId === task.id).map((e) => e.trigger)).toEqual(["boot-resume"]);
-      expect(stacks.harnessStacks.getLimitState(a)).toBeNull();
-      stacks.harnessStacks.delete(stack.id);
+      expect((await events(stack.id)).filter((e) => e.taskId === task.id).map((e) => e.trigger)).toEqual(["boot-resume"]);
+      expect(await stacks.harnessStacks.getLimitState(a)).toBeNull();
+      await stacks.harnessStacks.delete(stack.id);
     }
   });
 });
@@ -853,7 +874,7 @@ describe("a limit settlement that throws before consuming a scheduled switch (S7
   test("drops the request with a status line instead of leaving it for a later turn", async () => {
     const a = alias("s7throw-a");
     const b = alias("s7throw-b");
-    const stack = stacks.harnessStacks.create({ label: "s7throw", kind: "claude-code", members: [a, b] });
+    const stack = await stacks.harnessStacks.create({ label: "s7throw", kind: "claude-code", members: [a, b] });
     const task = makeTask(a, `work ${FAKE_CLAUDE_LIMIT_PROMPT_MARKER}`);
     // The earliest point of the settlement, before the request is consumed.
     const prev = orch.__setHarnessSwapSettleHookForTest((hooked, _runId, phase) => {
@@ -878,8 +899,8 @@ describe("a limit settlement that throws before consuming a scheduled switch (S7
     const lines = db.runs.events(runId).filter((e) => e.stream === "status").map((e) => e.data);
     expect(lines.some((l) => l.includes("switching accounts failed: synthetic settlement failure"))).toBe(true);
     expect(lines.some((l) => l.includes("scheduled account switch dropped: the account switch after the limit failed"))).toBe(true);
-    stacks.harnessStacks.clearLimitState(a);
-    stacks.harnessStacks.delete(stack.id);
+    await stacks.harnessStacks.clearLimitState(a);
+    await stacks.harnessStacks.delete(stack.id);
   }, 20_000);
 });
 
@@ -888,7 +909,7 @@ describe("a background agent settling inside the turn-end pump (S7 race)", () =>
     const { settleSubagentById } = await import("./claude-subagents.ts");
     const a = alias("s7pump-a");
     const b = alias("s7pump-b");
-    const stack = stacks.harnessStacks.create({ label: "s7pump", kind: "claude-code", members: [a, b] });
+    const stack = await stacks.harnessStacks.create({ label: "s7pump", kind: "claude-code", members: [a, b] });
     const task = makeTask(a, "plain work");
     const subagentId = `agent-${randomUUID()}`;
     // Whether the account-switch claim was free right after the last
@@ -899,9 +920,11 @@ describe("a background agent settling inside the turn-end pump (S7 race)", () =>
     const prev = orch.__setTurnSettlePumpHookForTest((hooked) => {
       if (hooked !== task.id) return;
       orch.__setTurnSettlePumpHookForTest(null);
-      settleSubagentById(subagentId, "completed", "receipt");
-      claimFreeAfterRelease = orch.claimTaskForAccountSwitch(task.id);
-      if (claimFreeAfterRelease) orch.releaseTaskAccountSwitch(task.id);
+      void (async () => {
+        await settleSubagentById(subagentId, "completed", "receipt");
+        claimFreeAfterRelease = await orch.claimTaskForAccountSwitch(task.id);
+        if (claimFreeAfterRelease) await orch.releaseTaskAccountSwitch(task.id);
+      })().catch((e) => console.error("[test] deferred hook failed:", e));
     });
     process.env.AGETOR_FAKE_CLAUDE_TURN_MS = "500";
     try {
@@ -912,7 +935,7 @@ describe("a background agent settling inside the turn-end pump (S7 race)", () =>
         status: "running", startedAt: Date.now(), endedAt: null,
       } as never);
       expect((await orch.switchTaskAccountNow(task.id)).status).toBe("scheduled");
-      await waitFor(() => db.tasks.get(task.id)?.agent === b && !orch.isTaskRunLive(task.id));
+      await waitFor(async () => db.tasks.get(task.id)?.agent === b && !await orch.isTaskRunLive(task.id));
     } finally {
       delete process.env.AGETOR_FAKE_CLAUDE_TURN_MS;
       orch.__setTurnSettlePumpHookForTest(prev);
@@ -921,8 +944,8 @@ describe("a background agent settling inside the turn-end pump (S7 race)", () =>
     const after = db.tasks.get(task.id)!;
     expect(after.agent).toBe(b);
     expect(after.harnessState?.scheduledSwitch ?? null).toBeNull();
-    expect(events(stack.id).filter((e) => e.taskId === task.id).map((e) => e.trigger)).toEqual(["scheduled"]);
-    stacks.harnessStacks.delete(stack.id);
+    expect((await events(stack.id)).filter((e) => e.taskId === task.id).map((e) => e.trigger)).toEqual(["scheduled"]);
+    await stacks.harnessStacks.delete(stack.id);
   }, 20_000);
 });
 
@@ -931,7 +954,7 @@ describe("a FAILED turn's background agents hold a scheduled switch at boot (M2,
     const { settleSubagentById } = await import("./claude-subagents.ts");
     const a = alias("m2boot-a");
     const b = alias("m2boot-b");
-    const stack = stacks.harnessStacks.create({ label: "m2boot", kind: "claude-code", members: [a, b] });
+    const stack = await stacks.harnessStacks.create({ label: "m2boot", kind: "claude-code", members: [a, b] });
     const task = makeTask(a, "p");
     // The turn failed with an API error (card blocked) while a background
     // agent kept running; the core then restarted with the request persisted.
@@ -951,10 +974,10 @@ describe("a FAILED turn's background agents hold a scheduled switch at boot (M2,
     await Bun.sleep(50);
     expect(db.tasks.get(task.id)!.agent).toBe(a);
     expect(db.tasks.get(task.id)!.harnessState?.scheduledSwitch).toBeTruthy();
-    expect(events(stack.id).filter((e) => e.taskId === task.id)).toHaveLength(0);
+    expect((await events(stack.id)).filter((e) => e.taskId === task.id)).toHaveLength(0);
     // Every other path treats it the same: no claim, no switch-now.
-    expect(orch.backgroundAgentsHoldTask(task.id)).toBe(true);
-    expect(orch.claimTaskForAccountSwitch(task.id)).toBe(false);
+    expect(await orch.backgroundAgentsHoldTask(task.id)).toBe(true);
+    expect(await orch.claimTaskForAccountSwitch(task.id)).toBe(false);
     let refusal: unknown = null;
     try {
       await orch.switchTaskAccountNow(task.id);
@@ -963,23 +986,23 @@ describe("a FAILED turn's background agents hold a scheduled switch at boot (M2,
     }
     expect((refusal as InstanceType<typeof orch.SwitchAccountRefusedError>).body.code).toBe("background-agents");
 
-    expect(settleSubagentById(subagentId, "completed", "receipt")).toBe(true);
-    await waitFor(() => db.tasks.get(task.id)?.agent === b && !orch.isTaskRunLive(task.id));
+    expect(await settleSubagentById(subagentId, "completed", "receipt")).toBe(true);
+    await waitFor(async () => db.tasks.get(task.id)?.agent === b && !await orch.isTaskRunLive(task.id));
     const after = db.tasks.get(task.id)!;
     expect(after.agent).toBe(b);
     expect(after.harnessState?.scheduledSwitch ?? null).toBeNull();
-    expect(events(stack.id).filter((e) => e.taskId === task.id).map((e) => e.trigger)).toEqual(["scheduled"]);
-    stacks.harnessStacks.delete(stack.id);
+    expect((await events(stack.id)).filter((e) => e.taskId === task.id).map((e) => e.trigger)).toEqual(["scheduled"]);
+    await stacks.harnessStacks.delete(stack.id);
   }, 20_000);
 });
 
 describe("a scheduled switch survives until its move succeeds (S5)", () => {
   const statusOf = (runId: string) => db.runs.events(runId).filter((e) => e.stream === "status").map((e) => e.data);
 
-  function scheduledIdleTask(prefix: string) {
+  async function scheduledIdleTask(prefix: string) {
     const a = alias(`${prefix}-a`);
     const b = alias(`${prefix}-b`);
-    const stack = stacks.harnessStacks.create({ label: prefix, kind: "claude-code", members: [a, b] });
+    const stack = await stacks.harnessStacks.create({ label: prefix, kind: "claude-code", members: [a, b] });
     const task = makeTask(a, "p", { column: "review" });
     const runId = insertRun(task.id, a);
     db.tasks.update(task.id, { runId });
@@ -991,7 +1014,7 @@ describe("a scheduled switch survives until its move succeeds (S5)", () => {
   }
 
   test("a move that throws after writing its intent drops the request WITH the failure line", async () => {
-    const { a, stack, task, runId } = scheduledIdleTask("s5throw");
+    const { a, stack, task, runId } = await scheduledIdleTask("s5throw");
     const prev = orch.__setScheduledSwitchHooksForTest({
       afterIntent: (id) => {
         if (id === task.id) throw new Error("synthetic move failure");
@@ -1007,11 +1030,11 @@ describe("a scheduled switch survives until its move succeeds (S5)", () => {
     expect(after.harnessState?.scheduledSwitch ?? null).toBeNull();
     expect(after.harnessState?.pendingSwap ?? null).toBeNull();
     expect(statusOf(runId).some((l) => l === "scheduled account switch failed: synthetic move failure")).toBe(true);
-    stacks.harnessStacks.delete(stack.id);
+    await stacks.harnessStacks.delete(stack.id);
   });
 
   test("a crash right after the intent is written boots into a retry of the scheduled switch, not 'run the task to switch'", async () => {
-    const { a, b, stack, task, runId } = scheduledIdleTask("s5crash");
+    const { a, b, stack, task, runId } = await scheduledIdleTask("s5crash");
     // What a crash right after the intent write leaves on disk.
     let leftOnDisk: Task["harnessState"] | null = null;
     const prev = orch.__setScheduledSwitchHooksForTest({
@@ -1034,7 +1057,7 @@ describe("a scheduled switch survives until its move succeeds (S5)", () => {
     db.tasks.update(task.id, { agent: a });
     db.tasks.setHarnessState(task.id, leftOnDisk);
     await orch.reconcilePendingHarnessSwaps();
-    await waitFor(() => db.tasks.get(task.id)?.agent === b && !orch.isTaskRunLive(task.id));
+    await waitFor(async () => db.tasks.get(task.id)?.agent === b && !await orch.isTaskRunLive(task.id));
     const after = db.tasks.get(task.id)!;
     expect(after.agent).toBe(b);
     expect(after.harnessState?.scheduledSwitch ?? null).toBeNull();
@@ -1043,8 +1066,8 @@ describe("a scheduled switch survives until its move succeeds (S5)", () => {
     const lines = statusOf(runId);
     expect(lines).toContain("the core restarted before the scheduled account switch started — it stays scheduled");
     expect(lines.some((l) => l.includes("run the task to switch"))).toBe(false);
-    expect(events(stack.id).filter((e) => e.taskId === task.id).map((e) => e.trigger)).toEqual(["scheduled"]);
-    stacks.harnessStacks.delete(stack.id);
+    expect((await events(stack.id)).filter((e) => e.taskId === task.id).map((e) => e.trigger)).toEqual(["scheduled"]);
+    await stacks.harnessStacks.delete(stack.id);
   });
 
   test("a boot completion of a row that already moved consumes the request, even when the copy fails: no second switch", async () => {
@@ -1053,7 +1076,7 @@ describe("a scheduled switch survives until its move succeeds (S5)", () => {
       const a = alias(`${tag}-a`);
       const b = alias(`${tag}-b`);
       const c = alias(`${tag}-c`);
-      const stack = stacks.harnessStacks.create({ label: tag, kind: "claude-code", members: [a, b, c] });
+      const stack = await stacks.harnessStacks.create({ label: tag, kind: "claude-code", members: [a, b, c] });
       // The row already moved to b before the restart; the intent and the
       // scheduled request are both still recorded. A session id whose
       // transcript does not exist on the source account makes the copy fail.
@@ -1070,13 +1093,13 @@ describe("a scheduled switch survives until its move succeeds (S5)", () => {
       const after = db.tasks.get(task.id)!;
       expect(after.agent).toBe(b);
       expect(after.harnessState?.scheduledSwitch ?? null).toBeNull();
-      const rows = events(stack.id).filter((e) => e.taskId === task.id);
+      const rows = (await events(stack.id)).filter((e) => e.taskId === task.id);
       expect(rows.map((e) => e.trigger)).toEqual(["boot-resume"]);
       if (copyFails) {
         expect(rows[0]!.continuation).toBe("restarted");
         expect(db.runs.events(prior).some((e) => e.stream === "status" && e.data.includes("starting fresh there"))).toBe(true);
       }
-      stacks.harnessStacks.delete(stack.id);
+      await stacks.harnessStacks.delete(stack.id);
     }
   });
 });
@@ -1085,7 +1108,7 @@ describe("waiting-switch settle edges (N1, N6)", () => {
   test("N1: a throw settling the switch on a claim release is logged, not left as an uncaught microtask error", async () => {
     const a = alias("n1-a");
     const b = alias("n1-b");
-    const stack = stacks.harnessStacks.create({ label: "n1", kind: "claude-code", members: [a, b] });
+    const stack = await stacks.harnessStacks.create({ label: "n1", kind: "claude-code", members: [a, b] });
     const task = makeTask(a, "p", { column: "review" });
     db.tasks.update(task.id, { runId: insertRun(task.id, a) });
     db.tasks.setHarnessState(task.id, {
@@ -1101,8 +1124,8 @@ describe("waiting-switch settle edges (N1, N6)", () => {
       },
     });
     try {
-      expect(orch.claimTaskForAccountSwitch(task.id)).toBe(true);
-      orch.releaseTaskAccountSwitch(task.id);
+      expect(await orch.claimTaskForAccountSwitch(task.id)).toBe(true);
+      await orch.releaseTaskAccountSwitch(task.id);
       await Bun.sleep(20);
     } finally {
       orch.__setScheduledSwitchHooksForTest(prev);
@@ -1112,20 +1135,20 @@ describe("waiting-switch settle edges (N1, N6)", () => {
     // Nothing moved; the request is still there for the next edge.
     expect(db.tasks.get(task.id)!.agent).toBe(a);
     expect(db.tasks.get(task.id)!.harnessState?.scheduledSwitch).toBeTruthy();
-    orch.cancelScheduledAccountSwitch(task.id);
-    stacks.harnessStacks.delete(stack.id);
+    await orch.cancelScheduledAccountSwitch(task.id);
+    await stacks.harnessStacks.delete(stack.id);
   });
 
   test("N6: background agents finishing during the follow-up drain: the settle's end applies the switch", async () => {
     const { settleSubagentById } = await import("./claude-subagents.ts");
     const a = alias("n6-a");
     const b = alias("n6-b");
-    const stack = stacks.harnessStacks.create({ label: "n6", kind: "claude-code", members: [a, b] });
+    const stack = await stacks.harnessStacks.create({ label: "n6", kind: "claude-code", members: [a, b] });
     const task = makeTask(a, "plain work");
     const subagentId = `agent-${randomUUID()}`;
     let atDrain: { agent: string; deferred: boolean } | null = null;
     const prev = orch.__setScheduledSwitchHooksForTest({
-      turnDrain: (id, runId) => {
+      turnDrain: async (id, runId) => {
         if (id !== task.id) return;
         // The turn end deferred the switch to the agent; it finishes now,
         // inside the settling window, where every other edge must wait.
@@ -1133,7 +1156,7 @@ describe("waiting-switch settle edges (N1, N6)", () => {
           agent: db.tasks.get(id)!.agent,
           deferred: db.runs.events(runId).some((e) => e.stream === "status" && e.data.includes("once the background agents finish")),
         };
-        settleSubagentById(subagentId, "completed", "receipt");
+        await settleSubagentById(subagentId, "completed", "receipt");
       },
     });
     process.env.AGETOR_FAKE_CLAUDE_TURN_MS = "500";
@@ -1145,7 +1168,7 @@ describe("waiting-switch settle edges (N1, N6)", () => {
         status: "running", startedAt: Date.now(), endedAt: null,
       } as never);
       expect((await orch.switchTaskAccountNow(task.id)).status).toBe("scheduled");
-      await waitFor(() => db.tasks.get(task.id)?.agent === b && !orch.isTaskRunLive(task.id));
+      await waitFor(async () => db.tasks.get(task.id)?.agent === b && !await orch.isTaskRunLive(task.id));
     } finally {
       delete process.env.AGETOR_FAKE_CLAUDE_TURN_MS;
       orch.__setScheduledSwitchHooksForTest(prev);
@@ -1154,8 +1177,8 @@ describe("waiting-switch settle edges (N1, N6)", () => {
     const after = db.tasks.get(task.id)!;
     expect(after.agent).toBe(b);
     expect(after.harnessState?.scheduledSwitch ?? null).toBeNull();
-    expect(events(stack.id).filter((e) => e.taskId === task.id).map((e) => e.trigger)).toEqual(["scheduled"]);
-    stacks.harnessStacks.delete(stack.id);
+    expect((await events(stack.id)).filter((e) => e.taskId === task.id).map((e) => e.trigger)).toEqual(["scheduled"]);
+    await stacks.harnessStacks.delete(stack.id);
   }, 20_000);
 });
 
@@ -1164,10 +1187,10 @@ describe("a FAILED turn's background agents are stopped and respected like a hel
 
   /** A stacked task whose last turn failed (card `blocked`) while one
    *  background agent kept running. */
-  function failedWithAgent(prefix: string, extra: { scheduled?: boolean; exhaustedAt?: number } = {}) {
+  async function failedWithAgent(prefix: string, extra: { scheduled?: boolean; exhaustedAt?: number } = {}) {
     const a = alias(`${prefix}-a`);
     const b = alias(`${prefix}-b`);
-    const stack = stacks.harnessStacks.create({ label: prefix, kind: "claude-code", members: [a, b] });
+    const stack = await stacks.harnessStacks.create({ label: prefix, kind: "claude-code", members: [a, b] });
     const task = makeTask(a, "p");
     const runId = insertRun(task.id, a, { status: "failed", exitCode: 1, claudeSessionId: `${prefix}-${task.id}` });
     db.tasks.update(task.id, { runId, column: "blocked" });
@@ -1189,7 +1212,7 @@ describe("a FAILED turn's background agents are stopped and respected like a hel
   }
 
   test("Stop (cancelRun) interrupts the agents and drops a waiting scheduled switch; the card and run stay as the failure left them", async () => {
-    const { a, stack, task, runId, agentRunning } = failedWithAgent("q1stop", { scheduled: true });
+    const { a, stack, task, runId, agentRunning } = await failedWithAgent("q1stop", { scheduled: true });
     expect(await orch.cancelRun(runId)).toBe(true);
     expect(agentRunning()).toBe(false);
     const after = db.tasks.get(task.id)!;
@@ -1201,57 +1224,57 @@ describe("a FAILED turn's background agents are stopped and respected like a hel
     // Nothing applies the dropped request once the agents are gone.
     await Bun.sleep(50);
     expect(db.tasks.get(task.id)!.agent).toBe(a);
-    expect(events(stack.id).filter((e) => e.taskId === task.id)).toHaveLength(0);
-    stacks.harnessStacks.delete(stack.id);
+    expect((await events(stack.id)).filter((e) => e.taskId === task.id)).toHaveLength(0);
+    await stacks.harnessStacks.delete(stack.id);
   });
 
   test("Stop also cancels an armed all-exhausted retry the failed turn left", async () => {
-    const { stack, task, runId, agentRunning } = failedWithAgent("q1stopretry", { exhaustedAt: Date.now() + 600_000 });
-    expect(orch.hasPendingHarnessRetry(task.id)).toBe(true);
+    const { stack, task, runId, agentRunning } = await failedWithAgent("q1stopretry", { exhaustedAt: Date.now() + 600_000 });
+    expect(await orch.hasPendingHarnessRetry(task.id)).toBe(true);
     expect(await orch.cancelRun(runId)).toBe(true);
     expect(agentRunning()).toBe(false);
-    expect(orch.hasPendingHarnessRetry(task.id)).toBe(false);
-    stacks.harnessStacks.delete(stack.id);
+    expect(await orch.hasPendingHarnessRetry(task.id)).toBe(false);
+    await stacks.harnessStacks.delete(stack.id);
   });
 
   test("archive with stopRun interrupts the agents", async () => {
-    const { stack, task, agentRunning } = failedWithAgent("q1archive");
+    const { stack, task, agentRunning } = await failedWithAgent("q1archive");
     const result = await orch.archiveTask(task.id, { force: true, stopRun: true });
     expect(result).not.toHaveProperty("error");
     expect(agentRunning()).toBe(false);
-    stacks.harnessStacks.delete(stack.id);
+    await stacks.harnessStacks.delete(stack.id);
   });
 
   test("the claude death watch keeps probing the REPL while they run", async () => {
     const { setHeldSessionProbe } = await import("./claude-tmux.ts");
-    const { stack, task, subagentId } = failedWithAgent("q1probe");
+    const { stack, task, subagentId } = await failedWithAgent("q1probe");
     const probe = setHeldSessionProbe(null);
     setHeldSessionProbe(probe);
-    expect(probe?.(task.id)).toBe(true);
+    expect(await probeNow(probe, task.id)).toBe(true);
     db.subagents.setStatus(subagentId, "completed", Date.now());
-    expect(probe?.(task.id)).toBe(false);
-    stacks.harnessStacks.delete(stack.id);
+    expect(await probeNow(probe, task.id)).toBe(false);
+    await stacks.harnessStacks.delete(stack.id);
   });
 
   test("a due all-exhausted retry is deferred instead of starting a turn that could drop the REPL", async () => {
-    const { a, stack, task, subagentId } = failedWithAgent("q1retry", { exhaustedAt: Date.now() });
+    const { a, stack, task, subagentId } = await failedWithAgent("q1retry", { exhaustedAt: Date.now() });
     try {
       // The timer fires only for the persisted schedule it was armed for.
       failover.armAutoRetry(task.id, db.tasks.get(task.id)!.harnessState!.allExhausted!.nextAttemptAt);
       await Bun.sleep(300);
       expect(db.runs.listForTask(task.id)).toHaveLength(1);
       expect(db.tasks.get(task.id)!.agent).toBe(a);
-      expect(orch.hasPendingHarnessRetry(task.id)).toBe(true);
+      expect(await orch.hasPendingHarnessRetry(task.id)).toBe(true);
     } finally {
       failover.cancelAutoRetry(task.id);
       db.subagents.setStatus(subagentId, "completed", Date.now());
-      await waitFor(() => !orch.isTaskRunLive(task.id), 3000);
-      stacks.harnessStacks.delete(stack.id);
+      await waitFor(async () => !await orch.isTaskRunLive(task.id), 3000);
+      await stacks.harnessStacks.delete(stack.id);
     }
   });
 
   test("a manual prepare does not move the task off an unusable account while they run", async () => {
-    const { a, stack, task } = failedWithAgent("q1prepare");
+    const { a, stack, task } = await failedWithAgent("q1prepare");
     // The current account is disabled: without the agents a manual prepare
     // would move the task to the backup.
     db.harnesses.setEnabled(a, false);
@@ -1261,7 +1284,7 @@ describe("a FAILED turn's background agents are stopped and respected like a hel
       expect(db.tasks.get(task.id)!.agent).toBe(a);
     } finally {
       db.harnesses.setEnabled(a, true);
-      stacks.harnessStacks.delete(stack.id);
+      await stacks.harnessStacks.delete(stack.id);
     }
   });
 });
@@ -1270,7 +1293,7 @@ describe("only a held card or a FAILED blocked one is held by its background age
   /** A stacked task on `a` whose last run ended with `status` on a `column`
    *  card while one agent row (a background shell, a persistent monitor) is
    *  still `running`. */
-  function cardWithAgent(
+  async function cardWithAgent(
     prefix: string,
     column: "ready" | "review" | "done" | "blocked",
     status: "cancelled" | "failed" | "succeeded",
@@ -1278,7 +1301,7 @@ describe("only a held card or a FAILED blocked one is held by its background age
   ) {
     const a = alias(`${prefix}-a`);
     const b = alias(`${prefix}-b`);
-    const stack = stacks.harnessStacks.create({ label: prefix, kind: "claude-code", members: [a, b] });
+    const stack = await stacks.harnessStacks.create({ label: prefix, kind: "claude-code", members: [a, b] });
     const task = makeTask(a, "p");
     const runId = insertRun(task.id, a, { status, exitCode: status === "succeeded" ? 0 : 1 });
     db.tasks.update(task.id, { runId, column });
@@ -1292,9 +1315,9 @@ describe("only a held card or a FAILED blocked one is held by its background age
       stackId: stack.id, position: 0, count: 2, tried: [], pendingSwap: null, allExhausted: null, lastMove: null,
       ...(extra.scheduled ? { scheduledSwitch: { requestedAt: Date.now() } } : {}),
     });
-    const done = () => {
+    const done = async () => {
       db.subagents.setStatus(subagentId, "completed", Date.now());
-      stacks.harnessStacks.delete(stack.id);
+      await stacks.harnessStacks.delete(stack.id);
     };
     return { a, b, stack, task, runId, subagentId, done };
   }
@@ -1309,43 +1332,43 @@ describe("only a held card or a FAILED blocked one is held by its background age
 
   test("Switch to next account moves a card whose turn was stopped (or that moved on) instead of refusing it", async () => {
     for (const [column, status] of NOT_HELD) {
-      const { b, task, done } = cardWithAgent(`a1now-${column}-${status}`, column, status);
+      const { b, task, done } = await cardWithAgent(`a1now-${column}-${status}`, column, status);
       try {
-        expect({ column, status, held: orch.backgroundAgentsHoldTask(task.id) }).toEqual({ column, status, held: false });
+        expect({ column, status, held: await orch.backgroundAgentsHoldTask(task.id) }).toEqual({ column, status, held: false });
         const result = await orch.switchTaskAccountNow(task.id);
         expect({ column, status, result: result.status }).toEqual({ column, status, result: "switched" });
         expect(db.tasks.get(task.id)!.agent).toBe(b);
       } finally {
-        done();
+        await done();
       }
     }
   }, 30_000);
 
   test("a scheduled switch on a stopped card is applied when a claim on it is released", async () => {
-    const { b, stack, task, done } = cardWithAgent("a1claim", "ready", "cancelled", { scheduled: true });
+    const { b, stack, task, done } = await cardWithAgent("a1claim", "ready", "cancelled", { scheduled: true });
     try {
-      expect(orch.claimTaskForAccountSwitch(task.id)).toBe(true);
-      orch.releaseTaskAccountSwitch(task.id);
+      expect(await orch.claimTaskForAccountSwitch(task.id)).toBe(true);
+      await orch.releaseTaskAccountSwitch(task.id);
       await waitFor(() => db.tasks.get(task.id)?.agent === b && !orch.isAccountSwitchUnderway(task.id));
       const after = db.tasks.get(task.id)!;
       expect(after.agent).toBe(b);
       expect(after.harnessState?.scheduledSwitch ?? null).toBeNull();
-      expect(events(stack.id).filter((e) => e.taskId === task.id).map((e) => e.trigger)).toEqual(["scheduled"]);
+      expect((await events(stack.id)).filter((e) => e.taskId === task.id).map((e) => e.trigger)).toEqual(["scheduled"]);
     } finally {
-      done();
+      await done();
     }
   }, 20_000);
 
   test("boot applies a scheduled switch of a stopped card instead of waiting for its agent rows", async () => {
-    const { b, stack, task, done } = cardWithAgent("a1boot", "review", "succeeded", { scheduled: true });
+    const { b, stack, task, done } = await cardWithAgent("a1boot", "review", "succeeded", { scheduled: true });
     try {
       await orch.reconcilePendingHarnessSwaps();
       await waitFor(() => db.tasks.get(task.id)?.agent === b && !orch.isAccountSwitchUnderway(task.id));
       expect(db.tasks.get(task.id)!.agent).toBe(b);
       expect(db.tasks.get(task.id)!.harnessState?.scheduledSwitch ?? null).toBeNull();
-      expect(events(stack.id).filter((e) => e.taskId === task.id).map((e) => e.trigger)).toEqual(["scheduled"]);
+      expect((await events(stack.id)).filter((e) => e.taskId === task.id).map((e) => e.trigger)).toEqual(["scheduled"]);
     } finally {
-      done();
+      await done();
     }
   }, 20_000);
 
@@ -1353,21 +1376,58 @@ describe("only a held card or a FAILED blocked one is held by its background age
     const { setHeldSessionProbe } = await import("./claude-tmux.ts");
     const probe = setHeldSessionProbe(null);
     setHeldSessionProbe(probe);
-    const failed = cardWithAgent("a1failed", "blocked", "failed");
-    const stopped = cardWithAgent("a1stopped", "ready", "cancelled");
+    const failed = await cardWithAgent("a1failed", "blocked", "failed");
+    const stopped = await cardWithAgent("a1stopped", "ready", "cancelled");
     try {
-      expect(orch.backgroundAgentsHoldTask(failed.task.id)).toBe(true);
-      expect(probe?.(failed.task.id)).toBe(true);
-      expect(orch.claimTaskForAccountSwitch(failed.task.id)).toBe(false);
-      expect(orch.backgroundAgentsHoldTask(stopped.task.id)).toBe(false);
-      expect(probe?.(stopped.task.id)).toBe(false);
+      expect(await orch.backgroundAgentsHoldTask(failed.task.id)).toBe(true);
+      expect(await probeNow(probe, failed.task.id)).toBe(true);
+      expect(await orch.claimTaskForAccountSwitch(failed.task.id)).toBe(false);
+      expect(await orch.backgroundAgentsHoldTask(stopped.task.id)).toBe(false);
+      expect(await probeNow(probe, stopped.task.id)).toBe(false);
       // The user drags the failed card on: nothing on it offers a Stop any
       // more, so it no longer holds either.
       db.tasks.update(failed.task.id, { column: "ready" });
-      expect(orch.backgroundAgentsHoldTask(failed.task.id)).toBe(false);
+      expect(await orch.backgroundAgentsHoldTask(failed.task.id)).toBe(false);
     } finally {
-      failed.done();
-      stopped.done();
+      await failed.done();
+      await stopped.done();
+    }
+  });
+
+  test("the held-session probe is one worker call per tick and returns no Task row (review S4)", async () => {
+    const { setHeldSessionProbe } = await import("./claude-tmux.ts");
+    const probe = setHeldSessionProbe(null);
+    setHeldSessionProbe(probe);
+    const { spyOn } = await import("bun:test");
+    const rpc = (await import("./db-rpc.ts")).getDbRpc();
+    const failed = await cardWithAgent("s4probe", "blocked", "failed");
+    const seen: string[] = [];
+    const results: unknown[] = [];
+    const realCall = rpc.call.bind(rpc);
+    const realOp = rpc.op.bind(rpc);
+    const callSpy = spyOn(rpc, "call").mockImplementation(((m: string, meth: string, a: unknown[]) => {
+      seen.push(`${m}.${meth}`);
+      return realCall(m, meth, a);
+    }) as never);
+    const opSpy = spyOn(rpc, "op").mockImplementation((async (name: string, a: unknown[]) => {
+      seen.push(name);
+      const r = await realOp(name as never, a as never);
+      results.push(r);
+      return r;
+    }) as never);
+    try {
+      // Two ticks: the first starts the read, the second sees its answer.
+      probe!(failed.task.id);
+      await orch.__heldProbeSettledForTest(failed.task.id);
+      expect(probe!(failed.task.id)).toBe(true);
+      await orch.__heldProbeSettledForTest(failed.task.id);
+      // Exactly one DB call per tick, and it is the boolean-sized op.
+      expect(seen).toEqual(["orchestrator.backgroundHold", "orchestrator.backgroundHold"]);
+      for (const r of results) expect(Object.keys(r as object).sort()).toEqual(["failedRunId", "held"]);
+    } finally {
+      callSpy.mockRestore();
+      opSpy.mockRestore();
+      await failed.done();
     }
   });
 });
@@ -1376,7 +1436,7 @@ describe("a restart before a switch-now move started keeps a carried scheduled r
   test("a manual switch-now intent carrying a scheduled request says it stays scheduled, and boot applies it", async () => {
     const a = alias("a4-a");
     const b = alias("a4-b");
-    const stack = stacks.harnessStacks.create({ label: "a4", kind: "claude-code", members: [a, b] });
+    const stack = await stacks.harnessStacks.create({ label: "a4", kind: "claude-code", members: [a, b] });
     const task = makeTask(a, "p", { column: "review" });
     const runId = insertRun(task.id, a);
     db.tasks.update(task.id, { runId });
@@ -1398,6 +1458,6 @@ describe("a restart before a switch-now move started keeps a carried scheduled r
       "the core restarted before the account switch started — the switch to the next account scheduled for this task stays scheduled",
     );
     expect(lines.some((l) => l.includes("run the task to switch"))).toBe(false);
-    stacks.harnessStacks.delete(stack.id);
+    await stacks.harnessStacks.delete(stack.id);
   }, 20_000);
 });

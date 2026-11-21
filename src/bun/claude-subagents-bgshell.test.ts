@@ -243,7 +243,8 @@ test("a Bash(run_in_background) launch + its stub tool_result creates a bg_sessi
   );
 
   const w = attachSubagentWatcher({ taskId, jsonlPath, manual: true });
-  w.pump(Date.now());
+  await w.ready;
+  await w.pump(Date.now());
 
   const row = subagents.get(id);
   expect(row).not.toBeNull();
@@ -283,7 +284,8 @@ test("review fix R8 — a stub whose output path contains a space is still parse
   );
 
   const w = attachSubagentWatcher({ taskId, jsonlPath, manual: true });
-  w.pump(Date.now());
+  await w.ready;
+  await w.pump(Date.now());
 
   const row = subagents.get(id);
   expect(row).not.toBeNull();
@@ -314,7 +316,8 @@ test("a stub whose content lacks the output-path sentence still creates the row,
   );
 
   const w = attachSubagentWatcher({ taskId, jsonlPath, manual: true });
-  w.pump(Date.now());
+  await w.ready;
+  await w.pump(Date.now());
 
   const row = subagents.get(id);
   expect(row).not.toBeNull();
@@ -353,7 +356,8 @@ test("review fix R6 — a coalesced user line with an unrelated tool_result bloc
   );
 
   const w = attachSubagentWatcher({ taskId, jsonlPath, manual: true });
-  w.pump(Date.now());
+  await w.ready;
+  await w.pump(Date.now());
 
   const row = subagents.get(id);
   expect(row).not.toBeNull();
@@ -388,11 +392,12 @@ test("live output tailing persists batches with offset-derived line_uuids and ne
   );
 
   const w = attachSubagentWatcher({ taskId, jsonlPath, manual: true });
+  await w.ready;
   const t0 = Date.now();
-  w.pump(t0); // discovers the row; output file is still empty, no tail yet
+  await w.pump(t0); // discovers the row; output file is still empty, no tail yet
 
   writeFileSync(outputPath, "hello "); // 6 bytes
-  w.pump(t0 + 1);
+  await w.pump(t0 + 1);
   let rows = await stdoutEvents(id);
   expect(rows.length).toBe(1);
   expect(rows[0]!.data).toBe("hello ");
@@ -402,14 +407,14 @@ test("live output tailing persists batches with offset-derived line_uuids and ne
   expect(stdoutStreamed[0]!.data).toBe("hello ");
 
   appendFileSync(outputPath, "world"); // total "hello world" (11 bytes)
-  w.pump(t0 + 2);
+  await w.pump(t0 + 2);
   rows = await stdoutEvents(id);
   expect(rows.length).toBe(2);
   expect(rows[1]!.data).toBe("world");
   expect(rows[1]!.line_uuid).toBe(`bgshell:${id}:6`);
 
   // No growth — a further pump must not duplicate anything.
-  w.pump(t0 + 3);
+  await w.pump(t0 + 3);
   rows = await stdoutEvents(id);
   expect(rows.length).toBe(2);
 
@@ -436,18 +441,19 @@ test("tailed output batches are sent with their stored id and ts; a batch alread
   );
 
   const w = attachSubagentWatcher({ taskId, jsonlPath, manual: true });
+  await w.ready;
   const t0 = Date.now();
-  w.pump(t0); // discovers the row; nothing to tail yet
+  await w.pump(t0); // discovers the row; nothing to tail yet
 
   // The first batch (offset 0) is already saved under its key — the tail's
   // insert of it is a dedup hit.
   runs.appendEvent(runId, "stdout", "hello ", `bgshell:${id}:0`, id);
   writeFileSync(outputPath, "hello ");
-  w.pump(t0 + 1);
+  await w.pump(t0 + 1);
   expect(captured.filter((e) => e.stream === "stdout" && e.subagentId === id)).toHaveLength(0);
 
   appendFileSync(outputPath, "world");
-  w.pump(t0 + 2);
+  await w.pump(t0 + 2);
   const row = db.query<{ id: number; ts: number; data: string }, [string]>(
     `SELECT id, ts, data FROM run_events WHERE line_uuid = ?`,
   ).get(`bgshell:${id}:6`)!;
@@ -478,11 +484,12 @@ test("review fix R4 — a batch beyond BG_SHELL_BATCH_MAX_BYTES is capped, and t
   );
 
   const w = attachSubagentWatcher({ taskId, jsonlPath, manual: true });
+  await w.ready;
   const t0 = Date.now();
-  w.pump(t0); // discover, output empty
+  await w.pump(t0); // discover, output empty
 
   writeFileSync(outputPath, "x".repeat(BG_SHELL_BATCH_MAX_BYTES + 100));
-  w.pump(t0 + 1);
+  await w.pump(t0 + 1);
   let rows = await stdoutEvents(id);
   expect(rows.length).toBe(1);
   expect(rows[0]!.data.length).toBe(BG_SHELL_BATCH_MAX_BYTES);
@@ -490,14 +497,14 @@ test("review fix R4 — a batch beyond BG_SHELL_BATCH_MAX_BYTES is capped, and t
 
   // Remainder drains on the next pump, keyed by the offset it actually
   // started at (not from 0 again).
-  w.pump(t0 + 2);
+  await w.pump(t0 + 2);
   rows = await stdoutEvents(id);
   expect(rows.length).toBe(2);
   expect(rows[1]!.data.length).toBe(100);
   expect(rows[1]!.line_uuid).toBe(`bgshell:${id}:${BG_SHELL_BATCH_MAX_BYTES}`);
 
   // Fully drained — a further pump adds nothing.
-  w.pump(t0 + 3);
+  await w.pump(t0 + 3);
   rows = await stdoutEvents(id);
   expect(rows.length).toBe(2);
 
@@ -528,12 +535,13 @@ test("a <task-notification> for the backgroundTaskId settles the row, and replay
   );
 
   const w = attachSubagentWatcher({ taskId, jsonlPath, manual: true });
+  await w.ready;
   const t0 = Date.now();
-  w.pump(t0);
+  await w.pump(t0);
   expect(subagents.get(id)!.status).toBe("running");
 
   appendFileSync(jsonlPath, notificationLine({ id }));
-  w.pump(t0 + 1);
+  await w.pump(t0 + 1);
 
   expect(subagents.get(id)!.status).toBe("completed");
   expect(subagents.hasRunning(taskId)).toBe(false);
@@ -549,7 +557,8 @@ test("a <task-notification> for the backgroundTaskId settles the row, and replay
   settleCalls.length = 0;
 
   const w2 = attachSubagentWatcher({ taskId, jsonlPath, manual: true });
-  w2.pump(t0 + 2);
+  await w2.ready;
+  await w2.pump(t0 + 2);
 
   expect(subagents.get(id)!.status).toBe("completed");
   expect(settleCalls.length).toBe(0);
@@ -580,19 +589,20 @@ test("review fix R1/R3 — a lost notification settles via the ceiling, and outp
   );
 
   const w = attachSubagentWatcher({ taskId, jsonlPath, manual: true });
+  await w.ready;
   const t0 = Date.now();
-  w.pump(t0);
+  await w.pump(t0);
   expect(subagents.get(id)!.status).toBe("running");
 
   // No output ever appended — the ceiling (timeout + margin) past the last
   // sign of life (here, ~startedAt) fires and settles it inferred.
-  w.pump(t0 + ceiling + 1);
+  await w.pump(t0 + ceiling + 1);
   expect(subagents.get(id)!.status).toBe("completed");
 
   // Evidence the shell was actually still alive: the output file grows.
   // Well within one more margin window past the settle (R3's retire bound).
   writeFileSync(outputPath, "still going");
-  w.pump(t0 + ceiling + 2);
+  await w.pump(t0 + ceiling + 2);
   expect(subagents.get(id)!.status).toBe("running");
 
   w.detach();
@@ -615,23 +625,24 @@ test("review fix R2 — once a ceiling-settled row is latched by a receipt, late
   );
 
   const w = attachSubagentWatcher({ taskId, jsonlPath, manual: true });
+  await w.ready;
   const t0 = Date.now();
-  w.pump(t0);
+  await w.pump(t0);
 
   // Ceiling settle (no output, no notification).
-  w.pump(t0 + ceiling + 1);
+  await w.pump(t0 + ceiling + 1);
   expect(subagents.get(id)!.status).toBe("completed");
 
   // The harness's own authoritative receipt arrives after the fact and
   // latches receiptSettled — even though the row was already settled by the
   // ceiling, not by this notification.
   appendFileSync(jsonlPath, notificationLine({ id }));
-  w.pump(t0 + ceiling + 2);
+  await w.pump(t0 + ceiling + 2);
   expect(subagents.get(id)!.status).toBe("completed");
 
   // LATER output growth — must not resurrect a receipt-latched row.
   writeFileSync(outputPath, "trailing buffered flush");
-  w.pump(t0 + ceiling + 3);
+  await w.pump(t0 + ceiling + 3);
   expect(subagents.get(id)!.status).toBe("completed");
 
   w.detach();
@@ -662,8 +673,9 @@ test("review fix R1 — recent output activity keeps the row running even though
   );
 
   const w = attachSubagentWatcher({ taskId, jsonlPath, manual: true });
+  await w.ready;
   // Register the row while still well within its ceiling relative to lineTs.
-  w.pump(lineTs + 500);
+  await w.pump(lineTs + 500);
   expect(subagents.get(id)!.status).toBe("running");
   expect(subagents.get(id)!.startedAt).toBeLessThanOrEqual(t0 - 100_000); // honored the old timestamp (R5)
 
@@ -674,7 +686,7 @@ test("review fix R1 — recent output activity keeps the row running even though
   writeFileSync(outputPath, "still writing");
   expect(lineTs + 200_000 - t0).toBeLessThan(1_000); // sanity: this "now" is ~t0, not ~lineTs
   expect(lineTs + 200_000 - t0).toBeGreaterThan(-1_000);
-  w.pump(lineTs + 200_000);
+  await w.pump(lineTs + 200_000);
 
   // If the ceiling were (incorrectly) anchored on startedAt, `now - startedAt`
   // here is ~200_000ms, comfortably past `ceiling` (121_000ms), and the row
@@ -708,7 +720,8 @@ test("a bg_session row created directly in the DB (simulating a pre-existing row
   });
 
   const w = attachSubagentWatcher({ taskId, jsonlPath, manual: true });
-  expect(() => w.pump(now)).not.toThrow();
+  await w.ready;
+  await expect(w.pump(now)).resolves.toBeUndefined();
 
   // Offset seeded at the file's CURRENT size at attach — the pre-existing
   // content must not be re-persisted as a "new" stdout batch (which is also
@@ -720,7 +733,7 @@ test("a bg_session row created directly in the DB (simulating a pre-existing row
   expect(subagents.get(id)!.status).toBe("running");
 
   appendFileSync(outputPath, " fresh bytes");
-  w.pump(now + 1);
+  await w.pump(now + 1);
   rows = await stdoutEvents(id);
   expect(rows.length).toBe(1);
   expect(rows[0]!.data).toBe(" fresh bytes");
@@ -728,7 +741,7 @@ test("a bg_session row created directly in the DB (simulating a pre-existing row
   // Still settles via the ordinary notification path — proof it landed in
   // bgShells (the settle widening's third lookup), not lost or mis-routed.
   appendFileSync(jsonlPath, notificationLine({ id }));
-  expect(() => w.pump(now + 2)).not.toThrow();
+  await expect(w.pump(now + 2)).resolves.toBeUndefined();
   expect(subagents.get(id)!.status).toBe("completed");
 
   w.detach();
@@ -758,12 +771,13 @@ test("replay guard — a rehydrated, already-settled bg_session row is not resur
   );
 
   const w = attachSubagentWatcher({ taskId, jsonlPath, manual: true });
+  await w.ready;
   const t0 = Date.now();
-  w.pump(t0);
+  await w.pump(t0);
   expect(subagents.get(id)!.status).toBe("running");
 
   appendFileSync(jsonlPath, notificationLine({ id }));
-  w.pump(t0 + 1);
+  await w.pump(t0 + 1);
   expect(subagents.get(id)!.status).toBe("completed");
 
   w.detach();
@@ -775,7 +789,8 @@ test("replay guard — a rehydrated, already-settled bg_session row is not resur
   // `scanLineForBgShellStub`'s `if (bgShells.has(id)) return;` guard must
   // fire — the replayed stub must never re-create/resurrect the row.
   const w2 = attachSubagentWatcher({ taskId, jsonlPath, manual: true });
-  w2.pump(t0 + 2);
+  await w2.ready;
+  await w2.pump(t0 + 2);
 
   expect(subagents.get(id)!.status).toBe("completed");
   expect(parked.length).toBe(0);
@@ -807,7 +822,8 @@ test("AGETOR_TRACK_BG_SHELLS=0 — no bg_session row is created from the same la
   );
 
   const w = mod.attachSubagentWatcher({ taskId, jsonlPath, manual: true });
-  w.pump(Date.now());
+  await w.ready;
+  await w.pump(Date.now());
 
   expect(subagents.get(id)).toBeNull();
   expect(subagents.listForTask(taskId).length).toBe(0);
@@ -839,7 +855,8 @@ test("review fix R5 — startedAt is taken from the stub line's own past timesta
   );
 
   const w = attachSubagentWatcher({ taskId, jsonlPath, manual: true });
-  w.pump(now); // scanned "now", but the line itself is old
+  await w.ready;
+  await w.pump(now); // scanned "now", but the line itself is old
 
   const row = subagents.get(id);
   expect(row).not.toBeNull();

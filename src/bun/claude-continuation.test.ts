@@ -1,8 +1,17 @@
-import { test, expect, afterAll } from "bun:test";
+import { test, expect, afterEach, afterAll } from "bun:test";
 import { mkdtempSync, writeFileSync, appendFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import path from "node:path";
 import { randomUUID } from "node:crypto";
+
+// A turn slot / sendTurn the test starts is the code under test: a rejection of
+// it is a failure, not noise. Collected here, asserted empty after every test
+// (an empty `.catch(() => {})` would hide it).
+const backgroundErrors: unknown[] = [];
+const noteBackgroundError = (e: unknown): void => { backgroundErrors.push(e); };
+afterEach(() => {
+  expect(backgroundErrors.splice(0)).toEqual([]);
+});
 
 // Pre-set AGETOR_DATA_DIR before claude-tmux.ts's transitive db.ts import —
 // same convention as claude-tmux-queue.test.ts / claude-tmux-death.test.ts.
@@ -660,7 +669,7 @@ test("notification-triggered adoption (onAdopted, settle handler) runs synchrono
     const old = recorder();
     const oldDone = __forTest.pushTurnSlot(state, old.onChunk);
     const order: string[] = [];
-    oldDone.then(() => order.push("old-run-then"));
+    void oldDone.then(() => order.push("old-run-then")).catch(() => {});
 
     __forTest.dispatchLine(state, endTurnLineId("old run's last line", "msg-old", "uuid-old"));
     expect(state.turnQueue.length).toBe(1); // staged, not fired
@@ -1356,7 +1365,7 @@ test("an async flush awaiting its read drops its batch after an intervening drai
   const state = __forTest.installSession(taskId, jsonlPath);
   try {
     const rec = recorder();
-    void __forTest.pushTurnSlot(state, rec.onChunk).catch(() => {});
+    void __forTest.pushTurnSlot(state, rec.onChunk).catch(noteBackgroundError);
     appendFileSync(jsonlPath, assistantLineId("only-once", "msg-once", "uuid-once"));
 
     // Start the async flush: it captures the start offset and suspends on its

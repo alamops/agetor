@@ -99,7 +99,7 @@ test("ExitPlanMode tool_use lands a pending plan on the task", async () => {
   const { id } = await newClaudeTask();
   const runId = await startAndGetRunId(id);
 
-  __dispatchChunkForTest(
+  await __dispatchChunkForTest(
     runId,
     id,
     "claude-code",
@@ -124,14 +124,14 @@ test("plain approval tool_result resolves the plan to approved, no edited conten
   const { id } = await newClaudeTask();
   const runId = await startAndGetRunId(id);
 
-  __dispatchChunkForTest(
+  await __dispatchChunkForTest(
     runId,
     id,
     "claude-code",
     "tool_use",
     toolUse("toolu_01", "ExitPlanMode", { plan: "# Plan", allowedPrompts: [] }),
   );
-  __dispatchChunkForTest(
+  await __dispatchChunkForTest(
     runId,
     id,
     "claude-code",
@@ -155,14 +155,14 @@ test("approval tool_result with the edited-plan marker stores the edited content
   const { id } = await newClaudeTask();
   const runId = await startAndGetRunId(id);
 
-  __dispatchChunkForTest(
+  await __dispatchChunkForTest(
     runId,
     id,
     "claude-code",
     "tool_use",
     toolUse("toolu_01", "ExitPlanMode", { plan: "# Original Plan\n\n- step one", allowedPrompts: [] }),
   );
-  __dispatchChunkForTest(
+  await __dispatchChunkForTest(
     runId,
     id,
     "claude-code",
@@ -190,14 +190,14 @@ test("a non-approval tool_result (rejection/interrupt) resolves the plan to reje
   const { id } = await newClaudeTask();
   const runId = await startAndGetRunId(id);
 
-  __dispatchChunkForTest(
+  await __dispatchChunkForTest(
     runId,
     id,
     "claude-code",
     "tool_use",
     toolUse("toolu_01", "ExitPlanMode", { plan: "# Plan", allowedPrompts: [] }),
   );
-  __dispatchChunkForTest(runId, id, "claude-code", "tool_result", toolResult("toolu_01", "The user rejected your plan."));
+  await __dispatchChunkForTest(runId, id, "claude-code", "tool_result", toolResult("toolu_01", "The user rejected your plan."));
 
   const task = tasks.get(id)!;
   const plan = task.plans[0]!;
@@ -212,8 +212,8 @@ test("a second ExitPlanMode supersedes a still-pending first plan", async () => 
   const { id } = await newClaudeTask();
   const runId = await startAndGetRunId(id);
 
-  __dispatchChunkForTest(runId, id, "claude-code", "tool_use", toolUse("toolu_01", "ExitPlanMode", { plan: "plan one" }));
-  __dispatchChunkForTest(runId, id, "claude-code", "tool_use", toolUse("toolu_02", "ExitPlanMode", { plan: "plan two" }));
+  await __dispatchChunkForTest(runId, id, "claude-code", "tool_use", toolUse("toolu_01", "ExitPlanMode", { plan: "plan one" }));
+  await __dispatchChunkForTest(runId, id, "claude-code", "tool_use", toolUse("toolu_02", "ExitPlanMode", { plan: "plan two" }));
 
   const task = tasks.get(id)!;
   expect(task.plans.length).toBe(2);
@@ -229,7 +229,7 @@ test("plan detection is scoped to claude-code — a cursor-kind chunk with the s
   const { id } = await newClaudeTask();
   const runId = await startAndGetRunId(id);
 
-  __dispatchChunkForTest(runId, id, "cursor", "tool_use", toolUse("toolu_01", "ExitPlanMode", { plan: "should be ignored" }));
+  await __dispatchChunkForTest(runId, id, "cursor", "tool_use", toolUse("toolu_01", "ExitPlanMode", { plan: "should be ignored" }));
 
   const task = tasks.get(id)!;
   expect(task.plans.length).toBe(0);
@@ -247,33 +247,33 @@ test("TaskCreate + TaskUpdate chunk sequence lands the right todo_progress summa
   expect(tasks.get(id)!.todoProgress).toBeNull();
 
   // 2x TaskCreate, with tool_results carrying the task numbers.
-  __dispatchChunkForTest(
+  await __dispatchChunkForTest(
     runId,
     id,
     "claude-code",
     "tool_use",
     toolUse("toolu_c1", "TaskCreate", { subject: "Write the plan", description: "…", activeForm: "Writing the plan" }),
   );
-  __dispatchChunkForTest(runId, id, "claude-code", "tool_result", toolResult("toolu_c1", "Task #1 created successfully: Write the plan"));
-  __dispatchChunkForTest(
+  await __dispatchChunkForTest(runId, id, "claude-code", "tool_result", toolResult("toolu_c1", "Task #1 created successfully: Write the plan"));
+  await __dispatchChunkForTest(
     runId,
     id,
     "claude-code",
     "tool_use",
     toolUse("toolu_c2", "TaskCreate", { subject: "Implement it", description: "…", activeForm: "Implementing" }),
   );
-  __dispatchChunkForTest(runId, id, "claude-code", "tool_result", toolResult("toolu_c2", "Task #2 created successfully: Implement it"));
+  await __dispatchChunkForTest(runId, id, "claude-code", "tool_result", toolResult("toolu_c2", "Task #2 created successfully: Implement it"));
 
   let summary = tasks.get(id)!.todoProgress;
   expect(summary).toEqual({ completed: 0, total: 2 });
 
   // TaskUpdate → in_progress on task 1 — total/completed unchanged.
-  __dispatchChunkForTest(runId, id, "claude-code", "tool_use", toolUse("toolu_u1", "TaskUpdate", { taskId: "1", status: "in_progress" }));
+  await __dispatchChunkForTest(runId, id, "claude-code", "tool_use", toolUse("toolu_u1", "TaskUpdate", { taskId: "1", status: "in_progress" }));
   summary = tasks.get(id)!.todoProgress;
   expect(summary).toEqual({ completed: 0, total: 2 });
 
   // TaskUpdate → completed on task 1 — completed increments.
-  __dispatchChunkForTest(runId, id, "claude-code", "tool_use", toolUse("toolu_u2", "TaskUpdate", { taskId: "1", status: "completed" }));
+  await __dispatchChunkForTest(runId, id, "claude-code", "tool_use", toolUse("toolu_u2", "TaskUpdate", { taskId: "1", status: "completed" }));
   summary = tasks.get(id)!.todoProgress;
   expect(summary).toEqual({ completed: 1, total: 2 });
 
@@ -290,7 +290,7 @@ test("todo_progress derivation works for a non-claude agent kind too (chunks are
   const { id } = await newClaudeTask();
   const runId = await startAndGetRunId(id);
 
-  __dispatchChunkForTest(
+  await __dispatchChunkForTest(
     runId,
     id,
     "codex",
@@ -309,7 +309,7 @@ test("an unrelated chunk (no todo-family marker) does not touch todo_progress", 
   const { id } = await newClaudeTask();
   const runId = await startAndGetRunId(id);
 
-  __dispatchChunkForTest(runId, id, "claude-code", "tool_use", toolUse("toolu_1", "Read", { file_path: "/tmp/x" }));
+  await __dispatchChunkForTest(runId, id, "claude-code", "tool_use", toolUse("toolu_1", "Read", { file_path: "/tmp/x" }));
   expect(tasks.get(id)!.todoProgress).toBeNull();
 
   await settle();
@@ -328,18 +328,18 @@ test("TaskUpdate by a claude-assigned (out-of-sequence) task number resolves cor
   const { id } = await newClaudeTask();
   const runId = await startAndGetRunId(id);
 
-  __dispatchChunkForTest(
+  await __dispatchChunkForTest(
     runId,
     id,
     "claude-code",
     "tool_use",
     toolUse("toolu_c1", "TaskCreate", { subject: "Out-of-sequence task", activeForm: "Working" }),
   );
-  __dispatchChunkForTest(runId, id, "claude-code", "tool_result", toolResult("toolu_c1", "Task #2 created successfully: Out-of-sequence task"));
+  await __dispatchChunkForTest(runId, id, "claude-code", "tool_result", toolResult("toolu_c1", "Task #2 created successfully: Out-of-sequence task"));
 
   // TaskUpdate addresses task "2" — the claude-assigned number, not the
   // sequential-fallback number (which would have been "1").
-  __dispatchChunkForTest(runId, id, "claude-code", "tool_use", toolUse("toolu_u1", "TaskUpdate", { taskId: "2", status: "completed" }));
+  await __dispatchChunkForTest(runId, id, "claude-code", "tool_use", toolUse("toolu_u1", "TaskUpdate", { taskId: "2", status: "completed" }));
 
   const summary = tasks.get(id)!.todoProgress;
   expect(summary).toEqual({ completed: 1, total: 1 });
@@ -352,10 +352,10 @@ test("a second run whose TaskCreate numbering restarts at 1 resets the board sum
   const { id } = await newClaudeTask();
   const runId1 = await startAndGetRunId(id);
 
-  __dispatchChunkForTest(runId1, id, "claude-code", "tool_use", toolUse("toolu_c1", "TaskCreate", { subject: "Run1 A", activeForm: "A" }));
-  __dispatchChunkForTest(runId1, id, "claude-code", "tool_result", toolResult("toolu_c1", "Task #1 created successfully: Run1 A"));
-  __dispatchChunkForTest(runId1, id, "claude-code", "tool_use", toolUse("toolu_c2", "TaskCreate", { subject: "Run1 B", activeForm: "B" }));
-  __dispatchChunkForTest(runId1, id, "claude-code", "tool_result", toolResult("toolu_c2", "Task #2 created successfully: Run1 B"));
+  await __dispatchChunkForTest(runId1, id, "claude-code", "tool_use", toolUse("toolu_c1", "TaskCreate", { subject: "Run1 A", activeForm: "A" }));
+  await __dispatchChunkForTest(runId1, id, "claude-code", "tool_result", toolResult("toolu_c1", "Task #1 created successfully: Run1 A"));
+  await __dispatchChunkForTest(runId1, id, "claude-code", "tool_use", toolUse("toolu_c2", "TaskCreate", { subject: "Run1 B", activeForm: "B" }));
+  await __dispatchChunkForTest(runId1, id, "claude-code", "tool_result", toolResult("toolu_c2", "Task #2 created successfully: Run1 B"));
 
   expect(tasks.get(id)!.todoProgress).toEqual({ completed: 0, total: 2 });
 
@@ -377,8 +377,8 @@ test("a second run whose TaskCreate numbering restarts at 1 resets the board sum
     cursorSessionId: null,
     geminiSessionId: null, fxSessionId: null,
   });
-  __dispatchChunkForTest(runId2, id, "claude-code", "tool_use", toolUse("toolu_c3", "TaskCreate", { subject: "Run2 A", activeForm: "A" }));
-  __dispatchChunkForTest(runId2, id, "claude-code", "tool_result", toolResult("toolu_c3", "Task #1 created successfully: Run2 A"));
+  await __dispatchChunkForTest(runId2, id, "claude-code", "tool_use", toolUse("toolu_c3", "TaskCreate", { subject: "Run2 A", activeForm: "A" }));
+  await __dispatchChunkForTest(runId2, id, "claude-code", "tool_result", toolResult("toolu_c3", "Task #1 created successfully: Run2 A"));
 
   // The restart is detected from the NUMBERING (result-derived #1 collides
   // with the dead session's #1 under different content) — without it, run 1's
@@ -393,11 +393,11 @@ test("a follow-up run that ADDS a task continues the session's numbering — boa
   const { id } = await newClaudeTask();
   const runId1 = await startAndGetRunId(id);
 
-  __dispatchChunkForTest(runId1, id, "claude-code", "tool_use", toolUse("toolu_c1", "TaskCreate", { subject: "Turn1 A", activeForm: "A" }));
-  __dispatchChunkForTest(runId1, id, "claude-code", "tool_result", toolResult("toolu_c1", "Task #1 created successfully: Turn1 A"));
-  __dispatchChunkForTest(runId1, id, "claude-code", "tool_use", toolUse("toolu_c2", "TaskCreate", { subject: "Turn1 B", activeForm: "B" }));
-  __dispatchChunkForTest(runId1, id, "claude-code", "tool_result", toolResult("toolu_c2", "Task #2 created successfully: Turn1 B"));
-  __dispatchChunkForTest(runId1, id, "claude-code", "tool_use", toolUse("toolu_u1", "TaskUpdate", { taskId: "1", status: "completed" }));
+  await __dispatchChunkForTest(runId1, id, "claude-code", "tool_use", toolUse("toolu_c1", "TaskCreate", { subject: "Turn1 A", activeForm: "A" }));
+  await __dispatchChunkForTest(runId1, id, "claude-code", "tool_result", toolResult("toolu_c1", "Task #1 created successfully: Turn1 A"));
+  await __dispatchChunkForTest(runId1, id, "claude-code", "tool_use", toolUse("toolu_c2", "TaskCreate", { subject: "Turn1 B", activeForm: "B" }));
+  await __dispatchChunkForTest(runId1, id, "claude-code", "tool_result", toolResult("toolu_c2", "Task #2 created successfully: Turn1 B"));
+  await __dispatchChunkForTest(runId1, id, "claude-code", "tool_use", toolUse("toolu_u1", "TaskUpdate", { taskId: "1", status: "completed" }));
 
   expect(tasks.get(id)!.todoProgress).toEqual({ completed: 1, total: 2 });
 
@@ -419,8 +419,8 @@ test("a follow-up run that ADDS a task continues the session's numbering — boa
     cursorSessionId: null,
     geminiSessionId: null, fxSessionId: null,
   });
-  __dispatchChunkForTest(runId2, id, "claude-code", "tool_use", toolUse("toolu_c3", "TaskCreate", { subject: "Turn2 C", activeForm: "C" }));
-  __dispatchChunkForTest(runId2, id, "claude-code", "tool_result", toolResult("toolu_c3", "Task #3 created successfully: Turn2 C"));
+  await __dispatchChunkForTest(runId2, id, "claude-code", "tool_use", toolUse("toolu_c3", "TaskCreate", { subject: "Turn2 C", activeForm: "C" }));
+  await __dispatchChunkForTest(runId2, id, "claude-code", "tool_result", toolResult("toolu_c3", "Task #3 created successfully: Turn2 C"));
 
   expect(tasks.get(id)!.todoProgress).toEqual({ completed: 1, total: 3 });
 
@@ -437,7 +437,7 @@ test("an assistant chunk quoting ExitPlanMode/TaskCreate/TaskUpdate in prose doe
   const { id } = await newClaudeTask();
   const runId = await startAndGetRunId(id);
 
-  __dispatchChunkForTest(
+  await __dispatchChunkForTest(
     runId,
     id,
     "claude-code",
@@ -452,7 +452,7 @@ test("an assistant chunk quoting ExitPlanMode/TaskCreate/TaskUpdate in prose doe
   // substring without the envelope form (defensive — real claude output
   // always uses the envelope form, but the pre-filter must not be fooled by
   // a loose substring match either).
-  __dispatchChunkForTest(
+  await __dispatchChunkForTest(
     runId,
     id,
     "claude-code",
@@ -473,7 +473,7 @@ test("a tool_result quoting 'created successfully' does not affect claude plan t
   const { id } = await newClaudeTask();
   const runId = await startAndGetRunId(id);
 
-  __dispatchChunkForTest(
+  await __dispatchChunkForTest(
     runId,
     id,
     "claude-code",
@@ -521,15 +521,15 @@ test("PATCH /tasks/:id cannot set plans or todoProgress — both stay server-man
   const { id } = await newClaudeTask();
   const runId = await startAndGetRunId(id);
 
-  __dispatchChunkForTest(runId, id, "claude-code", "tool_use", toolUse("toolu_01", "ExitPlanMode", { plan: "# Plan" }));
-  __dispatchChunkForTest(
+  await __dispatchChunkForTest(runId, id, "claude-code", "tool_use", toolUse("toolu_01", "ExitPlanMode", { plan: "# Plan" }));
+  await __dispatchChunkForTest(
     runId,
     id,
     "claude-code",
     "tool_use",
     toolUse("toolu_c1", "TaskCreate", { subject: "A task", activeForm: "Doing a task" }),
   );
-  __dispatchChunkForTest(runId, id, "claude-code", "tool_result", toolResult("toolu_c1", "Task #1 created successfully: A task"));
+  await __dispatchChunkForTest(runId, id, "claude-code", "tool_result", toolResult("toolu_c1", "Task #1 created successfully: A task"));
 
   const before = tasks.get(id)!;
   expect(before.plans.length).toBe(1);

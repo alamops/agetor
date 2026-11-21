@@ -20,7 +20,7 @@ const realOutputSnapshot = { ...realOutput };
 let currentClient: AgetorClient | null = null;
 const outputs: string[] = [];
 
-mock.module("./context.ts", () => ({
+void mock.module("./context.ts", () => ({
   ...realContextSnapshot,
   getClient: async () => {
     if (!currentClient) throw new Error("no fake client set for this test");
@@ -28,7 +28,7 @@ mock.module("./context.ts", () => ({
   },
 }));
 
-mock.module("./output.ts", () => ({
+void mock.module("./output.ts", () => ({
   ...realOutputSnapshot,
   c: {
     dim: (s: string) => s,
@@ -48,8 +48,8 @@ mock.module("./output.ts", () => ({
 }));
 
 afterAll(() => {
-  mock.module("./context.ts", () => realContextSnapshot);
-  mock.module("./output.ts", () => realOutputSnapshot);
+  void mock.module("./context.ts", () => realContextSnapshot);
+  void mock.module("./output.ts", () => realOutputSnapshot);
 });
 
 const { cmdHarness, parseHarnessFlags, FX_ASK_PROFILE_HINT } = await import("./commands/harness.ts");

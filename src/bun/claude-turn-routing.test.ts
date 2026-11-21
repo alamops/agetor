@@ -424,7 +424,7 @@ test("an unambiguous 'gone' probe routes a follow-up through the resume path (ki
   } finally {
     // Dispose in-memory state + kill whatever (fake) session is now named
     // for this task, mirroring claude-followup-restart.test.ts's cleanup.
-    dropSession(taskId);
+    await dropSession(taskId);
     rmSync(path.dirname(expectedJsonlPath), { recursive: true, force: true });
   }
 });
@@ -593,7 +593,7 @@ test("a large (>4KB) follow-up resume never embeds the prompt in new-session arg
     // Let the (independent, fire-and-forget) boot-wait IIFE reach
     // `attachTailer` before disposing the session — see `waitForRunStatus`.
     if (newRunId) await waitForRunStatus(runs, newRunId, "ready (jsonl:");
-    dropSession(taskId);
+    await dropSession(taskId);
     rmSync(path.dirname(expectedJsonlPath), { recursive: true, force: true });
   }
 });
@@ -699,7 +699,7 @@ test("a resume spawn with a deferred large prompt stays counted in flight until 
     __forTest.setBracketedEnterGapMs(prevGap);
     __forTest.setSlashCommandSettleMs(prevSettle);
     if (newRunId) await waitForRunStatus(runs, newRunId, "ready (jsonl:");
-    dropSession(taskId);
+    await dropSession(taskId);
     rmSync(path.dirname(expectedJsonlPath), { recursive: true, force: true });
   }
 });
@@ -827,7 +827,7 @@ test("cancelling a run while its large prompt is deferred (composer never confir
     // Let the (independent, fire-and-forget) boot-wait IIFE reach
     // `attachTailer` before disposing the session — see `waitForRunStatus`.
     if (newRunId) await waitForRunStatus(runs, newRunId, "ready (jsonl:");
-    dropSession(taskId);
+    await dropSession(taskId);
     rmSync(path.dirname(expectedJsonlPath), { recursive: true, force: true });
   }
 });
@@ -991,7 +991,7 @@ test("a failed deferred paste (load-buffer errors) settles the run instead of le
     // Let the (independent, fire-and-forget) boot-wait IIFE reach
     // `attachTailer` before disposing the session — see `waitForRunStatus`.
     if (newRunId) await waitForRunStatus(runs, newRunId, "ready (jsonl:");
-    dropSession(taskId);
+    await dropSession(taskId);
     rmSync(path.dirname(expectedJsonlPath), { recursive: true, force: true });
   }
 });
@@ -1091,7 +1091,7 @@ test("a small (<=4KB) follow-up resume still embeds the prompt in new-session ar
     // Let the (independent, fire-and-forget) boot-wait IIFE reach
     // `attachTailer` before disposing the session — see `waitForRunStatus`.
     if (newRunId) await waitForRunStatus(runs, newRunId, "ready (jsonl:");
-    dropSession(taskId);
+    await dropSession(taskId);
     rmSync(path.dirname(expectedJsonlPath), { recursive: true, force: true });
   }
 });
@@ -1147,7 +1147,7 @@ test("spawnClaudeViaTmux pins state.launchEffort from CLAUDE_CODE_EFFORT_LEVEL i
     // still-in-flight boot IIFE.
     await new Promise((r) => setTimeout(r, 300));
   } finally {
-    dropSession(taskId);
+    await dropSession(taskId);
     // Torn-down session's pinned effort is gone — getSessionLaunchEffort
     // reads live SessionState, not a cached snapshot.
     expect(__forTest.getSessionLaunchEffort(taskId)).toBeNull();
@@ -1188,7 +1188,7 @@ test("spawnClaudeViaTmux with no CLAUDE_CODE_EFFORT_LEVEL in the launch env leav
 
     await new Promise((r) => setTimeout(r, 300));
   } finally {
-    dropSession(taskId);
+    await dropSession(taskId);
     expect(__forTest.getSessionLaunchEffort(taskId)).toBeNull();
     rmSync(path.dirname(jsonlPath), { recursive: true, force: true });
     rmSync(cwd, { recursive: true, force: true });
@@ -1296,6 +1296,10 @@ async function seedIdleClaudeTask(prefix: string) {
     codexSessionId: null,
     cursorSessionId: null, geminiSessionId: null, fxSessionId: null,
   });
+  // The continuation factory adopts only for a task whose run registered in
+  // this process, as the run this seeded row stands for did when it spawned.
+  const { __noteRegisteredRunTaskForTest } = await import("./orchestrator.ts");
+  __noteRegisteredRunTaskForTest(taskId, { agent: "claude-code", mode: null });
   return { taskId, priorRunId, jsonlPath, state };
 }
 
@@ -1374,6 +1378,9 @@ test("RC2(b): a continuation adopted DURING sendClaudeTurn's has-session await i
     // The tailer picks the notification up in the gap: continuation adopted.
     appendFileSync(f.jsonlPath, notificationLine("rc2b"));
     __forTest.flushSync(f.state);
+    // The adoption writes its run row through the run's queue.
+    const { __continuationOpenedForTest } = await import("./orchestrator.ts");
+    await __continuationOpenedForTest(f.taskId);
     const adopted = tasks.get(f.taskId)!.runId!;
     expect(adopted).not.toBe(f.priorRunId);
     expect(runs.get(adopted)?.origin).toBe("continuation");
@@ -1420,7 +1427,7 @@ test("a freeze that lands during sendClaudeTurn's has-session await refuses the 
   try {
     const sending = sendInput(f.priorRunId, "typed just before the quit");
     await waitForLog(logPath, "has-session");
-    freezeLaunches();
+    await freezeLaunches();
 
     expect(await sending).toEqual({ delivered: false, reason: LAUNCHES_FROZEN_REASON });
     expect(runs.listForTask(f.taskId)).toHaveLength(1);
@@ -1447,7 +1454,7 @@ test("an idle-only claude send frozen during the has-session await reads busy, l
   try {
     const sending = sendInput(f.priorRunId, "reminder", { onlyIfIdle: true });
     await waitForLog(logPath, "has-session");
-    freezeLaunches();
+    await freezeLaunches();
 
     const result = await sending;
     expect(result.delivered).toBe(false);

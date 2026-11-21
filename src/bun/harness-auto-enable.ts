@@ -1,4 +1,4 @@
-import { harnessAutoEnabled, harnesses } from "./db.ts";
+import { harnessAutoEnabled, harnesses } from "./db-async.ts";
 import { refreshHarnessModels } from "./model-discovery.ts";
 import {
   AUTO_ENABLE_KINDS,
@@ -13,11 +13,22 @@ import {
  * it is turned on and recorded in `harness_auto_enabled`. The record is what
  * makes a later manual Off stick: a recorded id is never acted on again.
  *
- * Every function here is synchronous, so two concurrent `GET /harnesses` calls
- * (or a boot call racing one) cannot interleave between the `has` check and
- * the `record` write; the db `record` is also INSERT OR IGNORE. Whichever call
- * records an id first is the only one that enables and announces it.
+ * Database access is async, so the `has` check and the `record` write are no
+ * longer one synchronous step. Every function here therefore runs through one
+ * promise chain (`serialized`): two concurrent `GET /harnesses` calls (or a boot
+ * call racing one) still cannot interleave between the check and the write; the
+ * db `record` is also INSERT OR IGNORE. Whichever call records an id first is
+ * the only one that enables and announces it.
  */
+
+let chain: Promise<unknown> = Promise.resolve();
+
+/** Run `fn` after every earlier serialized call has settled (success or not). */
+function serialized<T>(fn: () => Promise<T>): Promise<T> {
+  const run = chain.then(fn, fn);
+  chain = run.catch(() => undefined);
+  return run;
+}
 
 type Broadcaster = (e: AppEvent) => boolean;
 
@@ -41,11 +52,13 @@ export function setHarnessAutoEnableBroadcaster(fn: Broadcaster | null): void {
   broadcaster = fn;
 }
 
-function buildNotice(harnessIds: string[]): Extract<AppEvent, { type: "harnesses_auto_enabled" }> | null {
+async function buildNotice(harnessIds: string[]): Promise<Extract<AppEvent, { type: "harnesses_auto_enabled" }> | null> {
   const ids: string[] = [];
   const labels: string[] = [];
+  // One read for every id (a handful of rows) rather than a round-trip each.
+  const rows = new Map((await harnesses.list()).map((h) => [h.id, h]));
   for (const id of harnessIds) {
-    const row = harnesses.get(id);
+    const row = rows.get(id);
     // A vanished row, or one the user turned back Off since, has nothing to announce.
     if (!row || !row.enabled) continue;
     ids.push(id);
@@ -61,24 +74,28 @@ function buildNotice(harnessIds: string[]): Extract<AppEvent, { type: "harnesses
  * Not-available rows are left alone and unrecorded so they turn on once the
  * CLI shows up.
  */
-export function applyHarnessAutoEnable(statuses: readonly HarnessStatus[]): string[] {
+export function applyHarnessAutoEnable(statuses: readonly HarnessStatus[]): Promise<string[]> {
+  return serialized(() => applyHarnessAutoEnableNow(statuses));
+}
+
+async function applyHarnessAutoEnableNow(statuses: readonly HarnessStatus[]): Promise<string[]> {
   if (!harnessAutoEnableActive()) return [];
   const enabledNow: string[] = [];
   for (const status of statuses) {
     if (!status.available || !AUTO_ENABLE_KINDS.has(status.kind)) continue;
-    const row = harnesses.get(status.harnessId);
+    const row = await harnesses.get(status.harnessId);
     // Built-in rows only: an additional account harness of the same kind is
     // the user's own and is never touched. A missing row (synthetic fallback)
     // has nothing to enable.
     if (!row || !row.isBuiltin || row.kind !== status.kind) continue;
-    if (harnessAutoEnabled.has(row.id)) continue;
-    harnessAutoEnabled.record(row.id);
+    if (await harnessAutoEnabled.has(row.id)) continue;
+    await harnessAutoEnabled.record(row.id);
     if (row.enabled) {
       // The user (or an earlier build) already had it on: nothing to announce.
-      harnessAutoEnabled.markNotified([row.id]);
+      await harnessAutoEnabled.markNotified([row.id]);
       continue;
     }
-    harnesses.setEnabled(row.id, true);
+    await harnesses.setEnabled(row.id, true);
     enabledNow.push(row.id);
   }
   if (enabledNow.length === 0) return enabledNow;
@@ -91,7 +108,7 @@ export function applyHarnessAutoEnable(statuses: readonly HarnessStatus[]): stri
 
   const fn = broadcaster;
   if (fn) {
-    const notice = buildNotice(enabledNow);
+    const notice = await buildNotice(enabledNow);
     if (notice) {
       let delivered = false;
       try {
@@ -100,7 +117,7 @@ export function applyHarnessAutoEnable(statuses: readonly HarnessStatus[]): stri
         console.error("[agetor] harness auto-enable broadcast failed:", err);
       }
       // Undelivered ids stay pending for the next /app/events subscriber.
-      if (delivered) harnessAutoEnabled.markNotified(enabledNow);
+      if (delivered) await harnessAutoEnabled.markNotified(enabledNow);
     }
   }
   return enabledNow;
@@ -111,10 +128,14 @@ export function applyHarnessAutoEnable(statuses: readonly HarnessStatus[]): stri
  * row that is still enabled, then mark every pending id notified (an id whose
  * row is gone or turned Off has nothing left to announce). No-op when none.
  */
-export function flushPendingHarnessAutoEnableNotice(send: (e: AppEvent) => void): void {
-  const pending = harnessAutoEnabled.pending();
+export function flushPendingHarnessAutoEnableNotice(send: (e: AppEvent) => void): Promise<void> {
+  return serialized(() => flushPendingNow(send));
+}
+
+async function flushPendingNow(send: (e: AppEvent) => void): Promise<void> {
+  const pending = await harnessAutoEnabled.pending();
   if (pending.length === 0) return;
-  const notice = buildNotice(pending);
+  const notice = await buildNotice(pending);
   if (notice) {
     try {
       send(notice);
@@ -124,7 +145,7 @@ export function flushPendingHarnessAutoEnableNotice(send: (e: AppEvent) => void)
       return;
     }
   }
-  harnessAutoEnabled.markNotified(pending);
+  await harnessAutoEnabled.markNotified(pending);
 }
 
 export const __forTest = {

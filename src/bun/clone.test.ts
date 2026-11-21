@@ -58,7 +58,7 @@ beforeEach(() => {
     savedEnv[key] = process.env[key];
     delete process.env[key];
   }
-  // See git-provider.test.ts: apiHostForRemote's cache is keyed by raw
+  // See git-provider.test.ts: resolveForgeApiHost's cache is keyed by raw
   // remoteHost, so without clearing it a host string reused across tests
   // could read a stale resolution from an earlier test's AGETOR_SSH_BIN stub.
   __clearApiHostCacheForTest();
@@ -84,7 +84,7 @@ afterAll(() => {
 /** Writes an executable ssh stub (see git-provider.test.ts's own
  *  `writeSshStub`) whose `-G -- <host>` resolution follows a small alias
  *  table, echoing any other host back unchanged (real ssh's behavior for a
- *  host with no matching `~/.ssh/config` entry). `apiHostForRemote` invokes
+ *  host with no matching `~/.ssh/config` entry). `resolveForgeApiHost` invokes
  *  it as `<stub> -G -- <host>`, so `$3` is the (already lowercased) host. */
 function writeAliasSshStub(): string {
   const dir = mkdtempSync(path.join(tmpdir(), "agetor-clone-ssh-stub-"));
@@ -122,8 +122,8 @@ describe("resolveCloneRepo", () => {
   });
 
   describe("shorthand", () => {
-    test("defaults to github when no shorthandProvider is given", () => {
-      const result = resolveCloneRepo("foo/bar");
+    test("defaults to github when no shorthandProvider is given", async () => {
+      const result = await resolveCloneRepo("foo/bar");
       expect(result).toEqual({
         ok: true,
         repo: {
@@ -138,13 +138,13 @@ describe("resolveCloneRepo", () => {
       });
     });
 
-    test("resolves against the picker's selected provider — github/gitlab/bitbucket", () => {
+    test("resolves against the picker's selected provider — github/gitlab/bitbucket", async () => {
       for (const [provider, cloudHost] of [
         ["github", "github.com"],
         ["gitlab", "gitlab.com"],
         ["bitbucket", "bitbucket.org"],
       ] as const) {
-        const result = resolveCloneRepo("acme/widgets", provider);
+        const result = await resolveCloneRepo("acme/widgets", provider);
         expect(result).toEqual({
           ok: true,
           repo: {
@@ -160,8 +160,8 @@ describe("resolveCloneRepo", () => {
       }
     });
 
-    test("gitlab shorthand keeps nested groups, repo/fullPath reflect the full nested path", () => {
-      const result = resolveCloneRepo("group/sub/project", "gitlab");
+    test("gitlab shorthand keeps nested groups, repo/fullPath reflect the full nested path", async () => {
+      const result = await resolveCloneRepo("group/sub/project", "gitlab");
       expect(result.ok).toBe(true);
       if (!result.ok) return;
       expect(result.repo.fullPath).toBe("group/sub/project");
@@ -171,8 +171,8 @@ describe("resolveCloneRepo", () => {
   });
 
   describe("ssh/scp — preserved verbatim, authOrigin null", () => {
-    test("github scp form with user preserved exactly", () => {
-      const result = resolveCloneRepo("git@github-work:foo/bar.git");
+    test("github scp form with user preserved exactly", async () => {
+      const result = await resolveCloneRepo("git@github-work:foo/bar.git");
       expect(result).toEqual({
         ok: true,
         repo: {
@@ -187,8 +187,8 @@ describe("resolveCloneRepo", () => {
       });
     });
 
-    test("gitlab ssh:// form with user/port preserved exactly, no resolution attempted", () => {
-      const result = resolveCloneRepo("ssh://myuser@gitlab-work:2222/group/proj.git");
+    test("gitlab ssh:// form with user/port preserved exactly, no resolution attempted", async () => {
+      const result = await resolveCloneRepo("ssh://myuser@gitlab-work:2222/group/proj.git");
       expect(result).toEqual({
         ok: true,
         repo: {
@@ -203,8 +203,8 @@ describe("resolveCloneRepo", () => {
       });
     });
 
-    test("bitbucket scp form over a dotless alias is accepted, host preserved as pasted", () => {
-      const result = resolveCloneRepo("git@bitbucket-work:acme/app.git");
+    test("bitbucket scp form over a dotless alias is accepted, host preserved as pasted", async () => {
+      const result = await resolveCloneRepo("git@bitbucket-work:acme/app.git");
       expect(result).toEqual({
         ok: true,
         repo: {
@@ -219,8 +219,8 @@ describe("resolveCloneRepo", () => {
       });
     });
 
-    test("bitbucket scp form over a genuine Server/DC-shaped dotted host is rejected", () => {
-      const result = resolveCloneRepo("git@bitbucket.mycompany.com:proj/repo.git");
+    test("bitbucket scp form over a genuine Server/DC-shaped dotted host is rejected", async () => {
+      const result = await resolveCloneRepo("git@bitbucket.mycompany.com:proj/repo.git");
       expect(result.ok).toBe(false);
       if (result.ok) return;
       expect(result.error).toContain("Bitbucket Server / Data Center is not supported");
@@ -228,8 +228,8 @@ describe("resolveCloneRepo", () => {
   });
 
   describe("github https", () => {
-    test("github.com clones as-is", () => {
-      const result = resolveCloneRepo("https://github.com/foo/bar");
+    test("github.com clones as-is", async () => {
+      const result = await resolveCloneRepo("https://github.com/foo/bar");
       expect(result).toEqual({
         ok: true,
         repo: {
@@ -244,9 +244,9 @@ describe("resolveCloneRepo", () => {
       });
     });
 
-    test("www. and http:// are both normalized to the same canonical https url", () => {
+    test("www. and http:// are both normalized to the same canonical https url", async () => {
       for (const input of ["https://www.github.com/foo/bar", "http://github.com/foo/bar"]) {
-        const result = resolveCloneRepo(input);
+        const result = await resolveCloneRepo(input);
         expect(result.ok).toBe(true);
         if (!result.ok) return;
         expect(result.repo.cloneUrl).toBe("https://github.com/foo/bar.git");
@@ -254,8 +254,8 @@ describe("resolveCloneRepo", () => {
       }
     });
 
-    test("an alias resolving to github.com is rewritten to github.com, rawHost stays the alias", () => {
-      const result = resolveCloneRepo("https://github-work/foo/bar");
+    test("an alias resolving to github.com is rewritten to github.com, rawHost stays the alias", async () => {
+      const result = await resolveCloneRepo("https://github-work/foo/bar");
       expect(result.ok).toBe(true);
       if (!result.ok) return;
       expect(result.repo.rawHost).toBe("github-work");
@@ -263,36 +263,36 @@ describe("resolveCloneRepo", () => {
       expect(result.repo.authOrigin).toBe("https://github.com/");
     });
 
-    test("a dotted GHES host is rejected with the GHES message", () => {
-      const result = resolveCloneRepo("https://github.mycompany.com/foo/bar");
+    test("a dotted GHES host is rejected with the GHES message", async () => {
+      const result = await resolveCloneRepo("https://github.mycompany.com/foo/bar");
       expect(result.ok).toBe(false);
       if (result.ok) return;
       expect(result.error).toContain("GitHub Enterprise Server");
       expect(result.error).toContain("github.mycompany.com");
     });
 
-    test("a dotless unresolved alias gets the SSH-alias hint, not the GHES message", () => {
-      const result = resolveCloneRepo("https://github-personal/foo/bar");
+    test("a dotless unresolved alias gets the SSH-alias hint, not the GHES message", async () => {
+      const result = await resolveCloneRepo("https://github-personal/foo/bar");
       expect(result.ok).toBe(false);
       if (result.ok) return;
       expect(result.error).toContain("looks like an SSH alias");
       expect(result.error).toContain("git@github-personal:foo/bar.git");
     });
 
-    test("cloud port :443 is dropped, any other port is rejected", () => {
-      const ok = resolveCloneRepo("https://github.com:443/foo/bar");
+    test("cloud port :443 is dropped, any other port is rejected", async () => {
+      const ok = await resolveCloneRepo("https://github.com:443/foo/bar");
       expect(ok.ok).toBe(true);
       if (ok.ok) expect(ok.repo.cloneUrl).toBe("https://github.com/foo/bar.git");
 
-      const rejected = resolveCloneRepo("https://github.com:8443/foo/bar");
+      const rejected = await resolveCloneRepo("https://github.com:8443/foo/bar");
       expect(rejected.ok).toBe(false);
       if (!rejected.ok) expect(rejected.error).toContain("unexpected port :8443");
     });
   });
 
   describe("gitlab https", () => {
-    test("gitlab.com clones as-is", () => {
-      const result = resolveCloneRepo("https://gitlab.com/foo/bar");
+    test("gitlab.com clones as-is", async () => {
+      const result = await resolveCloneRepo("https://gitlab.com/foo/bar");
       expect(result).toEqual({
         ok: true,
         repo: {
@@ -307,8 +307,8 @@ describe("resolveCloneRepo", () => {
       });
     });
 
-    test("nested groups are kept end to end (repo/fullPath/cloneUrl)", () => {
-      const result = resolveCloneRepo("https://gitlab.com/group/sub/project");
+    test("nested groups are kept end to end (repo/fullPath/cloneUrl)", async () => {
+      const result = await resolveCloneRepo("https://gitlab.com/group/sub/project");
       expect(result.ok).toBe(true);
       if (!result.ok) return;
       expect(result.repo.fullPath).toBe("group/sub/project");
@@ -316,8 +316,8 @@ describe("resolveCloneRepo", () => {
       expect(result.repo.cloneUrl).toBe("https://gitlab.com/group/sub/project.git");
     });
 
-    test("an alias resolving to gitlab.com behaves exactly like pasting gitlab.com", () => {
-      const result = resolveCloneRepo("https://gitlab-cloud-alias/foo/bar");
+    test("an alias resolving to gitlab.com behaves exactly like pasting gitlab.com", async () => {
+      const result = await resolveCloneRepo("https://gitlab-cloud-alias/foo/bar");
       expect(result.ok).toBe(true);
       if (!result.ok) return;
       expect(result.repo.rawHost).toBe("gitlab-cloud-alias");
@@ -325,8 +325,8 @@ describe("resolveCloneRepo", () => {
       expect(result.repo.authOrigin).toBe("https://gitlab.com/");
     });
 
-    test("self-hosted https with a port keeps scheme/port, authOrigin scoped to host:port", () => {
-      const result = resolveCloneRepo("https://gitlab.internal.example.com:8443/group/proj");
+    test("self-hosted https with a port keeps scheme/port, authOrigin scoped to host:port", async () => {
+      const result = await resolveCloneRepo("https://gitlab.internal.example.com:8443/group/proj");
       expect(result).toEqual({
         ok: true,
         repo: {
@@ -341,16 +341,16 @@ describe("resolveCloneRepo", () => {
       });
     });
 
-    test("self-hosted plain http:// keeps http, authOrigin is null (never send a token over cleartext)", () => {
-      const result = resolveCloneRepo("http://gitlab.internal.example.com/group/proj");
+    test("self-hosted plain http:// keeps http, authOrigin is null (never send a token over cleartext)", async () => {
+      const result = await resolveCloneRepo("http://gitlab.internal.example.com/group/proj");
       expect(result.ok).toBe(true);
       if (!result.ok) return;
       expect(result.repo.cloneUrl).toBe("http://gitlab.internal.example.com/group/proj.git");
       expect(result.repo.authOrigin).toBeNull();
     });
 
-    test("an alias to a self-hosted instance: cloneUrl AND authOrigin use the resolved host, rawHost stays the alias", () => {
-      const result = resolveCloneRepo("https://gitlab-work/group/proj");
+    test("an alias to a self-hosted instance: cloneUrl AND authOrigin use the resolved host, rawHost stays the alias", async () => {
+      const result = await resolveCloneRepo("https://gitlab-work/group/proj");
       expect(result.ok).toBe(true);
       if (!result.ok) return;
       expect(result.repo.rawHost).toBe("gitlab-work");
@@ -360,8 +360,8 @@ describe("resolveCloneRepo", () => {
 
     // Review finding #3: `ssh -G`'s resolved host used to be spliced into
     // `cloneUrl`/`authOrigin` with no validation at all.
-    test("a resolution that is itself malformed as a host (embeds a path/query) is rejected, never turned into a URL", () => {
-      const result = resolveCloneRepo("https://gitlab-evil/group/proj");
+    test("a resolution that is itself malformed as a host (embeds a path/query) is rejected, never turned into a URL", async () => {
+      const result = await resolveCloneRepo("https://gitlab-evil/group/proj");
       expect(result.ok).toBe(false);
       if (result.ok) return;
       expect(result.error).toContain('"gitlab-evil" resolves to "evil.example.com/x?tok=1"');
@@ -370,8 +370,8 @@ describe("resolveCloneRepo", () => {
       expect(result.error).not.toContain("://evil.example.com/x?tok=1");
     });
 
-    test("a gitlab-named alias resolving to github.com is rejected — never clones github.com under a GitLab credential origin", () => {
-      const result = resolveCloneRepo("https://gitlab-confused/group/proj");
+    test("a gitlab-named alias resolving to github.com is rejected — never clones github.com under a GitLab credential origin", async () => {
+      const result = await resolveCloneRepo("https://gitlab-confused/group/proj");
       expect(result.ok).toBe(false);
       if (result.ok) return;
       expect(result.error).toContain('"gitlab-confused" resolves to "github.com"');
@@ -380,8 +380,8 @@ describe("resolveCloneRepo", () => {
   });
 
   describe("bitbucket https", () => {
-    test("bitbucket.org clones as-is", () => {
-      const result = resolveCloneRepo("https://bitbucket.org/foo/bar");
+    test("bitbucket.org clones as-is", async () => {
+      const result = await resolveCloneRepo("https://bitbucket.org/foo/bar");
       expect(result).toEqual({
         ok: true,
         repo: {
@@ -396,32 +396,32 @@ describe("resolveCloneRepo", () => {
       });
     });
 
-    test("a Bitbucket Server /scm/ URL is rejected with the Server message", () => {
-      const result = resolveCloneRepo("https://bitbucket.mycompany.com/scm/proj/repo");
+    test("a Bitbucket Server /scm/ URL is rejected with the Server message", async () => {
+      const result = await resolveCloneRepo("https://bitbucket.mycompany.com/scm/proj/repo");
       expect(result.ok).toBe(false);
       if (result.ok) return;
       expect(result.error).toContain("Bitbucket Server / Data Center is not supported");
     });
 
-    test("a dotless alias over https gets the SSH-alias hint, not the Server message", () => {
-      const result = resolveCloneRepo("https://bitbucket-personal/foo/bar");
+    test("a dotless alias over https gets the SSH-alias hint, not the Server message", async () => {
+      const result = await resolveCloneRepo("https://bitbucket-personal/foo/bar");
       expect(result.ok).toBe(false);
       if (result.ok) return;
       expect(result.error).toContain("looks like an SSH alias");
     });
 
-    test("cloud port :443 is dropped, any other port is rejected", () => {
-      const ok = resolveCloneRepo("https://bitbucket.org:443/foo/bar");
+    test("cloud port :443 is dropped, any other port is rejected", async () => {
+      const ok = await resolveCloneRepo("https://bitbucket.org:443/foo/bar");
       expect(ok.ok).toBe(true);
 
-      const rejected = resolveCloneRepo("https://bitbucket.org:8443/foo/bar");
+      const rejected = await resolveCloneRepo("https://bitbucket.org:8443/foo/bar");
       expect(rejected.ok).toBe(false);
       if (!rejected.ok) expect(rejected.error).toContain("unexpected port :8443");
     });
   });
 
-  test("an unsupported host is rejected with the supported-hosts hint", () => {
-    const result = resolveCloneRepo("https://git.example.com/foo/bar");
+  test("an unsupported host is rejected with the supported-hosts hint", async () => {
+    const result = await resolveCloneRepo("https://git.example.com/foo/bar");
     expect(result.ok).toBe(false);
     if (result.ok) return;
     expect(result.error).toContain("unsupported host");
@@ -436,7 +436,7 @@ describe("resolveCloneRepo", () => {
 describe("cloneAuthEnv", () => {
   const auth = { origin: "https://github.com/", header: "Authorization: Basic abc123" };
 
-  test("fresh env (no GIT_CONFIG_COUNT) appends at indices 0/1", () => {
+  test("fresh env (no GIT_CONFIG_COUNT) appends at indices 0/1", async () => {
     const result = cloneAuthEnv({}, auth);
     expect(result).toEqual({
       GIT_CONFIG_COUNT: "2",
@@ -447,7 +447,7 @@ describe("cloneAuthEnv", () => {
     });
   });
 
-  test("a pre-existing GIT_CONFIG_COUNT=1 composes by appending at indices 1/2, COUNT becomes 3", () => {
+  test("a pre-existing GIT_CONFIG_COUNT=1 composes by appending at indices 1/2, COUNT becomes 3", async () => {
     const result = cloneAuthEnv({ GIT_CONFIG_COUNT: "1", GIT_CONFIG_KEY_0: "foo", GIT_CONFIG_VALUE_0: "bar" }, auth);
     expect(result).toEqual({
       GIT_CONFIG_COUNT: "3",
@@ -461,7 +461,7 @@ describe("cloneAuthEnv", () => {
     expect(result.GIT_CONFIG_KEY_0).toBeUndefined();
   });
 
-  test("a garbage or negative GIT_CONFIG_COUNT is treated as 0", () => {
+  test("a garbage or negative GIT_CONFIG_COUNT is treated as 0", async () => {
     for (const bad of ["garbage", "-5", "", undefined]) {
       const result = cloneAuthEnv({ GIT_CONFIG_COUNT: bad }, auth);
       expect(result.GIT_CONFIG_COUNT).toBe("2");
@@ -469,7 +469,7 @@ describe("cloneAuthEnv", () => {
     }
   });
 
-  test("returns ONLY the five new keys — nothing from baseEnv leaks through", () => {
+  test("returns ONLY the five new keys — nothing from baseEnv leaks through", async () => {
     const result = cloneAuthEnv({ GIT_CONFIG_COUNT: "0", PATH: "/usr/bin", HOME: "/home/x" }, auth);
     expect(Object.keys(result).sort()).toEqual(
       ["GIT_CONFIG_COUNT", "GIT_CONFIG_KEY_0", "GIT_CONFIG_KEY_1", "GIT_CONFIG_VALUE_0", "GIT_CONFIG_VALUE_1"].sort(),
@@ -495,7 +495,7 @@ describe("isAuthShapedCloneFailure", () => {
   ];
 
   for (const line of authShaped) {
-    test(`recognizes: ${line}`, () => {
+    test(`recognizes: ${line}`, async () => {
       expect(isAuthShapedCloneFailure(line)).toBe(true);
     });
   }
@@ -509,7 +509,7 @@ describe("isAuthShapedCloneFailure", () => {
   ];
 
   for (const line of notAuthShaped) {
-    test(`does not recognize: ${line}`, () => {
+    test(`does not recognize: ${line}`, async () => {
       expect(isAuthShapedCloneFailure(line)).toBe(false);
     });
   }
@@ -522,7 +522,7 @@ describe("isAuthShapedCloneFailure", () => {
 describe("explainCloneFailure", () => {
   const originalLine = "fatal: could not read Username for 'https://github.com': terminal prompts disabled";
 
-  test("auth-shaped + https + no token used yet: 'add a token' hint, original line kept first", () => {
+  test("auth-shaped + https + no token used yet: 'add a token' hint, original line kept first", async () => {
     const result = explainCloneFailure(originalLine, originalLine, {
       transport: "https",
       host: "github.com",
@@ -533,7 +533,7 @@ describe("explainCloneFailure", () => {
     expect(result).toContain("paste the SSH URL");
   });
 
-  test("auth-shaped + https + a token WAS tried: 'rejected or doesn't grant access' hint", () => {
+  test("auth-shaped + https + a token WAS tried: 'rejected or doesn't grant access' hint", async () => {
     const result = explainCloneFailure(originalLine, originalLine, {
       transport: "https",
       host: "github.com",
@@ -544,7 +544,7 @@ describe("explainCloneFailure", () => {
     expect(result).toContain("Settings → Git host tokens");
   });
 
-  test("auth-shaped + ssh: SSH-key hint regardless of usedToken (ssh never has a stored-token retry)", () => {
+  test("auth-shaped + ssh: SSH-key hint regardless of usedToken (ssh never has a stored-token retry)", async () => {
     for (const usedToken of [true, false]) {
       const result = explainCloneFailure(originalLine, originalLine, {
         transport: "ssh",
@@ -557,41 +557,41 @@ describe("explainCloneFailure", () => {
     }
   });
 
-  test("a moved (301/302/307/308) response after a token attempt: 'repository has moved' hint", () => {
+  test("a moved (301/302/307/308) response after a token attempt: 'repository has moved' hint", async () => {
     const line = "fatal: unable to access 'https://x/': The requested URL returned error: 301";
     const result = explainCloneFailure(line, line, { transport: "https", host: "x", usedToken: true });
     expect(result.startsWith(line)).toBe(true);
     expect(result).toContain("repository has moved");
   });
 
-  test("a moved response with NO token attempt is returned unchanged (nothing useful to add)", () => {
+  test("a moved response with NO token attempt is returned unchanged (nothing useful to add)", async () => {
     const line = "fatal: unable to access 'https://x/': The requested URL returned error: 301";
     const result = explainCloneFailure(line, line, { transport: "https", host: "x", usedToken: false });
     expect(result).toBe(line);
   });
 
-  test("host key verification failed: trust hint naming the host", () => {
+  test("host key verification failed: trust hint naming the host", async () => {
     const line = "Host key verification failed.";
     const result = explainCloneFailure(line, line, { transport: "ssh", host: "gitlab.com", usedToken: false });
     expect(result.startsWith(line)).toBe(true);
     expect(result).toContain('ssh -T git@gitlab.com');
   });
 
-  test("permission denied (publickey): key/agent hint", () => {
+  test("permission denied (publickey): key/agent hint", async () => {
     const line = "git@github.com: Permission denied (publickey).";
     const result = explainCloneFailure(line, line, { transport: "ssh", host: "github.com", usedToken: false });
     expect(result.startsWith(line)).toBe(true);
     expect(result).toContain("No SSH key was accepted");
   });
 
-  test("could not resolve host — ssh phrasing points at ~/.ssh/config", () => {
+  test("could not resolve host — ssh phrasing points at ~/.ssh/config", async () => {
     const line = "ssh: Could not resolve hostname gitlab-alias: nodename nor servname provided, or not known";
     const result = explainCloneFailure(line, line, { transport: "ssh", host: "gitlab-alias", usedToken: false });
     expect(result).toContain("didn't resolve");
     expect(result).toContain("~/.ssh/config");
   });
 
-  test("could not resolve host — https phrasing differs for a dotless (alias-shaped) host vs a dotted one", () => {
+  test("could not resolve host — https phrasing differs for a dotless (alias-shaped) host vs a dotted one", async () => {
     const dotlessLine = "fatal: unable to access 'https://x/': Could not resolve host: gitlab-alias";
     const dotless = explainCloneFailure(dotlessLine, dotlessLine, {
       transport: "https",
@@ -610,13 +610,13 @@ describe("explainCloneFailure", () => {
     expect(dotted).toContain("didn't resolve");
   });
 
-  test("an unrecognized line is returned completely unchanged", () => {
+  test("an unrecognized line is returned completely unchanged", async () => {
     const line = "fatal: some completely novel git error nobody mapped";
     expect(explainCloneFailure(line, line, { transport: "https", host: "x", usedToken: true })).toBe(line);
     expect(explainCloneFailure(line, line, { transport: "https", host: "x", usedToken: false })).toBe(line);
   });
 
-  test("never receives (and so can never leak) a token — the function signature carries no token field", () => {
+  test("never receives (and so can never leak) a token — the function signature carries no token field", async () => {
     // ctx is `{ transport; host; usedToken }` — usedToken is a boolean, not a
     // credential. Constructing every ctx shape above with a suspicious-looking
     // fake secret as `host` proves it only ever echoes host names, never a
@@ -630,7 +630,7 @@ describe("explainCloneFailure", () => {
     expect(result).not.toContain("glpat-");
   });
 
-  test("displayLine (not the full stderrText) leads the returned message", () => {
+  test("displayLine (not the full stderrText) leads the returned message", async () => {
     // stderrText carries the matching signal (auth-shaped), displayLine is a
     // DIFFERENT, shorter string that must be what actually leads the output —
     // proving the two params are genuinely independent, not just aliases of
@@ -707,31 +707,31 @@ describe("pickCloneDisplayLine — real git-over-ssh epilogue noise", () => {
     "Please make sure you have the correct access rights\n" +
     "and the repository exists.";
 
-  test("connection refused: picks the ssh: line, not 'and the repository exists.'", () => {
+  test("connection refused: picks the ssh: line, not 'and the repository exists.'", async () => {
     const sanitized = sanitizeCloneStderr(CONNECTION_REFUSED_EPILOGUE);
     expect(pickCloneDisplayLine(sanitized)).toBe("ssh: connect to host 127.0.0.1 port 2: Connection refused");
   });
 
-  test("could not resolve hostname: picks the ssh: line", () => {
+  test("could not resolve hostname: picks the ssh: line", async () => {
     const sanitized = sanitizeCloneStderr(COULD_NOT_RESOLVE_EPILOGUE);
     expect(pickCloneDisplayLine(sanitized)).toBe(
       "ssh: Could not resolve hostname nope-invalid-agetor-test.example: nodename nor servname provided, or not known",
     );
   });
 
-  test("host key verification failed: picks that line, not the generic fatal closer", () => {
+  test("host key verification failed: picks that line, not the generic fatal closer", async () => {
     expect(pickCloneDisplayLine(HOST_KEY_EPILOGUE)).toBe("Host key verification failed.");
   });
 
-  test("permission denied (publickey): picks that line", () => {
+  test("permission denied (publickey): picks that line", async () => {
     expect(pickCloneDisplayLine(PERMISSION_DENIED_EPILOGUE)).toBe("git@github.com: Permission denied (publickey).");
   });
 
-  test("GitHub 'ERROR: Repository not found.' over ssh: picks that line", () => {
+  test("GitHub 'ERROR: Repository not found.' over ssh: picks that line", async () => {
     expect(pickCloneDisplayLine(GITHUB_REPO_NOT_FOUND_EPILOGUE)).toBe("ERROR: Repository not found.");
   });
 
-  test("the generic fatal line survives when nothing more specific is underneath it", () => {
+  test("the generic fatal line survives when nothing more specific is underneath it", async () => {
     const onlyGeneric =
       "Cloning into 'exist'...\n" +
       "fatal: Could not read from remote repository.\n" +
@@ -741,7 +741,7 @@ describe("pickCloneDisplayLine — real git-over-ssh epilogue noise", () => {
     expect(pickCloneDisplayLine(onlyGeneric)).toBe("fatal: Could not read from remote repository.");
   });
 
-  test("end-to-end via explainCloneFailure: the ssh-key hint fires for the real host-key/publickey fixtures (dead-code fix)", () => {
+  test("end-to-end via explainCloneFailure: the ssh-key hint fires for the real host-key/publickey fixtures (dead-code fix)", async () => {
     const hostKeyDisplay = pickCloneDisplayLine(HOST_KEY_EPILOGUE);
     const hostKeyResult = explainCloneFailure(HOST_KEY_EPILOGUE, hostKeyDisplay, {
       transport: "ssh",
@@ -761,7 +761,7 @@ describe("pickCloneDisplayLine — real git-over-ssh epilogue noise", () => {
     expect(pkResult).not.toContain("and the repository exists");
   });
 
-  test("end-to-end: the connection-refused fixture is NOT auth-shaped and explainCloneFailure returns the display line unchanged", () => {
+  test("end-to-end: the connection-refused fixture is NOT auth-shaped and explainCloneFailure returns the display line unchanged", async () => {
     const sanitized = sanitizeCloneStderr(CONNECTION_REFUSED_EPILOGUE);
     const displayLine = pickCloneDisplayLine(sanitized);
     expect(isAuthShapedCloneFailure(sanitized)).toBe(false);
@@ -775,7 +775,7 @@ describe("pickCloneDisplayLine — real git-over-ssh epilogue noise", () => {
 // ---------------------------------------------------------------------------
 
 describe("sanitizeCloneStderr", () => {
-  test("strips C0/C1 control characters (including a literal \\r a real ssh emits) and neutralizes ANSI escapes, keeps \\n/\\t", () => {
+  test("strips C0/C1 control characters (including a literal \\r a real ssh emits) and neutralizes ANSI escapes, keeps \\n/\\t", async () => {
     const withControlChars =
       "fatal: \x1b[31mAuthentication failed\x1b[0m for 'https://x/'\r\n\x07bell\x1b]0;evil-title\x07done\tindented";
     const sanitized = sanitizeCloneStderr(withControlChars);
@@ -785,12 +785,12 @@ describe("sanitizeCloneStderr", () => {
     expect(sanitized).toContain("\t");
   });
 
-  test("caps an oversized single line to CLONE_STDERR_MAX_LINE_CHARS", () => {
+  test("caps an oversized single line to CLONE_STDERR_MAX_LINE_CHARS", async () => {
     const hugeLine = "x".repeat(5_000);
     expect(sanitizeCloneStderr(hugeLine).length).toBeLessThanOrEqual(500);
   });
 
-  test("caps the number of lines, keeping the TAIL", () => {
+  test("caps the number of lines, keeping the TAIL", async () => {
     const manyLines = Array.from({ length: 200 }, (_, i) => `line ${i}`).join("\n");
     const lines = sanitizeCloneStderr(manyLines).split("\n");
     expect(lines.length).toBe(50);
@@ -800,7 +800,7 @@ describe("sanitizeCloneStderr", () => {
 });
 
 describe("ReDoS linearity (review finding #2b)", () => {
-  test("isAuthShapedCloneFailure and explainCloneFailure stay well under 200ms on a 200KB adversarial single line", () => {
+  test("isAuthShapedCloneFailure and explainCloneFailure stay well under 200ms on a 200KB adversarial single line", async () => {
     // Many repeated "repository " occurrences with NO "not found" anywhere —
     // the exact shape that made the old unbounded `/repository.*not
     // found/i` pattern quadratic: each occurrence's failed `.*` scan used to
@@ -872,7 +872,7 @@ describe("parseCloneProgress", () => {
   ];
 
   for (const [record, expected] of cases) {
-    test(`recognizes: ${JSON.stringify(record)}`, () => {
+    test(`recognizes: ${JSON.stringify(record)}`, async () => {
       const result = parseCloneProgress(record);
       expect(result).not.toBeNull();
       expect(result!.phase).toBe(expected.phase as CloneProgress["phase"]);
@@ -884,7 +884,7 @@ describe("parseCloneProgress", () => {
     });
   }
 
-  test("remote: Total … (git's one-off transfer summary) is NOT a progress record", () => {
+  test("remote: Total … (git's one-off transfer summary) is NOT a progress record", async () => {
     // Real capture: interleaved mid-stream between two `Receiving objects`
     // records on the SAME line in git's raw output (no `\r`/`\n` of its
     // own separating it from the previous record) — but by the time this
@@ -895,24 +895,24 @@ describe("parseCloneProgress", () => {
     ).toBeNull();
   });
 
-  test("junk / unrecognized text is null", () => {
+  test("junk / unrecognized text is null", async () => {
     expect(parseCloneProgress("fatal: Authentication failed for 'https://x/'")).toBeNull();
     expect(parseCloneProgress("")).toBeNull();
     expect(parseCloneProgress("   ")).toBeNull();
     expect(parseCloneProgress("warning: redirecting to https://x/")).toBeNull();
   });
 
-  test("ANSI escape sequences are neutralized (control chars stripped) and the result still doesn't match — junk, not a crash", () => {
+  test("ANSI escape sequences are neutralized (control chars stripped) and the result still doesn't match — junk, not a crash", async () => {
     const withAnsi = "\x1b[31msome random colored text\x1b[0m";
     expect(parseCloneProgress(withAnsi)).toBeNull();
   });
 
-  test("an overlong JUNK line (no recognized prefix) is null, regardless of length", () => {
+  test("an overlong JUNK line (no recognized prefix) is null, regardless of length", async () => {
     const overlong = "x".repeat(10_000);
     expect(parseCloneProgress(overlong)).toBeNull();
   });
 
-  test("an overlong but WELL-FORMED progress line (huge object counts, still anchored end-to-end) is recognized and its `line` is capped at 200 chars", () => {
+  test("an overlong but WELL-FORMED progress line (huge object counts, still anchored end-to-end) is recognized and its `line` is capped at 200 chars", async () => {
     // Real git output is unbounded in the (a/b) object counts, not just the
     // percent digits — a huge repo can legitimately produce a long line
     // that still matches the anchored shape exactly (fix 6 below is about
@@ -935,7 +935,7 @@ describe("parseCloneProgress", () => {
   // real suffix shapes (an optional `(a/b)` count, `Receiving objects`'s
   // throughput suffix, an optional `, done.`) makes the WHOLE record fall
   // through as non-progress instead.
-  test("fix 6: a percent-shaped line followed by trailing prose is NOT recognized as progress — it's junk to this function, so the caller can preserve it as error text", () => {
+  test("fix 6: a percent-shaped line followed by trailing prose is NOT recognized as progress — it's junk to this function, so the caller can preserve it as error text", async () => {
     expect(parseCloneProgress("remote: Counting objects:  50% (1/2) error: repository is archived")).toBeNull();
     expect(parseCloneProgress("Receiving objects: 100% (2/2) fatal: unexpected disconnect")).toBeNull();
     expect(parseCloneProgress("remote: Enumerating objects: 5, done. error: repository is archived")).toBeNull();
@@ -948,7 +948,7 @@ describe("parseCloneProgress", () => {
   // plus the anchoring together, not a from-scratch ReDoS probe the way
   // `isAuthShapedCloneFailure`'s own linearity test (over the FULL,
   // uncapped stderr text) has to be.
-  test("fix 6: a long adversarial tail after a valid percent/count prefix is rejected fast (capped before matching, then falls through as junk)", () => {
+  test("fix 6: a long adversarial tail after a valid percent/count prefix is rejected fast (capped before matching, then falls through as junk)", async () => {
     const adversarial = "Receiving objects:  50% (1/2)" + " error: repository is archived".repeat(10_000);
     expect(adversarial.length).toBeGreaterThan(200_000);
     const start = performance.now();
@@ -958,7 +958,7 @@ describe("parseCloneProgress", () => {
     expect(elapsed).toBeLessThan(50);
   });
 
-  test("a malformed 4-digit percent capture clamps to 100 rather than overflowing", () => {
+  test("a malformed 4-digit percent capture clamps to 100 rather than overflowing", async () => {
     // `\d{1,3}` never captures more than 3 digits by construction, but a
     // pathological 3-digit value above 100 (git itself never emits one) must
     // still clamp rather than propagate a nonsensical percent.
@@ -993,7 +993,7 @@ function streamOfChunks(chunks: string[], delayMs = 0): ReadableStream<Uint8Arra
 }
 
 describe("readCloneStderrStream", () => {
-  test("splits on both \\r and \\n, excludes progress records from the returned text, keeps non-progress lines", () => {
+  test("splits on both \\r and \\n, excludes progress records from the returned text, keeps non-progress lines", async () => {
     const text =
       "Cloning into 'x'...\r" +
       "remote: Counting objects:  50% (1/2)        \r" +
@@ -1220,7 +1220,7 @@ describe("cloneAuthHeader", () => {
   });
 
   test("gitlab: stored token becomes oauth2:<tok>", async () => {
-    // gitlab.com is a CLOUD_HOSTS short-circuit in apiHostForRemote, so no
+    // gitlab.com is a CLOUD_HOSTS short-circuit in resolveForgeApiHost, so no
     // AGETOR_SSH_BIN stub is needed for this case.
     setGitHubToken("gitlab.com", "gl-tok-1");
     const header = await cloneAuthHeader("gitlab", "gitlab.com");
@@ -1266,7 +1266,7 @@ describe("cloneAuthHeader", () => {
     const originalPath = process.env.PATH;
     process.env.PATH = `${shadowDir}:${originalPath}`;
     try {
-      // gitlab.com short-circuits apiHostForRemote before any ssh spawn, so
+      // gitlab.com short-circuits resolveForgeApiHost before any ssh spawn, so
       // no AGETOR_SSH_BIN stub is needed here either.
       const header = await cloneAuthHeader("gitlab", "gitlab.com");
       expect(header).toBeNull();
@@ -1303,7 +1303,7 @@ describe("cloneAuthHeader", () => {
 // ---------------------------------------------------------------------------
 
 describe("defaultCloneDest", () => {
-  test("lands directly under $HOME", () => {
+  test("lands directly under $HOME", async () => {
     expect(defaultCloneDest("bar")).toBe(path.join(homedir(), "bar"));
   });
 });
@@ -1879,7 +1879,7 @@ describe("cloneRepo", () => {
     30_000,
   );
 
-  test("cancel: an unknown cloneId is always a no-op", () => {
+  test("cancel: an unknown cloneId is always a no-op", async () => {
     expect(cancelClone("never-registered-anywhere")).toBe(false);
   });
 

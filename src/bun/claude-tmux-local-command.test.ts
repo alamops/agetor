@@ -1,4 +1,4 @@
-import { test, expect, describe } from "bun:test";
+import { test, expect, afterEach, describe } from "bun:test";
 import { mkdtempSync, writeFileSync, readFileSync, chmodSync } from "node:fs";
 import { tmpdir } from "node:os";
 import path from "node:path";
@@ -6,6 +6,15 @@ import { randomUUID } from "node:crypto";
 import { SESSION_DIED_STATUS_PREFIX } from "../shared/types.ts";
 import type { LocalSettingInfo } from "./claude-tmux.ts";
 import { registerTmuxPrompt, activeTmuxPromptsForTask } from "./interactions.ts";
+
+// A turn slot / sendTurn the test starts is the code under test: a rejection of
+// it is a failure, not noise. Collected here, asserted empty after every test
+// (an empty `.catch(() => {})` would hide it).
+const backgroundErrors: unknown[] = [];
+const noteBackgroundError = (e: unknown): void => { backgroundErrors.push(e); };
+afterEach(() => {
+  expect(backgroundErrors.splice(0)).toEqual([]);
+});
 
 // Pre-set AGETOR_DATA_DIR before claude-tmux.ts's transitive db.ts import —
 // mirrors claude-tmux-unknown-command.test.ts / claude-tmux-queue.test.ts. A
@@ -516,7 +525,7 @@ test("non-slash slot: the same 3-line sequence renders normally but never stages
   const { taskId, state } = freshSession();
   try {
     const rec = recorder();
-    __forTest.pushTurnSlot(state, rec.onChunk); // slashCommand: null
+    void __forTest.pushTurnSlot(state, rec.onChunk).catch(noteBackgroundError); // slashCommand: null
 
     dispatchLine(state, caveatLine);
     dispatchLine(state, commandNameLine);
@@ -718,7 +727,7 @@ describe("setLocalSettingChangedHandler — local-setting-sync seam", () => {
     const rec = recorder();
     const prev = setLocalSettingChangedHandler(() => { calls++; });
     try {
-      __forTest.pushTurnSlot(state, rec.onChunk); // slashCommand: null
+      void __forTest.pushTurnSlot(state, rec.onChunk).catch(noteBackgroundError); // slashCommand: null
       dispatchLine(state, commandNameLine);
       dispatchLine(state, stdoutLine);
       expect(calls).toBe(1);
@@ -1600,7 +1609,7 @@ test("mirrorModelViaPicker: a turn already in flight (a live head slot) — { ok
     const rec = recorder();
     // A live head slot (real `resolve`) makes `turnInFlight(state)` true —
     // the entry check mirrorModelViaPicker's doc describes.
-    __forTest.pushTurnSlot(state, rec.onChunk);
+    void __forTest.pushTurnSlot(state, rec.onChunk).catch(noteBackgroundError);
     try {
       const result = await mirrorModelViaPicker(taskId, "Opus");
       expect(result).toEqual({ ok: false, reason: "turn in flight" });
@@ -1918,7 +1927,7 @@ test("sendTurn: bumpKeystroke fires at ENQUEUE time — state.lastKeystrokeAt is
 
     // Swallow the expected rejection (withheld paste) and let the guard's
     // grace window elapse so nothing leaks into a later test.
-    agentPromise.then((agent) => agent.done.catch(() => {}));
+    void agentPromise.then((agent) => agent.done.catch(() => {})).catch(() => {});
     await __forTest.pasteChains.get(taskId);
   } finally {
     __forTest.setCapturePastePane(prevPastePane);
@@ -1941,7 +1950,7 @@ test("PASTE_DROPPED_OUTCOME: a session torn down before the queued paste ever ru
   const agentPromise = sendTurn(taskId, "hello", () => {});
   // Irrelevant to this test's assertion (the dropped-op outcome's stderr
   // wording) — swallow it so it doesn't surface as an unhandled rejection.
-  agentPromise.then((agent) => agent.done.catch(() => {}));
+  void agentPromise.then((agent) => agent.done.catch(() => {})).catch(() => {});
   // Tear down SYNCHRONOUSLY, before the queued tmux op's microtask runs —
   // queueTmuxOp's identity gate then drops the op body entirely, so the
   // chain settles via the unconditional PASTE_DROPPED_OUTCOME backstop with
@@ -2735,7 +2744,7 @@ describe("sendTurn populates TurnSlot.slashCommand", () => {
       const { taskId, state } = freshSession();
       try {
         const rec = recorder();
-        sendTurn(taskId, "/effort high", rec.onChunk);
+        void sendTurn(taskId, "/effort high", rec.onChunk).catch(noteBackgroundError);
         expect(state.turnQueue[0]?.slashCommand).toBe("/effort");
         await __forTest.pasteChains.get(taskId);
       } finally {
@@ -2749,7 +2758,7 @@ describe("sendTurn populates TurnSlot.slashCommand", () => {
       const { taskId, state } = freshSession();
       try {
         const rec = recorder();
-        sendTurn(taskId, "hello there", rec.onChunk);
+        void sendTurn(taskId, "hello there", rec.onChunk).catch(noteBackgroundError);
         expect(state.turnQueue[0]?.slashCommand).toBeNull();
         await __forTest.pasteChains.get(taskId);
       } finally {
@@ -2797,7 +2806,7 @@ test("dropSession (disposeSessionState) clears composerHoldsText, lastLocalComma
     state.composerHoldsText = true;
     state.lastLocalCommandArgs = "high";
     state.scrapeIdleSettleStreak = 2;
-    dropSession(taskId);
+    await dropSession(taskId);
     expect(state.composerHoldsText).toBe(false);
     expect(state.lastLocalCommandArgs).toBeNull();
     expect(state.scrapeIdleSettleStreak).toBe(0);

@@ -57,7 +57,7 @@ let stub: ReturnType<typeof Bun.serve> | null = null;
 let stubDir: string | null = null;
 
 afterEach(() => {
-  stub?.stop(true);
+  void stub?.stop(true);
   stub = null;
   if (stubDir) rmSync(stubDir, { recursive: true, force: true });
   stubDir = null;

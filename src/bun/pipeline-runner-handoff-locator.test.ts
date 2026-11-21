@@ -222,7 +222,7 @@ test("the scan mode follows the run's harness: a fence split across two delta ev
   });
   const segments = ["Example:\n```\nnpm test\n", `\`\`\`\nDone.\n<${HANDOFF_TAG}>\n${handoff}\n</${HANDOFF_TAG}>`];
 
-  const kindFor = (agent: string) => {
+  const kindFor = async (agent: string) => {
     const runId = randomUUID();
     const now = Date.now();
     runs.insert({
@@ -241,16 +241,16 @@ test("the scan mode follows the run's harness: a fence split across two delta ev
       fxSessionId: null,
     });
     for (const s of segments) runs.appendEvent(runId, "assistant", s);
-    return __forTest.parsedRunResponse(runId).kind;
+    return (await __forTest.parsedRunResponse(runId)).kind;
   };
 
   try {
     // gemini/antigravity: legacy scan, no Markdown state per event — advances.
-    expect(kindFor("gemini")).toBe("handoff");
-    expect(kindFor("antigravity")).toBe("handoff");
+    expect(await kindFor("gemini")).toBe("handoff");
+    expect(await kindFor("antigravity")).toBe("handoff");
     // A message-level harness reads each event as Markdown on its own (the
     // documented trade-off): the second event's leading ``` opens a fence.
-    expect(kindFor("claude-code")).toBe("handoff-missing");
+    expect(await kindFor("claude-code")).toBe("handoff-missing");
   } finally {
     const { deleteTask } = await import("./orchestrator.ts");
     await deleteTask(taskId).catch(() => {});

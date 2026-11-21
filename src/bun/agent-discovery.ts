@@ -411,8 +411,8 @@ async function discoverCodex(env?: Record<string, string>, bin?: string): Promis
 
   const send = (obj: unknown): void => {
     try {
-      proc.stdin.write(`${JSON.stringify(obj)}\n`);
-      proc.stdin.flush();
+      void proc.stdin.write(`${JSON.stringify(obj)}\n`);
+      void proc.stdin.flush();
     } catch {
       // Child's stdin already closed (e.g. the `/bin/echo app-server` stub,
       // which exits immediately) — the caller learns "no response coming"
@@ -1534,7 +1534,7 @@ export function isDiscoveryReady(): boolean {
  * targets they carry are `HarnessTarget`s now, so a target list built from
  * this option may include codex harnesses alongside fx ones.
  */
-export type FxHarnessTargetsOption = HarnessTarget[] | (() => HarnessTarget[]);
+export type FxHarnessTargetsOption = HarnessTarget[] | (() => HarnessTarget[] | Promise<HarnessTarget[]>);
 
 /** Per-kind probe targets, resolved inside the enqueued run (see `runRefresh`). */
 export type KindTargetsOption = () => Promise<Partial<Record<AgentKind, KindProbeTarget>>>;
@@ -1582,7 +1582,7 @@ async function runRefresh(opts?: { fxHarnesses?: FxHarnessTargetsOption; kindTar
     // queued sweep from pruning a harness that was created after the sweep
     // was enqueued but before it started running.
     const targetsOpt = opts?.fxHarnesses;
-    const targets = typeof targetsOpt === "function" ? targetsOpt() : targetsOpt;
+    const targets = typeof targetsOpt === "function" ? await targetsOpt() : targetsOpt;
     if (targets) {
       // Reuse the kind-level result computed just above for any target
       // that's indistinguishable from that probe (no env override, and

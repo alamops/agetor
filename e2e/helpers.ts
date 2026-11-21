@@ -257,7 +257,9 @@ export function backdateArchivedAt(backend: E2EBackend, taskId: string, msAgo: n
       Date.now() - msAgo,
       taskId,
     ]);
-    if (res.changes !== 1) throw new Error(`backdateArchivedAt: task ${taskId} is not archived (changes=${res.changes})`);
+    // `changes` also counts the revision-log trigger rows (migration 093), so
+    // it is 3 for one task row, not 1: only "touched nothing" is an error.
+    if (res.changes < 1) throw new Error(`backdateArchivedAt: task ${taskId} is not archived (changes=${res.changes})`);
   });
 }
 

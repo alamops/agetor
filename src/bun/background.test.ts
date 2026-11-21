@@ -216,7 +216,7 @@ describe("C3 reconcile: remote access can't outlive a running host", () => {
         const s = await bg.getBackgroundStatus({ fresh: true });
         expect(s.remoteAccess).toBe(false);
         expect(remotePref()).toBe("off");
-        expect(bg.getRemoteAccess()).toEqual({ enabled: false, preview: true });
+        expect(await bg.getRemoteAccess()).toEqual({ enabled: false, preview: true });
         expect(warn.mock.calls.some((c) => String(c[0]).includes("remote access turned off"))).toBe(true);
       } finally {
         warn.mockRestore();
@@ -297,7 +297,7 @@ describe("C3 reconcile: remote access can't outlive a running host", () => {
     const restoreListeners = bg.__testing.suspendListeners();
     try {
       const stale = bg.getBackgroundStatus({ fresh: true });
-      bg.setRemoteAccessOnFromNativeBox(); // invalidates synchronously, probe still in flight
+      await bg.setRemoteAccessOnFromNativeBox(); // invalidates synchronously, probe still in flight
       await stale;
       expect(remotePref()).toBe("on");
       expect(warn.mock.calls.some((c) => String(c[0]).includes("remote access turned off"))).toBe(false);
@@ -315,7 +315,7 @@ describe("C3 reconcile: remote access can't outlive a running host", () => {
     const restoreListeners = bg.__testing.suspendListeners();
     try {
       const stale = bg.getBackgroundStatus({ fresh: true });
-      bg.setRemoteAccessOnFromNativeBox();
+      await bg.setRemoteAccessOnFromNativeBox();
       await stale;
       expect(remotePref()).toBe("on");
       const fresh = await bg.getBackgroundStatus({ fresh: true });
@@ -422,7 +422,7 @@ describe("regression: remote access turned on right after the host is registered
     const registered = await bg.turnOnBackground();
     expect(registered.state).toBe("starting");
     // This is what the native box does once the host is enabled.
-    bg.setRemoteAccessOnFromNativeBox();
+    await bg.setRemoteAccessOnFromNativeBox();
     await tick(40); // let the deferred change notification and any reconcile run
     const s = await bg.getBackgroundStatus({ fresh: true });
     expect(s.state).toBe("starting");
@@ -436,7 +436,7 @@ describe("regression: remote access turned on right after the host is registered
     try {
       seedFake({ registration: "notRegistered" });
       await bg.turnOnBackground();
-      bg.setRemoteAccessOnFromNativeBox();
+      await bg.setRemoteAccessOnFromNativeBox();
       await tick(160);
       const s = await bg.getBackgroundStatus({ fresh: true });
       expect(s.state).toBe("stopped");
@@ -451,7 +451,7 @@ describe("regression: remote access turned on right after the host is registered
     seedFake({ registration: "enabled" });
     const warn = spyOn(console, "warn").mockImplementation(() => {});
     try {
-      bg.setRemoteAccessOnFromNativeBox();
+      await bg.setRemoteAccessOnFromNativeBox();
       const s = await bg.getBackgroundStatus({ fresh: true });
       expect(s.state).toBe("stopped");
       expect(s.remoteAccess).toBe(false);
@@ -698,12 +698,12 @@ describe("change listeners", () => {
     const seen: BackgroundStatus[] = [];
     const off = bg.subscribeBackgroundChanges((s) => seen.push(s));
     try {
-      bg.setRemoteAccessOff(); // already off → silent
+      await bg.setRemoteAccessOff(); // already off → silent
       await tick(30);
       expect(seen).toHaveLength(0);
 
       db.preferences.set(REMOTE_ACCESS_PREF_KEY, "on");
-      bg.setRemoteAccessOff();
+      await bg.setRemoteAccessOff();
       expect(remotePref()).toBe("off");
       await tick(30);
       expect(seen).toHaveLength(1);
@@ -715,8 +715,8 @@ describe("change listeners", () => {
 });
 
 describe("remote access preference", () => {
-  test("defaults to off and reports preview", () => {
-    expect(bg.getRemoteAccess()).toEqual({ enabled: false, preview: true });
+  test("defaults to off and reports preview", async () => {
+    expect(await bg.getRemoteAccess()).toEqual({ enabled: false, preview: true });
   });
 
   test("setRemoteAccessOnFromNativeBox turns it on and tells listeners", async () => {
@@ -725,9 +725,9 @@ describe("remote access preference", () => {
     const seen: BackgroundStatus[] = [];
     const off = bg.subscribeBackgroundChanges((s) => seen.push(s));
     try {
-      bg.setRemoteAccessOnFromNativeBox();
+      await bg.setRemoteAccessOnFromNativeBox();
       expect(remotePref()).toBe("on");
-      expect(bg.getRemoteAccess().enabled).toBe(true);
+      expect((await bg.getRemoteAccess()).enabled).toBe(true);
       await tick(30);
       expect(seen.at(-1)).toMatchObject({ remoteAccess: true, state: "running" });
     } finally {
@@ -738,9 +738,9 @@ describe("remote access preference", () => {
   test("setRemoteAccessOff then switches it off again", async () => {
     seedFake({ registration: "enabled" });
     seedSupervisor();
-    bg.setRemoteAccessOnFromNativeBox();
-    bg.setRemoteAccessOff();
-    expect(bg.getRemoteAccess().enabled).toBe(false);
+    await bg.setRemoteAccessOnFromNativeBox();
+    await bg.setRemoteAccessOff();
+    expect((await bg.getRemoteAccess()).enabled).toBe(false);
     expect(remotePref()).toBe("off");
   });
 });
@@ -777,10 +777,10 @@ describe("AGETOR_FAKE_REMOTE_ACCESS=on seed", () => {
   }
   const script = `
     const bg = await import(${JSON.stringify(path.resolve(import.meta.dir, "background.ts"))});
-    const first = bg.getRemoteAccess().enabled;
+    const first = (await bg.getRemoteAccess()).enabled;
     // An explicit "off" is not re-seeded by a later read.
-    bg.setRemoteAccessOff();
-    console.log(JSON.stringify({ first, afterOff: bg.getRemoteAccess().enabled }));
+    await bg.setRemoteAccessOff();
+    console.log(JSON.stringify({ first, afterOff: (await bg.getRemoteAccess()).enabled }));
     process.exit(0);
   `;
 

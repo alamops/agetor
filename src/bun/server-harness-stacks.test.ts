@@ -1227,8 +1227,8 @@ describe("fix-round routes: cooldown clear, history, preview, restore, switch, c
     expect((await call("DELETE", "/harnesses/nope-acct/limit-state")).status).toBe(404);
     const { harnessStacks } = await import("./harness-stacks.ts");
     const base = { reason: "quota" as const, source: "claude-api-error" as const, message: "limit", resetAtMs: Date.now() + 3_600_000 };
-    harnessStacks.setLimitState("api-x", base);
-    harnessStacks.setLimitState("api-x", { ...base, model: "gpt-x" });
+    await harnessStacks.setLimitState("api-x", base);
+    await harnessStacks.setLimitState("api-x", { ...base, model: "gpt-x" });
     const rows = (await call("GET", "/harnesses")).body.limitStates as { harnessId: string; model: string | null }[];
     expect(rows.filter((r) => r.harnessId === "api-x").map((r) => r.model).sort()).toEqual([null, "gpt-x"].sort());
 
@@ -1245,8 +1245,8 @@ describe("fix-round routes: cooldown clear, history, preview, restore, switch, c
   test("DELETE /harnesses/:id/limit-state?scope=account clears only the account-wide row; the response carries rearmed", async () => {
     const { harnessStacks } = await import("./harness-stacks.ts");
     const base = { reason: "quota" as const, source: "claude-api-error" as const, message: "limit", resetAtMs: Date.now() + 3_600_000 };
-    harnessStacks.setLimitState("api-x", base);
-    harnessStacks.setLimitState("api-x", { ...base, model: "gpt-x" });
+    await harnessStacks.setLimitState("api-x", base);
+    await harnessStacks.setLimitState("api-x", { ...base, model: "gpt-x" });
     const res = await call("DELETE", "/harnesses/api-x/limit-state?scope=account");
     expect(res.status).toBe(200);
     expect(typeof res.body.rearmed).toBe("number");
@@ -1431,8 +1431,8 @@ describe("TT-E: fix-round routes (shapes, gates, 22b, finding 19)", () => {
     const id = makeAccount("ls");
     const { harnessStacks } = await import("./harness-stacks.ts");
     const base = { reason: "quota" as const, source: "claude-api-error" as const, message: "m", resetAtMs: Date.now() + 3_600_000 };
-    harnessStacks.setLimitState(id, base);
-    harnessStacks.setLimitState(id, { ...base, model: "sonnet-x" });
+    await harnessStacks.setLimitState(id, base);
+    await harnessStacks.setLimitState(id, { ...base, model: "sonnet-x" });
     const res = await call("DELETE", `/harnesses/${id}/limit-state?scope=account&model=SONNET-X`);
     expect(res.status).toBe(200);
     const left = (res.body.limitStates as { harnessId: string; model: string | null }[]).filter((r) => r.harnessId === id);
@@ -1449,7 +1449,7 @@ describe("TT-E: fix-round routes (shapes, gates, 22b, finding 19)", () => {
     const other = await makeStack([c, d], "rearm-other");
     const { harnessStacks } = await import("./harness-stacks.ts");
     const failover = await import("./harness-failover.ts");
-    harnessStacks.setLimitState(b, { reason: "quota", source: "claude-api-error", message: "m", resetAtMs: Date.now() + 36_000_000 });
+    await harnessStacks.setLimitState(b, { reason: "quota", source: "claude-api-error", message: "m", resetAtMs: Date.now() + 36_000_000 });
     const far = Date.now() + 36_000_000;
 
     const waiting = seedTaskRow({ agent: a, column: "blocked" });
@@ -1491,12 +1491,12 @@ describe("TT-E: fix-round routes (shapes, gates, 22b, finding 19)", () => {
     const stack = await makeStack([a, b], "history");
     const { harnessSwapEvents, SWAP_HISTORY_MAX_LIMIT, SWAP_HISTORY_DEFAULT_LIMIT } = await import("./harness-swap-history.ts");
     const t0 = Date.now() - 10_000;
-    const mk = (i: number) => harnessSwapEvents.insert({
+    const mk = async (i: number) => await harnessSwapEvents.insert({
       stackId: stack, taskId: null, taskTitle: `t${i}`, fromHarnessId: a, fromLabel: "A", toHarnessId: b, toLabel: "B",
       trigger: "manual", reason: "user", source: null, message: null, model: null, resetsAtMs: null,
       fromRunId: null, toRunId: null, continuation: null, at: t0 + i,
     });
-    for (let i = 0; i < 5; i++) mk(i);
+    for (let i = 0; i < 5; i++) await mk(i);
 
     const p1 = await call("GET", `/harness-stacks/${stack}/history?limit=2`);
     expect(p1.status).toBe(200);
@@ -1520,7 +1520,7 @@ describe("TT-E: fix-round routes (shapes, gates, 22b, finding 19)", () => {
     expect((await call("GET", `/harness-stacks/${stack}/history?limit=abc`)).body.events).toHaveLength(5);
     expect((await call("GET", `/harness-stacks/${stack}/history?limit=`)).body.events).toHaveLength(5);
 
-    for (let i = 5; i < SWAP_HISTORY_MAX_LIMIT + 5; i++) mk(i);
+    for (let i = 5; i < SWAP_HISTORY_MAX_LIMIT + 5; i++) await mk(i);
     const big = await call("GET", `/harness-stacks/${stack}/history?limit=999999`);
     expect(big.body.events).toHaveLength(SWAP_HISTORY_MAX_LIMIT);
     expect(big.body.nextCursor).not.toBeNull();
@@ -1584,12 +1584,12 @@ describe("TT-E: fix-round routes (shapes, gates, 22b, finding 19)", () => {
     db.tasks.update(scheduled, { runId: schedRun });
     db.tasks.setHarnessState(scheduled, { ...baseState(stack), scheduledSwitch: { requestedAt: Date.now() } } as never);
 
-    harnessSwapEvents.insert({
+    await harnessSwapEvents.insert({
       stackId: stack, taskId: retrying, taskTitle: "x", fromHarnessId: a, fromLabel: "A", toHarnessId: b, toLabel: "B",
       trigger: "limit", reason: "quota", source: null, message: null, model: null, resetsAtMs: null,
       fromRunId: null, toRunId: null, continuation: null,
     });
-    expect(harnessSwapEvents.countForStack(stack)).toBe(1);
+    expect(await harnessSwapEvents.countForStack(stack)).toBe(1);
     try {
       expect(failover.hasArmedAutoRetry(retrying)).toBe(true);
       expect((await call("DELETE", `/harness-stacks/${stack}`)).status).toBe(200);
@@ -1599,7 +1599,7 @@ describe("TT-E: fix-round routes (shapes, gates, 22b, finding 19)", () => {
       expect(statusLines(retryRun).some((l) => l.includes("automatic account retry cancelled — the stack was deleted"))).toBe(true);
       expect(statusLines(schedRun).some((l) => l.includes("scheduled account switch cancelled — the stack was deleted"))).toBe(true);
       // The history cascades with the stack, and the route is a 404 now.
-      expect(harnessSwapEvents.countForStack(stack)).toBe(0);
+      expect(await harnessSwapEvents.countForStack(stack)).toBe(0);
       expect((await call("GET", `/harness-stacks/${stack}/history`)).status).toBe(404);
     } finally {
       failover.cancelAutoRetry(retrying);
@@ -1729,7 +1729,7 @@ describe("TT-E: fix-round routes (shapes, gates, 22b, finding 19)", () => {
 
     // Every other member cooling: refused up front with per-member reasons.
     const t = seedTaskRow({ agent: a });
-    harnessStacks.setLimitState(b, { reason: "quota", source: "claude-api-error", message: "m", resetAtMs: Date.now() + 3_600_000 });
+    await harnessStacks.setLimitState(b, { reason: "quota", source: "claude-api-error", message: "m", resetAtMs: Date.now() + 3_600_000 });
     try {
       const cooling = await call("POST", `/tasks/${t}/switch-account`);
       expect(cooling.status).toBe(409);
@@ -1740,7 +1740,7 @@ describe("TT-E: fix-round routes (shapes, gates, 22b, finding 19)", () => {
       expect(db.tasks.get(t)!.agent).toBe(a);
       expect(db.tasks.get(t)!.harnessState?.scheduledSwitch ?? null).toBeNull();
     } finally {
-      harnessStacks.clearLimitState(b);
+      await harnessStacks.clearLimitState(b);
     }
 
     // Background agents hold the task.
@@ -1759,13 +1759,13 @@ describe("TT-E: fix-round routes (shapes, gates, 22b, finding 19)", () => {
     db.subagents.setStatus(subId, "completed", Date.now());
 
     // Another switch already holds the claim.
-    expect(orch.claimTaskForAccountSwitch(t)).toBe(true);
+    expect(await orch.claimTaskForAccountSwitch(t)).toBe(true);
     try {
       const busy = await call("POST", `/tasks/${t}/switch-account`);
       expect(busy.status).toBe(409);
       expect(busy.body.code).toBe("busy");
     } finally {
-      orch.releaseTaskAccountSwitch(t);
+      await orch.releaseTaskAccountSwitch(t);
     }
     for (const id of [lone, t, held]) db.tasks.delete(id);
     expect(stack).toBeTruthy();
@@ -1824,12 +1824,12 @@ describe("TT-E: fix-round routes (shapes, gates, 22b, finding 19)", () => {
     });
     try {
       // A claim release is one of the edges that applies a waiting request.
-      expect(orch.claimTaskForAccountSwitch(t)).toBe(true);
-      orch.releaseTaskAccountSwitch(t);
+      expect(await orch.claimTaskForAccountSwitch(t)).toBe(true);
+      await orch.releaseTaskAccountSwitch(t);
       const deadline = Date.now() + 8000;
       while (Date.now() < deadline && !reached) await Bun.sleep(10);
       expect(reached).toBe(true);
-      expect(orch.isScheduledSwitchUnderway(t)).toBe(true);
+      expect(await orch.isScheduledSwitchUnderway(t)).toBe(true);
 
       const busy = await call("DELETE", `/tasks/${t}/switch-account`);
       expect(busy.status).toBe(409);
@@ -1860,17 +1860,17 @@ describe("TT-E: fix-round routes (shapes, gates, 22b, finding 19)", () => {
     db.tasks.setHarnessState(t, { ...baseState(stackId), scheduledSwitch: { requestedAt: Date.now() } });
     // The claim the PATCH route takes for a same-stack agent change. That
     // PATCH may still be refused, which would leave the request behind.
-    expect(orch.claimTaskForAccountSwitch(t)).toBe(true);
+    expect(await orch.claimTaskForAccountSwitch(t)).toBe(true);
     try {
       expect(orch.isAccountSwitchUnderway(t)).toBe(true);
-      expect(orch.isScheduledSwitchUnderway(t)).toBe(false);
+      expect(await orch.isScheduledSwitchUnderway(t)).toBe(false);
       const cancel = await call("DELETE", `/tasks/${t}/switch-account`);
       expect(cancel.status).toBe(200);
       expect(cancel.body.cancelled).toBe(true);
       expect(db.tasks.get(t)!.harnessState?.scheduledSwitch ?? null).toBeNull();
       expect(statusLines(runId)).toContain("scheduled account switch cancelled");
     } finally {
-      orch.releaseTaskAccountSwitch(t);
+      await orch.releaseTaskAccountSwitch(t);
     }
     // The claim ends (the PATCH refused) with nothing left to apply.
     await Bun.sleep(50);

@@ -36,8 +36,38 @@ export function splitSqlStatements(sql: string): string[] {
   const statements: string[] = [];
   let current = "";
   let i = 0;
+  // CREATE TRIGGER bodies hold `;`-terminated statements between BEGIN and END,
+  // so inside a trigger a `;` only ends the statement at block depth 0. BEGIN
+  // and CASE open a block, END closes one (a `CASE ... END` expression nests).
+  // `isTrigger` caches the "does this statement start with CREATE TRIGGER"
+  // check, which is only evaluated when a BEGIN/CASE/END token shows up.
+  let depth = 0;
+  let isTrigger: boolean | null = null;
+  const isWordChar = (c: string | undefined) => c !== undefined && /[A-Za-z0-9_$]/.test(c);
   while (i < sql.length) {
     const ch = sql[i];
+    if (/[A-Za-z_]/.test(ch!) && !isWordChar(sql[i - 1])) {
+      let end = i + 1;
+      while (end < sql.length && isWordChar(sql[end])) end++;
+      const word = sql.slice(i, end);
+      const upper = word.toUpperCase();
+      if (upper === "BEGIN" || upper === "CASE" || upper === "END") {
+        // A quoted identifier ("end", `end`, [end]) is not a keyword.
+        const quoted = /["`\[]/.test(sql[i - 1] ?? "") && /["`\]]/.test(sql[end] ?? "");
+        // A token after `.` (`NEW.end`, `OLD.case`) is a column name.
+        const member = sql[i - 1] === ".";
+        if (!quoted && !member) {
+          if (isTrigger === null) {
+            const bare = current.replace(/--[^\n]*/g, "").replace(/\/\*[\s\S]*?\*\//g, "");
+            isTrigger = /^\s*CREATE\s+(?:TEMP(?:ORARY)?\s+)?TRIGGER\b/i.test(bare);
+          }
+          if (isTrigger) depth += upper === "END" ? -1 : 1;
+        }
+      }
+      current += word;
+      i = end;
+      continue;
+    }
     if (ch === "'") {
       // Consume the whole string literal, including any '' escapes, so a
       // semicolon or comment-opener inside it is never mistaken for one.
@@ -68,8 +98,15 @@ export function splitSqlStatements(sql: string): string[] {
       continue;
     }
     if (ch === ";") {
+      if (isTrigger && depth > 0) {
+        current += ch;
+        i++;
+        continue;
+      }
       statements.push(current);
       current = "";
+      depth = 0;
+      isTrigger = null;
       i++;
       continue;
     }
@@ -101,7 +138,7 @@ export function migrate(db: Database, migrations: Migration[]): string[] {
     if (applied.has(m.id)) continue;
     if (!m.aliases?.some((alias) => applied.has(alias))) continue;
     db.run(
-      `INSERT INTO _migrations (id, applied_at) VALUES (?, ?)`,
+      `INSERT OR IGNORE INTO _migrations (id, applied_at) VALUES (?, ?)`,
       [m.id, Date.now()],
     );
     applied.add(m.id);
@@ -109,11 +146,21 @@ export function migrate(db: Database, migrations: Migration[]): string[] {
 
   const pending = migrations.filter((m) => !applied.has(m.id));
 
-  const applyOne = db.transaction((m: Migration) => {
+  // Each migration is checked and applied inside one BEGIN IMMEDIATE
+  // transaction. The `applied` set above is only a hint: a second connection
+  // migrating the same file concurrently may have applied this migration since
+  // it was read, so it is re-read here after the write lock is held (the loser
+  // of the lock waits on busy_timeout, then sees the row and skips).
+  const applyOne = db.transaction((m: Migration): boolean => {
+    const isApplied = (id: string) =>
+      db.query<{ id: string }, [string]>(`SELECT id FROM _migrations WHERE id = ?`).get(id) !== null;
+    if (isApplied(m.id) || m.aliases?.some(isApplied)) return false;
     for (const statement of splitSqlStatements(m.sql)) db.run(statement);
     db.run(`INSERT INTO _migrations (id, applied_at) VALUES (?, ?)`, [m.id, Date.now()]);
+    return true;
   });
 
-  for (const m of pending) applyOne(m);
-  return pending.map((m) => m.id);
+  const ran: string[] = [];
+  for (const m of pending) if (applyOne.immediate(m)) ran.push(m.id);
+  return ran;
 }

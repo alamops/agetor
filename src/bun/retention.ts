@@ -33,7 +33,7 @@
  * but `trimToolResultData` declines (not JSON, content already within budget
  * though the envelope is large) would be re-read by every daily pass forever,
  * so a task whose sweep COMPLETED is recorded in the `retention_swept_tasks`
- * table (`retentionSweeps` in db.ts) under a key of everything that could make a re-sweep find new
+ * table (`retentionSweeps`, `db-core/preferences.ts`) under a key of everything that could make a re-sweep find new
  * work — its `archived_at` (a re-archive moves it), the size threshold, and
  * its newest event id (a JSONL rebuild of an archived task appends rows) — and
  * skipped while that key still matches. A task cut short by an abort or an
@@ -52,7 +52,9 @@
  *
  * ## Cooperative scheduling
  *
- * bun:sqlite is synchronous, so a pass must not hog the event loop. Work runs
+ * The pass pages rows through the async database API (in production every
+ * query runs on the database worker) and trims them on the main thread, so it
+ * must not hog the event loop. Work runs
  * in slices of at most `sliceMs` (20 ms): the slice clock is checked after
  * every row parse and every chunk write, and when it has run out the pass
  * yields with `setImmediate`. Each slice is wrapped in
@@ -63,35 +65,36 @@
  * huge. A single row's `JSON.parse` cannot be interrupted — that residual is
  * what plan §8 A3 / §10 measure. Because the pass yields, a task can be
  * unarchived (a message sent to it, the Unarchive button) while it is
- * mid-way through that task: every chunk's write transaction therefore
- * re-reads the task's `archived_at` INSIDE the same synchronous transaction
- * and drops the chunk — and moves on to the next task — when the task is no
+ * mid-way through that task: every chunk's write is therefore one named op,
+ * `retention.writeChunk` (`db-core/ops/retention-ops.ts`), that re-reads the
+ * task's `archived_at` INSIDE its own transaction on the worker and drops the
+ * chunk — and moves on to the next task — when the task is no
  * longer archived past the cutoff, so a task that came back to life is never
  * trimmed after the fact.
  *
  * ## Compact
  *
- * {@link compactDatabase} runs `VACUUM` + `wal_checkpoint(TRUNCATE)` on the
- * shared connection. VACUUM is a single synchronous call that blocks the whole
- * core (every request, every SSE stream) for its full duration — roughly
- * {@link DB_COMPACT_SEC_PER_GB} s per GB of live data. That is owner-accepted
- * (plan §2.6); the route that calls it refuses while any run is active and the
- * UI shows a blocking modal with the estimate.
+ * {@link compactDatabase} runs `VACUUM` + `wal_checkpoint(TRUNCATE)` as one
+ * op, `retention.compact`, on the database worker's connection. VACUUM is a
+ * single synchronous call: the main thread keeps serving, but every database
+ * call (so nearly every request) waits behind it for its full duration —
+ * roughly {@link DB_COMPACT_SEC_PER_GB} s per GB of live data. That is
+ * owner-accepted (plan §2.6); the route that calls it refuses while any run is
+ * active and the UI shows a blocking modal with the estimate.
  *
  * ## SQL covered by the plan guard
  *
  * Every statement against `run_events` that this module issues goes through a
- * `runs.*` helper in `db.ts`; the one that is an exported constant is
- * {@link TOOL_RESULT_TRIM_SQL}, listed in {@link RETENTION_SQL}. The remaining
- * helpers (`runs.replaceEventData` — a primary-key UPDATE;
+ * `runs.*` helper in `db-core/runs.ts` (directly, or inside a `retention.*`
+ * op); the one that is an exported constant is {@link TOOL_RESULT_TRIM_SQL},
+ * listed in {@link RETENTION_SQL}. The remaining helpers
+ * (`runs.replaceEventData` — a primary-key UPDATE; `runs.maxEventIdForRun`;
  * `runs.runIdsForTask`, `tasks.archivedBefore` — `runs`/`tasks` only) are
- * inline in `db.ts` and are covered by the plan-guard test's method sweep.
+ * covered by the plan-guard test's method sweep.
  *
  * This module must not import `orchestrator.ts` (circularity): the server
  * passes `activeRunCount` into {@link dbStats}.
  */
-import { statSync } from "node:fs";
-import { join } from "node:path";
 import {
   ARCHIVED_HISTORY_RETENTION_PREF,
   DB_COMPACT_SEC_PER_GB,
@@ -101,7 +104,9 @@ import {
   type RetentionPassResult,
 } from "../shared/types";
 import { trimToolResultData, utf8Length } from "../shared/tool-result-trim";
-import { TOOL_RESULT_TRIM_SQL, dataDir, db, preferences, retentionSweeps, runs, tasks } from "./db";
+import { TOOL_RESULT_TRIM_SQL, op, preferences, retentionSweeps, runs, tasks } from "./db-async.ts";
+import type { RetentionRewrite } from "./db-core/ops/retention-ops.ts";
+import { getDbRpc } from "./db-rpc.ts";
 import { beginLagLabel } from "./event-loop-lag";
 import { cleanupHarnessSessionCopies } from "./harness-session-transfer";
 
@@ -138,10 +143,9 @@ const BYTES_PER_GB = 1e9;
 const PREF_LAST_RUN_AT = "retention:lastRunAt";
 const PREF_LAST_FREED_BYTES = "retention:lastFreedBytes";
 const PREF_LAST_TRIMMED_ROWS = "retention:lastTrimmedRows";
-/** What a completed sweep of `taskId` saw; unchanged → nothing new to trim. */
-function sweepKey(taskId: string, archivedAt: number, maxBytes: number, runIds: string[]): string {
-  let maxEventId = 0;
-  for (const runId of runIds) maxEventId = Math.max(maxEventId, runs.maxEventIdForRun(runId));
+/** What a completed sweep saw; unchanged → nothing new to trim. `maxEventId`
+ *  is the newest event id across the task's runs. */
+function sweepKey(archivedAt: number, maxBytes: number, maxEventId: number): string {
   return `${archivedAt}:${maxBytes}:${maxEventId}`;
 }
 
@@ -164,23 +168,19 @@ export function isRetentionRunning(): boolean {
 
 /** The effective retention age in days, or `null` when trimming is off —
  *  either `AGETOR_ARCHIVED_HISTORY_RETENTION=0` or the preference is `"off"`. */
-export function configuredRetentionDays(): number | null {
+export async function configuredRetentionDays(): Promise<number | null> {
   if (process.env.AGETOR_ARCHIVED_HISTORY_RETENTION === "0") return null;
-  return parseArchivedHistoryRetentionDays(preferences.get(ARCHIVED_HISTORY_RETENTION_PREF));
+  return parseArchivedHistoryRetentionDays(await preferences.get(ARCHIVED_HISTORY_RETENTION_PREF));
 }
 
 function emptyResult(): RetentionPassResult {
   return { scannedTasks: 0, scannedRuns: 0, trimmedRows: 0, freedBytes: 0, durationMs: 0, aborted: false };
 }
 
-/** True while `taskId` still exists and is archived at or before `cutoff`.
- *  A direct single-column read (not `tasks.get`, which also folds pipeline
- *  step aggregates) — it runs once per written chunk. */
-function stillEligible(taskId: string, cutoff: number): boolean {
-  const row = db
-    .query<{ archived_at: number | null }, [string]>(`SELECT archived_at FROM tasks WHERE id = ?`)
-    .get(taskId);
-  return row !== null && row.archived_at !== null && row.archived_at <= cutoff;
+/** True while `taskId` still exists and is archived at or before `cutoff`
+ *  (`retention.stillEligible`, a single-column read). */
+function stillEligible(taskId: string, cutoff: number): Promise<boolean> {
+  return op("retention.stillEligible", [taskId, cutoff]);
 }
 
 /**
@@ -226,14 +226,29 @@ export async function runArchivedHistoryRetentionPass(opts: {
     disposeLabel = beginLagLabel("archived-history retention");
     sliceStart = performance.now();
   };
+  // In worker mode a database call is a wait for the worker, not work on this
+  // thread: the label is down while it is in flight, so a stall elsewhere in
+  // that window is not blamed on retention. In-process mode (tests,
+  // `AGETOR_DB_MODE=inprocess`) runs the query on this thread, so it stays up.
+  const dbOnThisThread = getDbRpc().mode === "inprocess";
+  const dbHop = async <T,>(call: () => Promise<T>): Promise<T> => {
+    if (dbOnThisThread) return call();
+    disposeLabel?.();
+    disposeLabel = null;
+    try {
+      return await call();
+    } finally {
+      disposeLabel = beginLagLabel("archived-history retention");
+    }
+  };
 
   try {
     const cutoff = now - days * DAY_MS;
-    const candidates = tasks.archivedBefore(cutoff);
+    const candidates = await tasks.archivedBefore(cutoff);
     // A task that was unarchived (or fell out of the age window) since drops
     // out of the record here; a deleted one already went with its row.
-    retentionSweeps.pruneNotArchivedBefore(cutoff);
-    const sweptTasks = retentionSweeps.all();
+    await retentionSweeps.pruneNotArchivedBefore(cutoff);
+    const sweptTasks = await retentionSweeps.all();
     let pageLimit = INITIAL_PAGE_ROWS;
     taskLoop: for (const candidate of candidates) {
       // Every iteration — including the swept-task skip below, which is the
@@ -244,8 +259,8 @@ export async function runArchivedHistoryRetentionPass(opts: {
         result.aborted = true;
         break;
       }
-      const taskRunIds = runs.runIdsForTask(candidate.id);
-      const key = sweepKey(candidate.id, candidate.archivedAt, maxBytes, taskRunIds);
+      const { runIds: taskRunIds, maxEventId } = await dbHop(() => op("retention.taskSweepInputs", [candidate.id]));
+      const key = sweepKey(candidate.archivedAt, maxBytes, maxEventId);
       if (sweptTasks.get(candidate.id) === key) continue;
       // Harness-stack copies (docs/architecture/harness-stacks.md): an
       // archived task's transferred provider sessions are removed with the
@@ -254,7 +269,7 @@ export async function runArchivedHistoryRetentionPass(opts: {
       // handoff row and is retried on the next pass. Re-check eligibility
       // here: the candidate list is a snapshot and the pass yields, so the
       // user can unarchive this task between that read and this cleanup.
-      if (!stillEligible(candidate.id, cutoff)) continue;
+      if (!(await dbHop(() => stillEligible(candidate.id, cutoff)))) continue;
       try {
         await cleanupHarnessSessionCopies(candidate.id);
       } catch (err) {
@@ -272,34 +287,34 @@ export async function runArchivedHistoryRetentionPass(opts: {
             result.aborted = true;
             break taskLoop;
           }
-          const rows = runs.toolResultRowsForTrim(runId, maxBytes, afterId, limit);
+          const rows = await dbHop(() => runs.toolResultRowsForTrim(runId, maxBytes, afterId, limit));
           if (rows.length === 0) break;
           await yieldIfSliceSpent();
 
           let pageChars = 0;
           for (const row of rows) pageChars += row.data.length;
 
-          let pending: Array<{ id: number; data: string }> = [];
+          let pending: RetentionRewrite[] = [];
           let pendingChars = 0;
           let pendingFreed = 0;
           /** Writes the gathered rewrites in one transaction — but only while
            *  the task is still archived past the cutoff, checked inside that
-           *  same transaction (no yield can land between check and write).
-           *  Returns false when the task was unarchived meanwhile. */
-          const flush = (): boolean => {
+           *  same transaction on the worker (`retention.writeChunk`), so no
+           *  other write can land between check and write. Resolves false
+           *  when the task was unarchived meanwhile. */
+          const flush = async (): Promise<boolean> => {
             const batch = pending;
             const freed = pendingFreed;
             pending = [];
             pendingChars = 0;
             pendingFreed = 0;
-            if (batch.length === 0) return stillEligible(candidate.id, cutoff);
-            return db.transaction((): boolean => {
-              if (!stillEligible(candidate.id, cutoff)) return false;
-              for (const r of batch) runs.replaceEventData(r.id, r.data);
+            if (batch.length === 0) return dbHop(() => stillEligible(candidate.id, cutoff));
+            const written = await dbHop(() => op("retention.writeChunk", [candidate.id, cutoff, batch]));
+            if (written) {
               result.trimmedRows += batch.length;
               result.freedBytes += freed;
-              return true;
-            })();
+            }
+            return written;
           };
 
           for (const row of rows) {
@@ -314,11 +329,11 @@ export async function runArchivedHistoryRetentionPass(opts: {
                 pendingFreed += trimmed.originalBytes - newBytes;
               }
             }
-            if (pendingChars >= CHUNK_INPUT_BYTES && !flush()) continue taskLoop;
+            if (pendingChars >= CHUNK_INPUT_BYTES && !(await flush())) continue taskLoop;
             await yieldIfSliceSpent();
             if (abortRequested) break;
           }
-          if (!flush()) continue taskLoop;
+          if (!(await flush())) continue taskLoop;
           await yieldIfSliceSpent();
 
           // Size the next fetch from this page's average row (see
@@ -335,7 +350,7 @@ export async function runArchivedHistoryRetentionPass(opts: {
         break;
       }
       try {
-        retentionSweeps.set(candidate.id, key);
+        await dbHop(() => retentionSweeps.set(candidate.id, key));
       } catch (err) {
         // Worst case one extra sweep of this task next pass, never a skipped one.
         console.warn("[agetor] retention: could not record swept task:", err);
@@ -351,9 +366,9 @@ export async function runArchivedHistoryRetentionPass(opts: {
 
   if (!result.aborted) {
     try {
-      preferences.set(PREF_LAST_RUN_AT, String(Date.now()));
-      preferences.set(PREF_LAST_FREED_BYTES, String(result.freedBytes));
-      preferences.set(PREF_LAST_TRIMMED_ROWS, String(result.trimmedRows));
+      await preferences.set(PREF_LAST_RUN_AT, String(Date.now()));
+      await preferences.set(PREF_LAST_FREED_BYTES, String(result.freedBytes));
+      await preferences.set(PREF_LAST_TRIMMED_ROWS, String(result.trimmedRows));
     } catch (err) {
       console.warn("[agetor] retention: could not record bookkeeping:", err);
     }
@@ -373,25 +388,31 @@ function envMs(name: string, fallback: number): number {
 }
 
 /** Fire one scheduled/requested pass if retention is currently enabled, then
- *  chase a queued re-run. Never throws. */
+ *  chase a queued re-run. Never throws: a failed preference read or pass is
+ *  logged. */
 function startPass(): void {
-  const days = configuredRetentionDays();
-  if (days === null) {
-    rerunQueued = false;
-    return;
-  }
-  if (running) {
-    rerunQueued = true;
-    return;
-  }
-  void runArchivedHistoryRetentionPass({ days })
-    .catch((err) => console.warn("[agetor] retention pass failed:", err))
-    .finally(() => {
+  void (async () => {
+    const days = await configuredRetentionDays();
+    if (days === null) {
+      rerunQueued = false;
+      return;
+    }
+    // Checked after the read: `runArchivedHistoryRetentionPass` sets `running`
+    // synchronously when called, so of two starts racing the read, the second
+    // queues a re-run instead of being a silent no-op.
+    if (running) {
+      rerunQueued = true;
+      return;
+    }
+    try {
+      await runArchivedHistoryRetentionPass({ days });
+    } finally {
       if (rerunQueued) {
         rerunQueued = false;
         startPass();
       }
-    });
+    }
+  })().catch((err) => console.warn("[agetor] retention pass failed:", err));
 }
 
 /**
@@ -454,27 +475,7 @@ export function stopRetentionTimers(): void {
   if (running) abortRequested = true;
 }
 
-function fileBytes(path: string): number {
-  try {
-    return statSync(path).size;
-  } catch {
-    return 0;
-  }
-}
-
-function dbFileBytes(): { fileBytes: number; walBytes: number } {
-  const main = join(dataDir, "agetor.sqlite");
-  return { fileBytes: fileBytes(main), walBytes: fileBytes(`${main}-wal`) };
-}
-
-function pragmaNumber(name: string): number {
-  const row = db.query<Record<string, number>, []>(`PRAGMA ${name}`).get();
-  const v = row ? Object.values(row)[0] : 0;
-  return typeof v === "number" && Number.isFinite(v) ? v : 0;
-}
-
-function numberPref(key: string): number | null {
-  const raw = preferences.get(key);
+function numberPref(raw: string | null): number | null {
   if (raw === null) return null;
   const n = Number(raw);
   return raw.trim() !== "" && Number.isFinite(n) && n >= 0 ? n : null;
@@ -486,15 +487,16 @@ function numberPref(key: string): number | null {
  * `compactEstimateSec` = live bytes (`(page_count − freelist_count) ×
  * page_size`) / 1e9 × {@link DB_COMPACT_SEC_PER_GB}, at least 1.
  */
-export function dbStats(activeRunCount: number): DbStats {
-  const sizes = dbFileBytes();
-  const pageSize = pragmaNumber("page_size");
-  const pageCount = pragmaNumber("page_count");
-  const freelistCount = pragmaNumber("freelist_count");
+export async function dbStats(activeRunCount: number): Promise<DbStats> {
+  const { fileBytes, walBytes, pageSize, pageCount, freelistCount } = await op("retention.fileStats", []);
   const liveBytes = Math.max(0, pageCount - freelistCount) * pageSize;
+  const days = await configuredRetentionDays();
+  const lastRunAt = numberPref(await preferences.get(PREF_LAST_RUN_AT));
+  const lastFreedBytes = numberPref(await preferences.get(PREF_LAST_FREED_BYTES));
+  const lastTrimmedRows = numberPref(await preferences.get(PREF_LAST_TRIMMED_ROWS));
   return {
-    fileBytes: sizes.fileBytes,
-    walBytes: sizes.walBytes,
+    fileBytes,
+    walBytes,
     pageSize,
     pageCount,
     freelistCount,
@@ -502,34 +504,31 @@ export function dbStats(activeRunCount: number): DbStats {
     compactEstimateSec: Math.max(1, Math.round((liveBytes / BYTES_PER_GB) * DB_COMPACT_SEC_PER_GB)),
     activeRunCount,
     retention: {
-      days: configuredRetentionDays(),
-      lastRunAt: numberPref(PREF_LAST_RUN_AT),
-      lastFreedBytes: numberPref(PREF_LAST_FREED_BYTES),
-      lastTrimmedRows: numberPref(PREF_LAST_TRIMMED_ROWS),
+      days,
+      lastRunAt,
+      lastFreedBytes,
+      lastTrimmedRows,
       running,
     },
   };
 }
 
 /**
- * `VACUUM` the database and truncate the WAL. Synchronous and blocking by
- * nature (see the module doc) — the caller enforces the "no run active" 409
- * gate. Throws when a retention pass is running (the pass is mid-yield and its
- * writes would interleave with the rebuild).
+ * `VACUUM` the database and truncate the WAL, as one op on the database
+ * worker (`retention.compact`; see the module doc). The caller enforces the
+ * "no run active" 409 gate. Rejects when a retention pass is running (the pass
+ * is mid-yield and its writes would interleave with the rebuild); that check
+ * is synchronous, before anything is sent to the worker.
  */
-export function compactDatabase(): { beforeBytes: number; afterBytes: number; durationMs: number } {
+export async function compactDatabase(): Promise<{ beforeBytes: number; afterBytes: number; durationMs: number }> {
   if (running) throw new Error("a retention pass is running — try again when it finishes");
-  const before = dbFileBytes();
-  const beforeBytes = before.fileBytes + before.walBytes;
-  const startedAt = performance.now();
-  const dispose = beginLagLabel("compact database");
+  // The lag label names what blocks the main thread. Only in-process mode
+  // (tests, `AGETOR_DB_MODE=inprocess`) runs VACUUM on this thread; in worker
+  // mode a main-thread stall during Compact is someone else's.
+  const dispose = getDbRpc().mode === "inprocess" ? beginLagLabel("compact database") : null;
   try {
-    db.exec("VACUUM");
-    db.query("PRAGMA wal_checkpoint(TRUNCATE)").get();
+    return await op("retention.compact", []);
   } finally {
-    dispose();
+    dispose?.();
   }
-  const durationMs = Math.round(performance.now() - startedAt);
-  const after = dbFileBytes();
-  return { beforeBytes, afterBytes: after.fileBytes + after.walBytes, durationMs };
 }

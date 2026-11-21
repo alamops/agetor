@@ -72,7 +72,7 @@ beforeAll(() => {
 });
 
 afterAll(() => {
-  server.stop(true);
+  void server.stop(true);
 });
 
 function reset(s: typeof script = {}) {
@@ -512,7 +512,7 @@ describe("errors", () => {
   test("a transport failure is a status-0 NetworkError without the password", async () => {
     const dead = Bun.serve({ port: 0, hostname: "127.0.0.1", fetch: () => new Response("x") });
     const url = `http://127.0.0.1:${dead.port}`;
-    dead.stop(true);
+    void dead.stop(true);
     const err = await createOpencodeClient({ url, password: PASSWORD }).info().catch((e) => e);
     expect(err).toBeInstanceOf(OpencodeHttpError);
     expect(err).toMatchObject({ status: 0, tag: "NetworkError", op: "info" });
@@ -541,7 +541,7 @@ describe("errors", () => {
       expect(err.message).not.toContain(PASSWORD);
       expect(hits).toEqual([]);
     } finally {
-      target.stop(true);
+      void target.stop(true);
     }
   });
 
@@ -824,7 +824,7 @@ describe("openOpencodeEventStream", () => {
       expect(c.events).toHaveLength(0);
       expect(hits).toEqual([]);
     } finally {
-      target.stop(true);
+      void target.stop(true);
     }
   });
 
@@ -860,7 +860,7 @@ describe("openOpencodeEventStream", () => {
   test("a connection error reports 'error' without leaking the password", async () => {
     const dead = Bun.serve({ port: 0, hostname: "127.0.0.1", fetch: () => new Response("x") });
     const url = `http://127.0.0.1:${dead.port}`;
-    dead.stop(true);
+    void dead.stop(true);
     const c = collect();
     openOpencodeEventStream({ url, password: PASSWORD }, c.h);
     await until(() => c.closes.length === 1);

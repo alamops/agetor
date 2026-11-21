@@ -487,33 +487,33 @@ describe("hasPriorSessionForHarness", () => {
     return id;
   }
 
-  test("only an earlier run on the same account counts (the settling run is excluded)", () => {
+  test("only an earlier run on the same account counts (the settling run is excluded)", async () => {
     const account = alias("claude-code");
     const taskId = seedTask(`task-prior-${seq}`);
     const current = seedRun(taskId, account.id, "sess-current");
     // The settling run's own freshly-minted id is not a conversation yet.
-    expect(transfer.hasPriorSessionForHarness(taskId, "claude_session_id", account.id, current)).toBe(false);
+    expect(await transfer.hasPriorSessionForHarness(taskId, "claude_session_id", account.id, current)).toBe(false);
     seedRun(taskId, account.id, "sess-earlier", Date.now() - 1_000);
-    expect(transfer.hasPriorSessionForHarness(taskId, "claude_session_id", account.id, current)).toBe(true);
+    expect(await transfer.hasPriorSessionForHarness(taskId, "claude_session_id", account.id, current)).toBe(true);
   });
 
-  test("a different account's session does not count", () => {
+  test("a different account's session does not count", async () => {
     const a = alias("claude-code");
     const b = alias("claude-code");
     const taskId = seedTask(`task-prior-other-${seq}`);
     const current = seedRun(taskId, a.id, null);
     seedRun(taskId, b.id, "sess-b", Date.now() - 1_000);
-    expect(transfer.hasPriorSessionForHarness(taskId, "claude_session_id", a.id, current)).toBe(false);
-    expect(transfer.hasPriorSessionForHarness(taskId, "claude_session_id", b.id, current)).toBe(true);
+    expect(await transfer.hasPriorSessionForHarness(taskId, "claude_session_id", a.id, current)).toBe(false);
+    expect(await transfer.hasPriorSessionForHarness(taskId, "claude_session_id", b.id, current)).toBe(true);
   });
 
-  test("a legacy bare-kind run resolves to the built-in account", () => {
+  test("a legacy bare-kind run resolves to the built-in account", async () => {
     const taskId = seedTask(`task-prior-legacy-${seq}`);
     const current = seedRun(taskId, "claude-code", "sess-legacy", Date.now() - 1_000);
     const built = dbm.harnesses.getByIdOrKind("claude-code");
     if (!built) return;
-    expect(transfer.hasPriorSessionForHarness(taskId, "claude_session_id", built.id, "other-run")).toBe(true);
-    expect(transfer.hasPriorSessionForHarness(taskId, "claude_session_id", built.id, current)).toBe(false);
+    expect(await transfer.hasPriorSessionForHarness(taskId, "claude_session_id", built.id, "other-run")).toBe(true);
+    expect(await transfer.hasPriorSessionForHarness(taskId, "claude_session_id", built.id, current)).toBe(false);
   });
 });
 
@@ -532,7 +532,7 @@ describe("collectHarnessSessionCopies / removeHarnessSessionCopies (harness dele
       createdAt: Date.now(),
     });
 
-    const copies = transfer.collectHarnessSessionCopies(to.id);
+    const copies = await transfer.collectHarnessSessionCopies(to.id);
     expect(copies).toHaveLength(1);
     expect(copies[0]!.root).toBe(to.home);
     expect(copies[0]!.kind).toBe("claude-code");
@@ -582,8 +582,8 @@ describe("collectHarnessSessionCopies / removeHarnessSessionCopies (harness dele
       createdAt: Date.now(),
     });
 
-    await transfer.removeHarnessSessionCopies(transfer.collectHarnessSessionCopies(to.id));
-    await transfer.removeHarnessSessionCopies(transfer.collectHarnessSessionCopies(codexTo.id));
+    await transfer.removeHarnessSessionCopies(await transfer.collectHarnessSessionCopies(to.id));
+    await transfer.removeHarnessSessionCopies(await transfer.collectHarnessSessionCopies(codexTo.id));
     dbm.harnessSessionHandoffs.deleteForHarness(to.id);
     dbm.harnessSessionHandoffs.deleteForHarness(codexTo.id);
 
@@ -944,7 +944,7 @@ describe("transfer completeness and cleanup (fix round T4)", () => {
     dbm.harnessSessionHandoffs.upsert({
       taskId, harnessId: to.id, columnName: "claude_session_id", sessionId: sid, copiedPaths: [], createdAt: 0,
     });
-    expect(transfer.findSessionIdForHarness(taskId, "claude_session_id", to.id)).toBeNull();
+    expect(await transfer.findSessionIdForHarness(taskId, "claude_session_id", to.id)).toBeNull();
 
     const oldSid = "66666666-6666-4666-8666-666666666666";
     write(path.join(from.home, "projects", column, `${oldSid}.jsonl`), "old");
@@ -1057,7 +1057,7 @@ describe("TT-B: fix-round transfer regressions", () => {
     const result = await run(from, to, taskId);
     expect(result.ok).toBe(false);
     expect(dbm.harnessSessionHandoffs.get(taskId, to.id, "claude_session_id")).toBeNull();
-    expect(transfer.findSessionIdForHarness(taskId, "claude_session_id", to.id)).toBeNull();
+    expect(await transfer.findSessionIdForHarness(taskId, "claude_session_id", to.id)).toBeNull();
   });
 
   test("a sidecar entry that cannot be copied becomes a warning; the transfer still succeeds", async () => {
@@ -1376,7 +1376,7 @@ describe("orphaned handoff copies (migration 088)", () => {
     for (const f of newFiles) expect(existsSync(f)).toBe(true);
     // The old row was never touched: its session is still the resumable one.
     expect(dbm.harnessSessionHandoffs.get(taskId, to.id, "claude_session_id")).toEqual(oldRow);
-    expect(transfer.findSessionIdForHarness(taskId, "claude_session_id", to.id)).toBe(oldSid);
+    expect(await transfer.findSessionIdForHarness(taskId, "claude_session_id", to.id)).toBe(oldSid);
 
     await transfer.sweepOrphanedHandoffCopiesAtBoot();
     for (const f of oldFiles) expect(existsSync(f)).toBe(true);
@@ -1696,7 +1696,7 @@ describe("orphaned handoff copies (migration 088)", () => {
     const file = path.join(to.home, "projects", "enc", `${oldSid}.jsonl`);
     write(file, "x");
     dbm.harnessOrphanedCopies.add(to.id, "claude_session_id", oldSid, [file]);
-    const copies = transfer.collectHarnessSessionCopies(to.id);
+    const copies = await transfer.collectHarnessSessionCopies(to.id);
     expect(copies).toEqual([expect.objectContaining({ sessionId: oldSid, paths: [file] })]);
     dbm.harnesses.delete(to.id);
     expect(dbm.harnessOrphanedCopies.list({ harnessId: to.id })).toEqual([]);
@@ -1782,7 +1782,7 @@ describe("orphan and handoff records whose column is not the account's kind (rev
       taskId, harnessId: codexAcct.id, columnName: "claude_session_id", sessionId: sid,
       copiedPaths: [codexAcct.file], createdAt: 1,
     });
-    const copies = transfer.collectHarnessSessionCopies(codexAcct.id);
+    const copies = await transfer.collectHarnessSessionCopies(codexAcct.id);
     expect(copies).toEqual([]);
     dbm.harnesses.delete(codexAcct.id);
     await transfer.removeHarnessSessionCopies(copies);
@@ -1801,5 +1801,39 @@ describe("orphan and handoff records whose column is not the account's kind (rev
     expect(await transfer.cleanupHarnessSessionCopies(taskId)).toEqual([]);
     expect(readFileSync(claudeAcct.file, "utf8")).toBe("live codex rollout");
     expect(dbm.harnessSessionHandoffs.get(taskId, claudeAcct.id, "codex_session_id")).toBeNull();
+  });
+});
+
+// ---------------------------------------------------------------------------
+// The pure halves of the session-id rule, shared by the async lookup here and
+// the orchestrator's synchronous spawn paths (non-blocking-core T10b-1).
+// ---------------------------------------------------------------------------
+describe("session id rule helpers", () => {
+  const handoff = (createdAt: number) => ({
+    taskId: "t", harnessId: "h", columnName: "claude_session_id" as const, sessionId: "handoff-sid", copiedPaths: [], createdAt,
+  });
+
+  test("handoffSessionWins: newer than the account's own run, none recorded, or an unfinished (stamp 0) intent", async () => {
+    const transfer = await import("./harness-session-transfer.ts");
+    expect(transfer.handoffSessionWins(null, null)).toBeNull();
+    expect(transfer.handoffSessionWins(handoff(0), null)).toBeNull();
+    expect(transfer.handoffSessionWins(handoff(100), null)).toBe("handoff-sid");
+    expect(transfer.handoffSessionWins(handoff(100), { startedAt: 100 })).toBe("handoff-sid");
+    expect(transfer.handoffSessionWins(handoff(100), { startedAt: 101 })).toBeNull();
+  });
+
+  test("sessionFromRuns: the first row whose agent resolves to the harness, through a map or a function", async () => {
+    const transfer = await import("./harness-session-transfer.ts");
+    const rows = [
+      { agent: "claude-code", sessionId: "legacy-newest" },
+      { agent: "acct-b", sessionId: "b-sid" },
+      { agent: "acct-a", sessionId: "a-sid" },
+    ];
+    // A legacy bare kind resolves to the built-in's id.
+    const ids = new Map([["claude-code", "builtin"]]);
+    expect(transfer.sessionFromRuns(rows, "builtin", ids)).toBe("legacy-newest");
+    expect(transfer.sessionFromRuns(rows, "acct-a", ids)).toBe("a-sid");
+    expect(transfer.sessionFromRuns(rows, "acct-zzz", ids)).toBeNull();
+    expect(transfer.sessionFromRuns(rows, "builtin", (agent) => (agent === "claude-code" ? "builtin" : agent))).toBe("legacy-newest");
   });
 });

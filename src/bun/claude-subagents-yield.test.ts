@@ -122,20 +122,21 @@ test("manual mode: ready is already resolved, the first pump() runs the first cy
   writeFileSync(path.join(subagentsDir, `agent-${agentId}.jsonl`), sidechainLines("m1", 3));
 
   const w = attachSubagentWatcher({ taskId, jsonlPath, manual: true });
+  await w.ready;
   // The seed ran synchronously inside attach; the first cycle has not.
   expect(await isResolved(w.ready)).toBe(true);
   expect(await isResolved(w.settled)).toBe(false);
   expect(await subagentEventCount(taskId)).toBe(0);
   expect(subagents.listForTask(taskId).length).toBe(0);
 
-  w.pump(Date.now());
+  await w.pump(Date.now());
   expect(await subagentEventCount(taskId)).toBe(3);
   expect(subagents.listForTask(taskId).map((s) => s.id)).toEqual([agentId]);
   expect(await isResolved(w.settled)).toBe(true);
 
   // Later pumps keep tailing (steady state), unchanged from the old semantics.
   appendFileSync(path.join(subagentsDir, `agent-${agentId}.jsonl`), sidechainLines("m1", 2, 3));
-  w.pump(Date.now());
+  await w.pump(Date.now());
   expect(await subagentEventCount(taskId)).toBe(5);
   w.detach();
 });
@@ -143,7 +144,7 @@ test("manual mode: ready is already resolved, the first pump() runs the first cy
 test("a GitHub Copilot subagent row is never seeded or tailed by the Claude watcher (copilot -> claude-code switch)", async () => {
   const { attachSubagentWatcher } = await import("./claude-subagents.ts");
   const { subagents } = await import("./db.ts");
-  const { taskId, runId, jsonlPath, now } = await seed();
+  const { taskId, runId, jsonlPath, subagentsDir, now } = await seed();
   // A file of Claude-shaped lines at the row's `sourcePath`: were the row seeded
   // as a JSONL subagent, the first cycle would tail and persist all of them.
   const foreignLog = path.join(FIXTURE_DIR, `copilot-log-${randomUUID()}.jsonl`);
@@ -154,17 +155,22 @@ test("a GitHub Copilot subagent row is never seeded or tailed by the Claude watc
     description: "copilot helper", spawnDepth: 1, sourcePath: foreignLog, toolUseId: "call_sub",
     status: "completed", startedAt: now - 5_000, endedAt: now - 1_000,
   });
-  // Control row on the same file, seeded the ordinary way, so a skip that
-  // stopped working (or a fixture that can't be tailed) fails this test.
+  // Control row with the same lines, seeded the ordinary way (its file sits in
+  // the watcher's subagents dir, the only place the transcript worker reads
+  // from), so a skip that stopped working (or a fixture that can't be tailed)
+  // fails this test.
   const controlId = "ctl0aaaaaaaa";
+  const controlLog = path.join(subagentsDir, `agent-${controlId}.jsonl`);
+  writeFileSync(controlLog, sidechainLines("cp", 4));
   subagents.insertIfAbsent({
     id: controlId, taskId, runId, parentKind: "subagent", agentType: "general-purpose",
-    description: "control", spawnDepth: 1, sourcePath: foreignLog, toolUseId: "toolu_ctl",
+    description: "control", spawnDepth: 1, sourcePath: controlLog, toolUseId: "toolu_ctl",
     status: "completed", startedAt: now - 4_000, endedAt: now - 1_000,
   });
 
   const w = attachSubagentWatcher({ taskId, jsonlPath, manual: true });
-  w.pump(Date.now());
+  await w.ready;
+  await w.pump(Date.now());
   const { db } = await import("./db.ts");
   const perSubagent = (id: string) =>
     db.query<{ c: number }, [string]>(`SELECT COUNT(*) c FROM run_events WHERE subagent_id = ?`).get(id)!.c;
@@ -188,7 +194,7 @@ test("production mode: pump() is a no-op while the seed / first cycle is pending
   const w = attachSubagentWatcher({ taskId, jsonlPath });
   // Synchronously after attach the first cycle cannot have started (it begins
   // FAST_POLL_MS after the seed), so a pump() here lands in the pending window.
-  w.pump(Date.now());
+  await w.pump(Date.now());
   expect(await subagentEventCount(taskId)).toBe(0);
   expect(subagents.listForTask(taskId).length).toBe(0);
 
@@ -196,7 +202,7 @@ test("production mode: pump() is a no-op while the seed / first cycle is pending
   // FAST_POLL_MS beat, and `ready` resolves strictly before `settled`.
   await w.ready;
   expect(await isResolved(w.settled)).toBe(false);
-  w.pump(Date.now());
+  await w.pump(Date.now());
   expect(await subagentEventCount(taskId)).toBe(0);
   expect(subagents.listForTask(taskId).length).toBe(0);
 
@@ -210,7 +216,7 @@ test("production mode: pump() is a no-op while the seed / first cycle is pending
   const secondId = "p2cccccccccc";
   writeFileSync(path.join(subagentsDir, `agent-${secondId}.jsonl`), sidechainLines("p2", 4));
   const before = await subagentEventCount(taskId);
-  w.pump(Date.now());
+  await w.pump(Date.now());
   expect(await subagentEventCount(taskId)).toBe(before + 2 + 4);
   expect(subagents.listForTask(taskId).map((s) => s.id).sort()).toEqual([agentId, secondId].sort());
   w.detach();
@@ -247,14 +253,14 @@ test("syncSettled for an id that is not rehydrated yet is a no-op, and the row l
   expect(() => w.syncSettled(monitorId, "completed", now, "receipt")).not.toThrow();
   // A notification for the not-yet-tracked monitor is likewise refused.
   const terminal = `<task-notification>\n<task-id>${monitorId}</task-id>\n<status>stopped</status>\n</task-notification>`;
-  expect(w.applyMonitorNotification(monitorId, terminal)).toBe(false);
+  expect(await w.applyMonitorNotification(monitorId, terminal)).toBe(false);
   expect(subagents.get(monitorId)!.status).toBe("running");
 
   await w.ready;
   // Rehydrated with the DB's status (running), NOT with the pre-seed sync: a
   // terminal receipt now takes effect on the in-memory state and settles the row.
   expect(w.hasMonitor(monitorId)).toBe(true);
-  expect(w.applyMonitorNotification(monitorId, terminal)).toBe(true);
+  expect(await w.applyMonitorNotification(monitorId, terminal)).toBe(true);
   expect(subagents.get(monitorId)!.status).toBe("completed");
   w.detach();
 });
@@ -286,7 +292,7 @@ test("a monitor activity notification that lands mid-seed takes the DB path and 
   // The map is incomplete mid-seed, so "no monitors" can't be claimed.
   expect(w.hasAnyMonitor()).toBe(true);
   const activity = `<task-notification>\n<task-id>${monitorId}</task-id>\n<event>tick 1</event>\n</task-notification>`;
-  handleBackgroundTaskNotification(taskId, monitorId, activity);
+  await handleBackgroundTaskNotification(taskId, monitorId, activity);
   // Used to take the `!hasAnyMonitor()` receipt shortcut and settle the row.
   expect(subagents.get(monitorId)!.status).toBe("running");
 
@@ -321,7 +327,7 @@ test("a row whose status changes while the seed is mid-flight is rehydrated with
   expect(w.hasMonitor(monitorId)).toBe(false);
   // Mid-seed activity reopens the row through the DB path.
   const activity = `<task-notification>\n<task-id>${monitorId}</task-id>\n<event>tick 2</event>\n</task-notification>`;
-  handleBackgroundTaskNotification(taskId, monitorId, activity);
+  await handleBackgroundTaskNotification(taskId, monitorId, activity);
   expect(subagents.get(monitorId)!.status).toBe("running");
 
   await w.ready;
@@ -330,7 +336,7 @@ test("a row whose status changes while the seed is mid-flight is rehydrated with
   // its terminal receipt below was latched without settling the row — which
   // then stayed `running` (holding the task) forever.
   const terminal = `<task-notification>\n<task-id>${monitorId}</task-id>\n<status>completed</status>\n</task-notification>`;
-  w.applyMonitorNotification(monitorId, terminal);
+  await w.applyMonitorNotification(monitorId, terminal);
   expect(subagents.get(monitorId)!.status).toBe("completed");
   w.detach();
 });
@@ -389,7 +395,7 @@ test("detach() mid-seed stops the job — no events are persisted afterwards —
   await Bun.sleep(900);
   expect(await subagentEventCount(t.taskId)).toBe(baseline);
   // A pump() on a detached handle stays inert too.
-  w.pump(Date.now());
+  await w.pump(Date.now());
   expect(await subagentEventCount(t.taskId)).toBe(baseline);
 });
 
@@ -411,11 +417,11 @@ test("AGETOR_TRACK_SUBAGENTS=0 (read at module load) yields a disabled stub whos
   const w = mod.attachSubagentWatcher({ taskId, jsonlPath });
   expect(await isResolved(w.ready)).toBe(true);
   expect(await isResolved(w.settled)).toBe(true);
-  w.pump(Date.now());
+  await w.pump(Date.now());
   w.syncSettled("whatever", "completed", Date.now());
   expect(w.hasMonitor("whatever")).toBe(false);
   expect(w.hasAnyMonitor()).toBe(false);
-  expect(w.applyMonitorNotification("whatever", "x")).toBe(false);
+  expect(await w.applyMonitorNotification("whatever", "x")).toBe(false);
   w.detach();
   await Bun.sleep(700); // past FAST_POLL_MS: nothing is ever tailed
   expect(await subagentEventCount(taskId)).toBe(0);

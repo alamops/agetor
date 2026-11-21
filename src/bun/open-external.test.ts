@@ -14,7 +14,7 @@ process.env.AGETOR_API_PORT = "4423";
 // Same approach as notifications.test.ts. The recorded array lets each test
 // assert what the route ultimately handed to the OS.
 const opened: string[] = [];
-mock.module("electrobun/bun", () => ({
+void mock.module("electrobun/bun", () => ({
   Utils: {
     openExternal: (url: string) => {
       opened.push(url);

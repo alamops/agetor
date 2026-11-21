@@ -265,6 +265,36 @@ test("approve of an edited plan sends the edited text", async () => {
   await deleteWhenSettled(id);
 });
 
+test("a plan record written while the approval is being delivered survives the approve", async () => {
+  const { id, task } = await newPlannedTask();
+  const plan = task.plans[0]!;
+  const LATE_ID = "late-plan-written-during-send";
+  // The approval's `user` event is emitted from the follow-up spawn, inside
+  // the route's `sendInput` await: land a concurrent `plans` write right then.
+  const { subscribe } = await import("./orchestrator.ts");
+  let wrote = false;
+  const unsubscribe = subscribe((e) => {
+    if (wrote || e.taskId !== id || e.stream !== "user" || !e.data.includes("The plan is approved")) return;
+    wrote = true;
+    const cur = tasks.get(id)!;
+    tasks.update(id, { plans: [...cur.plans, { ...plan, id: LATE_ID, status: "superseded" }] });
+  });
+  let res: Response;
+  try {
+    res = await approve(id, plan.id);
+  } finally {
+    unsubscribe();
+  }
+  expect(wrote).toBe(true);
+  expect(res.status).toBe(200);
+  const body = (await res.json()) as Task;
+  expect(body.plans.find((p) => p.id === plan.id)!.status).toBe("approved");
+  expect(body.plans.find((p) => p.id === LATE_ID)?.status).toBe("superseded");
+  expect(tasks.get(id)!.plans.map((p) => p.id)).toContain(LATE_ID);
+
+  await deleteWhenSettled(id);
+});
+
 test("approve on a profile-bound plan-mode copilot task keeps plan and returns the warning", async () => {
   const { id, task } = await newPlannedTask({ mode: "plan" });
   const plan = task.plans[0]!;

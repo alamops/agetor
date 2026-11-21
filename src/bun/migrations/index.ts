@@ -125,6 +125,7 @@ import m090 from "./090_harness_mirror_backup_folder.sql" with { type: "text" };
 // alias so a dev DB that already applied it is not re-migrated).
 import m091 from "./091_task_repositories.sql" with { type: "text" };
 import m092 from "./092_task_base_branch_and_prs.sql" with { type: "text" };
+import m093 from "./093_task_revs.sql" with { type: "text" };
 
 
 import type { Migration } from "../migrate.ts";
@@ -235,4 +236,5 @@ export const migrations: Migration[] = [
   { id: "090_harness_mirror_backup_folder", sql: m090 },
   { id: "091_task_repositories", sql: m091, aliases: ["087_task_repositories"] },
   { id: "092_task_base_branch_and_prs", sql: m092 },
+  { id: "093_task_revs", sql: m093 },
 ];

@@ -85,6 +85,9 @@ const CHILD_PAGE_LIMIT = 200;
 const CHILD_MAX_PAGES = 10;
 /** Cap on the server-supplied text that is folded into an error message. */
 const MAX_ERROR_TEXT_CHARS = 300;
+/** How much of a server-supplied error text is ever redacted: far above the
+ *  300 characters shown, so whitespace collapsing cannot starve the output. */
+const MAX_ERROR_SOURCE_CHARS = 16 * 1024;
 /** The most bytes of one request op's response body the client reads. */
 export const OPENCODE_MAX_RESPONSE_BYTES = 32 * 1024 * 1024;
 
@@ -151,7 +154,7 @@ export function redactSecrets(text: string, password?: string): string {
       if (secret) out = out.split(secret).join("[redacted]");
     }
   }
-  return (
+  return redactUserinfo(
     out
       // A quoted value, double- or single-quoted, its key quoted either way too
       // (`password: "a b"`, `"password":"x"`, `'password': 'x'`, `password "x"`),
@@ -162,19 +165,135 @@ export function redactSecrets(text: string, password?: string): string {
       // starts with a quote, so a value the lines above redacted stays as it is.
       .replace(/(password(?:["']?\s*[=:]\s*|\s+))(?!["'])\S+/gi, "$1[redacted]")
       .replace(/(authorization["']?\s*[:=]\s*["']?)(?:(?:basic|bearer)\s+)?[^\s"']+/gi, "$1[redacted]")
-      .replace(/\b(basic|bearer)(\s+)[A-Za-z0-9+/=._~-]{8,}/gi, "$1$2[redacted]")
-      // URL userinfo (`http://opencode:pw@127.0.0.1`, `opencode:pw@host`): the
-      // password part, whatever the user name.
-      .replace(/([a-z][a-z0-9+.-]*:\/\/|^|[\s"'(<=,;[{])([^\s:/@"'<>]+):(?!\/\/)[^\s@"'<>]+@/gi, "$1$2:[redacted]@")
+      .replace(/\b(basic|bearer)(\s+)[A-Za-z0-9+/=._~-]{8,}/gi, "$1$2[redacted]"),
   );
+}
+
+// Character classes of the URL-userinfo scan, as 7-bit tables built from the
+// regex classes they mirror (anything above 0x7f falls back to the regex).
+const NON_ASCII_SPACE = /\s/;
+const isSpace = (c: number): boolean => (c < 128 ? c === 32 || (c >= 9 && c <= 13) : NON_ASCII_SPACE.test(String.fromCharCode(c)));
+const isLetter = (c: number): boolean => (c >= 65 && c <= 90) || (c >= 97 && c <= 122);
+// [a-z0-9+.-] with the i flag: a scheme's characters after its first letter.
+const isSchemeChar = (c: number): boolean => isLetter(c) || (c >= 48 && c <= 57) || c === 43 || c === 46 || c === 45;
+// A character that may precede a user name when no scheme does: [\s"'(<=,;[{].
+const isLeadDelimiter = (c: number): boolean =>
+  isSpace(c) || c === 34 || c === 39 || c === 40 || c === 60 || c === 61 || c === 44 || c === 59 || c === 91 || c === 123;
+// [^\s:/@"'<>]: a user name.
+const isUserChar = (c: number): boolean =>
+  !(isSpace(c) || c === 58 || c === 47 || c === 64 || c === 34 || c === 39 || c === 60 || c === 62);
+// [^\s@"'<>]: a password (a user name's class plus `:` and `/`).
+const isPasswordChar = (c: number): boolean => !(isSpace(c) || c === 64 || c === 34 || c === 39 || c === 60 || c === 62);
+
+/** The index one past the run of characters satisfying `test` that starts at `from`. */
+function runEnd(text: string, from: number, test: (c: number) => boolean): number {
+  let i = from;
+  while (i < text.length && test(text.charCodeAt(i))) i++;
+  return i;
+}
+
+/**
+ * URL userinfo (`http://opencode:pw@127.0.0.1`, `opencode:pw@host`): the
+ * password part, whatever the user name. A linear scan; the regex it replaces,
+ * `/([a-z][a-z0-9+.-]*:\/\/|^|[\s"'(<=,;[{])([^\s:/@"'<>]+):(?!\/\/)[^\s@"'<>]+@/gi`
+ * replaced with `$1$2:[redacted]@`, re-scanned the same long token from every
+ * start and took quadratic time on a long run with no whitespace.
+ *
+ * A match is a prefix (a scheme and `://`, the start of the text, or one
+ * delimiter character), a user name, `:` not followed by `//`, a password and
+ * `@`. Each character class excludes the character that ends its run, so a run
+ * never backtracks and each one is measured once: the run lengths after a
+ * start are cached by the index they end at, which keeps the scan O(n).
+ */
+let userinfoScans = 0;
+
+/** Test-only: how many times `redactUserinfo` got past its early return and
+ *  ran the scan (so a timing test can prove its input reached the scan). */
+export function __userinfoScanCountForTest(): number {
+  return userinfoScans;
+}
+
+function redactUserinfo(text: string): string {
+  // Every match ends in `@` and holds a `:`.
+  if (!text.includes("@") || !text.includes(":")) return text;
+  userinfoScans++;
+  const n = text.length;
+  // userEnd/passEnd memoize runEnd for a run start already measured; a start
+  // inside a measured run is answered from the run's end without a rescan.
+  const userEnds = new Int32Array(n + 1).fill(-1);
+  const passEnds = new Int32Array(n + 1).fill(-1);
+  const schemeEnds = new Int32Array(n + 1).fill(-1);
+  const measure = (cache: Int32Array, from: number, test: (c: number) => boolean): number => {
+    const known = cache[from] ?? -1;
+    if (known >= 0) return known;
+    const end = runEnd(text, from, test);
+    // Every start of the run ends at the same index.
+    for (let k = from; k < end; k++) cache[k] = end;
+    cache[end] = end;
+    return end;
+  };
+  /** Where the userinfo after `from` ends (past its `@`), or -1 when none starts there. */
+  const userinfoEnd = (from: number): number => {
+    const userEnd = measure(userEnds, from, isUserChar);
+    if (userEnd === from || text.charCodeAt(userEnd) !== 58 || text.startsWith("//", userEnd + 1)) return -1;
+    const passEnd = measure(passEnds, userEnd + 1, isPasswordChar);
+    if (passEnd === userEnd + 1 || text.charCodeAt(passEnd) !== 64) return -1;
+    return passEnd + 1;
+  };
+  let out = "";
+  let copied = 0; // text[0, copied) is already in `out`
+  let i = 0;
+  while (i < n) {
+    const c = text.charCodeAt(i);
+    let userStart = -1;
+    let end = -1;
+    // The alternatives in the order of the pattern: scheme, start of text, delimiter.
+    if (isLetter(c)) {
+      const schemeEnd = measure(schemeEnds, i, isSchemeChar);
+      if (text.startsWith("://", schemeEnd)) {
+        userStart = schemeEnd + 3;
+        end = userinfoEnd(userStart);
+      }
+    }
+    if (end < 0 && i === 0) {
+      userStart = 0;
+      end = userinfoEnd(0);
+    }
+    if (end < 0 && isLeadDelimiter(c)) {
+      userStart = i + 1;
+      end = userinfoEnd(userStart);
+    }
+    if (end < 0) {
+      i++;
+      continue;
+    }
+    const userEnd = userEnds[userStart] ?? userStart;
+    out += text.slice(copied, userEnd + 1) + "[redacted]@";
+    copied = end;
+    i = end;
+  }
+  return copied === 0 ? text : out + text.slice(copied);
 }
 
 /** Server-supplied text folded into an error: redacted, control characters
  *  flattened, capped. (Printing it to a terminal still goes through
  *  `escapeFreeText` at the call site.) */
-function safeErrorText(text: string, password: string): string {
+export function safeErrorText(text: string, password: string): string {
+  // Bound the input BEFORE redacting: the redactor allocates per character
+  // (the userinfo scan keeps three Int32Array(n + 1)), so a multi-megabyte
+  // server body must never reach it. The output is capped at
+  // MAX_ERROR_TEXT_CHARS anyway, so only a prefix can be shown. When the text
+  // was cut, the (possibly partial) token at the cut is dropped too, so half
+  // a secret straddling the boundary can never survive redaction.
+  let bounded = text;
+  if (text.length > MAX_ERROR_SOURCE_CHARS) {
+    bounded = text.slice(0, MAX_ERROR_SOURCE_CHARS);
+    let end = bounded.length;
+    while (end > 0 && !isSpace(bounded.charCodeAt(end - 1))) end--;
+    if (end > 0) bounded = bounded.slice(0, end);
+  }
   // eslint-disable-next-line no-control-regex
-  const flat = redactSecrets(text, password).replace(/[\u0000-\u001f\u007f]+/g, " ").trim();
+  const flat = redactSecrets(bounded, password).replace(/[\u0000-\u001f\u007f]+/g, " ").trim();
   return flat.length > MAX_ERROR_TEXT_CHARS ? `${flat.slice(0, MAX_ERROR_TEXT_CHARS)}...` : flat;
 }
 

@@ -1,4 +1,4 @@
-import { existsSync, lstatSync, mkdirSync, readdirSync, rmSync } from "node:fs";
+import { lstat, mkdir, readdir, rm, stat } from "node:fs/promises";
 import { homedir } from "node:os";
 import path from "node:path";
 import type { CloneProgressPhase, GitProvider } from "../shared/types.ts";
@@ -9,7 +9,7 @@ import {
   isValidCloneHost,
   parseCloneInput,
 } from "../shared/clone-input.ts";
-import { apiHostForRemote, bitbucketCreds, gitlabToken } from "./git-provider.ts";
+import { bitbucketCreds, gitlabToken, resolveForgeApiHost } from "./git-provider.ts";
 import { githubToken, run } from "./github.ts";
 import { coreSpawn } from "./core-spawn.ts";
 import { bitbucketServerError } from "./bitbucket.ts";
@@ -24,7 +24,7 @@ import { bitbucketServerError } from "./bitbucket.ts";
  * syntactic parsing (which shape was pasted, what host/path it names) lives
  * in the shared, host-resolution-free `../shared/clone-input.ts` — this
  * module is the layer on top that applies the Git integration's REAL host
- * rules (`ssh -G` alias resolution via `apiHostForRemote`, Bitbucket
+ * rules (`ssh -G` alias resolution via `resolveForgeApiHost`, Bitbucket
  * Server/Data Center rejection via `bitbucketServerError`, per-provider
  * credential resolution) on top of that syntax, because none of that can run
  * in the webview. Everything here is deterministic and unit-tested. The
@@ -108,7 +108,7 @@ function rejectedCloudPort(
  * Per-provider https rules mirror the Git integration's own resolvers
  * exactly, so "what clones" and "what the Git integration dialog already
  * talks to" never drift:
- *  - **GitHub**: `apiHostForRemote` must resolve to `github.com` — GitHub
+ *  - **GitHub**: `resolveForgeApiHost` must resolve to `github.com` — GitHub
  *    Enterprise Server has no https support here (the integration doesn't
  *    support it either), and a dotless unresolved alias gets the SSH hint
  *    instead (nothing to reject-with-detail, since ssh told us nothing).
@@ -142,10 +142,10 @@ function rejectedCloudPort(
  * rejected up front via the same `bitbucketServerError` guard, since Server/DC
  * speaks neither this module's REST adapter nor (obviously) this clone flow.
  */
-export function resolveCloneRepo(
+export async function resolveCloneRepo(
   input: string,
   shorthandProvider: GitProvider = "github",
-): ResolveCloneResult {
+): Promise<ResolveCloneResult> {
   const parsed = parseCloneInput(input, shorthandProvider);
   if (!parsed.ok) return { ok: false, error: parsed.error };
   const v = parsed.value;
@@ -169,7 +169,7 @@ export function resolveCloneRepo(
   if (v.transport === "ssh") {
     const rawHost = v.rawHost!;
     if (v.provider === "bitbucket") {
-      const serverError = bitbucketServerError({
+      const serverError = await bitbucketServerError({
         provider: "bitbucket",
         host: "bitbucket.org",
         remoteHost: rawHost,
@@ -198,7 +198,7 @@ export function resolveCloneRepo(
 
   // https / http.
   const rawHost = v.rawHost!;
-  const resolved = apiHostForRemote(rawHost);
+  const resolved = await resolveForgeApiHost(rawHost);
 
   if (v.provider === "github") {
     if (resolved !== "github.com") {
@@ -297,7 +297,7 @@ export function resolveCloneRepo(
   }
 
   // Bitbucket.
-  const serverError = bitbucketServerError({
+  const serverError = await bitbucketServerError({
     provider: "bitbucket",
     host: "bitbucket.org",
     remoteHost: rawHost,
@@ -1410,6 +1410,16 @@ async function runGitClone(
   }
 }
 
+/** Async `existsSync`: true when the path can be stat-ed (following links). */
+async function pathExists(p: string): Promise<boolean> {
+  try {
+    await stat(p);
+    return true;
+  } catch {
+    return false;
+  }
+}
+
 /** Refuses an existing non-empty destination (git would too, but this gives
  *  a clean message instead of git's stderr); creates the destination's
  *  parent directory otherwise. Shared by `cloneRepo`'s pre-attempt-1 check
@@ -1417,11 +1427,11 @@ async function runGitClone(
  *  §3 D4) — the second call is a no-op in the common case (git already left
  *  `dest` exactly as this function would), and only matters when something
  *  external changed `dest` between the two attempts. */
-function checkCloneDestination(dest: string): CloneResult {
-  if (existsSync(dest)) {
+async function checkCloneDestination(dest: string): Promise<CloneResult> {
+  if (await pathExists(dest)) {
     let empty = false;
     try {
-      empty = readdirSync(dest).length === 0;
+      empty = (await readdir(dest)).length === 0;
     } catch {
       return { ok: false, error: `destination is not a readable directory: ${dest}` };
     }
@@ -1429,7 +1439,7 @@ function checkCloneDestination(dest: string): CloneResult {
     return { ok: true };
   }
   try {
-    mkdirSync(path.dirname(dest), { recursive: true });
+    await mkdir(path.dirname(dest), { recursive: true });
   } catch (err) {
     return { ok: false, error: `cannot create parent directory: ${String(err)}` };
   }
@@ -1457,7 +1467,7 @@ function checkCloneDestination(dest: string): CloneResult {
  *    long-running clone between `checkCloneDestination` and this point, and
  *    blindly recursing through whatever now sits at that path — possibly a
  *    symlink to somewhere that has nothing to do with this clone — would be
- *    a TOCTOU deletion of arbitrary attacker-chosen content. `lstatSync`
+ *    a TOCTOU deletion of arbitrary attacker-chosen content. `lstat`
  *    (never `statSync`) is what makes the check about `dest`'s OWN identity
  *    rather than whatever it might point to. When the guard passes, `dest`
  *    ends up ABSENT, as if the clone had never been attempted.
@@ -1468,7 +1478,7 @@ function checkCloneDestination(dest: string): CloneResult {
  *    there before this call started, but — review finding #3's TOCTOU fix —
  *    only entries this clone attempt could plausibly have written are
  *    removed: `.git` unconditionally (git always names it exactly that,
- *    every time), and any OTHER entry only when its own `lstatSync` (never
+ *    every time), and any OTHER entry only when its own `lstat` (never
  *    followed through a symlink) birth time — `ctime` as the fallback on a
  *    platform/filesystem that doesn't report `birthtime`, e.g. most Linux
  *    filesystems — is at or after `startedAt`. An entry that was already
@@ -1492,12 +1502,12 @@ function checkCloneDestination(dest: string): CloneResult {
  * swallowed rather than surfaced — cancellation must not itself fail the
  * caller.
  */
-function cleanupCancelledCloneDest(dest: string, preExisted: boolean, startedAt: number): void {
+async function cleanupCancelledCloneDest(dest: string, preExisted: boolean, startedAt: number): Promise<void> {
   if (!preExisted) {
     try {
-      const st = lstatSync(dest);
+      const st = await lstat(dest);
       if (st.isDirectory() && !st.isSymbolicLink()) {
-        rmSync(dest, { recursive: true, force: true });
+        await rm(dest, { recursive: true, force: true });
       }
     } catch {
       // Best-effort — see doc comment above (also covers `dest` never
@@ -1508,7 +1518,7 @@ function cleanupCancelledCloneDest(dest: string, preExisted: boolean, startedAt:
   }
   let entries: string[] = [];
   try {
-    entries = readdirSync(dest);
+    entries = await readdir(dest);
   } catch {
     return;
   }
@@ -1516,13 +1526,13 @@ function cleanupCancelledCloneDest(dest: string, preExisted: boolean, startedAt:
     const entryPath = path.join(dest, entry);
     try {
       if (entry === ".git") {
-        rmSync(entryPath, { recursive: true, force: true });
+        await rm(entryPath, { recursive: true, force: true });
         continue;
       }
-      const st = lstatSync(entryPath);
+      const st = await lstat(entryPath);
       const createdAt = st.birthtimeMs > 0 ? st.birthtimeMs : st.ctimeMs;
       if (createdAt >= startedAt) {
-        rmSync(entryPath, { recursive: true, force: true });
+        await rm(entryPath, { recursive: true, force: true });
       }
     } catch {
       // Best-effort — see doc comment above.
@@ -1654,7 +1664,7 @@ async function cloneRepoInner(
   onProgress: ((progress: CloneProgress) => void) | undefined,
   cloneId: string | undefined,
 ): Promise<CloneResult> {
-  const destPreExisted = existsSync(dest);
+  const destPreExisted = await pathExists(dest);
 
   /** Never lets a throwing `onProgress` escape `cloneRepo` (review finding
    *  #7) — the git child (if any) has already been spawned or killed by the
@@ -1695,7 +1705,7 @@ async function cloneRepoInner(
     return result;
   };
 
-  const destCheck1 = checkCloneDestination(dest);
+  const destCheck1 = await checkCloneDestination(dest);
   if (!destCheck1.ok) return finish(destCheck1);
 
   // Never rate-limited or budgeted — see this function's own doc comment
@@ -1727,19 +1737,19 @@ async function cloneRepoInner(
     ok: false,
     error: `clone timed out after ${formatCloneTimeoutDuration(timeoutMs)}`,
   });
-  const cancelledResult = (): CloneResult => {
-    cleanupCancelledCloneDest(dest, destPreExisted, startedAt);
+  const cancelledResult = async (): Promise<CloneResult> => {
+    await cleanupCancelledCloneDest(dest, destPreExisted, startedAt);
     return { ok: false, cancelled: true, error: "clone cancelled" };
   };
 
   // Review finding #2: a cancellation requested before attempt 1 ever
   // spawns (this clone was already announced as pending by `cloneRepo`
   // above) is honored right here — no git child is spawned at all.
-  if (consumeCancelRequest(cloneId)) return finish(cancelledResult());
+  if (consumeCancelRequest(cloneId)) return finish(await cancelledResult());
 
   const attempt1 = await runGitClone(source, dest, {}, timeoutMs, { cloneId, onProgress });
   if (attempt1.ok) return finish({ ok: true });
-  if (attempt1.cancelled) return finish(cancelledResult());
+  if (attempt1.cancelled) return finish(await cancelledResult());
   if (attempt1.timedOut) return finish(timedOutResult());
   // Attempt 1's own (non-timeout) failure, run through `explainCloneFailure`
   // with `usedToken: false` — reused by both early-return branches below
@@ -1758,7 +1768,7 @@ async function cloneRepoInner(
     // Review finding #2: a cancellation that arrived any time during
     // attempt 1 but after attempt 1 itself already settled (non-cancelled)
     // is honored here, before doing any more work toward a retry.
-    if (consumeCancelRequest(cloneId)) return finish(cancelledResult());
+    if (consumeCancelRequest(cloneId)) return finish(await cancelledResult());
 
     const remainingMs = timeoutMs - (Date.now() - startedAt);
     if (remainingMs < RETRY_MIN_TIMEOUT_MS) {
@@ -1770,7 +1780,7 @@ async function cloneRepoInner(
       return finish(attempt1FailureResult, attempt1.displayLine);
     }
 
-    const destCheck2 = checkCloneDestination(dest);
+    const destCheck2 = await checkCloneDestination(dest);
     if (!destCheck2.ok) {
       return finish(attempt1FailureResult, attempt1.displayLine);
     }
@@ -1780,7 +1790,7 @@ async function cloneRepoInner(
     // `gh auth token` shellout) — a cancellation that arrived while it was
     // resolving is honored here, before the retry's `runGitClone` call,
     // regardless of whether a credential actually came back.
-    if (consumeCancelRequest(cloneId)) return finish(cancelledResult());
+    if (consumeCancelRequest(cloneId)) return finish(await cancelledResult());
     if (auth) {
       usedToken = true;
       // Only emitted once a real credential resolved — never for a retry
@@ -1793,7 +1803,7 @@ async function cloneRepoInner(
       const extraEnv = cloneAuthEnv(process.env as Record<string, string | undefined>, auth);
       last = await runGitClone(source, dest, extraEnv, remainingMs, { cloneId, onProgress });
       if (last.ok) return finish({ ok: true });
-      if (last.cancelled) return finish(cancelledResult());
+      if (last.cancelled) return finish(await cancelledResult());
       if (last.timedOut) return finish(timedOutResult());
     }
   }

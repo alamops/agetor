@@ -132,6 +132,8 @@ test("Cursor ask result broadcasts the persisted event id and timestamp", async 
   const args = { taskId, runId, toolCallId: `ask-${randomUUID()}`, content: "cancelled" };
   recordCursorAskToolResult(args);
   recordCursorAskToolResult(args);
+  // Fire-and-forget (the registry is synchronous): wait for the second insert (a no-op) to land.
+  await new Promise((r) => setTimeout(r, 100));
   const matching = storedRows(runId).filter((row) => row.stream === "tool_result" && row.data.includes(args.toolCallId));
   const sent = framesOf(runId).filter((frame) => frame.stream === "tool_result" && frame.data.includes(args.toolCallId));
   expect(matching).toHaveLength(1);
@@ -151,7 +153,7 @@ test("a dispatched chunk is sent with the stored id and ts", async () => {
   const { taskId, runId } = await settledRun();
   const before = framesOf(runId).length;
 
-  orch.__dispatchChunkForTest(runId, taskId, "claude-code", "assistant", "hello ids", "uuid-hello");
+  await orch.__dispatchChunkForTest(runId, taskId, "claude-code", "assistant", "hello ids", "uuid-hello");
 
   const sent = framesOf(runId).slice(before);
   expect(sent.length).toBe(1);
@@ -164,8 +166,8 @@ test("a repeated lineUuid is saved and sent once", async () => {
   const { taskId, runId } = await settledRun();
   const before = framesOf(runId).length;
 
-  orch.__dispatchChunkForTest(runId, taskId, "claude-code", "assistant", "same line", "uuid-dup");
-  orch.__dispatchChunkForTest(runId, taskId, "claude-code", "assistant", "same line", "uuid-dup");
+  await orch.__dispatchChunkForTest(runId, taskId, "claude-code", "assistant", "same line", "uuid-dup");
+  await orch.__dispatchChunkForTest(runId, taskId, "claude-code", "assistant", "same line", "uuid-dup");
 
   expect(framesOf(runId).slice(before).filter((f) => f.data === "same line").length).toBe(1);
   expect(storedRows(runId).filter((r) => r.data === "same line").length).toBe(1);
@@ -175,7 +177,7 @@ test("appendRunStatusLine is sent with the stored id and ts", async () => {
   const { taskId, runId } = await settledRun();
   const before = framesOf(runId).length;
 
-  orch.appendRunStatusLine(taskId, runId, "a status breadcrumb");
+  await orch.appendRunStatusLine(taskId, runId, "a status breadcrumb");
 
   const sent = framesOf(runId).slice(before);
   expect(sent.length).toBe(1);
@@ -190,8 +192,8 @@ test("ids strictly increase in send order across an interleaved burst", async ()
 
   for (let i = 0; i < 20; i++) {
     const run = i % 2 === 0 ? a : b;
-    if (i % 3 === 0) orch.appendRunStatusLine(run.taskId, run.runId, `burst status ${i}`);
-    else orch.__dispatchChunkForTest(run.runId, run.taskId, "claude-code", "assistant", `burst ${i}`, `burst-${i}`);
+    if (i % 3 === 0) await orch.appendRunStatusLine(run.taskId, run.runId, `burst status ${i}`);
+    else await orch.__dispatchChunkForTest(run.runId, run.taskId, "claude-code", "assistant", `burst ${i}`, `burst-${i}`);
   }
 
   const sent = frames.slice(before).filter((f) => f.data.startsWith("burst"));
@@ -334,8 +336,9 @@ test("a monitor event stores and sends the line's own time", async () => {
   );
 
   const w = attachSubagentWatcher({ taskId, jsonlPath, manual: true });
+  await w.ready;
   try {
-    w.pump(t0);
+    await w.pump(t0);
     const content = `<task-notification>\n<task-id>${monitorId}</task-id>\n<summary>Monitor event: "ids"</summary>\n<event>3 passed</event>\n</task-notification>`;
     appendFileSync(
       jsonlPath,
@@ -355,7 +358,7 @@ test("a monitor event stores and sends the line's own time", async () => {
           message: { role: "user", content },
         }),
     );
-    w.pump(t0 + 1);
+    await w.pump(t0 + 1);
 
     const row = dbmod.db
       .query<StoredRow, [string]>(

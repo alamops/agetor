@@ -270,7 +270,8 @@ test("a Monitor launch + its stub tool_result creates a monitor row, holds the t
   );
 
   const w = attachSubagentWatcher({ taskId, jsonlPath, manual: true });
-  w.pump(Date.now());
+  await w.ready;
+  await w.pump(Date.now());
 
   const row = subagents.get(id);
   expect(row).not.toBeNull();
@@ -310,8 +311,9 @@ test("an ordinary Monitor event does not settle the row, and persists exactly on
   writeFileSync(jsonlPath, launchLine({ toolUseId, description: "serial re-run of 3 specs" }) + stubLine({ toolUseId, id }));
 
   const w = attachSubagentWatcher({ taskId, jsonlPath, manual: true });
+  await w.ready;
   const t0 = Date.now();
-  w.pump(t0);
+  await w.pump(t0);
   expect(subagents.get(id)!.status).toBe("running");
 
   appendFileSync(
@@ -322,7 +324,7 @@ test("an ordinary Monitor event does not settle the row, and persists exactly on
       event: "4 failed\n36 passed (8.9m)",
     }),
   );
-  w.pump(t0 + 1);
+  await w.pump(t0 + 1);
 
   expect(subagents.get(id)!.status).toBe("running");
   expect(subagents.hasRunning(taskId)).toBe(true);
@@ -351,10 +353,11 @@ test("replaying an already-persisted Monitor event on reattach does not duplicat
   writeFileSync(jsonlPath, launchLine({ toolUseId }) + stubLine({ toolUseId, id }));
 
   const w = attachSubagentWatcher({ taskId, jsonlPath, manual: true });
+  await w.ready;
   const t0 = Date.now();
-  w.pump(t0);
+  await w.pump(t0);
   appendFileSync(jsonlPath, eventLines({ id, event: "1 failed" }));
-  w.pump(t0 + 1);
+  await w.pump(t0 + 1);
   expect((await stdoutEvents(id)).length).toBe(1);
   w.detach();
 
@@ -365,7 +368,8 @@ test("replaying an already-persisted Monitor event on reattach does not duplicat
   // replays the WHOLE main jsonl from offset 0 — the launch, stub, AND the
   // event pair all re-scan.
   const w2 = attachSubagentWatcher({ taskId, jsonlPath, manual: true });
-  w2.pump(t0 + 2);
+  await w2.ready;
+  await w2.pump(t0 + 2);
 
   expect(subagents.get(id)!.status).toBe("running");
   expect((await stdoutEvents(id)).length).toBe(1); // no duplicate row
@@ -398,12 +402,13 @@ test("a Monitor timeout event settles the row via receipt, and a later event doe
   writeFileSync(jsonlPath, launchLine({ toolUseId, timeoutMs: 5_000 }) + stubLine({ toolUseId, id, timeoutMs: 5_000 }));
 
   const w = attachSubagentWatcher({ taskId, jsonlPath, manual: true });
+  await w.ready;
   const t0 = Date.now();
-  w.pump(t0);
+  await w.pump(t0);
   expect(subagents.get(id)!.status).toBe("running");
 
   appendFileSync(jsonlPath, eventLines({ id, event: "[Monitor timed out — re-arm if needed.]" }));
-  w.pump(t0 + 1);
+  await w.pump(t0 + 1);
 
   expect(subagents.get(id)!.status).toBe("completed");
   expect(subagents.hasRunning(taskId)).toBe(false);
@@ -416,7 +421,7 @@ test("a Monitor timeout event settles the row via receipt, and a later event doe
   // A later notification for the same id — receipt-settled rows never
   // resurrect (unlike a ceiling-settled row).
   appendFileSync(jsonlPath, eventLines({ id, event: "9 passed", timestamp: new Date(t0 + 2).toISOString() }));
-  w.pump(t0 + 2);
+  await w.pump(t0 + 2);
   expect(subagents.get(id)!.status).toBe("completed");
 
   w.detach();
@@ -437,12 +442,13 @@ test("a Monitor notification carrying <status>stopped</status> settles the row",
   writeFileSync(jsonlPath, launchLine({ toolUseId }) + stubLine({ toolUseId, id }));
 
   const w = attachSubagentWatcher({ taskId, jsonlPath, manual: true });
+  await w.ready;
   const t0 = Date.now();
-  w.pump(t0);
+  await w.pump(t0);
   expect(subagents.get(id)!.status).toBe("running");
 
   appendFileSync(jsonlPath, eventLines({ id, status: "stopped" }));
-  w.pump(t0 + 1);
+  await w.pump(t0 + 1);
 
   expect(subagents.get(id)!.status).toBe("completed");
   expect(subagents.hasRunning(taskId)).toBe(false);
@@ -461,12 +467,13 @@ test("a Monitor notification with an unrecognised non-terminal <status> is skipp
   writeFileSync(jsonlPath, launchLine({ toolUseId }) + stubLine({ toolUseId, id }));
 
   const w = attachSubagentWatcher({ taskId, jsonlPath, manual: true });
+  await w.ready;
   const t0 = Date.now();
-  w.pump(t0);
+  await w.pump(t0);
   expect(subagents.get(id)!.status).toBe("running");
 
   appendFileSync(jsonlPath, eventLines({ id, status: "paused" }));
-  w.pump(t0 + 1);
+  await w.pump(t0 + 1);
 
   expect(subagents.get(id)!.status).toBe("running");
   expect(subagents.hasRunning(taskId)).toBe(true);
@@ -498,16 +505,17 @@ test("a timed Monitor settles via the ceiling once its timeout + margin elapses 
   );
 
   const w = attachSubagentWatcher({ taskId, jsonlPath, manual: true });
-  w.pump(t0);
+  await w.ready;
+  await w.pump(t0);
   expect(subagents.get(id)!.status).toBe("running");
   expect(subagents.get(id)!.startedAt).toBe(t0);
 
   // Still within the margin.
-  w.pump(t0 + ceiling - 1);
+  await w.pump(t0 + ceiling - 1);
   expect(subagents.get(id)!.status).toBe("running");
 
   // Past the ceiling — no notification ever arrived, settle inferred.
-  w.pump(t0 + ceiling + 1);
+  await w.pump(t0 + ceiling + 1);
   expect(subagents.get(id)!.status).toBe("completed");
 
   w.detach();
@@ -540,8 +548,9 @@ test("a later non-terminal event flips a ceiling-settled timed Monitor back to r
   );
 
   const w = attachSubagentWatcher({ taskId, jsonlPath, manual: true });
-  w.pump(t0);
-  w.pump(t0 + ceiling + 1);
+  await w.ready;
+  await w.pump(t0);
+  await w.pump(t0 + ceiling + 1);
   expect(subagents.get(id)!.status).toBe("completed"); // ceiling-settled, per the sibling test above
 
   const parkedBefore = parked.length;
@@ -551,7 +560,7 @@ test("a later non-terminal event flips a ceiling-settled timed Monitor back to r
   // `applyMonitorNotification`'s flip-back block, this SHOULD settle back to
   // "running" with a fresh parked-discovery fire.
   appendFileSync(jsonlPath, eventLines({ id, event: "1 passed", timestamp: new Date(t0 + ceiling + 2).toISOString() }));
-  w.pump(t0 + ceiling + 2);
+  await w.pump(t0 + ceiling + 2);
   expect(subagents.get(id)!.status).toBe("running");
   expect(parked.length).toBe(parkedBefore + 1);
 
@@ -592,25 +601,26 @@ test("a persistent Monitor is not settled by inactivity before the default stale
   );
 
   const w = attachSubagentWatcher({ taskId, jsonlPath, manual: true });
-  w.pump(t0);
+  await w.ready;
+  await w.pump(t0);
   expect(subagents.get(id)!.status).toBe("running");
   expect(subagents.get(id)!.startedAt).toBe(lineTs);
 
   // An event arrives, resetting the activity anchor away from the
   // (already nearly-expired) original startedAt.
   appendFileSync(jsonlPath, eventLines({ id, event: "still watching" }));
-  w.pump(t0 + 5_000);
+  await w.pump(t0 + 5_000);
   expect(subagents.get(id)!.status).toBe("running");
 
   // Comfortably under the NEW anchor's stale window — no further
   // notification is processed from here on, so `lastActivityAt` stays fixed
   // and a synthetic future `now` is safe to inject.
-  w.pump(t0 + 5_000 + MONITOR_DEFAULT_STALE_MS - 5_000);
+  await w.pump(t0 + 5_000 + MONITOR_DEFAULT_STALE_MS - 5_000);
   expect(subagents.get(id)!.status).toBe("running");
 
   // Past the stale window measured from the event (NOT from the original,
   // already-59-minutes-old startedAt) — settles.
-  w.pump(t0 + 5_000 + MONITOR_DEFAULT_STALE_MS + 5_000);
+  await w.pump(t0 + 5_000 + MONITOR_DEFAULT_STALE_MS + 5_000);
   expect(subagents.get(id)!.status).toBe("completed");
 
   w.detach();
@@ -636,7 +646,8 @@ test("a pre-existing monitor row is rehydrated into the watcher's monitors map o
   });
 
   const w = attachSubagentWatcher({ taskId, jsonlPath, manual: true });
-  expect(() => w.pump(now)).not.toThrow();
+  await w.ready;
+  await expect(w.pump(now)).resolves.toBeUndefined();
   expect(subagents.get(id)!.status).toBe("running");
   expect(subagents.get(id)!.parentKind).toBe("monitor");
   expect(subagents.hasRunning(taskId)).toBe(true);
@@ -645,7 +656,7 @@ test("a pre-existing monitor row is rehydrated into the watcher's monitors map o
     jsonlPath,
     eventLines({ id, event: "[Monitor timed out — re-arm if needed.]", timestamp: new Date(now + 1).toISOString() }),
   );
-  expect(() => w.pump(now + 1)).not.toThrow();
+  await expect(w.pump(now + 1)).resolves.toBeUndefined();
   expect(subagents.get(id)!.status).toBe("completed");
 
   w.detach();
@@ -668,10 +679,11 @@ test("handleBackgroundTaskNotification routes a non-terminal Monitor body throug
   writeFileSync(jsonlPath, launchLine({ toolUseId }) + stubLine({ toolUseId, id }));
 
   const w = attachSubagentWatcher({ taskId, jsonlPath, manual: true });
-  w.pump(Date.now());
+  await w.ready;
+  await w.pump(Date.now());
   expect(subagents.get(id)!.status).toBe("running");
 
-  handleBackgroundTaskNotification(taskId, id, notificationBlock({ id, event: "3 passed" }));
+  await handleBackgroundTaskNotification(taskId, id, notificationBlock({ id, event: "3 passed" }));
 
   expect(subagents.get(id)!.status).toBe("running");
   expect((await stdoutEvents(id)).length).toBe(1);
@@ -692,10 +704,11 @@ test("handleBackgroundTaskNotification routes a terminal Monitor body through th
   writeFileSync(jsonlPath, launchLine({ toolUseId }) + stubLine({ toolUseId, id }));
 
   const w = attachSubagentWatcher({ taskId, jsonlPath, manual: true });
-  w.pump(Date.now());
+  await w.ready;
+  await w.pump(Date.now());
   expect(subagents.get(id)!.status).toBe("running");
 
-  handleBackgroundTaskNotification(taskId, id, notificationBlock({ id, event: "[Monitor timed out — re-arm if needed.]" }));
+  await handleBackgroundTaskNotification(taskId, id, notificationBlock({ id, event: "[Monitor timed out — re-arm if needed.]" }));
 
   expect(subagents.get(id)!.status).toBe("completed");
   expect(subagents.hasRunning(taskId)).toBe(false);
@@ -719,7 +732,7 @@ test("handleBackgroundTaskNotification falls back to the DB-only path for an unw
 
   // No `attachSubagentWatcher` call at all for this task — the row only
   // exists in the DB.
-  handleBackgroundTaskNotification(taskId, id, notificationBlock({ id, event: "2 passed" }));
+  await handleBackgroundTaskNotification(taskId, id, notificationBlock({ id, event: "2 passed" }));
 
   expect(subagents.get(id)!.status).toBe("running");
   expect((await stdoutEvents(id)).length).toBe(1);
@@ -739,7 +752,7 @@ test("handleBackgroundTaskNotification falls back to the DB-only path for an unw
     status: "running", startedAt: now, endedAt: null,
   });
 
-  handleBackgroundTaskNotification(taskId, id, notificationBlock({ id, status: "stopped" }));
+  await handleBackgroundTaskNotification(taskId, id, notificationBlock({ id, status: "stopped" }));
 
   expect(subagents.get(id)!.status).toBe("completed");
   expect(subagents.hasRunning(taskId)).toBe(false);
@@ -763,7 +776,7 @@ test("handleBackgroundTaskNotification settles a non-monitor row unconditionally
   // no terminal <event> text) — but a bg_session (or any non-monitor) row is
   // settled unconditionally by ANY notification body, exactly like before
   // this feature existed.
-  handleBackgroundTaskNotification(taskId, id, notificationBlock({ id, event: "still going" }));
+  await handleBackgroundTaskNotification(taskId, id, notificationBlock({ id, event: "still going" }));
 
   expect(subagents.get(id)!.status).toBe("completed");
 });
@@ -787,7 +800,8 @@ test("AGETOR_TRACK_MONITORS=0 — no monitor row is created from the same launch
   writeFileSync(jsonlPath, launchLine({ toolUseId }) + stubLine({ toolUseId, id }));
 
   const w = mod.attachSubagentWatcher({ taskId, jsonlPath, manual: true });
-  w.pump(Date.now());
+  await w.ready;
+  await w.pump(Date.now());
 
   expect(subagents.get(id)).toBeNull();
   expect(subagents.listForTask(taskId).length).toBe(0);
@@ -814,7 +828,8 @@ test("a Monitor stub whose tool_use_id has no pending launch entry still creates
   writeFileSync(jsonlPath, stubLine({ toolUseId: "toolu_orphan1", id, timeoutMs: 500_000, persistent: false }));
 
   const w = attachSubagentWatcher({ taskId, jsonlPath, manual: true });
-  w.pump(Date.now());
+  await w.ready;
+  await w.pump(Date.now());
 
   const row = subagents.get(id);
   expect(row).not.toBeNull();
@@ -836,7 +851,8 @@ test("a Monitor launch whose stub never arrives creates no row", async () => {
   writeFileSync(jsonlPath, launchLine({ toolUseId: "toolu_nostub1", description: "never confirmed" }));
 
   const w = attachSubagentWatcher({ taskId, jsonlPath, manual: true });
-  w.pump(Date.now());
+  await w.ready;
+  await w.pump(Date.now());
 
   expect(subagents.listForTask(taskId).length).toBe(0);
   expect(subagents.hasRunning(taskId)).toBe(false);
@@ -874,15 +890,16 @@ test("finding #1: a flipped-back timed monitor does not re-settle while events k
   );
 
   const w = attachSubagentWatcher({ taskId, jsonlPath, manual: true });
-  w.pump(t0);
-  w.pump(t0 + ceiling + 1);
+  await w.ready;
+  await w.pump(t0);
+  await w.pump(t0 + ceiling + 1);
   expect(subagents.get(id)!.status).toBe("completed"); // ceiling-settled, per the sibling test above
 
   // Flip back with a live event. Per finding #1(b), this also discards the
   // row's `timeoutMs`/`persistent` — from here on it behaves like a
   // persistent/rehydrated monitor (activity-anchored ceiling only).
   appendFileSync(jsonlPath, eventLines({ id, event: "event 1", timestamp: new Date(t0 + ceiling + 2).toISOString() }));
-  w.pump(t0 + ceiling + 2);
+  await w.pump(t0 + ceiling + 2);
   expect(subagents.get(id)!.status).toBe("running");
 
   // Several MORE ticks past the original deadline, each with its own live
@@ -896,7 +913,7 @@ test("finding #1: a flipped-back timed monitor does not re-settle while events k
   for (let i = 0; i < 3; i++) {
     const now = Date.now();
     appendFileSync(jsonlPath, eventLines({ id, event: `event ${i + 2}`, timestamp: new Date(now).toISOString() }));
-    w.pump(now);
+    await w.pump(now);
     expect(subagents.get(id)!.status).toBe("running");
   }
 
@@ -904,9 +921,9 @@ test("finding #1: a flipped-back timed monitor does not re-settle while events k
   // (anchored to the LAST event's real `lastActivityAt`) still runs; past it
   // settles, exactly like a genuinely persistent monitor.
   const lastActivity = Date.now();
-  w.pump(lastActivity + MONITOR_DEFAULT_STALE_MS - 5_000);
+  await w.pump(lastActivity + MONITOR_DEFAULT_STALE_MS - 5_000);
   expect(subagents.get(id)!.status).toBe("running");
-  w.pump(lastActivity + MONITOR_DEFAULT_STALE_MS + 5_000);
+  await w.pump(lastActivity + MONITOR_DEFAULT_STALE_MS + 5_000);
   expect(subagents.get(id)!.status).toBe("completed");
 
   w.detach();
@@ -928,12 +945,13 @@ test("finding #2: an <event> that merely STARTS with a terminal-looking bracket 
   writeFileSync(jsonlPath, launchLine({ toolUseId }) + stubLine({ toolUseId, id }));
 
   const w = attachSubagentWatcher({ taskId, jsonlPath, manual: true });
+  await w.ready;
   const t0 = Date.now();
-  w.pump(t0);
+  await w.pump(t0);
   expect(subagents.get(id)!.status).toBe("running");
 
   appendFileSync(jsonlPath, eventLines({ id, event: "[Monitor stopped] 3 failed, 1 passed" }));
-  w.pump(t0 + 1);
+  await w.pump(t0 + 1);
 
   expect(subagents.get(id)!.status).toBe("running");
   expect(subagents.hasRunning(taskId)).toBe(true);
@@ -955,12 +973,13 @@ test("finding #2: an <event> that carries the exact terminal marker plus trailin
   writeFileSync(jsonlPath, launchLine({ toolUseId }) + stubLine({ toolUseId, id }));
 
   const w = attachSubagentWatcher({ taskId, jsonlPath, manual: true });
+  await w.ready;
   const t0 = Date.now();
-  w.pump(t0);
+  await w.pump(t0);
 
   // Trailing text after the closing bracket breaks the end anchor.
   appendFileSync(jsonlPath, eventLines({ id, event: "[Monitor timed out — re-arm if needed.] extra" }));
-  w.pump(t0 + 1);
+  await w.pump(t0 + 1);
   expect(subagents.get(id)!.status).toBe("running");
 
   // The exact verified marker, and nothing else, still settles.
@@ -968,7 +987,7 @@ test("finding #2: an <event> that carries the exact terminal marker plus trailin
     jsonlPath,
     eventLines({ id, event: "[Monitor timed out — re-arm if needed.]", timestamp: new Date(t0 + 2).toISOString() }),
   );
-  w.pump(t0 + 2);
+  await w.pump(t0 + 2);
   expect(subagents.get(id)!.status).toBe("completed");
 
   w.detach();
@@ -1003,13 +1022,15 @@ test("finding #3(a/b): a ceiling-settled row rehydrates with its flip-back gate 
   );
 
   const w = attachSubagentWatcher({ taskId, jsonlPath, manual: true });
-  w.pump(t0);
-  w.pump(t0 + ceiling + 1);
+  await w.ready;
+  await w.pump(t0);
+  await w.pump(t0 + ceiling + 1);
   expect(subagents.get(id)!.status).toBe("completed"); // settled by the CEILING — no receipt ever persisted
   w.detach(); // simulate an agetor restart: all in-memory MonitorState is gone
 
   const w2 = attachSubagentWatcher({ taskId, jsonlPath, manual: true });
-  w2.pump(t0 + ceiling + 2); // rehydrates the row into `monitors`
+  await w2.ready;
+  await w2.pump(t0 + ceiling + 2); // rehydrates the row into `monitors`
   expect(subagents.get(id)!.status).toBe("completed"); // rehydration alone never resurrects
 
   const parkedBefore = parked.length;
@@ -1017,7 +1038,7 @@ test("finding #3(a/b): a ceiling-settled row rehydrates with its flip-back gate 
     jsonlPath,
     eventLines({ id, event: "1 passed", timestamp: new Date(t0 + ceiling + 3).toISOString() }),
   );
-  w2.pump(t0 + ceiling + 3);
+  await w2.pump(t0 + ceiling + 3);
 
   expect(subagents.get(id)!.status).toBe("running");
   expect(parked.length).toBe(parkedBefore + 1);
@@ -1036,21 +1057,23 @@ test("finding #3(a/b): a receipt-settled row rehydrates with its flip-back gate 
   writeFileSync(jsonlPath, launchLine({ toolUseId }) + stubLine({ toolUseId, id }));
 
   const w = attachSubagentWatcher({ taskId, jsonlPath, manual: true });
+  await w.ready;
   const t0 = Date.now();
-  w.pump(t0);
+  await w.pump(t0);
   appendFileSync(jsonlPath, eventLines({ id, event: "[Monitor timed out — re-arm if needed.]" }));
-  w.pump(t0 + 1);
+  await w.pump(t0 + 1);
   expect(subagents.get(id)!.status).toBe("completed"); // settled by an AUTHORITATIVE receipt
   w.detach();
 
   const w2 = attachSubagentWatcher({ taskId, jsonlPath, manual: true });
-  w2.pump(t0 + 2); // rehydrates — the `terminal:`-prefixed line_uuid is on record
+  await w2.ready;
+  await w2.pump(t0 + 2); // rehydrates — the `terminal:`-prefixed line_uuid is on record
 
   appendFileSync(
     jsonlPath,
     eventLines({ id, event: "1 passed", timestamp: new Date(t0 + 3).toISOString() }),
   );
-  w2.pump(t0 + 3);
+  await w2.pump(t0 + 3);
 
   expect(subagents.get(id)!.status).toBe("completed"); // never flips back — the harness already said it's over
 
@@ -1072,7 +1095,7 @@ test("finding #3(c): handleBackgroundTaskNotification flips a ceiling-settled DB
   });
 
   // No `attachSubagentWatcher` call for this task at all.
-  handleBackgroundTaskNotification(taskId, id, notificationBlock({ id, event: "3 passed" }));
+  await handleBackgroundTaskNotification(taskId, id, notificationBlock({ id, event: "3 passed" }));
 
   expect(subagents.get(id)!.status).toBe("running");
   expect(subagents.hasRunning(taskId)).toBe(true);
@@ -1096,7 +1119,7 @@ test("finding #3(c): handleBackgroundTaskNotification does NOT flip a settled DB
   const body = notificationBlock({ id, event: "9 passed" });
 
   // First delivery: fresh event, genuinely new — flips the row back.
-  handleBackgroundTaskNotification(taskId, id, body);
+  await handleBackgroundTaskNotification(taskId, id, body);
   expect(subagents.get(id)!.status).toBe("running");
   expect((await stdoutEvents(id)).length).toBe(1);
 
@@ -1109,7 +1132,7 @@ test("finding #3(c): handleBackgroundTaskNotification does NOT flip a settled DB
   // timestamp threaded on this path, so the same hash-only line_uuid).
   // `persistMonitorEvent`'s `runs.appendEvent` dedups it — `isNew` is
   // `false` — so it must NOT resurrect the row this time.
-  handleBackgroundTaskNotification(taskId, id, body);
+  await handleBackgroundTaskNotification(taskId, id, body);
   expect(subagents.get(id)!.status).toBe("completed");
   expect((await stdoutEvents(id)).length).toBe(1); // no duplicate row either
 });
@@ -1139,7 +1162,8 @@ test("finding #4: a Monitor notification with an unrecognised <status> and no <e
   );
 
   const w = attachSubagentWatcher({ taskId, jsonlPath, manual: true });
-  w.pump(t0);
+  await w.ready;
+  await w.pump(t0);
   expect(subagents.get(id)!.status).toBe("running");
 
   // A notification with an UNRECOGNISED <status> and no <event> tag at all.
@@ -1148,18 +1172,18 @@ test("finding #4: a Monitor notification with an unrecognised <status> and no <e
   // silently dropping it — `lastActivityAt` would stay pinned at the
   // original (59-minutes-stale) anchor.
   appendFileSync(jsonlPath, eventLines({ id, status: "paused" }));
-  w.pump(t0 + 5_000);
+  await w.pump(t0 + 5_000);
   expect(subagents.get(id)!.status).toBe("running");
   expect((await stdoutEvents(id)).length).toBe(0); // no <event> text — nothing to persist to the tab
 
   // Comfortably under the NEW anchor's (the "paused" notification's) stale
   // window. Without the fix, this point is already ~7.14 hours past the
   // ORIGINAL 59-minutes-old anchor and would have settled well before now.
-  w.pump(t0 + 5_000 + MONITOR_DEFAULT_STALE_MS - 5_000);
+  await w.pump(t0 + 5_000 + MONITOR_DEFAULT_STALE_MS - 5_000);
   expect(subagents.get(id)!.status).toBe("running");
 
   // Past the stale window measured from the "paused" notification.
-  w.pump(t0 + 5_000 + MONITOR_DEFAULT_STALE_MS + 5_000);
+  await w.pump(t0 + 5_000 + MONITOR_DEFAULT_STALE_MS + 5_000);
   expect(subagents.get(id)!.status).toBe("completed");
 
   w.detach();
@@ -1183,14 +1207,15 @@ test("finding #5: an identical Monitor event repeated 30s later persists as a se
   writeFileSync(jsonlPath, launchLine({ toolUseId }) + stubLine({ toolUseId, id }));
 
   const w = attachSubagentWatcher({ taskId, jsonlPath, manual: true });
+  await w.ready;
   const t0 = Date.now();
-  w.pump(t0);
+  await w.pump(t0);
   expect(subagents.get(id)!.status).toBe("running");
 
   const eventText = "0 failed, 12 passed";
   const ts1 = t0;
   appendFileSync(jsonlPath, eventLines({ id, event: eventText, timestamp: new Date(ts1).toISOString() }));
-  w.pump(t0 + 1);
+  await w.pump(t0 + 1);
 
   let rows = await stdoutEvents(id);
   expect(rows.length).toBe(1); // the enqueue+origin twin of ONE event collapses to one row
@@ -1200,7 +1225,7 @@ test("finding #5: an identical Monitor event repeated 30s later persists as a se
   // replay of the same line. Must persist as its own row.
   const ts2 = ts1 + 30_000;
   appendFileSync(jsonlPath, eventLines({ id, event: eventText, timestamp: new Date(ts2).toISOString() }));
-  w.pump(t0 + 2);
+  await w.pump(t0 + 2);
 
   rows = await stdoutEvents(id);
   expect(rows.length).toBe(2);
@@ -1243,7 +1268,8 @@ test("finding #8: handleBackgroundTaskNotification skips the extra DB probe when
     const a = await seed();
     writeFileSync(a.jsonlPath, ""); // no Monitor launch/stub lines at all
     const wA = attachSubagentWatcher({ taskId: a.taskId, jsonlPath: a.jsonlPath, manual: true });
-    wA.pump(Date.now());
+    await wA.ready;
+    await wA.pump(Date.now());
     const idA = "bg_probe_a";
     subagents.insertIfAbsent({
       id: idA, taskId: a.taskId, runId: a.runId, parentKind: "bg_session",
@@ -1252,7 +1278,7 @@ test("finding #8: handleBackgroundTaskNotification skips the extra DB probe when
       status: "running", startedAt: Date.now(), endedAt: null,
     });
     getCalls = 0;
-    handleBackgroundTaskNotification(a.taskId, idA, notificationBlock({ id: idA, event: "still going" }));
+    await handleBackgroundTaskNotification(a.taskId, idA, notificationBlock({ id: idA, event: "still going" }));
     const callsWithWatcher = getCalls;
     wA.detach();
 
@@ -1268,7 +1294,7 @@ test("finding #8: handleBackgroundTaskNotification skips the extra DB probe when
       status: "running", startedAt: Date.now(), endedAt: null,
     });
     getCalls = 0;
-    handleBackgroundTaskNotification(b.taskId, idB, notificationBlock({ id: idB, event: "still going" }));
+    await handleBackgroundTaskNotification(b.taskId, idB, notificationBlock({ id: idB, event: "still going" }));
     const callsNoWatcher = getCalls;
 
     expect(callsWithWatcher).toBe(callsNoWatcher - 1);
@@ -1299,8 +1325,9 @@ test("a Monitor event dispatched live with the line's timestamp and then read by
   writeFileSync(jsonlPath, launchLine({ toolUseId, description: "watch build" }) + stubLine({ toolUseId, id }));
 
   const w = attachSubagentWatcher({ taskId, jsonlPath, manual: true });
+  await w.ready;
   const t0 = Date.now();
-  w.pump(t0);
+  await w.pump(t0);
   expect(subagents.get(id)!.status).toBe("running");
 
   // claude-tmux's live tailer sees the enqueue line first and forwards the raw
@@ -1312,8 +1339,8 @@ test("a Monitor event dispatched live with the line's timestamp and then read by
   const summary = 'Monitor event: "watch build"';
   const event = "12 passed\n1 skipped";
   appendFileSync(jsonlPath, eventLines({ id, summary, event, timestamp }));
-  handleBackgroundTaskNotification(taskId, id, notificationBlock({ id, summary, event }), Date.parse(timestamp));
-  w.pump(t0 + 1);
+  await handleBackgroundTaskNotification(taskId, id, notificationBlock({ id, summary, event }), Date.parse(timestamp));
+  await w.pump(t0 + 1);
 
   expect(subagents.get(id)!.status).toBe("running");
   const rows = await stdoutEvents(id);
@@ -1340,8 +1367,9 @@ test("an <event> carrying quotes and backslashes reaches the tab decoded via the
   const id = "mon_esc1";
   writeFileSync(jsonlPath, launchLine({ toolUseId, description: "watch build" }) + stubLine({ toolUseId, id }));
   const w = attachSubagentWatcher({ taskId, jsonlPath, manual: true });
+  await w.ready;
   const t0 = Date.now();
-  w.pump(t0);
+  await w.pump(t0);
 
   // JSON.stringify escapes both the quotes and the backslashes on the raw
   // line; the scan must hand the DECODED text to the hash and the tab.
@@ -1349,8 +1377,8 @@ test("an <event> carrying quotes and backslashes reaches the tab decoded via the
   const summary = 'Monitor event: "watch build"';
   const event = 'Error: expected "ok" at C:\\build\\log.txt';
   appendFileSync(jsonlPath, eventLines({ id, summary, event, timestamp }));
-  w.pump(t0 + 1);
-  handleBackgroundTaskNotification(taskId, id, notificationBlock({ id, summary, event }), Date.parse(timestamp));
+  await w.pump(t0 + 1);
+  await handleBackgroundTaskNotification(taskId, id, notificationBlock({ id, summary, event }), Date.parse(timestamp));
 
   expect(subagents.get(id)!.status).toBe("running");
   const rows = await stdoutEvents(id);
@@ -1375,7 +1403,7 @@ test("handleBackgroundTaskNotification persists a fresh non-terminal event for a
     status: "orphaned", startedAt: now - 10_000, endedAt: now, // closed by session death, not the ceiling
   });
 
-  handleBackgroundTaskNotification(taskId, id, notificationBlock({ id, event: "3 passed" }));
+  await handleBackgroundTaskNotification(taskId, id, notificationBlock({ id, event: "3 passed" }));
 
   expect(subagents.get(id)!.status).toBe("orphaned");
   expect(subagents.hasRunning(taskId)).toBe(false);

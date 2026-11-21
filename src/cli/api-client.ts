@@ -3,7 +3,8 @@ import {
   probeLiveCore,
   type CoreCreds,
 } from "../bun/core-creds.ts";
-import { taskListPath, type TaskListOptions } from "../shared/types.ts";
+import { taskListPath, type TaskDelta, type TaskListOptions } from "../shared/types.ts";
+import { isTaskDelta, taskDeltaPath } from "../shared/task-delta.ts";
 import type {
   Task,
   Run,
@@ -250,6 +251,16 @@ export class AgetorClient {
    *  server-side (`TaskListArchived`). */
   listTasks(opts: TaskListOptions = {}): Promise<Task[]> {
     return this.req("GET", taskListPath(opts));
+  }
+  /** `GET /tasks?delta=1[&since=]`: what changed since `since` (a prior
+   *  answer's `cursor`), or a snapshot when there is no cursor or the core no
+   *  longer honors it. A core that predates the delta API answers a bare
+   *  array, returned as it is: a legacy full list (`isTaskDelta` tells them
+   *  apart). Anything else throws. */
+  async listTaskDelta(opts: TaskListOptions = {}, since?: string | null): Promise<TaskDelta | Task[]> {
+    const body = await this.req<unknown>("GET", taskDeltaPath(opts, since));
+    if (isTaskDelta(body) || Array.isArray(body)) return body as TaskDelta | Task[];
+    throw new Error("unexpected GET /tasks response");
   }
   getTask(id: string): Promise<Task> {
     return this.req("GET", `/tasks/${encodeURIComponent(id)}`);

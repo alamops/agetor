@@ -1,6 +1,6 @@
 import pkg from "../../package.json" with { type: "json" };
-import { CLI_TOKEN, formatHostForUrl, getApiPort, resolveApiHost } from "./api-config.ts";
-import { db, dataDir, subagents, preferences } from "./db.ts";
+import { API_TOKEN, CLI_TOKEN, formatHostForUrl, getApiPort, resolveApiHost } from "./api-config.ts";
+import { dataDir } from "./db-path.ts";
 import {
   freezeLaunches,
   launchesInFlight,
@@ -36,6 +36,12 @@ import {
 } from "./core-creds.ts";
 import { daemonLog } from "./daemon-log.ts";
 import { bootReadySignal } from "./boot-gate.ts";
+import { startTasksChangedPush } from "./task-change-push.ts";
+import { installCoreLog, registerLogSecret } from "./core-log.ts";
+import { preferences, runs, setTaskDecorations, subagents } from "./db-async.ts";
+import { awaitDbReady, drainCoreForQuit } from "./boot-db.ts";
+import { countPendingForTask, pendingCountsByTask, preloadPipelineParents } from "./interactions.ts";
+import { countTerminals, terminalCountsByTask } from "./terminals.ts";
 import { CORE_EXIT_PARK, HANDOFF_LAUNCH_SETTLE_MS, launchedBy, resolveIdleTimeoutMs } from "./daemon-mode.ts";
 import {
   installHeadlessNotifications,
@@ -87,15 +93,9 @@ const SUBAGENT_HOLD_MAX_MS = 6 * 60 * 60 * 1000; // 6h
  *  diagnosable from the single line it did emit. */
 let loggedHasRunningWorkError = false;
 
-function hasRunningRuns(): boolean {
+async function hasRunningRuns(): Promise<boolean> {
   try {
-    return (
-      db
-        .query<{ one: number }, []>(
-          "SELECT 1 AS one FROM runs WHERE status = 'running' LIMIT 1",
-        )
-        .get() != null
-    );
+    return (await runs.runningTasks()).length > 0;
   } catch {
     return false;
   }
@@ -104,10 +104,10 @@ function hasRunningRuns(): boolean {
 /** Daemon-wide "is anything still working?" — running runs OR running
  *  background agents/workflows (subagent rows started within
  *  `SUBAGENT_HOLD_MAX_MS`). Exported for tests. */
-export function hasRunningWork(): boolean {
-  if (hasRunningRuns()) return true;
+export async function hasRunningWork(): Promise<boolean> {
+  if (await hasRunningRuns()) return true;
   try {
-    return subagents.hasAnyRunning(Date.now() - SUBAGENT_HOLD_MAX_MS);
+    return await subagents.hasAnyRunning(Date.now() - SUBAGENT_HOLD_MAX_MS);
   } catch (err) {
     if (!loggedHasRunningWorkError) {
       loggedHasRunningWorkError = true;
@@ -121,6 +121,8 @@ export function hasRunningWork(): boolean {
 
 let shuttingDown = false;
 let handingOff = false;
+/** Upper bound on waiting for `freezeLaunches`' backlog writes at shutdown. */
+const SHUTDOWN_FREEZE_WAIT_MS = 3_000;
 
 /**
  * The app asked for the port (`/daemon/shutdown {mode:"handoff"}`). Exiting
@@ -136,7 +138,7 @@ let handingOff = false;
 async function handOffPort(reason: string, code: number): Promise<void> {
   if (handingOff || shuttingDown) return;
   handingOff = true;
-  freezeLaunches();
+  await freezeLaunches();
   const pending = launchesInFlight();
   if (pending > 0) {
     daemonLog(`handoff requested — waiting for ${pending} agent launch(es) to settle`);
@@ -159,12 +161,12 @@ function shutdown(reason: string, code = 0, opts: { realStop?: boolean } = {}): 
   daemonLog(`shutting down (${reason})`);
   // Take no new work, and keep the follow-ups queued in memory (they would die
   // with the process) in their tasks' backlog trays. Idempotent: a handoff
-  // already froze before its launch wait.
-  try {
-    freezeLaunches();
-  } catch (err) {
+  // already froze before its launch wait. The freeze stops taking work at the
+  // call; its backlog writes are database hops, awaited (bounded) below before
+  // the database worker is closed.
+  const freezing = freezeLaunches().catch((err: unknown) => {
     daemonLog(`freezing launches failed: ${String(err)}`);
-  }
+  });
   // fx-acp.ts's own SIGINT/SIGTERM/SIGHUP handlers always reap `fx acp`
   // children but only call `process.exit` themselves when they're the sole
   // listener for that signal — since this module registers its own
@@ -212,10 +214,29 @@ function shutdown(reason: string, code = 0, opts: { realStop?: boolean } = {}): 
       /* best-effort */
     }
   }
-  process.exit(code);
+  // Last: drain core.log and close the db worker before the exit, bounded so a
+  // stuck worker can never hold the shutdown. `process.exit` is the only way out.
+  // The freeze's backlog writes land first (bounded too).
+  void Promise.race([freezing, Bun.sleep(SHUTDOWN_FREEZE_WAIT_MS)])
+    .then(() => drainCoreForQuit())
+    .finally(() => process.exit(code));
 }
 
 export async function runDaemon(): Promise<void> {
+  // First thing in the process body (importing this module from the CLI must
+  // not tee the console or open a log): console output from here on lands in
+  // <dataDir>/logs/core.log. The tokens are registered so no line carries them.
+  installCoreLog();
+  registerLogSecret(API_TOKEN);
+  registerLogSecret(CLI_TOKEN);
+  // Worker-mode Task results carry the same badge counts the main-thread
+  // connection computes (lazy: these registries live in other modules).
+  setTaskDecorations({
+    countPendingForTask: (taskId) => countPendingForTask(taskId),
+    countTerminals: (taskId) => countTerminals(taskId),
+    pendingCountsByTask: () => pendingCountsByTask(),
+    terminalCountsByTask: () => terminalCountsByTask(),
+  });
   process.env.AGETOR_HEADLESS = "1";
   const mode = launchedBy();
   const isLoginItem = mode === "login-item";
@@ -250,7 +271,7 @@ export async function runDaemon(): Promise<void> {
   // underneath it (boot reconciliation, step 5 in
   // docs/architecture/task-lifecycle.md). A restore throw is logged and ends
   // the process with exit 1 — no swallow.
-  rehydratePath();
+  await rehydratePath();
   // Event-loop lag monitor (docs/plans/non-blocking-session-restore.md, decision
   // C): one `.unref()`'d sampler that names whatever held the single main thread
   // for >= 1 s (a labelled `beginLagLabel` span, else a bare "no label" warning).
@@ -349,6 +370,11 @@ export async function runDaemon(): Promise<void> {
   );
   ownsCreds = true;
 
+  // The db worker opens the database and runs migrations while the rest of
+  // boot proceeds; the gate stays shut until it is ready. /health and /info
+  // answer meanwhile. A failure is logged and retried, never skipped.
+  const dbBoot = awaitDbReady({ isStopped: () => shuttingDown });
+
   // A restore that throws must not leave a bound server whose routes wait on a
   // ready signal that never comes.
   try {
@@ -375,6 +401,9 @@ export async function runDaemon(): Promise<void> {
     // Adopt the OpenCode servers a previous core left running before the
     // reconcile reattaches `server=agetor` runs to them (index.ts has the same step).
     await adoptOpencodeServers();
+    // Before the first reconcile query, and so before the gate opens.
+    if (!(await dbBoot)) return;
+    await preloadPipelineParents();
     await reconcileOrphans();
     // M16: same ordering as index.ts's desktop boot path — reconcile every
     // pipeline parent left mid-flight by a prior crash/restart right after
@@ -453,6 +482,10 @@ export async function runDaemon(): Promise<void> {
   // The boot restore is done: let the routes through.
   markBootReady();
 
+  // Task-list push: one throttled `tasks-changed` event per task revision or
+  // decoration change on the global SSE stream (task-change-push.ts).
+  startTasksChangedPush();
+
   // Complete (or visibly block) harness-stack swaps a restart interrupted.
   // After the gate: a completion mirrors config and copies a transcript,
   // which must not hold every route. Each task is claimed first, so a Run or
@@ -521,13 +554,25 @@ export async function runDaemon(): Promise<void> {
   // process alive on its own — the listening server does that.
   if (idleTimeoutMs > 0) {
     let idleSince: number | null = null;
-    const timer = setInterval(() => {
-      if (hasRunningWork() || attachedClientCount() > 0) {
+    // Single-flight: a check whose database reads are still in flight when
+    // the next tick fires is not doubled up.
+    let checking = false;
+    const check = async (): Promise<void> => {
+      if (await hasRunningWork() || attachedClientCount() > 0) {
         idleSince = null;
         return;
       }
       if (idleSince == null) idleSince = Date.now();
       else if (Date.now() - idleSince >= idleTimeoutMs) shutdown("idle timeout", 0, { realStop: true });
+    };
+    const timer = setInterval(() => {
+      if (checking) return;
+      checking = true;
+      void check()
+        .catch((err: unknown) => daemonLog(`idle check failed: ${String(err)}`))
+        .finally(() => {
+          checking = false;
+        });
     }, IDLE_CHECK_MS);
     timer.unref();
   }

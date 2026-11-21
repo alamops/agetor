@@ -1293,6 +1293,64 @@ test("opencodeAskAnswerFromBody maps ids, labels and typed text, and refuses eve
   expect(r.ok && Object.keys(r.answer)).toEqual(["__proto__"]);
 });
 
+test("a step's FIRST card carries pipelineParentId synchronously once its parent is noted", async () => {
+  const { notePipelineParent, forgetPipelineParent, clearPipelineParentCacheForTests, cancelPendingForTask } = await import("./interactions.ts");
+  clearPipelineParentCacheForTests();
+  notePipelineParent("step-noted", "parent-noted");
+  const { req } = await makePrompt("step-noted", "r1", "fp-noted");
+  expect(req.pipelineParentId).toBe("parent-noted");
+  cancelPendingForTask("step-noted", "done");
+  forgetPipelineParent("step-noted");
+  const plain = await makePrompt("step-noted", "r2", "fp-noted-2");
+  expect("pipelineParentId" in plain.req).toBe(false);
+  cancelPendingForTask("step-noted", "done");
+});
+
+test("the boot preload loads stored step parents, so the first card carries its parent synchronously", async () => {
+  const { preloadPipelineParents, clearPipelineParentCacheForTests, cancelPendingForTask } = await import("./interactions.ts");
+  const { db } = await import("./db.ts");
+  await makeTaskWithCwd("pre-parent");
+  await makeTaskWithCwd("pre-step");
+  await makeTaskWithCwd("pre-archived");
+  db.run(`UPDATE tasks SET pipeline_parent_id = 'pre-parent' WHERE id IN ('pre-step', 'pre-archived')`);
+  db.run(`UPDATE tasks SET archived_at = 1 WHERE id = 'pre-archived'`);
+  try {
+    clearPipelineParentCacheForTests();
+    expect(await preloadPipelineParents()).toBeGreaterThanOrEqual(1);
+    const step = await makePrompt("pre-step", "r1", "fp-pre-step");
+    expect(step.req.pipelineParentId).toBe("pre-parent");
+    const archived = await makePrompt("pre-archived", "r1", "fp-pre-archived");
+    expect(archived.req.pipelineParentId).toBeUndefined();
+  } finally {
+    cancelPendingForTask("pre-step", "done");
+    cancelPendingForTask("pre-archived", "done");
+    // bun test shares one db.ts singleton across files: an archived_at = 1 row
+    // left behind is an old archived task to every later retention test.
+    db.run(`DELETE FROM tasks WHERE id IN ('pre-parent', 'pre-step', 'pre-archived')`);
+  }
+});
+
+test("the fallback parent lookup nudges the PARENT's decoration so its folded badge updates", async () => {
+  const { clearPipelineParentCacheForTests, cancelPendingForTask } = await import("./interactions.ts");
+  const { db } = await import("./db.ts");
+  const { currentDecorationRev, decorationChangedSince } = await import("./task-decoration-rev.ts");
+  await makeTaskWithCwd("fb-parent");
+  await makeTaskWithCwd("fb-step");
+  db.run(`UPDATE tasks SET pipeline_parent_id = 'fb-parent' WHERE id = 'fb-step'`);
+  try {
+    clearPipelineParentCacheForTests(); // the cache does not know the step
+    const before = currentDecorationRev();
+    await makePrompt("fb-step", "r1", "fp-fb-step");
+    // The registration itself marks only the step; the lookup settles later.
+    for (let i = 0; i < 50 && !(decorationChangedSince(before) ?? []).includes("fb-parent"); i++) await Bun.sleep(10);
+    expect(decorationChangedSince(before)).toContain("fb-parent");
+  } finally {
+    cancelPendingForTask("fb-step", "done");
+    clearPipelineParentCacheForTests();
+    db.run(`DELETE FROM tasks WHERE id IN ('fb-parent', 'fb-step')`);
+  }
+});
+
 /* ── answerKind / held / pane-text redaction (docs/plans/claude-enter-to-confirm-prompts.md T2) ── */
 
 test("registerTmuxPrompt masks a typed OAuth code in the stored, broadcast and listed pane text", async () => {

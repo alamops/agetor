@@ -154,9 +154,9 @@ test("without the marker the generic fake reply is unchanged", async () => {
   expect(chunks.filter((c) => c.stream === "stdout").map((c) => c.data)).toEqual(["fake response to: just hello"]);
 });
 
-test("renderFakePrProposalReply returns null for a template that isn't valid UTF-8 base64url", () => {
-  expect(renderFakePrProposalReply("nope", `${FAKE_CLAUDE_PR_PROPOSAL_PROMPT_MARKER}:_w`)).toBeNull();
-  expect(renderFakePrProposalReply("nope", "no marker at all")).toBeNull();
+test("renderFakePrProposalReply returns null for a template that isn't valid UTF-8 base64url", async () => {
+  expect(await renderFakePrProposalReply("nope", `${FAKE_CLAUDE_PR_PROPOSAL_PROMPT_MARKER}:_w`)).toBeNull();
+  expect(await renderFakePrProposalReply("nope", "no marker at all")).toBeNull();
 });
 
 test("with a pipeline handoff marker too, the proposal prints before the handoff on turn 1 only", async () => {

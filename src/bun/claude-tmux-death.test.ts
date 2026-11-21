@@ -525,7 +525,7 @@ test(
       // tear the session down intentionally right away (mirrors delete/
       // archive/agent-switch calling `dropSession` on a held task).
       ctrlTmux.setGone(true);
-      dropSession(taskId);
+      await dropSession(taskId);
 
       // Wait a full fire window past the teardown. If `dropSession` failed to
       // clear the real `deathTimer` (a "zombie" interval left running against

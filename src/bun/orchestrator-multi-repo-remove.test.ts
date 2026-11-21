@@ -545,23 +545,23 @@ test("withTaskRepositoryRoots names only checkouts that exist; a single task get
     id = task.id;
     const [present, missing] = task.repositories!;
     const opts = { mode: null };
-    expect(withTaskRepositoryRoots(id, opts)).toMatchObject({
+    expect(await withTaskRepositoryRoots(id, opts)).toMatchObject({
       extraDirectories: [present!.worktreePath, missing!.worktreePath],
     });
     rmSync(missing!.worktreePath!, { recursive: true, force: true });
-    const pruned = withTaskRepositoryRoots(id, opts)!;
+    const pruned = (await withTaskRepositoryRoots(id, opts))!;
     expect(pruned.extraDirectories).toEqual([present!.worktreePath!]);
     expect(pruned.codexWorkspaceRepos).toEqual([{ worktreePath: present!.worktreePath!, repoPath: a }]);
     // Nothing on disk at all: no flags.
     rmSync(present!.worktreePath!, { recursive: true, force: true });
-    expect(withTaskRepositoryRoots(id, opts)).toBe(opts);
+    expect(await withTaskRepositoryRoots(id, opts)).toBe(opts);
 
     const single = await createTask({ title: "roots single", prompt: "p", agent: "claude-code", workdir: solo, isolation: "worktree" });
     if ("error" in single) throw new Error(single.error);
     singleId = single.task.id;
     mkdirSync(await workspaceOf(singleId), { recursive: true });
     tasks.update(singleId, { worktreePath: await workspaceOf(singleId) });
-    expect(withTaskRepositoryRoots(singleId, opts)).toBe(opts);
+    expect(await withTaskRepositoryRoots(singleId, opts)).toBe(opts);
   } finally {
     cleanup(id ? await workspaceOf(id) : undefined, singleId ? await workspaceOf(singleId) : undefined, a, b, solo);
   }
@@ -581,7 +581,7 @@ test("withTaskRepositoryRoots hands the claude driver the auto-trust directories
     id = task.id;
     const opts = { mode: null };
     // Default on (no stored value): one entry per checkout, named after the repository.
-    const on = withTaskRepositoryRoots(id, opts)!;
+    const on = (await withTaskRepositoryRoots(id, opts))!;
     expect(on.autoTrustDirectories?.map((d) => d.name)).toEqual(task.repositories!.map((r) => r.name));
     for (const [i, d] of on.autoTrustDirectories!.entries()) {
       expect(d.paths[0]).toBe(task.repositories![i]!.worktreePath!);
@@ -591,11 +591,11 @@ test("withTaskRepositoryRoots hands the claude driver the auto-trust directories
     // The argv roots are unchanged by the preference.
     expect(on.extraDirectories).toEqual(task.repositories!.map((r) => r.worktreePath!));
     preferences.set(CLAUDE_AUTO_TRUST_PREF, "0");
-    const off = withTaskRepositoryRoots(id, opts)!;
+    const off = (await withTaskRepositoryRoots(id, opts))!;
     expect(off.autoTrustDirectories).toBeUndefined();
     expect(off.extraDirectories).toEqual(on.extraDirectories);
     preferences.set(CLAUDE_AUTO_TRUST_PREF, "1");
-    expect(withTaskRepositoryRoots(id, opts)!.autoTrustDirectories).toHaveLength(2);
+    expect((await withTaskRepositoryRoots(id, opts))!.autoTrustDirectories).toHaveLength(2);
   } finally {
     preferences.set(CLAUDE_AUTO_TRUST_PREF, "1"); // back to the default (on) for later tests
     cleanup(id ? await workspaceOf(id) : undefined, a, b);

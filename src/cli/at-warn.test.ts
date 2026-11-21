@@ -16,7 +16,7 @@ import * as realOutput from "./output.ts";
 const realOutputSnapshot = { ...realOutput };
 const errLines: string[] = [];
 
-mock.module("./output.ts", () => ({
+void mock.module("./output.ts", () => ({
   ...realOutputSnapshot,
   errln: (msg = "") => {
     errLines.push(msg);
@@ -24,7 +24,7 @@ mock.module("./output.ts", () => ({
 }));
 
 afterAll(() => {
-  mock.module("./output.ts", () => realOutputSnapshot);
+  void mock.module("./output.ts", () => realOutputSnapshot);
 });
 
 const {

@@ -171,7 +171,7 @@ describe("harness-stack swap", () => {
     const homeB = home(idB);
     alias(idA, homeA);
     alias(idB, homeB);
-    const stack = stacks.harnessStacks.create({ label: "swap", kind: "claude-code", members: [idA, idB] });
+    const stack = await stacks.harnessStacks.create({ label: "swap", kind: "claude-code", members: [idA, idB] });
     const task = makeTask(idA, `do it ${FAKE_CLAUDE_LIMIT_PROMPT_MARKER}`);
 
     const started = await orch.startTask(task.id);
@@ -204,7 +204,7 @@ describe("harness-stack swap", () => {
     expect(final.agent).toBe(idB);
     expect(final.column).toBe("review");
     expect(final.harnessState?.pendingSwap ?? null).toBeNull();
-    stacks.harnessStacks.delete(stack.id);
+    await stacks.harnessStacks.delete(stack.id);
   }, 15_000);
 
   test("a Codex quota limit (the real CLI prose) swaps and resumes the transferred rollout on the backup (S24, R-S15)", async () => {
@@ -221,11 +221,20 @@ describe("harness-stack swap", () => {
     };
     const rootA = codexHome(idA);
     const rootB = codexHome(idB);
-    const stack = stacks.harnessStacks.create({ label: "codex-swap", kind: "codex", members: [idA, idB] });
+    const stack = await stacks.harnessStacks.create({ label: "codex-swap", kind: "codex", members: [idA, idB] });
     const prevDriver = process.env.AGETOR_CODEX_DRIVER;
     const prevBin = process.env.AGETOR_CODEX_BIN;
     process.env.AGETOR_CODEX_DRIVER = "fake";
     process.env.AGETOR_CODEX_BIN = "/bin/echo";
+    // The real prose's reset is a wall-clock time, so build it relative to the
+    // test's clock: the top of the hour three hours ahead is always future
+    // (never a "just passed" 3 PM, which the parser reads as null).
+    const prevReset = process.env.AGETOR_FAKE_CODEX_LIMIT_RESET;
+    const resetDate = new Date();
+    resetDate.setMinutes(0, 0, 0);
+    resetDate.setHours(resetDate.getHours() + 3);
+    const expectedResetHour = resetDate.getHours();
+    process.env.AGETOR_FAKE_CODEX_LIMIT_RESET = `${expectedResetHour % 12 === 0 ? 12 : expectedResetHour % 12}:00 ${expectedResetHour >= 12 ? "PM" : "AM"}`;
     const prompts: string[] = [];
     let taskId = "";
     const prevPrompt = orch.__setHarnessSwapPromptHookForTest((hooked, prompt) => {
@@ -276,26 +285,28 @@ describe("harness-stack swap", () => {
       expect(db.harnessSessionHandoffs.get(task.id, idB, "codex_session_id")?.sessionId).toBe(threadId);
       // The real prose classified as quota with its parsed 3 PM reset, which
       // the swap notice carries.
-      const cooldown = stacks.harnessStacks.getLimitState(idA);
+      const cooldown = await stacks.harnessStacks.getLimitState(idA);
       expect(cooldown?.reason).toBe("quota");
       const noticeRaw = statusLines(successor!.id).find((l) => l.startsWith("harness-swap: "));
       const resetsAtMs = parseHarnessSwapNotice(noticeRaw ?? "")?.resetsAtMs;
       expect(typeof resetsAtMs).toBe("number");
       expect(resetsAtMs!).toBeGreaterThan(Date.now());
-      expect(new Date(resetsAtMs!).getHours()).toBe(15);
+      expect(new Date(resetsAtMs!).getHours()).toBe(expectedResetHour);
       expect(new Date(resetsAtMs!).getMinutes()).toBe(0);
       // The provider-reported reset is the account's cooldown, not a fallback.
       expect(cooldown?.exhaustedUntilMs).toBe(resetsAtMs!);
       expect(db.tasks.get(task.id)!.agent).toBe(idB);
     } finally {
       orch.__setHarnessSwapPromptHookForTest(prevPrompt);
-      stacks.harnessStacks.clearLimitState(idA);
-      stacks.harnessStacks.clearLimitState(idB);
-      stacks.harnessStacks.delete(stack.id);
+      await stacks.harnessStacks.clearLimitState(idA);
+      await stacks.harnessStacks.clearLimitState(idB);
+      await stacks.harnessStacks.delete(stack.id);
       if (prevDriver === undefined) delete process.env.AGETOR_CODEX_DRIVER;
       else process.env.AGETOR_CODEX_DRIVER = prevDriver;
       if (prevBin === undefined) delete process.env.AGETOR_CODEX_BIN;
       else process.env.AGETOR_CODEX_BIN = prevBin;
+      if (prevReset === undefined) delete process.env.AGETOR_FAKE_CODEX_LIMIT_RESET;
+      else process.env.AGETOR_FAKE_CODEX_LIMIT_RESET = prevReset;
     }
   }, 20_000);
 
@@ -304,7 +315,7 @@ describe("harness-stack swap", () => {
     const idB = `api-limit-b-${seq}`;
     alias(idA, home(idA));
     alias(idB, home(idB));
-    const stack = stacks.harnessStacks.create({ label: "api-limit", kind: "claude-code", members: [idA, idB] });
+    const stack = await stacks.harnessStacks.create({ label: "api-limit", kind: "claude-code", members: [idA, idB] });
     const globals: GlobalEvent[] = [];
     const unsub = orch.subscribeGlobal((e) => globals.push(e));
     let taskId = "";
@@ -339,9 +350,9 @@ describe("harness-stack swap", () => {
     } finally {
       unsub();
       if (taskId) {
-        stacks.harnessStacks.clearLimitState(idA);
-        stacks.harnessStacks.clearLimitState(idB);
-        stacks.harnessStacks.delete(stack.id);
+        await stacks.harnessStacks.clearLimitState(idA);
+        await stacks.harnessStacks.clearLimitState(idB);
+        await stacks.harnessStacks.delete(stack.id);
       }
     }
   }, 15_000);
@@ -352,9 +363,9 @@ describe("harness-stack swap", () => {
     const idB = `ex-b-${seq}`;
     alias(idA, home(idA));
     alias(idB, home(idB));
-    const stack = stacks.harnessStacks.create({ label: "exhausted", kind: "claude-code", members: [idA, idB] });
+    const stack = await stacks.harnessStacks.create({ label: "exhausted", kind: "claude-code", members: [idA, idB] });
     // The backup is already cooling, so the walk has nowhere to go.
-    stacks.harnessStacks.setLimitState(idB, {
+    await stacks.harnessStacks.setLimitState(idB, {
       reason: "quota",
       resetAtMs: Date.now() + 120_000,
       message: "usage limit",
@@ -377,8 +388,8 @@ describe("harness-stack swap", () => {
     expect(runs[0]!.status).toBe("failed");
     const { cancelAutoRetry } = await import("./harness-failover.ts");
     cancelAutoRetry(task.id);
-    stacks.harnessStacks.clearLimitState(idB);
-    stacks.harnessStacks.delete(stack.id);
+    await stacks.harnessStacks.clearLimitState(idB);
+    await stacks.harnessStacks.delete(stack.id);
   }, 15_000);
 
   test("an all-exhausted retry skips the still-cooling account and resumes the conversation", async () => {
@@ -386,9 +397,9 @@ describe("harness-stack swap", () => {
     const idB = `retry-b-${seq}`;
     alias(idA, home(idA));
     alias(idB, home(idB));
-    const stack = stacks.harnessStacks.create({ label: "retry", kind: "claude-code", members: [idA, idB] });
+    const stack = await stacks.harnessStacks.create({ label: "retry", kind: "claude-code", members: [idA, idB] });
     // Force the first settlement to block: the backup is cooling too.
-    stacks.harnessStacks.setLimitState(idB, {
+    await stacks.harnessStacks.setLimitState(idB, {
       reason: "quota",
       resetAtMs: Date.now() + 120_000,
       message: "usage limit",
@@ -406,7 +417,7 @@ describe("harness-stack swap", () => {
     // the fallback quota backoff. The current account A is still cooling, so
     // the retry must move to B — and because the first turn recorded a tool
     // call, it must transfer and resume the session, not start fresh.
-    stacks.harnessStacks.clearLimitState(idB);
+    await stacks.harnessStacks.clearLimitState(idB);
     const state = blocked.harnessState!;
     const nextAttemptAt = Date.now();
     db.tasks.setHarnessState(task.id, {
@@ -427,8 +438,8 @@ describe("harness-stack swap", () => {
     expect(runs[1]!.origin).toBe("harness-swap");
     expect(runs[1]!.claudeSessionId).toBe(`fake-swap-${task.id}`);
     expect(db.tasks.get(task.id)?.agent).toBe(idB);
-    stacks.harnessStacks.clearLimitState(idA);
-    stacks.harnessStacks.delete(stack.id);
+    await stacks.harnessStacks.clearLimitState(idA);
+    await stacks.harnessStacks.delete(stack.id);
   }, 15_000);
 
   test("an all-exhausted retry surfaces the mirror warnings on the successor run (R13-M2)", async () => {
@@ -443,8 +454,8 @@ describe("harness-stack swap", () => {
     // success; it must now land on the successor's message stream.
     writeFileSync(path.join(homeA, "settings.json"), "{}\n");
     writeFileSync(path.join(homeB, "settings.json"), "[]\n");
-    const stack = stacks.harnessStacks.create({ label: "retry-warn", kind: "claude-code", members: [idA, idB] });
-    stacks.harnessStacks.setLimitState(idB, {
+    const stack = await stacks.harnessStacks.create({ label: "retry-warn", kind: "claude-code", members: [idA, idB] });
+    await stacks.harnessStacks.setLimitState(idB, {
       reason: "quota",
       resetAtMs: Date.now() + 120_000,
       message: "usage limit",
@@ -455,7 +466,7 @@ describe("harness-stack swap", () => {
     await waitFor(() => db.tasks.get(task.id)?.column === "blocked");
 
     const blocked = db.tasks.get(task.id)!;
-    stacks.harnessStacks.clearLimitState(idB);
+    await stacks.harnessStacks.clearLimitState(idB);
     const state = blocked.harnessState!;
     const nextAttemptAt = Date.now();
     db.tasks.setHarnessState(task.id, {
@@ -475,8 +486,8 @@ describe("harness-stack swap", () => {
     // The wording names what actually failed (a JSON array is valid JSON but
     // not a settings object), instead of claiming invalid JSON.
     expect(successorLines.some((line) => line.includes("not a JSON object"))).toBe(true);
-    stacks.harnessStacks.clearLimitState(idA);
-    stacks.harnessStacks.delete(stack.id);
+    await stacks.harnessStacks.clearLimitState(idA);
+    await stacks.harnessStacks.delete(stack.id);
   }, 15_000);
 
   test("an all-exhausted retry blocks when the recorded transcript is gone", async () => {
@@ -485,9 +496,9 @@ describe("harness-stack swap", () => {
     const homeA = home(idA);
     alias(idA, homeA);
     alias(idB, home(idB));
-    const stack = stacks.harnessStacks.create({ label: "retry-gone", kind: "claude-code", members: [idA, idB] });
+    const stack = await stacks.harnessStacks.create({ label: "retry-gone", kind: "claude-code", members: [idA, idB] });
     // Force the first settlement to block: the backup is cooling too.
-    stacks.harnessStacks.setLimitState(idB, {
+    await stacks.harnessStacks.setLimitState(idB, {
       reason: "quota",
       resetAtMs: Date.now() + 120_000,
       message: "usage limit",
@@ -508,7 +519,7 @@ describe("harness-stack swap", () => {
     unlinkSync(transcript);
 
     // Let the backup serve, then fire the retry "now".
-    stacks.harnessStacks.clearLimitState(idB);
+    await stacks.harnessStacks.clearLimitState(idB);
     const state = blocked.harnessState!;
     const nextAttemptAt = Date.now();
     db.tasks.setHarnessState(task.id, {
@@ -535,11 +546,11 @@ describe("harness-stack swap", () => {
     // A hard block is a manual fix: the stale all-exhausted marker must be
     // cleared, or the card/badge/CLI would claim "Retrying…" with no timer.
     expect(after.harnessState?.allExhausted ?? null).toBeNull();
-    expect(orch.hasPendingHarnessRetry(task.id)).toBe(false);
+    expect(await orch.hasPendingHarnessRetry(task.id)).toBe(false);
     const { harnessStackBannerMode } = await import("../shared/harness-stack.ts");
     expect(harnessStackBannerMode(after.harnessState)).not.toBe("exhausted");
-    stacks.harnessStacks.clearLimitState(idA);
-    stacks.harnessStacks.delete(stack.id);
+    await stacks.harnessStacks.clearLimitState(idA);
+    await stacks.harnessStacks.delete(stack.id);
   }, 15_000);
 
   test("a none-usable backup blocks with a manual-fix line, not a phantom quota retry", async () => {
@@ -555,17 +566,17 @@ describe("harness-stack swap", () => {
       mkdirSync(dir, { recursive: true });
       alias(id, dir);
     }
-    const stack = stacks.harnessStacks.create({ label: "none-usable", kind: "claude-code", members: [idA, idB, idC] });
+    const stack = await stacks.harnessStacks.create({ label: "none-usable", kind: "claude-code", members: [idA, idB, idC] });
     const task = makeTask(idA, `limit ${FAKE_CLAUDE_LIMIT_PROMPT_MARKER}`);
 
     // Remove the account that hit the limit from the stack before the
     // settlement resolves. Its own cooldown is then not a member cooldown, so
     // the remaining two logged-out accounts are `none-usable` rather than a
     // quota-exhausted train.
-    const prev = orch.__setHarnessLimitObservedHookForTest((observedTaskId) => {
+    const prev = orch.__setHarnessLimitObservedHookForTest(async (observedTaskId) => {
       orch.__setHarnessLimitObservedHookForTest(null);
       expect(observedTaskId).toBe(task.id);
-      stacks.harnessStacks.update(stack.id, { members: [idB, idC] });
+      await stacks.harnessStacks.update(stack.id, { members: [idB, idC] });
     });
     // Platform-independent login evidence: on darwin a credential-less
     // config dir would otherwise fall through to a keychain probe. Pin a
@@ -589,8 +600,8 @@ describe("harness-stack swap", () => {
     // No timer was armed, so the transcript must not claim a quota retry.
     expect(lines.some((l) => /retrying at/i.test(l))).toBe(false);
     expect(lines.some((l) => /out of quota/i.test(l))).toBe(false);
-    stacks.harnessStacks.clearLimitState(idA);
-    stacks.harnessStacks.delete(stack.id);
+    await stacks.harnessStacks.clearLimitState(idA);
+    await stacks.harnessStacks.delete(stack.id);
   }, 15_000);
 
   test("a same-account retry after the reset resumes the existing session", async () => {
@@ -598,8 +609,8 @@ describe("harness-stack swap", () => {
     const idB = `same-b-${seq}`;
     alias(idA, home(idA));
     alias(idB, home(idB));
-    const stack = stacks.harnessStacks.create({ label: "same", kind: "claude-code", members: [idA, idB] });
-    stacks.harnessStacks.setLimitState(idB, {
+    const stack = await stacks.harnessStacks.create({ label: "same", kind: "claude-code", members: [idA, idB] });
+    await stacks.harnessStacks.setLimitState(idB, {
       reason: "quota",
       resetAtMs: Date.now() + 120_000,
       message: "usage limit",
@@ -613,7 +624,7 @@ describe("harness-stack swap", () => {
     // A's reset arrives first; B is still cooling. The retry stays on A and
     // must resume the same provider session rather than resending the prompt
     // on a fresh one.
-    stacks.harnessStacks.clearLimitState(idA);
+    await stacks.harnessStacks.clearLimitState(idA);
     const state = db.tasks.get(task.id)!.harnessState!;
     const nextAttemptAt = Date.now();
     db.tasks.setHarnessState(task.id, {
@@ -631,9 +642,9 @@ describe("harness-stack swap", () => {
     expect(runs[1]!.agent).toBe(idA);
     expect(runs[1]!.origin).toBe("harness-swap");
     expect(runs[1]!.claudeSessionId).toBe(`fake-swap-${task.id}`);
-    stacks.harnessStacks.clearLimitState(idA);
-    stacks.harnessStacks.clearLimitState(idB);
-    stacks.harnessStacks.delete(stack.id);
+    await stacks.harnessStacks.clearLimitState(idA);
+    await stacks.harnessStacks.clearLimitState(idB);
+    await stacks.harnessStacks.delete(stack.id);
   }, 15_000);
 
   test("a retry that fails for a non-limit reason ends the failover loop", async () => {
@@ -641,9 +652,9 @@ describe("harness-stack swap", () => {
     const idB = `retry-fail-b-${seq}`;
     alias(idA, home(idA));
     alias(idB, home(idB));
-    const stack = stacks.harnessStacks.create({ label: "retry-fail", kind: "claude-code", members: [idA, idB] });
+    const stack = await stacks.harnessStacks.create({ label: "retry-fail", kind: "claude-code", members: [idA, idB] });
     // Force the first settlement to block: the backup is cooling too.
-    stacks.harnessStacks.setLimitState(idB, {
+    await stacks.harnessStacks.setLimitState(idB, {
       reason: "quota",
       resetAtMs: Date.now() + 120_000,
       message: "usage limit",
@@ -659,7 +670,7 @@ describe("harness-stack swap", () => {
     // API error). The retry marker must end the loop — leaving `inFlight`
     // armed is what lets the normal settle clear `allExhausted` instead of
     // showing "Retrying…" forever with `nextAttemptAt: 0` and no timer.
-    stacks.harnessStacks.clearLimitState(idB);
+    await stacks.harnessStacks.clearLimitState(idB);
     const state = db.tasks.get(task.id)!.harnessState!;
     const nextAttemptAt = Date.now();
     db.tasks.setHarnessState(task.id, {
@@ -682,12 +693,12 @@ describe("harness-stack swap", () => {
       }, 8000);
       runs = [...db.runs.listForTask(task.id)].sort((a, b) => a.startedAt - b.startedAt);
       allExhausted = db.tasks.get(task.id)!.harnessState?.allExhausted ?? null;
-      pendingRetry = orch.hasPendingHarnessRetry(task.id);
+      pendingRetry = await orch.hasPendingHarnessRetry(task.id);
     } finally {
       delete process.env.AGETOR_FAKE_CLAUDE_API_ERROR;
-      stacks.harnessStacks.clearLimitState(idA);
-      stacks.harnessStacks.clearLimitState(idB);
-      stacks.harnessStacks.delete(stack.id);
+      await stacks.harnessStacks.clearLimitState(idA);
+      await stacks.harnessStacks.clearLimitState(idB);
+      await stacks.harnessStacks.delete(stack.id);
     }
 
     expect(runs).toHaveLength(2);
@@ -702,10 +713,10 @@ describe("harness-stack swap", () => {
     const idB = `retry-spawn-b-${seq}`;
     alias(idA, home(idA));
     alias(idB, home(idB));
-    const stack = stacks.harnessStacks.create({ label: "retry-spawn-throw", kind: "claude-code", members: [idA, idB] });
+    const stack = await stacks.harnessStacks.create({ label: "retry-spawn-throw", kind: "claude-code", members: [idA, idB] });
     // Force the first settlement to block so the retry timer is what starts the
     // successor (the R8-M1 path: the retry is re-armed after a failed spawn).
-    stacks.harnessStacks.setLimitState(idB, {
+    await stacks.harnessStacks.setLimitState(idB, {
       reason: "quota",
       resetAtMs: Date.now() + 120_000,
       message: "usage limit",
@@ -725,7 +736,7 @@ describe("harness-stack swap", () => {
     let runsAfter: ReturnType<typeof db.runs.listForTask> = [];
     let retryState: { attempts: number; inFlight?: boolean; nextAttemptAt: number } | null = null;
     try {
-      stacks.harnessStacks.clearLimitState(idB);
+      await stacks.harnessStacks.clearLimitState(idB);
       // A deterministic synchronous throw inside `spawnAgent` → the swap's
       // `spawnAgentOrFail` catch. `buildCommand` requires a model; the empty
       // string reaches it as-is (nullish coalescing does not fall back).
@@ -750,9 +761,9 @@ describe("harness-stack swap", () => {
       unsubscribe();
       db.tasks.update(task.id, { model: "sonnet-4.6" });
       failover.cancelAutoRetry(task.id);
-      stacks.harnessStacks.clearLimitState(idA);
-      stacks.harnessStacks.clearLimitState(idB);
-      stacks.harnessStacks.delete(stack.id);
+      await stacks.harnessStacks.clearLimitState(idA);
+      await stacks.harnessStacks.clearLimitState(idB);
+      await stacks.harnessStacks.delete(stack.id);
     }
 
     expect(runsAfter).toHaveLength(2);
@@ -779,8 +790,8 @@ describe("harness-stack swap", () => {
     const idB = `retry-throw-b-${seq}`;
     alias(idA, home(idA));
     alias(idB, home(idB));
-    const stack = stacks.harnessStacks.create({ label: "retry-throw", kind: "claude-code", members: [idA, idB] });
-    stacks.harnessStacks.setLimitState(idB, {
+    const stack = await stacks.harnessStacks.create({ label: "retry-throw", kind: "claude-code", members: [idA, idB] });
+    await stacks.harnessStacks.setLimitState(idB, {
       reason: "quota",
       resetAtMs: Date.now() + 120_000,
       message: "usage limit",
@@ -801,7 +812,7 @@ describe("harness-stack swap", () => {
     let runCount = 0;
     let pending = false;
     try {
-      stacks.harnessStacks.clearLimitState(idB);
+      await stacks.harnessStacks.clearLimitState(idB);
       const state = db.tasks.get(task.id)!.harnessState!;
       const nextAttemptAt = Date.now();
       db.tasks.setHarnessState(task.id, {
@@ -818,13 +829,13 @@ describe("harness-stack swap", () => {
       }, 8000);
       after = db.tasks.get(task.id)!.harnessState;
       runCount = db.runs.listForTask(task.id).length;
-      pending = orch.hasPendingHarnessRetry(task.id);
+      pending = await orch.hasPendingHarnessRetry(task.id);
     } finally {
       orch.__setHarnessSwapSpawnHookForTest(prevHook);
       failover.cancelAutoRetry(task.id);
-      stacks.harnessStacks.clearLimitState(idA);
-      stacks.harnessStacks.clearLimitState(idB);
-      stacks.harnessStacks.delete(stack.id);
+      await stacks.harnessStacks.clearLimitState(idA);
+      await stacks.harnessStacks.clearLimitState(idB);
+      await stacks.harnessStacks.delete(stack.id);
     }
 
     expect(after?.allExhausted?.inFlight).not.toBe(true);
@@ -894,7 +905,7 @@ describe("harness-stack swap", () => {
     const homeB = home(idB);
     alias(idA, homeA);
     alias(idB, homeB);
-    const stack = stacks.harnessStacks.create({ label: "clean", kind: "claude-code", members: [idA, idB] });
+    const stack = await stacks.harnessStacks.create({ label: "clean", kind: "claude-code", members: [idA, idB] });
     const task = makeTask(idA, `no tools yet ${FAKE_CLAUDE_LIMIT_CLEAN_PROMPT_MARKER}`);
 
     // The clean-retry branch has no transfer and the fake driver does not echo
@@ -950,7 +961,7 @@ describe("harness-stack swap", () => {
     const text = formatHarnessSwapNotice(notice);
     expect(text).toContain("Restarting the request on this account.");
     expect(text).not.toContain("transferred conversation");
-    stacks.harnessStacks.delete(stack.id);
+    await stacks.harnessStacks.delete(stack.id);
   }, 15_000);
 
   test("a follow-up turn that limits before its first tool call keeps the earlier conversation", async () => {
@@ -960,7 +971,7 @@ describe("harness-stack swap", () => {
     const homeB = home(idB);
     alias(idA, homeA);
     alias(idB, homeB);
-    const stack = stacks.harnessStacks.create({ label: "follow-up", kind: "claude-code", members: [idA, idB] });
+    const stack = await stacks.harnessStacks.create({ label: "follow-up", kind: "claude-code", members: [idA, idB] });
     const task = makeTask(idA, "first ask");
 
     // An earlier turn on A already produced a provider conversation; the first
@@ -1007,7 +1018,7 @@ describe("harness-stack swap", () => {
     // parser); the formatted divider is what must not claim a restart.
     expect(notice.continuation).not.toBe("restarted");
     expect(formatHarnessSwapNotice(notice)).toContain("Continuing from the transferred conversation.");
-    stacks.harnessStacks.delete(stack.id);
+    await stacks.harnessStacks.delete(stack.id);
   }, 15_000);
 
   test("a same-account retry after a follow-up limit also resumes the earlier conversation", async () => {
@@ -1016,7 +1027,7 @@ describe("harness-stack swap", () => {
     const homeA = home(idA);
     alias(idA, homeA);
     alias(idB, home(idB));
-    const stack = stacks.harnessStacks.create({ label: "follow-same", kind: "claude-code", members: [idA, idB] });
+    const stack = await stacks.harnessStacks.create({ label: "follow-same", kind: "claude-code", members: [idA, idB] });
     const task = makeTask(idA, "first ask");
     const sessionId = `prior-same-${task.id}`;
     const priorRunId = seedPriorConversation(task, idA, sessionId);
@@ -1024,7 +1035,7 @@ describe("harness-stack swap", () => {
     // The backup is still cooling, so the follow-up limit cannot leave the
     // account. A's own reset then re-picks A — the same-account retry must
     // resume the conversation a fresh session would throw away (R11-M1).
-    stacks.harnessStacks.setLimitState(idB, {
+    await stacks.harnessStacks.setLimitState(idB, {
       reason: "quota",
       resetAtMs: Date.now() + 120_000,
       message: "usage limit",
@@ -1040,7 +1051,7 @@ describe("harness-stack swap", () => {
       await waitFor(() => db.tasks.get(task.id)?.column === "blocked");
       expect(db.tasks.get(task.id)!.harnessState?.allExhausted).toBeTruthy();
 
-      stacks.harnessStacks.clearLimitState(idA);
+      await stacks.harnessStacks.clearLimitState(idA);
       const state = db.tasks.get(task.id)!.harnessState!;
       const nextAttemptAt = Date.now();
       db.tasks.setHarnessState(task.id, {
@@ -1055,8 +1066,8 @@ describe("harness-stack swap", () => {
       }, 8000);
     } finally {
       orch.__setHarnessSwapPromptHookForTest(prevPromptHook);
-      stacks.harnessStacks.clearLimitState(idA);
-      stacks.harnessStacks.clearLimitState(idB);
+      await stacks.harnessStacks.clearLimitState(idA);
+      await stacks.harnessStacks.clearLimitState(idB);
     }
 
     const runs = [...db.runs.listForTask(task.id)].sort((a, b) => a.startedAt - b.startedAt);
@@ -1070,7 +1081,7 @@ describe("harness-stack swap", () => {
     const { composeHarnessStackContinuationPrompt } = await import("../shared/harness-stack.ts");
     expect(prompts).toHaveLength(1);
     expect(prompts[0]).toBe(composeHarnessStackContinuationPrompt());
-    stacks.harnessStacks.delete(stack.id);
+    await stacks.harnessStacks.delete(stack.id);
   }, 15_000);
 
   test("boot keeps a settled successor's outcome instead of blocking a stale pending swap", async () => {
@@ -1078,7 +1089,7 @@ describe("harness-stack swap", () => {
     const idB = `boot-b-${seq}`;
     alias(idA, home(idA));
     alias(idB, home(idB));
-    const stack = stacks.harnessStacks.create({ label: "boot-reconcile", kind: "claude-code", members: [idA, idB] });
+    const stack = await stacks.harnessStacks.create({ label: "boot-reconcile", kind: "claude-code", members: [idA, idB] });
     const task = makeTask(idB, "already continued");
     const oldRunId = randomUUID();
     const successorId = randomUUID();
@@ -1123,13 +1134,13 @@ describe("harness-stack swap", () => {
     // The successor already succeeded; boot must not overwrite that with a
     // "core restarted mid-switch" block.
     expect(after.column).toBe("review");
-    stacks.harnessStacks.delete(stack.id);
+    await stacks.harnessStacks.delete(stack.id);
   }, 15_000);
 
   test("a 1-member stack settles like a lone account and drains a follow-up typed during the limit", async () => {
     const idA = `inert-a-${seq}`;
     alias(idA, home(idA));
-    const stack = stacks.harnessStacks.create({ label: "inert", kind: "claude-code", members: [idA] });
+    const stack = await stacks.harnessStacks.create({ label: "inert", kind: "claude-code", members: [idA] });
     const task = makeTask(idA, `limit ${FAKE_CLAUDE_LIMIT_PROMPT_MARKER}`);
 
     const prev = orch.__setHarnessSwapSettleHookForTest(async (hookedTaskId, runId, phase) => {
@@ -1171,7 +1182,7 @@ describe("harness-stack swap", () => {
       .flatMap((r) => db.runs.events(r.id))
       .filter((e) => e.stream === "user" && e.data.includes("follow-up during the limit"));
     expect(userBubbles).toHaveLength(1);
-    stacks.harnessStacks.delete(stack.id);
+    await stacks.harnessStacks.delete(stack.id);
   }, 20_000);
 
   test("a pending all-exhausted retry is reported and can be cancelled before it fires", async () => {
@@ -1179,7 +1190,7 @@ describe("harness-stack swap", () => {
     const idB = `pending-b-${seq}`;
     alias(idA, home(idA));
     alias(idB, home(idB));
-    const stack = stacks.harnessStacks.create({ label: "pending-retry", kind: "claude-code", members: [idA, idB] });
+    const stack = await stacks.harnessStacks.create({ label: "pending-retry", kind: "claude-code", members: [idA, idB] });
     const task = makeTask(idA, "never runs");
     const now = Date.now();
     db.tasks.setHarnessState(task.id, {
@@ -1200,18 +1211,18 @@ describe("harness-stack swap", () => {
     });
     failover.armAutoRetry(task.id, now + 60);
 
-    expect(orch.hasPendingHarnessRetry(task.id)).toBe(true);
-    expect(orch.cancelHarnessRetryForTask(task.id)).toBe(true);
-    expect(orch.hasPendingHarnessRetry(task.id)).toBe(false);
+    expect(await orch.hasPendingHarnessRetry(task.id)).toBe(true);
+    expect(await orch.cancelHarnessRetryForTask(task.id)).toBe(true);
+    expect(await orch.hasPendingHarnessRetry(task.id)).toBe(false);
     expect(db.tasks.get(task.id)!.harnessState!.allExhausted).toBeNull();
-    expect(orch.cancelHarnessRetryForTask(task.id)).toBe(false);
+    expect(await orch.cancelHarnessRetryForTask(task.id)).toBe(false);
     // The handle itself is gone, not merely a state the callback would ignore.
     expect(failover.hasArmedAutoRetry(task.id)).toBe(false);
 
     await new Promise((r) => setTimeout(r, 150));
     // The timer was cleared, not fired: no run appeared.
     expect(db.runs.listForTask(task.id)).toHaveLength(0);
-    stacks.harnessStacks.delete(stack.id);
+    await stacks.harnessStacks.delete(stack.id);
   }, 15_000);
 
   test("a Stop in the settlement window aborts the swap before a successor exists", async () => {
@@ -1219,7 +1230,7 @@ describe("harness-stack swap", () => {
     const idB = `stop-window-b-${seq}`;
     alias(idA, home(idA));
     alias(idB, home(idB));
-    const stack = stacks.harnessStacks.create({ label: "stop-window", kind: "claude-code", members: [idA, idB] });
+    const stack = await stacks.harnessStacks.create({ label: "stop-window", kind: "claude-code", members: [idA, idB] });
     const task = makeTask(idA, `limit ${FAKE_CLAUDE_LIMIT_PROMPT_MARKER}`);
 
     const prev = orch.__setHarnessSwapSettleHookForTest(async (stoppedTaskId, runId, phase) => {
@@ -1248,7 +1259,7 @@ describe("harness-stack swap", () => {
     expect(after.agent).toBe(idA);
     expect(after.harnessState?.pendingSwap ?? null).toBeNull();
     expect(after.harnessState?.allExhausted ?? null).toBeNull();
-    stacks.harnessStacks.delete(stack.id);
+    await stacks.harnessStacks.delete(stack.id);
   }, 15_000);
 
   test("a Stop while the train is exhausted blocks no card and arms no retry", async () => {
@@ -1256,8 +1267,8 @@ describe("harness-stack swap", () => {
     const idB = `stop-ex-b-${seq}`;
     alias(idA, home(idA));
     alias(idB, home(idB));
-    const stack = stacks.harnessStacks.create({ label: "stop-exhausted", kind: "claude-code", members: [idA, idB] });
-    stacks.harnessStacks.setLimitState(idB, {
+    const stack = await stacks.harnessStacks.create({ label: "stop-exhausted", kind: "claude-code", members: [idA, idB] });
+    await stacks.harnessStacks.setLimitState(idB, {
       reason: "quota",
       resetAtMs: Date.now() + 120_000,
       message: "usage limit",
@@ -1275,14 +1286,14 @@ describe("harness-stack swap", () => {
       await waitFor(() => db.tasks.get(task.id)?.column === "ready");
     } finally {
       orch.__setHarnessSwapSettleHookForTest(prev);
-      stacks.harnessStacks.clearLimitState(idB);
+      await stacks.harnessStacks.clearLimitState(idB);
     }
 
     const after = db.tasks.get(task.id)!;
     expect(after.column).toBe("ready");
     expect(after.harnessState?.allExhausted ?? null).toBeNull();
     expect(db.runs.listForTask(task.id)).toHaveLength(1);
-    stacks.harnessStacks.delete(stack.id);
+    await stacks.harnessStacks.delete(stack.id);
   }, 15_000);
 
   test("an archive during the mirror/transfer never resurrects the swap", async () => {
@@ -1290,7 +1301,7 @@ describe("harness-stack swap", () => {
     const idB = `arch-b-${seq}`;
     alias(idA, home(idA));
     alias(idB, home(idB));
-    const stack = stacks.harnessStacks.create({ label: "archive", kind: "claude-code", members: [idA, idB] });
+    const stack = await stacks.harnessStacks.create({ label: "archive", kind: "claude-code", members: [idA, idB] });
     const task = makeTask(idA, `limit ${FAKE_CLAUDE_LIMIT_PROMPT_MARKER}`);
 
     const prev = orch.__setHarnessSwapSettleHookForTest(async (archivedTaskId, _runId, phase) => {
@@ -1309,7 +1320,7 @@ describe("harness-stack swap", () => {
     expect(db.runs.listForTask(task.id)).toHaveLength(1);
     expect(db.tasks.get(task.id)?.agent).toBe(idA);
     expect(db.tasks.get(task.id)?.harnessState?.pendingSwap ?? null).toBeNull();
-    stacks.harnessStacks.delete(stack.id);
+    await stacks.harnessStacks.delete(stack.id);
   }, 15_000);
 
   test("a pane limit passthrough drops the paused REPL session", async () => {
@@ -1317,18 +1328,18 @@ describe("harness-stack swap", () => {
     const idB = `pane-pass-b-${seq}`;
     alias(idA, home(idA));
     alias(idB, home(idB));
-    const stack = stacks.harnessStacks.create({ label: "pane-pass", kind: "claude-code", members: [idA, idB] });
+    const stack = await stacks.harnessStacks.create({ label: "pane-pass", kind: "claude-code", members: [idA, idB] });
     const task = makeTask(idA, `pane limit ${FAKE_CLAUDE_LIMIT_PANE_PROMPT_MARKER}`);
     // The pane notice leaves the REPL parked; model that state explicitly.
     claude.__forTest.installSession(task.id, path.join(DATA_DIR, "pane-session.jsonl"));
 
     let observed = 0;
-    const prev = orch.__setHarnessLimitObservedHookForTest((observedTaskId) => {
+    const prev = orch.__setHarnessLimitObservedHookForTest(async (observedTaskId) => {
       orch.__setHarnessLimitObservedHookForTest(null);
       expect(observedTaskId).toBe(task.id);
       observed++;
       // No swap target left when the settlement resolves (M1 window).
-      stacks.harnessStacks.delete(stack.id);
+      await stacks.harnessStacks.delete(stack.id);
     });
     try {
       await orch.startTask(task.id);
@@ -1358,15 +1369,15 @@ describe("harness-stack swap", () => {
     const idB = `gone-b-${seq}`;
     alias(idA, home(idA));
     alias(idB, home(idB));
-    const stack = stacks.harnessStacks.create({ label: "gone", kind: "claude-code", members: [idA, idB] });
+    const stack = await stacks.harnessStacks.create({ label: "gone", kind: "claude-code", members: [idA, idB] });
     const task = makeTask(idA, `limit ${FAKE_CLAUDE_LIMIT_PROMPT_MARKER}`);
 
-    const prev = orch.__setHarnessLimitObservedHookForTest((observedTaskId) => {
+    const prev = orch.__setHarnessLimitObservedHookForTest(async (observedTaskId) => {
       orch.__setHarnessLimitObservedHookForTest(null);
       expect(observedTaskId).toBe(task.id);
       // The user deletes the stack while the limited turn is still settling,
       // so there is no swap target left when the done handler decides.
-      stacks.harnessStacks.delete(stack.id);
+      await stacks.harnessStacks.delete(stack.id);
     });
     try {
       const started = await orch.startTask(task.id);
@@ -1400,7 +1411,7 @@ describe("harness-stack swap", () => {
     const idB = `arch-refuse-b-${seq}`;
     alias(idA, home(idA));
     alias(idB, home(idB));
-    const stack = stacks.harnessStacks.create({ label: "arch-refuse", kind: "claude-code", members: [idA, idB] });
+    const stack = await stacks.harnessStacks.create({ label: "arch-refuse", kind: "claude-code", members: [idA, idB] });
     const task = makeTask(idA, "never runs");
     const now = Date.now();
     db.tasks.setHarnessState(task.id, {
@@ -1420,7 +1431,7 @@ describe("harness-stack swap", () => {
       lastMove: null,
     });
     failover.armAutoRetry(task.id, now + 60_000);
-    expect(orch.hasPendingHarnessRetry(task.id)).toBe(true);
+    expect(await orch.hasPendingHarnessRetry(task.id)).toBe(true);
 
     // The card is not in Done, so the archive is refused — and a refused
     // archive must not cancel the retry or drop the exhausted countdown.
@@ -1428,16 +1439,16 @@ describe("harness-stack swap", () => {
     expect("error" in result).toBe(true);
     expect(db.tasks.get(task.id)!.archivedAt).toBeNull();
     expect(db.tasks.get(task.id)!.harnessState?.allExhausted).not.toBeNull();
-    expect(orch.hasPendingHarnessRetry(task.id)).toBe(true);
+    expect(await orch.hasPendingHarnessRetry(task.id)).toBe(true);
 
-    expect(orch.cancelHarnessRetryForTask(task.id)).toBe(true);
-    stacks.harnessStacks.delete(stack.id);
+    expect(await orch.cancelHarnessRetryForTask(task.id)).toBe(true);
+    await stacks.harnessStacks.delete(stack.id);
   }, 15_000);
 
   test("a one-member stack is inert: the limit settles normally with no retry", async () => {
     const idA = `solo-a-${seq}`;
     alias(idA, home(idA));
-    const stack = stacks.harnessStacks.create({ label: "solo", kind: "claude-code", members: [idA] });
+    const stack = await stacks.harnessStacks.create({ label: "solo", kind: "claude-code", members: [idA] });
     const task = makeTask(idA, `limit ${FAKE_CLAUDE_LIMIT_PROMPT_MARKER}`);
     await orch.startTask(task.id);
     await waitFor(() => db.tasks.get(task.id)?.column !== "running");
@@ -1447,7 +1458,7 @@ describe("harness-stack swap", () => {
     expect(after.harnessState?.allExhausted ?? null).toBeNull();
     expect(after.harnessState?.pendingSwap ?? null).toBeNull();
     expect(db.runs.listForTask(task.id)).toHaveLength(1);
-    stacks.harnessStacks.delete(stack.id);
+    await stacks.harnessStacks.delete(stack.id);
   }, 15_000);
 
   test("only Claude's synthetic api-error status is classified from raw text", () => {
@@ -1485,7 +1496,7 @@ describe("manual same-stack account switch", () => {
     const idB = `manual-b-${seq}`;
     alias(idA, home(idA));
     alias(idB, home(idB));
-    const stack = stacks.harnessStacks.create({ label: "manual", kind: "claude-code", members: [idA, idB] });
+    const stack = await stacks.harnessStacks.create({ label: "manual", kind: "claude-code", members: [idA, idB] });
     const task = makeTask(idA, "manual switch");
     seedPriorConversation(task, idA, "11111111-1111-4111-8111-111111111111");
 
@@ -1500,7 +1511,7 @@ describe("manual same-stack account switch", () => {
     // The conversation genuinely moved: the handoff is what a later resume reads.
     expect(db.harnessSessionHandoffs.get(task.id, idB, "claude_session_id")?.sessionId)
       .toBe("11111111-1111-4111-8111-111111111111");
-    stacks.harnessStacks.delete(stack.id);
+    await stacks.harnessStacks.delete(stack.id);
   }, 15_000);
 
   test("records manual-switch even when the task has no recorded session (review S2)", async () => {
@@ -1508,7 +1519,7 @@ describe("manual same-stack account switch", () => {
     const idB = `manual-nosession-b-${seq}`;
     alias(idA, home(idA));
     alias(idB, home(idB));
-    const stack = stacks.harnessStacks.create({ label: "manual-nosession", kind: "claude-code", members: [idA, idB] });
+    const stack = await stacks.harnessStacks.create({ label: "manual-nosession", kind: "claude-code", members: [idA, idB] });
     const task = makeTask(idA, "manual switch without a session");
     // Nothing ran on the old account: there is no transcript to copy, but the
     // user still made a manual move inside the stack.
@@ -1525,7 +1536,7 @@ describe("manual same-stack account switch", () => {
     expect(state?.lastMove).toMatchObject({ from: idA, to: idB, reason: "manual-switch" });
     expect(state?.pendingSwap ?? null).toBeNull();
     expect(db.harnessSessionHandoffs.get(task.id, idB, "claude_session_id")).toBeNull();
-    stacks.harnessStacks.delete(stack.id);
+    await stacks.harnessStacks.delete(stack.id);
   }, 15_000);
 
   test("a held switch claim refuses a Run and a message, then clears", async () => {
@@ -1533,7 +1544,7 @@ describe("manual same-stack account switch", () => {
     const idB = `hold-b-${seq}`;
     alias(idA, home(idA));
     alias(idB, home(idB));
-    const stack = stacks.harnessStacks.create({ label: "hold", kind: "claude-code", members: [idA, idB] });
+    const stack = await stacks.harnessStacks.create({ label: "hold", kind: "claude-code", members: [idA, idB] });
     const task = makeTask(idA, "hold");
 
     // A run row so `sendInput` has something to address (it declines before
@@ -1556,19 +1567,19 @@ describe("manual same-stack account switch", () => {
     } as never);
     db.tasks.update(task.id, { runId, column: "review" });
 
-    expect(orch.claimTaskForAccountSwitch(task.id)).toBe(true);
+    expect(await orch.claimTaskForAccountSwitch(task.id)).toBe(true);
     // A second switch cannot steal the claim.
-    expect(orch.claimTaskForAccountSwitch(task.id)).toBe(false);
+    expect(await orch.claimTaskForAccountSwitch(task.id)).toBe(false);
     const started = await orch.startTask(task.id);
     expect("error" in started && started.error).toContain("switching accounts");
     const sent = await orch.sendInput(runId, "hello during the copy", { bounded: false });
     expect(sent.delivered).toBe(false);
     if (!sent.delivered) expect(sent.reason).toContain("switching accounts");
 
-    orch.releaseTaskAccountSwitch(task.id);
+    await orch.releaseTaskAccountSwitch(task.id);
     // After release the claim is free again; nothing is left gate-closed.
-    expect(orch.claimTaskForAccountSwitch(task.id)).toBe(true);
-    orch.releaseTaskAccountSwitch(task.id);
-    stacks.harnessStacks.delete(stack.id);
+    expect(await orch.claimTaskForAccountSwitch(task.id)).toBe(true);
+    await orch.releaseTaskAccountSwitch(task.id);
+    await stacks.harnessStacks.delete(stack.id);
   }, 15_000);
 });

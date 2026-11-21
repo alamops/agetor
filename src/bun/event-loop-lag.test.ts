@@ -61,7 +61,7 @@ describe("event-loop-lag monitor", () => {
     const lines = warnings.filter((w) => w.includes("core was unresponsive"));
     expect(lines).toHaveLength(1);
     expect(lines[0]).toMatch(
-      /^\[agetor\] core was unresponsive for \d+\.\ds during attach subagent watcher · task task-1$/,
+      /^\[agetor\] core was unresponsive for \d+\.\ds during attach subagent watcher · task task-1 \{.*\}$/,
     );
   });
 
@@ -107,7 +107,43 @@ describe("event-loop-lag monitor", () => {
     await waitForReports(1);
     expect(reports[0]!.label).toBeNull();
     expect(reports[0]!.ctx).toBeNull();
-    expect(warnings.some((w) => w.endsWith("during idle"))).toBe(true);
+    expect(warnings.some((w) => / during idle \{/.test(w))).toBe(true);
+  });
+
+  test("an unlabelled stall is still written, with the structured detail, via console.warn", async () => {
+    // No label and no runId: the sink-side status line never fires for this, so
+    // the console.warn (teed into core.log) is the only trace.
+    startLagMonitor({ sampleMs: 20, stallMs: 150, force: true });
+    Bun.sleepSync(400);
+    await waitForReports(1);
+    const line = warnings.find((w) => w.includes("core was unresponsive"))!;
+    expect(line).toBeDefined();
+    const detail = JSON.parse(line.slice(line.indexOf("{")));
+    expect(detail.label).toBe("idle");
+    expect(detail.lagMs).toBeGreaterThanOrEqual(150);
+    expect(detail.overlaps).toEqual([]);
+    expect(detail.taskId).toBeUndefined();
+  });
+
+  test("a stall line lists every overlapping label with its overlap and the task/run ids", async () => {
+    let clock = 0;
+    startLagMonitor({ sampleMs: 5, stallMs: 1000, now: () => clock, force: true });
+    const endOuter = beginLagLabel("boot reattach", { taskId: "t1" });
+    const endInner = beginLagLabel("attach subagent watcher", { taskId: "t1", runId: "r1" });
+    clock += 2000;
+    endInner();
+    endOuter();
+    await waitForReports(1);
+    const line = warnings.find((w) => w.includes("core was unresponsive"))!;
+    const detail = JSON.parse(line.slice(line.indexOf("{")));
+    expect(detail.label).toBe("attach subagent watcher");
+    expect(detail.taskId).toBe("t1");
+    expect(detail.runId).toBe("r1");
+    expect(detail.overlaps.map((o: { label: string }) => o.label).sort()).toEqual([
+      "attach subagent watcher",
+      "boot reattach",
+    ]);
+    for (const o of detail.overlaps) expect(o.overlapMs).toBeGreaterThan(1900);
   });
 
   test("a short block under the stall bar is not reported", async () => {

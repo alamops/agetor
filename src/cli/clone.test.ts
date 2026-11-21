@@ -51,7 +51,7 @@ let onAppEvents: ((e: AppEvent) => void) | null = null;
 let sseCalls: { pathname: string; dataDir?: string }[] = [];
 let orderLog: string[] = [];
 
-mock.module("./context.ts", () => ({
+void mock.module("./context.ts", () => ({
   ...realContextSnapshot,
   getClient: async () => {
     if (!currentClient) throw new Error("no fake client set for this test");
@@ -59,7 +59,7 @@ mock.module("./context.ts", () => ({
   },
 }));
 
-mock.module("./output.ts", () => ({
+void mock.module("./output.ts", () => ({
   ...realOutputSnapshot,
   c: {
     dim: (s: string) => s,
@@ -83,7 +83,7 @@ mock.module("./output.ts", () => ({
   },
 }));
 
-mock.module("./sse.ts", () => ({
+void mock.module("./sse.ts", () => ({
   ...realSseSnapshot,
   streamSse: (
     pathname: string,
@@ -102,9 +102,9 @@ mock.module("./sse.ts", () => ({
 }));
 
 afterAll(() => {
-  mock.module("./context.ts", () => realContextSnapshot);
-  mock.module("./output.ts", () => realOutputSnapshot);
-  mock.module("./sse.ts", () => realSseSnapshot);
+  void mock.module("./context.ts", () => realContextSnapshot);
+  void mock.module("./output.ts", () => realOutputSnapshot);
+  void mock.module("./sse.ts", () => realSseSnapshot);
 });
 
 const { cmdClone, formatCloneProgressLine, CloneProgressPrinter } = await import(
@@ -933,7 +933,7 @@ test("AgetorClient.cloneProject: POSTs /projects/clone with the JSON body and be
     expect(captured!.contentType).toBe("application/json");
     expect(captured!.body).toEqual(input);
   } finally {
-    server.stop(true);
+    void server.stop(true);
   }
 });
 
@@ -964,7 +964,7 @@ test("AgetorClient.cancelClone: DELETEs /projects/clone/:cloneId with the bearer
     expect(captured!.pathname).toBe("/projects/clone/c1234567-89ab-cdef-0123-456789abcdef");
     expect(captured!.authorization).toBe("Bearer tok-xyz");
   } finally {
-    server.stop(true);
+    void server.stop(true);
   }
 });
 
@@ -986,6 +986,6 @@ test("AgetorClient.cancelClone: a 404 propagates as a thrown ApiError", async ()
       message: "clone not found",
     });
   } finally {
-    server.stop(true);
+    void server.stop(true);
   }
 });

@@ -1,6 +1,6 @@
 import type { AgentProfile, Task } from "../shared/types.ts";
 import { isMultiRepoTask } from "../shared/multi-repo.ts";
-import { agentProfiles, tasks, type AgentProfileInsertInput } from "./db.ts";
+import { agentProfiles, tasks, type AgentProfileInsertInput } from "./db-async.ts";
 import { createTask } from "./orchestrator.ts";
 
 export interface DuplicateAgentProfileResult {
@@ -19,16 +19,15 @@ export async function duplicateAgentProfile(
   payload: AgentProfileInsertInput,
   copyTasks: boolean,
 ): Promise<DuplicateAgentProfileResult | { notFound: true }> {
-  const source = agentProfiles.get(sourceId);
+  const source = await agentProfiles.get(sourceId);
   if (!source) return { notFound: true };
 
-  const profile = agentProfiles.insert(payload);
+  const profile = await agentProfiles.insert(payload);
   const copiedTasks: Task[] = [];
   const taskCopyErrors: { sourceTaskId: string; error: string }[] = [];
   if (!copyTasks) return { profile, copiedTasks, taskCopyErrors };
 
-  const eligible = tasks
-    .list()
+  const eligible = (await tasks.list())
     .filter((t) => t.agentProfileId === source.id && !t.archivedAt && !t.pipelineId && !t.pipelineParentId)
     .sort((a, b) => a.createdAt - b.createdAt);
 

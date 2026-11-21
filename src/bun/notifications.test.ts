@@ -19,7 +19,7 @@ process.env.AGETOR_API_PORT = "4401";
 // happens to import `BrowserWindow` / `Updater` / `ApplicationMenu` from
 // crashing on a missing export.
 const recorded: Array<{ title: string; body?: string; subtitle?: string; silent?: boolean; taskId?: string }> = [];
-mock.module("electrobun/bun", () => ({
+void mock.module("electrobun/bun", () => ({
   Utils: {
     showNotification: (opts: { title: string; body?: string; subtitle?: string; silent?: boolean; taskId?: string }) => {
       recorded.push(opts);
@@ -329,7 +329,7 @@ test("subscribeGlobal receives events emitted via emitGlobal (drives the /events
   const { subscribeGlobal, __emitGlobalForTest } = await import("./orchestrator.ts");
   const received: Array<{ kind: string }> = [];
   const unsub = subscribeGlobal((e) => received.push(e));
-  __emitGlobalForTest({
+  await __emitGlobalForTest({
     kind: "run-status",
     taskId: "sse-route-test",
     runId: "r1",

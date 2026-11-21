@@ -134,10 +134,10 @@ function exhausted(at: number, patch: Partial<NonNullable<TaskHarnessState["allE
   return { at, attempts: 0, max: 3, nextAttemptAt: at, earliestResetAtMs: null, reason: "quota", ...patch };
 }
 
-async function waitFor(fn: () => boolean, ms = 8000): Promise<void> {
+async function waitFor(fn: () => boolean | Promise<boolean>, ms = 8000): Promise<void> {
   const deadline = Date.now() + ms;
   while (Date.now() < deadline) {
-    if (fn()) return;
+    if (await fn()) return;
     await Bun.sleep(15);
   }
 }
@@ -163,8 +163,8 @@ const sortedRuns = (taskId: string) => [...db.runs.listForTask(taskId)].sort((a,
 const statusLines = (runId: string) => db.runs.events(runId).filter((e) => e.stream === "status").map((e) => e.data);
 const userRows = (runId: string) => db.runs.events(runId).filter((e) => e.stream === "user").map((e) => e.data);
 const backlogTexts = (taskId: string) => db.tasks.get(taskId)!.backlog.map((i) => i.text);
-const histRows = (stackId: string, taskId: string) =>
-  history.harnessSwapEvents.page(stackId, { limit: 100 }).events.filter((e) => e.taskId === taskId);
+const histRows = async (stackId: string, taskId: string) =>
+  (await history.harnessSwapEvents.page(stackId, { limit: 100 })).events.filter((e) => e.taskId === taskId);
 const limitChunk = (extra: Record<string, unknown> = {}) =>
   `${HARNESS_LIMIT_STATUS_PREFIX}${JSON.stringify({
     reason: "quota", resetAtMs: Date.now() + 3_600_000, message: "usage limit", source: "claude-api-error", ...extra,
@@ -191,11 +191,11 @@ describe("finding 1: a successor limit while a claim is held is deferred, then s
     return async () => {
       await waitFor(() => state.handler !== null);
       const deadline = Date.now() + 8000;
-      while (Date.now() < deadline && stacks.harnessStacks.getLimitState(on) === null) {
+      while (Date.now() < deadline && await stacks.harnessStacks.getLimitState(on) === null) {
         state.handler!("status" as never, limitChunk());
         await Bun.sleep(5);
       }
-      state.injected = stacks.harnessStacks.getLimitState(on) !== null;
+      state.injected = await stacks.harnessStacks.getLimitState(on) !== null;
     };
   }
 
@@ -203,7 +203,7 @@ describe("finding 1: a successor limit while a claim is held is deferred, then s
     const a = alias("f1-a");
     const b = alias("f1-b");
     const c = alias("f1-c");
-    const stack = stacks.harnessStacks.create({ label: "f1", kind: "claude-code", members: [a, b, c] });
+    const stack = await stacks.harnessStacks.create({ label: "f1", kind: "claude-code", members: [a, b, c] });
     const task = makeTask(a, `work ${FAKE_CLAUDE_LIMIT_PROMPT_MARKER}`);
     const state = { handler: null as ((s: never, d: string) => void) | null, injected: false };
     const gateRef: { release: (() => void) | null } = { release: null };
@@ -252,20 +252,20 @@ describe("finding 1: a successor limit while a claim is held is deferred, then s
     expect(rows[2]!.origin).toBe("harness-swap");
     expect(rows.some((r) => r.status === "running")).toBe(false);
     expect(db.tasks.get(task.id)!.agent).toBe(c);
-    expect(histRows(stack.id, task.id).map((r) => r.trigger).sort()).toEqual(["limit", "limit"]);
+    expect((await histRows(stack.id, task.id)).map((r) => r.trigger).sort()).toEqual(["limit", "limit"]);
     // The held message was still waiting for its delivery when the successor
     // it was meant for hit the limit: it never reached an account (no run
     // echoes it, so it is not duplicated) and lands in the tray exactly once.
     expect(rows.flatMap((r) => userRows(r.id)).filter((t) => t.includes("typed during the swap"))).toEqual([]);
     expect(backlogTexts(task.id)).toEqual(["typed during the swap"]);
-    for (const id of [a, b, c]) stacks.harnessStacks.clearLimitState(id);
-    stacks.harnessStacks.delete(stack.id);
+    for (const id of [a, b, c]) await stacks.harnessStacks.clearLimitState(id);
+    await stacks.harnessStacks.delete(stack.id);
   }, 40_000);
 
   test("during held follow-up delivery with nowhere to go: the card is blocked, not left running", async () => {
     const a = alias("f1blk-a");
     const b = alias("f1blk-b");
-    const stack = stacks.harnessStacks.create({ label: "f1blk", kind: "claude-code", members: [a, b] });
+    const stack = await stacks.harnessStacks.create({ label: "f1blk", kind: "claude-code", members: [a, b] });
     const task = makeTask(a, `work ${FAKE_CLAUDE_LIMIT_PROMPT_MARKER}`);
     const state = { handler: null as ((s: never, d: string) => void) | null, injected: false };
     const gateRef: { release: (() => void) | null } = { release: null };
@@ -309,15 +309,15 @@ describe("finding 1: a successor limit while a claim is held is deferred, then s
     // once, on no run.
     expect(rows.flatMap((r) => userRows(r.id)).filter((t) => t.includes("typed during the swap"))).toEqual([]);
     expect(backlogTexts(task.id)).toEqual(["typed during the swap"]);
-    for (const id of [a, b]) stacks.harnessStacks.clearLimitState(id);
-    stacks.harnessStacks.delete(stack.id);
+    for (const id of [a, b]) await stacks.harnessStacks.clearLimitState(id);
+    await stacks.harnessStacks.delete(stack.id);
   }, 40_000);
 
   test("during the boot swap claim: settled on release, not left running", async () => {
     const a = alias("f1boot-a");
     const b = alias("f1boot-b");
     const c = alias("f1boot-c");
-    const stack = stacks.harnessStacks.create({ label: "f1boot", kind: "claude-code", members: [a, b, c] });
+    const stack = await stacks.harnessStacks.create({ label: "f1boot", kind: "claude-code", members: [a, b, c] });
     const task = makeTask(a, "work", { column: "running" });
     const oldRun = insertRun(task.id, a, { status: "running", endedAt: null, exitCode: null });
     db.tasks.update(task.id, { runId: oldRun });
@@ -372,14 +372,14 @@ describe("finding 1: a successor limit while a claim is held is deferred, then s
     // limited: in the tray once, on no run.
     expect(rows.flatMap((r) => userRows(r.id)).filter((t) => t.includes("typed during boot"))).toEqual([]);
     expect(backlogTexts(task.id)).toEqual(["typed during boot"]);
-    for (const id of [a, b, c]) stacks.harnessStacks.clearLimitState(id);
-    stacks.harnessStacks.delete(stack.id);
+    for (const id of [a, b, c]) await stacks.harnessStacks.clearLimitState(id);
+    await stacks.harnessStacks.delete(stack.id);
   }, 40_000);
 
   test("a foreign claim (an account switch that owns the next turn) passes through to the normal settle", async () => {
     const a = alias("f1foreign-a");
     const b = alias("f1foreign-b");
-    const stack = stacks.harnessStacks.create({ label: "f1foreign", kind: "claude-code", members: [a, b] });
+    const stack = await stacks.harnessStacks.create({ label: "f1foreign", kind: "claude-code", members: [a, b] });
     const task = makeTask(a, "plain work");
     const state = { handler: null as ((s: never, d: string) => void) | null };
     const prevTap = orch.__setChunkHandlerTapForTest((_runId, hooked, handler) => {
@@ -390,19 +390,20 @@ describe("finding 1: a successor limit while a claim is held is deferred, then s
         expect(await orch.startTask(task.id)).toHaveProperty("runId");
         await waitFor(() => state.handler !== null);
         const deadline = Date.now() + 5000;
-        while (Date.now() < deadline && stacks.harnessStacks.getLimitState(a) === null) {
+        while (Date.now() < deadline && await stacks.harnessStacks.getLimitState(a) === null) {
           state.handler!("status" as never, limitChunk());
           await Bun.sleep(5);
         }
-        expect(stacks.harnessStacks.getLimitState(a)).not.toBeNull();
-        // Not the swap window: an ordinary account-switch claim.
-        expect(orch.claimTaskForAccountSwitch(task.id)).toBe(true);
+        expect(await stacks.harnessStacks.getLimitState(a)).not.toBeNull();
+        // Not the swap window: an ordinary account-switch claim holder. (The
+        // real claim refuses a live run, review S3, so stand in for it.)
+        expect(orch.__testing.holdSwitchClaimForTest(task.id)).toBe(true);
         await waitFor(() => db.runs.listForTask(task.id).every((r) => r.status !== "running"), 8000);
-        orch.releaseTaskAccountSwitch(task.id);
+        await orch.releaseTaskAccountSwitch(task.id);
       });
     } finally {
       orch.__setChunkHandlerTapForTest(prevTap);
-      orch.releaseTaskAccountSwitch(task.id);
+      await orch.releaseTaskAccountSwitch(task.id);
     }
     const rows = sortedRuns(task.id);
     // Settled normally in place: no deferral, no successor next to the claim holder.
@@ -410,9 +411,9 @@ describe("finding 1: a successor limit while a claim is held is deferred, then s
     expect(rows[0]!.status).toBe("failed");
     expect(statusLines(rows[0]!.id).some((l) => l.includes("switching once the current switch settles"))).toBe(false);
     expect(db.tasks.get(task.id)!.column).toBe("ready");
-    expect(histRows(stack.id, task.id)).toHaveLength(0);
-    stacks.harnessStacks.clearLimitState(a);
-    stacks.harnessStacks.delete(stack.id);
+    expect(await histRows(stack.id, task.id)).toHaveLength(0);
+    await stacks.harnessStacks.clearLimitState(a);
+    await stacks.harnessStacks.delete(stack.id);
   }, 30_000);
 });
 
@@ -428,14 +429,14 @@ describe("S8: a live successor's deferred limit during the boot swap claim", () 
     const a = alias("s8-a");
     const b = alias("s8-b");
     const c = alias("s8-c");
-    const stack = stacks.harnessStacks.create({ label: "s8", kind: "claude-code", members: [a, b, c] });
+    const stack = await stacks.harnessStacks.create({ label: "s8", kind: "claude-code", members: [a, b, c] });
     const task = makeTask(b, "plain work");
     // A second, newer task whose boot resume runs first (newest first): its
     // spawn hook holds the reconcile loop until the first task's successor has
     // limited, so that limit lands inside the boot claim deterministically.
     const x1 = alias("s8-x1");
     const x2 = alias("s8-x2");
-    const other = stacks.harnessStacks.create({ label: "s8x", kind: "claude-code", members: [x1, x2] });
+    const other = await stacks.harnessStacks.create({ label: "s8x", kind: "claude-code", members: [x1, x2] });
     const blocker = makeTask(x1, "work", { column: "running", createdAt: Date.now() + 60_000 });
     const blockerRun = insertRun(blocker.id, x1, { status: "running", endedAt: null, exitCode: null });
     db.tasks.update(blocker.id, { runId: blockerRun });
@@ -462,11 +463,11 @@ describe("S8: a live successor's deferred limit during the boot swap claim", () 
         const liveRunId = (started as { runId: string }).runId;
         await waitFor(() => state.handler !== null);
         const deadline = Date.now() + 8000;
-        while (Date.now() < deadline && stacks.harnessStacks.getLimitState(b) === null) {
+        while (Date.now() < deadline && await stacks.harnessStacks.getLimitState(b) === null) {
           state.handler!("status" as never, limitChunk());
           await Bun.sleep(5);
         }
-        expect(stacks.harnessStacks.getLimitState(b)).not.toBeNull();
+        expect(await stacks.harnessStacks.getLimitState(b)).not.toBeNull();
         // The restart left both swaps persisted.
         const oldRun = insertRun(task.id, a, { status: "failed", exitCode: -1 });
         db.tasks.setHarnessState(task.id, {
@@ -495,13 +496,13 @@ describe("S8: a live successor's deferred limit during the boot swap claim", () 
     expect(rows[1]!.origin).toBe("harness-swap");
     // Decided once, by the deferred settlement: no blocked row, no "run the
     // task to continue" line the swap then contradicts.
-    expect(histRows(stack.id, task.id).map((r) => r.trigger)).toEqual(["limit"]);
+    expect((await histRows(stack.id, task.id)).map((r) => r.trigger)).toEqual(["limit"]);
     expect(sortedRuns(task.id).some((r) => statusLines(r.id).some((l) => l.includes("the core restarted during the account switch")))).toBe(false);
     expect(db.tasks.get(task.id)!.agent).toBe(c);
     expect(db.tasks.get(task.id)!.column).not.toBe("blocked");
-    for (const id of [a, b, c, x1, x2]) stacks.harnessStacks.clearLimitState(id);
-    stacks.harnessStacks.delete(stack.id);
-    stacks.harnessStacks.delete(other.id);
+    for (const id of [a, b, c, x1, x2]) await stacks.harnessStacks.clearLimitState(id);
+    await stacks.harnessStacks.delete(stack.id);
+    await stacks.harnessStacks.delete(other.id);
   }, 60_000);
 });
 
@@ -513,7 +514,7 @@ describe("finding 2: a crash mid-swap resumes instead of orphaning", () => {
   test("old run still running: no orphaned event, no step settle, the swap resumes", async () => {
     const a = alias("f2-a");
     const b = alias("f2-b");
-    const stack = stacks.harnessStacks.create({ label: "f2", kind: "claude-code", members: [a, b] });
+    const stack = await stacks.harnessStacks.create({ label: "f2", kind: "claude-code", members: [a, b] });
     const task = makeTask(a, "work", { column: "running", pipelineId: randomUUID() } as Partial<Task>);
     const oldRun = insertRun(task.id, a, { status: "running", endedAt: null, exitCode: null });
     db.tasks.update(task.id, { runId: oldRun });
@@ -548,14 +549,14 @@ describe("finding 2: a crash mid-swap resumes instead of orphaning", () => {
     // The old run was only ever reported as a harness-swap failure; a step
     // runner settles on any other terminal status, so none was emitted for it.
     expect(seen.filter((e) => e.kind === "run-status" && e.runId === oldRun).every((e) => (e as { reason?: string }).reason === "harness-swap")).toBe(true);
-    expect(histRows(stack.id, task.id).map((r) => r.trigger)).toEqual(["boot-resume"]);
-    stacks.harnessStacks.delete(stack.id);
+    expect((await histRows(stack.id, task.id)).map((r) => r.trigger)).toEqual(["boot-resume"]);
+    await stacks.harnessStacks.delete(stack.id);
   }, 30_000);
 
   test("a resume that throws blocks the task with harness-swap-failed and one blocked history row", async () => {
     const a = alias("f2throw-a");
     const b = alias("f2throw-b");
-    const stack = stacks.harnessStacks.create({ label: "f2throw", kind: "claude-code", members: [a, b] });
+    const stack = await stacks.harnessStacks.create({ label: "f2throw", kind: "claude-code", members: [a, b] });
     const task = makeTask(a, "work", { column: "running" });
     const oldRun = insertRun(task.id, a, { status: "running", endedAt: null, exitCode: null });
     db.tasks.update(task.id, { runId: oldRun });
@@ -575,8 +576,8 @@ describe("finding 2: a crash mid-swap resumes instead of orphaning", () => {
     expect(after.column).toBe("blocked");
     expect(after.harnessState?.pendingSwap ?? null).toBeNull();
     expect(db.runs.get(oldRun)!.status).toBe("failed");
-    expect(histRows(stack.id, task.id).map((r) => r.trigger)).toEqual(["blocked"]);
-    stacks.harnessStacks.delete(stack.id);
+    expect((await histRows(stack.id, task.id)).map((r) => r.trigger)).toEqual(["blocked"]);
+    await stacks.harnessStacks.delete(stack.id);
   }, 20_000);
 });
 
@@ -587,10 +588,10 @@ describe("finding 2: a crash mid-swap resumes instead of orphaning", () => {
 describe("finding 3: Codex queued follow-ups are stashed on every ending without a successor", () => {
   const CODEX_ENV = { AGETOR_CODEX_DRIVER: "fake", AGETOR_CODEX_BIN: "/bin/echo", AGETOR_FAKE_CODEX_RESOLVE_DELAY_MS: "400" };
 
-  function codexStack(prefix: string) {
+  async function codexStack(prefix: string) {
     const a = codexAlias(`${prefix}-a`);
     const b = codexAlias(`${prefix}-b`);
-    const stack = stacks.harnessStacks.create({ label: prefix, kind: "codex", members: [a, b] });
+    const stack = await stacks.harnessStacks.create({ label: prefix, kind: "codex", members: [a, b] });
     const task = makeTask(a, "plain codex work", { model: "fixture-codex-model" } as Partial<Task>);
     return { a, b, stack, task };
   }
@@ -607,8 +608,8 @@ describe("finding 3: Codex queued follow-ups are stashed on every ending without
   }
 
   test("all accounts exhausted: the queued message and the one held in the window are stashed, queued first", async () => {
-    const { a, b, stack, task } = codexStack("f3blk");
-    stacks.harnessStacks.setLimitState(b, { reason: "quota", resetAtMs: Date.now() + 3_600_000, message: "x", source: "codex-turn-failed" } as never);
+    const { a, b, stack, task } = await codexStack("f3blk");
+    await stacks.harnessStacks.setLimitState(b, { reason: "quota", resetAtMs: Date.now() + 3_600_000, message: "x", source: "codex-turn-failed" } as never);
     const prev = orch.__setHarnessSwapSettleHookForTest(async (hooked, runId, phase) => {
       if (hooked !== task.id || phase !== "before-block") return;
       orch.__setHarnessSwapSettleHookForTest(null);
@@ -628,12 +629,12 @@ describe("finding 3: Codex queued follow-ups are stashed on every ending without
     expect(backlogTexts(task.id)).toEqual(["third message", "typed during the window"]);
     // Nothing ran the stranded message.
     expect(db.runs.listForTask(task.id)).toHaveLength(2);
-    for (const id of [a, b]) stacks.harnessStacks.clearLimitState(id);
-    stacks.harnessStacks.delete(stack.id);
+    for (const id of [a, b]) await stacks.harnessStacks.clearLimitState(id);
+    await stacks.harnessStacks.delete(stack.id);
   }, 40_000);
 
   test("a transfer that fails and blocks: the queued message is stashed", async () => {
-    const { a, b, stack, task } = codexStack("f3xfer");
+    const { a, b, stack, task } = await codexStack("f3xfer");
     // No rollout on A: the limited turn did work, so the move has nothing to copy and blocks.
     try {
       await withEnv(CODEX_ENV, async () => {
@@ -645,12 +646,12 @@ describe("finding 3: Codex queued follow-ups are stashed on every ending without
     }
     expect(backlogTexts(task.id)).toContain("third message");
     expect(sortedRuns(task.id)).toHaveLength(2);
-    for (const id of [a, b]) stacks.harnessStacks.clearLimitState(id);
-    stacks.harnessStacks.delete(stack.id);
+    for (const id of [a, b]) await stacks.harnessStacks.clearLimitState(id);
+    await stacks.harnessStacks.delete(stack.id);
   }, 40_000);
 
   test("a Stop in the settlement window: the queued message is stashed, not drained", async () => {
-    const { a, b, stack, task } = codexStack("f3stop");
+    const { a, b, stack, task } = await codexStack("f3stop");
     const prev = orch.__setHarnessSwapSettleHookForTest(async (hooked, runId, phase) => {
       if (hooked !== task.id || phase !== "settle") return;
       orch.__setHarnessSwapSettleHookForTest(null);
@@ -667,12 +668,12 @@ describe("finding 3: Codex queued follow-ups are stashed on every ending without
     expect(backlogTexts(task.id)).toContain("third message");
     expect(sortedRuns(task.id)).toHaveLength(2);
     expect(db.tasks.get(task.id)!.agent).toBe(a);
-    for (const id of [a, b]) stacks.harnessStacks.clearLimitState(id);
-    stacks.harnessStacks.delete(stack.id);
+    for (const id of [a, b]) await stacks.harnessStacks.clearLimitState(id);
+    await stacks.harnessStacks.delete(stack.id);
   }, 40_000);
 
   test("a successor whose spawn fails: the queued message is stashed", async () => {
-    const { a, b, stack, task } = codexStack("f3spawn");
+    const { a, b, stack, task } = await codexStack("f3spawn");
     plantRollout(codexRoot(a), `fake-codex-thread-${task.id}`);
     // The conversation moves fine, then the successor cannot start: an empty
     // model makes the driver throw on every spawn.
@@ -691,17 +692,17 @@ describe("finding 3: Codex queued follow-ups are stashed on every ending without
       failover.cancelAutoRetry(task.id);
     }
     expect(backlogTexts(task.id)).toContain("third message");
-    for (const id of [a, b]) stacks.harnessStacks.clearLimitState(id);
-    stacks.harnessStacks.delete(stack.id);
+    for (const id of [a, b]) await stacks.harnessStacks.clearLimitState(id);
+    await stacks.harnessStacks.delete(stack.id);
   }, 40_000);
 
   test("a launch freeze in the window leaves the swap for the next owner: the queued message is stashed first", async () => {
-    const { a, b, stack, task } = codexStack("f3frz");
+    const { a, b, stack, task } = await codexStack("f3frz");
     plantRollout(codexRoot(a), `fake-codex-thread-${task.id}`);
     const prev = orch.__setHarnessSwapSettleHookForTest(async (hooked, _runId, phase) => {
       if (hooked !== task.id || phase !== "after-transfer") return;
       orch.__setHarnessSwapSettleHookForTest(null);
-      orch.freezeLaunches();
+      await orch.freezeLaunches();
     });
     try {
       await withEnv(CODEX_ENV, async () => {
@@ -717,8 +718,8 @@ describe("finding 3: Codex queued follow-ups are stashed on every ending without
     // The swap itself is left persisted for the next owner.
     expect(db.tasks.get(task.id)!.harnessState?.pendingSwap?.to).toBe(b);
     db.tasks.setHarnessState(task.id, null);
-    for (const id of [a, b]) stacks.harnessStacks.clearLimitState(id);
-    stacks.harnessStacks.delete(stack.id);
+    for (const id of [a, b]) await stacks.harnessStacks.clearLimitState(id);
+    await stacks.harnessStacks.delete(stack.id);
   }, 40_000);
 });
 
@@ -731,8 +732,8 @@ describe("finding 4: clean-retry follow-ups survive every ending of the retry", 
   async function armedCleanRetry(prefix: string) {
     const a = alias(`${prefix}-a`);
     const b = alias(`${prefix}-b`);
-    const stack = stacks.harnessStacks.create({ label: prefix, kind: "claude-code", members: [a, b] });
-    stacks.harnessStacks.setLimitState(b, { reason: "quota", resetAtMs: Date.now() + 3_600_000, message: "usage limit", source: "claude-api-error" });
+    const stack = await stacks.harnessStacks.create({ label: prefix, kind: "claude-code", members: [a, b] });
+    await stacks.harnessStacks.setLimitState(b, { reason: "quota", resetAtMs: Date.now() + 3_600_000, message: "usage limit", source: "claude-api-error" });
     const task = makeTask(a, `no tools yet ${FAKE_CLAUDE_LIMIT_CLEAN_PROMPT_MARKER}`);
     const prev = orch.__setHarnessLimitObservedHookForTest((hooked, runId) => {
       if (hooked !== task.id) return;
@@ -753,24 +754,24 @@ describe("finding 4: clean-retry follow-ups survive every ending of the retry", 
   test("a manual message ends the retry and stashes the follow-ups once", async () => {
     const { a, b, stack, task, original } = await armedCleanRetry("f4manual");
     // The user takes the task back by typing: a manual prepare ends the armed retry.
-    stacks.harnessStacks.clearLimitState(a);
-    stacks.harnessStacks.clearLimitState(b);
+    await stacks.harnessStacks.clearLimitState(a);
+    await stacks.harnessStacks.clearLimitState(b);
     await orch.sendInput(original, "my own message");
     await waitFor(() => backlogTexts(task.id).includes("also update the docs"));
     expect(backlogTexts(task.id).filter((t) => t === "also update the docs")).toHaveLength(1);
     expect(db.tasks.get(task.id)!.harnessState?.allExhausted?.cleanRetryOf).toBeUndefined();
     // Nothing is stashed a second time by a later cancel.
-    orch.cancelHarnessRetryForTask(task.id);
+    await orch.cancelHarnessRetryForTask(task.id);
     expect(backlogTexts(task.id).filter((t) => t === "also update the docs")).toHaveLength(1);
     await waitFor(() => db.runs.listForTask(task.id).every((r) => r.status !== "running"));
     failover.cancelAutoRetry(task.id);
-    stacks.harnessStacks.delete(stack.id);
+    await stacks.harnessStacks.delete(stack.id);
   }, 30_000);
 
   test("the retry attempt cap ends the retry and stashes the follow-ups", async () => {
     const a = alias("f4cap-a");
     const b = alias("f4cap-b");
-    const stack = stacks.harnessStacks.create({ label: "f4cap", kind: "claude-code", members: [a, b] });
+    const stack = await stacks.harnessStacks.create({ label: "f4cap", kind: "claude-code", members: [a, b] });
     // An empty model makes every retry spawn throw: each fired retry spends an attempt.
     const task = makeTask(a, "the task prompt", { model: "" as never, column: "blocked" });
     const original = insertRun(task.id, a, { status: "failed", exitCode: -1, startedAt: Date.now() - 5_000, endedAt: Date.now() - 4_900 });
@@ -791,13 +792,13 @@ describe("finding 4: clean-retry follow-ups survive every ending of the retry", 
     }
     expect(db.tasks.get(task.id)!.harnessState?.allExhausted).toMatchObject({ attempts: 3, nextAttemptAt: 0 });
     expect(backlogTexts(task.id)).toEqual(["follow-up one"]);
-    stacks.harnessStacks.delete(stack.id);
+    await stacks.harnessStacks.delete(stack.id);
   }, 20_000);
 
   test("a second consecutive clean retry recovers the follow-ups from the original run", async () => {
     const a = alias("f4chain-a");
     const b = alias("f4chain-b");
-    const stack = stacks.harnessStacks.create({ label: "f4chain", kind: "claude-code", members: [a, b] });
+    const stack = await stacks.harnessStacks.create({ label: "f4chain", kind: "claude-code", members: [a, b] });
     const task = makeTask(a, "the task prompt", { column: "blocked" });
     const original = insertRun(task.id, a, { status: "failed", exitCode: -1, startedAt: Date.now() - 9_000, endedAt: Date.now() - 8_900 });
     db.runs.appendEvent(original, "user", "the task prompt");
@@ -815,16 +816,16 @@ describe("finding 4: clean-retry follow-ups survive every ending of the retry", 
       stackId: stack.id, position: 1, count: 2, tried: [a, b], pendingSwap: null, lastMove: null,
       allExhausted: exhausted(Date.now(), { attempts: 1, nextAttemptAt: Date.now() + 3_600_000, cleanRetryOf: original }),
     });
-    expect(orch.cancelHarnessRetryForTask(task.id, "cancelled for test")).toBe(true);
+    expect(await orch.cancelHarnessRetryForTask(task.id, "cancelled for test")).toBe(true);
     // Each message once, in send order, and never the hidden wrapper text.
     expect(backlogTexts(task.id)).toEqual(["follow-up one", "follow-up two"]);
-    stacks.harnessStacks.delete(stack.id);
+    await stacks.harnessStacks.delete(stack.id);
   });
 
   test("a first part that is not the task prompt is kept (S6) and the stash is a one-shot", async () => {
     const a = alias("f4s6-a");
     const b = alias("f4s6-b");
-    const stack = stacks.harnessStacks.create({ label: "f4s6", kind: "claude-code", members: [a, b] });
+    const stack = await stacks.harnessStacks.create({ label: "f4s6", kind: "claude-code", members: [a, b] });
     const task = makeTask(a, "the task prompt", { column: "blocked" });
     const original = insertRun(task.id, a, { status: "failed", exitCode: -1, startedAt: Date.now() - 5_000, endedAt: Date.now() - 4_900 });
     db.runs.appendEvent(original, "user", "a fresh start message");
@@ -834,18 +835,18 @@ describe("finding 4: clean-retry follow-ups survive every ending of the retry", 
       stackId: stack.id, position: 0, count: 2, tried: [a], pendingSwap: null, lastMove: null,
       allExhausted: exhausted(Date.now(), { nextAttemptAt: Date.now() + 3_600_000, cleanRetryOf: original }),
     });
-    expect(orch.cancelHarnessRetryForTask(task.id)).toBe(true);
+    expect(await orch.cancelHarnessRetryForTask(task.id)).toBe(true);
     expect(backlogTexts(task.id)).toEqual(["a fresh start message", "and a follow-up"]);
-    expect(orch.cancelHarnessRetryForTask(task.id)).toBe(false);
+    expect(await orch.cancelHarnessRetryForTask(task.id)).toBe(false);
     expect(backlogTexts(task.id)).toHaveLength(2);
-    stacks.harnessStacks.delete(stack.id);
+    await stacks.harnessStacks.delete(stack.id);
   });
 
   test("two identical unread mid-turn sends are both kept in the tray", async () => {
     const a = alias("f4twin-a");
     const b = alias("f4twin-b");
-    const stack = stacks.harnessStacks.create({ label: "f4twin", kind: "claude-code", members: [a, b] });
-    stacks.harnessStacks.setLimitState(b, { reason: "quota", resetAtMs: Date.now() + 3_600_000, message: "x", source: "claude-pane" });
+    const stack = await stacks.harnessStacks.create({ label: "f4twin", kind: "claude-code", members: [a, b] });
+    await stacks.harnessStacks.setLimitState(b, { reason: "quota", resetAtMs: Date.now() + 3_600_000, message: "x", source: "claude-pane" });
     // A transfer-branch limit (the turn used a tool) with nowhere to go: the retry
     // resumes a copied transcript that never held the unread messages.
     const task = makeTask(a, `work ${FAKE_CLAUDE_LIMIT_PROMPT_MARKER}`);
@@ -864,8 +865,8 @@ describe("finding 4: clean-retry follow-ups survive every ending of the retry", 
       failover.cancelAutoRetry(task.id);
     }
     expect(backlogTexts(task.id)).toEqual(["same text", "same text"]);
-    for (const id of [a, b]) stacks.harnessStacks.clearLimitState(id);
-    stacks.harnessStacks.delete(stack.id);
+    for (const id of [a, b]) await stacks.harnessStacks.clearLimitState(id);
+    await stacks.harnessStacks.delete(stack.id);
   }, 20_000);
 });
 
@@ -877,7 +878,7 @@ describe("finding 5: cooldown clears are conditional", () => {
   test("a success that started before another task's limit leaves that cooldown alone", async () => {
     const a = alias("f5-a");
     const b = alias("f5-b");
-    const stack = stacks.harnessStacks.create({ label: "f5", kind: "claude-code", members: [a, b] });
+    const stack = await stacks.harnessStacks.create({ label: "f5", kind: "claude-code", members: [a, b] });
     const slow = makeTask(a, "a slow plain turn");
     let startedAt = 0;
     try {
@@ -886,8 +887,8 @@ describe("finding 5: cooldown clears are conditional", () => {
         startedAt = db.runs.listForTask(slow.id)[0]!.startedAt;
         // Another task on the same account hits a limit while this turn is running.
         await Bun.sleep(0);
-        stacks.harnessStacks.setLimitState(a, { reason: "quota", resetAtMs: Date.now() + 3_600_000, message: "other task", source: "claude-api-error" }, Math.max(Date.now(), startedAt + 5));
-        expect(stacks.harnessStacks.getLimitState(a)).not.toBeNull();
+        await stacks.harnessStacks.setLimitState(a, { reason: "quota", resetAtMs: Date.now() + 3_600_000, message: "other task", source: "claude-api-error" }, Math.max(Date.now(), startedAt + 5));
+        expect(await stacks.harnessStacks.getLimitState(a)).not.toBeNull();
         await waitFor(settledRuns(slow.id, 1), 10_000);
       });
     } finally {
@@ -895,62 +896,65 @@ describe("finding 5: cooldown clears are conditional", () => {
     }
     expect(db.runs.listForTask(slow.id)[0]!.status).toBe("succeeded");
     // The success began before the limit was recorded, so it proves nothing about it.
-    expect(stacks.harnessStacks.getLimitState(a)?.message).toBe("other task");
-    stacks.harnessStacks.clearLimitState(a);
-    stacks.harnessStacks.delete(stack.id);
+    expect((await stacks.harnessStacks.getLimitState(a))?.message).toBe("other task");
+    await stacks.harnessStacks.clearLimitState(a);
+    await stacks.harnessStacks.delete(stack.id);
   }, 20_000);
 
   test("a success that started after the limit clears it", async () => {
     const a = alias("f5ok-a");
     const b = alias("f5ok-b");
-    const stack = stacks.harnessStacks.create({ label: "f5ok", kind: "claude-code", members: [a, b] });
-    stacks.harnessStacks.setLimitState(a, { reason: "quota", resetAtMs: Date.now() + 3_600_000, message: "stale", source: "claude-api-error" }, Date.now() - 60_000);
+    const stack = await stacks.harnessStacks.create({ label: "f5ok", kind: "claude-code", members: [a, b] });
+    await stacks.harnessStacks.setLimitState(a, { reason: "quota", resetAtMs: Date.now() + 3_600_000, message: "stale", source: "claude-api-error" }, Date.now() - 60_000);
     const task = makeTask(a, "a plain turn");
     expect(await orch.startTask(task.id)).toHaveProperty("runId");
     await waitFor(settledRuns(task.id, 1));
-    await waitFor(() => stacks.harnessStacks.getLimitState(a) === null);
-    expect(stacks.harnessStacks.getLimitState(a)).toBeNull();
-    stacks.harnessStacks.delete(stack.id);
+    await waitFor(async () => (await stacks.harnessStacks.getLimitState(a)) === null);
+    expect(await stacks.harnessStacks.getLimitState(a)).toBeNull();
+    await stacks.harnessStacks.delete(stack.id);
   }, 20_000);
 
   test("a recovered per-model Codex 429 self-clears its own model row; a newer overwrite of that row survives", async () => {
     const a = codexAlias("f5cm-a");
     const b = codexAlias("f5cm-b");
-    const stack = stacks.harnessStacks.create({ label: "f5cm", kind: "codex", members: [a, b] });
+    const stack = await stacks.harnessStacks.create({ label: "f5cm", kind: "codex", members: [a, b] });
     const own = makeTask(a, "plain codex work", { model: "fixture-codex-model" } as Partial<Task>);
     const newer = makeTask(a, "plain codex work", { model: "fixture-codex-model" } as Partial<Task>);
     const signal = { reason: "rate_limit", resetAtMs: null, message: "429 for the model", source: "codex-error", model: "fixture-codex-model" };
-    const feed = (target: Task, after?: () => void) => orch.__setChunkHandlerTapForTest((_runId, hooked, handler) => {
+    const feed = (target: Task, after?: () => void | Promise<void>) => orch.__setChunkHandlerTapForTest((tapRunId, hooked, handler) => {
       if (hooked !== target.id) return;
       orch.__setChunkHandlerTapForTest(null);
       setTimeout(() => {
-        handler("status", `${HARNESS_LIMIT_STATUS_PREFIX}${JSON.stringify(signal)}`);
-        after?.();
+        void (async () => {
+          handler("status", `${HARNESS_LIMIT_STATUS_PREFIX}${JSON.stringify(signal)}`);
+          await orch.__settleChunkWorkForTest(tapRunId);
+          await after?.();
+        })().catch((e) => console.error("[test] deferred hook failed:", e));
       }, 150);
     });
     let sawOwn = false;
     let ownAfter: unknown = "unset";
-    let newerAfter: ReturnType<typeof stacks.harnessStacks.getLimitState> = null;
+    let newerAfter: Awaited<ReturnType<typeof stacks.harnessStacks.getLimitState>> = null;
     let wideAfter: unknown = "unset";
     try {
       await withEnv({ AGETOR_CODEX_DRIVER: "fake", AGETOR_CODEX_BIN: "/bin/echo", AGETOR_FAKE_CODEX_RESOLVE_DELAY_MS: "700" }, async () => {
         // `getLimitState(a, { model })` also returns the account-wide row, so
         // only the stored row's own `model` proves the signal kept its model.
-        feed(own, () => { sawOwn = stacks.harnessStacks.getLimitState(a, { model: "fixture-codex-model" })?.model === "fixture-codex-model"; });
+        feed(own, async () => { sawOwn = (await stacks.harnessStacks.getLimitState(a, { model: "fixture-codex-model" }))?.model === "fixture-codex-model"; });
         expect(await orch.startTask(own.id)).toHaveProperty("runId");
         await waitFor(() => db.tasks.get(own.id)?.column === "review", 10_000);
-        ownAfter = stacks.harnessStacks.getLimitState(a, { model: "fixture-codex-model" });
-        feed(newer, () => {
-          stacks.harnessStacks.setLimitState(a, { ...signal, message: "newer model overwrite" } as never, Date.now() + 5);
+        ownAfter = await stacks.harnessStacks.getLimitState(a, { model: "fixture-codex-model" });
+        feed(newer, async () => {
+          await stacks.harnessStacks.setLimitState(a, { ...signal, message: "newer model overwrite" } as never, Date.now() + 5);
         });
         expect(await orch.startTask(newer.id)).toHaveProperty("runId");
         await waitFor(() => db.tasks.get(newer.id)?.column === "review", 10_000);
-        newerAfter = stacks.harnessStacks.getLimitState(a, { model: "fixture-codex-model" });
-        wideAfter = stacks.harnessStacks.getLimitState(a);
+        newerAfter = await stacks.harnessStacks.getLimitState(a, { model: "fixture-codex-model" });
+        wideAfter = await stacks.harnessStacks.getLimitState(a);
       });
     } finally {
       orch.__setChunkHandlerTapForTest(null);
-      stacks.harnessStacks.clearLimitState(a);
+      await stacks.harnessStacks.clearLimitState(a);
     }
     expect(sawOwn).toBe(true);
     expect(ownAfter).toBeNull();
@@ -959,51 +963,54 @@ describe("finding 5: cooldown clears are conditional", () => {
     expect(newerAfter!.model).toBe("fixture-codex-model");
     // Nothing was written account-wide: other models stay usable.
     expect(wideAfter).toBeNull();
-    stacks.harnessStacks.delete(stack.id);
+    await stacks.harnessStacks.delete(stack.id);
   }, 40_000);
 
   test("a recovered Codex 429 self-clears exactly its own row; a newer overwrite survives", async () => {
     const a = codexAlias("f5cx-a");
     const b = codexAlias("f5cx-b");
-    const stack = stacks.harnessStacks.create({ label: "f5cx", kind: "codex", members: [a, b] });
+    const stack = await stacks.harnessStacks.create({ label: "f5cx", kind: "codex", members: [a, b] });
     const own = makeTask(a, "plain codex work", { model: "fixture-codex-model" } as Partial<Task>);
     const newer = makeTask(a, "plain codex work", { model: "fixture-codex-model" } as Partial<Task>);
     const signal = { reason: "rate_limit", resetAtMs: null, message: "429 Too Many Requests", source: "codex-error" };
-    const feed = (target: Task, after?: () => void) => orch.__setChunkHandlerTapForTest((_runId, hooked, handler) => {
+    const feed = (target: Task, after?: () => void | Promise<void>) => orch.__setChunkHandlerTapForTest((tapRunId, hooked, handler) => {
       if (hooked !== target.id) return;
       orch.__setChunkHandlerTapForTest(null);
       setTimeout(() => {
-        handler("status", `${HARNESS_LIMIT_STATUS_PREFIX}${JSON.stringify(signal)}`);
-        after?.();
+        void (async () => {
+          handler("status", `${HARNESS_LIMIT_STATUS_PREFIX}${JSON.stringify(signal)}`);
+          await orch.__settleChunkWorkForTest(tapRunId);
+          await after?.();
+        })().catch((e) => console.error("[test] deferred hook failed:", e));
       }, 150);
     });
     let sawOwn = false;
     let afterOwn: unknown = "unset";
-    let afterNewer: ReturnType<typeof stacks.harnessStacks.getLimitState> = null;
+    let afterNewer: Awaited<ReturnType<typeof stacks.harnessStacks.getLimitState>> = null;
     try {
       await withEnv({ AGETOR_CODEX_DRIVER: "fake", AGETOR_CODEX_BIN: "/bin/echo", AGETOR_FAKE_CODEX_RESOLVE_DELAY_MS: "700" }, async () => {
         // 1. Its own row, still the stored one when the turn completes: cleared.
-        feed(own, () => { sawOwn = stacks.harnessStacks.getLimitState(a) !== null; });
+        feed(own, async () => { sawOwn = await stacks.harnessStacks.getLimitState(a) !== null; });
         expect(await orch.startTask(own.id)).toHaveProperty("runId");
         await waitFor(() => db.tasks.get(own.id)?.column === "review", 10_000);
-        afterOwn = stacks.harnessStacks.getLimitState(a);
+        afterOwn = await stacks.harnessStacks.getLimitState(a);
         // 2. Another task overwrote the row after this run stored it: kept.
-        feed(newer, () => {
-          stacks.harnessStacks.setLimitState(a, { ...signal, message: "newer overwrite" } as never, Date.now() + 5);
+        feed(newer, async () => {
+          await stacks.harnessStacks.setLimitState(a, { ...signal, message: "newer overwrite" } as never, Date.now() + 5);
         });
         expect(await orch.startTask(newer.id)).toHaveProperty("runId");
         await waitFor(() => db.tasks.get(newer.id)?.column === "review", 10_000);
-        afterNewer = stacks.harnessStacks.getLimitState(a);
+        afterNewer = await stacks.harnessStacks.getLimitState(a);
       });
     } finally {
       orch.__setChunkHandlerTapForTest(null);
-      stacks.harnessStacks.clearLimitState(a);
+      await stacks.harnessStacks.clearLimitState(a);
     }
     expect(sawOwn).toBe(true);
     expect(afterOwn).toBeNull();
     expect(afterNewer).not.toBeNull();
     expect(afterNewer!.message).toBe("newer overwrite");
-    stacks.harnessStacks.delete(stack.id);
+    await stacks.harnessStacks.delete(stack.id);
   }, 40_000);
 });
 
@@ -1015,11 +1022,11 @@ describe("swap history: one row per move, per trigger", () => {
   test("limit: one row with the limit's reason, source and both account ids", async () => {
     const a = alias("h-limit-a");
     const b = alias("h-limit-b");
-    const stack = stacks.harnessStacks.create({ label: "h-limit", kind: "claude-code", members: [a, b] });
+    const stack = await stacks.harnessStacks.create({ label: "h-limit", kind: "claude-code", members: [a, b] });
     const task = makeTask(a, `work ${FAKE_CLAUDE_LIMIT_PROMPT_MARKER}`);
     expect(await orch.startTask(task.id)).toHaveProperty("runId");
     await waitFor(settledRuns(task.id, 2));
-    const rows = histRows(stack.id, task.id);
+    const rows = await histRows(stack.id, task.id);
     expect(rows).toHaveLength(1);
     expect(rows[0]).toMatchObject({ trigger: "limit", fromHarnessId: a, toHarnessId: b, continuation: "transferred" });
     expect(rows[0]!.reason).not.toBeNull();
@@ -1027,30 +1034,30 @@ describe("swap history: one row per move, per trigger", () => {
     const runIds = sortedRuns(task.id).map((r) => r.id);
     expect(rows[0]!.fromRunId).toBe(runIds[0] ?? null);
     expect(rows[0]!.toRunId).toBe(runIds[1] ?? null);
-    stacks.harnessStacks.clearLimitState(a);
-    stacks.harnessStacks.delete(stack.id);
+    await stacks.harnessStacks.clearLimitState(a);
+    await stacks.harnessStacks.delete(stack.id);
   }, 20_000);
 
   test("clean limit: the row says the request was restarted, not transferred", async () => {
     const a = alias("h-clean-a");
     const b = alias("h-clean-b");
-    const stack = stacks.harnessStacks.create({ label: "h-clean", kind: "claude-code", members: [a, b] });
+    const stack = await stacks.harnessStacks.create({ label: "h-clean", kind: "claude-code", members: [a, b] });
     const task = makeTask(a, `ask ${FAKE_CLAUDE_LIMIT_CLEAN_PROMPT_MARKER}`);
     expect(await orch.startTask(task.id)).toHaveProperty("runId");
     await waitFor(settledRuns(task.id, 2));
-    const rows = histRows(stack.id, task.id);
+    const rows = await histRows(stack.id, task.id);
     expect(rows).toHaveLength(1);
     expect(rows[0]).toMatchObject({ trigger: "limit", continuation: "restarted" });
-    stacks.harnessStacks.clearLimitState(a);
-    stacks.harnessStacks.delete(stack.id);
+    await stacks.harnessStacks.clearLimitState(a);
+    await stacks.harnessStacks.delete(stack.id);
   }, 20_000);
 
   test("retry to another account and a same-account retry each write one `retry` row", async () => {
     const a = alias("h-retry-a");
     const b = alias("h-retry-b");
-    const stack = stacks.harnessStacks.create({ label: "h-retry", kind: "claude-code", members: [a, b] });
+    const stack = await stacks.harnessStacks.create({ label: "h-retry", kind: "claude-code", members: [a, b] });
     // (1) A still cools, so the retry moves the task to B.
-    stacks.harnessStacks.setLimitState(a, { reason: "quota", resetAtMs: Date.now() + 600_000, message: "x", source: "claude-pane" });
+    await stacks.harnessStacks.setLimitState(a, { reason: "quota", resetAtMs: Date.now() + 600_000, message: "x", source: "claude-pane" });
     const toB = makeTask(a, "plain retry work", { column: "blocked" });
     const lastB = insertRun(toB.id, a, { status: "failed", exitCode: -1 });
     db.tasks.update(toB.id, { runId: lastB });
@@ -1061,11 +1068,11 @@ describe("swap history: one row per move, per trigger", () => {
     });
     failover.armAutoRetry(toB.id, at);
     await waitFor(settledRuns(toB.id, 2), 10_000);
-    const rowsB = histRows(stack.id, toB.id);
+    const rowsB = await histRows(stack.id, toB.id);
     expect(rowsB).toHaveLength(1);
     expect(rowsB[0]).toMatchObject({ trigger: "retry", fromHarnessId: a, toHarnessId: b });
     // (2) The reset passed: the retry resumes on the SAME account, still one row.
-    stacks.harnessStacks.clearLimitState(a);
+    await stacks.harnessStacks.clearLimitState(a);
     const same = makeTask(a, "plain retry work", { column: "blocked" });
     const lastSame = insertRun(same.id, a, { status: "failed", exitCode: -1 });
     db.tasks.update(same.id, { runId: lastSame });
@@ -1075,30 +1082,30 @@ describe("swap history: one row per move, per trigger", () => {
     });
     failover.armAutoRetry(same.id, at);
     await waitFor(settledRuns(same.id, 2), 10_000);
-    const rowsSame = histRows(stack.id, same.id);
+    const rowsSame = await histRows(stack.id, same.id);
     expect(rowsSame).toHaveLength(1);
     expect(rowsSame[0]).toMatchObject({ trigger: "retry", fromHarnessId: a, toHarnessId: a });
-    stacks.harnessStacks.delete(stack.id);
+    await stacks.harnessStacks.delete(stack.id);
   }, 30_000);
 
   test("manual move from the picker: one `manual` row", async () => {
     const a = alias("h-manual-a");
     const b = alias("h-manual-b");
-    const stack = stacks.harnessStacks.create({ label: "h-manual", kind: "claude-code", members: [a, b] });
+    const stack = await stacks.harnessStacks.create({ label: "h-manual", kind: "claude-code", members: [a, b] });
     const task = makeTask(a, "manual switch");
     const before = db.tasks.get(task.id)!;
     db.tasks.update(task.id, { agent: b });
     await orch.reconcileTaskSession(task.id, before, db.tasks.get(task.id)!);
-    const rows = histRows(stack.id, task.id);
+    const rows = await histRows(stack.id, task.id);
     expect(rows).toHaveLength(1);
     expect(rows[0]).toMatchObject({ trigger: "manual", reason: "user", fromHarnessId: a, toHarnessId: b });
-    stacks.harnessStacks.delete(stack.id);
+    await stacks.harnessStacks.delete(stack.id);
   });
 
   test("unavailable at Run: a disabled account moves on start with one `unavailable` row", async () => {
     const a = alias("h-unavail-a");
     const b = alias("h-unavail-b");
-    const stack = stacks.harnessStacks.create({ label: "h-unavail", kind: "claude-code", members: [a, b] });
+    const stack = await stacks.harnessStacks.create({ label: "h-unavail", kind: "claude-code", members: [a, b] });
     const task = makeTask(a, "plain work");
     db.harnesses.setEnabled(a, false);
     try {
@@ -1108,17 +1115,17 @@ describe("swap history: one row per move, per trigger", () => {
       db.harnesses.setEnabled(a, true);
     }
     expect(db.tasks.get(task.id)!.agent).toBe(b);
-    const rows = histRows(stack.id, task.id);
+    const rows = await histRows(stack.id, task.id);
     expect(rows).toHaveLength(1);
     expect(rows[0]).toMatchObject({ trigger: "unavailable", fromHarnessId: a, toHarnessId: b });
-    stacks.harnessStacks.delete(stack.id);
+    await stacks.harnessStacks.delete(stack.id);
   }, 20_000);
 
   test("blocked with the limit's reason: all accounts exhausted writes one `blocked` row, not two", async () => {
     const a = alias("h-blocked-a");
     const b = alias("h-blocked-b");
-    const stack = stacks.harnessStacks.create({ label: "h-blocked", kind: "claude-code", members: [a, b] });
-    stacks.harnessStacks.setLimitState(b, { reason: "quota", resetAtMs: Date.now() + 3_600_000, message: "x", source: "claude-pane" });
+    const stack = await stacks.harnessStacks.create({ label: "h-blocked", kind: "claude-code", members: [a, b] });
+    await stacks.harnessStacks.setLimitState(b, { reason: "quota", resetAtMs: Date.now() + 3_600_000, message: "x", source: "claude-pane" });
     const task = makeTask(a, `work ${FAKE_CLAUDE_LIMIT_PROMPT_MARKER}`);
     try {
       expect(await orch.startTask(task.id)).toHaveProperty("runId");
@@ -1126,20 +1133,20 @@ describe("swap history: one row per move, per trigger", () => {
     } finally {
       failover.cancelAutoRetry(task.id);
     }
-    const rows = histRows(stack.id, task.id);
+    const rows = await histRows(stack.id, task.id);
     expect(rows.map((r) => r.trigger)).toEqual(["blocked"]);
     // The limit's own reason and source, not the generic no-usable-member.
     expect(rows[0]!.reason).toBe("quota");
     expect(rows[0]!.source).not.toBeNull();
     expect(rows[0]!.toHarnessId).toBeNull();
-    for (const id of [a, b]) stacks.harnessStacks.clearLimitState(id);
-    stacks.harnessStacks.delete(stack.id);
+    for (const id of [a, b]) await stacks.harnessStacks.clearLimitState(id);
+    await stacks.harnessStacks.delete(stack.id);
   }, 20_000);
 
   test("a Stop during the settlement window writes no row at all", async () => {
     const a = alias("h-stop-a");
     const b = alias("h-stop-b");
-    const stack = stacks.harnessStacks.create({ label: "h-stop", kind: "claude-code", members: [a, b] });
+    const stack = await stacks.harnessStacks.create({ label: "h-stop", kind: "claude-code", members: [a, b] });
     const task = makeTask(a, `work ${FAKE_CLAUDE_LIMIT_PROMPT_MARKER}`);
     const prev = orch.__setHarnessSwapSettleHookForTest(async (hooked, runId, phase) => {
       if (hooked !== task.id || phase !== "settle") return;
@@ -1152,9 +1159,9 @@ describe("swap history: one row per move, per trigger", () => {
     } finally {
       orch.__setHarnessSwapSettleHookForTest(prev);
     }
-    expect(histRows(stack.id, task.id)).toHaveLength(0);
-    stacks.harnessStacks.clearLimitState(a);
-    stacks.harnessStacks.delete(stack.id);
+    expect(await histRows(stack.id, task.id)).toHaveLength(0);
+    await stacks.harnessStacks.clearLimitState(a);
+    await stacks.harnessStacks.delete(stack.id);
   }, 20_000);
 });
 
@@ -1166,7 +1173,7 @@ describe("a 1-member stack is inert at Run (22a)", () => {
   test("Run takes the normal pre-flight and clears a stale retry and its timer", async () => {
     const a = alias("inert-a");
     const b = alias("inert-b");
-    const stack = stacks.harnessStacks.create({ label: "inert", kind: "claude-code", members: [a, b] });
+    const stack = await stacks.harnessStacks.create({ label: "inert", kind: "claude-code", members: [a, b] });
     const task = makeTask(a, "plain work", { column: "blocked" });
     const at = Date.now() + 3_600_000;
     db.tasks.setHarnessState(task.id, {
@@ -1176,7 +1183,7 @@ describe("a 1-member stack is inert at Run (22a)", () => {
     failover.armAutoRetry(task.id, at);
     expect(failover.hasArmedAutoRetry(task.id)).toBe(true);
     // Cut to one account: the stack is now a lone account in effect.
-    stacks.harnessStacks.update(stack.id, { members: [a] });
+    await stacks.harnessStacks.update(stack.id, { members: [a] });
     try {
       expect(await orch.startTask(task.id)).toHaveProperty("runId");
       await waitFor(settledRuns(task.id, 1));
@@ -1186,19 +1193,19 @@ describe("a 1-member stack is inert at Run (22a)", () => {
     expect(failover.hasArmedAutoRetry(task.id)).toBe(false);
     expect(db.tasks.get(task.id)!.harnessState ?? null).toBeNull();
     expect(db.tasks.get(task.id)!.agent).toBe(a);
-    expect(histRows(stack.id, task.id)).toHaveLength(0);
-    stacks.harnessStacks.delete(stack.id);
+    expect(await histRows(stack.id, task.id)).toHaveLength(0);
+    await stacks.harnessStacks.delete(stack.id);
   }, 20_000);
 });
 
 describe("rearmRetriesAfterCooldownClear: only limit-blocked, waiting tasks; no attempt spent (22b companion)", () => {
-  test("skips in-flight, no-usable-member, capped, archived and other-stack tasks; keeps the attempt count", () => {
+  test("skips in-flight, no-usable-member, capped, archived and other-stack tasks; keeps the attempt count", async () => {
     const a = alias("rearm2-a");
     const b = alias("rearm2-b");
     const other = alias("rearm2-o1");
     const other2 = alias("rearm2-o2");
-    const stack = stacks.harnessStacks.create({ label: "rearm2", kind: "claude-code", members: [a, b] });
-    const otherStack = stacks.harnessStacks.create({ label: "rearm2-other", kind: "claude-code", members: [other, other2] });
+    const stack = await stacks.harnessStacks.create({ label: "rearm2", kind: "claude-code", members: [a, b] });
+    const otherStack = await stacks.harnessStacks.create({ label: "rearm2-other", kind: "claude-code", members: [other, other2] });
     const far = Date.now() + 3_600_000;
     const make = (agent: string, st: string, ex: ReturnType<typeof exhausted>, extra: Partial<Task> = {}) => {
       const t = makeTask(agent, "p", { column: "blocked", ...extra });
@@ -1214,7 +1221,7 @@ describe("rearmRetriesAfterCooldownClear: only limit-blocked, waiting tasks; no 
     const archived = make(a, stack.id, exhausted(Date.now(), { attempts: 0, nextAttemptAt: far }), { archivedAt: Date.now() });
     const elsewhere = make(other, otherStack.id, exhausted(Date.now(), { attempts: 0, nextAttemptAt: far }));
 
-    expect(orch.rearmRetriesAfterCooldownClear(a)).toBe(1);
+    expect(await orch.rearmRetriesAfterCooldownClear(a)).toBe(1);
     const fresh = db.tasks.get(waiting.t.id)!.harnessState!.allExhausted!;
     expect(fresh.nextAttemptAt).toBeLessThan(far);
     // Re-arming is not a retry: the attempt count is untouched.
@@ -1229,8 +1236,8 @@ describe("rearmRetriesAfterCooldownClear: only limit-blocked, waiting tasks; no 
     expect(failover.hasArmedAutoRetry(waiting.t.id)).toBe(true);
     expect(failover.hasArmedAutoRetry(inFlight.t.id)).toBe(false);
     for (const t of [waiting, inFlight, noMember, capped, archived, elsewhere]) failover.cancelAutoRetry(t.t.id);
-    stacks.harnessStacks.delete(stack.id);
-    stacks.harnessStacks.delete(otherStack.id);
+    await stacks.harnessStacks.delete(stack.id);
+    await stacks.harnessStacks.delete(otherStack.id);
   });
 });
 
@@ -1238,7 +1245,7 @@ describe("cancelHarnessRetryForTask with a live in-flight retry (22b)", () => {
   test("clears the loop marker only: no status line, no stash, the live successor keeps its follow-ups", async () => {
     const a = alias("cancel-live-a");
     const b = alias("cancel-live-b");
-    const stack = stacks.harnessStacks.create({ label: "cancel-live", kind: "claude-code", members: [a, b] });
+    const stack = await stacks.harnessStacks.create({ label: "cancel-live", kind: "claude-code", members: [a, b] });
     const task = makeTask(a, "a long plain turn");
     try {
       await withEnv({ AGETOR_FAKE_CLAUDE_TURN_MS: "800" }, async () => {
@@ -1250,7 +1257,7 @@ describe("cancelHarnessRetryForTask with a live in-flight retry (22b)", () => {
           stackId: stack.id, position: 0, count: 2, tried: [a], pendingSwap: null, lastMove: null,
           allExhausted: exhausted(Date.now(), { attempts: 1, nextAttemptAt: Date.now(), inFlight: true, attemptRunId: runId, cleanRetryOf: runId }),
         });
-        expect(orch.cancelHarnessRetryForTask(task.id, "automatic account retry cancelled")).toBe(true);
+        expect(await orch.cancelHarnessRetryForTask(task.id, "automatic account retry cancelled")).toBe(true);
         expect(db.tasks.get(task.id)!.harnessState?.allExhausted ?? null).toBeNull();
         expect(statusLines(runId).some((l) => l.includes("automatic account retry cancelled"))).toBe(false);
         expect(backlogTexts(task.id)).toEqual([]);
@@ -1259,13 +1266,13 @@ describe("cancelHarnessRetryForTask with a live in-flight retry (22b)", () => {
     } finally {
       failover.cancelAutoRetry(task.id);
     }
-    stacks.harnessStacks.delete(stack.id);
+    await stacks.harnessStacks.delete(stack.id);
   }, 20_000);
 
-  test("an armed (not running) retry does get the line, once", () => {
+  test("an armed (not running) retry does get the line, once", async () => {
     const a = alias("cancel-armed-a");
     const b = alias("cancel-armed-b");
-    const stack = stacks.harnessStacks.create({ label: "cancel-armed", kind: "claude-code", members: [a, b] });
+    const stack = await stacks.harnessStacks.create({ label: "cancel-armed", kind: "claude-code", members: [a, b] });
     const task = makeTask(a, "p", { column: "blocked" });
     const runId = insertRun(task.id, a, { status: "failed", exitCode: -1 });
     db.tasks.update(task.id, { runId });
@@ -1273,10 +1280,10 @@ describe("cancelHarnessRetryForTask with a live in-flight retry (22b)", () => {
       stackId: stack.id, position: 0, count: 2, tried: [a], pendingSwap: null, lastMove: null,
       allExhausted: exhausted(Date.now(), { nextAttemptAt: Date.now() + 3_600_000 }),
     });
-    expect(orch.cancelHarnessRetryForTask(task.id, "automatic account retry cancelled")).toBe(true);
+    expect(await orch.cancelHarnessRetryForTask(task.id, "automatic account retry cancelled")).toBe(true);
     expect(statusLines(runId).filter((l) => l === "automatic account retry cancelled")).toHaveLength(1);
-    expect(orch.cancelHarnessRetryForTask(task.id)).toBe(false);
-    stacks.harnessStacks.delete(stack.id);
+    expect(await orch.cancelHarnessRetryForTask(task.id)).toBe(false);
+    await stacks.harnessStacks.delete(stack.id);
   });
 });
 

@@ -122,9 +122,9 @@ test("archiveTask responds before teardown runs — the worktree is (usually) st
     // flight for this task right now).
     const stillHasDirImmediately = existsSync(worktreePath);
     let settledImmediately = false;
-    pendingTeardown(taskId).then(() => {
+    void pendingTeardown(taskId).then(() => {
       settledImmediately = true;
-    });
+    }).catch(() => {});
     // Give queued microtasks (but not the deferred job's own awaits) a chance
     // to run without letting the teardown's internal awaits resolve.
     await Promise.resolve();
@@ -275,7 +275,7 @@ test("sweepArchivedTeardowns enqueues teardown for a task stranded archived-with
     tasks.update(taskId, { archivedAt: Date.now() });
     expect(existsSync(worktreePath)).toBe(true);
 
-    const enqueued = sweepArchivedTeardowns();
+    const enqueued = await sweepArchivedTeardowns();
     expect(enqueued).toBeGreaterThanOrEqual(1);
 
     await pendingTeardown(taskId);
@@ -563,7 +563,7 @@ test("steady-state regression: a dirty worktree archived before archives removed
     // fail again, every time, exactly like the reported "stuck forever,
     // retried and failed every boot" cycle.
     for (let i = 0; i < 2; i++) {
-      const enqueued = sweepArchivedTeardowns();
+      const enqueued = await sweepArchivedTeardowns();
       expect(enqueued).toBeGreaterThanOrEqual(1);
       await pendingTeardown(taskId);
       expect(existsSync(worktreePath)).toBe(true);

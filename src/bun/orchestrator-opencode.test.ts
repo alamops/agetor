@@ -283,7 +283,7 @@ test("a cross-kind agent switch resets opencodeServer to shared", async () => {
 async function seedRunningChild(taskId: string, runId: string, description: string): Promise<string> {
   const { registerOpencodeSubagent, opencodeSubagentId } = await import("./opencode-subagents.ts");
   const child = `ses_left${randomUUID().replace(/-/g, "")}`;
-  registerOpencodeSubagent({
+  await registerOpencodeSubagent({
     taskId,
     runId,
     notice: { childSessionId: child, description, agentType: "explore", toolUseId: `call-${child}`, background: true },
@@ -450,7 +450,7 @@ test("a held task that isn't being torn down is still released by the settle", a
   const { taskId, runId } = insertTaskWithRun({ agent: "opencode", column: "running", runStatus: "succeeded" });
   const rowId = await seedRunningChild(taskId, runId, "Live child");
   const { orphanRunningOpencodeSubagents } = await import("./opencode-subagents.ts");
-  expect(orphanRunningOpencodeSubagents(taskId, "test settle")).toBe(1);
+  expect(await orphanRunningOpencodeSubagents(taskId, "test settle")).toBe(1);
   expect(db.subagents.get(rowId)?.status).toBe("orphaned");
   expect(db.tasks.get(taskId)?.column).toBe("review");
 });

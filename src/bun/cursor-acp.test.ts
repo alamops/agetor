@@ -3,6 +3,7 @@ import { randomUUID } from "node:crypto";
 import { mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import path from "node:path";
+import { rmTestDataDir } from "./test-data-dir.ts";
 
 const dataDir = mkdtempSync(path.join(tmpdir(), "agetor-cursor-acp-"));
 process.env.AGETOR_DATA_DIR = dataDir;
@@ -379,7 +380,9 @@ beforeAll(async () => {
 
 afterAll(() => {
   rmSync(scratch, { recursive: true, force: true });
-  rmSync(dataDir, { recursive: true, force: true });
+  // Never a raw rmSync of the data dir: bun test shares one db.ts singleton, and
+  // when this file opened it the sqlite lives here (CLAUDE.md test rules).
+  rmTestDataDir(dataDir);
 });
 
 type Chunk = { stream: string; data: string; lineUuid?: string };
@@ -748,7 +751,7 @@ test("rebuildOpenCursorAsks re-registers open rows as restart follow-ups without
     },
   });
   expect(listOpenCursorAsks()).toHaveLength(1);
-  rebuildOpenCursorAsks();
+  await rebuildOpenCursorAsks();
   expect(listOpenCursorAsks()).toHaveLength(1);
   const pending = listPendingForTask("task-rebuild");
   expect(pending).toHaveLength(1);
@@ -758,7 +761,7 @@ test("rebuildOpenCursorAsks re-registers open rows as restart follow-ups without
   expect(card.followupCause).toBe("restart");
   expect(card.source).toBe("cursor");
   expect(card.questions[0]?.question).toBe("Which option?");
-  rebuildOpenCursorAsks();
+  await rebuildOpenCursorAsks();
   expect(listPendingForTask("task-rebuild")).toHaveLength(1);
   expect(listOpenCursorAsks()).toHaveLength(1);
 });

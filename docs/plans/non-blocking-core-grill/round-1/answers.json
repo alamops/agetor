@@ -1,0 +1,173 @@
+{
+  "version": 1,
+  "formId": "non-blocking-core-grill-r1",
+  "title": "Grill — a multi-threaded, non-blocking Agetor core",
+  "round": 1,
+  "mode": "served",
+  "specFile": "questions.json",
+  "specSha256": "30fd97d620a9b6dda9d9d9f2e6411a1a0c778a6900583adc65f3e893a1d5ed68",
+  "submittedAt": "2026-11-20T02:14:37.215Z",
+  "receivedAt": "2026-11-20T02:14:37.355Z",
+  "answeredBy": null,
+  "summary": {
+    "total": 14,
+    "answered": 13,
+    "skipped": 0,
+    "unanswered": 0,
+    "optionalLeftBlank": 1,
+    "notApplicable": 0,
+    "acceptedRecommendations": 12,
+    "overrodeRecommendations": [
+      "threading-model"
+    ],
+    "oneWayDoorsNotAnswered": [],
+    "withNotes": [],
+    "needsAnswer": [],
+    "complete": true
+  },
+  "answers": {
+    "threading-model": {
+      "n": 1,
+      "title": "How far should the multi-threading go?",
+      "type": "single",
+      "status": "answered",
+      "impact": "blocking",
+      "value": "full-async",
+      "display": "Full DB worker: every query async",
+      "acceptedRecommendation": false,
+      "recommended": "hybrid"
+    },
+    "board-refresh": {
+      "n": 2,
+      "title": "How should the board and TUI keep their task lists fresh?",
+      "type": "single",
+      "status": "answered",
+      "impact": "blocking",
+      "value": "delta-plus-push",
+      "display": "Delta poll + push",
+      "acceptedRecommendation": true
+    },
+    "watcher-fix": {
+      "n": 3,
+      "title": "Which changes to the Claude subagent watcher?",
+      "type": "multi",
+      "status": "answered",
+      "impact": "shape",
+      "value": [
+        "bounded",
+        "worker-parse",
+        "batch-insert",
+        "label-scope"
+      ],
+      "display": "Deadline-bound every pass; Read + parse transcripts in the transcript worker; Batch inserts per chunk; Fix the lag label",
+      "acceptedRecommendation": true
+    },
+    "other-blockers": {
+      "n": 4,
+      "title": "Which other main-thread blockers should this change also fix?",
+      "type": "multi",
+      "status": "answered",
+      "impact": "shape",
+      "value": [
+        "login-path",
+        "request-scans",
+        "ssh-config",
+        "rm-sync"
+      ],
+      "display": "Boot: login-shell PATH probe; Request-path file scans; git provider `ssh -G` probe; Recursive rmSync on delete / clone cleanup",
+      "acceptedRecommendation": true
+    },
+    "block-budget": {
+      "n": 5,
+      "title": "What's the longest the main thread may be blocked by any single unit of work?",
+      "type": "number",
+      "status": "answered",
+      "impact": "shape",
+      "value": 100,
+      "display": "100 ms",
+      "acceptedRecommendation": true
+    },
+    "health-p95": {
+      "n": 6,
+      "title": "Target /health p95 latency while heavy work runs (opening a long transcript, a big subagent run, the board polling)?",
+      "type": "number",
+      "status": "answered",
+      "impact": "shape",
+      "value": 100,
+      "display": "100 ms",
+      "acceptedRecommendation": true
+    },
+    "delivery": {
+      "n": 7,
+      "title": "How should it ship?",
+      "type": "single",
+      "status": "answered",
+      "impact": "minor",
+      "value": "one-pr",
+      "display": "One PR, one commit per wave",
+      "acceptedRecommendation": true
+    },
+    "sqlite-cache": {
+      "n": 8,
+      "title": "SQLite memory settings",
+      "type": "confirm",
+      "status": "answered",
+      "impact": "minor",
+      "value": "`cache_size` 64 MB and `mmap_size` 256 MB on the main connection; the reader worker gets the same.",
+      "acceptedRecommendation": true
+    },
+    "core-log": {
+      "n": 9,
+      "title": "Persistent core log",
+      "type": "confirm",
+      "status": "answered",
+      "impact": "minor",
+      "value": "`~/.agetor/logs/core.log`, mode 0600, rotated at 5 MB × 3 files, written by a buffered async writer (never a sync write per line), secrets redacted. Every stall ≥ 1 s is logged, with or without a task label.",
+      "acceptedRecommendation": true
+    },
+    "compact-out": {
+      "n": 10,
+      "title": "Compact database (VACUUM)",
+      "type": "confirm",
+      "status": "answered",
+      "impact": "minor",
+      "value": "Leave it as it is: manual, refused while a run is active. Out of scope.",
+      "acceptedRecommendation": true
+    },
+    "busy-banner": {
+      "n": 11,
+      "title": "The busy banner",
+      "type": "confirm",
+      "status": "answered",
+      "impact": "minor",
+      "value": "Keep it exactly as it is (observational; 3 s pending plus two missed /health probes).",
+      "acceptedRecommendation": true
+    },
+    "benchmark": {
+      "n": 12,
+      "title": "Repeatable benchmark",
+      "type": "confirm",
+      "status": "answered",
+      "impact": "minor",
+      "value": "Add `scripts/measure-core-responsiveness.ts`: a headless core on a `.backup` copy of a real-sized DB in `~/.agetor-dev`, driving the board poll, a transcript replay and a subagent run, reporting /health p50/p95/max and the longest main-thread block, before and after. Never touches ~/.agetor.",
+      "acceptedRecommendation": true
+    },
+    "e2e": {
+      "n": 13,
+      "title": "E2E coverage",
+      "type": "confirm",
+      "status": "answered",
+      "impact": "minor",
+      "value": "Extend the busy-banner and board specs: a heavy load (big transcript replay + many tasks) runs while the test asserts the board keeps updating and the banner never appears; plus a delta/push spec for the board.",
+      "acceptedRecommendation": true
+    },
+    "done-means": {
+      "n": 14,
+      "title": "Anything that has to be true before you'd call this done?",
+      "type": "longtext",
+      "status": "unanswered",
+      "optional": true
+    }
+  },
+  "generalNotes": null
+}

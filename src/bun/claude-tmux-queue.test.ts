@@ -1,4 +1,4 @@
-import { test, expect } from "bun:test";
+import { test, expect, afterEach } from "bun:test";
 import {
   mkdtempSync,
   writeFileSync,
@@ -12,6 +12,15 @@ import {
 import { tmpdir } from "node:os";
 import path from "node:path";
 import { randomUUID } from "node:crypto";
+
+// A turn slot / sendTurn the test starts is the code under test: a rejection of
+// it is a failure, not noise. Collected here, asserted empty after every test
+// (an empty `.catch(() => {})` would hide it).
+const backgroundErrors: unknown[] = [];
+const noteBackgroundError = (e: unknown): void => { backgroundErrors.push(e); };
+afterEach(() => {
+  expect(backgroundErrors.splice(0)).toEqual([]);
+});
 
 // Pre-set AGETOR_DATA_DIR before claude-tmux.ts's transitive db.ts import.
 process.env.AGETOR_DATA_DIR = mkdtempSync(path.join(tmpdir(), "agetor-tmux-queue-"));
@@ -1493,7 +1502,7 @@ test("bumpActivity alone (a turn resolving purely from claude's own JSONL conten
   state.lastKeystrokeAt = staleKeystroke;
   state.lastActivityAt = 0;
   try {
-    __forTest.pushTurnSlot(state, () => {});
+    void __forTest.pushTurnSlot(state, () => {}).catch(noteBackgroundError);
     appendFileSync(jsonlPath, endTurnLine("done"));
     __forTest.flushSync(state);
 
@@ -1577,7 +1586,7 @@ test("sendTurn(...).pasteOutcome resolves a PASTE_DROPPED_OUTCOME-shaped failure
   // otherwise surface as an unhandled-rejection failure unrelated to this
   // test's actual assertion (pasteOutcome, below). Chained via `.then`
   // (not awaited) so it doesn't delay the synchronous teardown below.
-  agentPromise.then((agent) => agent.done.catch(() => {}));
+  void agentPromise.then((agent) => agent.done.catch(() => {})).catch(() => {});
   // Tear down the session SYNCHRONOUSLY, before the queued tmux op's
   // microtask gets a chance to run — queueTmuxOp's identity gate
   // (`sessions.get(taskId) === expectedState`) then drops the op body

@@ -84,6 +84,7 @@ import { autoEnabledToastText, opencodeSessionsFoundText } from "@/lib/import-se
 import { ONBOARDING_DISMISSED_PREF, deriveOnboardingSteps, resolveOnboardingVisibility } from "@/lib/onboarding";
 import type { SettingsSectionId } from "@/lib/settings-dialog-view";
 import { reconcileById } from "@/lib/reconcile";
+import { createTaskDeltaClient, type TaskDeltaClient } from "@/lib/task-delta-client";
 import { parseStickyUserMessagesPreference, STICKY_USER_MESSAGES_PREF } from "@/lib/user-message-display";
 import { FX_AUTO_RESUME_DELAY_PREF, FX_AUTO_RESUME_PREF } from "@/lib/fx-auto-resume-prefs";
 import { parseFxAutoResumePrefs } from "../shared/fx-recovery.ts";
@@ -769,77 +770,58 @@ function AppInner() {
   // function's doc comment. A ref (not state) since it's pure bookkeeping
   // that must survive across polls without itself triggering a render.
   const taskReconcileCacheRef = useRef(new Map<string, { obj: Task; json: string }>());
-  // The last poll answer `refresh()` reconciled and the state it produced,
-  // so a 304 (same array back) skips the per-task compare.
-  const lastAppliedTaskListRef = useRef<{ list: Task[]; result: Task[] } | null>(null);
   // In-flight guards for the 2s `refresh()` / 15s `refreshAgents()` interval
   // pollers below (task-details-blank-while-session-restores.md §3.1/§3.4):
   // a tick is skipped while the previous poll of the same kind hasn't
   // resolved yet, so a slow request never stacks with the next tick's.
-  const refreshPollInFlightRef = useRef(false);
   const refreshAgentsPollInFlightRef = useRef(false);
   const refreshProjectsPollInFlightRef = useRef(false);
-  // Ids the last SUCCESSFUL `/tasks` poll listed — the "previous list" for
-  // the in-app toast sweep in `refresh()` below. A task that simply hasn't
-  // been polled yet (just created, not in this set) is never swept.
-  const polledTaskIdsRef = useRef<Set<string> | null>(null);
   // What the next `/tasks` poll asks for (`TaskListArchived`). Written by the
   // effect beside `taskMenu` below, read by `refresh()` (stable identity, so
   // through a ref). Starts at `exclude` so the boot poll never ships the
   // archive; that effect switches to the full list when a view needs it.
   const taskListOptsRef = useRef<TaskListOptions>({ archived: "exclude" });
 
-  /** Re-list tasks. Returns the fetched list so callers that need to inspect a
-   *  task right after a mutation don't have to issue a second GET. `null` on
-   *  failure — the last good snapshot stays rendered and the poll retries. */
-  const refresh = useCallback(async (): Promise<Task[] | null> => {
-    try {
-      const opts = taskListOptsRef.current;
-      const list = await api.listTasks(opts);
-      // The view changed what the poll should carry while this request was
-      // in flight (e.g. the board switched to All): a stale `exclude` answer
-      // landing after the `include` one would drop the archived cards until
-      // the next tick, so it is returned to the caller but not applied.
-      if (taskListOptsRef.current.archived !== opts.archived) return list;
-      // `list` (unreconciled) is what callers get back for immediate reads
-      // (e.g. re-checking a just-created task's branch); the reconciled,
-      // identity-preserving version is what actually lands in state.
-      setTasks((prev) => {
-        // An unchanged list (the conditional poll's 304) comes back as the
-        // same array; when the state is still exactly what that array was
-        // reconciled into, there is nothing to compare. An optimistic edit
-        // since then (archive, unarchive…) changed `prev`, so the server's
-        // answer is applied over it as before.
-        const last = lastAppliedTaskListRef.current;
-        if (last && last.list === list && last.result === prev) return prev;
-        const next = reconcileById(prev, list, (t) => t.id, taskReconcileCacheRef.current);
-        lastAppliedTaskListRef.current = { list, result: next };
-        return next;
-      });
-      // Gates onboarding visibility (see `resolveOnboardingVisibility`'s
-      // `loaded` input) — set unconditionally on every success, cheap no-op
-      // once already true.
-      setTasksLoaded(true);
-      // Onboarding's steps count archived tasks too, so they wait for a poll
-      // that carried them (see `onboardingVisibility`'s `loaded`).
-      if (opts.archived === "include") setTasksWithArchivedLoaded(true);
-      // Toast-slot sweep (after a SUCCESSFUL poll only): a task whose toast
-      // can no longer be acted on — archived, or listed by the previous poll
-      // and gone from this one — must not keep an in-app toast up. O(n);
-      // `dismissTaskToast` is a Map lookup and a no-op on an empty slot.
-      const prevIds = polledTaskIdsRef.current;
-      const nextIds = new Set<string>();
-      for (const t of list) {
-        nextIds.add(t.id);
-        if (t.archivedAt != null) dismissTaskToast(t.id);
-      }
-      if (prevIds) {
-        for (const id of prevIds) if (!nextIds.has(id)) dismissTaskToast(id);
-      }
-      polledTaskIdsRef.current = nextIds;
-      return list;
-    } catch { return null; /* keep last good snapshot; retry next tick */ }
-  }, []);
+  // The board's delta refresh (`lib/task-delta-client.ts`): owns the cursor,
+  // the one-in-flight rule and the held server list. `refresh()` below, the
+  // 2 s / 15 s safety poll and the `tasks-changed` push all go through it, so
+  // there is never more than one `/tasks` request in flight.
+  const taskDeltaRef = useRef<TaskDeltaClient | null>(null);
+  if (taskDeltaRef.current === null) {
+    taskDeltaRef.current = createTaskDeltaClient({
+      fetch: (opts, since) => api.listTaskDelta(opts, since),
+      getOpts: () => taskListOptsRef.current,
+      cache: taskReconcileCacheRef.current,
+      commit: (list) => {
+        setTasks(list);
+        // Gates onboarding visibility (see `resolveOnboardingVisibility`'s
+        // `loaded` input) - set on every success, cheap no-op once true.
+        setTasksLoaded(true);
+      },
+      onApplied: ({ vanishedIds, archivedIds, opts }) => {
+        // Onboarding's steps count archived tasks too, so they wait for a poll
+        // that carried them (see `onboardingVisibility`'s `loaded`).
+        if (opts.archived === "include") setTasksWithArchivedLoaded(true);
+        // Toast-slot sweep (after a SUCCESSFUL fetch only): a task whose toast
+        // can no longer be acted on - archived, or listed by the previous fetch
+        // and gone from this one (a delta's `removedIds` included) - must not
+        // keep an in-app toast up. `dismissTaskToast` is a Map lookup and a
+        // no-op on an empty slot. A task never fetched is never swept.
+        for (const id of archivedIds) dismissTaskToast(id);
+        for (const id of vanishedIds) dismissTaskToast(id);
+      },
+    });
+  }
+
+  /** Re-list tasks (a delta fetch, or a snapshot when the cursor is unusable).
+   *  Returns the merged list so callers that need to inspect a task right after
+   *  a mutation don't have to issue a second GET; a call during a fetch gets the
+   *  follow-up fetch's list. `null` on failure - the last good snapshot stays
+   *  rendered and the next trigger retries. */
+  const refresh = useCallback(
+    (): Promise<Task[] | null> => taskDeltaRef.current!.refresh(),
+    [],
+  );
   const refreshAgents = useCallback(async () => {
     try {
       const payload = await api.listHarnesses();
@@ -976,12 +958,10 @@ function AppInner() {
     // bug previously fixed there.
     const t = setInterval(() => {
       if (!document.hidden) {
-        // Skip this tick if the previous `refresh()` poll is still in
-        // flight — see `refreshPollInFlightRef`'s comment above.
-        if (!refreshPollInFlightRef.current) {
-          refreshPollInFlightRef.current = true;
-          void refresh().finally(() => { refreshPollInFlightRef.current = false; });
-        }
+        // The controller skips the tick while a fetch is in flight and until
+        // its interval has elapsed (15 s with the global stream connected,
+        // 2 s without; the push does the real work while connected).
+        taskDeltaRef.current!.poll();
         // Same guard, its own ref — a slow `/projects` fetch must not stack
         // with the next 2s tick either.
         if (!refreshProjectsPollInFlightRef.current) {
@@ -998,13 +978,9 @@ function AppInner() {
     }, 15_000);
     const onVisible = () => {
       if (document.hidden) return;
-      // Route through the same in-flight guard the interval poll uses — a
-      // focus/visibility event landing mid-poll must not stack a second
-      // `/tasks` request on top of one already in flight.
-      if (!refreshPollInFlightRef.current) {
-        refreshPollInFlightRef.current = true;
-        void refresh().finally(() => { refreshPollInFlightRef.current = false; });
-      }
+      // The controller coalesces a focus/visibility refresh landing mid-fetch
+      // into one follow-up, never a second parallel `/tasks` request.
+      void refresh();
       if (!refreshProjectsPollInFlightRef.current) {
         refreshProjectsPollInFlightRef.current = true;
         void refreshProjects().finally(() => { refreshProjectsPollInFlightRef.current = false; });
@@ -1496,9 +1472,16 @@ function AppInner() {
         }
         void (async () => {
           try {
-            const list = await api.listTasks();
-            setTasks(list);
-            const found = findTaskById(list, ev.taskId);
+            // The same refresh path as the board; only a task the board's
+            // filter hides (archived) needs the unfiltered list.
+            let list = await refresh();
+            let found = list ? findTaskById(list, ev.taskId) : undefined;
+            if (!found) {
+              list = await api.listTasks();
+              setTasks(list);
+              found = findTaskById(list, ev.taskId);
+            }
+            if (!list) return;
             if (found) {
               // `tasksRef` only catches up with `setTasks` after the next
               // commit, so the resolver reads the list just fetched.
@@ -1594,6 +1577,14 @@ function AppInner() {
           error: ev.status === "error" ? ev.message : null,
           lastCheckedAt: ev.ts,
         });
+        return;
+      }
+      // The delta-refresh trigger (`tasks-changed`) carries no task: the board
+      // fetches its delta (a no-op when the cursor is already held) and the
+      // toast logic below never sees it. Skipped while the window is hidden;
+      // the visibility handler refreshes on return.
+      if (ev.kind === "tasks-changed") {
+        if (!document.hidden) taskDeltaRef.current!.notify(ev.cursor);
         return;
       }
       // "Already looking at it" — the run panel is open on the task, OR the
@@ -1934,8 +1925,16 @@ function AppInner() {
         }
       }
     };
-    const cancel = api.subscribeGlobalEvents(handle);
-    return cancel;
+    const cancel = api.subscribeGlobalEvents(handle, (connected) => {
+      taskDeltaRef.current!.setConnected(connected);
+      // A (re)connect: pushes sent while the stream was down are lost, so
+      // catch up now rather than at the next safety tick.
+      if (connected) void refresh();
+    });
+    return () => {
+      cancel();
+      taskDeltaRef.current!.setConnected(false);
+    };
     // `openTask`, `openPipelineStep`, `openPipelineAttention`,
     // `mergeTaskFields`, `raisePipelineNeedsYou` and `settleOwedPipelineAlert`
     // all have stable identities (the first three read
@@ -1943,7 +1942,7 @@ function AppInner() {
     // directly — see `viewRef`'s doc comment above) — listing them doesn't
     // cause a resubscribe, it just keeps this effect honest about what it
     // closes over.
-  }, [openTask, openPipelineStep, openPipelineAttention, mergeTaskFields, raisePipelineNeedsYou, raisePipelineReview, settleOwedPipelineAlert]);
+  }, [openTask, openPipelineStep, openPipelineAttention, mergeTaskFields, raisePipelineNeedsYou, raisePipelineReview, settleOwedPipelineAlert, refresh]);
 
   // Hidden pipeline STEP tasks never count toward anything user-facing (D11,
   // `docs/plans/pipelines.md`) — the board filter row's "N of M tasks" count and the
@@ -2682,6 +2681,14 @@ function AppInner() {
       ? { archived: "include" }
       : { archived: "exclude", keep: keepTaskIdsKey ? keepTaskIdsKey.split(",") : [] };
   }, [needsArchivedTasks, keepTaskIdsKey]);
+  // Any change of the filter key (back to Active, a kept archived task opening
+  // or closing) refetches at once instead of waiting for a push or the safety
+  // poll. An ACTIVE task opening or closing leaves the key unchanged, so the
+  // controller does nothing then. `tasks` is a dep because the key depends on
+  // the held list (a kept task turning archived changes it).
+  useEffect(() => {
+    taskDeltaRef.current!.filterChanged();
+  }, [needsArchivedTasks, keepTaskIdsKey, tasks]);
   // Fetch right away when archived tasks become needed, so switching the
   // board to All/Archived or opening Worktrees doesn't wait for the next
   // tick (declared after the effect above, so the ref is already updated).

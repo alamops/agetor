@@ -475,7 +475,7 @@ test("S7: a prepare reporting an unknown checkout doesn't overwrite the stored c
       ],
       unknownCheckouts: [second!.name],
     } as unknown as import("./worktree.ts").PreparedWorkdir;
-    noteRestoredCheckout(task.id, prepared);
+    await noteRestoredCheckout(task.id, prepared);
     const stored = tasks.get(task.id)!.repositories!;
     expect(stored.find((r) => r.name === first!.name)?.checkoutBranch).toBe("live/first");
     expect(stored.find((r) => r.name === second!.name)?.checkoutBranch).toBe("recorded/second");

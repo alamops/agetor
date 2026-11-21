@@ -88,7 +88,7 @@ test("resumeFxRecovery: issues POST /tasks/<url-encoded id>/fx-resume with no bo
     expect(captured!.contentType).toBeNull();
     expect(captured!.body).toBe("");
   } finally {
-    server.stop(true);
+    void server.stop(true);
   }
 });
 
@@ -163,7 +163,7 @@ test("cancelFxAutoResume: issues DELETE /tasks/<url-encoded id>/fx-auto-resume w
     expect(captured!.contentType).toBeNull();
     expect(captured!.body).toBe("");
   } finally {
-    server.stop(true);
+    void server.stop(true);
   }
 });
 
@@ -280,7 +280,7 @@ test("bundle calls: an unreadable 2xx rejects with the lost-answer message", asy
     );
     expect((exported as ApiError).message).toBe("the core's answer to the export was lost — try again");
   } finally {
-    server.stop(true);
+    void server.stop(true);
   }
 });
 
@@ -332,7 +332,7 @@ test("bundle calls: an HTTP error answer keeps the core's own message", async ()
     expect((err as ApiError).status).toBe(500);
     expect((err as ApiError).message).toBe("import failed — nothing was imported: boom");
   } finally {
-    server.stop(true);
+    void server.stop(true);
   }
 });
 
@@ -383,7 +383,7 @@ test("ApiError exposes the 403 body's code and a plain message", async () => {
     expect(d.code).toBeUndefined();
     expect(d.status).toBe(404);
   } finally {
-    server.stop(true);
+    void server.stop(true);
   }
 });
 
@@ -417,13 +417,13 @@ test("createHarnessStack / patchHarnessStack use the long mirror budget, and a t
     expect(budgets[2]).toBe(15_000);
   } finally {
     AbortSignal.timeout = realTimeout;
-    server.stop(true);
+    void server.stop(true);
   }
 
   // A core that is gone: no answer at all → status 0 with the save hint.
   const dead = Bun.serve({ port: 0, fetch: () => new Response("") });
   const deadPort = dead.port!;
-  dead.stop(true);
+  void dead.stop(true);
   const client = new AgetorClient({ port: deadPort, token: "tok" });
   let err: unknown;
   try {
@@ -502,12 +502,12 @@ test("ids are URL-encoded; switch/preview/restore/agent-patch use the long budge
     expect(budgets[12]).toBe(15_000); // plain patch keeps the default
   } finally {
     AbortSignal.timeout = realTimeout;
-    server.stop(true);
+    void server.stop(true);
   }
 
   const dead = Bun.serve({ port: 0, fetch: () => new Response("") });
   const deadPort = dead.port!;
-  dead.stop(true);
+  void dead.stop(true);
   const client = new AgetorClient({ port: deadPort, token: "tok" });
   for (const call of [() => client.switchTaskAccount("t1"), () => client.patchTask("t1", { agent: "b" })]) {
     let err: unknown;
@@ -569,7 +569,7 @@ test("finding 20: every id-taking stack / harness / switch / task method percent
       }
     }
   } finally {
-    server.stop(true);
+    void server.stop(true);
   }
 });
 
@@ -602,7 +602,7 @@ test("budgets: create/patch stack, preview, restore, switch and an agent patch g
     for (const k of ["history", "cooldown", "cancel", "plainPatch"]) expect(budgets[k], k).toBe(15_000);
   } finally {
     AbortSignal.timeout = realTimeout;
-    server.stop(true);
+    void server.stop(true);
   }
 });
 
@@ -624,12 +624,12 @@ test("a switch 409 refusal reaches the caller untouched (status, body, message);
       expect((err as ApiError).message).not.toContain("may have gone through");
     }
   } finally {
-    server.stop(true);
+    void server.stop(true);
   }
   // The stack writes keep their own wording and a lost patch of a non-agent field has none.
   const dead = Bun.serve({ port: 0, fetch: () => new Response("") });
   const port = dead.port!;
-  dead.stop(true);
+  void dead.stop(true);
   const lost = new AgetorClient({ port, token: "tok" });
   let plain: unknown;
   try {
@@ -639,4 +639,38 @@ test("a switch 409 refusal reaches the caller untouched (status, body, message);
   }
   expect((plain as ApiError).status).toBe(0);
   expect((plain as ApiError).message).not.toContain("may have gone through");
+});
+
+// `listTaskDelta` against a bare stub: the path it builds, the envelope it
+// returns as is, and an older core's bare array returned as a legacy list.
+test("listTaskDelta: sends delta=1 and since, returns the envelope or a legacy array", async () => {
+  const seen: string[] = [];
+  let body: unknown = {
+    format: "delta", cursor: "c9", snapshot: false, tasks: [], removedIds: ["x"], decorations: {},
+  };
+  const server = Bun.serve({
+    port: 0,
+    fetch: (req) => {
+      const u = new URL(req.url);
+      seen.push(u.pathname + u.search);
+      return new Response(JSON.stringify(body), { headers: { "content-type": "application/json" } });
+    },
+  });
+  try {
+    const client = new AgetorClient({ port: server.port!, token: "tok" });
+    const env = await client.listTaskDelta({ archived: "exclude" }, "c8");
+    expect(seen[0]).toBe("/tasks?archived=exclude&delta=1&since=c8");
+    expect(Array.isArray(env)).toBe(false);
+    expect((env as { cursor: string }).cursor).toBe("c9");
+
+    body = [{ id: "legacy" }];
+    const legacy = await client.listTaskDelta({ archived: "exclude" });
+    expect(seen[1]).toBe("/tasks?archived=exclude&delta=1");
+    expect(legacy).toEqual([{ id: "legacy" }] as never);
+
+    body = { nope: true };
+    await expect(client.listTaskDelta()).rejects.toThrow("unexpected");
+  } finally {
+    void server.stop(true);
+  }
 });

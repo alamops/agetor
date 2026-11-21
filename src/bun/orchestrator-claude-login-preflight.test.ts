@@ -175,7 +175,7 @@ describe("Start pre-flight on a harness stack", () => {
   test("a current account that logged out since the stack's login cache was warmed moves to the backup, and the run says why, once", async () => {
     const a = account("in");
     const b = account("in");
-    const stack = stacks.harnessStacks.create({ label: "login-move", kind: "claude-code", members: [a.id, b.id] });
+    const stack = await stacks.harnessStacks.create({ label: "login-move", kind: "claude-code", members: [a.id, b.id] });
     try {
       const task = makeTask(a.id);
       // The stack planner reads the warmed (cached) login state: A was logged in.
@@ -201,14 +201,14 @@ describe("Start pre-flight on a harness stack", () => {
       expect(aboutA).toEqual([`${a.id} isn't logged in — ${status.CLAUDE_LOGIN_HINT}`]);
       expect(lines.join("\n")).not.toContain(ACCOUNT_EMAIL);
     } finally {
-      stacks.harnessStacks.delete(stack.id);
+      await stacks.harnessStacks.delete(stack.id);
     }
   }, 20_000);
 
   test("every account in the stack logged out: the Start is refused with the login hint and nothing runs", async () => {
     const a = account("out");
     const b = account("out");
-    const stack = stacks.harnessStacks.create({ label: "login-none", kind: "claude-code", members: [a.id, b.id] });
+    const stack = await stacks.harnessStacks.create({ label: "login-none", kind: "claude-code", members: [a.id, b.id] });
     try {
       const task = makeTask(a.id);
       const refused = await orch.startTask(task.id);
@@ -220,14 +220,14 @@ describe("Start pre-flight on a harness stack", () => {
       expect(db.runs.listForTask(task.id)).toHaveLength(0);
       expect(db.tasks.get(task.id)!.column).toBe("ready");
     } finally {
-      stacks.harnessStacks.delete(stack.id);
+      await stacks.harnessStacks.delete(stack.id);
     }
   }, 20_000);
 
   test("a current account the cache still says is logged out, but that the user just logged in to, is not left", async () => {
     const a = account("out");
     const b = account("in");
-    const stack = stacks.harnessStacks.create({ label: "login-stale", kind: "claude-code", members: [a.id, b.id] });
+    const stack = await stacks.harnessStacks.create({ label: "login-stale", kind: "claude-code", members: [a.id, b.id] });
     try {
       const task = makeTask(a.id);
       // The /harnesses poll cached A as logged out (60 s TTL)…
@@ -241,14 +241,14 @@ describe("Start pre-flight on a harness stack", () => {
       expect(db.tasks.get(task.id)!.agent).toBe(a.id);
       expect(db.runs.listForTask(task.id)[0]!.agent).toBe(a.id);
     } finally {
-      stacks.harnessStacks.delete(stack.id);
+      await stacks.harnessStacks.delete(stack.id);
     }
   }, 20_000);
 
   test("after an all-logged-out refusal, logging in and pressing Start again at once goes through", async () => {
     const a = account("out");
     const b = account("out");
-    const stack = stacks.harnessStacks.create({ label: "login-retry", kind: "claude-code", members: [a.id, b.id] });
+    const stack = await stacks.harnessStacks.create({ label: "login-retry", kind: "claude-code", members: [a.id, b.id] });
     try {
       const task = makeTask(a.id);
       const refused = await orch.startTask(task.id);
@@ -263,7 +263,7 @@ describe("Start pre-flight on a harness stack", () => {
       expect(db.tasks.get(task.id)!.agent).toBe(a.id);
       expect(db.runs.listForTask(task.id)[0]!.agent).toBe(a.id);
     } finally {
-      stacks.harnessStacks.delete(stack.id);
+      await stacks.harnessStacks.delete(stack.id);
     }
   }, 20_000);
 });

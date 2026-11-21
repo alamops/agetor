@@ -42,7 +42,7 @@ const outputs: string[] = [];
 const errors: string[] = [];
 const jsonOutputs: unknown[] = [];
 
-mock.module("./context.ts", () => ({
+void mock.module("./context.ts", () => ({
   ...realContextSnapshot,
   getClient: async () => {
     if (!currentClient) throw new Error("no client set for this test");
@@ -51,7 +51,7 @@ mock.module("./context.ts", () => ({
 }));
 
 const id = (s: string) => s;
-mock.module("./output.ts", () => ({
+void mock.module("./output.ts", () => ({
   ...realOutputSnapshot,
   isTTY: false,
   c: { dim: id, bold: id, red: id, green: id, yellow: id, cyan: id, gray: id, magenta: id, blue: id },
@@ -67,8 +67,8 @@ mock.module("./output.ts", () => ({
 }));
 
 afterAll(() => {
-  mock.module("./context.ts", () => realContextSnapshot);
-  mock.module("./output.ts", () => realOutputSnapshot);
+  void mock.module("./context.ts", () => realContextSnapshot);
+  void mock.module("./output.ts", () => realOutputSnapshot);
 });
 
 const { cmdExport, cmdImport } = await import("./commands/bundle.ts");

@@ -48,7 +48,7 @@ beforeAll(async () => {
 afterAll(async () => {
   const { tasks } = await import("./db.ts");
   const { killTerminalsForTask } = await import("./terminals.ts");
-  for (const t of tasks.list()) killTerminalsForTask(t.id);
+  for (const t of tasks.list()) await killTerminalsForTask(t.id);
   server?.stop?.();
   for (const k of ENV_KEYS) {
     if (SAVED_ENV[k] === undefined) delete process.env[k];
@@ -174,7 +174,7 @@ test("POST /tasks/:id/terminals treats a null JSON body as an empty one (never 5
     await res.text();
   }
   const { killTerminalsForTask } = await import("./terminals.ts");
-  killTerminalsForTask(task.id);
+  await killTerminalsForTask(task.id);
   // An unknown task with a null body is still a plain 404.
   const missing = await call("/tasks/no-such-task/terminals", { method: "POST", body: "null" });
   expect(missing.status).toBe(404);

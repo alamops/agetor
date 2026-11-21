@@ -306,7 +306,7 @@ describe("answerTmuxPromptInPane — a field that already has text, and a prompt
         onKeys: (keys: string[]) => { sent.push(...keys); fakePane.text = " Login successful. Press Enter to continue…"; },
       };
       // No task row: the seam only installs the pane (no card of its own).
-      registerFakePromptPane(taskId, fakePane);
+      await registerFakePromptPane(taskId, fakePane);
       cleanups.push(() => clearFakePromptPane(taskId));
       const match = __forTest.pickScrapeMatch(fakePane.text, { paneWorking: false, paneIdle: false, watchdogArmed: false, boot: true })!;
       expect(match.answerKind).toBe("code");
@@ -339,7 +339,7 @@ describe("answerTmuxPromptInPane — a field that already has text, and a prompt
       ].join("\n");
       const fakePane = { text: held, onKeys: (keys: string[]) => { sent.push(...keys); } };
       // No task row: the seam only installs the pane (no card of its own).
-      registerFakePromptPane(taskId, fakePane);
+      await registerFakePromptPane(taskId, fakePane);
       cleanups.push(() => clearFakePromptPane(taskId));
       const match = __forTest.pickScrapeMatch(held, { paneWorking: false, paneIdle: false, watchdogArmed: false, boot: true })!;
       const { req } = registerTmuxPrompt({

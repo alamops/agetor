@@ -13,7 +13,7 @@ import {
   FNM_END,
 } from "./login-path.ts";
 
-// rehydratePath() and defaultDevPaths() both read process.env at call time and
+// await rehydratePath() and defaultDevPaths() both read process.env at call time and
 // rehydratePath mutates process.env.PATH. Snapshot the relevant vars and
 // restore them after each test so cases don't leak into siblings.
 function snapshotEnv(): () => void {
@@ -180,9 +180,9 @@ describe("rehydratePath", () => {
     rmSync(tmp, { recursive: true, force: true });
   });
 
-  test("returns the merged PATH and writes it to process.env.PATH", () => {
+  test("returns the merged PATH and writes it to process.env.PATH", async () => {
     process.env.PATH = "/usr/bin:/bin";
-    const result = rehydratePath();
+    const result = await rehydratePath();
     expect(process.env.PATH).toBe(result);
     const segments = result.split(":");
     expect(segments).toContain("/usr/bin");
@@ -190,28 +190,28 @@ describe("rehydratePath", () => {
     expect(segments).toContain("/opt/homebrew/bin");
   });
 
-  test("is idempotent — calling twice produces the same PATH", () => {
+  test("is idempotent — calling twice produces the same PATH", async () => {
     process.env.PATH = "/usr/bin:/bin";
-    const first = rehydratePath();
-    const second = rehydratePath();
+    const first = await rehydratePath();
+    const second = await rehydratePath();
     expect(second).toBe(first);
   });
 
-  test("dedupes paths already present in the original PATH", () => {
+  test("dedupes paths already present in the original PATH", async () => {
     process.env.PATH = `/opt/homebrew/bin:/usr/bin`;
-    const result = rehydratePath();
+    const result = await rehydratePath();
     const segments = result.split(":");
     const count = segments.filter((s) => s === "/opt/homebrew/bin").length;
     expect(count).toBe(1);
   });
 
-  test("preserves entries from the original PATH (never drops)", () => {
+  test("preserves entries from the original PATH (never drops)", async () => {
     process.env.PATH = `/my/custom/bin:/usr/bin`;
-    const result = rehydratePath();
+    const result = await rehydratePath();
     expect(result.split(":")).toContain("/my/custom/bin");
   });
 
-  test("adopts FNM_DIR from the login shell and enumerates its versions", () => {
+  test("adopts FNM_DIR from the login shell and enumerates its versions", async () => {
     // Simulate a Finder launch: FNM_DIR absent from our env, but the user's
     // login shell exports it. A fake $SHELL prints the probe markers with a
     // FNM_DIR that has a node version installed; rehydratePath should adopt it
@@ -233,8 +233,63 @@ printf '%s' '${FNM_START}'; printf '%s' '${fnmDir}'; printf '%s' '${FNM_END}'
     delete process.env.FNM_DIR; // must be adopted from the probe, not the env
     process.env.PATH = "/usr/bin";
 
-    const result = rehydratePath();
+    const result = await rehydratePath();
     expect(process.env.FNM_DIR ?? "").toBe(fnmDir);
     expect(result.split(":")).toContain(bin);
+  });
+});
+
+describe("rehydratePath login-shell probe", () => {
+  let restore: () => void;
+  let tmp: string;
+
+  beforeEach(() => {
+    restore = snapshotEnv();
+    tmp = mkdtempSync(path.join(os.tmpdir(), "agetor-login-path-"));
+    process.env.HOME = tmp;
+    delete process.env.FNM_DIR;
+  });
+
+  afterEach(() => {
+    restore();
+    rmSync(tmp, { recursive: true, force: true });
+  });
+
+  function stubShell(body: string): string {
+    const shell = path.join(tmp, "stub-shell.sh");
+    writeFileSync(shell, `#!/bin/sh\n${body}\n`);
+    chmodSync(shell, 0o755);
+    return shell;
+  }
+
+  test("adopts the PATH a stub login shell prints, ahead of the current PATH", async () => {
+    process.env.SHELL = stubShell(
+      `printf '%s' '${MARKER_START}'; printf '%s' "/stub/one:/stub/two"; printf '%s' '${MARKER_END}'`,
+    );
+    process.env.PATH = "/usr/bin:/bin";
+    const result = await rehydratePath();
+    const segments = result.split(":");
+    expect(segments.slice(0, 2)).toEqual(["/stub/one", "/stub/two"]);
+    expect(segments).toContain("/usr/bin");
+    expect(process.env.PATH).toBe(result);
+  });
+
+  test("a hanging login shell is killed at the budget and boot continues", async () => {
+    process.env.SHELL = stubShell(
+      `printf '%s' '${MARKER_START}'; printf '%s' "/early/bin"; printf '%s' '${MARKER_END}'\nsleep 30`,
+    );
+    process.env.PATH = "/usr/bin:/bin";
+    const started = Date.now();
+    const result = await rehydratePath();
+    expect(Date.now() - started).toBeLessThan(15_000);
+    expect(result.split(":")).toContain("/early/bin");
+  });
+
+  test("a missing shell binary falls back to the default dev paths", async () => {
+    process.env.SHELL = path.join(tmp, "no-such-shell");
+    process.env.PATH = "/usr/bin:/bin";
+    const result = await rehydratePath();
+    expect(result.split(":")).toContain("/opt/homebrew/bin");
+    expect(result.split(":")).toContain("/usr/bin");
   });
 });

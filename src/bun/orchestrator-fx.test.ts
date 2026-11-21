@@ -541,6 +541,46 @@ test("fx steer dropped: the text comes back as the next turn after settle, witho
   }
 });
 
+test("fx steer dropped: the 'sending it as the next turn' line keeps the place the driver dropped it at — before 'turn complete', in id order and in live send order", async () => {
+  process.env.AGETOR_FAKE_FX_STEER_HOLD_MS = "200";
+  const { sendInput, subscribe } = await import("./orchestrator.ts");
+  const { runs } = await import("./db.ts");
+  const { FX_STEER_DROPPED_STATUS } = await import("./fx-acp.ts");
+  const live: { runId: string; stream: string; data: string; id?: number }[] = [];
+  const unsubscribe = subscribe((e) => {
+    live.push({ runId: e.runId, stream: e.stream, data: e.data, ...(e.id !== undefined ? { id: e.id } : {}) });
+  });
+  try {
+    const { taskId, firstRunId } = await startSteerTask("fx steer line order", "turn one __agetor_fake_fx_steer__:dropped");
+    await settle(30);
+    expect((await sendInput(firstRunId, "steer that gets dropped")).delivered).toBe(true);
+    await waitFor(() => runs.listForTask(taskId).length === 2, 5000);
+    await waitFor(() => runs.listForTask(taskId).every((r) => r.status !== "running"), 5000);
+
+    // The line is written only once the task is checked (a database read), yet
+    // it holds the slot the driver dropped the steer at: before the turn's own
+    // "turn complete" line, which the driver sent after it.
+    const stored = runs.events(firstRunId).filter((e) => e.stream === "status").map((e) => e.data);
+    const droppedAt = stored.indexOf(FX_STEER_DROPPED_STATUS);
+    const completeAt = stored.indexOf("turn complete");
+    expect(droppedAt).toBeGreaterThanOrEqual(0);
+    expect(completeAt).toBeGreaterThan(droppedAt);
+
+    // Live frames of the run left in the same order, each with its stored id,
+    // ids strictly increasing (what a resumed stream relies on).
+    const sent = live.filter((e) => e.runId === firstRunId && e.id !== undefined);
+    const sentIds = sent.map((e) => e.id!);
+    expect(sentIds).toEqual([...sentIds].sort((a, b) => a - b));
+    expect(new Set(sentIds).size).toBe(sentIds.length);
+    const liveStatus = sent.filter((e) => e.stream === "status").map((e) => e.data);
+    expect(liveStatus.indexOf("turn complete")).toBeGreaterThan(liveStatus.indexOf(FX_STEER_DROPPED_STATUS));
+    expect(liveStatus.indexOf(FX_STEER_DROPPED_STATUS)).toBeGreaterThanOrEqual(0);
+  } finally {
+    unsubscribe();
+    delete process.env.AGETOR_FAKE_FX_STEER_HOLD_MS;
+  }
+});
+
 test("fx steer dropped after a later follow-up queued: the dropped steer still runs first, in send order", async () => {
   process.env.AGETOR_FAKE_FX_STEER_HOLD_MS = "200";
   try {
@@ -1525,7 +1565,7 @@ test("resumeFxRecovery: a turn already in flight for the task → 409", async ()
   // since this test doesn't otherwise touch the auto-resume engine at all.
   await waitForRunSettled(runId, 5000);
   const { cancelFxAutoResume, __testing } = await import("./orchestrator.ts");
-  cancelFxAutoResume(taskId, "cancelled");
+  await cancelFxAutoResume(taskId, "cancelled");
   expect(__testing.pendingFxAutoResume(taskId)).toBe(false);
 });
 
@@ -1886,7 +1926,7 @@ test("fx auto-resume: cancelFxAutoResume cancels a pending schedule (status line
     await waitForRunSettled(runId, 5000);
     expect(__testing.pendingFxAutoResume(taskId)).toBe(true);
 
-    const cancelled = cancelFxAutoResume(taskId, "cancelled");
+    const cancelled = await cancelFxAutoResume(taskId, "cancelled");
     expect(cancelled).toBe(true);
 
     const rec = tasks.get(taskId)?.fxRecovery;
@@ -1902,7 +1942,7 @@ test("fx auto-resume: cancelFxAutoResume cancels a pending schedule (status line
     ).toBe(true);
 
     // A second call has nothing left to cancel.
-    expect(cancelFxAutoResume(taskId, "cancelled")).toBe(false);
+    expect(await cancelFxAutoResume(taskId, "cancelled")).toBe(false);
   } finally {
     unsub();
   }
@@ -2154,7 +2194,7 @@ test("rearmFxAutoResumes: re-arms a past-due persisted schedule (fires after a r
   // CURRENT latest resumable pause. Cancel the real schedule the storm just
   // armed, then hand-craft a stale, past-due one in its place.
   const stale = await pausedTask("fx rearm stale");
-  cancelFxAutoResume(stale.taskId, "cancelled");
+  await cancelFxAutoResume(stale.taskId, "cancelled");
   const staleRec = tasks.get(stale.taskId)?.fxRecovery;
   if (!staleRec) throw new Error("expected a paused fxRecovery row");
   tasks.setFxRecovery(stale.taskId, {
@@ -2172,7 +2212,7 @@ test("rearmFxAutoResumes: re-arms a past-due persisted schedule (fires after a r
   // Scenario (a): a valid past-due schedule for a genuinely-still-paused
   // task — rearm must re-arm it (short, staggered), not fire it inline.
   const valid = await pausedTask("fx rearm past-due");
-  cancelFxAutoResume(valid.taskId, "cancelled");
+  await cancelFxAutoResume(valid.taskId, "cancelled");
   const validRec = tasks.get(valid.taskId)?.fxRecovery;
   if (!validRec) throw new Error("expected a paused fxRecovery row");
   tasks.setFxRecovery(valid.taskId, {
@@ -2266,7 +2306,7 @@ test("startTask (fx): a pre-flight failure leaves a paused fxRecovery row untouc
   // Cancel the pending auto-resume timer first — this assertion is about the
   // PERSISTED row surviving a pre-flight failure, not about a still-armed
   // timer surviving (that's covered by the other auto-resume tests above).
-  cancelFxAutoResume(taskId, "cancelled");
+  await cancelFxAutoResume(taskId, "cancelled");
   const pausedRec = tasks.get(taskId)?.fxRecovery;
   expect(pausedRec?.state).toBe("paused");
 
@@ -2339,7 +2379,7 @@ test("noteFxRunSettled clears a stale paused row via clearFxRecovery — cancels
   // the timer before its own run can reach this hook, so driving
   // `noteFxRunSettled` directly is the only deterministic way to exercise
   // this exact precondition.
-  __testing.noteFxRunSettled(pausedTask, "unrelated-run-id", "succeeded");
+  await __testing.noteFxRunSettled(pausedTask, "unrelated-run-id", "succeeded");
 
   // Before the fix, this branch called `tasks.setFxRecovery(taskId, null)`
   // directly — clearing the DB row but leaving the in-memory timer armed, so

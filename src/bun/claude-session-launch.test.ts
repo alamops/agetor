@@ -321,13 +321,13 @@ test("with no client connected the notice is held, then sent to the next client 
     expect(seenIds()).toEqual([]);
 
     const sent: AppEvent[] = [];
-    flushPendingClaudeSessionsNotice((e) => sent.push(e));
+    await flushPendingClaudeSessionsNotice((e) => sent.push(e));
     expect(sent).toEqual([expect.objectContaining({ type: "claude_sessions_found", count: 1 })]);
     expect(seenIds()).toEqual(["held-one"]);
 
     // Delivered once. A reconnect does not repeat it.
     sent.length = 0;
-    flushPendingClaudeSessionsNotice((e) => sent.push(e));
+    await flushPendingClaudeSessionsNotice((e) => sent.push(e));
     expect(sent).toEqual([]);
   } finally {
     clearPendingClaudeSessionsNotice();
@@ -360,7 +360,7 @@ test("a held notice drops a session imported before a client connected", async (
       origin: "imported",
     });
     const sent: AppEvent[] = [];
-    flushPendingClaudeSessionsNotice((e) => sent.push(e));
+    await flushPendingClaudeSessionsNotice((e) => sent.push(e));
     expect(sent).toEqual([]);
     expect(seenIds()).toEqual([]);
   } finally {

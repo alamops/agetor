@@ -3,7 +3,7 @@ import { existsSync, mkdirSync, readdirSync, realpathSync, rmSync, statSync, wri
 import { rm } from "node:fs/promises";
 import { basename, isAbsolute, join, relative, resolve } from "node:path";
 import {
-  db,
+  op,
   tasks,
   runs,
   harnesses,
@@ -19,8 +19,10 @@ import {
   IMPORTED_OPENCODE_HELD_ELSEWHERE,
   type SessionIdColumn,
   type AppendedEvent,
-} from "./db.ts";
-import { isHiddenContinuationUserText as dbIsHiddenContinuationUserText } from "./db.ts";
+  isHiddenContinuationUserText as dbIsHiddenContinuationUserText,
+} from "./db-async.ts";
+import { appendAndEmit } from "./run-emit-queue.ts";
+import type { ColumnMoveGuard, TaskSnapshot } from "./db-core/ops/orchestrator-ops.ts";
 import { markStalled, clearStalled } from "./stall-registry.ts";
 // File READERS (JSONL paths, tailers, watchers) resolve the account's config
 // dir through `claudeConfigDirFor`; only the spawn pins the override (CR1).
@@ -42,7 +44,6 @@ import { getDiscoveredEfforts, getDiscoveredModels, getHarnessDiscoveredModels, 
 import { preflightCatalogFor } from "./model-discovery.ts";
 import { OPENCODE_DEFAULT_MODEL, formatOpencodeTurnBreadcrumb, opencodeMajor, type OpencodeTransport } from "../shared/opencode.ts";
 import { importedSessionOf } from "../shared/imported-session.ts";
-import { resolveClaudePlan, upsertClaudePlanFromExitPlanMode, upsertDetectedPlan } from "./task-plans.ts";
 import { deriveTodoProgress, summarizeTodoProgress } from "../shared/todo-progress.ts";
 import { ISSUE_SNAPSHOT_FILENAME, normalizeIssueUrl, parseIssueUrl } from "../shared/issue-task.ts";
 import { providerRepoForDir } from "./git-provider.ts";
@@ -109,6 +110,7 @@ import {
 } from "./harness-session-transfer.ts";
 import {
   HARNESS_STACK_RETRY_MAX,
+  KEEP_TASK_STATE,
   armAutoRetry,
   cancelAutoRetry,
   clearFailoverState,
@@ -153,8 +155,8 @@ import {
  * dangling alias references — callers must surface a clear error rather
  * than silently picking a kind.
  */
-function resolveHarness(harnessId: string): Harness | null {
-  return harnesses.getByIdOrKind(harnessId);
+async function resolveHarness(harnessId: string): Promise<Harness | null> {
+  return await harnesses.getByIdOrKind(harnessId);
 }
 import {
   cancelPendingForTask,
@@ -165,6 +167,7 @@ import {
   setRunEventEmitter,
   type AnyRequest,
   type InteractionResolved,
+  forgetPipelineParent,
 } from "./interactions.ts";
 import {
   CLAUDE_API_ERROR_STATUS_PREFIX,
@@ -271,6 +274,7 @@ import {
 import { copilotHome } from "./copilot-home.ts";
 import {
   dropFxSession,
+  FX_STEER_DROPPED_STATUS,
 } from "./fx-acp.ts";
 import { beginLagLabel, setLagStallSink } from "./event-loop-lag.ts";
 import {
@@ -420,8 +424,42 @@ interface ActiveRun {
    *  `blocked` immediately and the done handler reads this on resolution to
    *  keep it there (record the run as `failed`, not bounce to `ready`). */
   unknownCommand: boolean;
+  /** Chunk-handler work that needs the database (recording a limit signal,
+   *  asking whether a stacked task fails over). The handler is synchronous, so
+   *  it chains that work here in order and the done handler waits for it
+   *  (`settleChunkWork`) before it reads `apiError`, `limitHit` or
+   *  `limitRecorded`. `chunkWorkPending` counts the unfinished steps so a
+   *  handle with none costs the done handler no await. */
+  chunkWork: Promise<void>;
+  chunkWorkPending: number;
 }
 const active = new Map<string, ActiveRun>(); // runId -> handle
+
+/** Test seam: resolves once the database-backed chunk-handler work queued so
+ *  far on `runId` (a recorded limit signal, an API-error classification) has
+ *  landed. */
+export async function __settleChunkWorkForTest(runId: string): Promise<void> {
+  await settleChunkWork(active.get(runId));
+  await runChunksSettled(runId);
+}
+
+/** Queue database-backed chunk-handler work on a run, in call order. */
+function queueChunkWork(handle: ActiveRun, what: string, work: () => Promise<void>): void {
+  handle.chunkWorkPending++;
+  handle.chunkWork = handle.chunkWork
+    .then(work)
+    .catch((err) => {
+      console.warn(`[agetor] ${what} failed:`, err);
+    })
+    .finally(() => {
+      handle.chunkWorkPending--;
+    });
+}
+
+/** Wait for the chunk-handler work queued so far (a no-op when none). */
+async function settleChunkWork(handle: ActiveRun | undefined): Promise<void> {
+  if (handle && handle.chunkWorkPending > 0) await handle.chunkWork;
+}
 
 // Guards `reapIdleSessions` against overlapping sweeps — the boot one-shot
 // and the recurring `setInterval` in index.ts could otherwise both be
@@ -473,20 +511,20 @@ function enqueueTeardown(taskId: string, key: string, job: () => Promise<void>):
       console.warn(`[agetor] deferred teardown failed for task ${taskId}:`, err);
     });
   teardownTails.set(key, p);
-  p.finally(() => {
+  // `p` never rejects (the job's failure is caught above), so a plain `then`
+  // is its settle hook.
+  void p.then(() => {
     // Only clear the entry if it's still the current tail for this key — a
     // later enqueue for the same workdir must not have its chain slot
     // clobbered by this settle, and this also bounds the map's size (an idle
     // workdir's entry is removed once its chain drains).
     if (teardownTails.get(key) === p) teardownTails.delete(key);
-  });
-  teardowns.set(taskId, p);
-  p.finally(() => {
     // Only clear the entry if it's still ours — a later enqueue for the same
     // task (e.g. delete right after archive) must not have its promise
     // clobbered by this settle.
     if (teardowns.get(taskId) === p) teardowns.delete(taskId);
   });
+  teardowns.set(taskId, p);
   return p;
 }
 
@@ -522,11 +560,10 @@ function enqueueTeardownMany(taskId: string, keys: string[], job: () => Promise<
       console.warn(`[agetor] deferred teardown failed for task ${taskId}:`, err);
     });
   for (const k of unique) teardownTails.set(k, p);
-  p.finally(() => {
-    for (const k of unique) if (teardownTails.get(k) === p) teardownTails.delete(k);
-  });
   teardowns.set(taskId, p);
-  p.finally(() => {
+  // `p` never rejects (the job's failure is caught above).
+  void p.then(() => {
+    for (const k of unique) if (teardownTails.get(k) === p) teardownTails.delete(k);
     if (teardowns.get(taskId) === p) teardowns.delete(taskId);
   });
   return p;
@@ -575,7 +612,8 @@ function enqueueRepositoryRemoval<T>(taskId: string, keys: string[], job: () => 
   const settled = result.then(() => undefined, () => undefined);
   for (const k of unique) teardownTails.set(k, settled);
   repositoryRemovals.set(taskId, settled);
-  settled.finally(() => {
+  // `settled` never rejects.
+  void settled.then(() => {
     for (const k of unique) if (teardownTails.get(k) === settled) teardownTails.delete(k);
     if (repositoryRemovals.get(taskId) === settled) repositoryRemovals.delete(taskId);
   });
@@ -615,44 +653,97 @@ export function subscribe(fn: Listener): () => void {
  * Fan an event out to the `/tasks/:id/events` subscribers.
  *
  * Ordering invariant (the SSE resume cursor relies on it): a SAVED row is
- * sent synchronously, right after its insert, with its stored `{id, ts}` —
- * so the order frames leave here is the order of their `run_events.id`s. Go
- * through {@link saveAndEmit} for that; never batch, defer or queue the send
- * of a saved row, or a client could see id N+1 before id N and a resume from
- * N+1 would skip it. Unsaved (live-only) events carry no `id`.
+ * sent right after its insert, with its stored `{id, ts}`, and the sends of
+ * one run leave here in the order of their `run_events.id`s. Go through
+ * {@link saveAndEmit} for that: it rides the run's queue in
+ * `run-emit-queue.ts` (`appendAndEmit`), which runs a run's inserts one at a
+ * time in call order and sends each row as soon as its own insert lands.
+ * Never send a saved row any other way, or a client could see id N+1 before
+ * id N and a resume from N+1 would skip it. Unsaved (live-only) events carry
+ * no `id`.
  */
 function emit(e: RunEvent) {
   for (const fn of listeners) fn(e);
 }
 
-/**
- * Persist an event and send it to live subscribers with the row's stored
- * `id` and `ts` (so a live frame and its replayed copy are identical).
- * Sends nothing on a `(run_id, line_uuid)` dedup hit — that row was already
- * delivered when it was first saved. Throws like `runs.appendEvent` (e.g. a
- * cascade-deleted run); use {@link saveStatusLineQuietly} on settle paths.
- */
-function saveAndEmit(args: {
+type SaveAndEmitArgs = {
   runId: string;
   taskId: string;
   stream: RunEvent["stream"];
   data: string;
   lineUuid?: string | null;
   subagentId?: string | null;
-}): AppendedEvent | null {
+};
+
+/**
+ * Persist an event and send it to live subscribers with the row's stored
+ * `id` and `ts` (so a live frame and its replayed copy are identical).
+ * Sends nothing on a `(run_id, line_uuid)` dedup hit — that row was already
+ * delivered when it was first saved. Rejects like `runs.appendEvent` (e.g. a
+ * cascade-deleted run); use {@link saveStatusLineQuietly} on settle paths.
+ *
+ * The call takes its place in the run's queue synchronously, so a caller that
+ * cannot wait (a driver's chunk callback) still gets its rows saved and sent
+ * in the order it called: it uses {@link queueSaveAndEmit}.
+ */
+function saveAndEmit(
+  args: SaveAndEmitArgs,
+  onlyIf?: () => Promise<boolean>,
+): Promise<AppendedEvent | null> {
   const { runId, taskId, stream, data, lineUuid, subagentId } = args;
-  const row = runs.appendEvent(runId, stream, data, lineUuid, subagentId);
-  if (!row) return null;
-  emit({
+  // The insert never rejects inside the queue: a failure is carried out and
+  // rethrown to this caller only, so the queue does not log a run deleted
+  // under a settling turn (the quiet variant decides what to log). `onlyIf`
+  // decides inside the row's slot whether it is written at all (null when
+  // not), so a line whose condition needs a read keeps its place in order.
+  type Outcome = { row: AppendedEvent | null } | { error: unknown };
+  const queued = appendAndEmit<Outcome>(
     runId,
-    taskId,
-    stream,
-    data,
-    ts: row.ts,
-    id: row.id,
-    ...(subagentId ? { subagentId } : {}),
+    async () => {
+      try {
+        if (onlyIf && !(await onlyIf())) return { row: null };
+        return { row: await runs.appendEvent(runId, stream, data, lineUuid, subagentId) };
+      } catch (error) {
+        return { error };
+      }
+    },
+    (outcome) => {
+      if (!("row" in outcome) || !outcome.row) return;
+      emit({
+        runId,
+        taskId,
+        stream,
+        data,
+        ts: outcome.row.ts,
+        id: outcome.row.id,
+        ...(subagentId ? { subagentId } : {}),
+      });
+    },
+  );
+  return queued.then((outcome) => {
+    if ("error" in outcome) throw outcome.error;
+    return outcome.row;
   });
-  return row;
+}
+
+/**
+ * {@link saveAndEmit} for a synchronous caller (a driver's chunk callback, a
+ * timer): the row takes its place in the run's queue now, and a failure is
+ * logged instead of rejecting into nobody.
+ */
+function queueSaveAndEmit(args: SaveAndEmitArgs): void {
+  saveAndEmit(args).catch((err: unknown) => {
+    console.warn(`[agetor] failed to persist ${args.stream} event for run ${args.runId}:`, err);
+  });
+}
+
+/**
+ * Resolves once every row queued on `runId` so far has been saved and sent.
+ * A run's final status write waits on this, so it never lands before the
+ * run's last event.
+ */
+function runEventsSettled(runId: string): Promise<void> {
+  return appendAndEmit(runId, () => Promise.resolve(null), () => undefined).then(() => undefined);
 }
 
 /**
@@ -663,16 +754,17 @@ function saveAndEmit(args: {
  * breadcrumb must not stop `attachDoneHandler` from draining queues and
  * moving the card.
  */
-function saveStatusLineQuietly(
+async function saveStatusLineQuietly(
   runId: string,
   taskId: string,
   data: string,
   stream: "status" | "stderr" = "status",
-): AppendedEvent | null {
+): Promise<AppendedEvent | null> {
   try {
-    return saveAndEmit({ runId, taskId, stream, data });
+    return await saveAndEmit({ runId, taskId, stream, data });
   } catch (err) {
-    if (runs.get(runId)) console.warn(`[agetor] failed to persist ${stream} line for run ${runId}:`, err);
+    const run = await runs.get(runId).catch(() => null);
+    if (run) console.warn(`[agetor] failed to persist ${stream} line for run ${runId}:`, err);
     return null;
   }
 }
@@ -727,15 +819,13 @@ setContinuationRunFactory(startContinuationRun);
 setLagStallSink((stall) => {
   const ctx = stall.ctx;
   if (!ctx?.runId) return;
-  try {
-    appendRunStatusLine(
-      ctx.taskId,
-      ctx.runId,
-      `core was unresponsive for ${(stall.lagMs / 1000).toFixed(1)} s during ${stall.label ?? "unlabelled work"}`,
-    );
-  } catch {
+  appendRunStatusLine(
+    ctx.taskId,
+    ctx.runId,
+    `core was unresponsive for ${(stall.lagMs / 1000).toFixed(1)} s during ${stall.label ?? "unlabelled work"}`,
+  ).catch(() => {
     // The run or task is gone (deleted mid-stall) — nothing to annotate.
-  }
+  });
 });
 
 // Death-watch during a #92 hold: keep polling `tmux has-session` even though
@@ -745,7 +835,38 @@ setLagStallSink((stall) => {
 // failed while its background agents kept running is watched too: if that
 // REPL dies, nothing else would ever settle their rows, and they would block
 // every account switch on the task (`backgroundAgentsHoldTask`) for good.
-setHeldSessionProbe(backgroundAgentsHoldTask);
+//
+// The death watch asks synchronously on every poll tick, and the predicate
+// reads the database, so the probe answers from the last completed read and
+// starts the next one (one in flight per task): a hold is seen one tick (400 ms)
+// after it begins, and an idle task costs the same one indexed lookup per tick
+// it always did. Only "held" answers are kept, so the set holds held tasks only.
+const heldProbeAnswers = new Set<string>();
+const heldProbeInFlight = new Map<string, Promise<void>>();
+function heldSessionProbe(taskId: string): boolean {
+  if (!heldProbeInFlight.has(taskId)) {
+    const refresh = backgroundAgentsHoldTask(taskId)
+      .then((held) => {
+        if (held) heldProbeAnswers.add(taskId);
+        else heldProbeAnswers.delete(taskId);
+      }, (err: unknown) => {
+        heldProbeAnswers.delete(taskId);
+        console.warn(`[agetor] held-task probe failed for task ${taskId}:`, err);
+      })
+      .then(() => {
+        heldProbeInFlight.delete(taskId);
+      });
+    heldProbeInFlight.set(taskId, refresh);
+  }
+  return heldProbeAnswers.has(taskId);
+}
+setHeldSessionProbe(heldSessionProbe);
+
+/** Test hook: resolves once the held-session probe's read in flight for
+ *  `taskId` (if any) has updated its answer. Not part of the public surface. */
+export async function __heldProbeSettledForTest(taskId: string): Promise<void> {
+  await (heldProbeInFlight.get(taskId) ?? Promise.resolve());
+}
 
 // Run association for `signalSubagentApiError` (#93): answers "what run id
 // is currently in flight for this task, per the orchestrator's OWN `active`
@@ -756,10 +877,19 @@ setHeldSessionProbe(backgroundAgentsHoldTask);
 // run resolves — so the extra `active.has` check (the exact idiom used
 // throughout this file, e.g. the busy/idle branch in `sendInput`) is what
 // actually answers "in flight right now."
+//
+// The probe is synchronous and `task.runId` is a database read, so the answer
+// comes from the `active` map alone: the most recently registered live run of
+// the task. Every path that registers a run first points `task.runId` at it, so
+// this is the task's current run whenever that run is live; while a newer run
+// is still spawning (not yet registered) it names the older live one, which is
+// the turn actually running on the session.
 setActiveRunProbe((taskId) => {
-  const task = tasks.get(taskId);
-  if (!task?.runId) return null;
-  return active.has(task.runId) ? task.runId : null;
+  let current: string | null = null;
+  for (const [runId, handle] of active) {
+    if (handle.taskId === taskId) current = runId;
+  }
+  return current;
 });
 
 // Local-command setting sync (§10 of the model/effort local-command plan):
@@ -772,8 +902,21 @@ setActiveRunProbe((taskId) => {
 // into the session (that would be `reconcileTaskSession`'s job, and calling
 // it here would bounce a spurious second confirm off the very update we're
 // recording).
+//
+// Applied one at a time per task, in the order claude reported them, so a
+// quick `/model a` then `/model b` can't land as `a`.
+const localSettingTails = new Map<string, Promise<void>>();
 setLocalSettingChangedHandler((taskId, info) => {
-  applyClaudeLocalSetting(taskId, info);
+  const prev = localSettingTails.get(taskId) ?? Promise.resolve();
+  const tail = prev
+    .then(() => applyClaudeLocalSetting(taskId, info))
+    .then(() => undefined, (err: unknown) => {
+      console.warn(`[agetor] syncing a local /model or /effort change for task ${taskId} failed:`, err);
+    });
+  localSettingTails.set(taskId, tail);
+  void tail.then(() => {
+    if (localSettingTails.get(taskId) === tail) localSettingTails.delete(taskId);
+  });
 });
 
 // Background-task notification signal: a parent task-notification JSONL line
@@ -787,9 +930,11 @@ setLocalSettingChangedHandler((taskId, info) => {
 // its completion, so a `monitor` row settles only on a terminal receipt and
 // records everything else as activity. Tolerant by design: an id matching no
 // row, or a duplicate fired again on reattach replay, is a no-op.
-setBackgroundTaskSettledHandler((taskId, agentId, body, lineTimestampMs) => {
-  handleBackgroundTaskNotification(taskId, agentId, body, lineTimestampMs);
-});
+setBackgroundTaskSettledHandler((taskId, agentId, body, lineTimestampMs) =>
+  // Returns the promise: the claude-tmux dispatch does not wait for it but logs
+  // a rejection, and tests await it.
+  handleBackgroundTaskNotification(taskId, agentId, body, lineTimestampMs),
+);
 
 /**
  * Subscribe to the app-wide lifecycle stream — terminal run-status
@@ -849,8 +994,8 @@ export function setHeldStepStoppedHandler(fn: HeldStepStoppedHandler | null): He
  *  record of the stop runs later, under its per-parent lock, by which time
  *  Claude may have adopted a continuation that is a NEW turn, not the stopped
  *  one. Never throws — a runner bug must not break Stop. */
-function reportHeldStepStopped(taskId: string): void {
-  const task = tasks.get(taskId);
+async function reportHeldStepStopped(taskId: string): Promise<void> {
+  const task = await tasks.get(taskId);
   if (!task?.pipelineParentId) return;
   try {
     heldStepStoppedHandler?.(taskId, task.runId ?? null);
@@ -892,46 +1037,47 @@ const PIPELINE_PARENT_STAMPED_KINDS = new Set<GlobalEvent["kind"]>([
   "harness-swap",
 ]);
 
-/** The pipeline parent id of a hidden step task, or `undefined` for an
- *  ordinary task (including a pipeline PARENT — `pipelineParentId` is only
- *  ever set on a step row). A cheap single-row read; the field is written
- *  exactly once, at insert, so there's nothing to invalidate. */
-function stepParentOf(taskId: string): string | undefined {
-  return tasks.get(taskId)?.pipelineParentId ?? undefined;
-}
-
-/** Stamp `pipelineParentId` onto a per-task event (see
- *  {@link PIPELINE_PARENT_STAMPED_KINDS}) unless the emitter already set it
- *  (interactions.ts stamps its own `interaction` events), plus the parent's
- *  title as `pipelineParentTitle` — a toast for a run started right after the
- *  page loaded can arrive before the client's task poll has the parent row,
- *  and would otherwise name the pipeline by a short id. Built with
- *  `Object.assign` rather than an object-literal spread so this compiles the
- *  same whether or not the union member declares the optional fields. */
-function stampPipelineParent(e: GlobalEvent): GlobalEvent {
-  if (!PIPELINE_PARENT_STAMPED_KINDS.has(e.kind) || !("taskId" in e)) return e;
-  const stamped = e as { pipelineParentId?: string; pipelineParentTitle?: string };
-  if (stamped.pipelineParentTitle !== undefined) return e;
-  const pipelineParentId = stamped.pipelineParentId ?? stepParentOf(e.taskId);
-  if (pipelineParentId === undefined) return e;
-  const pipelineParentTitle = tasks.get(pipelineParentId)?.title;
+/**
+ * The pipeline stamp of a per-task event: `pipelineParentId` (when the task is
+ * a hidden step row, or the emitter already named it) and the parent's title.
+ * One read in the database worker (`orchestrator.pipelineStamp`); an ordinary
+ * task, a pipeline PARENT included, gets none. `pipelineParentId` is written
+ * once, at insert, so there's nothing to invalidate. Built with
+ * `Object.assign` rather than an object-literal spread so this compiles the
+ * same whether or not the union member declares the optional fields.
+ */
+async function stampPipelineParent(e: GlobalEvent): Promise<GlobalEvent> {
+  if (!needsPipelineStamp(e)) return e;
+  const stamped = e as { taskId: string; pipelineParentId?: string };
+  const stamp = await op("orchestrator.pipelineStamp", [stamped.taskId, stamped.pipelineParentId ?? null]);
+  if (!stamp) return e;
   return Object.assign(
     {},
     e,
-    { pipelineParentId },
-    pipelineParentTitle ? { pipelineParentTitle } : {},
+    { pipelineParentId: stamp.parentId },
+    stamp.parentTitle ? { pipelineParentTitle: stamp.parentTitle } : {},
   ) as GlobalEvent;
 }
 
-/** Fan an app-wide lifecycle event out to every subscriber. Each listener
- *  is isolated (L-R8): a throw inside one — the pipeline runner's own
- *  `handleRunStatus`/`handleColumnChange` dispatch, the SSE bridge, a test
- *  hook — is logged and must never skip the listeners after it, nor unwind
- *  into the emitter (the done handler's `noteFxRunSettled` and the four
- *  `drain*Queue` calls run AFTER its `emitGlobal`, and would be silently
- *  skipped otherwise). */
-function emitGlobal(e: GlobalEvent) {
-  const stamped = stampPipelineParent(e);
+/** Whether {@link stampPipelineParent} has anything to look up for `e`: a
+ *  per-task kind (see {@link PIPELINE_PARENT_STAMPED_KINDS}) the emitter did
+ *  not already stamp with a title (interactions.ts stamps its own
+ *  `interaction` events with the parent id only). */
+function needsPipelineStamp(e: GlobalEvent): boolean {
+  if (!PIPELINE_PARENT_STAMPED_KINDS.has(e.kind) || !("taskId" in e)) return false;
+  const stamped = e as { pipelineParentId?: string; pipelineParentTitle?: string };
+  if (stamped.pipelineParentTitle !== undefined) return false;
+  // interactions.ts stamps its own events from its registry of step parents
+  // (every live step is noted at creation and preloaded at boot): one with no
+  // parent id is an ordinary task's, with nothing to look up, so it reaches
+  // the subscribers at once, while the interaction counts it was raised with
+  // still hold.
+  if (e.kind === "interaction" && stamped.pipelineParentId === undefined) return false;
+  return true;
+}
+
+/** Fan a (stamped) global event out to every subscriber, each isolated. */
+function fanOutGlobal(stamped: GlobalEvent): void {
   for (const fn of globalListeners) {
     try {
       fn(stamped);
@@ -941,15 +1087,66 @@ function emitGlobal(e: GlobalEvent) {
   }
 }
 
+/** The tail of the global emit chain while an event is waiting on its stamp
+ *  lookup; null when idle. */
+let globalEmitTail: Promise<void> | null = null;
+
+/** Fan an app-wide lifecycle event out to every subscriber. Each listener
+ *  is isolated (L-R8): a throw inside one — the pipeline runner's own
+ *  `handleRunStatus`/`handleColumnChange` dispatch, the SSE bridge, a test
+ *  hook — is logged and must never skip the listeners after it, nor unwind
+ *  into the emitter.
+ *
+ *  A per-task event is stamped with its pipeline parent first, which takes a
+ *  database read, so events go out through one chain: subscribers see them in
+ *  the order they were emitted, and an event with nothing to look up still
+ *  waits behind a stamped one emitted before it. With the chain idle such an
+ *  event goes out synchronously. The returned promise resolves once the event
+ *  reached every subscriber and never rejects (a failed lookup sends the event
+ *  unstamped): an async caller awaits it to keep "the listeners have run"
+ *  ordering, a synchronous one may drop it. */
+function emitGlobal(e: GlobalEvent): Promise<void> {
+  const lookup = needsPipelineStamp(e);
+  if (!lookup && globalEmitTail === null) {
+    fanOutGlobal(e);
+    return Promise.resolve();
+  }
+  const prev = globalEmitTail ?? Promise.resolve();
+  const p = prev.then(async () => {
+    let stamped = e;
+    if (lookup) {
+      try {
+        stamped = await stampPipelineParent(e);
+      } catch (err) {
+        console.warn(`[agetor] pipeline stamp lookup failed for a ${e.kind} event:`, err);
+      }
+    }
+    fanOutGlobal(stamped);
+  });
+  globalEmitTail = p;
+  void p.then(() => {
+    if (globalEmitTail === p) globalEmitTail = null;
+  });
+  return p;
+}
+
+/** Test hook: resolves once every global event emitted so far has reached
+ *  the subscribers (a per-task kind waits for its pipeline stamp read). Not
+ *  part of the public surface. */
+export async function __globalEventsSettledForTest(): Promise<void> {
+  while (globalEmitTail !== null) await globalEmitTail;
+}
+
 /**
  * Publish an app-wide lifecycle event from outside the orchestrator (e.g.
  * the auto-updater). Exported so subsystems with their own lifecycle don't
  * have to re-implement the listener set — there's exactly one
  * `subscribeGlobal` channel and the SSE endpoint that feeds the UI is wired
- * to it once.
+ * to it once. Delivery may finish after this returns (see {@link emitGlobal});
+ * it never fails.
  */
 export function publishGlobalEvent(e: GlobalEvent): void {
-  emitGlobal(e);
+  void emitGlobal(e);
 }
 
 /** Canonicalize CR/LF in user-supplied text before it's emitted as a
@@ -963,23 +1160,32 @@ function normalizeUserText(s: string): string {
 }
 
 /**
- * Update a task's column and broadcast the transition. Reads the row's
- * current column first so the global event carries `prev` — saves the UI
- * from keeping its own diff state. Pass `null` for `runId` when the change
- * isn't tied to a specific run (e.g. orphan reconciliation).
+ * Update a task's column and broadcast the transition. The row's current
+ * column is read in the same transaction as the write (op
+ * `orchestrator.setColumn`) so the global event carries the true `prev` —
+ * saves the UI from keeping its own diff state. Pass `null` for `runId` when
+ * the change isn't tied to a specific run (e.g. orphan reconciliation).
+ *
+ * `guard` makes the move conditional on the stored rows, checked inside that
+ * transaction: a caller that decided from an earlier read (the run is still
+ * the task's current one, the card is still in `running`, …) passes the
+ * condition here so the move can't land on a task that changed meanwhile.
+ * Returns whether the column was written.
  */
-function updateColumn(
+async function updateColumn(
   taskId: string,
   runId: string | null,
   next: ColumnId,
   reason?: "api-error" | "approval" | "session-died" | "unknown-command" | "pipeline" | "harness-exhausted" | "harness-swap-failed",
-): void {
-  const before = tasks.get(taskId);
-  const prev: ColumnId | null = before?.column ?? null;
-  tasks.update(taskId, { column: next });
-  if (prev !== next) {
-    emitGlobal({ kind: "column", taskId, runId, column: next, prev, ts: Date.now(), reason });
+  guard?: ColumnMoveGuard,
+): Promise<boolean> {
+  const { prev, applied } = await op("orchestrator.setColumn", [taskId, next, guard ?? null]);
+  // An unguarded move on a task that no longer exists still reports the
+  // transition (prev null), as it always has.
+  if ((applied || (!guard && prev === null)) && prev !== next) {
+    await emitGlobal({ kind: "column", taskId, runId, column: next, prev, ts: Date.now(), reason });
   }
+  return applied;
 }
 
 /**
@@ -990,8 +1196,8 @@ function updateColumn(
  * runner-driven transition apart from an ordinary one (docs/plans/pipelines.md
  * D12).
  */
-export function pipelineUpdateColumn(taskId: string, runId: string | null, next: ColumnId): void {
-  updateColumn(taskId, runId, next, "pipeline");
+export async function pipelineUpdateColumn(taskId: string, runId: string | null, next: ColumnId): Promise<void> {
+  await updateColumn(taskId, runId, next, "pipeline");
 }
 
 /**
@@ -1005,8 +1211,8 @@ export function pipelineUpdateColumn(taskId: string, runId: string | null, next:
  * user at a parent that's already gone would leave the orphaned step
  * permanently undeletable/unarchivable.
  */
-export function isOrphanedPipelineStep(task: Task): boolean {
-  return task.pipelineParentId != null && tasks.get(task.pipelineParentId) == null;
+export async function isOrphanedPipelineStep(task: Task): Promise<boolean> {
+  return task.pipelineParentId != null && await tasks.get(task.pipelineParentId) == null;
 }
 
 /**
@@ -1021,19 +1227,19 @@ export function isOrphanedPipelineStep(task: Task): boolean {
  * `reapIdleSessions`'s per-candidate guard) can reuse it without a second,
  * redundant `tasks.get`.
  */
-function isTaskHeldByBackgroundAgents(task: Task): boolean {
+async function isTaskHeldByBackgroundAgents(task: Task): Promise<boolean> {
   if (task.column !== "running" || task.runId == null) return false;
-  if (runs.get(task.runId)?.status !== "succeeded") return false;
-  return subagents.hasRunning(task.id);
+  if ((await runs.get(task.runId))?.status !== "succeeded") return false;
+  return await subagents.hasRunning(task.id);
 }
 
 /** Exported for `pipeline-runner.ts` (M-R3): a step task whose turn
  *  succeeded but whose background subagents are still running has NOT
  *  settled as far as the pipeline is concerned — the runner keeps that
  *  execution active until `maybeReleaseHeldTask` releases it. */
-export function isHeldByBackgroundAgents(taskId: string): boolean {
-  const task = tasks.get(taskId);
-  return task ? isTaskHeldByBackgroundAgents(task) : false;
+export async function isHeldByBackgroundAgents(taskId: string): Promise<boolean> {
+  const task = await tasks.get(taskId);
+  return task ? await isTaskHeldByBackgroundAgents(task) : false;
 }
 
 /**
@@ -1055,16 +1261,12 @@ export function isHeldByBackgroundAgents(taskId: string): boolean {
  * on) holds nothing: such rows may never finish, and with no Stop on the card
  * the switch would wait for them forever.
  */
-export function backgroundAgentsHoldTask(taskId: string): boolean {
-  // Polled by the claude death watch on every tick of an idle session, so the
-  // common "no background agent" answer costs one indexed lookup.
-  const task = tasks.get(taskId);
-  if (!task) return false;
-  if (isTaskHeldByBackgroundAgents(task)) return true;
-  if (task.column !== "blocked" || task.runId == null) return false;
-  if (!subagents.hasRunning(taskId)) return false;
-  if (runs.get(task.runId)?.status !== "failed") return false;
-  return !(active.has(task.runId) || runs.hasRunning(taskId));
+export async function backgroundAgentsHoldTask(taskId: string): Promise<boolean> {
+  // Polled by the claude death watch on every tick of an idle session: one
+  // worker op, a boolean-sized reply, never a Task row.
+  const { held, failedRunId } = await op("orchestrator.backgroundHold", [taskId]);
+  if (held) return true;
+  return failedRunId != null && !active.has(failedRunId);
 }
 
 /**
@@ -1091,22 +1293,31 @@ export function backgroundAgentsHoldTask(taskId: string): boolean {
  * not on disk yet (the `checkDone`/`checkStale` paths) still releases; the
  * pipeline runner's release grace covers that case.
  */
-function maybeReleaseHeldTask(taskId: string): void {
+async function maybeReleaseHeldTask(taskId: string): Promise<void> {
   // A delete or archive tearing the task's session down settles its subagent
   // rows on the way out; moving the card to `review` then would fire a column
   // event, a toast, an OS notification and the pipeline runner's column
   // listener for a task that is going away (or already frozen).
   if (deletingTaskIds.has(taskId)) return;
   drainSessionJsonl(taskId);
-  const task = tasks.get(taskId);
+  // A continuation the drain just adopted writes its run row and points
+  // `task.runId` at it through the run's queue: wait for that write, so the
+  // read below sees the new running run (and releases nothing), as it did when
+  // the adoption wrote synchronously.
+  await awaitContinuationOpen(taskId);
+  const task = await tasks.get(taskId);
   if (!task || task.archivedAt != null) return;
-  if (
-    task.column === "running"
-    && task.runId != null
-    && runs.get(task.runId)?.status === "succeeded"
-    && !subagents.hasRunning(taskId)
-  ) {
-    updateColumn(taskId, task.runId, "review");
+  if (task.column === "running" && task.runId != null) {
+    // The whole hold predicate is re-checked in the write's transaction: a
+    // follow-up minted meanwhile (a new `runId`), a subagent that started
+    // again or a user move must not be overwritten by this release.
+    await updateColumn(taskId, task.runId, "review", undefined, {
+      columnIn: ["running"],
+      runId: task.runId,
+      runStatus: "succeeded",
+      noRunningSubagents: true,
+      notArchived: true,
+    });
   }
   // A "switch to next account" deferred behind the background agents runs now.
   // Not only on the release above: a turn that FAILED with background agents
@@ -1130,14 +1341,20 @@ function maybeReleaseHeldTask(taskId: string): void {
  * intent or an error state the discovery of a background agent must not
  * override.
  */
-function pullBackParkedTask(taskId: string): void {
-  const task = tasks.get(taskId);
+async function pullBackParkedTask(taskId: string): Promise<void> {
+  const task = await tasks.get(taskId);
   if (!task || task.column !== "review" || task.runId == null) return;
-  if (runs.get(task.runId)?.status !== "succeeded") return;
   const runId = task.runId;
-  updateColumn(taskId, runId, "running");
+  // Re-checked in the write's transaction, so a user move or a new run since
+  // the read above is never overwritten.
+  const moved = await updateColumn(taskId, runId, "running", undefined, {
+    columnIn: ["review"],
+    runId,
+    runStatus: "succeeded",
+  });
+  if (!moved) return;
   const data = "background agent active — task pulled back to running";
-  saveAndEmit({ runId, taskId, stream: "status", data });
+  await saveAndEmit({ runId, taskId, stream: "status", data });
 }
 
 /** Test hook: drive the event bus directly to verify SSE routing without
@@ -1149,8 +1366,8 @@ export function __emitForTest(e: RunEvent): void {
 /** Test hook: drive the global event bus directly to verify the `/events`
  *  SSE wiring without orchestrating a real run. Not part of the public
  *  surface. */
-export function __emitGlobalForTest(e: GlobalEvent): void {
-  emitGlobal(e);
+export async function __emitGlobalForTest(e: GlobalEvent): Promise<void> {
+  await emitGlobal(e);
 }
 
 /**
@@ -1162,15 +1379,16 @@ export function __emitGlobalForTest(e: GlobalEvent): void {
  * `tool_use`/`tool_result` chunks through the real detection pipeline
  * without a canned fake-driver scenario for every shape under test. Not
  * part of the public surface. */
-export function __dispatchChunkForTest(
+export async function __dispatchChunkForTest(
   runId: string,
   taskId: string,
   kind: AgentKind,
   stream: RunEvent["stream"],
   data: string,
   lineUuid?: string,
-): void {
+): Promise<void> {
   makeChunkHandler(runId, taskId, kind, null)(stream, data, lineUuid);
+  await runChunksSettled(runId);
 }
 
 /**
@@ -1207,7 +1425,7 @@ export function wireInteractionBroadcast(): void {
     // even when no panel for this task is open (or it's open but the window is
     // backgrounded and can't repaint the card). The per-task `interaction`
     // event above only reaches the RunPanel subscribed to this task.
-    emitGlobal({
+    void emitGlobal({
       kind: "interaction",
       taskId: req.taskId,
       runId: req.runId,
@@ -1235,7 +1453,7 @@ export function wireInteractionBroadcast(): void {
     });
     // App-level companion to the pending emit above — lets the notification
     // hook clear its "Waiting on you" alert once the last prompt is gone.
-    emitGlobal({
+    void emitGlobal({
       kind: "interaction",
       taskId: res.taskId,
       runId: res.runId,
@@ -1289,9 +1507,7 @@ export async function reconcileOrphans(): Promise<number> {
   // task; only the latest reflects the user's current intent. Older
   // siblings get flipped to orphaned so we never have two SessionState
   // objects fighting for the same tmux session.
-  const stale = db.query<{ id: string; task_id: string; tmux_session: string | null; claude_session_id: string | null; codex_session_id: string | null; cursor_session_id: string | null; gemini_session_id: string | null; fx_session_id: string | null; antigravity_session_id: string | null; opencode_session_id: string | null; copilot_session_id: string | null; agent: string; started_at: number }, []>(
-    `SELECT id, task_id, tmux_session, claude_session_id, codex_session_id, cursor_session_id, gemini_session_id, fx_session_id, antigravity_session_id, opencode_session_id, copilot_session_id, agent, started_at FROM runs WHERE status = 'running' ORDER BY started_at DESC, id DESC`,
-  ).all();
+  const stale = await op("orchestrator.runningRuns", []);
 
   const reattachedTaskIds = new Set<string>();
   const orphaned: { id: string; task_id: string; prevColumn: ColumnId | null; kind: AgentKind | null }[] = [];
@@ -1308,10 +1524,14 @@ export async function reconcileOrphans(): Promise<number> {
   // have; the loop below and the held-task pass read the answers.
   const opencodeServer = await reconcileOpencodeServerRuns(stale);
 
-  for (const row of stale) {
-    const task = tasks.get(row.task_id);
+  // Every row's task and harness in two hops, not two per row.
+  const staleTasks = await op("orchestrator.getTasks", [stale.map((row) => row.task_id)]);
+  const staleHarnesses = await op("orchestrator.resolveHarnesses", [stale.map((row) => row.agent)]);
+
+  for (const [index, row] of stale.entries()) {
+    const task = staleTasks[index] ?? null;
     const prevColumn: ColumnId | null = task?.column ?? null;
-    const kind = resolveHarness(row.agent)?.kind ?? null;
+    const kind = staleHarnesses[index]?.kind ?? null;
     const interruptedSwap = task?.harnessState?.pendingSwap;
     if (task && interruptedSwap && !interruptedSwap.manual && interruptedSwap.runId === row.id) {
       swapInterrupted.push({ id: row.id, task_id: row.task_id });
@@ -1395,7 +1615,7 @@ export async function reconcileOrphans(): Promise<number> {
       const endLag = beginLagLabel(`boot reattach · task ${row.task_id}`, { taskId: row.task_id, runId: row.id });
       try {
         const cwd = task.worktreePath ?? task.workdir;
-        const harness = resolveHarness(task.agent);
+        const harness = await resolveHarness(task.agent);
         const onChunk = makeChunkHandler(row.id, row.task_id, kind as AgentKind, task.mode);
         const spawned = kind === "claude-code"
           ? await reattachSession({
@@ -1408,9 +1628,9 @@ export async function reconcileOrphans(): Promise<number> {
               // value (null there) would miss (CR1).
               configDir: harness ? claudeConfigDirFor(harness) : null,
               onChunk,
-              seenLineUuids: runs.seenLineUuidsForTask(row.task_id),
+              seenLineUuids: await runs.seenLineUuidsForTask(row.task_id),
               mode: task.mode,
-              harnessFailover: harnessFailoverEnabledFor(task),
+              harnessFailover: await harnessFailoverEnabledFor(task),
               // A session spawned moments before the previous owner exited (an
               // app taking the port over from a live background core) may not
               // have written its JSONL yet: wait for it rather than killing a
@@ -1423,7 +1643,7 @@ export async function reconcileOrphans(): Promise<number> {
               runId: row.id,
               sessionName: row.tmux_session as string,
               onChunk,
-              seenLineUuids: runs.seenLineUuidsForTask(row.task_id),
+              seenLineUuids: await runs.seenLineUuidsForTask(row.task_id),
             })
           : kind === "gemini"
           ? await reattachGeminiSession({
@@ -1431,7 +1651,7 @@ export async function reconcileOrphans(): Promise<number> {
               runId: row.id,
               sessionName: row.tmux_session as string,
               onChunk,
-              seenLineUuids: runs.seenLineUuidsForTask(row.task_id),
+              seenLineUuids: await runs.seenLineUuidsForTask(row.task_id),
             })
           : kind === "opencode"
           ? await reattachOpencodeTurn(row.id, row.task_id, row.agent, row.tmux_session as string, cwd, onChunk)
@@ -1441,14 +1661,14 @@ export async function reconcileOrphans(): Promise<number> {
               runId: row.id,
               sessionName: row.tmux_session as string,
               onChunk,
-              seenLineUuids: runs.seenLineUuidsForTask(row.task_id),
+              seenLineUuids: await runs.seenLineUuidsForTask(row.task_id),
             })
           : await reattachCopilotSession({
               taskId: row.task_id,
               runId: row.id,
               sessionName: row.tmux_session as string,
               onChunk,
-              seenLineUuids: runs.seenLineUuidsForTask(row.task_id),
+              seenLineUuids: await runs.seenLineUuidsForTask(row.task_id),
               sessionId: row.copilot_session_id as string,
               copilotHome: copilotHome({ harnessHome: harness?.home ?? null, harnessEnv: harness?.env ?? null }),
               mode: task.mode ?? defaultModeFor("copilot"),
@@ -1456,7 +1676,6 @@ export async function reconcileOrphans(): Promise<number> {
               onSubagent: makeCopilotSubagentSink(row.id, row.task_id),
             });
         if (spawned) {
-          registerActiveRun(row.id, row.task_id, task, spawned);
           // Pre-seed `handle.apiError` when the prior process had already
           // emitted the api-error status to run_events for this run. The
           // reattach replay can't re-emit it — the assistant-line uuid is in
@@ -1468,8 +1687,11 @@ export async function reconcileOrphans(): Promise<number> {
           // `(run_id)` index (a bare EXISTS let the planner walk the whole
           // `status` stream) and ignores subagent tailers' own transient
           // api-error rows (`subagent_id IS NULL`, since #81), which must not
-          // seed the main run's apiError.
-          const priorApiError = runs.hasPriorApiErrorStatus(row.id, CLAUDE_API_ERROR_STATUS_PREFIX);
+          // seed the main run's apiError. Read before the run registers, so
+          // registering, seeding and attaching the done handler happen with
+          // nothing awaited in between.
+          const priorApiError = await runs.hasPriorApiErrorStatus(row.id, CLAUDE_API_ERROR_STATUS_PREFIX);
+          registerActiveRun(row.id, row.task_id, task, spawned);
           if (priorApiError) {
             const handle = active.get(row.id);
             if (handle) handle.apiError = true;
@@ -1493,35 +1715,24 @@ export async function reconcileOrphans(): Promise<number> {
 
   const now = Date.now();
   for (const row of swapInterrupted) {
-    runs.update(row.id, { status: "failed", endedAt: now, exitCode: -1 });
-    saveStatusLineQuietly(row.id, row.task_id, "the core restarted during the account switch — finishing it");
-    emitGlobal({ kind: "run-status", taskId: row.task_id, runId: row.id, status: "failed", ts: now, reason: "harness-swap" });
+    await runs.update(row.id, { status: "failed", endedAt: now, exitCode: -1 });
+    await saveStatusLineQuietly(row.id, row.task_id, "the core restarted during the account switch — finishing it");
+    await emitGlobal({ kind: "run-status", taskId: row.task_id, runId: row.id, status: "failed", ts: now, reason: "harness-swap" });
   }
   if (orphaned.length > 0) {
-    const reconcile = db.transaction(() => {
-      for (const row of orphaned) {
-        db.run(
-          `UPDATE runs SET status = 'orphaned', ended_at = ?, exit_code = -1 WHERE id = ?`,
-          [now, row.id],
-        );
-        db.run(
-          `INSERT INTO run_events (run_id, stream, data, ts) VALUES (?, ?, ?, ?)`,
-          [row.id, "status", "orphaned — agetor restarted while this run was active", now],
-        );
-        db.run(
-          `UPDATE tasks SET "column" = 'ready', run_id = NULL WHERE id = ? AND "column" = 'running'`,
-          [row.task_id],
-        );
-        // Copilot owns its subagent rows (the claude watcher is the only other
-        // writer, and its rows are retired by the held-task pass below). A
-        // dead copilot run can never settle its tabs, and a row left `running`
-        // would read as a live background agent forever.
-        if (row.kind === "copilot") subagents.settleRunningForRun(row.id, "orphaned", now);
-      }
-    });
-    reconcile();
+    // One transaction (op `orchestrator.orphanRuns`) for every orphan: the run
+    // `orphaned` with its status line, its task back to `ready` when it still
+    // sits in `running`. Copilot owns its subagent rows (the claude watcher is
+    // the only other writer, and its rows are retired by the held-task pass
+    // below): a dead copilot run can never settle its tabs, and a row left
+    // `running` would read as a live background agent forever, so the op
+    // settles them too.
+    await op("orchestrator.orphanRuns", [
+      orphaned.map((row) => ({ id: row.id, task_id: row.task_id, copilot: row.kind === "copilot" })),
+      now,
+    ]);
     for (const row of orphaned) {
-      emitGlobal({
+      await emitGlobal({
         kind: "run-status",
         taskId: row.task_id,
         runId: row.id,
@@ -1529,7 +1740,7 @@ export async function reconcileOrphans(): Promise<number> {
         ts: now,
       });
       if (row.prevColumn === "running") {
-        emitGlobal({ kind: "column", taskId: row.task_id, runId: null, column: "ready", prev: row.prevColumn, ts: now });
+        await emitGlobal({ kind: "column", taskId: row.task_id, runId: null, column: "ready", prev: row.prevColumn, ts: now });
       }
     }
   }
@@ -1550,7 +1761,7 @@ export async function reconcileOrphans(): Promise<number> {
   // after the orphan writes, so a card's follow-up
   // addresses a task that is no longer `running`.
   try {
-    rebuildOpenCursorAsks();
+    await rebuildOpenCursorAsks();
   } catch (err) {
     console.warn("[agetor] could not rebuild open cursor questions:", err);
   }
@@ -1570,15 +1781,18 @@ export async function reconcileOrphans(): Promise<number> {
   // one `running` subagents row, regardless of column.
   let reArmed = 0;
   let released = 0;
-  const heldTaskIds = subagents.taskIdsWithRunning();
+  const heldTaskIds = await subagents.taskIdsWithRunning();
   // A server=agetor task whose last turn is over but whose background subagents
   // still run on the server (after a restart or a hand-over): listen for them
   // again instead of orphaning their rows.
-  const lingeredTaskIds = opencodeServer.lingerHeldTasks(reattachedTaskIds);
-  for (const heldId of heldTaskIds) {
-    const task = tasks.get(heldId);
+  const lingeredTaskIds = await opencodeServer.lingerHeldTasks(reattachedTaskIds);
+  // Every held task and its harness in two hops, not two per task.
+  const heldTasks = await op("orchestrator.getTasks", [heldTaskIds]);
+  const heldHarnesses = await op("orchestrator.resolveHarnesses", [heldTasks.map((t) => t?.agent ?? "")]);
+  for (const [index, heldId] of heldTaskIds.entries()) {
+    const task = heldTasks[index] ?? null;
     if (!task) continue;
-    const heldKind = resolveHarness(task.agent)?.kind ?? null;
+    const heldKind = heldHarnesses[index]?.kind ?? null;
     // OpenCode rows are settled by whatever drives the session: on the
     // agetor-owned server the driver settles each child live (and a lingering
     // handle keeps doing so after the root turn ends); on `opencode run` the
@@ -1592,7 +1806,7 @@ export async function reconcileOrphans(): Promise<number> {
     const openCodeTailLive =
       heldKind === "opencode" && (opencodeSessionActive(heldId) || hasOpencodeServerTurn(heldId) || lingeredTaskIds.has(heldId));
     if (!openCodeTailLive) {
-      released += orphanRunningOpencodeSubagents(heldId, "agetor restarted while it was running");
+      released += await orphanRunningOpencodeSubagents(heldId, "agetor restarted while it was running");
     }
     if (heldKind !== "claude-code") {
       // A live OpenCode tail owns its own rows (its `beforeSettle` retires
@@ -1610,40 +1824,40 @@ export async function reconcileOrphans(): Promise<number> {
       const liveRunId = heldKind === "copilot" && reattachedTaskIds.has(heldId) ? task.runId : null;
       if (liveRunId) {
         const staleRunIds = new Set(
-          subagents
-            .listForTask(heldId)
+          (await subagents
+            .listForTask(heldId))
             .flatMap((r) => (r.status === "running" && r.runId && r.runId !== liveRunId ? [r.runId] : [])),
         );
         for (const staleRunId of staleRunIds) {
-          makeCopilotSubagentSink(staleRunId, heldId).settleAll("orphaned");
+          await makeCopilotSubagentSink(staleRunId, heldId).settleAll("orphaned");
           released++;
         }
       } else {
-        orphanRunningSubagents(heldId);
+        await orphanRunningSubagents(heldId);
         released++;
       }
       continue;
     }
-    if (!subagents.hasRunning(heldId)) continue;
+    if (!await subagents.hasRunning(heldId)) continue;
 
     if (task.column === "running") {
       // Classic held-task path, unchanged: only proceed when the terminal run
       // has actually succeeded (i.e. this is a genuinely stuck "held for
       // background agents" task, not an ordinary run still legitimately in
       // progress that just happens to also have live subagent rows).
-      if (!isHeldByBackgroundAgents(heldId)) continue;
+      if (!await isHeldByBackgroundAgents(heldId)) continue;
       if (await sessionExistsByName(sessionNameFor(heldId))) {
-        const run = task.runId ? runs.get(task.runId) : null;
+        const run = task.runId ? await runs.get(task.runId) : null;
         // No JSONL session id means no watch directory to derive, so nothing will
         // ever observe these agents finishing. Treat it exactly like a dead
         // session and release, rather than leaving the card held forever.
         if (!run?.claudeSessionId) {
-          orphanRunningSubagents(heldId);
+          await orphanRunningSubagents(heldId);
           released++;
           continue;
         }
         const cwd = task.worktreePath ?? task.workdir;
-        const harness = resolveHarness(task.agent);
+        const harness = await resolveHarness(task.agent);
         // `.ready` = the seed finished: the boot path waits for each watcher's
         // seed (so the held-task decision below sees a consistent view) but
         // the seed itself is cooperative and yields to the event loop.
@@ -1657,7 +1871,7 @@ export async function reconcileOrphans(): Promise<number> {
         // Session gone: no watcher could ever observe these agents finishing, so
         // flip the rows now. `orphanRunningSubagents` fires the settle hook →
         // `maybeReleaseHeldTask` → the card advances to `review`.
-        orphanRunningSubagents(heldId);
+        await orphanRunningSubagents(heldId);
         released++;
       }
       continue;
@@ -1673,14 +1887,14 @@ export async function reconcileOrphans(): Promise<number> {
     // HARD INVARIANT: never kill or create tmux sessions here — only re-arm
     // watchers and flip DB rows.
     if (await sessionExistsByName(sessionNameFor(heldId))) {
-      const run = task.runId ? runs.get(task.runId) : null;
+      const run = task.runId ? await runs.get(task.runId) : null;
       if (!run?.claudeSessionId) {
-        orphanRunningSubagents(heldId);
+        await orphanRunningSubagents(heldId);
         released++;
         continue;
       }
       const cwd = task.worktreePath ?? task.workdir;
-      const harness = resolveHarness(task.agent);
+      const harness = await resolveHarness(task.agent);
       await attachSubagentWatcher({
         taskId: heldId,
         runId: run.id,
@@ -1693,7 +1907,7 @@ export async function reconcileOrphans(): Promise<number> {
       // isn't `running`), so this only clears the stale subagent rows — it
       // does not move the card, which is already sitting wherever the user
       // (or the earlier normal completion) left it.
-      orphanRunningSubagents(heldId);
+      await orphanRunningSubagents(heldId);
       released++;
     }
   }
@@ -1746,11 +1960,11 @@ function stepCheckoutMissing(task: Task): boolean {
  * single-repository task gets the very same `opts` object back, so its argv
  * stays byte-identical. Exported for its unit test.
  */
-export function withTaskRepositoryRoots(
+export async function withTaskRepositoryRoots(
   taskId: string,
   opts: SpawnAgentArgs["opts"],
-): SpawnAgentArgs["opts"] {
-  const task = tasks.get(taskId);
+): Promise<SpawnAgentArgs["opts"]> {
+  const task = await tasks.get(taskId);
   if (!task || !isMultiRepoTask(task)) return opts;
   // Only checkouts that exist right now: a repository whose checkout is gone
   // (its source repository was deleted, a hand-removed directory) would make
@@ -1759,7 +1973,7 @@ export function withTaskRepositoryRoots(
     (r): r is TaskRepository & { worktreePath: string } => Boolean(r.worktreePath) && existsSync(r.worktreePath!),
   );
   if (materialized.length === 0) return opts;
-  const autoTrust = isClaudeAutoTrustOn(preferences.get(CLAUDE_AUTO_TRUST_PREF))
+  const autoTrust = isClaudeAutoTrustOn(await preferences.get(CLAUDE_AUTO_TRUST_PREF))
     ? autoTrustDirectoriesFor(materialized)
     : undefined;
   return {
@@ -1843,7 +2057,7 @@ async function spawnAgentOrFail(
   opts: SpawnAgentOrFailOptions = {},
 ): Promise<{ agent: SpawnedAgent; message?: undefined } | { agent: null; message: string }> {
   try {
-    const baseOpts = withTaskRepositoryRoots(args.taskId, args.opts);
+    const baseOpts = await withTaskRepositoryRoots(args.taskId, args.opts);
     // Claude's pane usage-limit notice only settles a turn when the task is
     // on a stack WITH a backup; a lone account keeps claude's own
     // auto-continue (plan §2.2). One central injection keeps every spawn path
@@ -1851,7 +2065,7 @@ async function spawnAgentOrFail(
     const spawnArgs: SpawnAgentArgs = args.harness.kind === "claude-code"
       ? {
           ...args,
-          opts: { ...baseOpts, harnessFailover: harnessFailoverEnabledFor(tasks.get(args.taskId)) },
+          opts: { ...baseOpts, harnessFailover: await harnessFailoverEnabledFor(await tasks.get(args.taskId)) },
         }
       : { ...args, opts: baseOpts };
     return { agent: await spawnAgent(spawnArgs) };
@@ -1866,11 +2080,11 @@ async function spawnAgentOrFail(
     // so this is the ONLY terminal signal a subscriber — the pipeline
     // runner, the UI's toasts — gets for a spawn that never started; without
     // it a pipeline step whose spawn threw sat `running` forever.
-    const wasCurrentRun = tasks.get(taskId)?.runId === runId;
-    runs.update(runId, { status: "failed", endedAt: Date.now(), exitCode: -1 });
-    tasks.update(taskId, { column: "ready", runId: null });
+    const wasCurrentRun = (await tasks.get(taskId))?.runId === runId;
+    await runs.update(runId, { status: "failed", endedAt: Date.now(), exitCode: -1 });
+    await tasks.update(taskId, { column: "ready", runId: null });
     if (wasCurrentRun && !opts.suppressFailureStatus) {
-      emitGlobal({ kind: "run-status", taskId, runId, status: "failed", ts: Date.now() });
+      await emitGlobal({ kind: "run-status", taskId, runId, status: "failed", ts: Date.now() });
     }
     return { agent: null, message };
   }
@@ -1989,6 +2203,21 @@ export function activeRunCount(): number {
 }
 
 /**
+ * Ids of the tasks this process is driving a run for (`active`) or still
+ * starting one for (`startingTaskIds`, held through the whole bounded-spawn
+ * pending window), each once. Synchronous on purpose: the desktop app's
+ * `before-quit` hook cannot await, and it unions this with its database
+ * snapshot (index.ts, `quitRunningTasks`), which can trail a fresh start by a
+ * read. Like `activeRunCount`, a claude run held open by background subagents
+ * is still in `active`, so it counts.
+ */
+export function liveRunTaskIds(): string[] {
+  const ids = new Set(startingTaskIds);
+  for (const run of active.values()) ids.add(run.taskId);
+  return [...ids];
+}
+
+/**
  * How many launches this process is still in the middle of: spawns that hold
  * a task's start claim (`startingTaskIds`, which covers the codex/cursor/…
  * one-shot launches and claude's own pre-JSONL spawn), claude sessions that
@@ -2052,7 +2281,7 @@ let launchesFrozenFlag = false;
  * Runs already in flight keep going: their tmux sessions outlive the process
  * and the next owner reattaches them.
  */
-export function freezeLaunches(): void {
+export async function freezeLaunches(): Promise<void> {
   if (launchesFrozenFlag) return;
   launchesFrozenFlag = true;
   try {
@@ -2067,14 +2296,14 @@ export function freezeLaunches(): void {
   }
   for (const taskId of [...swapFollowUps.keys()]) {
     try {
-      stashSwapFollowUps(taskId);
+      await stashSwapFollowUps(taskId);
     } catch (err) {
       console.warn(`[agetor] stashing held follow-ups for task ${taskId} failed:`, err);
     }
   }
   for (const taskId of tasksWithQueuedFollowUps()) {
     try {
-      stashQueuedFollowUps(taskId, tasks.get(taskId)?.runId ?? null, "Agetor stopped before it could run");
+      await stashQueuedFollowUps(taskId, (await tasks.get(taskId))?.runId ?? null, "Agetor stopped before it could run");
     } catch (err) {
       console.warn(`[agetor] stashing queued follow-ups for task ${taskId} failed:`, err);
     }
@@ -2132,7 +2361,7 @@ function adoptPendingTaskCancel(taskId: string, runId: string): boolean {
 
 /** Release `taskId`'s `startingTaskIds` claim, dropping any Stop recorded
  *  against the claim that no minted run adopted. */
-function releaseStartingClaim(taskId: string): void {
+async function releaseStartingClaim(taskId: string): Promise<void> {
   startingTaskIds.delete(taskId);
   const stopped = pendingCancelTaskIds.delete(taskId);
   // An OpenCode wake that arrived while the claim was held waits for this edge.
@@ -2141,18 +2370,16 @@ function releaseStartingClaim(taskId: string): void {
   // the claim holder (`settleScheduledSwitchAtTurnEnd`). A holder that minted a
   // run hands it to that run's turn end; one that ended without a live run (a
   // failed pre-flight, a failed spawn) must settle it here, or it would fire at
-  // some unrelated later turn end.
-  if (tasks.get(taskId)?.harnessState?.scheduledSwitch) {
-    // A throw here would surface as an uncaught microtask error, not reach the
-    // claim holder; log it like `endTurnSettle` does.
-    queueMicrotask(() => {
-      try {
-        settleWaitingScheduledSwitch(taskId, { stopped });
-      } catch (err) {
-        console.warn(`[agetor] settling a waiting account switch for ${taskId} failed:`, err);
-      }
-    });
+  // some unrelated later turn end. The claim itself is already released
+  // above (synchronously); this read never rejects into the claim holder's
+  // `finally`, a failure is logged like `endTurnSettle` does.
+  let scheduled = false;
+  try {
+    scheduled = Boolean((await tasks.get(taskId))?.harnessState?.scheduledSwitch);
+  } catch (err) {
+    console.warn(`[agetor] checking a waiting account switch for ${taskId} failed:`, err);
   }
+  if (scheduled) settleWaitingScheduledSwitch(taskId, { stopped });
 }
 
 /**
@@ -2184,15 +2411,17 @@ async function consumePendingCancel(
   agent.done.catch(() => {});
   agent.kill();
   if (opts.dropClaudeSession) await dropSession(taskId);
-  runs.update(runId, { status: "cancelled", endedAt: Date.now(), exitCode: -1 });
-  if (tasks.get(taskId)?.runId === runId) {
+  await runs.update(runId, { status: "cancelled", endedAt: Date.now(), exitCode: -1 });
+  if ((await tasks.get(taskId))?.runId === runId) {
     onChunk("status", "cancelled by user before the agent launched");
-    updateColumn(taskId, runId, "ready");
     // H1: no done handler will ever fire for this run (it never registered),
     // so emit the terminal transition here — gated exactly like the done
-    // handler's `isTerminalRun` — or a pipeline step stopped mid-spawn would
-    // never reach the runner and its run would sit `running` forever.
-    emitGlobal({ kind: "run-status", taskId, runId, status: "cancelled", ts: Date.now() });
+    // handler's `isTerminalRun` (re-checked with the move, in one
+    // transaction) — or a pipeline step stopped mid-spawn would never reach
+    // the runner and its run would sit `running` forever.
+    if (await updateColumn(taskId, runId, "ready", undefined, { runId })) {
+      await emitGlobal({ kind: "run-status", taskId, runId, status: "cancelled", ts: Date.now() });
+    }
   }
   return true;
 }
@@ -2222,9 +2451,9 @@ async function consumePendingCancel(
  * that only want "the profile to inject/display right now" (the CLI, the
  * webview) can just read `.profile`.
  */
-export function effectiveAgentProfile(
+export async function effectiveAgentProfile(
   task: Task,
-): { profile: AgentProfileSnapshot; source: "live" | "snapshot" } | null {
+): Promise<{ profile: AgentProfileSnapshot; source: "live" | "snapshot" } | null> {
   if (!task.agentProfileId && !task.agentProfile) return null;
 
   // Pipeline step tasks are frozen at launch (D8, docs/plans/pipelines.md):
@@ -2238,10 +2467,10 @@ export function effectiveAgentProfile(
     return { profile: task.agentProfile, source: "snapshot" };
   }
 
-  if (task.agentProfileId && runs.countForTask(task.id) === 0) {
-    const profile: AgentProfile | null = agentProfiles.get(task.agentProfileId);
+  if (task.agentProfileId && await runs.countForTask(task.id) === 0) {
+    const profile: AgentProfile | null = await agentProfiles.get(task.agentProfileId);
     if (profile) {
-      const harness = resolveHarness(profile.harness);
+      const harness = await resolveHarness(profile.harness);
       if (harness) {
         return {
           profile: snapshotFromProfile(profile, { kind: harness.kind, label: harness.label }, Date.now()),
@@ -2290,11 +2519,25 @@ export function agentProfileSnapshotDrifted(
  * just-started or just-settled spawn — should use this instead of
  * re-deriving the same check inline.
  */
-export function isTaskRunLive(taskId: string): boolean {
+export async function isTaskRunLive(taskId: string): Promise<boolean> {
   if (startingTaskIds.has(taskId)) return true;
-  const task = tasks.get(taskId);
+  return taskRunLiveFrom(taskId, await readTaskSnapshot(taskId));
+}
+
+/** One consistent read of a task, its harness and its background-agent hold
+ *  (op `orchestrator.taskSnapshot`): a busy/idle decision made from it and
+ *  the in-memory run state with nothing awaited in between sees one view. */
+function readTaskSnapshot(taskId: string): Promise<TaskSnapshot> {
+  return op("orchestrator.taskSnapshot", [taskId]);
+}
+
+/** {@link isTaskRunLive} decided synchronously from a snapshot. */
+function taskRunLiveFrom(taskId: string, snap: TaskSnapshot): boolean {
+  if (startingTaskIds.has(taskId)) return true;
+  const task = snap.task;
   if (!task) return false;
-  if (task.runId && active.has(task.runId)) return true;
+  // The current run, or a continuation adopted but not yet on the row.
+  if (currentClaudeRunOf(task) !== null) return true;
   // M-R3: a HELD task (terminal run succeeded, background subagents still
   // running, card parked in `running` by the done handler) has no `active`
   // handle, but its work genuinely isn't finished — `cancelRun` still has
@@ -2302,7 +2545,16 @@ export function isTaskRunLive(taskId: string): boolean {
   // Retry/Advance past it or advance the graph off its handoff until
   // `maybeReleaseHeldTask` lets it go. Same DB-derived predicate the done
   // handler and `cancelRun` already agree on.
-  return isTaskHeldByBackgroundAgents(task);
+  return snap.held;
+}
+
+/** {@link isAnyRunOfTaskLive} decided synchronously from a snapshot. */
+function anyRunOfTaskLiveFrom(taskId: string, snap: TaskSnapshot): boolean {
+  if (taskRunLiveFrom(taskId, snap)) return true;
+  for (const handle of active.values()) {
+    if (handle.taskId === taskId) return true;
+  }
+  return false;
 }
 
 /**
@@ -2317,12 +2569,8 @@ export function isTaskRunLive(taskId: string): boolean {
  * advance a step while any of its runs is live" rule and the idle-only send
  * gate (docs/plans/handoff-identification-fix.md D5/D6).
  */
-export function isAnyRunOfTaskLive(taskId: string): boolean {
-  if (isTaskRunLive(taskId)) return true;
-  for (const handle of active.values()) {
-    if (handle.taskId === taskId) return true;
-  }
-  return false;
+export async function isAnyRunOfTaskLive(taskId: string): Promise<boolean> {
+  return anyRunOfTaskLiveFrom(taskId, await readTaskSnapshot(taskId));
 }
 
 /**
@@ -2335,7 +2583,7 @@ export function isAnyRunOfTaskLive(taskId: string): boolean {
  * from the other side). A handle that's absent, or present but not
  * cancelled, is not "cancelling" — it's either idle or a genuinely live run.
  */
-export function isTaskRunCancelling(taskId: string): boolean {
+export async function isTaskRunCancelling(taskId: string): Promise<boolean> {
   // Every live handle of the task counts, a displaced one included: a task
   // whose current run is cancelling but whose displaced continuation is still
   // running genuinely is not stopping.
@@ -2350,8 +2598,8 @@ export function isTaskRunCancelling(taskId: string): boolean {
   // (`pendingCancelRunIds`): its spawn path will kill it instead of
   // registering it, so the run is going down even though its row still
   // reads `running` and no handle exists yet.
-  const currentRunId = tasks.get(taskId)?.runId;
-  return currentRunId != null && pendingCancelRunIds.has(currentRunId) && runs.get(currentRunId)?.status === "running";
+  const currentRunId = (await tasks.get(taskId))?.runId;
+  return currentRunId != null && pendingCancelRunIds.has(currentRunId) && (await runs.get(currentRunId))?.status === "running";
 }
 
 /**
@@ -2370,19 +2618,34 @@ export function isTaskRunCancelling(taskId: string): boolean {
 export async function startTask(
   taskId: string,
 ): Promise<{ runId: string; unresolvedRefs?: string[]; pending?: true } | { error: string; code?: string }> {
-  let task = tasks.get(taskId);
-  if (!task) return { error: "task not found" };
+  // The claim is checked and taken before the first await: two starts landing
+  // together (a double click, a re-POST) must not both pass the checks while
+  // the task row is being read. Each refusal below releases it again.
   if (launchesFrozenFlag) return { error: LAUNCHES_FROZEN_REASON, code: "launches-frozen" };
-  if (task.runId && active.has(task.runId)) return { error: "task already running" };
   if (accountSwitchTaskIds.has(taskId)) return { error: "switching accounts — try again in a moment" };
   if (startingTaskIds.has(taskId)) return { error: "task is already starting" };
+  startingTaskIds.add(taskId);
+  const refuse = async (
+    result: { error: string; code?: string },
+  ): Promise<{ error: string; code?: string }> => {
+    await releaseStartingClaim(taskId);
+    return result;
+  };
+  let task: Task | null;
+  try {
+    task = await tasks.get(taskId);
+  } catch (err) {
+    await releaseStartingClaim(taskId);
+    throw err;
+  }
+  if (!task) return refuse({ error: "task not found" });
+  if (task.runId && active.has(task.runId)) return refuse({ error: "task already running" });
   // The prompt becomes the run's first user message: one that is exactly the
   // hidden swap wrapper would be acted on by the agent while every renderer
   // hides it (review S1).
   if (!task.pipelineId && isHiddenContinuationUserText(task.prompt)) {
-    return { error: HIDDEN_CONTINUATION_REFUSAL, code: "hidden-continuation" };
+    return refuse({ error: HIDDEN_CONTINUATION_REFUSAL, code: "hidden-continuation" });
   }
-  startingTaskIds.add(taskId);
   return startTaskInner(taskId, task);
 }
 
@@ -2450,13 +2713,13 @@ async function startTaskInner(
   // `removeTaskRepository` settles through the same wait), and the prepare
   // below must not re-create a checkout that was just removed. A single
   // task's row is used exactly as before.
-  if (isMultiRepoTask(task)) task = tasks.get(taskId) ?? task;
+  if (isMultiRepoTask(task)) task = await tasks.get(taskId) ?? task;
 
   // Starting an archived task auto-unarchives it — otherwise the card would
   // move through columns (running → review/ready) while hidden behind the
   // archive filter, which is confusing at best.
   if (task.archivedAt != null) {
-    task = tasks.update(taskId, { archivedAt: null }) ?? task;
+    task = await tasks.update(taskId, { archivedAt: null }) ?? task;
   }
 
   // Pipeline tasks never spawn an agent themselves — Run instead kicks off
@@ -2480,7 +2743,7 @@ async function startTaskInner(
   // triggers a copy-down; a "snapshot" result means the task already ran at
   // least once and must launch with exactly what it launched with before —
   // nothing to refresh, `effective` below just carries it through unchanged.
-  const resolvedProfile = effectiveAgentProfile(task);
+  const resolvedProfile = await effectiveAgentProfile(task);
   if (resolvedProfile?.source === "live") {
     const { profile } = resolvedProfile;
     // A profile's own `effort: null` means "no opinion" — but a model that
@@ -2501,7 +2764,10 @@ async function startTaskInner(
       task.maxMode !== profile.maxMode ||
       agentProfileSnapshotDrifted(task.agentProfile ?? null, profile);
     if (driftedFromRow) {
-      task = tasks.update(taskId, {
+      // A guarded write: a Detach that landed since `effectiveAgentProfile`
+      // read the binding must not be undone by this copy-down (it returns
+      // null and writes nothing); the task is then re-read as it now stands.
+      await op("orchestrator.copyDownProfile", [taskId, {
         agent: profile.harness,
         model: profile.model,
         effort: resolvedEffort,
@@ -2509,8 +2775,9 @@ async function startTaskInner(
         speed: profile.speed,
         maxMode: profile.maxMode,
         opencodeServer: profileOpencodeServer,
-      }) ?? task;
-      task = tasks.setAgentProfile(taskId, profile.id, profile) ?? task;
+      }, profile]);
+      // (Read through the facade, which carries the badge counts an op result lacks.)
+      task = await tasks.get(taskId) ?? task;
     }
   }
   const effective: AgentProfileSnapshot | null = resolvedProfile?.profile ?? null;
@@ -2539,7 +2806,7 @@ async function startTaskInner(
     }
     if (prepared.moved) {
       await dropSessionAfterAccountMove(taskId, prepared.moved.from);
-      task = tasks.get(taskId) ?? task;
+      task = await tasks.get(taskId) ?? task;
       accountMoveNotes.push(...(prepared.warnings ?? []));
     }
   }
@@ -2550,7 +2817,7 @@ async function startTaskInner(
   // is on a real stack, move to a usable backup once instead of refusing the
   // Run — the whole point of the train. A non-stack task keeps the exact same
   // error it always had.
-  let harness: Harness | null = resolveHarness(task.agent);
+  let harness: Harness | null = await resolveHarness(task.agent);
   let status: HarnessStatus | null = null;
   let preflightMoved = false;
   for (;;) {
@@ -2605,7 +2872,7 @@ async function startTaskInner(
     // backup gets one forced move off it (the cached member snapshot said it
     // was usable, so a normal prepare was a no-op). The destination is
     // re-probed by the next loop iteration; if it also fails, refuse.
-    if (preflightMoved || !harnessFailoverEnabledFor(task)) return { error: failure };
+    if (preflightMoved || !(await harnessFailoverEnabledFor(task))) return { error: failure };
     preflightMoved = true;
     const moved = await prepareTaskHarnessForUser(taskId, {
       manual: true,
@@ -2614,10 +2881,10 @@ async function startTaskInner(
     });
     if (!moved.ok || !moved.moved) return { error: moved.error ?? failure };
     await dropSessionAfterAccountMove(taskId, moved.moved.from);
-    task = tasks.get(taskId) ?? task;
+    task = await tasks.get(taskId) ?? task;
     // Say why the account was left: the failure that forced the move.
     accountMoveNotes.push(failure, ...(moved.warnings ?? []));
-    harness = resolveHarness(task.agent);
+    harness = await resolveHarness(task.agent);
   }
   if (!harness || !status) {
     return { error: `harness "${task.agent}" not found — pick another in the task's settings` };
@@ -2657,7 +2924,7 @@ async function startTaskInner(
   const prepared = await prepareTaskWorkdir(task, {
     takenBranches: await branchesPinnedByOtherTasks(
       taskId,
-      tasks.list(),
+      await tasks.pinnedBranches(),
       multiRepo ? { resolveRoot: repoRoot } : {},
     ),
   });
@@ -2671,11 +2938,7 @@ async function startTaskInner(
   // pinned base refs. (`prepared.repositories` is present exactly when the
   // multi path ran, one entry included.)
   if (prepared.repositories) {
-    const checkouts = prepared.repositories;
-    db.transaction(() => {
-      tasks.setRepositories(taskId, checkouts);
-      recordPreparedRepositoryCheckouts(taskId, checkouts, prepared.unknownCheckouts);
-    })();
+    await op("orchestrator.recordRepositories", [taskId, prepared.repositories, [...(prepared.unknownCheckouts ?? [])]]);
   }
 
   // Expand `@`-tokens into absolute paths now, right after `prepareWorkdir`
@@ -2761,7 +3024,7 @@ async function startTaskInner(
   const multiPrepared = Boolean(prepared.repositories);
   if (shouldLazyPinBaseRef(task.baseRef, prepared)) {
     const sha = await resolveRef(task.workdir, "HEAD");
-    if (sha) tasks.update(taskId, { baseRef: sha });
+    if (sha) await tasks.update(taskId, { baseRef: sha });
   }
   // A multi-repository row has no scalar baseRef: pin every entry that is
   // missing one against its own repository, before the persist transaction
@@ -2782,37 +3045,38 @@ async function startTaskInner(
   // strand the user's only path back to the paused response. From this point
   // on a run row WILL be inserted below, so the old pause is genuinely
   // superseded regardless of whether the spawn itself goes on to succeed.
-  if (harness.kind === "fx") clearFxRecovery(taskId);
+  if (harness.kind === "fx") await clearFxRecovery(taskId);
 
   const runId = randomUUID();
   const now = Date.now();
   const prevColumn: ColumnId = task.column;
 
-  // Single transaction: flip the task into running with the new run id, branch,
-  // worktree path; insert the run row. Either everything sticks or nothing does.
-  const persist = db.transaction(() => {
-    tasks.update(taskId, {
+  // Single transaction (op `orchestrator.persistRunStart`): flip the task into
+  // running with the new run id, branch, worktree path; insert the run row.
+  // Either everything sticks or nothing does.
+  //
+  // Multi-repository materialization persists every entry's worktree path,
+  // branch (possibly a per-repo fallback) and last-seen checkout in the same
+  // transaction as the workspace mirror; the prepare's live reads are the
+  // freshest checkout values, recorded through the dedicated setter (see
+  // `setRepositories`' merge rule). Run start is one of the four
+  // last-seen-checkout refresh points (start, settle, terminal open, archive).
+  // Isolation "none", or a reuse whose branch read failed, has nothing to
+  // record — keep whatever was recorded rather than erasing it
+  // (`recordableCheckout`).
+  const persistedPrev = await op("orchestrator.persistRunStart", [{
+    taskId,
+    taskPatch: {
       column: "running",
       branch: prepared.branch,
       worktreePath: prepared.worktreePath,
       runId,
-    });
-    // Multi-repository materialization: persist every entry's worktree path,
-    // branch (possibly a per-repo fallback) and last-seen checkout in the same
-    // transaction as the workspace mirror above.
-    if (prepared.repositories) {
-      tasks.setRepositories(taskId, prepared.repositories);
-      // The prepare's live reads are the freshest checkout values; record
-      // them through the dedicated setter (see `setRepositories`' merge rule).
-      recordPreparedRepositoryCheckouts(taskId, prepared.repositories, prepared.unknownCheckouts);
-    }
-    // Run start is one of the four last-seen-checkout refresh points (start,
-    // settle, terminal open, archive). Isolation "none", or a reuse whose
-    // branch read failed, has nothing to record — keep whatever was recorded
-    // rather than erasing it (`recordableCheckout`).
-    const checkout = recordableCheckout(prepared);
-    if (checkout !== undefined) tasks.setCheckoutBranch(taskId, checkout);
-    runs.insert({
+    },
+    ...(prepared.repositories
+      ? { repositories: prepared.repositories, unknownCheckouts: [...(prepared.unknownCheckouts ?? [])] }
+      : {}),
+    checkout: recordableCheckout(prepared),
+    run: {
       id: runId,
       taskId,
       agent: task.agent,
@@ -2839,12 +3103,14 @@ async function startTaskInner(
       fxSessionId: null,
       antigravitySessionId: null,
       copilotSessionId: null,
-    });
-  });
-  persist();
+    },
+  }]);
   adoptPendingTaskCancel(taskId, runId);
-  if (prevColumn !== "running") {
-    emitGlobal({ kind: "column", taskId, runId, column: "running", prev: prevColumn, ts: now });
+  // The column the row had when the start wrote it (read in that transaction);
+  // the snapshot's is the fallback for a row that vanished meanwhile.
+  const startPrevColumn = persistedPrev ?? prevColumn;
+  if (startPrevColumn !== "running") {
+    await emitGlobal({ kind: "column", taskId, runId, column: "running", prev: startPrevColumn, ts: now });
   }
 
   // The agent-instructions preamble (from `effective`, if this task is bound
@@ -2872,11 +3138,7 @@ async function startTaskInner(
     prompt: promptWithRefs,
     cwd: prepared.cwd,
     onChunk,
-    onSessionId: (sessionId) => {
-      runs.update(runId, sessionIdPatchFor(harness.kind, sessionId));
-      // opencode: a new session is a new wake-watch target (server driver only; a no-op before boot).
-      if (harness.kind === "opencode") scheduleOpencodeWatchRefresh();
-    },
+    onSessionId: (sessionId) => recordRunSessionId(runId, harness.kind, sessionId),
     // copilot: the driver reports subagents inline in its JSON stream; the
     // sink turns each into a `subagents` row (a tab) + tagged events.
     ...(harness.kind === "copilot" ? { copilotSubagents: makeCopilotSubagentSink(runId, taskId) } : {}),
@@ -2917,10 +3179,12 @@ async function startTaskInner(
   const continuation: Promise<{ ok: true } | { ok: false; message: string }> = (async () => {
     try {
       const { agent, message } = await spawnAgentOrFail(spawnArgs);
-      // Consume a Stop that landed while the spawn was in flight (see
-      // `pendingCancelRunIds`) on every settle path, agent or not.
-      const cancelledWhilePending = pendingCancelRunIds.delete(runId);
-      if (!agent) return { ok: false as const, message: message ?? "unknown error" };
+      if (!agent) {
+        // Consume a Stop that landed while the spawn was in flight (see
+        // `pendingCancelRunIds`) on every settle path, agent or not.
+        pendingCancelRunIds.delete(runId);
+        return { ok: false as const, message: message ?? "unknown error" };
+      }
 
       // Ownership guard: by the time the spawn settles the task may have
       // been deleted, archived, or this run may no longer be the task's
@@ -2930,24 +3194,27 @@ async function startTaskInner(
       // force-archive (`archiveTask`'s `active.has(task.runId)` guard is
       // false during this exact pending window, since `registerActiveRun`
       // hasn't run yet) must be treated the same as delete/replace here.
-      const fresh = tasks.get(taskId);
+      const fresh = await tasks.get(taskId);
+      // Consumed after the read, in the same synchronous step as the
+      // registration below: a Stop recorded during the read is seen here.
+      const cancelledWhilePending = pendingCancelRunIds.delete(runId);
       if (!fresh || fresh.archivedAt != null || fresh.runId !== runId || cancelledWhilePending) {
         agent.kill();
         if (harness.kind === "claude-code") await dropSession(taskId);
-        runs.update(runId, { status: "cancelled", endedAt: Date.now(), exitCode: -1 });
+        await runs.update(runId, { status: "cancelled", endedAt: Date.now(), exitCode: -1 });
         if (cancelledWhilePending && fresh && fresh.runId === runId) {
           // A user Stop, not a delete/replace: settle the task like the done
           // handler would for a cancelled run (`ready`, this run stays its
           // latest) and say why nothing ran.
           spawnArgs.onChunk("status", "cancelled by user before the agent launched");
-          updateColumn(taskId, runId, "ready");
+          await updateColumn(taskId, runId, "ready", undefined, { runId });
         } else if (fresh?.archivedAt != null && fresh.runId === runId) {
           // Force-archive in this window does not move the column, and this
           // run never registers, so the done handler will not pull it to
           // `ready` either. Left on `running`, unarchive shows Stop for a
           // process that is already gone.
           spawnArgs.onChunk("status", "task archived before the agent launched");
-          updateColumn(taskId, runId, "ready");
+          await updateColumn(taskId, runId, "ready", undefined, { runId });
         }
         // H1: this run never registers, so no done handler will ever emit
         // its terminal transition — do it here whenever the run is still the
@@ -2956,7 +3223,7 @@ async function startTaskInner(
         // `isTerminalRun`. A delete/replace (`fresh.runId !== runId`) is not
         // terminal for the task and stays silent, as before.
         if (fresh && fresh.runId === runId) {
-          emitGlobal({ kind: "run-status", taskId, runId, status: "cancelled", ts: Date.now() });
+          await emitGlobal({ kind: "run-status", taskId, runId, status: "cancelled", ts: Date.now() });
         }
         return { ok: true as const };
       }
@@ -2969,19 +3236,21 @@ async function startTaskInner(
       // that same resolution here so the opening breadcrumb reports what
       // actually launched. Persisted (and sent with its row id) so a stream
       // resumed after a reconnect sees it exactly once, like the drift lines
-      // below.
-      saveStatusLineQuietly(
-        runId,
-        taskId,
-        `started — ${prepared.note} — agent=${task.agent}, model=${task.model ?? "—"}, mode=${task.mode ?? defaultModeFor(harness.kind)}`,
-      );
-      for (const line of worktreeDriftStatusLines(task, prepared)) {
-        appendRunStatusLine(taskId, runId, line);
-      }
-      for (const line of accountMoveNotes) {
-        appendRunStatusLine(taskId, runId, line);
-      }
+      // below. Each line takes its place in the run's queue right here, so
+      // they land in this order ahead of anything the run writes later, and
+      // the done handler is attached with nothing awaited since the run
+      // registered.
+      const opening = [
+        saveStatusLineQuietly(
+          runId,
+          taskId,
+          `started — ${prepared.note} — agent=${task.agent}, model=${task.model ?? "—"}, mode=${task.mode ?? defaultModeFor(harness.kind)}`,
+        ),
+        ...worktreeDriftStatusLines(task, prepared).map((line) => saveStatusLineQuietly(runId, taskId, line)),
+        ...accountMoveNotes.map((line) => saveStatusLineQuietly(runId, taskId, line)),
+      ];
       attachDoneHandler(runId, taskId, agent);
+      await Promise.all(opening);
       return { ok: true as const };
     } catch (err) {
       // `spawnAgentOrFail` never throws (it catches internally and already
@@ -2992,7 +3261,7 @@ async function startTaskInner(
       console.warn(`[agetor] detached spawn continuation failed for task ${taskId} run ${runId}:`, err);
       return { ok: false as const, message };
     } finally {
-      releaseStartingClaim(taskId);
+      await releaseStartingClaim(taskId);
     }
   })();
 
@@ -3012,8 +3281,8 @@ async function startTaskInner(
       // No run was minted (a pre-flight or worktree error): messages typed
       // while the claim was held go back to the backlog rather than being
       // replayed onto some later, unrelated run.
-      stashSwapFollowUps(taskId);
-      releaseStartingClaim(taskId);
+      await stashSwapFollowUps(taskId);
+      await releaseStartingClaim(taskId);
     }
   }
 }
@@ -3069,16 +3338,11 @@ function isTodoFamilyChunk(stream: RunEvent["stream"], data: string): boolean {
  * settlement" contract as `detectCursorPlan` (plan §7); the caller wraps
  * this in try/catch too, belt-and-braces.
  */
-function maybeUpdateTodoProgress(taskId: string): void {
-  const events = runs.todoRelevantEventsForTask(taskId);
+async function maybeUpdateTodoProgress(taskId: string): Promise<void> {
+  const events = await runs.todoRelevantEventsForTask(taskId);
   const summary = summarizeTodoProgress(deriveTodoProgress(events));
-  const task = tasks.get(taskId);
-  if (!task) return;
-  const current = task.todoProgress ?? null;
-  const changed = summary === null
-    ? current !== null
-    : current === null || current.completed !== summary.completed || current.total !== summary.total;
-  if (changed) tasks.update(taskId, { todoProgress: summary });
+  // Compared with the stored summary and written in one transaction.
+  await op("orchestrator.setTodoProgress", [taskId, summary]);
 }
 
 /**
@@ -3119,13 +3383,13 @@ function maybeUpdateTodoProgress(taskId: string): void {
  *    relative to parsing a potentially large result body, and results in
  *    exactly one `tasks.get` either way (reused below, not re-fetched).
  */
-function maybeTrackClaudePlan(taskId: string, runId: string, stream: RunEvent["stream"], data: string): void {
+async function maybeTrackClaudePlan(taskId: string, runId: string, stream: RunEvent["stream"], data: string): Promise<void> {
   let task: Task | null;
   if (stream === "tool_use") {
     if (!data.includes('"name":"ExitPlanMode"')) return;
     task = null; // fetched below, after confirming the parse is worthwhile
   } else if (stream === "tool_result") {
-    task = tasks.get(taskId);
+    task = await tasks.get(taskId);
     if (!task || !task.plans.some((p) => p.status === "pending")) return;
   } else {
     return;
@@ -3149,15 +3413,9 @@ function maybeTrackClaudePlan(taskId: string, runId: string, stream: RunEvent["s
     const plan = (input as Record<string, unknown>).plan;
     if (typeof plan !== "string" || plan.trim() === "") return;
 
-    task = tasks.get(taskId);
-    if (!task) return;
-    const next = upsertClaudePlanFromExitPlanMode(task.plans, {
-      toolCallId,
-      runId,
-      content: plan,
-      now: Date.now(),
-    });
-    if (next !== task.plans) tasks.update(taskId, { plans: next });
+    // Read, transform and written in one transaction (a concurrent edit is
+    // never overwritten with a stale array).
+    await op("orchestrator.applyPlanChange", [taskId, { kind: "exit-plan-mode", toolCallId, runId, content: plan, now: Date.now() }]);
     return;
   }
 
@@ -3175,8 +3433,7 @@ function maybeTrackClaudePlan(taskId: string, runId: string, stream: RunEvent["s
       : "";
   if (!resultText) return;
 
-  const next = resolveClaudePlan(task!.plans, toolUseId, resultText, Date.now());
-  if (next !== task!.plans) tasks.update(taskId, { plans: next });
+  await op("orchestrator.applyPlanChange", [taskId, { kind: "resolve-claude", toolUseId, resultText, now: Date.now() }]);
 }
 
 /** Literal envelope substring for a `SendUserFile` tool_use chunk (see
@@ -3279,13 +3536,13 @@ function rememberSentFilesRequest(runId: string, toolUseId: string, req: SentFil
  * "detection bugs must never break run settlement" contract as
  * `maybeUpdateTodoProgress`/`maybeTrackClaudePlan` above.
  */
-function maybeTrackSentFiles(
+async function maybeTrackSentFiles(
   taskId: string,
   runId: string,
   stream: RunEvent["stream"],
   data: string,
   eventId: number | null,
-): void {
+): Promise<void> {
   if (eventId === null) return;
 
   if (stream === "tool_use") {
@@ -3332,7 +3589,7 @@ function maybeTrackSentFiles(
     stash!.delete(toolUseId);
   } else {
     if (!SENT_FILES_DELIVERED_RE.test(toolResultText(chunk.content))) return;
-    const fallback = runs.findToolUseEvent(runId, toolUseId);
+    const fallback = await runs.findToolUseEvent(runId, toolUseId);
     if (!fallback) return;
 
     let fallbackParsed: unknown;
@@ -3354,7 +3611,7 @@ function maybeTrackSentFiles(
   const res = parseSentFilesToolResult(chunk.content, isError, attachments);
   if (!res.delivered) return;
 
-  const task = tasks.get(taskId);
+  const task = await tasks.get(taskId);
   if (!task) return;
   const cwd = task.worktreePath ?? task.workdir;
 
@@ -3387,8 +3644,8 @@ function maybeTrackSentFiles(
         runId,
       }));
 
-  tasks.mergeSentFiles(taskId, entries);
-  emitGlobal({
+  await tasks.mergeSentFiles(taskId, entries);
+  await emitGlobal({
     kind: "files-sent",
     taskId,
     runId,
@@ -3467,6 +3724,41 @@ function makeChunkHandler(
   return handler;
 }
 
+/**
+ * Per-run chain of the chunk handler's database follow-up work (the unread
+ * watermark, todo/plan/sent-files tracking, the chunk-time column flips). A
+ * driver calls the handler synchronously, chunk after chunk; each chunk's
+ * insert takes its place in the run's emit queue at once (`saveAndEmit`), and
+ * its follow-up runs here after that insert landed and after the previous
+ * chunk's follow-up, so the work happens in arrival order exactly as when it
+ * was synchronous. Different runs never wait on each other. An entry is
+ * dropped as soon as its chain goes idle.
+ */
+const chunkTails = new Map<string, Promise<void>>();
+
+function queueRunChunkWork(runId: string, work: () => Promise<void>): void {
+  const prev = chunkTails.get(runId) ?? Promise.resolve();
+  const tail = prev.then(work).catch((err: unknown) => {
+    console.warn(`[agetor] chunk follow-up for run ${runId} failed:`, err);
+  });
+  chunkTails.set(runId, tail);
+  void tail.then(() => {
+    if (chunkTails.get(runId) === tail) chunkTails.delete(runId);
+  });
+}
+
+/**
+ * Resolves once every chunk handed to `runId`'s handler so far has been saved
+ * and sent and its follow-up work has finished, along with every other row
+ * queued on the run. The done handler waits on this before it reads the run's
+ * state or writes its final status, so a chunk-time `blocked` flip lands before
+ * the settle and the final status never lands before the run's last event.
+ */
+async function runChunksSettled(runId: string): Promise<void> {
+  await (chunkTails.get(runId) ?? Promise.resolve());
+  await runEventsSettled(runId);
+}
+
 function makeChunkHandlerInner(
   runId: string,
   taskId: string,
@@ -3474,19 +3766,9 @@ function makeChunkHandlerInner(
   _mode: Task["mode"],
 ): RunChunkHandler {
   return (stream: RunEvent["stream"], data: string, lineUuid?: string) => {
-    let eventId: number | null;
-    try {
-      // A dedup hit (`null`) sends nothing: the row was delivered when it
-      // was first saved (e.g. a reattach replay re-delivering a line).
-      eventId = saveAndEmit({ runId, taskId, stream, data, lineUuid })?.id ?? null;
-    } catch (err) {
-      // A chunk can still arrive after deleteTask cascade-deleted this run
-      // (e.g. claude's boot-timeout stderr lines, 30 s after the spawn), and
-      // the insert then fails its run_events foreign key. There is nothing
-      // left to record it on, so drop it; any other failure still throws.
-      if (!runs.get(runId)) return;
-      throw err;
-    }
+    // Taken synchronously, so this chunk's row is saved and sent in the order
+    // the driver delivered it.
+    const saved = saveAndEmit({ runId, taskId, stream, data, lineUuid });
     // Harness-stack limit signal. The structured sentinel is authoritative;
     // raw text is a conservative backstop for Claude's synthetic API-error
     // line only (`isRawTextLimitChunk`). A limit never flips the column here —
@@ -3515,73 +3797,25 @@ function makeChunkHandlerInner(
         }
         if (signal) {
           handle.limitHit = signal;
-          const task = tasks.get(taskId);
-          // Account identity comes from the run, never `task.agent`: a swap
-          // or manual move may already point the task at the next account.
-          const harnessId = runs.get(runId)?.agent ?? (task ? taskHarnessId(task) : null);
-          if (harnessId) {
-            const stored = recordLimitSignal(harnessId, signal);
+          // The cooldown write is a database hop; the done handler waits for
+          // it (`settleChunkWork`) before it reads `limitRecorded`.
+          const hit = signal;
+          queueChunkWork(handle, `recording the limit signal for task ${taskId}`, async () => {
+            // Account identity comes from the run, never `task.agent`: a swap
+            // or manual move may already point the task at the next account.
+            const task = await tasks.get(taskId);
+            const harnessId = (await runs.get(runId))?.agent ?? (task ? taskHarnessId(task) : null);
+            if (!harnessId) return;
+            const stored = await recordLimitSignal(harnessId, hit);
             handle.limitRecorded = { harnessId, model: stored.model ?? null, updatedAt: stored.updatedAt };
-          }
+          });
         }
       }
     }
-    // Todo/task-tools board summary: re-derive + persist on any
-    // TodoWrite/TaskCreate/TaskUpdate chunk, for every agent kind. Cheap
-    // substring pre-filter keeps the common case (unrelated chunks) a no-op.
-    if (isTodoFamilyChunk(stream, data)) {
-      try {
-        maybeUpdateTodoProgress(taskId);
-      } catch {
-        // Never let todo-progress derivation break run settlement.
-      }
-    }
-    // Unread-indicator watermark: bump on every top-level assistant event.
-    // `makeChunkHandler`'s closure has no `subagentId` — every call site that
-    // builds one (see the `onChunk` call sites above) is the MAIN-stream
-    // dispatcher for a task's own run. Subagent transcript lines never reach
-    // here at all: they're appended via a completely separate call site
-    // (`runs.appendEvent(fs.runId, stream, data, lineUuid, fs.subagentId)` in
-    // claude-subagents.ts) with their own `emitFn`, and the live-only
-    // `"subagent"` stream (lifecycle deltas) is explicitly never persisted
-    // (see `RunEventStream`'s doc comment in shared/types.ts) — so it can't
-    // reach `appendEvent` either. That makes every `stream === "assistant"`
-    // chunk seen here unconditionally "no subagent attribution" by
-    // construction; no extra `subagent_id` check is needed (or possible —
-    // this closure never receives one). `eventId` is `null` when
-    // `appendEvent`'s dedup (`INSERT OR IGNORE` on `line_uuid`) found the row
-    // already persisted — e.g. a reattach replay re-delivering a line this
-    // process already streamed before restart — in which case the watermark
-    // was already bumped by the original insert and must not be bumped
-    // again here.
-    if (stream === "assistant" && eventId != null) {
-      try {
-        tasks.noteAssistantEvent(taskId, eventId);
-      } catch {
-        // Never let unread-watermark tracking break run settlement.
-      }
-    }
-    // Claude plan history: ExitPlanMode tool_use/tool_result pairs, claude
-    // only — cursor's plan detection stays exclusively in `detectCursorPlan`
-    // at run settlement.
-    if (kind === "claude-code") {
-      try {
-        maybeTrackClaudePlan(taskId, runId, stream, data);
-      } catch {
-        // Never let plan-history tracking break run settlement.
-      }
-    }
-    // Sent-files ("Files sent to you" cards): SendUserFile tool_use/
-    // tool_result pairs, every agent kind (fx synthesizes the same pair).
-    try {
-      maybeTrackSentFiles(taskId, runId, stream, data, eventId);
-    } catch {
-      // Never let sent-files detection break run settlement.
-    }
     // Claude API-error path: claude-tmux emits a sentinel status chunk on
     // synthetic `isApiErrorMessage` lines (529, 400, …) and resolves the
-    // turn. Flip to `blocked` here so the card stops sitting in `running`,
-    // and mark the handle so `attachDoneHandler` doesn't bounce it back to
+    // turn. Flip to `blocked` so the card stops sitting in `running`, and
+    // mark the handle so `attachDoneHandler` doesn't bounce it back to
     // `ready` when the resolution lands a moment later. Exception: when the
     // same sentinel was classified as a provider limit on a real stack, the
     // swap settlement owns the turn (see below).
@@ -3592,7 +3826,6 @@ function makeChunkHandlerInner(
     ) {
       const handle = active.get(runId);
       if (handle && !handle.apiError) {
-        const task = tasks.get(taskId);
         // A stacked Claude API error that IS a provider limit (429/402) is
         // owned by the swap settlement, which keeps the card `running` while
         // it mirrors + transfers + spawns the successor. Flipping to
@@ -3600,48 +3833,34 @@ function makeChunkHandlerInner(
         // notification and drop the card out of `running` before the swap
         // starts — contradicting the "the card never leaves running"
         // invariant. The settlement still records the old run `failed`.
-        const swapOwnsIt = handle.limitHit !== null && harnessFailoverEnabledFor(task);
-        if (!swapOwnsIt) {
-          handle.apiError = true;
-          if (task && task.runId === runId) {
-            updateColumn(taskId, runId, "blocked", "api-error");
+        // The failover lookup is a database read, so the decision is queued
+        // on the run and the done handler waits for it (`settleChunkWork`)
+        // before it reads `apiError`.
+        queueChunkWork(handle, `classifying the API error for task ${taskId}`, async () => {
+          if (handle.apiError) return;
+          const task = await tasks.get(taskId);
+          const swapOwnsIt = handle.limitHit !== null && await harnessFailoverEnabledFor(task);
+          if (!swapOwnsIt) {
+            handle.apiError = true;
+            if (task && task.runId === runId) {
+              await updateColumn(taskId, runId, "blocked", "api-error", { runId });
+            }
           }
-        }
+        });
       }
     }
-    // Session-died path (both agents): the driver emits this sentinel when a
-    // running turn's tmux session vanished. Flip to `blocked` so the card
-    // stops sitting in `running`, and mark the handle so `attachDoneHandler`
-    // keeps it there (and records `failed`) when the run settles a beat later.
+    // Session-died and unknown-command sentinels mark the handle now, so a
+    // done handler that runs right after reads them; their `blocked` column
+    // flip is chunk follow-up work below.
+    let flipSessionDied = false;
     if (stream === "status" && data.startsWith(SESSION_DIED_STATUS_PREFIX)) {
       const handle = active.get(runId);
       if (handle && !handle.sessionDied) {
         handle.sessionDied = true;
-        const task = tasks.get(taskId);
-        if (task && task.runId === runId) {
-          updateColumn(taskId, runId, "blocked", "session-died");
-        }
+        flipSessionDied = true;
       }
     }
-    // Turn-stall watchdog path (claude-code only today — codex/gemini turns
-    // are headless one-shots with no TUI to wedge on): the driver flags an
-    // in-flight turn whose transcript has gone silent past the stall
-    // threshold. Soft signal only — the session is alive, so no column flip,
-    // no handle flag, no settle; just mark/unmark the task so the API can
-    // decorate `stalledSince`.
-    if (stream === "status" && data.startsWith(TURN_STALLED_STATUS_PREFIX)) {
-      const task = tasks.get(taskId);
-      if (task && task.runId === runId) markStalled(taskId, Date.now());
-    }
-    if (stream === "status" && data.startsWith(TURN_STALL_RESUMED_STATUS_PREFIX)) {
-      clearStalled(taskId);
-    }
-    // Unknown-slash-command path (claude-code only): claude's TUI rejected
-    // the pasted message as an unknown slash command — no JSONL line was
-    // ever written for it, so claude-tmux's pane scraper is the only source
-    // of this sentinel. Flip to `blocked` here so the card stops sitting in
-    // `running`, and mark the handle so `attachDoneHandler` doesn't bounce
-    // it back to `ready` when the resolution lands a moment later.
+    let flipUnknownCommand = false;
     if (
       kind === "claude-code"
       && stream === "status"
@@ -3650,19 +3869,172 @@ function makeChunkHandlerInner(
       const handle = active.get(runId);
       if (handle && !handle.unknownCommand) {
         handle.unknownCommand = true;
-        const task = tasks.get(taskId);
-        if (task && task.runId === runId) {
-          updateColumn(taskId, runId, "blocked", "unknown-command");
-        }
+        flipUnknownCommand = true;
       }
     }
+    queueRunChunkWork(runId, async () => {
+      let eventId: number | null;
+      try {
+        // A dedup hit (`null`) sends nothing: the row was delivered when it
+        // was first saved (e.g. a reattach replay re-delivering a line).
+        eventId = (await saved)?.id ?? null;
+      } catch (err) {
+        // A chunk can still arrive after deleteTask cascade-deleted this run
+        // (e.g. claude's boot-timeout stderr lines, 30 s after the spawn), and
+        // the insert then fails its run_events foreign key. There is nothing
+        // left to record it on, so drop it; any other failure is logged.
+        if (!(await runs.get(runId))) return;
+        throw err;
+      }
+      // Todo/task-tools board summary: re-derive + persist on any
+      // TodoWrite/TaskCreate/TaskUpdate chunk, for every agent kind. Cheap
+      // substring pre-filter keeps the common case (unrelated chunks) a no-op.
+      if (isTodoFamilyChunk(stream, data)) {
+        try {
+          await maybeUpdateTodoProgress(taskId);
+        } catch {
+          // Never let todo-progress derivation break run settlement.
+        }
+      }
+      // Unread-indicator watermark: bump on every top-level assistant event.
+      // `makeChunkHandler`'s closure has no `subagentId` — every call site that
+      // builds one (see the `onChunk` call sites above) is the MAIN-stream
+      // dispatcher for a task's own run. Subagent transcript lines never reach
+      // here at all: they're appended via a completely separate call site
+      // (claude-subagents.ts) with their own `emitFn`, and the live-only
+      // `"subagent"` stream (lifecycle deltas) is explicitly never persisted
+      // (see `RunEventStream`'s doc comment in shared/types.ts) — so it can't
+      // reach `appendEvent` either. That makes every `stream === "assistant"`
+      // chunk seen here unconditionally "no subagent attribution" by
+      // construction. `eventId` is `null` when `appendEvent`'s dedup
+      // (`INSERT OR IGNORE` on `line_uuid`) found the row already persisted —
+      // e.g. a reattach replay re-delivering a line this process already
+      // streamed before restart — in which case the watermark was already
+      // bumped by the original insert and must not be bumped again here. The
+      // write itself is monotonic (one guarded UPDATE), so no ordering of
+      // these calls can move it backwards.
+      if (stream === "assistant" && eventId != null) {
+        try {
+          await tasks.noteAssistantEvent(taskId, eventId);
+        } catch {
+          // Never let unread-watermark tracking break run settlement.
+        }
+      }
+      // Claude plan history: ExitPlanMode tool_use/tool_result pairs, claude
+      // only — cursor's plan detection stays exclusively in `detectCursorPlan`
+      // at run settlement.
+      if (kind === "claude-code") {
+        try {
+          await maybeTrackClaudePlan(taskId, runId, stream, data);
+        } catch {
+          // Never let plan-history tracking break run settlement.
+        }
+      }
+      // Sent-files ("Files sent to you" cards): SendUserFile tool_use/
+      // tool_result pairs, every agent kind (fx synthesizes the same pair).
+      try {
+        await maybeTrackSentFiles(taskId, runId, stream, data, eventId);
+      } catch {
+        // Never let sent-files detection break run settlement.
+      }
+      // Session-died path (both agents): the driver emits this sentinel when a
+      // running turn's tmux session vanished. Flip to `blocked` so the card
+      // stops sitting in `running`; the handle (marked above) keeps it there
+      // (and records `failed`) when the run settles a beat later. Guarded on
+      // the run still being the task's current one at the write.
+      if (flipSessionDied) {
+        await updateColumn(taskId, runId, "blocked", "session-died", { runId });
+      }
+      // Turn-stall watchdog path (claude-code only today — codex/gemini turns
+      // are headless one-shots with no TUI to wedge on): the driver flags an
+      // in-flight turn whose transcript has gone silent past the stall
+      // threshold. Soft signal only — the session is alive, so no column flip,
+      // no handle flag, no settle; just mark/unmark the task so the API can
+      // decorate `stalledSince`. In this chain, so a resume never lands before
+      // the stall it ends.
+      if (stream === "status" && data.startsWith(TURN_STALLED_STATUS_PREFIX)) {
+        const task = await tasks.get(taskId);
+        if (task && task.runId === runId) markStalled(taskId, Date.now());
+      }
+      if (stream === "status" && data.startsWith(TURN_STALL_RESUMED_STATUS_PREFIX)) {
+        clearStalled(taskId);
+      }
+      // Unknown-slash-command path (claude-code only): claude's TUI rejected
+      // the pasted message as an unknown slash command — no JSONL line was
+      // ever written for it, so claude-tmux's pane scraper is the only source
+      // of this sentinel. Flip to `blocked` so the card stops sitting in
+      // `running`; the handle (marked above) keeps `attachDoneHandler` from
+      // bouncing it back to `ready` when the resolution lands a moment later.
+      if (flipUnknownCommand) {
+        await updateColumn(taskId, runId, "blocked", "unknown-command", { runId });
+      }
+    });
   };
 }
+
+/**
+ * What {@link startContinuationRun} needs to know synchronously about a task
+ * whose run registered in this process (the harness and mode it ran with):
+ * claude-tmux only asks for a continuation on a session such a run started or
+ * reattached. One entry per task, replaced on every registration and dropped
+ * when the task is archived or deleted.
+ */
+const registeredRunTasks = new Map<string, RegisteredRunTask>();
+
+/** What a run registration records about its task (see {@link registeredRunTasks}). */
+type RegisteredRunTask = Pick<Task, "agent" | "mode">;
+
+/**
+ * Continuation runs whose row and `task.run_id` are still being written
+ * (taskId -> runId): from the factory's synchronous adoption until the write
+ * landed. A send deciding fold-vs-mint from a read taken in that window sees
+ * the previous run id, so {@link currentClaudeRunOf} counts this one.
+ */
+const openingContinuationRuns = new Map<string, string>();
+
+/** The live run a claude send folds into: the task's current run when it is
+ *  registered, else a continuation adopted but not yet written to the row. */
+function currentClaudeRunOf(task: Pick<Task, "id" | "runId">): string | null {
+  if (task.runId && active.has(task.runId)) return task.runId;
+  const opening = openingContinuationRuns.get(task.id);
+  return opening && active.has(opening) ? opening : null;
+}
+
+/** taskId -> the write of the continuation run opened last (run row, column,
+ *  opening line); dropped once it landed. Tests await it. */
+const continuationOpens = new Map<string, Promise<void>>();
+
+/** Test hook: resolves once the continuation run the factory opened last for
+ *  `taskId` has its row, column move and opening line written (or was
+ *  declined). Not part of the public surface. */
+export async function __continuationOpenedForTest(taskId: string): Promise<void> {
+  await awaitContinuationOpen(taskId);
+}
+
+/** Wait until the continuation run opened last for `taskId` (if one is still
+ *  being written) has its row, column move and opening line in place. Never
+ *  rejects. */
+async function awaitContinuationOpen(taskId: string): Promise<void> {
+  await (continuationOpens.get(taskId) ?? Promise.resolve());
+}
+
+/** Test hook: record that a run of `taskId` registered in this process, as a
+ *  spawn or reattach does (what the continuation factory requires before it
+ *  adopts a turn), for a test that seeds the rows directly. Not part of the
+ *  public surface. */
+export function __noteRegisteredRunTaskForTest(taskId: string, task: RegisteredRunTask): void {
+  registeredRunTasks.set(taskId, { agent: task.agent, mode: task.mode });
+}
+
+/** Continuation runs whose row was never written (the task was gone, archived
+ *  or no longer Claude Code by the time it was checked): their chunks are
+ *  dropped and their done handler does nothing. Consumed by the done handler. */
+const declinedContinuationRuns = new Set<string>();
 
 function registerActiveRun(
   runId: string,
   taskId: string,
-  task: Task,
+  task: RegisteredRunTask,
   // NOT `ReturnType<typeof spawnAgent>` — `spawnAgent` itself resolves to
   // `Promise<SpawnedAgent>` (wave 1 async contract); every caller here
   // already passes the awaited value. Using the raw ReturnType would
@@ -3673,6 +4045,7 @@ function registerActiveRun(
   // used as if it were the resolved agent).
   agent: SpawnedAgent,
 ): void {
+  registeredRunTasks.set(taskId, { agent: task.agent, mode: task.mode });
   active.set(runId, {
     taskId,
     agent: task.agent,
@@ -3683,10 +4056,32 @@ function registerActiveRun(
     limitRecorded: null,
     sessionDied: false,
     unknownCommand: false,
+    chunkWork: Promise.resolve(),
+    chunkWorkPending: 0,
     writeInput: (line) => agent.writeInput(line),
     ...(agent.steer ? { steer: (line: string) => agent.steer?.(line) === true } : {}),
   });
   trackOpencodeServerTurn(runId, taskId, task, agent);
+}
+
+/**
+ * Write a patch to a run row from a synchronous driver callback (a reported
+ * session id). The write rides the run's emit queue, so it lands in order with
+ * the run's events, and the done handler (which waits for that queue) reads
+ * and settles the run only after it. `after` runs once the write landed.
+ */
+function queueRunPatch(runId: string, patch: Partial<Run>, after?: () => void): void {
+  appendAndEmit(runId, () => runs.update(runId, patch), () => after?.()).catch((err: unknown) => {
+    console.warn(`[agetor] recording a session id on run ${runId} failed:`, err);
+  });
+}
+
+/** {@link queueRunPatch} with the session-id column of `kind`. The patch is
+ *  built synchronously, so an unknown kind still throws into the spawn. */
+function recordRunSessionId(runId: string, kind: AgentKind, sessionId: string): void {
+  // opencode: a new session is a new wake-watch target (server driver only; a
+  // no-op before boot).
+  queueRunPatch(runId, sessionIdPatchFor(kind, sessionId), kind === "opencode" ? scheduleOpencodeWatchRefresh : undefined);
 }
 
 /**
@@ -3729,7 +4124,14 @@ function sessionIdPatchFor(kind: AgentKind, sessionId: string): Partial<Run> {
  * claude watcher drives through `setSubagentSettleHook`, so a card held in
  * `running` for a still-open subagent advances the moment the last one closes.
  */
-function makeCopilotSubagentSink(runId: string, taskId: string): CopilotSubagentSink {
+/** The orchestrator's copilot sink: every method takes its place in the run's
+ *  emit queue synchronously (the driver calls them in stream order) and
+ *  returns a promise that settles when its work is done and never rejects. */
+type OrchestratorCopilotSink = {
+  [K in keyof CopilotSubagentSink]: (...args: Parameters<CopilotSubagentSink[K]>) => Promise<void>;
+};
+
+function makeCopilotSubagentSink(runId: string, taskId: string): OrchestratorCopilotSink {
   const subagentIdFor = (toolCallId: string): string => `cp-${runId}-${toolCallId}`;
   const emitLifecycle = (sub: Subagent, phase: SubagentEvent["phase"]): void => {
     const payload: SubagentEvent = { phase, subagent: sub };
@@ -3742,71 +4144,104 @@ function makeCopilotSubagentSink(runId: string, taskId: string): CopilotSubagent
       subagentId: sub.id,
     });
   };
-  const release = (): void => {
-    try {
-      maybeReleaseHeldTask(taskId);
-    } catch (e) {
-      console.error(`[agetor] copilot subagent settle hook threw for task ${taskId}:`, e);
-    }
-  };
+  // A row write and its lifecycle send ride the run's emit queue, so they keep
+  // their place among the run's saved events (a tab is announced before its
+  // first event, and finished after its last). A settle then runs the held
+  // release (`after`), and the returned promise covers that too.
+  const queued = <Row>(
+    what: string,
+    write: () => Promise<Row>,
+    send: (row: Row) => void,
+    after?: (row: Row) => Promise<void>,
+  ): Promise<void> =>
+    appendAndEmit(runId, write, send)
+      .then(async (row) => {
+        if (after) await after(row);
+      })
+      .catch((e: unknown) => {
+        console.error(`[agetor] copilot subagent ${what} failed for run ${runId}:`, e);
+      });
   return {
     started(info) {
       const id = subagentIdFor(info.toolCallId);
-      // A replayed `started` (reattach) finds the row already there — keep its
-      // status/timing and don't announce it a second time.
-      if (subagents.get(id)) return;
-      const sub: Subagent = {
-        id,
-        taskId,
-        runId,
-        // A dedicated kind (never "subagent") so the Claude watcher's seed
-        // skips the row — see `seedRow` in claude-subagents.ts. No source file
-        // of its own: its events live inline in the copilot run's log and are
-        // persisted by this sink, so `sourcePath` stays empty (which also keeps
-        // `subagentActivityWithin` from stat'ing the main log for it).
-        parentKind: "copilot_subagent",
-        agentType: info.agentType ?? info.name ?? null,
-        description: info.description || info.name || null,
-        spawnDepth: 1,
-        sourcePath: "",
-        toolUseId: info.toolCallId,
-        status: "running",
-        startedAt: Date.now(),
-        endedAt: null,
-      };
-      subagents.insertIfAbsent(sub);
-      emitLifecycle(sub, "started");
+      return queued(
+        "start",
+        async (): Promise<Subagent | null> => {
+          // A replayed `started` (reattach) finds the row already there — keep
+          // its status/timing and don't announce it a second time.
+          if (await subagents.get(id)) return null;
+          const sub: Subagent = {
+            id,
+            taskId,
+            runId,
+            // A dedicated kind (never "subagent") so the Claude watcher's seed
+            // skips the row — see `seedRow` in claude-subagents.ts. No source file
+            // of its own: its events live inline in the copilot run's log and are
+            // persisted by this sink, so `sourcePath` stays empty (which also keeps
+            // `subagentActivityWithin` from stat'ing the main log for it).
+            parentKind: "copilot_subagent",
+            agentType: info.agentType ?? info.name ?? null,
+            description: info.description || info.name || null,
+            spawnDepth: 1,
+            sourcePath: "",
+            toolUseId: info.toolCallId,
+            status: "running",
+            startedAt: Date.now(),
+            endedAt: null,
+          };
+          await subagents.insertIfAbsent(sub);
+          return sub;
+        },
+        (sub) => {
+          if (sub) emitLifecycle(sub, "started");
+        },
+      );
     },
     event(parentToolCallId, stream, data, lineUuid) {
       const id = subagentIdFor(parentToolCallId);
-      try {
-        // Sends nothing for a replayed line (dedup hit).
-        saveAndEmit({ runId, taskId, stream, data, lineUuid, subagentId: id });
-      } catch (e) {
+      // Sends nothing for a replayed line (dedup hit).
+      return saveAndEmit({ runId, taskId, stream, data, lineUuid, subagentId: id }).then(() => undefined, (e: unknown) => {
         // The run row cascade-deleted under a live tail: cost one event, not
         // the rest of the batch.
         console.error(`[agetor] failed to persist copilot subagent event for ${id}:`, e);
-        return;
-      }
+      });
     },
     settled(toolCallId, status) {
       const id = subagentIdFor(toolCallId);
-      const row = subagents.get(id);
-      if (!row || row.status !== "running") return;
-      const endedAt = Date.now();
-      subagents.setStatus(id, status, endedAt);
-      emitLifecycle({ ...row, status, endedAt }, "finished");
-      release();
+      return queued(
+        "settle",
+        async (): Promise<Subagent | null> => {
+          const row = await subagents.get(id);
+          if (!row || row.status !== "running") return null;
+          const endedAt = Date.now();
+          await subagents.setStatus(id, status, endedAt);
+          return { ...row, status, endedAt };
+        },
+        (row) => {
+          if (row) emitLifecycle(row, "finished");
+        },
+        async (row) => {
+          if (row) await maybeReleaseHeldTask(taskId);
+        },
+      );
     },
     settleAll(status) {
-      const open = subagents
-        .listForTask(taskId)
-        .filter((r) => r.runId === runId && r.status === "running");
-      if (open.length === 0) return;
-      const endedAt = Date.now();
-      subagents.settleRunningForRun(runId, status, endedAt);
-      for (const row of open) emitLifecycle({ ...row, status, endedAt }, "finished");
-      release();
+      return queued(
+        "settle-all",
+        async (): Promise<Subagent[]> => {
+          const open = (await subagents.listForTask(taskId)).filter((r) => r.runId === runId && r.status === "running");
+          if (open.length === 0) return [];
+          const endedAt = Date.now();
+          await subagents.settleRunningForRun(runId, status, endedAt);
+          return open.map((row) => ({ ...row, status, endedAt }));
+        },
+        (rows) => {
+          for (const row of rows) emitLifecycle(row, "finished");
+        },
+        async (rows) => {
+          if (rows.length > 0) await maybeReleaseHeldTask(taskId);
+        },
+      );
     },
   };
 }
@@ -3821,10 +4256,10 @@ function makeCopilotSubagentSink(runId: string, taskId: string): CopilotSubagent
  * `detectCursorPlan`: re-reads the task fresh, idempotent by `toolCallId`,
  * never throws.
  */
-function detectCopilotPlan(task: Task, runId: string): void {
-  if (resolveHarness(task.agent)?.kind !== "copilot") return;
+async function detectCopilotPlan(task: Task, runId: string): Promise<void> {
+  if ((await resolveHarness(task.agent))?.kind !== "copilot") return;
 
-  const lastToolUse = runs.lastToolUseData(runId);
+  const lastToolUse = await runs.lastToolUseData(runId);
   if (lastToolUse === null) return;
 
   let parsed: unknown;
@@ -3844,16 +4279,8 @@ function detectCopilotPlan(task: Task, runId: string): void {
   const plan = (input as Record<string, unknown>).plan;
   if (typeof plan !== "string" || plan.trim() === "") return;
 
-  const fresh = tasks.get(task.id);
-  if (!fresh) return;
-  const nextPlans = upsertDetectedPlan(fresh.plans, {
-    toolCallId: callId,
-    runId,
-    name: null,
-    content: plan,
-    now: Date.now(),
-  });
-  if (nextPlans !== fresh.plans) tasks.update(task.id, { plans: nextPlans });
+  // Re-read, transformed and written in one transaction.
+  await op("orchestrator.applyPlanChange", [task.id, { kind: "detected", toolCallId: callId, runId, name: null, content: plan, now: Date.now() }]);
 }
 
 /**
@@ -3876,10 +4303,10 @@ function detectCopilotPlan(task: Task, runId: string): void {
  * unexpected shapes) already resolves to a silent no-op here, matching plan
  * §7: a detection failure must never break run settlement.
  */
-function detectCursorPlan(task: Task, runId: string): void {
-  if (resolveHarness(task.agent)?.kind !== "cursor") return;
+async function detectCursorPlan(task: Task, runId: string): Promise<void> {
+  if ((await resolveHarness(task.agent))?.kind !== "cursor") return;
 
-  const lastToolUse = runs.lastToolUseData(runId);
+  const lastToolUse = await runs.lastToolUseData(runId);
   if (lastToolUse === null) return;
 
   let parsed: unknown;
@@ -3905,16 +4332,8 @@ function detectCursorPlan(task: Task, runId: string): void {
   const nameRaw = (args as Record<string, unknown>).name;
   const name = typeof nameRaw === "string" ? nameRaw : null;
 
-  const fresh = tasks.get(task.id);
-  if (!fresh) return;
-  const nextPlans = upsertDetectedPlan(fresh.plans, {
-    toolCallId: callId,
-    runId,
-    name,
-    content: plan,
-    now: Date.now(),
-  });
-  if (nextPlans !== fresh.plans) tasks.update(task.id, { plans: nextPlans });
+  // Re-read, transformed and written in one transaction.
+  await op("orchestrator.applyPlanChange", [task.id, { kind: "detected", toolCallId: callId, runId, name, content: plan, now: Date.now() }]);
 }
 
 /**
@@ -3929,9 +4348,24 @@ function detectCursorPlan(task: Task, runId: string): void {
  * git failed) leaves the stored value alone. Never throws: it runs
  * fire-and-forget off `attachDoneHandler`.
  */
+/** Per-task chain of {@link noteRunSettledCheckout}: off the settle path (a
+ *  `git symbolic-ref` per checkout), but one at a time per task, in settle
+ *  order, so an older settle's reading never lands after a newer one's. The
+ *  note logs its own failures; an entry is dropped once its chain is idle. */
+const checkoutNoteTails = new Map<string, Promise<void>>();
+
+function queueRunSettledCheckout(taskId: string): void {
+  const prev = checkoutNoteTails.get(taskId) ?? Promise.resolve();
+  const tail = prev.then(() => noteRunSettledCheckout(taskId));
+  checkoutNoteTails.set(taskId, tail);
+  void tail.then(() => {
+    if (checkoutNoteTails.get(taskId) === tail) checkoutNoteTails.delete(taskId);
+  });
+}
+
 async function noteRunSettledCheckout(taskId: string): Promise<void> {
   try {
-    const task = tasks.get(taskId);
+    const task = await tasks.get(taskId);
     if (!task || task.isolation !== "worktree" || !task.worktreePath) return;
     const repos = task.repositories ?? [];
     if (isMultiRepoTask(task)) {
@@ -3943,13 +4377,13 @@ async function noteRunSettledCheckout(taskId: string): Promise<void> {
       for (const repo of repos) {
         if (!repo.worktreePath || !existsSync(repo.worktreePath)) continue;
         const live = await readCheckoutBranch(repo.worktreePath);
-        if (live.ok) tasks.setRepositoryCheckout(taskId, repo.name, live.branch);
+        if (live.ok) await tasks.setRepositoryCheckout(taskId, repo.name, live.branch);
       }
       return;
     }
     if (!existsSync(task.worktreePath)) return;
     const live = await readCheckoutBranch(task.worktreePath);
-    if (live.ok) tasks.setCheckoutBranch(taskId, live.branch);
+    if (live.ok) await tasks.setCheckoutBranch(taskId, live.branch);
   } catch (err) {
     console.warn(`[agetor] could not record checkout branch for task ${taskId}:`, err);
   }
@@ -4017,14 +4451,21 @@ const switchStopRequested = new Set<string>();
  * switch marker: `startTask`, the per-kind spawn paths and `isTaskRunLive`
  * all see it, and `sendInput` declines with the switch-specific reason.
  */
-export function claimTaskForAccountSwitch(taskId: string): boolean {
+export async function claimTaskForAccountSwitch(taskId: string): Promise<boolean> {
   if (startingTaskIds.has(taskId)) return false;
   // A freeze admits no new account move (the next owner's boot decides).
   if (launchesFrozenFlag) return false;
   // A held task's REPL (or a failed turn's) is still hosting background
   // agents: the switch would drop it and abandon them (review N3). The PATCH
   // route refuses with its own 409 first; this keeps every other caller out too.
-  if (backgroundAgentsHoldTask(taskId)) return false;
+  if (await backgroundAgentsHoldTask(taskId)) return false;
+  // The hold read yielded: check again and claim in one synchronous step, so
+  // a start (or another switch) that claimed meanwhile is never shared.
+  if (startingTaskIds.has(taskId) || launchesFrozenFlag) return false;
+  // A run that registered since the caller's `hasRunning` read (its spawn
+  // finished and released its start claim during the awaits above) is live
+  // now: switching under it would drop the session mid-turn.
+  for (const run of active.values()) if (run.taskId === taskId) return false;
   startingTaskIds.add(taskId);
   accountSwitchTaskIds.add(taskId);
   return true;
@@ -4047,20 +4488,20 @@ export function isAccountSwitchUnderway(taskId: string): boolean {
  * completion of one) may still be refused or fail and leave the request
  * behind, so a Cancel then drops the request as usual.
  */
-export function isScheduledSwitchUnderway(taskId: string): boolean {
+export async function isScheduledSwitchUnderway(taskId: string): Promise<boolean> {
   if (!accountSwitchTaskIds.has(taskId)) return false;
   if (switchNowTaskIds.has(taskId)) return true;
-  const pending = tasks.get(taskId)?.harnessState?.pendingSwap;
+  const pending = (await tasks.get(taskId))?.harnessState?.pendingSwap;
   return bootSwapClaims.has(taskId) && pending?.manual === true && pending.switchNow != null;
 }
 
 /** Release a claim taken by {@link claimTaskForAccountSwitch}. Safe to call
  *  when the switch threw: the claim must never outlive the copy. */
-export function releaseTaskAccountSwitch(taskId: string): void {
+export async function releaseTaskAccountSwitch(taskId: string): Promise<void> {
   accountSwitchTaskIds.delete(taskId);
   switchNowTaskIds.delete(taskId);
   switchStopRequested.delete(taskId);
-  releaseStartingClaim(taskId);
+  await releaseStartingClaim(taskId);
 }
 
 /**
@@ -4070,18 +4511,18 @@ export function releaseTaskAccountSwitch(taskId: string): void {
  * automatic swap is protected by its own `pendingSwap`; the manual path had
  * none. Returns false when the task or its stack no longer resolves.
  */
-export function beginManualAccountSwitch(
+export async function beginManualAccountSwitch(
   taskId: string,
   from: string,
   to: string,
   opts: { switchNow?: "manual" | "scheduled" } = {},
-): boolean {
-  const task = tasks.get(taskId);
+): Promise<boolean> {
+  const task = await tasks.get(taskId);
   if (!task) return false;
-  const stack = harnessStacks.getByMember(from);
+  const stack = await harnessStacks.getByMember(from);
   if (!stack) return false;
   const position = stack.members.findIndex((m) => m.harnessId === from);
-  updateTaskState(taskId, (state) => ({
+  await updateTaskState(taskId, (state) => ({
     stackId: stack.id,
     position: position < 0 ? 0 : position,
     count: stack.members.length,
@@ -4108,11 +4549,25 @@ export function beginManualAccountSwitch(
   return true;
 }
 
+/** Clear `pendingSwap` only while it still satisfies `matches`: the check and
+ *  the write are one atomic step on the state read inside it, so a newer swap
+ *  that was persisted meanwhile is never cleared. */
+async function clearPendingSwapIf(
+  taskId: string,
+  matches: (pending: NonNullable<TaskHarnessState["pendingSwap"]>) => boolean,
+): Promise<void> {
+  await updateTaskState(taskId, (state) => (
+    state?.pendingSwap && matches(state.pendingSwap) ? { ...state, pendingSwap: null } : KEEP_TASK_STATE
+  ));
+}
+
 /** Drop a manual-switch intent that never became a real move (the PATCH was
  *  refused, or its reconcile threw before writing the final state). */
-export function clearManualAccountSwitch(taskId: string): void {
-  if (!tasks.get(taskId)?.harnessState?.pendingSwap?.manual) return;
-  patchTaskState(taskId, { pendingSwap: null });
+export async function clearManualAccountSwitch(taskId: string): Promise<void> {
+  // The check and the clear are one atomic step on the state read inside it.
+  await updateTaskState(taskId, (state) => (
+    state?.pendingSwap?.manual ? { ...state, pendingSwap: null } : KEEP_TASK_STATE
+  ));
 }
 
 // ---------------------------------------------------------------------------
@@ -4134,17 +4589,17 @@ function memberReasonsText(reasons: readonly HarnessMemberReason[]): string {
 }
 
 /** The run a task-level status line should land on. */
-function noteRunIdOf(taskId: string): string | null {
-  return tasks.get(taskId)?.runId ?? runs.latestForTask(taskId)?.id ?? null;
+async function noteRunIdOf(taskId: string): Promise<string | null> {
+  return (await tasks.get(taskId))?.runId ?? (await runs.latestForTask(taskId))?.id ?? null;
 }
 
 /** True while a turn, a start/swap claim or a persisted swap owns the task, so
  *  an account move now would race it. */
-function accountSwitchMustWait(task: Task): boolean {
+async function accountSwitchMustWait(task: Task): Promise<boolean> {
   return (
     (task.runId != null && active.has(task.runId))
     || isTurnSettling(task.id)
-    || runs.hasRunning(task.id)
+    || await runs.hasRunning(task.id)
     || startingTaskIds.has(task.id)
     || swapWindowTaskIds.has(task.id)
     || Boolean(task.harnessState?.pendingSwap)
@@ -4152,11 +4607,16 @@ function accountSwitchMustWait(task: Task): boolean {
 }
 
 /** Drop a scheduled switch and say why on the task's latest run. */
-function dropScheduledSwitch(taskId: string, line: string): void {
-  if (!tasks.get(taskId)?.harnessState?.scheduledSwitch) return;
-  patchTaskState(taskId, { scheduledSwitch: null });
-  const runId = noteRunIdOf(taskId);
-  if (runId) saveStatusLineQuietly(runId, taskId, line);
+async function dropScheduledSwitch(taskId: string, line: string): Promise<void> {
+  let dropped = false;
+  await updateTaskState(taskId, (state) => {
+    if (!state?.scheduledSwitch) return KEEP_TASK_STATE;
+    dropped = true;
+    return { ...state, scheduledSwitch: null };
+  });
+  if (!dropped) return;
+  const runId = await noteRunIdOf(taskId);
+  if (runId) await saveStatusLineQuietly(runId, taskId, line);
 }
 
 /**
@@ -4165,32 +4625,32 @@ function dropScheduledSwitch(taskId: string, line: string): void {
  * switch claim. Never cools the old account and never adds it to `tried`.
  */
 async function moveTaskForSwitchNow(taskId: string, toId: string, trigger: "manual" | "scheduled"): Promise<void> {
-  const before = tasks.get(taskId);
+  const before = await tasks.get(taskId);
   if (!before) return;
   switchNowTaskIds.add(taskId);
-  beginManualAccountSwitch(taskId, before.agent, toId, { switchNow: trigger });
+  await beginManualAccountSwitch(taskId, before.agent, toId, { switchNow: trigger });
   let threw = false;
   try {
     // Awaited only when a test hook returns a promise: no yield in production.
     const heldByTest = scheduledSwitchTestHooks.afterIntent?.(taskId);
     if (heldByTest) await heldByTest;
-    const updated = tasks.update(taskId, { agent: toId });
+    const updated = await tasks.update(taskId, { agent: toId });
     if (!updated) {
-      clearManualAccountSwitch(taskId);
+      await clearManualAccountSwitch(taskId);
       return;
     }
     await reconcileTaskSession(taskId, before, updated, { switchNow: trigger });
   } catch (err) {
     threw = true;
-    clearManualAccountSwitch(taskId);
+    await clearManualAccountSwitch(taskId);
     throw err;
   } finally {
     // The final state write clears it; a path that bailed early must not
     // leave a request nobody will honour. A scheduled move that threw keeps
     // it for its caller, which drops it with the error
     // (`applyScheduledSwitch`).
-    if (!(threw && trigger === "scheduled") && tasks.get(taskId)?.harnessState?.scheduledSwitch) {
-      patchTaskState(taskId, { scheduledSwitch: null });
+    if (!(threw && trigger === "scheduled") && (await tasks.get(taskId))?.harnessState?.scheduledSwitch) {
+      await patchTaskState(taskId, { scheduledSwitch: null });
     }
   }
 }
@@ -4207,11 +4667,11 @@ const heldAfterQueueTaskIds = new Set<string>();
 async function drainHeldBehindQueue(taskId: string, stash: boolean): Promise<void> {
   if (!heldAfterQueueTaskIds.delete(taskId)) return;
   try {
-    if (stash) stashSwapFollowUps(taskId);
+    if (stash) await stashSwapFollowUps(taskId);
     else await drainSwapFollowUps(taskId);
   } catch (err) {
     console.warn(`[agetor] delivering messages held during the account switch for ${taskId} failed:`, err);
-    stashSwapFollowUps(taskId);
+    await stashSwapFollowUps(taskId);
   }
 }
 
@@ -4221,17 +4681,17 @@ async function drainHeldBehindQueue(taskId: string, stash: boolean): Promise<voi
  *  the order stays oldest first. */
 async function finishSwitchNow(taskId: string, behindQueue = false): Promise<void> {
   const stopped = switchStopRequested.has(taskId);
-  releaseTaskAccountSwitch(taskId);
+  await releaseTaskAccountSwitch(taskId);
   if (behindQueue && !stopped) {
     heldAfterQueueTaskIds.add(taskId);
     return;
   }
   try {
-    if (stopped) stashSwapFollowUps(taskId);
+    if (stopped) await stashSwapFollowUps(taskId);
     else await drainSwapFollowUps(taskId);
   } catch (err) {
     console.warn(`[agetor] delivering messages held during the account switch for ${taskId} failed:`, err);
-    stashSwapFollowUps(taskId);
+    await stashSwapFollowUps(taskId);
   }
 }
 
@@ -4245,14 +4705,61 @@ async function finishSwitchNow(taskId: string, behindQueue = false): Promise<voi
  * Throws {@link SwitchAccountRefusedError}. The caller checks the task exists.
  */
 export async function switchTaskAccountNow(taskId: string): Promise<SwitchAccountResult> {
-  const task = tasks.get(taskId);
-  if (!task) throw new Error(`task not found: ${taskId}`);
-  // Not awaited: this function checks the task's state and takes its claim in one
-  // synchronous run, and an await here would let a start slip in between. The
-  // `/harnesses` poll keeps the login cache warm in the app; this refresh only
-  // helps the next plan, and a cold cache fails open.
+  // An idle task takes the account-switch claim BEFORE the target is planned
+  // (planning reads the database, so it yields): a message arriving meanwhile
+  // is then held behind the move, exactly as it is once the move runs, instead
+  // of starting a turn that makes this switch refuse as busy. A refusal, or a
+  // request that is scheduled behind a live turn instead, gives the claim back
+  // (`finishSwitchNow` also delivers what was held).
+  //
+  // The claim is taken synchronously, before the task row is read, whenever
+  // what this process knows allows it (no start or switch claim, no live
+  // handle, not frozen); the database half of the idle check (a `running` run
+  // row, background agents holding the task) is read right after, and a task
+  // that fails it gives the claim back before anything else happens.
+  const tentative = !accountSwitchTaskIds.has(taskId)
+    && !startingTaskIds.has(taskId)
+    && !launchesFrozenFlag
+    && ![...active.values()].some((h) => h.taskId === taskId);
+  if (tentative) {
+    startingTaskIds.add(taskId);
+    accountSwitchTaskIds.add(taskId);
+    // The switch-now marker rides with the claim from here, so a message that
+    // arrives while the target is planned is held (`sendInput`) and a Cancel
+    // of a scheduled switch answers busy, as they do once the move itself runs.
+    switchNowTaskIds.add(taskId);
+  }
+  const claimState = { preClaimed: tentative, released: false };
+  try {
+    const task = await tasks.get(taskId);
+    if (!task) throw new Error(`task not found: ${taskId}`);
+    if (tentative) {
+      const idleAtCall = !((task.runId != null && active.has(task.runId)) || await runs.hasRunning(taskId));
+      if (!idleAtCall || await backgroundAgentsHoldTask(taskId)) {
+        // Not idle after all: no claim (the request is scheduled behind the
+        // live turn, or refused for the agents), and whatever was held in the
+        // meantime goes out through the ordinary path.
+        claimState.preClaimed = false;
+        await finishSwitchNow(taskId);
+      }
+    }
+    return await switchTaskAccountNowClaimed(taskId, task, claimState);
+  } finally {
+    if (claimState.preClaimed && !claimState.released) await finishSwitchNow(taskId);
+  }
+}
+
+async function switchTaskAccountNowClaimed(
+  taskId: string,
+  task: Task,
+  claimState: { preClaimed: boolean; released: boolean },
+): Promise<SwitchAccountResult> {
+  // Not awaited: the login probe can take seconds, and the claim above is held
+  // until this switch settles. The `/harnesses` poll keeps the login cache warm
+  // in the app; this refresh only helps the next plan, and a cold cache fails
+  // open.
   void warmStackLogins(task).catch(() => {});
-  const plan = planManualSwitchTarget(task);
+  const plan = await planManualSwitchTarget(task);
   if (plan.kind === "refused") {
     throw new SwitchAccountRefusedError({
       error: plan.code === "not-in-stack"
@@ -4271,13 +4778,13 @@ export async function switchTaskAccountNow(taskId: string): Promise<SwitchAccoun
   // The same check the PATCH route makes: the switch drops the REPL that hosts
   // the background agents, whether the turn that left them running succeeded
   // or failed.
-  if (backgroundAgentsHoldTask(taskId)) {
+  if (await backgroundAgentsHoldTask(taskId)) {
     throw new SwitchAccountRefusedError({
       error: "stop the background agents before switching accounts",
       code: "background-agents",
     });
   }
-  if (accountSwitchTaskIds.has(taskId)) {
+  if (!claimState.preClaimed && accountSwitchTaskIds.has(taskId)) {
     throw new SwitchAccountRefusedError({ error: "switching accounts — try again in a moment", code: "busy" });
   }
   // A claim alone (a start that has not minted its run yet) is not a turn the
@@ -4297,18 +4804,18 @@ export async function switchTaskAccountNow(taskId: string): Promise<SwitchAccoun
     });
   }
   // Only a genuinely live run can be waited for.
-  const liveTurn = (task.runId != null && active.has(task.runId)) || runs.hasRunning(taskId);
+  const liveTurn = (task.runId != null && active.has(task.runId)) || await runs.hasRunning(taskId);
   if (launchesFrozenFlag && !liveTurn) {
     throw new SwitchAccountRefusedError({ error: LAUNCHES_FROZEN_REASON, code: "launches-frozen" });
   }
-  if (!liveTurn && startingTaskIds.has(taskId)) {
+  if (!claimState.preClaimed && !liveTurn && startingTaskIds.has(taskId)) {
     throw new SwitchAccountRefusedError({ error: "task is busy starting a turn — try again in a moment", code: "busy" });
   }
   if (liveTurn) {
     if (!task.harnessState?.scheduledSwitch) {
       const requestedAt = Date.now();
-      updateTaskState(taskId, (state, current) => {
-        const resolved = harnessStacks.resolveForTask(current);
+      await updateTaskState(taskId, async (state, current) => {
+        const resolved = await harnessStacks.resolveForTask(current);
         const base: TaskHarnessState = state ?? {
           stackId: plan.stack.id,
           position: resolved?.position ?? 0,
@@ -4320,20 +4827,22 @@ export async function switchTaskAccountNow(taskId: string): Promise<SwitchAccoun
         };
         return { ...base, scheduledSwitch: { requestedAt } };
       });
-      const runId = noteRunIdOf(taskId);
-      if (runId) saveStatusLineQuietly(runId, taskId, "switch to the next account scheduled for the end of this turn");
+      const runId = await noteRunIdOf(taskId);
+      if (runId) await saveStatusLineQuietly(runId, taskId, "switch to the next account scheduled for the end of this turn");
     }
-    return { status: "scheduled", task: tasks.get(taskId) ?? task };
+    return { status: "scheduled", task: await tasks.get(taskId) ?? task };
   }
-  if (!claimTaskForAccountSwitch(taskId)) {
+  if (!claimState.preClaimed && !await claimTaskForAccountSwitch(taskId)) {
     throw new SwitchAccountRefusedError({ error: "task is busy starting a turn — try again in a moment", code: "busy" });
   }
+  claimState.preClaimed = true;
   try {
     await moveTaskForSwitchNow(taskId, plan.member.harnessId, "manual");
   } finally {
+    claimState.released = true;
     await finishSwitchNow(taskId);
   }
-  const after = tasks.get(taskId);
+  const after = await tasks.get(taskId);
   if (!after || after.agent !== plan.member.harnessId) {
     // `reconcileTaskSession` put the row back: background agents appeared
     // between the check and the claim.
@@ -4344,12 +4853,12 @@ export async function switchTaskAccountNow(taskId: string): Promise<SwitchAccoun
 
 /** Clear a scheduled switch (the user cancelled it). A no-op returning the task
  *  when nothing is scheduled. The caller checks the task exists. */
-export function cancelScheduledAccountSwitch(taskId: string, line = "scheduled account switch cancelled"): Task {
-  const task = tasks.get(taskId);
+export async function cancelScheduledAccountSwitch(taskId: string, line = "scheduled account switch cancelled"): Promise<Task> {
+  const task = await tasks.get(taskId);
   if (!task) throw new Error(`task not found: ${taskId}`);
   if (!task.harnessState?.scheduledSwitch) return task;
-  dropScheduledSwitch(taskId, line);
-  return tasks.get(taskId) ?? task;
+  await dropScheduledSwitch(taskId, line);
+  return await tasks.get(taskId) ?? task;
 }
 
 /**
@@ -4360,20 +4869,19 @@ export function cancelScheduledAccountSwitch(taskId: string, line = "scheduled a
  * are frozen (the next owner's boot performs it).
  */
 async function applyScheduledSwitch(taskId: string, behindQueue = false): Promise<void> {
-  const task = tasks.get(taskId);
+  const task = await tasks.get(taskId);
   if (!task?.harnessState?.scheduledSwitch) return;
   if (launchesFrozenFlag) return;
   // Background agents hold the task, or a turn is live: the request stays
   // persisted and is applied when they finish (`maybeReleaseHeldTask`) or the
   // turn ends. `reconcileTaskSession` must never see a live run, or it would
   // take its "start fresh" branch.
-  if (backgroundAgentsHoldTask(taskId) || runs.hasRunning(taskId)) return;
-  // Not awaited, for the reason `switchTaskAccountNow` gives: the checks above and
-  // the claim below must stay one synchronous run.
+  if (await backgroundAgentsHoldTask(taskId) || await runs.hasRunning(taskId)) return;
+  // Not awaited, for the reason `switchTaskAccountNowClaimed` gives.
   void warmStackLogins(task).catch(() => {});
-  const plan = planManualSwitchTarget(task);
+  const plan = await planManualSwitchTarget(task);
   if (plan.kind === "refused") {
-    dropScheduledSwitch(
+    await dropScheduledSwitch(
       taskId,
       plan.code === "not-in-stack"
         ? "scheduled account switch dropped: the task is no longer in a stack with a backup account"
@@ -4381,12 +4889,12 @@ async function applyScheduledSwitch(taskId: string, behindQueue = false): Promis
     );
     return;
   }
-  if (!claimTaskForAccountSwitch(taskId)) return;
+  if (!await claimTaskForAccountSwitch(taskId)) return;
   try {
     await moveTaskForSwitchNow(taskId, plan.member.harnessId, "scheduled");
   } catch (err) {
     console.warn(`[agetor] scheduled account switch for ${taskId} failed:`, err);
-    dropScheduledSwitch(taskId, `scheduled account switch failed: ${err instanceof Error ? err.message : String(err)}`);
+    await dropScheduledSwitch(taskId, `scheduled account switch failed: ${err instanceof Error ? err.message : String(err)}`);
   } finally {
     await finishSwitchNow(taskId, behindQueue);
   }
@@ -4403,22 +4911,22 @@ async function settleScheduledSwitchAtTurnEnd(
   status: RunStatus,
   wasCancelled: boolean,
 ): Promise<void> {
-  const task = tasks.get(taskId);
+  const task = await tasks.get(taskId);
   if (!task?.harnessState?.scheduledSwitch) return;
   // A newer turn already owns the task: its end decides.
   if (task.runId !== runId) return;
   if (wasCancelled || status === "cancelled") {
-    dropScheduledSwitch(taskId, "scheduled account switch cancelled (stopped)");
+    await dropScheduledSwitch(taskId, "scheduled account switch cancelled (stopped)");
     return;
   }
   // Another start holds the task: its run's turn end decides, or, when it ends
   // without a live run, the claim release does (`releaseStartingClaim`).
   if (startingTaskIds.has(taskId)) return;
-  if (backgroundAgentsHoldTask(taskId)) {
+  if (await backgroundAgentsHoldTask(taskId)) {
     // Dropping the REPL would abandon the background agents: wait for them
     // (`maybeReleaseHeldTask` applies it; a Stop drops it).
-    const noteRunId = noteRunIdOf(taskId);
-    if (noteRunId) saveStatusLineQuietly(noteRunId, taskId, "will switch to the next account once the background agents finish");
+    const noteRunId = await noteRunIdOf(taskId);
+    if (noteRunId) await saveStatusLineQuietly(noteRunId, taskId, "will switch to the next account once the background agents finish");
     return;
   }
   await applyScheduledSwitch(taskId, true);
@@ -4434,24 +4942,32 @@ async function settleScheduledSwitchAtTurnEnd(
  * own end. Fire-and-forget.
  */
 function settleWaitingScheduledSwitch(taskId: string, opts: { stopped?: boolean } = {}): void {
+  // Fire-and-forget, as ever: the synchronous prefix (the test hook, the reads)
+  // runs before this returns, the harness-state writes follow.
+  void settleWaitingScheduledSwitchNow(taskId, opts).catch((err) => {
+    console.warn(`[agetor] settling a waiting account switch for ${taskId} failed:`, err);
+  });
+}
+
+async function settleWaitingScheduledSwitchNow(taskId: string, opts: { stopped?: boolean } = {}): Promise<void> {
   scheduledSwitchTestHooks.waitingSettle?.(taskId);
-  const task = tasks.get(taskId);
+  const task = await tasks.get(taskId);
   const scheduled = task?.harnessState?.scheduledSwitch;
   if (!task || !scheduled) return;
   if (task.archivedAt != null) {
-    patchTaskState(taskId, { scheduledSwitch: null });
+    await patchTaskState(taskId, { scheduledSwitch: null });
     return;
   }
   // A Stop that landed on the start holding the task: either recorded on the
   // claim with no run to adopt it, or adopted by a run that was cancelled
   // before it registered (no done handler ever settles that run).
-  const latest = task.runId ? runs.get(task.runId) : null;
+  const latest = task.runId ? await runs.get(task.runId) : null;
   if (opts.stopped || (latest?.status === "cancelled" && (latest.endedAt ?? 0) >= scheduled.requestedAt)) {
-    dropScheduledSwitch(taskId, "scheduled account switch cancelled (stopped)");
+    await dropScheduledSwitch(taskId, "scheduled account switch cancelled (stopped)");
     return;
   }
   if (launchesFrozenFlag) return;
-  if (accountSwitchMustWait(task) || backgroundAgentsHoldTask(taskId)) return;
+  if (await accountSwitchMustWait(task) || await backgroundAgentsHoldTask(taskId)) return;
   void applyScheduledSwitch(taskId).catch((err) => {
     console.warn(`[agetor] deferred account switch for ${taskId} failed:`, err);
   });
@@ -4460,8 +4976,8 @@ function settleWaitingScheduledSwitch(taskId: string, opts: { stopped?: boolean 
 /** A limit settlement that threw supersedes a scheduled switch exactly as one
  *  that moved or blocked the task does (it is consumed there); the throw can
  *  land before that point, and the task is blocked either way. */
-function dropScheduledSwitchAfterFailedLimitMove(taskId: string): void {
-  dropScheduledSwitch(taskId, "scheduled account switch dropped: the account switch after the limit failed");
+function dropScheduledSwitchAfterFailedLimitMove(taskId: string): Promise<void> {
+  return dropScheduledSwitch(taskId, "scheduled account switch dropped: the account switch after the limit failed");
 }
 
 /**
@@ -4470,17 +4986,17 @@ function dropScheduledSwitchAfterFailedLimitMove(taskId: string): void {
  * end; a pending swap's reconcile owns its state.
  */
 async function reconcileScheduledSwitchesAtBoot(): Promise<void> {
-  for (const task of tasks.list()) {
+  for (const task of await tasks.list()) {
     if (!task.harnessState?.scheduledSwitch) continue;
     if (launchesFrozenFlag) return;
     if (task.archivedAt != null) {
-      patchTaskState(task.id, { scheduledSwitch: null });
+      await patchTaskState(task.id, { scheduledSwitch: null });
       continue;
     }
     // Background agents still running after the restart (the subagent
     // watcher is re-armed at boot) hold the request whether the turn that
     // left them succeeded or failed; their release edge applies it.
-    if (accountSwitchMustWait(task) || backgroundAgentsHoldTask(task.id)) continue;
+    if (await accountSwitchMustWait(task) || await backgroundAgentsHoldTask(task.id)) continue;
     try {
       await applyScheduledSwitch(task.id);
     } catch (err) {
@@ -4652,14 +5168,14 @@ async function drainSwapFollowUps(taskId: string): Promise<void> {
   swapFollowUps.delete(taskId);
   for (let i = 0; i < q.length; i++) {
     const item = q[i]!;
-    const task = tasks.get(taskId);
+    const task = await tasks.get(taskId);
     if (!task?.runId) {
-      stashFollowUpBatch(taskId, q.slice(i).map((rest) => rest.text));
+      await stashFollowUpBatch(taskId, q.slice(i).map((rest) => rest.text));
       return;
     }
     const result = await sendHeldFollowUp(task.runId, item, false);
     if (!result.delivered) {
-      stashFollowUpBatch(taskId, q.slice(i).map((rest) => rest.text));
+      await stashFollowUpBatch(taskId, q.slice(i).map((rest) => rest.text));
       return;
     }
   }
@@ -4691,7 +5207,7 @@ async function deliverHeldFollowUpsToSuccessor(taskId: string, runId: string): P
     }
     // An archive in between must not be undone by a send (`sendInput`
     // un-archives); the window-close stash puts the rest in the tray.
-    const current = tasks.get(taskId);
+    const current = await tasks.get(taskId);
     if (!active.has(runId) || current?.runId !== runId || current.archivedAt != null || launchesFrozenFlag) return;
     const item = q.shift()!;
     if (q.length === 0) swapFollowUps.delete(taskId);
@@ -4700,18 +5216,18 @@ async function deliverHeldFollowUpsToSuccessor(taskId: string, runId: string): P
       // Back at the head, then everything goes to the tray in typed order.
       const rest = swapFollowUps.get(taskId) ?? [];
       swapFollowUps.set(taskId, [item, ...rest]);
-      stashSwapFollowUps(taskId);
+      await stashSwapFollowUps(taskId);
       return;
     }
   }
 }
 
 /** Re-stash every held follow-up (Stop/archive/delete during the window). */
-function stashSwapFollowUps(taskId: string): void {
+async function stashSwapFollowUps(taskId: string): Promise<void> {
   const q = swapFollowUps.get(taskId);
   if (!q || q.length === 0) return;
   swapFollowUps.delete(taskId);
-  stashFollowUpBatch(taskId, [...q].reverse().map((item) => item.text));
+  await stashFollowUpBatch(taskId, [...q].reverse().map((item) => item.text));
 }
 
 /**
@@ -4722,21 +5238,21 @@ function stashSwapFollowUps(taskId: string): void {
  * for the hours a retry timer can wait answered `{delivered: true}` for text
  * a restart would silently lose.
  */
-function stashHeldFollowUpsUnlessLive(taskId: string): void {
-  const runId = tasks.get(taskId)?.runId;
+async function stashHeldFollowUpsUnlessLive(taskId: string): Promise<void> {
+  const runId = (await tasks.get(taskId))?.runId;
   if (runId && active.has(runId)) return;
-  stashSwapFollowUps(taskId);
+  await stashSwapFollowUps(taskId);
 }
 
 /** Delete the cooldown row a run stored itself, only while it is still the
  *  row it stored (same key and `updatedAt`): a newer overwrite survives. */
-function clearOwnLimitState(own: { harnessId: string; model: string | null; updatedAt: number }): void {
-  const still = harnessStacks.listLimitStates().some(
+async function clearOwnLimitState(own: { harnessId: string; model: string | null; updatedAt: number }): Promise<void> {
+  const still = (await harnessStacks.listLimitStates()).some(
     (row) => row.harnessId === own.harnessId && (row.model ?? null) === own.model && row.updatedAt === own.updatedAt,
   );
   if (!still) return;
-  if (own.model) harnessStacks.clearLimitState(own.harnessId, { model: own.model });
-  else harnessStacks.clearLimitState(own.harnessId, { startedAtMs: own.updatedAt });
+  if (own.model) await harnessStacks.clearLimitState(own.harnessId, { model: own.model });
+  else await harnessStacks.clearLimitState(own.harnessId, { startedAtMs: own.updatedAt });
 }
 
 /**
@@ -4748,12 +5264,12 @@ function clearOwnLimitState(own: { harnessId: string; model: string | null; upda
  * follow-up as its own later turn) and the messages held during the swap
  * window. A started successor drains these itself, so it never calls this.
  */
-function stashFollowUpsWithoutSuccessor(taskId: string, statusRunId: string | null, midTurnRunId?: string | null): void {
+async function stashFollowUpsWithoutSuccessor(taskId: string, statusRunId: string | null, midTurnRunId?: string | null): Promise<void> {
   // `backlog.add` prepends, so the newest group goes in first and the tray
   // reads oldest to newest from the top: held (newest), queued, mid-turn.
-  stashSwapFollowUps(taskId);
-  stashQueuedFollowUps(taskId, statusRunId || null, "no new turn started after the account switch");
-  if (midTurnRunId) stashUndeliveredMidTurnFollowUps(taskId, midTurnRunId);
+  await stashSwapFollowUps(taskId);
+  await stashQueuedFollowUps(taskId, statusRunId || null, "no new turn started after the account switch");
+  if (midTurnRunId) await stashUndeliveredMidTurnFollowUps(taskId, midTurnRunId);
 }
 
 /**
@@ -4761,8 +5277,8 @@ function stashFollowUpsWithoutSuccessor(taskId: string, statusRunId: string | nu
  * undefined. An `inFlight` retry already started its successor, which carries
  * the follow-ups itself.
  */
-function unrunCleanRetryOf(taskId: string): string | undefined {
-  const ex = tasks.get(taskId)?.harnessState?.allExhausted;
+async function unrunCleanRetryOf(taskId: string): Promise<string | undefined> {
+  const ex = (await tasks.get(taskId))?.harnessState?.allExhausted;
   return ex && !ex.inFlight ? ex.cleanRetryOf : undefined;
 }
 
@@ -4775,17 +5291,17 @@ function unrunCleanRetryOf(taskId: string): string | undefined {
  * new messages; the rest is newer and is kept in order without repeating a
  * message. A sequential-turn harness (Codex) replays only the first row.
  */
-function cleanRetryChainParts(taskId: string, retryOfRunId: string): string[] {
-  const firstOnly = runHarnessKind(retryOfRunId) !== "claude-code";
-  const parts = cleanRetryPartsFromRows(runs.mainUserRows(retryOfRunId), { firstOnly });
-  const original = runs.get(retryOfRunId);
+async function cleanRetryChainParts(taskId: string, retryOfRunId: string): Promise<string[]> {
+  const firstOnly = await runHarnessKind(retryOfRunId) !== "claude-code";
+  const parts = cleanRetryPartsFromRows(await runs.mainUserRows(retryOfRunId), { firstOnly });
+  const original = await runs.get(retryOfRunId);
   if (original && !firstOnly) {
-    const later = runs
-      .listForTask(taskId)
+    const later = (await runs
+      .listForTask(taskId))
       .filter((r) => r.origin === "harness-swap" && r.startedAt > original.startedAt)
       .sort((a, b) => a.startedAt - b.startedAt);
     for (const run of later) {
-      for (const part of cleanRetryPartsFromRows(runs.mainUserRows(run.id), {}).slice(1)) {
+      for (const part of cleanRetryPartsFromRows(await runs.mainUserRows(run.id), {}).slice(1)) {
         if (!parts.includes(part)) parts.push(part);
       }
     }
@@ -4800,18 +5316,18 @@ function cleanRetryChainParts(taskId: string, retryOfRunId: string): string[] {
  * sequential-turn harness (Codex) replays only the first row: its follow-ups
  * were queued turns, already stashed when the retry blocked.
  */
-function stashCleanRetryFollowUps(taskId: string, retryOfRunId: string): void {
-  const chain = cleanRetryChainParts(taskId, retryOfRunId);
+async function stashCleanRetryFollowUps(taskId: string, retryOfRunId: string): Promise<void> {
+  const chain = await cleanRetryChainParts(taskId, retryOfRunId);
   // Drop the first part only when it is the task prompt (what the replay would
   // have re-sent anyway). A fresh start on another account whose first message
   // was something else keeps every part: none of them is the prompt.
-  const prompt = canonicalizeUserText((tasks.get(taskId)?.prompt ?? "").replace(/\r\n?/g, "\n")).trim();
+  const prompt = canonicalizeUserText(((await tasks.get(taskId))?.prompt ?? "").replace(/\r\n?/g, "\n")).trim();
   const parts = chain.length > 0 && chain[0] === prompt ? chain.slice(1) : chain;
   if (parts.length === 0) return;
   // `backlog.add` PREPENDS: restash newest first so the tray reads in send order.
-  const saved = stashFollowUpBatch(taskId, [...parts].reverse());
+  const saved = await stashFollowUpBatch(taskId, [...parts].reverse());
   if (saved === 0) return;
-  saveStatusLineQuietly(
+  await saveStatusLineQuietly(
     retryOfRunId,
     taskId,
     `${saved === 1 ? "a message" : `${saved} messages`} sent before the account retry — saved to your backlog, resend from the tray`,
@@ -4820,32 +5336,32 @@ function stashCleanRetryFollowUps(taskId: string, retryOfRunId: string): void {
 
 /** End an armed clean retry's claim on its follow-ups: clear the marker first
  *  (a stash happens at most once) and stash them. */
-function endCleanRetry(taskId: string, alsoStash?: () => void): void {
-  const retryOf = unrunCleanRetryOf(taskId);
+async function endCleanRetry(taskId: string, alsoStash?: () => Promise<void>): Promise<void> {
+  const retryOf = await unrunCleanRetryOf(taskId);
   if (retryOf) {
-    patchTaskState(taskId, (state) => (
+    await patchTaskState(taskId, (state) => (
       state.allExhausted ? { allExhausted: { ...state.allExhausted, cleanRetryOf: undefined } } : {}
     ));
   }
   // The retry's follow-ups precede everything queued or held after them, so
   // they are stashed last (the tray prepends).
-  alsoStash?.();
-  if (retryOf) stashCleanRetryFollowUps(taskId, retryOf);
+  if (alsoStash) await alsoStash();
+  if (retryOf) await stashCleanRetryFollowUps(taskId, retryOf);
 }
 
 /** `planExhausted` for the re-arm paths (a retry that found nothing usable, a
  *  failed retry spawn): when the new state no longer holds an armed clean retry
  *  (the cap was reached, or nothing can reset by itself), the retry ended
  *  without running and its follow-ups go back to the tray. */
-function planExhaustedTracked(
+async function planExhaustedTracked(
   taskId: string,
   plan: Parameters<typeof planExhausted>[1],
   now = Date.now(),
   opts: Parameters<typeof planExhausted>[3] = {},
 ): ReturnType<typeof planExhausted> {
-  const priorOf = unrunCleanRetryOf(taskId);
-  const persisted = planExhausted(taskId, plan, now, opts);
-  if (priorOf && persisted?.allExhausted?.cleanRetryOf !== priorOf) stashCleanRetryFollowUps(taskId, priorOf);
+  const priorOf = await unrunCleanRetryOf(taskId);
+  const persisted = await planExhausted(taskId, plan, now, opts);
+  if (priorOf && persisted?.allExhausted?.cleanRetryOf !== priorOf) await stashCleanRetryFollowUps(taskId, priorOf);
   return persisted;
 }
 
@@ -4855,41 +5371,45 @@ async function prepareTaskHarnessForUser(
   taskId: string,
   opts: Parameters<typeof prepareTaskHarness>[1],
 ): ReturnType<typeof prepareTaskHarness> {
-  const retryOf = unrunCleanRetryOf(taskId);
+  const retryOf = await unrunCleanRetryOf(taskId);
   const result = await prepareTaskHarness(taskId, opts);
-  if (retryOf && tasks.get(taskId)?.harnessState?.allExhausted?.cleanRetryOf !== retryOf) {
-    stashCleanRetryFollowUps(taskId, retryOf);
+  if (retryOf && (await tasks.get(taskId))?.harnessState?.allExhausted?.cleanRetryOf !== retryOf) {
+    await stashCleanRetryFollowUps(taskId, retryOf);
   }
   return result;
 }
 
 /** The stack a task's history row belongs to, or null (no row is written). */
-function historyStackIdOf(task: Task, accountId: string): string | null {
-  return harnessStacks.getByMember(accountId)?.id ?? harnessStacks.resolveForTask(task)?.stack.id ?? task.harnessState?.stackId ?? null;
+async function historyStackIdOf(task: Task, accountId: string): Promise<string | null> {
+  return (await harnessStacks.getByMember(accountId))?.id ?? (await harnessStacks.resolveForTask(task))?.stack.id ?? task.harnessState?.stackId ?? null;
 }
 
 /** One history row for a blocked outcome (no move). Never throws. */
-function recordBlockedHistory(
+async function recordBlockedHistory(
   taskId: string,
   runId: string | null,
   reason: NonNullable<HarnessSwapEvent["reason"]>,
   signal: HarnessLimitSignal | null,
-): void {
-  const task = tasks.get(taskId);
+): Promise<void> {
+  const task = await tasks.get(taskId);
   if (!task) return;
-  const from = (runId ? runs.get(runId)?.agent : null) ?? task.agent;
-  const stackId = historyStackIdOf(task, from);
-  if (!stackId) return;
-  recordHarnessSwapEvent({
-    task,
-    stackId,
-    trigger: "blocked",
-    fromHarnessId: from,
-    toHarnessId: null,
-    reason,
-    signal,
-    fromRunId: runId || null,
-  });
+  const from = (runId ? (await runs.get(runId))?.agent : null) ?? task.agent;
+  try {
+    const stackId = await historyStackIdOf(task, from);
+    if (!stackId) return;
+    await recordHarnessSwapEvent({
+      task,
+      stackId,
+      trigger: "blocked",
+      fromHarnessId: from,
+      toHarnessId: null,
+      reason,
+      signal,
+      fromRunId: runId || null,
+    });
+  } catch (err) {
+    console.warn(`[agetor] harness swap history write failed for task ${taskId}:`, err);
+  }
 }
 
 /**
@@ -4914,32 +5434,32 @@ function runDeferredLimitSettlement(taskId: string): void {
 
 async function settleDeferredLimit(taskId: string, runId: string, signal: HarnessLimitSignal): Promise<void> {
   // Something else (boot orphaning, a delete) already ended the run.
-  if (runs.get(runId)?.status !== "running") return;
-  const task = tasks.get(taskId);
+  if ((await runs.get(runId))?.status !== "running") return;
+  const task = await tasks.get(taskId);
   if (task && task.runId === runId) {
     try {
       if (await handleHarnessLimitSettlement({ task, runId, signal }) === "handled") return;
     } catch (err) {
       console.warn(`[agetor] harness swap settlement failed for task ${taskId}:`, err);
-      if (tasks.get(taskId)?.harnessState?.pendingSwap?.runId === runId) patchTaskState(taskId, { pendingSwap: null });
+      await clearPendingSwapIf(taskId, (pending) => pending.runId === runId);
       swapCancelRequested.delete(taskId);
-      runs.update(runId, { status: "failed", endedAt: Date.now(), exitCode: -1 });
-      saveStatusLineQuietly(runId, taskId, `switching accounts failed: ${err instanceof Error ? err.message : String(err)}`);
-      dropScheduledSwitchAfterFailedLimitMove(taskId);
-      updateColumn(taskId, runId, "blocked", "harness-swap-failed");
-      recordBlockedHistory(taskId, runId, signal.reason, { ...signal, message: `the account switch failed: ${err instanceof Error ? err.message : String(err)}` });
-      emitGlobal({ kind: "run-status", taskId, runId, status: "failed", ts: Date.now(), reason: "harness-swap" });
+      await runs.update(runId, { status: "failed", endedAt: Date.now(), exitCode: -1 });
+      await saveStatusLineQuietly(runId, taskId, `switching accounts failed: ${err instanceof Error ? err.message : String(err)}`);
+      await dropScheduledSwitchAfterFailedLimitMove(taskId);
+      await updateColumn(taskId, runId, "blocked", "harness-swap-failed");
+      await recordBlockedHistory(taskId, runId, signal.reason, { ...signal, message: `the account switch failed: ${err instanceof Error ? err.message : String(err)}` });
+      await emitGlobal({ kind: "run-status", taskId, runId, status: "failed", ts: Date.now(), reason: "harness-swap" });
       return;
     }
   }
   // No swap target (or the task moved on): the normal failed settle.
-  runs.update(runId, { status: "failed", endedAt: Date.now(), exitCode: -1 });
-  const current = tasks.get(taskId);
+  await runs.update(runId, { status: "failed", endedAt: Date.now(), exitCode: -1 });
+  const current = await tasks.get(taskId);
   const isTerminalRun = !!current && current.runId === runId;
-  if (isTerminalRun) updateColumn(taskId, runId, "ready");
-  saveStatusLineQuietly(runId, taskId, "exit:-1");
+  if (isTerminalRun) await updateColumn(taskId, runId, "ready", undefined, { runId });
+  await saveStatusLineQuietly(runId, taskId, "exit:-1");
   if (isTerminalRun) {
-    emitGlobal({ kind: "run-status", taskId, runId, status: "failed", ts: Date.now() });
+    await emitGlobal({ kind: "run-status", taskId, runId, status: "failed", ts: Date.now() });
   } else {
     reportDisplacedStepRunSettled(current, taskId, runId, "failed");
   }
@@ -4974,12 +5494,12 @@ function noteMidTurnFollowUp(runId: string, text: string): void {
  * over mark the oldest noted follow-ups of that text as delivered, so two
  * identical unread sends are never counted as one delivered pair.
  */
-function undeliveredMidTurnFollowUps(runId: string): string[] {
+async function undeliveredMidTurnFollowUps(runId: string): Promise<string[]> {
   const noted = midTurnFollowUps.get(runId);
   if (!noted || noted.length === 0) return [];
   const echoes = new Map<string, number>();
   const twins = new Map<string, number>();
-  for (const row of runs.mainUserRows(runId)) {
+  for (const row of await runs.mainUserRows(runId)) {
     const key = composeCleanRetryText([row.data]);
     if (key === null) continue;
     const m = row.twin ? twins : echoes;
@@ -5021,14 +5541,14 @@ function undeliveredMidTurnFollowUps(runId: string): string[] {
  * passthrough branch. Without it the REPL that held them in its input box was
  * dropped and the text was gone although the sender saw it as sent.
  */
-function stashUndeliveredMidTurnFollowUps(taskId: string, runId: string): void {
-  const texts = undeliveredMidTurnFollowUps(runId);
+async function stashUndeliveredMidTurnFollowUps(taskId: string, runId: string): Promise<void> {
+  const texts = await undeliveredMidTurnFollowUps(runId);
   midTurnFollowUps.delete(runId);
   if (texts.length === 0) return;
   // `backlog.add` PREPENDS: restash newest first so the tray reads in send order.
-  const saved = stashFollowUpBatch(taskId, [...texts].reverse());
+  const saved = await stashFollowUpBatch(taskId, [...texts].reverse());
   if (saved === 0) return;
-  saveStatusLineQuietly(
+  await saveStatusLineQuietly(
     runId,
     taskId,
     `${saved === 1 ? "a message claude had not read yet" : `${saved} messages claude had not read yet`} — saved to your backlog, resend from the tray`,
@@ -5055,8 +5575,8 @@ export const isHiddenContinuationUserText: (text: string) => boolean = dbIsHidde
  * `Task.agent` may already have moved to the backup when the old run settles,
  * so callers pass the run's own `agent`.
  */
-function harnessLineFor(taskId: string, runId: string): string {
-  return runs.get(runId)?.agent ?? taskHarnessId(tasks.get(taskId) ?? { agent: "" });
+async function harnessLineFor(taskId: string, runId: string): Promise<string> {
+  return (await runs.get(runId))?.agent ?? taskHarnessId(await tasks.get(taskId) ?? { agent: "" });
 }
 
 /**
@@ -5064,9 +5584,9 @@ function harnessLineFor(taskId: string, runId: string): string {
  * backup. A 0/1-member stack is deliberately inert (plan assumption 6): it
  * must behave exactly like a lone account — no failover, no retry loop.
  */
-function harnessFailoverEnabledFor(task: Pick<Task, "id" | "agent" | "harnessState"> | null | undefined): boolean {
+async function harnessFailoverEnabledFor(task: Pick<Task, "id" | "agent" | "harnessState"> | null | undefined): Promise<boolean> {
   if (!task) return false;
-  const resolved = harnessStacks.resolveForTask(task);
+  const resolved = await harnessStacks.resolveForTask(task);
   return resolved !== null && resolved.stack.members.length >= 2;
 }
 
@@ -5094,13 +5614,13 @@ export function __noteMidTurnFollowUpForTest(runId: string, text: string): void 
 
 /** The harness kind of the account a run executed on (not `task.agent`,
  *  which a swap may already have moved). */
-function runHarnessKind(runId: string): AgentKind | null {
-  const agent = runs.get(runId)?.agent;
-  return agent ? resolveHarness(agent)?.kind ?? null : null;
+async function runHarnessKind(runId: string): Promise<AgentKind | null> {
+  const agent = (await runs.get(runId))?.agent;
+  return agent ? (await resolveHarness(agent))?.kind ?? null : null;
 }
 
-function harnessLabelOf(harnessId: string): string {
-  return resolveHarness(harnessId)?.label ?? harnessId;
+async function harnessLabelOf(harnessId: string): Promise<string> {
+  return (await resolveHarness(harnessId))?.label ?? harnessId;
 }
 
 function harnessSessionColumnFor(kind: AgentKind): SessionIdColumn | null {
@@ -5117,7 +5637,7 @@ function harnessSessionColumnFor(kind: AgentKind): SessionIdColumn | null {
  * transfer so the spawn starts on the new account.
  */
 async function dropSessionAfterAccountMove(taskId: string, fromHarnessId: string): Promise<void> {
-  const kind = resolveHarness(fromHarnessId)?.kind;
+  const kind = (await resolveHarness(fromHarnessId))?.kind;
   try {
     if (kind === "claude-code") await dropSession(taskId);
     else if (kind === "codex") await dropCodexSession(taskId);
@@ -5143,15 +5663,15 @@ async function dropPausedLimitedSession(
   signal: HarnessLimitSignal,
 ): Promise<void> {
   if (signal.source !== "claude-pane") return;
-  const harnessId = runs.get(runId)?.agent ?? tasks.get(taskId)?.agent ?? "";
-  if (resolveHarness(harnessId)?.kind !== "claude-code") return;
+  const harnessId = (await runs.get(runId))?.agent ?? (await tasks.get(taskId))?.agent ?? "";
+  if ((await resolveHarness(harnessId))?.kind !== "claude-code") return;
   try {
     await dropSession(taskId);
   } catch (err) {
     console.warn(`[agetor] dropping the paused limited session for ${taskId} failed:`, err);
   }
   // Whatever sat in the dropped REPL's input box is gone with it (R-S12).
-  stashUndeliveredMidTurnFollowUps(taskId, runId);
+  await stashUndeliveredMidTurnFollowUps(taskId, runId);
 }
 
 /**
@@ -5192,7 +5712,7 @@ async function handleHarnessLimitSettlement(args: {
       // the run is never failed with its column undecided and no second
       // successor is minted next to the one this window is finishing.
       deferredLimitSettlements.set(taskId, { runId, signal });
-      saveStatusLineQuietly(runId, taskId, `account limit reached (${limitReasonText(signal.reason)}) — switching once the current switch settles`);
+      await saveStatusLineQuietly(runId, taskId, `account limit reached (${limitReasonText(signal.reason)}) — switching once the current switch settles`);
       return "handled";
     }
     // A manual start or an account switch holds the claim: it owns the next
@@ -5214,14 +5734,14 @@ async function handleHarnessLimitSettlement(args: {
       // into a later, unrelated swap. A successor's limit deferred behind this
       // window consumes the Stop itself.
       if (!deferredLimitSettlements.has(taskId)) swapCancelRequested.delete(taskId);
-      releaseStartingClaim(taskId);
+      await releaseStartingClaim(taskId);
       // A passthrough hands the held messages to the normal settle's drain;
       // every handled ending without a live successor stashes them now (M6).
       // Mid-turn follow-ups Claude never read go to the tray too unless the
       // successor carried them (it then already forgot them) — R-S12.
       if (outcome === "handled") {
-        stashHeldFollowUpsUnlessLive(taskId);
-        stashUndeliveredMidTurnFollowUps(taskId, runId);
+        await stashHeldFollowUpsUnlessLive(taskId);
+        await stashUndeliveredMidTurnFollowUps(taskId, runId);
       }
     } finally {
       runDeferredLimitSettlement(taskId);
@@ -5242,26 +5762,26 @@ async function settleHarnessLimitInClaim(
   // phases still fire only on the swap path.)
   await harnessSwapSettleHook?.(taskId, runId, "settle");
 
-  const fetched = tasks.get(taskId);
+  const fetched = await tasks.get(taskId);
   if (!fetched) {
-    runs.update(runId, { status: "failed", endedAt: Date.now(), exitCode: -1 });
+    await runs.update(runId, { status: "failed", endedAt: Date.now(), exitCode: -1 });
     return "handled";
   }
-  const resolved = harnessStacks.resolveForTask(fetched);
+  const resolved = await harnessStacks.resolveForTask(fetched);
   if (!resolved) {
     // No stack (a lone account, or a stack deleted mid-run): no swap is
     // possible. Say what happened in plain words, then let the normal settle
     // own the run (status/column, checkout note, drained follow-ups). A pane
     // limit parked the REPL, so drop that session first.
     await dropPausedLimitedSession(taskId, runId, signal);
-    saveStatusLineQuietly(runId, taskId, `account limit reached (${limitReasonText(signal.reason)})`);
+    await saveStatusLineQuietly(runId, taskId, `account limit reached (${limitReasonText(signal.reason)})`);
     return "passthrough";
   }
   if (fetched.archivedAt != null) {
     // The archive already owns the teardown; the normal settle records the
     // visible failure without touching the archived card.
     await dropPausedLimitedSession(taskId, runId, signal);
-    saveStatusLineQuietly(runId, taskId, "account limit reached — task archived, no failover");
+    await saveStatusLineQuietly(runId, taskId, "account limit reached — task archived, no failover");
     return "passthrough";
   }
 
@@ -5272,7 +5792,7 @@ async function settleHarnessLimitInClaim(
     // chunk handler already recorded the account cooldown; the normal
     // settle applies the same column/queue bookkeeping as any failure.
     await dropPausedLimitedSession(taskId, runId, signal);
-    saveStatusLineQuietly(runId, taskId, `account limit reached (${limitReasonText(signal.reason)})`);
+    await saveStatusLineQuietly(runId, taskId, `account limit reached (${limitReasonText(signal.reason)})`);
     return "passthrough";
   }
 
@@ -5282,18 +5802,18 @@ async function settleHarnessLimitInClaim(
   // swap about to start. (The `"settle"` test hook already ran at the top of
   // this settlement, before the target checks.)
   if (swapCancelRequested.delete(taskId)) {
-    abortSwapForUserStop(taskId, runId);
+    await abortSwapForUserStop(taskId, runId);
     return "handled";
   }
   // The account that actually hit the limit is the run's own agent. A
   // displaced/manual move can make `task.agent` point elsewhere by the time
   // this settle runs; recording the limit against the wrong account would
   // cool the backup and leave the offending one usable.
-  const runHarnessId = runs.get(runId)?.agent ?? fetched.agent;
+  const runHarnessId = (await runs.get(runId))?.agent ?? fetched.agent;
   const current = stack.members.some((m) => m.harnessId === runHarnessId)
     ? runHarnessId
     : resolved.current;
-  const fromHarness = resolveHarness(current);
+  const fromHarness = await resolveHarness(current);
   const fromLabel = fromHarness?.label ?? current;
   const fromKind = fromHarness?.kind ?? null;
   // The limited run was itself an all-exhausted retry attempt (or a swap
@@ -5301,13 +5821,13 @@ async function settleHarnessLimitInClaim(
   // member, or alternating accounts whose cooldowns expire reset the cap
   // forever (review M8).
   const priorExhausted = fetched.harnessState?.allExhausted ?? null;
-  recordTried(taskId, current);
-  harnessStacks.setLimitState(current, signal);
-  saveStatusLineQuietly(runId, taskId, `account limit reached: ${signal.reason} — switching`);
+  await recordTried(taskId, current);
+  await harnessStacks.setLimitState(current, signal);
+  await saveStatusLineQuietly(runId, taskId, `account limit reached: ${signal.reason} — switching`);
   // The turn ended in a provider limit: failover moves (or blocks) the task
   // anyway, so a requested "switch to next account" is consumed here, without
   // a second move.
-  if (fetched.harnessState?.scheduledSwitch) patchTaskState(taskId, { scheduledSwitch: null });
+  if (fetched.harnessState?.scheduledSwitch) await patchTaskState(taskId, { scheduledSwitch: null });
 
   // The limit notice leaves Claude's REPL paused and the codex turn is over;
   // drop the session either way. Cards for this run can never be answered.
@@ -5322,10 +5842,10 @@ async function settleHarnessLimitInClaim(
   } catch (err) {
     console.warn(`[agetor] dropping the limited session for ${taskId} failed:`, err);
   }
-  const abandoned = subagents.runningCountForTask(taskId);
+  const abandoned = await subagents.runningCountForTask(taskId);
   if (abandoned > 0) {
-    orphanRunningSubagents(taskId);
-    saveStatusLineQuietly(
+    await orphanRunningSubagents(taskId);
+    await saveStatusLineQuietly(
       runId,
       taskId,
       `abandoned ${abandoned} background agent${abandoned === 1 ? "" : "s"} on ${fromLabel}`,
@@ -5336,16 +5856,16 @@ async function settleHarnessLimitInClaim(
   // can land in that window too. The session is already gone, so honor the
   // stop here instead of mirroring/spawning onto the backup.
   if (swapCancelRequested.delete(taskId)) {
-    abortSwapForUserStop(taskId, runId);
+    await abortSwapForUserStop(taskId, runId);
     return "handled";
   }
 
   await warmStackLogins(fetched);
-  const plan = planNextMember(tasks.get(taskId) ?? fetched, { currentId: current });
+  const plan = await planNextMember(await tasks.get(taskId) ?? fetched, { currentId: current });
   if (plan.kind === "next") {
     // A logged-out backup is skipped like an exhausted one; say so on the run.
-    for (const line of loggedOutSkipLines(plan.skipped)) saveStatusLineQuietly(runId, taskId, line);
-    const toHarness = resolveHarness(plan.member.harnessId);
+    for (const line of await loggedOutSkipLines(plan.skipped)) await saveStatusLineQuietly(runId, taskId, line);
+    const toHarness = await resolveHarness(plan.member.harnessId);
     if (!toHarness) {
       await blockStackTask(taskId, runId, "harness-swap-failed", "the backup account no longer exists", signal);
       return "handled";
@@ -5369,23 +5889,24 @@ async function settleHarnessLimitInClaim(
   // exhausted must not block the card, arm a retry or spend an attempt.
   await harnessSwapSettleHook?.(taskId, runId, "before-block");
   if (swapCancelRequested.delete(taskId)) {
-    abortSwapForUserStop(taskId, runId);
+    await abortSwapForUserStop(taskId, runId);
     return "handled";
   }
 
   // All exhausted / no usable member: block with a countdown and arm a
   // retry (or leave it manual when nothing can reset by itself).
+  // The members' labels in one hop, not one per member.
   const message =
     plan.kind === "all-exhausted"
       ? `every account in this stack is out of quota`
-      : formatStackUnusable(plan.reasons.map((r) => ({
-        ...r,
-        label: harnesses.getByIdOrKind(r.harnessId)?.label,
-      })));
-  runs.update(runId, { status: "failed", endedAt: Date.now(), exitCode: -1 });
-  saveStatusLineQuietly(runId, taskId, message);
-  emitGlobal({ kind: "run-status", taskId, runId, status: "failed", ts: Date.now(), reason: "harness-exhausted" });
-  updateColumn(taskId, runId, "blocked", plan.kind === "all-exhausted" ? "harness-exhausted" : "harness-swap-failed");
+      : await (async () => {
+        const labels = await op("orchestrator.resolveHarnesses", [plan.reasons.map((r) => r.harnessId)]);
+        return formatStackUnusable(plan.reasons.map((r, i) => ({ ...r, label: labels[i]?.label })));
+      })();
+  await runs.update(runId, { status: "failed", endedAt: Date.now(), exitCode: -1 });
+  await saveStatusLineQuietly(runId, taskId, message);
+  await emitGlobal({ kind: "run-status", taskId, runId, status: "failed", ts: Date.now(), reason: "harness-exhausted" });
+  await updateColumn(taskId, runId, "blocked", plan.kind === "all-exhausted" ? "harness-exhausted" : "harness-swap-failed");
   // The initial exhaustion does not spend a retry attempt: `attempts`
   // counts retries that actually started, so the promised three-attempt
   // cap is three retry runs, not two. A settlement of a run that was
@@ -5395,14 +5916,14 @@ async function settleHarnessLimitInClaim(
   // a clean restart: the run it replays is persisted so a retry that ends
   // without running can still hand the follow-ups after the original prompt
   // back (`allExhausted.cleanRetryOf`).
-  const cleanRetry = !conversationToPreserve(taskId, runId, current, harnessSessionColumnFor(fromKind ?? "claude-code") ?? "claude_session_id");
-  const persisted = planExhausted(taskId, plan, Date.now(), {
+  const cleanRetry = !(await conversationToPreserve(taskId, runId, current, harnessSessionColumnFor(fromKind ?? "claude-code") ?? "claude_session_id"));
+  const persisted = await planExhausted(taskId, plan, Date.now(), {
     startedThisAttempt: priorExhausted != null,
     // Chain to the ORIGINAL run (a retry that limited again): its rows are
     // tagged, while a successor holds the whole request as one wrapper row.
     cleanRetryOf: cleanRetry ? (priorExhausted?.cleanRetryOf ?? runId) : null,
   });
-  recordBlockedHistory(
+  await recordBlockedHistory(
     taskId,
     runId,
     persisted?.allExhausted?.reason ?? (plan.kind === "all-exhausted" ? signal.reason : "no-usable-member"),
@@ -5420,7 +5941,7 @@ async function settleHarnessLimitInClaim(
         attempts: ex.attempts,
         max: ex.max,
       });
-    if (copy) saveStatusLineQuietly(runId, taskId, copy);
+    if (copy) await saveStatusLineQuietly(runId, taskId, copy);
   }
   // Mid-turn follow-ups Claude never read: a clean retry re-sends every
   // user text of this run (they are its persisted bubbles), so it carries
@@ -5435,7 +5956,7 @@ async function settleHarnessLimitInClaim(
   // process while the sender was told `delivered` (review M6). They then run
   // as normal messages once the user acts. Follow-ups a clean retry replays
   // are covered by `cleanRetryOf` if it never runs.
-  stashFollowUpsWithoutSuccessor(taskId, runId, runId);
+  await stashFollowUpsWithoutSuccessor(taskId, runId, runId);
   return "handled";
 }
 
@@ -5454,16 +5975,16 @@ function limitReasonText(reason: HarnessLimitSignal["reason"]): string {
  * returns to `ready` with no retry armed and any follow-ups typed during the
  * window are re-stashed.
  */
-function abortSwapForUserStop(taskId: string, runId: string): void {
+async function abortSwapForUserStop(taskId: string, runId: string): Promise<void> {
   swapCancelRequested.delete(taskId);
-  runs.update(runId, { status: "cancelled", endedAt: Date.now(), exitCode: -1 });
-  saveStatusLineQuietly(runId, taskId, "cancelled by user during the account switch");
-  endCleanRetry(taskId, () => stashFollowUpsWithoutSuccessor(taskId, runId));
-  patchTaskState(taskId, { pendingSwap: null, allExhausted: null });
-  dropScheduledSwitch(taskId, "scheduled account switch cancelled (stopped)");
+  await runs.update(runId, { status: "cancelled", endedAt: Date.now(), exitCode: -1 });
+  await saveStatusLineQuietly(runId, taskId, "cancelled by user during the account switch");
+  await endCleanRetry(taskId, () => stashFollowUpsWithoutSuccessor(taskId, runId));
+  await patchTaskState(taskId, { pendingSwap: null, allExhausted: null });
+  await dropScheduledSwitch(taskId, "scheduled account switch cancelled (stopped)");
   cancelAutoRetry(taskId);
-  if (tasks.get(taskId)?.runId === runId) updateColumn(taskId, runId, "ready");
-  emitGlobal({ kind: "run-status", taskId, runId, status: "cancelled", ts: Date.now() });
+  await updateColumn(taskId, runId, "ready", undefined, { runId });
+  await emitGlobal({ kind: "run-status", taskId, runId, status: "cancelled", ts: Date.now() });
 }
 
 /**
@@ -5473,11 +5994,11 @@ function abortSwapForUserStop(taskId: string, runId: string): void {
  * idempotent). The old run really ended in a limit, so it is recorded failed
  * with the swap reason (no failure toast); the card stays `running`.
  */
-function leaveSwapForNextOwner(taskId: string, runId: string): void {
-  runs.update(runId, { status: "failed", endedAt: Date.now(), exitCode: -1 });
-  saveStatusLineQuietly(runId, taskId, "the account switch will finish after the restart");
-  emitGlobal({ kind: "run-status", taskId, runId, status: "failed", ts: Date.now(), reason: "harness-swap" });
-  stashFollowUpsWithoutSuccessor(taskId, runId);
+async function leaveSwapForNextOwner(taskId: string, runId: string): Promise<void> {
+  await runs.update(runId, { status: "failed", endedAt: Date.now(), exitCode: -1 });
+  await saveStatusLineQuietly(runId, taskId, "the account switch will finish after the restart");
+  await emitGlobal({ kind: "run-status", taskId, runId, status: "failed", ts: Date.now(), reason: "harness-swap" });
+  await stashFollowUpsWithoutSuccessor(taskId, runId);
 }
 
 type AllExhaustedState = NonNullable<TaskHarnessState["allExhausted"]>;
@@ -5534,19 +6055,19 @@ async function executeStackSwap(args: {
   // Persist the intent before the mirror/transfer awaits (the first
   // crash-sensitive stretch) so boot can finish or visibly block it. The
   // teardown awaits before this are idempotent and already complete.
-  updateTaskState(taskId, swapState);
+  await updateTaskState(taskId, swapState);
   if (launchesFrozenFlag) {
     // The process is handing off: do not start a mirror/transfer the exit
     // would cut off. The persisted intent is the next owner's (review S7).
-    leaveSwapForNextOwner(taskId, runId);
+    await leaveSwapForNextOwner(taskId, runId);
     return;
   }
 
   const column = harnessSessionColumnFor(fromKind ?? "claude-code");
-  const preserveConversation = conversationToPreserve(taskId, runId, current, column ?? "claude_session_id");
+  const preserveConversation = await conversationToPreserve(taskId, runId, current, column ?? "claude_session_id");
   // No recorded session id at all (a clean turn with no transcript yet) is
   // the clean-retry branch — nothing is lost.
-  const sessionId = preserveConversation && column ? findLastSessionIdForHarness(taskId, column, current) : null;
+  const sessionId = preserveConversation && column ? await findLastSessionIdForHarness(taskId, column, current) : null;
   let abort: "stop" | "superseded" | "frozen" | null = null;
   const moved = await moveTaskToMember({
     taskId,
@@ -5566,7 +6087,7 @@ async function executeStackSwap(args: {
         abort = "stop";
         return false;
       }
-      const after = tasks.get(taskId);
+      const after = await tasks.get(taskId);
       if (!after || after.archivedAt != null || after.harnessState?.pendingSwap?.runId !== runId) {
         abort = "superseded";
         return false;
@@ -5581,7 +6102,7 @@ async function executeStackSwap(args: {
   });
   // Best-effort mirror/transfer warnings must not vanish: surface them on the
   // run that started the swap.
-  for (const warning of moved.warnings) saveStatusLineQuietly(runId, taskId, warning);
+  for (const warning of moved.warnings) await saveStatusLineQuietly(runId, taskId, warning);
   if (moved.kind === "transfer-failed") {
     // The account has a recorded conversation, so "no-session" (the file is
     // gone) is not nothing-to-lose: never silently start fresh on the backup.
@@ -5590,33 +6111,33 @@ async function executeStackSwap(args: {
   }
   if (moved.kind === "aborted") {
     if (abort === "stop") {
-      abortSwapForUserStop(taskId, runId);
+      await abortSwapForUserStop(taskId, runId);
       return;
     }
     if (abort === "frozen") {
-      leaveSwapForNextOwner(taskId, runId);
+      await leaveSwapForNextOwner(taskId, runId);
       return;
     }
-    runs.update(runId, { status: "failed", endedAt: Date.now(), exitCode: -1 });
-    saveStatusLineQuietly(runId, taskId, "the account switch was cancelled before it started");
-    stashFollowUpsWithoutSuccessor(taskId, runId);
+    await runs.update(runId, { status: "failed", endedAt: Date.now(), exitCode: -1 });
+    await saveStatusLineQuietly(runId, taskId, "the account switch was cancelled before it started");
+    await stashFollowUpsWithoutSuccessor(taskId, runId);
     // The archive/delete may have landed before our own `pendingSwap` write,
     // so this settlement owns clearing it or boot reconcile would later
     // resurrect the swap.
-    patchTaskState(taskId, { pendingSwap: null, allExhausted: null });
-    const afterAbort = tasks.get(taskId);
+    await patchTaskState(taskId, { pendingSwap: null, allExhausted: null });
+    const afterAbort = await tasks.get(taskId);
     if (afterAbort?.runId === runId && afterAbort.archivedAt == null) {
-      updateColumn(taskId, runId, "ready");
+      await updateColumn(taskId, runId, "ready", undefined, { runId, notArchived: true });
     }
-    emitGlobal({ kind: "run-status", taskId, runId, status: "failed", ts: Date.now(), reason: "harness-swap" });
+    await emitGlobal({ kind: "run-status", taskId, runId, status: "failed", ts: Date.now(), reason: "harness-swap" });
     return;
   }
 
-  runs.update(runId, { status: "failed", endedAt: Date.now(), exitCode: -1 });
-  saveStatusLineQuietly(runId, taskId, `switched from ${fromLabel} to ${toLabel}`);
-  emitGlobal({ kind: "run-status", taskId, runId, status: "failed", ts: Date.now(), reason: "harness-swap" });
+  await runs.update(runId, { status: "failed", endedAt: Date.now(), exitCode: -1 });
+  await saveStatusLineQuietly(runId, taskId, `switched from ${fromLabel} to ${toLabel}`);
+  await emitGlobal({ kind: "run-status", taskId, runId, status: "failed", ts: Date.now(), reason: "harness-swap" });
 
-  const cleanRetryParts = cleanRetryPartsFromRows(runs.mainUserRows(runId), {
+  const cleanRetryParts = cleanRetryPartsFromRows(await runs.mainUserRows(runId), {
     // Codex queues a follow-up typed during a live turn as its own later
     // run; only Claude folds it into this one. Replaying a queued Codex
     // row here would duplicate it.
@@ -5627,7 +6148,7 @@ async function executeStackSwap(args: {
   const hasToolUse = preserveConversation && transferredSessionId !== null;
   const spawned = await spawnSwapContinuation({
     taskId,
-    task: tasks.get(taskId) ?? fetched,
+    task: await tasks.get(taskId) ?? fetched,
     from: current,
     fromLabel,
     to: toHarness.id,
@@ -5640,7 +6161,7 @@ async function executeStackSwap(args: {
     cleanRetryParts,
     historyTrigger: args.trigger ?? "limit",
     // Follow-ups Claude never wrote to the copied transcript (review S16).
-    undelivered: hasToolUse && fromKind === "claude-code" ? undeliveredMidTurnFollowUps(runId) : [],
+    undelivered: hasToolUse && fromKind === "claude-code" ? await undeliveredMidTurnFollowUps(runId) : [],
     position: member.position + 1,
     count,
   });
@@ -5653,16 +6174,13 @@ async function executeStackSwap(args: {
     // The carried retry marker has no retry behind it here (only the
     // all-exhausted handler re-arms after a failed spawn): the blocked card
     // is a manual fix, not "Retrying…" with no timer.
-    endCleanRetry(taskId);
-    patchTaskState(taskId, { allExhausted: null });
+    await endCleanRetry(taskId);
+    await patchTaskState(taskId, { allExhausted: null });
     cancelAutoRetry(taskId);
   }
   // Clear only the swap we just completed. A successor that already
   // settled into its own next swap must keep that newer pending state.
-  const afterSpawn = tasks.get(taskId)?.harnessState;
-  if (afterSpawn?.pendingSwap?.to === toHarness.id && afterSpawn.pendingSwap.runId === runId) {
-    patchTaskState(taskId, { pendingSwap: null });
-  }
+  await clearPendingSwapIf(taskId, (pending) => pending.to === toHarness.id && pending.runId === runId);
 }
 
 /** True when there is a conversation worth transferring: this run did work (a
@@ -5674,14 +6192,14 @@ async function executeStackSwap(args: {
  *  whose FIRST turn on this account produced no tool call takes the documented
  *  clean retry — the run being settled is excluded from the "prior" check
  *  because its own session id is not a conversation yet. */
-function conversationToPreserve(
+async function conversationToPreserve(
   taskId: string,
   runId: string,
   harnessId: string,
   column: SessionIdColumn,
-): boolean {
-  if (runs.hasToolUse(runId)) return true;
-  if (harnessSessionHandoffs.get(taskId, harnessId, column) !== null) return true;
+): Promise<boolean> {
+  if (await runs.hasToolUse(runId)) return true;
+  if (await harnessSessionHandoffs.get(taskId, harnessId, column) !== null) return true;
   return hasPriorSessionForHarness(taskId, column, harnessId, runId);
 }
 
@@ -5696,28 +6214,28 @@ async function blockStackTask(
    *  no limit behind it reads `no-usable-member`. */
   limit: HarnessLimitSignal | null = null,
 ): Promise<void> {
-  runs.update(runId, { status: "failed", endedAt: Date.now(), exitCode: -1 });
-  saveStatusLineQuietly(runId, taskId, message);
+  await runs.update(runId, { status: "failed", endedAt: Date.now(), exitCode: -1 });
+  await saveStatusLineQuietly(runId, taskId, message);
   // The retry this block ends will never run: its follow-ups go back to the
   // tray together with everything queued or held.
-  endCleanRetry(taskId, () => stashFollowUpsWithoutSuccessor(taskId, runId || null));
+  await endCleanRetry(taskId, () => stashFollowUpsWithoutSuccessor(taskId, runId || null));
   // A hard block is a manual intervention: clear the retry marker entirely.
   // Keeping `allExhausted` with `nextAttemptAt: 0` made RunPanel, StackBadge
   // and `agetor show` claim "Retrying…" with no timer armed — the blocked
   // column and this status line are the truth until the user acts.
-  patchTaskState(taskId, { pendingSwap: null, allExhausted: null });
+  await patchTaskState(taskId, { pendingSwap: null, allExhausted: null });
   cancelAutoRetry(taskId);
   // This is a terminal settle for the swap/retry: a Stop recorded during the
   // window must not leak into a later, unrelated swap (the retry path has no
   // `handleHarnessLimitSettlement` finally to clear it).
   swapCancelRequested.delete(taskId);
   if (limit) {
-    recordBlockedHistory(taskId, runId || null, limit.reason, { ...limit, message: `the account switch failed: ${message}` });
+    await recordBlockedHistory(taskId, runId || null, limit.reason, { ...limit, message: `the account switch failed: ${message}` });
   } else {
-    recordBlockedHistory(taskId, runId || null, "no-usable-member", null);
+    await recordBlockedHistory(taskId, runId || null, "no-usable-member", null);
   }
-  emitGlobal({ kind: "run-status", taskId, runId, status: "failed", ts: Date.now(), reason: "harness-swap" });
-  updateColumn(taskId, runId, "blocked", reason);
+  await emitGlobal({ kind: "run-status", taskId, runId, status: "failed", ts: Date.now(), reason: "harness-swap" });
+  await updateColumn(taskId, runId, "blocked", reason);
 }
 
 /** What happened to the successor run a swap tried to start. */
@@ -5767,7 +6285,7 @@ async function spawnSwapContinuation(args: {
   undelivered?: readonly string[];
 }): Promise<SwapSpawnOutcome> {
   const { taskId, from, fromLabel, to, toLabel, signal } = args;
-  const harness = resolveHarness(to);
+  const harness = await resolveHarness(to);
   if (!harness) {
     await blockStackTask(taskId, args.oldRunId, "harness-swap-failed", `${toLabel} no longer exists`, signal);
     return "failed";
@@ -5807,49 +6325,48 @@ async function spawnSwapContinuation(args: {
   harnessSwapPromptHook?.(taskId, prompt);
   const newRunId = randomUUID();
   const now = Date.now();
-  const prevColumn = tasks.get(taskId)?.column ?? "running";
-
-  db.transaction(() => {
-    runs.insert({
-      id: newRunId,
-      taskId,
-      agent: to,
-      status: "running",
-      startedAt: now,
-      endedAt: null,
-      exitCode: null,
-      tmuxSession: kind === "opencode" ? null : sessionNameFor(taskId),
-      // Keeps its pre-stamp (docs/plans/claude-enter-to-confirm-prompts.md T7/P-3):
-      // `resumeSessionId` is the destination account's TRANSFERRED session, whose
-      // file was copied before this insert, so it names a real session; boot
-      // reconcile's reattach key and `lastSessionIdForTask` need it from the start.
-      // An id an older build stamped without a file heals in `spawnAgent`
-      // (`resolveClaudeResume`: fresh under the same id) and is re-stamped by
-      // `onSessionFileReady`.
-      claudeSessionId: kind === "claude-code" ? resumeSessionId : null,
-      codexSessionId: kind === "codex" ? resumeSessionId : null,
-      cursorSessionId: null,
-      geminiSessionId: null,
-      fxSessionId: null,
-      antigravitySessionId: null,
-      origin: "harness-swap",
-    });
-    tasks.update(taskId, { column: "running", runId: newRunId });
-  })();
+  // One transaction (op `orchestrator.insertRunAndPoint`): the successor run
+  // row, the task pointed at it in `running`, and the column it had before.
+  const prevColumn = (await op("orchestrator.insertRunAndPoint", [{
+    id: newRunId,
+    taskId,
+    agent: to,
+    status: "running",
+    startedAt: now,
+    endedAt: null,
+    exitCode: null,
+    tmuxSession: kind === "opencode" ? null : sessionNameFor(taskId),
+    // Keeps its pre-stamp (docs/plans/claude-enter-to-confirm-prompts.md T7/P-3):
+    // `resumeSessionId` is the destination account's TRANSFERRED session, whose
+    // file was copied before this insert, so it names a real session; boot
+    // reconcile's reattach key and `lastSessionIdForTask` need it from the start.
+    // An id an older build stamped without a file heals in `spawnAgent`
+    // (`resolveClaudeResume`: fresh under the same id) and is re-stamped by
+    // `onSessionFileReady`.
+    claudeSessionId: kind === "claude-code" ? resumeSessionId : null,
+    codexSessionId: kind === "codex" ? resumeSessionId : null,
+    cursorSessionId: null,
+    geminiSessionId: null,
+    fxSessionId: null,
+    antigravitySessionId: null,
+    origin: "harness-swap",
+  }])) ?? "running";
   // Stamp the retry marker with the run it belongs to so boot can tell a
   // settled-for-a-non-limit-reason retry (stop retrying) from a crash
   // mid-spawn (re-arm). A user swap has no `allExhausted` marker.
-  const retryMarker = tasks.get(taskId)?.harnessState?.allExhausted;
+  const retryMarker = (await tasks.get(taskId))?.harnessState?.allExhausted;
   if (retryMarker) {
-    patchTaskState(taskId, { allExhausted: { ...retryMarker, inFlight: true, attemptRunId: newRunId } });
+    await patchTaskState(taskId, (state) => (
+      state.allExhausted ? { allExhausted: { ...state.allExhausted, inFlight: true, attemptRunId: newRunId } } : {}
+    ));
   }
   // The move committed and its successor run exists: one history row, with both
   // run ids. (`moveTaskToMember` was called without `history` for these moves.)
   {
-    const moved = tasks.get(taskId);
-    const stackId = moved ? historyStackIdOf(moved, to) : null;
+    const moved = await tasks.get(taskId);
+    const stackId = moved ? await historyStackIdOf(moved, to) : null;
     if (moved && stackId) {
-      recordHarnessSwapEvent({
+      await recordHarnessSwapEvent({
         task: moved,
         stackId,
         trigger: args.historyTrigger,
@@ -5866,7 +6383,7 @@ async function spawnSwapContinuation(args: {
   // run-level pending cancel (`pendingCancelRunIds`), consumed below.
   const stoppedDuringClaim = adoptPendingTaskCancel(taskId, newRunId);
   if (prevColumn !== "running") {
-    emitGlobal({ kind: "column", taskId, runId: newRunId, column: "running", prev: prevColumn, ts: now });
+    await emitGlobal({ kind: "column", taskId, runId: newRunId, column: "running", prev: prevColumn, ts: now });
   }
 
   /** Settle the freshly minted successor as cancelled: kill what was spawned,
@@ -5877,15 +6394,15 @@ async function spawnSwapContinuation(args: {
     agentHandle?.kill();
     if (kind === "claude-code") await dropSession(taskId);
     else if (kind === "codex") await dropCodexSession(taskId);
-    runs.update(newRunId, { status: "cancelled", endedAt: Date.now(), exitCode: -1 });
-    saveStatusLineQuietly(newRunId, taskId, statusLine);
+    await runs.update(newRunId, { status: "cancelled", endedAt: Date.now(), exitCode: -1 });
+    await saveStatusLineQuietly(newRunId, taskId, statusLine);
     // The successor never ran: the retry's follow-ups and everything queued or
     // held for it go back to the tray.
-    endCleanRetry(taskId, () => stashFollowUpsWithoutSuccessor(taskId, newRunId));
-    patchTaskState(taskId, { pendingSwap: null, allExhausted: null });
+    await endCleanRetry(taskId, () => stashFollowUpsWithoutSuccessor(taskId, newRunId));
+    await patchTaskState(taskId, { pendingSwap: null, allExhausted: null });
     cancelAutoRetry(taskId);
-    if (tasks.get(taskId)?.runId === newRunId) updateColumn(taskId, newRunId, "ready");
-    emitGlobal({ kind: "run-status", taskId, runId: newRunId, status: "cancelled", ts: Date.now() });
+    await updateColumn(taskId, newRunId, "ready", undefined, { runId: newRunId });
+    await emitGlobal({ kind: "run-status", taskId, runId: newRunId, status: "cancelled", ts: Date.now() });
   };
 
   if (stoppedDuringClaim || swapCancelRequested.delete(taskId)) {
@@ -5911,20 +6428,20 @@ async function spawnSwapContinuation(args: {
   // spawn, so it is present even if the spawn fails. A same-account retry is
   // not a switch and must not claim one.
   if (args.sameAccount) {
-    saveAndEmit({
+    await saveAndEmit({
       runId: newRunId,
       taskId,
       stream: "status",
       data: `Retrying on ${toLabel} after the quota reset…`,
     });
   } else {
-    saveAndEmit({
+    await saveAndEmit({
       runId: newRunId,
       taskId,
       stream: "status",
       data: `${HARNESS_SWAP_STATUS_PREFIX}${JSON.stringify(notice)}`,
     });
-    emitGlobal({
+    await emitGlobal({
       kind: "harness-swap",
       taskId,
       from,
@@ -5943,7 +6460,7 @@ async function spawnSwapContinuation(args: {
   // the divider, in the same message stream, so a partially mirrored stack is
   // visible to the user (review R13-M2).
   for (const note of args.notes ?? []) {
-    saveStatusLineQuietly(newRunId, taskId, note);
+    await saveStatusLineQuietly(newRunId, taskId, note);
   }
   if (args.hasToolUse) {
     onChunk("status", `continuing the transferred conversation on ${toLabel}`);
@@ -5959,9 +6476,7 @@ async function spawnSwapContinuation(args: {
       prompt,
       cwd,
       onChunk,
-      onSessionId: (sessionId) => {
-        runs.update(newRunId, sessionIdPatchFor(kind, sessionId));
-      },
+      onSessionId: (sessionId) => queueRunPatch(newRunId, sessionIdPatchFor(kind, sessionId)),
       opts: {
         mode: args.task.mode,
         model: args.task.model ?? DEFAULT_MODEL[kind],
@@ -5986,26 +6501,28 @@ async function spawnSwapContinuation(args: {
     // spawn spends its attempt and re-arms through `planExhausted` right
     // after this returns. `blockStackTask` (a terminal hard block) and the
     // limit settlement (which has no retry behind it) clear it outright.
-    patchTaskState(taskId, (state) => ({
+    await patchTaskState(taskId, (state) => ({
       pendingSwap: null,
       ...(state.allExhausted ? { allExhausted: { ...state.allExhausted, inFlight: false, nextAttemptAt: 0 } } : {}),
     }));
-    saveStatusLineQuietly(newRunId, taskId, `${toLabel} could not start the turn`);
-    updateColumn(taskId, newRunId, "blocked", "harness-swap-failed");
-    emitGlobal({ kind: "run-status", taskId, runId: newRunId, status: "failed", ts: Date.now(), reason: "harness-swap" });
+    await saveStatusLineQuietly(newRunId, taskId, `${toLabel} could not start the turn`);
+    await updateColumn(taskId, newRunId, "blocked", "harness-swap-failed");
+    await emitGlobal({ kind: "run-status", taskId, runId: newRunId, status: "failed", ts: Date.now(), reason: "harness-swap" });
     // Nothing will run these now, and the successor never registered; put
     // them back in the tray instead of leaving them in memory.
-    stashFollowUpsWithoutSuccessor(taskId, newRunId);
+    await stashFollowUpsWithoutSuccessor(taskId, newRunId);
     return "failed";
   }
+  const fresh = await tasks.get(taskId);
   // Stop landed while the spawn was in flight: `cancelRun` records it either
   // against the swap (`swapCancelRequested`) or the run/claim
   // (`pendingCancelRunIds`). Both must win over registering the successor.
+  // Checked after the read, in the same synchronous step as the registration
+  // below, so a Stop recorded during the read is not missed.
   if (swapCancelRequested.delete(taskId) || pendingCancelRunIds.delete(newRunId)) {
     await settleSuccessorCancelled("cancelled by user during the account switch");
     return "stopped";
   }
-  const fresh = tasks.get(taskId);
   if (!fresh || fresh.archivedAt != null || fresh.runId !== newRunId) {
     // A force-archive or delete/replace in this pending window. The run never
     // registers, so no done handler will ever settle it or pull the column
@@ -6015,20 +6532,20 @@ async function spawnSwapContinuation(args: {
     agent.kill();
     if (kind === "claude-code") await dropSession(taskId);
     else if (kind === "codex") await dropCodexSession(taskId);
-    runs.update(newRunId, { status: "cancelled", endedAt: Date.now(), exitCode: -1 });
+    await runs.update(newRunId, { status: "cancelled", endedAt: Date.now(), exitCode: -1 });
     // A replacement run that is live owns the queues; otherwise nothing will
     // drain what was queued or held for this successor.
     if (!fresh || fresh.archivedAt != null || !fresh.runId || !active.has(fresh.runId)) {
-      stashFollowUpsWithoutSuccessor(taskId, newRunId);
+      await stashFollowUpsWithoutSuccessor(taskId, newRunId);
     }
     if (fresh && fresh.runId === newRunId) {
-      saveStatusLineQuietly(
+      await saveStatusLineQuietly(
         newRunId,
         taskId,
         fresh.archivedAt != null ? "task archived before the account switch finished" : "the account switch was superseded",
       );
-      updateColumn(taskId, newRunId, "ready");
-      emitGlobal({ kind: "run-status", taskId, runId: newRunId, status: "cancelled", ts: Date.now() });
+      await updateColumn(taskId, newRunId, "ready", undefined, { runId: newRunId });
+      await emitGlobal({ kind: "run-status", taskId, runId: newRunId, status: "cancelled", ts: Date.now() });
     }
     return "stopped";
   }
@@ -6053,7 +6570,9 @@ function attachDoneHandler(
   // agent handle, never the promise `spawnAgent` itself returns.
   agent: SpawnedAgent,
 ): void {
-  agent.done
+  // The settle chain is per run (one `done` per agent) and ordered; its own
+  // failures are logged at the end of the chain, never left unhandled.
+  void agent.done
     // Async: `drainCodexQueue`/`drainCursorQueue`/`drainGeminiQueue`/
     // `drainFxQueue` below now await their own spawn (wave 1's async
     // `spawnAgentOrFail`). This callback is never itself awaited by anything
@@ -6065,14 +6584,27 @@ function attachDoneHandler(
     // the `.catch()` below exactly as a synchronous throw always did.
     .then(async (code) => {
       const handle = active.get(runId);
+      await settleChunkWork(handle);
       const wasCancelled = handle?.cancelled ?? false;
       const wasApiError = handle?.apiError ?? false;
       const wasSessionDied = handle?.sessionDied ?? false;
       const wasUnknownCommand = handle?.unknownCommand ?? false;
+      // Out of `active` as soon as `done` resolved (the run is no longer live
+      // for any busy check), exactly as before the database moved threads.
       active.delete(runId);
       settlingTurnRuns.set(runId, taskId);
+      followUpDrainPendingRuns.add(runId);
+      // Every chunk the driver delivered is saved and its follow-up (a
+      // `blocked` flip, the unread watermark) has landed before this settle
+      // reads the run's state or writes its final status.
+      await runChunksSettled(runId);
+      if (declinedContinuationRuns.delete(runId)) {
+        // A continuation whose task was gone or archived when its row was
+        // due: no row was written, so there is nothing to settle.
+        return;
+      }
       // First thing, so nothing below can leave a settled server turn counted as busy.
-      const wasOpencodeServerRun = forgetOpencodeServerTurn(runId);
+      const wasOpencodeServerRun = await forgetOpencodeServerTurn(runId);
       // Nothing can arrive for a run that's no longer running — drop its
       // sent-files scratch space (plan §3 decision 4) so it can't leak.
       pendingSentFilesByRun.delete(runId);
@@ -6088,12 +6620,12 @@ function attachDoneHandler(
       // turn failure, and a retried 429 inside a successful turn must not
       // fail the run or swap the task (review M1). The cooldown the chunk
       // handler may have recorded is cleared by the successful settle below.
-      const limitSignal = limitSignalForSettle(runHarnessKind(runId), code, handle?.limitHit ?? null);
+      const limitSignal = limitSignalForSettle(await runHarnessKind(runId), code, handle?.limitHit ?? null);
       if (handle?.limitHit && !limitSignal && handle.limitRecorded) {
         // The turn completed, so the signal its own chunk handler recorded was
         // not a limit (a retried 429 inside a successful turn): take back that
         // exact row, never one another task wrote or overwrote meanwhile.
-        clearOwnLimitState(handle.limitRecorded);
+        await clearOwnLimitState(handle.limitRecorded);
       }
       let limitFailed = false;
       if (limitSignal && !wasCancelled) {
@@ -6101,7 +6633,7 @@ function attachDoneHandler(
         // target is resolved. Lets a test delete the stack at exactly this
         // point (M1: a deleted stack must still fail the run).
         await harnessLimitObservedHook?.(taskId, runId);
-        const limitTask = tasks.get(taskId);
+        const limitTask = await tasks.get(taskId);
         // Only the task's CURRENT run may fail over. A displaced run that
         // settles late has already been replaced; swapping the task from its
         // stale account would abandon the live conversation.
@@ -6119,16 +6651,14 @@ function attachDoneHandler(
             const message = err instanceof Error ? err.message : String(err);
             // Drop the persisted swap intent on a hard failure so a later Stop
             // cannot be attributed to this already-dead swap.
-            if (tasks.get(taskId)?.harnessState?.pendingSwap?.runId === runId) {
-              patchTaskState(taskId, { pendingSwap: null });
-            }
+            await clearPendingSwapIf(taskId, (pending) => pending.runId === runId);
             swapCancelRequested.delete(taskId);
-            runs.update(runId, { status: "failed", endedAt: Date.now(), exitCode: -1 });
-            saveStatusLineQuietly(runId, taskId, `switching accounts failed: ${message}`);
-            dropScheduledSwitchAfterFailedLimitMove(taskId);
-            updateColumn(taskId, runId, "blocked", "harness-swap-failed");
-            recordBlockedHistory(taskId, runId, limitSignal.reason, { ...limitSignal, message: `the account switch failed: ${message}` });
-            emitGlobal({ kind: "run-status", taskId, runId, status: "failed", ts: Date.now(), reason: "harness-swap" });
+            await runs.update(runId, { status: "failed", endedAt: Date.now(), exitCode: -1 });
+            await saveStatusLineQuietly(runId, taskId, `switching accounts failed: ${message}`);
+            await dropScheduledSwitchAfterFailedLimitMove(taskId);
+            await updateColumn(taskId, runId, "blocked", "harness-swap-failed");
+            await recordBlockedHistory(taskId, runId, limitSignal.reason, { ...limitSignal, message: `the account switch failed: ${message}` });
+            await emitGlobal({ kind: "run-status", taskId, runId, status: "failed", ts: Date.now(), reason: "harness-swap" });
             return;
           }
         } else {
@@ -6150,11 +6680,11 @@ function attachDoneHandler(
         : limitFailed ? "failed"
         : (wasApiError || wasSessionDied || wasUnknownCommand) ? "failed"
         : code === 0 ? "succeeded" : "failed";
-      runs.update(runId, { status: newStatus, endedAt: Date.now(), exitCode: code });
+      await runs.update(runId, { status: newStatus, endedAt: Date.now(), exitCode: code });
       // Run settle is a last-seen-checkout refresh point for every harness
       // kind (the agent may have switched branches during the turn).
       // Fire-and-forget: one `git symbolic-ref`, never on the settle path.
-      void noteRunSettledCheckout(taskId);
+      queueRunSettledCheckout(taskId);
       // Only flip the task's column when the run that just resolved is
       // still the latest one. If the user pipelined a follow-up while
       // this run was in flight, `task.runId` already points at the
@@ -6163,7 +6693,7 @@ function attachDoneHandler(
       // run-status emit is gated on the same condition so the toast
       // hook doesn't fire "succeeded" mid-conversation for a turn the
       // user has already moved past.
-      const task = tasks.get(taskId);
+      const task = await tasks.get(taskId);
       // Cursor plan detection: runs whenever THIS run resolved `succeeded`,
       // not gated on `isTerminalRun` — a folded/superseded run's tool_use
       // history is just as real, and `upsertDetectedPlan`'s supersede
@@ -6172,8 +6702,8 @@ function attachDoneHandler(
       // settlement (plan §7 blast radius).
       if (newStatus === "succeeded" && task) {
         try {
-          detectCursorPlan(task, runId);
-          detectCopilotPlan(task, runId);
+          await detectCursorPlan(task, runId);
+          await detectCopilotPlan(task, runId);
         } catch {
           // Never let plan detection break run settlement.
         }
@@ -6199,7 +6729,7 @@ function attachDoneHandler(
         // already on disk and makes the hold decision deterministic.
         try {
           turnSettlePumpHook?.(taskId, runId);
-          pumpWatcherForHoldCheck(taskId);
+          await pumpWatcherForHoldCheck(taskId);
         } catch {
           // Belt-and-braces: the callee already swallows its own errors, but a
           // watcher problem must never derail run settlement.
@@ -6210,10 +6740,10 @@ function attachDoneHandler(
           && !wasApiError
           && !wasSessionDied
           && !wasUnknownCommand
-          && subagents.hasRunning(taskId);
+          && await subagents.hasRunning(taskId);
         if (holdForSubagents) {
-          const runningCount = subagents.runningCountForTask(taskId);
-          saveStatusLineQuietly(
+          const runningCount = await subagents.runningCountForTask(taskId);
+          await saveStatusLineQuietly(
             runId,
             taskId,
             `background agents still running (${runningCount}) — holding in running`,
@@ -6226,12 +6756,14 @@ function attachDoneHandler(
             ? "ready"
             : (wasApiError || wasSessionDied || wasUnknownCommand) ? "blocked"
             : newStatus === "succeeded" ? "review" : "ready";
-          updateColumn(taskId, runId, nextColumn);
+          // Only while this run is still the task's current one: a follow-up
+          // minted during the awaits above owns the column now.
+          await updateColumn(taskId, runId, nextColumn, undefined, { runId });
         }
       }
-      saveStatusLineQuietly(runId, taskId, wasCancelled ? `cancelled (exit:${code})` : `exit:${code}`);
+      await saveStatusLineQuietly(runId, taskId, wasCancelled ? `cancelled (exit:${code})` : `exit:${code}`);
       if (isTerminalRun) {
-        emitGlobal({ kind: "run-status", taskId, runId, status: newStatus, ts: Date.now() });
+        await emitGlobal({ kind: "run-status", taskId, runId, status: newStatus, ts: Date.now() });
       } else {
         reportDisplacedStepRunSettled(task, taskId, runId, newStatus);
       }
@@ -6240,23 +6772,28 @@ function attachDoneHandler(
       // 4), since a queued follow-up's own spawn is what actually clears the
       // row once it drains, and `recordFxPause` needs to see the queue as it
       // stands right now to decide whether to skip scheduling.
-      noteFxRunSettled(task, runId, newStatus);
+      await noteFxRunSettled(task, runId, newStatus);
       // A requested "switch to next account" runs BEFORE the queued follow-ups
       // drain, so they start on the new account.
       await settleScheduledSwitchAtTurnEnd(taskId, runId, newStatus, wasCancelled);
       scheduledSwitchTestHooks.turnDrain?.(taskId, runId);
       await drainFollowUpQueues(taskId, runId, wasCancelled);
+      followUpDrainPendingRuns.delete(runId);
       await settleHarnessStateAndFollowUps(taskId, runId, newStatus, wasCancelled);
       if (wasOpencodeServerRun) retryDeferredOpencodeWake(taskId);
     })
     .catch(async (err) => {
       const handle = active.get(runId);
+      await settleChunkWork(handle);
       const wasCancelled = handle?.cancelled ?? false;
       const wasSessionDied = handle?.sessionDied ?? false;
       const wasUnknownCommand = handle?.unknownCommand ?? false;
       active.delete(runId);
       settlingTurnRuns.set(runId, taskId);
-      const wasOpencodeServerRun = forgetOpencodeServerTurn(runId);
+      followUpDrainPendingRuns.add(runId);
+      await runChunksSettled(runId);
+      if (declinedContinuationRuns.delete(runId)) return;
+      const wasOpencodeServerRun = await forgetOpencodeServerTurn(runId);
       pendingSentFilesByRun.delete(runId);
       // A driver that rejects after emitting a limit signal still has a stack
       // settlement to run (e.g. the CLI exits non-zero on the limit notice).
@@ -6265,7 +6802,7 @@ function attachDoneHandler(
         // Let the settlement resolve the target (or its no-stack/archived/
         // 0-1 member passthrough); a reject is already a failed run.
         await harnessLimitObservedHook?.(taskId, runId);
-        const limitTask = tasks.get(taskId);
+        const limitTask = await tasks.get(taskId);
         if (limitTask && limitTask.runId === runId) {
           try {
             // `"passthrough"` (no swap target) falls through to the normal
@@ -6277,56 +6814,72 @@ function attachDoneHandler(
             // The swap is over (hard failure): drop its persisted intent so a
             // later Stop cannot be mistaken for this swap's cancellation and
             // poison the next one.
-            if (tasks.get(taskId)?.harnessState?.pendingSwap?.runId === runId) {
-              patchTaskState(taskId, { pendingSwap: null });
-            }
+            await clearPendingSwapIf(taskId, (pending) => pending.runId === runId);
             swapCancelRequested.delete(taskId);
-            runs.update(runId, { status: "failed", endedAt: Date.now(), exitCode: -1 });
-            saveStatusLineQuietly(runId, taskId, `switching accounts failed: ${message}`);
-            dropScheduledSwitchAfterFailedLimitMove(taskId);
-            updateColumn(taskId, runId, "blocked", "harness-swap-failed");
-            recordBlockedHistory(taskId, runId, limitSignal.reason, { ...limitSignal, message: `the account switch failed: ${message}` });
-            emitGlobal({ kind: "run-status", taskId, runId, status: "failed", ts: Date.now(), reason: "harness-swap" });
+            await runs.update(runId, { status: "failed", endedAt: Date.now(), exitCode: -1 });
+            await saveStatusLineQuietly(runId, taskId, `switching accounts failed: ${message}`);
+            await dropScheduledSwitchAfterFailedLimitMove(taskId);
+            await updateColumn(taskId, runId, "blocked", "harness-swap-failed");
+            await recordBlockedHistory(taskId, runId, limitSignal.reason, { ...limitSignal, message: `the account switch failed: ${message}` });
+            await emitGlobal({ kind: "run-status", taskId, runId, status: "failed", ts: Date.now(), reason: "harness-swap" });
             return;
           }
         }
       }
       const newStatus: RunStatus = wasCancelled ? "cancelled" : "failed";
-      runs.update(runId, { status: newStatus, endedAt: Date.now(), exitCode: -1 });
-      void noteRunSettledCheckout(taskId);
-      const task = tasks.get(taskId);
+      await runs.update(runId, { status: newStatus, endedAt: Date.now(), exitCode: -1 });
+      queueRunSettledCheckout(taskId);
+      const task = await tasks.get(taskId);
       const isTerminalRun = !!task && task.runId === runId;
       if (isTerminalRun) {
         // A session-death / unknown-command that reaches the reject path (not
         // the case today — both drivers resolve on these — but keep the
         // column consistent with the resolve path if a future refactor ever
         // rejects instead).
-        updateColumn(taskId, runId, (wasSessionDied || wasUnknownCommand) ? "blocked" : "ready");
+        await updateColumn(taskId, runId, (wasSessionDied || wasUnknownCommand) ? "blocked" : "ready", undefined, { runId });
       }
-      saveStatusLineQuietly(
+      await saveStatusLineQuietly(
         runId,
         taskId,
         wasCancelled ? "cancelled" : String(err),
         wasCancelled ? "status" : "stderr",
       );
       if (isTerminalRun) {
-        emitGlobal({ kind: "run-status", taskId, runId, status: newStatus, ts: Date.now() });
+        await emitGlobal({ kind: "run-status", taskId, runId, status: newStatus, ts: Date.now() });
       } else {
         reportDisplacedStepRunSettled(task, taskId, runId, newStatus);
       }
       // fx-only settlement hook — see the matching call/comment in the
       // `.then` branch above.
-      noteFxRunSettled(task, runId, newStatus);
+      await noteFxRunSettled(task, runId, newStatus);
       // A requested "switch to next account" runs BEFORE the queued follow-ups
       // drain, so they start on the new account.
       await settleScheduledSwitchAtTurnEnd(taskId, runId, newStatus, wasCancelled);
       scheduledSwitchTestHooks.turnDrain?.(taskId, runId);
       await drainFollowUpQueues(taskId, runId, wasCancelled);
+      followUpDrainPendingRuns.delete(runId);
       await settleHarnessStateAndFollowUps(taskId, runId, newStatus, wasCancelled);
       if (wasOpencodeServerRun) retryDeferredOpencodeWake(taskId);
     })
-    .finally(() => endTurnSettle(runId, taskId));
+    .catch((err: unknown) => {
+      console.error(`[agetor] settling run ${runId} of task ${taskId} failed:`, err);
+    })
+    .finally(() => {
+      // A settle that returned before its drain (a limit handled by a swap)
+      // drains nothing for this run.
+      followUpDrainPendingRuns.delete(runId);
+      return endTurnSettle(runId, taskId);
+    });
 }
+
+/**
+ * Runs whose done handler has taken them out of `active` but has not drained
+ * the task's follow-up queues yet. A message that lands in that window (its
+ * check found no live handle) is still queued, and the drain picks it up; once
+ * the drain ran, the run's final status is written and the message is routed
+ * as for a settled run.
+ */
+const followUpDrainPendingRuns = new Set<string>();
 
 /**
  * Runs whose done handler is settling (`runId` -> `taskId`): from the moment
@@ -6352,11 +6905,11 @@ function isTurnSettling(taskId: string): boolean {
  *  applicable meanwhile (its background agents finished after the turn end
  *  deferred it) and that every edge skipped while the turn was settling is
  *  applied now. */
-function endTurnSettle(runId: string, taskId: string): void {
+async function endTurnSettle(runId: string, taskId: string): Promise<void> {
   settlingTurnRuns.delete(runId);
   if (isTurnSettling(taskId)) return;
   try {
-    if (tasks.get(taskId)?.harnessState?.scheduledSwitch) settleWaitingScheduledSwitch(taskId);
+    if ((await tasks.get(taskId))?.harnessState?.scheduledSwitch) settleWaitingScheduledSwitch(taskId);
   } catch (err) {
     console.warn(`[agetor] settling a waiting account switch for ${taskId} failed:`, err);
   }
@@ -6373,17 +6926,17 @@ async function settleHarnessStateAndFollowUps(
   status: RunStatus,
   wasCancelled: boolean,
 ): Promise<void> {
-  const task = tasks.get(taskId);
+  const task = await tasks.get(taskId);
   // A successful turn is proof the account is serving again, even when the
   // task is not (or no longer) in a stack. It clears only what was recorded
   // before the turn started (a limit another task recorded while this turn ran
   // is newer evidence), for the account-wide row and the model the turn ran.
   if (status === "succeeded") {
-    const run = runs.get(runId);
+    const run = await runs.get(runId);
     if (run) {
-      harnessStacks.clearLimitState(harnessLineFor(taskId, runId), {
+      await harnessStacks.clearLimitState(await harnessLineFor(taskId, runId), {
         startedAtMs: run.startedAt,
-        model: cooldownModelFor({ model: task?.model ?? null }, run.agent),
+        model: await cooldownModelFor({ model: task?.model ?? null }, run.agent),
       });
     }
   }
@@ -6394,9 +6947,9 @@ async function settleHarnessStateAndFollowUps(
     if (status === "succeeded" || wasCancelled) {
       // A clean retry still armed (not running) ends here: hand its
       // follow-ups back before `resetLap` drops the marker.
-      endCleanRetry(taskId);
+      await endCleanRetry(taskId);
       // `resetLap` also ends the all-exhausted loop (attempts included).
-      resetLap(taskId);
+      await resetLap(taskId);
       cancelAutoRetry(taskId);
     } else if (exhausted?.inFlight) {
       // The retry run itself ended for a reason that is not a provider limit
@@ -6404,10 +6957,10 @@ async function settleHarnessStateAndFollowUps(
       // loop on the same error, so end the failover loop and leave the normal
       // settle's visible failure in place.
       cancelAutoRetry(taskId);
-      patchTaskState(taskId, { allExhausted: null });
+      await patchTaskState(taskId, { allExhausted: null });
     }
   }
-  const current = tasks.get(taskId);
+  const current = await tasks.get(taskId);
   if (!current?.runId || !active.has(current.runId)) {
     await drainSwapFollowUps(taskId);
   }
@@ -6434,14 +6987,14 @@ async function drainFollowUpQueues(
     fxPendingSteers.delete(runId);
     // The tray prepends: the newer held messages go in first.
     await drainHeldBehindQueue(taskId, true);
-    stashQueuedFollowUps(taskId, runId, "Agetor stopped before it could run");
+    await stashQueuedFollowUps(taskId, runId, "Agetor stopped before it could run");
     return;
   }
-  if (wasCancelled && isPipelineStepTaskId(taskId)) {
+  if (wasCancelled && await isPipelineStepTaskId(taskId)) {
     // Dropped steers were re-queued in send order before `done` resolved.
     fxPendingSteers.delete(runId);
     await drainHeldBehindQueue(taskId, true);
-    stashQueuedFollowUpsOfStoppedStep(taskId, runId);
+    await stashQueuedFollowUpsOfStoppedStep(taskId, runId);
     return;
   }
   await drainCodexQueue(taskId);
@@ -6459,8 +7012,8 @@ async function drainFollowUpQueues(
   await drainHeldBehindQueue(taskId, false);
 }
 
-function isPipelineStepTaskId(taskId: string): boolean {
-  return tasks.get(taskId)?.pipelineParentId != null;
+async function isPipelineStepTaskId(taskId: string): Promise<boolean> {
+  return (await tasks.get(taskId))?.pipelineParentId != null;
 }
 
 /**
@@ -6499,8 +7052,8 @@ function takeQueuedFollowUps(taskId: string): string[] {
  * step. A task gone or archived meanwhile keeps nothing
  * (`restashPasteWithheldText`), and then no line is written.
  */
-function stashQueuedFollowUpsOfStoppedStep(taskId: string, runId: string): void {
-  stashQueuedFollowUps(taskId, runId, "this pipeline step was stopped", "to continue it");
+async function stashQueuedFollowUpsOfStoppedStep(taskId: string, runId: string): Promise<void> {
+  await stashQueuedFollowUps(taskId, runId, "this pipeline step was stopped", "to continue it");
 }
 
 /**
@@ -6510,15 +7063,15 @@ function stashQueuedFollowUpsOfStoppedStep(taskId: string, runId: string): void 
  * archived keeps nothing (`restashPasteWithheldText`), and then no line is
  * written.
  */
-function stashQueuedFollowUps(taskId: string, runId: string | null, why: string, tail = ""): void {
+async function stashQueuedFollowUps(taskId: string, runId: string | null, why: string, tail = ""): Promise<void> {
   const lines = takeQueuedFollowUps(taskId);
   if (lines.length === 0) return;
   // `backlog.add` PREPENDS, so restash newest first (see `drainCodexQueue`).
-  const saved = stashFollowUpBatch(taskId, [...lines].reverse()) > 0;
+  const saved = await stashFollowUpBatch(taskId, [...lines].reverse()) > 0;
   if (!saved || runId === null) return;
   const what = lines.length === 1 ? "queued message not sent" : `${lines.length} queued messages not sent`;
   const data = `${what} — ${why}; saved to your backlog, resend from the tray${tail ? ` ${tail}` : ""}`;
-  saveAndEmit({ runId, taskId, stream: "status", data });
+  await saveAndEmit({ runId, taskId, stream: "status", data });
 }
 
 /** Every task id with at least one queued follow-up, any harness. */
@@ -6545,8 +7098,8 @@ function tasksWithQueuedFollowUps(): string[] {
  * tray like any other stopped step's queue
  * ({@link stashQueuedFollowUpsOfStoppedStep}).
  */
-function dropQueuedFollowUpsAfterPendingCancel(taskId: string, runId: string): void {
-  if (isPipelineStepTaskId(taskId)) stashQueuedFollowUpsOfStoppedStep(taskId, runId);
+async function dropQueuedFollowUpsAfterPendingCancel(taskId: string, runId: string): Promise<void> {
+  if (await isPipelineStepTaskId(taskId)) await stashQueuedFollowUpsOfStoppedStep(taskId, runId);
   else takeQueuedFollowUps(taskId);
 }
 
@@ -6591,8 +7144,8 @@ export async function reconcileTaskSession(
    *  matching history trigger. */
   opts: { switchNow?: "manual" | "scheduled" } = {},
 ): Promise<void> {
-  const beforeKind = resolveHarness(before.agent)?.kind ?? null;
-  const afterKind = resolveHarness(after.agent)?.kind ?? null;
+  const beforeKind = (await resolveHarness(before.agent))?.kind ?? null;
+  const afterKind = (await resolveHarness(after.agent))?.kind ?? null;
   // Treat any harness id change as a session-killing event for claude — the
   // alias's HOME/env block changes, so the on-disk JSONL & login differ. Even
   // same-kind alias swaps (claude-work → claude-personal) need a fresh tmux.
@@ -6601,25 +7154,25 @@ export async function reconcileTaskSession(
     // hand: preserve the conversation (handoff) and keep the queued
     // follow-ups. The route refuses this while a run is live, so a live run
     // here means an internal/older caller — fall through to today's behavior.
-    const beforeStack = harnessStacks.getByMember(before.agent);
-    const afterStack = harnessStacks.getByMember(after.agent);
+    const beforeStack = await harnessStacks.getByMember(before.agent);
+    const afterStack = await harnessStacks.getByMember(after.agent);
     const sameStack = Boolean(beforeStack && afterStack && beforeStack.id === afterStack.id);
-    if (sameStack && backgroundAgentsHoldTask(taskId)) {
+    if (sameStack && await backgroundAgentsHoldTask(taskId)) {
       // The REPL still hosts background agents: the switch would drop it and
       // abandon them mid-work (review N3). The PATCH route refuses this with a
       // 409 before writing; a direct caller that got here anyway is refused
       // too — the row goes back to its account and the session is untouched.
-      tasks.update(taskId, { agent: before.agent });
-      clearManualAccountSwitch(taskId);
-      const fromLabel = resolveHarness(before.agent)?.label ?? before.agent;
-      saveStatusLineQuietly(
+      await tasks.update(taskId, { agent: before.agent });
+      await clearManualAccountSwitch(taskId);
+      const fromLabel = (await resolveHarness(before.agent))?.label ?? before.agent;
+      await saveStatusLineQuietly(
         after.runId ?? before.runId ?? "",
         taskId,
         `account switch refused: background agents are still running on ${fromLabel} — switch once they finish or after Stop`,
       );
       return;
     }
-    const sameStackSwitch = sameStack && !runs.hasRunning(taskId);
+    const sameStackSwitch = sameStack && !await runs.hasRunning(taskId);
     // Hold the start claim + switch marker for the whole switch: the transfer,
     // the successful state write AND the fallback teardown. The route normally
     // takes it before `tasks.update`; a direct caller (tests, an older path)
@@ -6629,7 +7182,7 @@ export async function reconcileTaskSession(
     if (sameStackSwitch) {
       const ownsClaim = !accountSwitchTaskIds.has(taskId);
       if (ownsClaim) {
-        if (!claimTaskForAccountSwitch(taskId)) {
+        if (!await claimTaskForAccountSwitch(taskId)) {
           console.warn(`[agetor] deferred account switch for ${taskId}: another start owns the task`);
           return;
         }
@@ -6639,9 +7192,9 @@ export async function reconcileTaskSession(
     try {
       if (sameStackSwitch) {
         const sameStack = afterStack as NonNullable<typeof afterStack>;
-        const beforeKind = resolveHarness(before.agent)?.kind;
+        const beforeKind = (await resolveHarness(before.agent))?.kind;
         const column = beforeKind ? harnessSessionColumnFor(beforeKind) : null;
-        const sessionId = column ? findLastSessionIdForHarness(taskId, column, taskHarnessId(before)) : null;
+        const sessionId = column ? await findLastSessionIdForHarness(taskId, column, taskHarnessId(before)) : null;
         const statusRunId = after.runId ?? before.runId ?? "";
         // A manual move inside the stack is a hand-driven failover: record the
         // move even when there is no provider session to copy (a task that
@@ -6653,7 +7206,7 @@ export async function reconcileTaskSession(
         const position = sameStack.members.findIndex((m) => m.harnessId === after.agent);
         // The move clears `allExhausted`: a clean retry that was still armed
         // ends here without running, so its unread follow-ups go to the tray.
-        const armedCleanRetry = unrunCleanRetryOf(taskId);
+        const armedCleanRetry = await unrunCleanRetryOf(taskId);
         const moved = await moveTaskToMember({
           taskId,
           stack: sameStack,
@@ -6674,35 +7227,35 @@ export async function reconcileTaskSession(
             lastMove: { from: before.agent, to: after.agent, at: Date.now(), reason: opts.switchNow ? "switch-now" : "manual-switch" },
           }),
         });
-        for (const warning of moved.warnings) saveStatusLineQuietly(statusRunId, taskId, warning);
+        for (const warning of moved.warnings) await saveStatusLineQuietly(statusRunId, taskId, warning);
         if (moved.kind === "moved") {
-          if (armedCleanRetry) stashCleanRetryFollowUps(taskId, armedCleanRetry);
+          if (armedCleanRetry) await stashCleanRetryFollowUps(taskId, armedCleanRetry);
           // A Stop pressed while the conversation was copying: the move
           // finished, but nothing queued for the task drains onto the new
           // account (held messages are re-stashed when the claim is released).
           if (switchStopRequested.has(taskId)) {
-            stashQueuedFollowUps(taskId, statusRunId, "stopped during the account switch");
+            await stashQueuedFollowUps(taskId, statusRunId, "stopped during the account switch");
           }
           await dropSessionAfterAccountMove(taskId, before.agent);
           cancelAutoRetry(taskId);
-          const toLabel = resolveHarness(after.agent)?.label ?? after.agent;
-          saveStatusLineQuietly(statusRunId, taskId, `switched to ${toLabel} — continuing this conversation`);
+          const toLabel = (await resolveHarness(after.agent))?.label ?? after.agent;
+          await saveStatusLineQuietly(statusRunId, taskId, `switched to ${toLabel} — continuing this conversation`);
           return;
         }
         // The account changed but its conversation could not be copied. Fall
         // through to the reset path; never pretend continuity. The source
         // account's files are only read by a transfer, never removed.
-        const toLabel = resolveHarness(after.agent)?.label ?? after.agent;
-        saveStatusLineQuietly(
+        const toLabel = (await resolveHarness(after.agent))?.label ?? after.agent;
+        await saveStatusLineQuietly(
           statusRunId,
           taskId,
           `could not move the conversation to ${toLabel} (${moved.kind === "transfer-failed" ? moved.message : "cancelled"}) — starting fresh there`,
         );
         // The account did change (the row was written first), so the move gets
         // its history row; nothing was transferred.
-        const rowNow = tasks.get(taskId);
+        const rowNow = await tasks.get(taskId);
         if (rowNow && rowNow.agent === after.agent) {
-          recordHarnessSwapEvent({
+          await recordHarnessSwapEvent({
             task: rowNow,
             stackId: sameStack.id,
             trigger: opts.switchNow ?? "manual",
@@ -6715,7 +7268,7 @@ export async function reconcileTaskSession(
         // The reset below would delete the queued follow-ups of a
         // switch-now (or stopped) move; they go to the tray instead.
         if (opts.switchNow || switchStopRequested.has(taskId)) {
-          stashQueuedFollowUps(taskId, statusRunId, "the conversation could not be moved to the new account");
+          await stashQueuedFollowUps(taskId, statusRunId, "the conversation could not be moved to the new account");
         }
       }
       // Any queued codex/cursor/gemini/antigravity/opencode/copilot/fx follow-ups
@@ -6733,9 +7286,9 @@ export async function reconcileTaskSession(
       // account it was copied onto, so it never steers another account's
       // resume; the files go with task delete, archived-history retention
       // and harness delete.
-      const endedCleanRetry = unrunCleanRetryOf(taskId);
-      clearFailoverState(taskId);
-      if (endedCleanRetry) stashCleanRetryFollowUps(taskId, endedCleanRetry);
+      const endedCleanRetry = await unrunCleanRetryOf(taskId);
+      await clearFailoverState(taskId);
+      if (endedCleanRetry) await stashCleanRetryFollowUps(taskId, endedCleanRetry);
       codexTurnQueue.delete(taskId);
       cursorTurnQueue.delete(taskId);
       geminiTurnQueue.delete(taskId);
@@ -6756,13 +7309,13 @@ export async function reconcileTaskSession(
         // never landed) would otherwise hold the card forever under the next
         // harness: the claude watcher skips `copilot_subagent` rows and
         // `subagents.hasRunning` is task-wide.
-        orphanRunningSubagents(taskId);
+        await orphanRunningSubagents(taskId);
       }
       else if (beforeKind === "fx") dropFxSession(taskId); // fx has no tmux session — stays sync
       // Same reasoning for a pending fx auto-resume schedule: it belongs to
       // the old fx session, and the new agent (fx or otherwise) has nothing to
       // resume (plan §3 T2 item 8). Harmless no-op when there was none.
-      clearFxRecovery(taskId);
+      await clearFxRecovery(taskId);
       // Cross-kind switches (e.g. claude-code → codex alias) leave mode/
       // model/effort ids that belong to the old kind's option set; the
       // next spawn would error or fall through to verbatim flags. Reset
@@ -6772,7 +7325,7 @@ export async function reconcileTaskSession(
       // server option goes back to its default too (D-4).
       if (afterKind && beforeKind !== afterKind) {
         const nextMode = defaultModeFor(afterKind);
-        tasks.update(taskId, {
+        await tasks.update(taskId, {
           mode: nextMode,
           model: null,
           effort: null,
@@ -6783,7 +7336,7 @@ export async function reconcileTaskSession(
       }
       return;
     } finally {
-      if (releaseSwitchClaim) releaseTaskAccountSwitch(taskId);
+      if (releaseSwitchClaim) await releaseTaskAccountSwitch(taskId);
     }
   }
   if (afterKind !== "claude-code") return;
@@ -6795,7 +7348,7 @@ export async function reconcileTaskSession(
   // silently keeping the current posture is the least-surprising option.
   if (before.mode !== after.mode && after.mode) {
     const result = await cycleToMode(taskId, after.mode);
-    emitModeChangeStatus(taskId, after.mode, result);
+    await emitModeChangeStatus(taskId, after.mode, result);
     // Only refresh the PreToolUse matcher when the mode change actually
     // took effect. Otherwise we'd narrow the matcher (e.g. to bypass's
     // narrow-no-mcp scope) while claude is still in the old mode — the
@@ -6808,7 +7361,7 @@ export async function reconcileTaskSession(
     if (result.ok) {
       const cwd = after.worktreePath ?? after.workdir;
       const refreshed = await ensureInstalledForCwd(cwd, after.mode);
-      if (!refreshed) emitMatcherRefreshFailure(taskId, cwd);
+      if (!refreshed) await emitMatcherRefreshFailure(taskId, cwd);
     }
   }
   // Model mirror: claude 2.1.246's `/model` PICKER, confirmed with `s`
@@ -6836,7 +7389,7 @@ export async function reconcileTaskSession(
     const modelId = after.model;
     const family = claudeModelPickerFamily(modelId);
     if (!family) {
-      emitModelMirrorUnsupportedStatus(taskId, modelId);
+      await emitModelMirrorUnsupportedStatus(taskId, modelId);
     } else {
       const result = await mirrorModelViaPicker(taskId, family, { onPasteFailure: () => {} });
       if (!result.ok) {
@@ -6856,9 +7409,9 @@ export async function reconcileTaskSession(
         // landed `"turn in flight"` yet — the two files are being edited
         // concurrently.
         if (MODEL_MIRROR_NEXT_RUN_REASONS.has(result.reason)) {
-          emitModelMirrorNextRunStatus(taskId, modelId, result.reason);
+          await emitModelMirrorNextRunStatus(taskId, modelId, result.reason);
         } else {
-          emitModelMirrorFailureStatus(taskId, modelId, result.reason);
+          await emitModelMirrorFailureStatus(taskId, modelId, result.reason);
         }
       }
     }
@@ -6873,7 +7426,7 @@ export async function reconcileTaskSession(
   // records that the new value takes effect on the NEXT run
   // (docs/plans/model-effort-local-command-turns.md §10, owner decision 1).
   if (before.effort !== after.effort && after.effort) {
-    emitEffortPinnedStatus(taskId, after.effort, before.effort);
+    await emitEffortPinnedStatus(taskId, after.effort, before.effort);
   }
 }
 
@@ -6885,11 +7438,11 @@ export async function reconcileTaskSession(
  * (or a later change that lands on a picker-representable id) will pick it
  * up. Mirrors `emitModeChangeStatus`'s append+emit pattern.
  */
-function emitModelMirrorUnsupportedStatus(taskId: string, modelId: string): void {
-  const recent = runs.listForTask(taskId)[0];
+async function emitModelMirrorUnsupportedStatus(taskId: string, modelId: string): Promise<void> {
+  const recent = (await runs.listForTask(taskId))[0];
   if (!recent) return;
   const data = `model ${modelId} applies on the next run — claude's picker can't select it for this session`;
-  saveAndEmit({ runId: recent.id, taskId, stream: "status", data });
+  await saveAndEmit({ runId: recent.id, taskId, stream: "status", data });
 }
 
 /**
@@ -6921,12 +7474,12 @@ const MODEL_MIRROR_NEXT_RUN_REASONS = new Set(["no live session", "turn in fligh
  * "applies on the next run" framing for a picker-incompatible id. Mirrors
  * `emitModeChangeStatus`'s append+emit pattern.
  */
-function emitModelMirrorNextRunStatus(taskId: string, modelId: string, reason: string): void {
-  const recent = runs.listForTask(taskId)[0];
+async function emitModelMirrorNextRunStatus(taskId: string, modelId: string, reason: string): Promise<void> {
+  const recent = (await runs.listForTask(taskId))[0];
   if (!recent) return;
   const detail = reason === "turn in flight" ? "claude is mid-turn" : reason;
   const data = `model ${modelId} applies on the next run — ${detail}`;
-  saveAndEmit({ runId: recent.id, taskId, stream: "status", data });
+  await saveAndEmit({ runId: recent.id, taskId, stream: "status", data });
 }
 
 /**
@@ -6940,11 +7493,11 @@ function emitModelMirrorNextRunStatus(taskId: string, modelId: string, reason: s
  * successful mirror) fixes it. Mirrors `emitModeChangeStatus`'s append+emit
  * pattern.
  */
-function emitModelMirrorFailureStatus(taskId: string, modelId: string, reason: string): void {
-  const recent = runs.listForTask(taskId)[0];
+async function emitModelMirrorFailureStatus(taskId: string, modelId: string, reason: string): Promise<void> {
+  const recent = (await runs.listForTask(taskId))[0];
   if (!recent) return;
   const data = `⚠️ model change not applied — ${reason}; the task's model is ${modelId} but the session kept its previous one`;
-  saveAndEmit({ runId: recent.id, taskId, stream: "status", data });
+  await saveAndEmit({ runId: recent.id, taskId, stream: "status", data });
 }
 
 /**
@@ -6957,12 +7510,12 @@ function emitModelMirrorFailureStatus(taskId: string, modelId: string, reason: s
  * in-memory session state has already been disposed. Mirrors
  * `emitModeChangeStatus`'s append+emit pattern.
  */
-function emitEffortPinnedStatus(taskId: string, effortId: string, beforeEffort: string | null): void {
-  const recent = runs.listForTask(taskId)[0];
+async function emitEffortPinnedStatus(taskId: string, effortId: string, beforeEffort: string | null): Promise<void> {
+  const recent = (await runs.listForTask(taskId))[0];
   if (!recent) return;
   const pinned = getSessionLaunchEffort(taskId) ?? beforeEffort ?? "its launch effort";
   const data = `effort ${effortId} applies on the next run — this session is pinned to ${pinned} by CLAUDE_CODE_EFFORT_LEVEL`;
-  saveAndEmit({ runId: recent.id, taskId, stream: "status", data });
+  await saveAndEmit({ runId: recent.id, taskId, stream: "status", data });
 }
 
 /**
@@ -7057,23 +7610,23 @@ function effortFallbackForModelChange(
  * Returns true when a row actually changed (and a status breadcrumb was
  * attempted on the task's most recent run, if one exists).
  */
-export function applyClaudeLocalSetting(taskId: string, info: LocalSettingInfo): boolean {
-  const task = tasks.get(taskId);
+export async function applyClaudeLocalSetting(taskId: string, info: LocalSettingInfo): Promise<boolean> {
+  const task = await tasks.get(taskId);
   if (!task) return false;
-  if ((resolveHarness(task.agent)?.kind ?? null) !== "claude-code") return false;
+  if (((await resolveHarness(task.agent))?.kind ?? null) !== "claude-code") return false;
 
   const outcome = parseClaudeLocalSetting(info);
   if (!outcome) return false;
 
-  const recent = runs.listForTask(taskId)[0];
-  const announce = (data: string) => {
+  const recent = (await runs.listForTask(taskId))[0];
+  const announce = async (data: string): Promise<void> => {
     if (!recent) return;
-    saveAndEmit({ runId: recent.id, taskId, stream: "status", data });
+    await saveAndEmit({ runId: recent.id, taskId, stream: "status", data });
   };
 
   if (outcome.kind === "unrepresentable") {
     const current = outcome.setting === "model" ? task.model : task.effort;
-    announce(describeUnrepresentableLocalSetting(outcome, current));
+    await announce(describeUnrepresentableLocalSetting(outcome, current));
     return false;
   }
 
@@ -7112,7 +7665,7 @@ export function applyClaudeLocalSetting(taskId: string, info: LocalSettingInfo):
     // fires on an ordinary open-and-dismiss of a row that matches the
     // session. A `Set model to` outcome is a real change and is never gated.
     if (outcome.kept && !info.viaMirror) {
-      announce(describeKeptModelNotSynced(outcome.id, effectiveCurrentModel));
+      await announce(describeKeptModelNotSynced(outcome.id, effectiveCurrentModel));
       return false;
     }
 
@@ -7152,7 +7705,7 @@ export function applyClaudeLocalSetting(taskId: string, info: LocalSettingInfo):
     );
     if (!allowed.has(outcome.id)) {
       const modelLabel = task.model ?? DEFAULT_MODEL["claude-code"];
-      announce(
+      await announce(
         `effort "${outcome.id}" isn't supported on ${modelLabel} in agetor — left as ${task.effort ?? "unset"}`,
       );
       return false;
@@ -7165,10 +7718,10 @@ export function applyClaudeLocalSetting(taskId: string, info: LocalSettingInfo):
   // Direct DB update — deliberately NOT `reconcileTaskSession` /
   // `sendSlashCommand`. The change came FROM claude; pushing it back in
   // would re-trigger the very confirm modal we just resolved.
-  const updated = tasks.update(taskId, patch);
+  const updated = await tasks.update(taskId, patch);
   if (!updated) return false;
 
-  announce(breadcrumb);
+  await announce(breadcrumb);
   return true;
 }
 
@@ -7182,12 +7735,12 @@ export function applyClaudeLocalSetting(taskId: string, info: LocalSettingInfo):
  * run row to attach to (shouldn't happen — a live tmux session implies at
  * least one prior run — but defensive).
  */
-function emitModeChangeStatus(
+async function emitModeChangeStatus(
   taskId: string,
   agetorMode: string,
   result: CycleResult,
-): void {
-  const recent = runs.listForTask(taskId)[0];
+): Promise<void> {
+  const recent = (await runs.listForTask(taskId))[0];
   if (!recent) return;
   const runId = recent.id;
   const data = result.ok
@@ -7196,7 +7749,7 @@ function emitModeChangeStatus(
       : `mode → ${agetorMode} (${result.via === "slash-plan" ? "via /plan" : `via Shift+Tab ×${result.presses}`})`)
     : formatModeChangeFailure(agetorMode, result);
   if (!data) return;
-  saveAndEmit({ runId, taskId, stream: "status", data });
+  await saveAndEmit({ runId, taskId, stream: "status", data });
 }
 
 /**
@@ -7210,11 +7763,11 @@ function emitModeChangeStatus(
  * hand-edited `.claude/settings.local.json` into malformed JSON — point
  * them at the file so they can fix it.
  */
-function emitMatcherRefreshFailure(taskId: string, cwd: string): void {
-  const recent = runs.listForTask(taskId)[0];
+async function emitMatcherRefreshFailure(taskId: string, cwd: string): Promise<void> {
+  const recent = (await runs.listForTask(taskId))[0];
   if (!recent) return;
   const data = `⚠️ mode took effect but the hook matcher couldn't be refreshed — check ${cwd}/.claude/settings.local.json for malformed JSON. The matcher will sync on the next session start.`;
-  saveAndEmit({ runId: recent.id, taskId, stream: "status", data });
+  await saveAndEmit({ runId: recent.id, taskId, stream: "status", data });
 }
 
 /**
@@ -7266,9 +7819,12 @@ function formatModeChangeFailure(agetorMode: string, result: Extract<CycleResult
  * timeouts. Shared by `cancelRun` (Stop button) and `archiveTask`
  * (`stopRun`) so the two can't drift.
  */
-function stopActiveHandle(h: ActiveRun, reason: string): void {
+async function stopActiveHandle(h: ActiveRun, reason: string): Promise<void> {
   // Messages typed during a swap/start window are re-stashed, never dropped.
-  stashSwapFollowUps(h.taskId);
+  // They are taken off the hold at once (the stash's synchronous start); the
+  // write is awaited after the handle is stopped, so the kill below is not
+  // delayed by a database hop.
+  const stashed = stashSwapFollowUps(h.taskId);
   // OpenCode: a wake for an execution that started before this moment is the
   // one this Stop interrupts (`orchestrator-opencode-server.ts`).
   noteOpencodeStopRequested(h.taskId);
@@ -7284,6 +7840,7 @@ function stopActiveHandle(h: ActiveRun, reason: string): void {
   // subagents (a follow-up registered, its prompt not sent yet: the linger
   // ends only on the root's next execution). The Stop reaches them too.
   if (liveLingeringOpencodeTurns(h.taskId).length > 0) void disposeLingeringOpencodeTurns(h.taskId);
+  await stashed;
 }
 
 /**
@@ -7301,13 +7858,13 @@ function stopActiveHandle(h: ActiveRun, reason: string): void {
  */
 export async function reconcileHarnessFailover(opts: { includeSwaps?: boolean } = {}): Promise<void> {
   try {
-    harnessStacks.pruneExpired();
+    await harnessStacks.pruneExpired();
   } catch (err) {
     console.warn("[agetor] pruning expired harness cooldowns failed:", err);
   }
   try {
-    rearmAutoRetries();
-    restoreBlockedRetryColumns();
+    await rearmAutoRetries();
+    await restoreBlockedRetryColumns();
   } catch (err) {
     console.warn("[agetor] re-arming harness retries failed:", err);
   }
@@ -7322,12 +7879,12 @@ export async function reconcileHarnessFailover(opts: { includeSwaps?: boolean } 
  * moved off `blocked` cancels its retry), so put such a card back where the
  * countdown belongs.
  */
-function restoreBlockedRetryColumns(): void {
-  for (const task of tasks.list()) {
+async function restoreBlockedRetryColumns(): Promise<void> {
+  for (const task of await tasks.list()) {
     const ex = task.harnessState?.allExhausted;
     if (!ex || ex.nextAttemptAt <= 0 || task.archivedAt != null) continue;
-    if (task.column !== "ready" || runs.hasRunning(task.id)) continue;
-    updateColumn(task.id, task.runId ?? null, "blocked", "harness-exhausted");
+    if (task.column !== "ready" || await runs.hasRunning(task.id)) continue;
+    await updateColumn(task.id, task.runId ?? null, "blocked", "harness-exhausted", { columnIn: ["ready"] });
   }
 }
 
@@ -7343,7 +7900,7 @@ const bootSwapClaims = new Set<string>();
  * declined, as during a live switch), so nothing races the completion.
  */
 export async function reconcilePendingHarnessSwaps(): Promise<number> {
-  for (const task of tasks.list()) {
+  for (const task of await tasks.list()) {
     const pending = task.harnessState?.pendingSwap;
     if (!pending || startingTaskIds.has(task.id)) continue;
     startingTaskIds.add(task.id);
@@ -7359,7 +7916,7 @@ export async function reconcilePendingHarnessSwaps(): Promise<number> {
   } finally {
     // A task whose reconcile never ran (it was cleared meanwhile) keeps no
     // claim.
-    for (const taskId of [...bootSwapClaims]) releaseBootSwapClaim(taskId);
+    for (const taskId of [...bootSwapClaims]) await releaseBootSwapClaim(taskId);
   }
   // A "switch to next account" requested during a turn that ended while the
   // core was down is performed now, after the swaps (they own those tasks).
@@ -7371,15 +7928,15 @@ export async function reconcilePendingHarnessSwaps(): Promise<number> {
   return reconciled;
 }
 
-function releaseBootSwapClaim(taskId: string): void {
+async function releaseBootSwapClaim(taskId: string): Promise<void> {
   if (!bootSwapClaims.delete(taskId)) return;
   try {
     accountSwitchTaskIds.delete(taskId);
     switchStopRequested.delete(taskId);
     swapWindowTaskIds.delete(taskId);
     if (!deferredLimitSettlements.has(taskId)) swapCancelRequested.delete(taskId);
-    releaseStartingClaim(taskId);
-    stashHeldFollowUpsUnlessLive(taskId);
+    await releaseStartingClaim(taskId);
+    await stashHeldFollowUpsUnlessLive(taskId);
   } finally {
     // A successor that limited while this claim was held settles now.
     runDeferredLimitSettlement(taskId);
@@ -7403,14 +7960,14 @@ function releaseBootSwapClaim(taskId: string): void {
  * {@link reconcilePendingHarnessSwaps}, or here for a direct call).
  */
 async function reconcileHarnessSwap(taskId: string): Promise<void> {
-  const task = tasks.get(taskId);
+  const task = await tasks.get(taskId);
   if (!task) {
-    releaseBootSwapClaim(taskId);
+    await releaseBootSwapClaim(taskId);
     return;
   }
   const pending = task.harnessState?.pendingSwap;
   if (!pending) {
-    releaseBootSwapClaim(taskId);
+    await releaseBootSwapClaim(taskId);
     return;
   }
   if (!bootSwapClaims.has(taskId)) {
@@ -7425,7 +7982,7 @@ async function reconcileHarnessSwap(taskId: string): Promise<void> {
   try {
     await reconcileHarnessSwapInClaim(task, pending);
   } finally {
-    releaseBootSwapClaim(taskId);
+    await releaseBootSwapClaim(taskId);
   }
 }
 
@@ -7434,16 +7991,16 @@ type PendingSwapState = NonNullable<TaskHarnessState["pendingSwap"]>;
 async function reconcileHarnessSwapInClaim(task: Task, pending: PendingSwapState): Promise<void> {
   const taskId = task.id;
   if (task.archivedAt != null) {
-    patchTaskState(taskId, { pendingSwap: null });
+    await patchTaskState(taskId, { pendingSwap: null });
     return;
   }
   if (pending.manual) {
     await reconcileManualAccountSwitch(task, pending);
     return;
   }
-  const oldRun = runs.get(pending.runId);
+  const oldRun = await runs.get(pending.runId);
   if (oldRun && oldRun.status === "running") {
-    runs.update(pending.runId, { status: "failed", endedAt: Date.now(), exitCode: -1 });
+    await runs.update(pending.runId, { status: "failed", endedAt: Date.now(), exitCode: -1 });
   }
   const liveRunId = task.runId;
   // No successor was minted when the task still points at the limited run, or
@@ -7451,7 +8008,7 @@ async function reconcileHarnessSwapInClaim(task: Task, pending: PendingSwapState
   // at nothing and the limited run is the task's latest.
   if (
     (liveRunId && liveRunId === pending.runId)
-    || (!liveRunId && runs.latestForTask(taskId)?.id === pending.runId)
+    || (!liveRunId && (await runs.latestForTask(taskId))?.id === pending.runId)
   ) {
     await resumeInterruptedSwap(task, pending);
     return;
@@ -7462,30 +8019,30 @@ async function reconcileHarnessSwapInClaim(task: Task, pending: PendingSwapState
     // but is still owned: its deferred settlement swaps (or blocks) it as soon
     // as the claim is released, so blocking it here first would write a
     // blocked row and a "run the task" line the swap then contradicts.
-    patchTaskState(taskId, { pendingSwap: null });
+    await patchTaskState(taskId, { pendingSwap: null });
     return;
   }
-  const successor = liveRunId ? runs.get(liveRunId) : null;
+  const successor = liveRunId ? await runs.get(liveRunId) : null;
   if (successor && successor.status !== "running") {
     // The successor ran and settled before the restart, but the post-spawn
     // clear never landed. Its own visible outcome is authoritative; blocking
     // here would overwrite a successful swap with "restarted mid-switch".
-    patchTaskState(taskId, { pendingSwap: null });
+    await patchTaskState(taskId, { pendingSwap: null });
     return;
   }
-  blockInterruptedSwap(task, pending, "the core restarted during the account switch — run the task to continue on the next account");
+  await blockInterruptedSwap(task, pending, "the core restarted during the account switch — run the task to continue on the next account");
 }
 
-function blockInterruptedSwap(task: Task, pending: PendingSwapState, line: string): void {
+async function blockInterruptedSwap(task: Task, pending: PendingSwapState, line: string): Promise<void> {
   const taskId = task.id;
-  endCleanRetry(taskId);
-  patchTaskState(taskId, { pendingSwap: null, allExhausted: null });
-  recordBlockedHistory(taskId, pending.runId, "no-usable-member", null);
+  await endCleanRetry(taskId);
+  await patchTaskState(taskId, { pendingSwap: null, allExhausted: null });
+  await recordBlockedHistory(taskId, pending.runId, "no-usable-member", null);
   cancelAutoRetry(taskId);
-  saveStatusLineQuietly(pending.runId, taskId, line);
-  const column = tasks.get(taskId)?.column ?? task.column;
+  await saveStatusLineQuietly(pending.runId, taskId, line);
+  const column = (await tasks.get(taskId))?.column ?? task.column;
   if (column === "running" || column === "ready") {
-    updateColumn(taskId, pending.runId, "blocked", "harness-swap-failed");
+    await updateColumn(taskId, pending.runId, "blocked", "harness-swap-failed");
   }
 }
 
@@ -7497,25 +8054,25 @@ function blockInterruptedSwap(task: Task, pending: PendingSwapState, line: strin
  */
 async function resumeInterruptedSwap(task: Task, pending: PendingSwapState): Promise<void> {
   const taskId = task.id;
-  const stack = harnessStacks.getByMember(pending.from)
-    ?? harnessStacks.getByMember(pending.to)
-    ?? (task.harnessState?.stackId ? harnessStacks.get(task.harnessState.stackId) : null);
-  const toHarness = resolveHarness(pending.to);
+  const stack = (await harnessStacks.getByMember(pending.from))
+    ?? (await harnessStacks.getByMember(pending.to))
+    ?? (task.harnessState?.stackId ? await harnessStacks.get(task.harnessState.stackId) : null);
+  const toHarness = await resolveHarness(pending.to);
   const member = stack?.members.find((m) => m.harnessId === pending.to) ?? null;
   const unusable = !stack || stack.members.length < 2
     ? "the stack no longer has a backup"
     : !toHarness || !member
       ? "the backup account is no longer in the stack"
-      : memberUnusableReason(member, task);
+      : await memberUnusableReason(member, task);
   if (unusable || !stack || !toHarness || !member) {
-    blockInterruptedSwap(
+    await blockInterruptedSwap(
       task,
       pending,
       `the core restarted during the account switch and it cannot finish (${unusable ?? "unavailable"}) — run the task to continue`,
     );
     return;
   }
-  const fromHarness = resolveHarness(pending.from);
+  const fromHarness = await resolveHarness(pending.from);
   try {
     await executeStackSwap({
       taskId,
@@ -7540,13 +8097,13 @@ async function resumeInterruptedSwap(task: Task, pending: PendingSwapState): Pro
     // already failed and the column is still `running`: decide it now, or the
     // card stays stuck and the persisted swap rethrows on every boot.
     console.warn(`[agetor] resuming the account switch for ${taskId} failed:`, err);
-    if (tasks.get(taskId)?.runId === pending.runId) {
-      blockInterruptedSwap(
+    if ((await tasks.get(taskId))?.runId === pending.runId) {
+      await blockInterruptedSwap(
         task,
         pending,
         `the account switch could not be finished after the restart (${err instanceof Error ? err.message : String(err)}) — run the task to continue`,
       );
-      stashFollowUpsWithoutSuccessor(taskId, pending.runId, pending.runId);
+      await stashFollowUpsWithoutSuccessor(taskId, pending.runId, pending.runId);
     }
   }
 }
@@ -7560,16 +8117,14 @@ async function resumeInterruptedSwap(task: Task, pending: PendingSwapState): Pro
  */
 async function reconcileManualAccountSwitch(task: Task, pending: PendingSwapState): Promise<void> {
   const taskId = task.id;
-  const clear = () => {
-    if (tasks.get(taskId)?.harnessState?.pendingSwap?.manual) patchTaskState(taskId, { pendingSwap: null });
-  };
+  const clear = () => clearManualAccountSwitch(taskId);
   // Once the row has left the source account (every branch after the first),
   // a scheduled "switch to next account" the intent carried is consumed by
   // this move (the final state write below omits it) or by its failure, and
   // never re-applied by the scheduled-switch reconcile that runs next.
-  const clearWithScheduled = () => {
-    clear();
-    if (tasks.get(taskId)?.harnessState?.scheduledSwitch) patchTaskState(taskId, { scheduledSwitch: null });
+  const clearWithScheduled = async (): Promise<void> => {
+    await clear();
+    if ((await tasks.get(taskId))?.harnessState?.scheduledSwitch) await patchTaskState(taskId, { scheduledSwitch: null });
   };
   if (task.agent === pending.from) {
     // The row update never landed; the task is still on the source account.
@@ -7577,9 +8132,9 @@ async function reconcileManualAccountSwitch(task: Task, pending: PendingSwapStat
     // it, whichever move wrote the intent), and
     // `reconcileScheduledSwitchesAtBoot` retries it right after, so the line
     // says so whenever one is recorded.
-    clear();
-    const stillScheduled = tasks.get(taskId)?.harnessState?.scheduledSwitch != null;
-    saveStatusLineQuietly(
+    await clear();
+    const stillScheduled = (await tasks.get(taskId))?.harnessState?.scheduledSwitch != null;
+    await saveStatusLineQuietly(
       pending.runId,
       taskId,
       pending.switchNow === "scheduled"
@@ -7594,18 +8149,18 @@ async function reconcileManualAccountSwitch(task: Task, pending: PendingSwapStat
   }
   if (task.agent !== pending.to) {
     // Edited to a third account before the restart; this intent is stale.
-    clearWithScheduled();
+    await clearWithScheduled();
     return;
   }
-  const fromHarness = resolveHarness(pending.from);
-  const toHarness = resolveHarness(pending.to);
-  const stack = harnessStacks.getByMember(pending.to);
+  const fromHarness = await resolveHarness(pending.from);
+  const toHarness = await resolveHarness(pending.to);
+  const stack = await harnessStacks.getByMember(pending.to);
   if (!fromHarness || !toHarness || !stack) {
-    clearWithScheduled();
+    await clearWithScheduled();
     return;
   }
   const column = harnessSessionColumnFor(fromHarness.kind);
-  const sessionId = column ? findLastSessionIdForHarness(taskId, column, pending.from) : null;
+  const sessionId = column ? await findLastSessionIdForHarness(taskId, column, pending.from) : null;
   const position = stack.members.findIndex((m) => m.harnessId === pending.to);
   const moved = await moveTaskToMember({
     taskId,
@@ -7627,14 +8182,14 @@ async function reconcileManualAccountSwitch(task: Task, pending: PendingSwapStat
       lastMove: { from: pending.from, to: pending.to, at: Date.now(), reason: pending.switchNow ? "switch-now" : "manual-switch" },
     }),
   });
-  for (const warning of moved.warnings) saveStatusLineQuietly(pending.runId, taskId, warning);
+  for (const warning of moved.warnings) await saveStatusLineQuietly(pending.runId, taskId, warning);
   if (moved.kind !== "moved") {
     // The account changed but its conversation could not be copied. Surface
     // it exactly like the live fallback path does; never pretend continuity.
-    clearWithScheduled();
-    const rowNow = tasks.get(taskId);
+    await clearWithScheduled();
+    const rowNow = await tasks.get(taskId);
     if (rowNow) {
-      recordHarnessSwapEvent({
+      await recordHarnessSwapEvent({
         task: rowNow,
         stackId: stack.id,
         trigger: "boot-resume",
@@ -7644,18 +8199,18 @@ async function reconcileManualAccountSwitch(task: Task, pending: PendingSwapStat
         continuation: "restarted",
       });
     }
-    saveStatusLineQuietly(
+    await saveStatusLineQuietly(
       pending.runId,
       taskId,
       `could not move the conversation to ${toHarness.label} (${moved.kind === "transfer-failed" ? moved.message : "cancelled"}) — starting fresh there`,
     );
     if (task.column === "running") {
-      updateColumn(taskId, pending.runId, "blocked", "harness-swap-failed");
+      await updateColumn(taskId, pending.runId, "blocked", "harness-swap-failed");
     }
     return;
   }
   cancelAutoRetry(taskId);
-  saveStatusLineQuietly(
+  await saveStatusLineQuietly(
     pending.runId,
     taskId,
     `switched to ${toHarness.label} — continuing this conversation`,
@@ -7675,8 +8230,8 @@ async function reconcileManualAccountSwitch(task: Task, pending: PendingSwapStat
  * not spending one would let a persistent failure loop without ever reaching
  * the visible cap — then re-arm through the normal `planExhausted` path.
  */
-function recoverFailedHarnessAutoRetry(taskId: string): void {
-  const task = tasks.get(taskId);
+async function recoverFailedHarnessAutoRetry(taskId: string): Promise<void> {
+  const task = await tasks.get(taskId);
   if (!task || task.archivedAt != null) {
     cancelAutoRetry(taskId);
     return;
@@ -7687,27 +8242,36 @@ function recoverFailedHarnessAutoRetry(taskId: string): void {
   // it failed here or the next retry would be refused by `runs.hasRunning`.
   const currentRunId = task.runId;
   if (currentRunId) {
-    const current = runs.get(currentRunId);
+    const current = await runs.get(currentRunId);
     if (current?.status === "running") {
       if (active.has(currentRunId)) return;
-      runs.update(currentRunId, { status: "failed", endedAt: Date.now(), exitCode: -1 });
-      tasks.update(taskId, { column: "blocked", runId: null });
+      await runs.update(currentRunId, { status: "failed", endedAt: Date.now(), exitCode: -1 });
+      await tasks.update(taskId, { column: "blocked", runId: null });
     }
   }
-  const exhausted = tasks.get(taskId)?.harnessState?.allExhausted;
+  // Read, spend the attempt and write in one atomic step on the state read
+  // inside it; `exhausted` is the marker as it stood before the spend.
+  let exhausted: NonNullable<TaskHarnessState["allExhausted"]> | null = null;
+  let attempts = 0;
+  await updateTaskState(taskId, (state) => {
+    const live = state?.allExhausted;
+    if (!state || !live) return KEEP_TASK_STATE;
+    exhausted = live;
+    attempts = Math.min(live.attempts + 1, HARNESS_STACK_RETRY_MAX);
+    return { ...state, allExhausted: { ...live, attempts, inFlight: false, nextAttemptAt: 0 } };
+  });
   if (!exhausted) return;
-  const attempts = Math.min(exhausted.attempts + 1, HARNESS_STACK_RETRY_MAX);
-  patchTaskState(taskId, { allExhausted: { ...exhausted, attempts, inFlight: false, nextAttemptAt: 0 } });
+  const spent = exhausted as NonNullable<TaskHarnessState["allExhausted"]>;
   if (attempts >= HARNESS_STACK_RETRY_MAX) {
-    endCleanRetry(taskId);
+    await endCleanRetry(taskId);
     cancelAutoRetry(taskId);
     return;
   }
-  planExhaustedTracked(
+  await planExhaustedTracked(
     taskId,
     {
       kind: "all-exhausted",
-      earliestResetAtMs: exhausted.earliestResetAtMs,
+      earliestResetAtMs: spent.earliestResetAtMs,
       skipped: [],
     },
     Date.now(),
@@ -7736,7 +8300,7 @@ async function fireHarnessAutoRetry(taskId: string): Promise<void> {
     // The timer callback's own `.catch` only logs; recover the persisted
     // in-flight marker here or the task never retries again (R8-S2).
     console.warn(`[agetor] harness auto-retry failed for task ${taskId}:`, err);
-    recoverFailedHarnessAutoRetry(taskId);
+    await recoverFailedHarnessAutoRetry(taskId);
   } finally {
     swapWindowTaskIds.delete(taskId);
     // A Stop recorded against this retry's window (`cancelRun` saw the swap
@@ -7746,11 +8310,11 @@ async function fireHarnessAutoRetry(taskId: string): Promise<void> {
     if (!deferredLimitSettlements.has(taskId)) swapCancelRequested.delete(taskId);
     harnessRetriesInFlight.delete(taskId);
     try {
-      releaseStartingClaim(taskId);
+      await releaseStartingClaim(taskId);
       // Messages typed during the retry window drain on a live successor;
       // otherwise (re-armed, blocked, capped, stopped) they go to the tray now
       // (review M6).
-      stashHeldFollowUpsUnlessLive(taskId);
+      await stashHeldFollowUpsUnlessLive(taskId);
     } finally {
       // A retry successor that limited while this window was open settles now.
       runDeferredLimitSettlement(taskId);
@@ -7759,7 +8323,7 @@ async function fireHarnessAutoRetry(taskId: string): Promise<void> {
 }
 
 async function fireHarnessAutoRetryInner(taskId: string): Promise<void> {
-  const task = tasks.get(taskId);
+  const task = await tasks.get(taskId);
   if (!task || task.archivedAt != null) {
     cancelAutoRetry(taskId);
     return;
@@ -7767,27 +8331,27 @@ async function fireHarnessAutoRetryInner(taskId: string): Promise<void> {
   const exhausted = task.harnessState?.allExhausted;
   if (!exhausted) return;
   if (exhausted.attempts >= HARNESS_STACK_RETRY_MAX) return;
-  if (runs.hasRunning(taskId) || backgroundAgentsHoldTask(taskId)) {
+  if (await runs.hasRunning(taskId) || await backgroundAgentsHoldTask(taskId)) {
     // A turn is live (an adopted continuation, a reattached run), or background
     // agents (after a succeeded or a failed turn) still run in the REPL a
     // retry on another account would drop: never mint
     // a second one, but do not consume the timer either — push it a short
     // backoff out so the countdown is still owned by a timer (review Q7). The
     // live run's own settle clears or re-plans the state.
-    deferAutoRetryNow(taskId);
+    await deferAutoRetryNow(taskId);
     return;
   }
   if (task.column !== "blocked") {
     // The user moved the card out of `blocked` (contract C3, review M5): the
     // countdown no longer describes it. Never pull it back to `running`.
-    cancelHarnessRetryForTask(taskId);
+    await cancelHarnessRetryForTask(taskId);
     return;
   }
-  const resolved = harnessStacks.resolveForTask(task);
+  const resolved = await harnessStacks.resolveForTask(task);
   if (!resolved) {
     // The stack is gone: this retry will never run.
-    endCleanRetry(taskId);
-    patchTaskState(taskId, { allExhausted: null });
+    await endCleanRetry(taskId);
+    await patchTaskState(taskId, { allExhausted: null });
     return;
   }
   await warmStackLogins(task);
@@ -7797,51 +8361,51 @@ async function fireHarnessAutoRetryInner(taskId: string): Promise<void> {
   // on would re-arm it (a wait or none-usable plan). Settle it like the Stop
   // `beforeCommit` catches: the countdown ends, the card stays blocked.
   if (swapCancelRequested.delete(taskId)) {
-    cancelHarnessRetryForTask(taskId);
-    const stoppedRun = runs.latestForTask(taskId);
-    if (stoppedRun) saveStatusLineQuietly(stoppedRun.id, taskId, "cancelled by user during the account retry");
+    await cancelHarnessRetryForTask(taskId);
+    const stoppedRun = await runs.latestForTask(taskId);
+    if (stoppedRun) await saveStatusLineQuietly(stoppedRun.id, taskId, "cancelled by user during the account retry");
     return;
   }
   // The login probe awaited: a Stop, a column move, an archive or a manual
   // start may have cleared the countdown meanwhile. Plan from the live row, and
   // never re-arm a retry the user already ended.
-  const live = tasks.get(taskId);
+  const live = await tasks.get(taskId);
   if (!live || live.archivedAt != null || live.column !== "blocked" || !live.harnessState?.allExhausted) return;
-  if (runs.hasRunning(taskId) || backgroundAgentsHoldTask(taskId)) {
-    deferAutoRetryNow(taskId);
+  if (await runs.hasRunning(taskId) || await backgroundAgentsHoldTask(taskId)) {
+    await deferAutoRetryNow(taskId);
     return;
   }
-  const liveResolved = harnessStacks.resolveForTask(live);
+  const liveResolved = await harnessStacks.resolveForTask(live);
   if (!liveResolved) {
-    endCleanRetry(taskId);
-    patchTaskState(taskId, { allExhausted: null });
+    await endCleanRetry(taskId);
+    await patchTaskState(taskId, { allExhausted: null });
     return;
   }
   const { stack, current } = liveResolved;
   const now = Date.now();
-  const plan = planRetryMember(live, { now });
+  const plan = await planRetryMember(live, { now });
   if (plan.kind !== "next") {
-    planExhaustedTracked(taskId, plan, now, { startedThisAttempt: false });
+    await planExhaustedTracked(taskId, plan, now, { startedThisAttempt: false });
     return;
   }
-  const toHarness = resolveHarness(plan.member.harnessId);
+  const toHarness = await resolveHarness(plan.member.harnessId);
   if (!toHarness) {
-    planExhaustedTracked(taskId, { kind: "none-usable", reasons: [{ harnessId: plan.member.harnessId, reason: "account no longer exists" }], earliestResetAtMs: null, skipped: [] }, Date.now(), { startedThisAttempt: false });
+    await planExhaustedTracked(taskId, { kind: "none-usable", reasons: [{ harnessId: plan.member.harnessId, reason: "account no longer exists" }], earliestResetAtMs: null, skipped: [] }, Date.now(), { startedThisAttempt: false });
     return;
   }
-  const fromHarness = resolveHarness(current);
+  const fromHarness = await resolveHarness(current);
   const sameAccount = plan.member.harnessId === current;
   const fromKind = fromHarness?.kind ?? null;
   const column = fromKind ? harnessSessionColumnFor(fromKind) : null;
-  const lastRun = runs.latestForTask(taskId);
+  const lastRun = await runs.latestForTask(taskId);
   // Same rule as the limit settlement: a conversation exists when this run
   // did work, a previous swap already copied one onto the current account, or
   // an earlier turn on this account recorded a session (a follow-up turn that
   // limits before its first tool call still has all its history).
   const preserveConversation = lastRun
-    ? conversationToPreserve(taskId, lastRun.id, current, column ?? (toHarness.kind === "codex" ? "codex_session_id" : "claude_session_id"))
+    ? await conversationToPreserve(taskId, lastRun.id, current, column ?? (toHarness.kind === "codex" ? "codex_session_id" : "claude_session_id"))
     : false;
-  const sessionId = preserveConversation && column ? findLastSessionIdForHarness(taskId, column, current) : null;
+  const sessionId = preserveConversation && column ? await findLastSessionIdForHarness(taskId, column, current) : null;
   const position = stack.members.findIndex((m) => m.harnessId === toHarness.id);
   // Set by `beforeCommit` when a Stop recorded during the move aborted it.
   let retryStopped = false as boolean;
@@ -7871,7 +8435,7 @@ async function fireHarnessAutoRetryInner(taskId: string): Promise<void> {
         retryStopped = true;
         return false;
       }
-      const beforeSpawn = tasks.get(taskId);
+      const beforeSpawn = await tasks.get(taskId);
       return Boolean(
         beforeSpawn
         && beforeSpawn.archivedAt == null
@@ -7923,8 +8487,8 @@ async function fireHarnessAutoRetryInner(taskId: string): Promise<void> {
       // Settle like a user Stop on a blocked card with an armed retry: the
       // countdown and its exhausted state end, held messages go to the tray,
       // the card stays where it is and the task keeps its account.
-      cancelHarnessRetryForTask(taskId);
-      if (lastRun) saveStatusLineQuietly(lastRun.id, taskId, "cancelled by user during the account retry");
+      await cancelHarnessRetryForTask(taskId);
+      if (lastRun) await saveStatusLineQuietly(lastRun.id, taskId, "cancelled by user during the account retry");
       return;
     }
     if (!launchesFrozenFlag) cancelAutoRetry(taskId);
@@ -7941,15 +8505,15 @@ async function fireHarnessAutoRetryInner(taskId: string): Promise<void> {
   // so a marked clean retry rebuilds its parts from the chain of the ORIGINAL
   // run instead (the follow-ups would be lost otherwise).
   const retryParts = exhausted.cleanRetryOf
-    ? cleanRetryChainParts(taskId, exhausted.cleanRetryOf)
-    : cleanRetryPartsFromRows(lastRun ? runs.mainUserRows(lastRun.id) : [], {
+    ? await cleanRetryChainParts(taskId, exhausted.cleanRetryOf)
+    : cleanRetryPartsFromRows(lastRun ? await runs.mainUserRows(lastRun.id) : [], {
       firstOnly: fromKind !== "claude-code",
     });
   const outcome = await spawnSwapContinuation({
     taskId,
-    task: tasks.get(taskId) ?? task,
+    task: await tasks.get(taskId) ?? task,
     from: current,
-    fromLabel: harnessLabelOf(current),
+    fromLabel: await harnessLabelOf(current),
     to: toHarness.id,
     toLabel: toHarness.label,
     oldRunId: lastRun?.id ?? "",
@@ -7969,7 +8533,7 @@ async function fireHarnessAutoRetryInner(taskId: string): Promise<void> {
     sameAccount,
     historyTrigger: "retry",
   });
-  const after = tasks.get(taskId)?.harnessState;
+  const after = (await tasks.get(taskId))?.harnessState;
   if (!after) return;
   if (outcome === "started") {
     // Keep `inFlight` true for the whole life of the successor run. It is the
@@ -8000,14 +8564,16 @@ async function fireHarnessAutoRetryInner(taskId: string): Promise<void> {
   const retryAttempts = after.allExhausted.attempts + 1;
   if (retryAttempts >= HARNESS_STACK_RETRY_MAX) {
     // The cap ends the retry without running it: its follow-ups go to the tray.
-    endCleanRetry(taskId);
-    patchTaskState(taskId, {
-      allExhausted: { ...after.allExhausted, attempts: HARNESS_STACK_RETRY_MAX, inFlight: false, nextAttemptAt: 0, cleanRetryOf: undefined },
-    });
-    if (lastRun) saveStatusLineQuietly(lastRun.id, taskId, formatStackExhausted({ nextAttemptAt: 0, attempts: HARNESS_STACK_RETRY_MAX, max: HARNESS_STACK_RETRY_MAX }));
+    await endCleanRetry(taskId);
+    await patchTaskState(taskId, (state) => (
+      state.allExhausted
+        ? { allExhausted: { ...state.allExhausted, attempts: HARNESS_STACK_RETRY_MAX, inFlight: false, nextAttemptAt: 0, cleanRetryOf: undefined } }
+        : {}
+    ));
+    if (lastRun) await saveStatusLineQuietly(lastRun.id, taskId, formatStackExhausted({ nextAttemptAt: 0, attempts: HARNESS_STACK_RETRY_MAX, max: HARNESS_STACK_RETRY_MAX }));
     return;
   }
-  planExhaustedTracked(
+  await planExhaustedTracked(
     taskId,
     { kind: "all-exhausted", earliestResetAtMs: after.allExhausted.earliestResetAtMs ?? null, skipped: [] },
     Date.now(),
@@ -8026,9 +8592,9 @@ setHarnessFailoverHooks({
   // A REPL hosting background agents is live, whether the turn that left
   // them succeeded or failed; a manual prepare must not move it (Q6).
   isTaskHeld: (taskId) => backgroundAgentsHoldTask(taskId),
-  onScheduledSwitchDropped: (taskId, line) => {
-    const runId = noteRunIdOf(taskId);
-    if (runId) saveStatusLineQuietly(runId, taskId, line);
+  onScheduledSwitchDropped: async (taskId, line) => {
+    const runId = await noteRunIdOf(taskId);
+    if (runId) await saveStatusLineQuietly(runId, taskId, line);
   },
 });
 
@@ -8041,18 +8607,18 @@ setHarnessFailoverHooks({
  * clear fixes), past the attempt cap, or archived is left alone. Returns how
  * many tasks were re-armed.
  */
-export function rearmRetriesAfterCooldownClear(harnessId: string): number {
+export async function rearmRetriesAfterCooldownClear(harnessId: string): Promise<number> {
   let count = 0;
-  for (const task of tasks.list()) {
+  for (const task of await tasks.list()) {
     const ex = task.harnessState?.allExhausted;
     if (!ex || ex.inFlight || ex.reason === "no-usable-member") continue;
     if (task.archivedAt != null || ex.attempts >= HARNESS_STACK_RETRY_MAX) continue;
-    const resolved = harnessStacks.resolveForTask(task);
+    const resolved = await harnessStacks.resolveForTask(task);
     if (!resolved || !resolved.stack.members.some((m) => m.harnessId === harnessId)) continue;
     const now = Date.now();
     const at = now + retryMinMs();
-    const memberReasons = memberReasonsFor(resolved.stack, task, now, { includeCurrent: true });
-    patchTaskState(task.id, (state) => (
+    const memberReasons = await memberReasonsFor(resolved.stack, task, now, { includeCurrent: true });
+    await patchTaskState(task.id, (state) => (
       state.allExhausted
         ? {
           allExhausted: {
@@ -8064,9 +8630,9 @@ export function rearmRetriesAfterCooldownClear(harnessId: string): number {
         : {}
     ));
     armAutoRetry(task.id, at);
-    const label = harnesses.getByIdOrKind(harnessId)?.label ?? harnessId;
-    const runId = noteRunIdOf(task.id);
-    if (runId) saveStatusLineQuietly(runId, task.id, `cooldown cleared on ${label} — retrying soon`);
+    const label = (await harnesses.getByIdOrKind(harnessId))?.label ?? harnessId;
+    const runId = await noteRunIdOf(task.id);
+    if (runId) await saveStatusLineQuietly(runId, task.id, `cooldown cleared on ${label} — retrying soon`);
     count++;
   }
   return count;
@@ -8083,19 +8649,19 @@ export function rearmRetriesAfterCooldownClear(harnessId: string): number {
  * button) and `archiveTask` (`stopRun`).
  */
 async function stopHeldTask(taskId: string, reason: string): Promise<void> {
-  stashSwapFollowUps(taskId);
-  dropScheduledSwitch(taskId, "scheduled account switch cancelled (stopped)");
+  await stashSwapFollowUps(taskId);
+  await dropScheduledSwitch(taskId, "scheduled account switch cancelled (stopped)");
   cancelPendingForTask(taskId, reason);
   // An OpenCode task on the agetor-owned server has no claude session to
   // interrupt: Stop ends the handle still listening for its background
   // subagents (which interrupts them) and retires their rows to release the
   // hold. Whatever the server runs on the session afterwards is a wake like
   // any other (plan R3): it becomes a run and pulls the card back.
-  if (isOpencodeServerTask(taskId)) {
+  if (await isOpencodeServerTask(taskId)) {
     noteOpencodeStopRequested(taskId);
     dropDeferredOpencodeWake(taskId);
     await disposeLingeringOpencodeTurns(taskId);
-    orphanRunningOpencodeSubagents(taskId, reason);
+    await orphanRunningOpencodeSubagents(taskId, reason);
     return;
   }
   // Ordering rule (§7 of the async-warmup plan): the interrupt must complete
@@ -8103,7 +8669,7 @@ async function stopHeldTask(taskId: string, reason: string): Promise<void> {
   // `enqueueArchiveTeardown`'s kill-before-teardown discipline. Awaited here
   // rather than left as a bare call now that `interruptTaskSession` is async.
   await interruptTaskSession(taskId);
-  orphanRunningSubagents(taskId);
+  await orphanRunningSubagents(taskId);
 }
 
 export async function cancelRun(runId: string): Promise<boolean> {
@@ -8117,17 +8683,17 @@ export async function cancelRun(runId: string): Promise<boolean> {
     // already succeeded, so the card advances to `review`. A turn that FAILED
     // with its background agents still running is stopped the same way (the
     // card stays where its failure put it).
-    const taskId = runs.get(runId)?.taskId;
+    const taskId = (await runs.get(runId))?.taskId;
     if (!taskId) return false;
     // This process is handing off (`freezeLaunches`) and the settlement
     // already left its persisted swap for the next owner (no claim holds the
     // task any more): nothing here would ever read a recorded Stop, and the
     // next owner's boot would finish the swap the user just stopped. Settle
     // the Stop now, as a Stop before the successor existed (review N1).
-    const leftSwap = tasks.get(taskId)?.harnessState?.pendingSwap;
+    const leftSwap = (await tasks.get(taskId))?.harnessState?.pendingSwap;
     if (leftSwap && !leftSwap.manual && launchesFrozenFlag && !startingTaskIds.has(taskId)) {
       cancelPendingForTask(taskId, "cancelled by user");
-      abortSwapForUserStop(taskId, leftSwap.runId);
+      await abortSwapForUserStop(taskId, leftSwap.runId);
       return true;
     }
     // A swap between the old run's failure and the successor's spawn: record
@@ -8138,10 +8704,10 @@ export async function cancelRun(runId: string): Promise<boolean> {
     // after `active.delete`, before `pendingSwap` is persisted — where
     // `pendingCancelRunIds.add(oldRunId)` below would target a run nothing
     // ever spawns again and silently lose the Stop.
-    const pendingSwapOfTask = tasks.get(taskId)?.harnessState?.pendingSwap;
+    const pendingSwapOfTask = (await tasks.get(taskId))?.harnessState?.pendingSwap;
     if ((pendingSwapOfTask && !pendingSwapOfTask.manual) || swapWindowTaskIds.has(taskId)) {
       swapCancelRequested.add(taskId);
-      stashSwapFollowUps(taskId);
+      await stashSwapFollowUps(taskId);
       cancelPendingForTask(taskId, "cancelled by user");
       return true;
     }
@@ -8151,11 +8717,11 @@ export async function cancelRun(runId: string): Promise<boolean> {
     // onto the new account; the flag dies with the switch's claim.
     if (accountSwitchTaskIds.has(taskId)) {
       switchStopRequested.add(taskId);
-      stashSwapFollowUps(taskId);
+      await stashSwapFollowUps(taskId);
       cancelPendingForTask(taskId, "cancelled by user");
       return true;
     }
-    if (backgroundAgentsHoldTask(taskId)) {
+    if (await backgroundAgentsHoldTask(taskId)) {
       // A start holds the task's claim and has not minted its run yet (a
       // Run's pre-flight, a follow-up's spawn): the Stop is meant for the turn
       // it is about to start. Record it against the claim, as
@@ -8171,12 +8737,12 @@ export async function cancelRun(runId: string): Promise<boolean> {
       // ahead of the settle the hold's release triggers. Only a held
       // SUCCEEDED step is still unsettled for the runner; a failed turn
       // already settled its step.
-      if (isHeldByBackgroundAgents(taskId)) reportHeldStepStopped(taskId);
+      if (await isHeldByBackgroundAgents(taskId)) await reportHeldStepStopped(taskId);
       await stopHeldTask(taskId, "cancelled by user");
       // A failed turn can also have left an armed all-exhausted retry or an
       // fx auto-resume: the Stop ends those too, as it would without agents.
-      if (hasPendingHarnessRetry(taskId) && !runs.hasRunning(taskId)) cancelHarnessRetryForTask(taskId);
-      if (fxAutoResumeTimers.has(taskId)) cancelFxAutoResume(taskId, "stopped");
+      if (await hasPendingHarnessRetry(taskId) && !await runs.hasRunning(taskId)) await cancelHarnessRetryForTask(taskId);
+      if (fxAutoResumeTimers.has(taskId)) await cancelFxAutoResume(taskId, "stopped");
       return true;
     }
     // A settled OpenCode turn may still be listening for its background
@@ -8193,7 +8759,7 @@ export async function cancelRun(runId: string): Promise<boolean> {
       // The pending spawn may have registered while the dispose was awaited.
       const registered = active.get(runId);
       if (registered) {
-        stopActiveHandle(registered, "cancelled by user");
+        await stopActiveHandle(registered, "cancelled by user");
         return true;
       }
     }
@@ -8202,20 +8768,30 @@ export async function cancelRun(runId: string): Promise<boolean> {
     // pending auto-resume timer is what's left to act on (plan §3 T2 item 8):
     // cancel the schedule rather than reporting failure.
     if (fxAutoResumeTimers.has(taskId)) {
-      return cancelFxAutoResume(taskId, "stopped") || endedLinger;
+      return await cancelFxAutoResume(taskId, "stopped") || endedLinger;
     }
     // A blocked stack task waiting on an armed all-exhausted retry has no run
     // to kill either: Stop cancels the countdown, so nothing starts after the
     // user asked for silence (review M5). The card stays where it is.
-    if (hasPendingHarnessRetry(taskId) && !runs.hasRunning(taskId)) {
-      return cancelHarnessRetryForTask(taskId) || endedLinger;
+    if (await hasPendingHarnessRetry(taskId) && !await runs.hasRunning(taskId)) {
+      return (await cancelHarnessRetryForTask(taskId)) || endedLinger;
     }
     // Bounded-spawn pending window: the run is the task's current run and
     // still `running`, but its agent hasn't registered yet. Record the
     // cancel for the continuation (see `pendingCancelRunIds`) instead of
     // reporting "nothing to stop".
-    const run = runs.get(runId);
-    if (run && run.status === "running" && tasks.get(taskId)?.runId === runId) {
+    const run = await runs.get(runId);
+    const currentRunId = (await tasks.get(taskId))?.runId;
+    // The spawn may have registered during the reads above: stop it now. The
+    // registration and the spawn's consumption of a recorded Stop happen with
+    // nothing awaited in between, so either this sees the handle or the spawn
+    // sees the record below.
+    const registeredNow = active.get(runId);
+    if (registeredNow) {
+      await stopActiveHandle(registeredNow, "cancelled by user");
+      return true;
+    }
+    if (run && run.status === "running" && currentRunId === runId) {
       pendingCancelRunIds.add(runId);
       dropDeferredOpencodeWake(taskId);
       cancelPendingForTask(taskId, "cancelled by user");
@@ -8224,7 +8800,7 @@ export async function cancelRun(runId: string): Promise<boolean> {
     return endedLinger;
   }
   // Stop targets the whole task, not just one run.
-  stopActiveHandle(h, "cancelled by user");
+  await stopActiveHandle(h, "cancelled by user");
   return true;
 }
 
@@ -8241,7 +8817,7 @@ export async function cancelRun(runId: string): Promise<boolean> {
  * ({@link pendingCancelTaskIds}). Returns whether anything was stopped.
  */
 export async function cancelLiveRunOfTask(taskId: string): Promise<boolean> {
-  const currentRunId = tasks.get(taskId)?.runId;
+  const currentRunId = (await tasks.get(taskId))?.runId;
   if (currentRunId && (await cancelRun(currentRunId))) return true;
   let newest: string | null = null;
   // `active` is a Map: insertion order is registration order, newest last.
@@ -8474,12 +9050,11 @@ async function sendInputWith(
   opts: { bounded?: boolean; onlyIfIdle?: boolean },
   internal: SendInputInternal,
 ): Promise<SendInputResult> {
-  const row = db.query<{ task_id: string; agent: string }, [string]>(
-    `SELECT task_id, agent FROM runs WHERE id = ?`,
-  ).get(runId);
-  if (!row) return { delivered: false, reason: "run not found" };
+  const run = await runs.get(runId);
+  if (!run) return { delivered: false, reason: "run not found" };
+  const row = { task_id: run.taskId, agent: run.agent };
 
-  const task = tasks.get(row.task_id);
+  const task = await tasks.get(row.task_id);
   if (!task) return { delivered: false, reason: "task not found" };
   if (launchesFrozenFlag) return frozenSendResult(opts.onlyIfIdle === true);
   // Only agetor's own swap sends may produce the hidden continuation value;
@@ -8517,7 +9092,7 @@ async function sendInputWith(
   void inner.then((result) => settleLateSend(row.task_id, rawLine, result)).catch((err) => {
     console.error(`[agetor] late send settle failed for task ${row.task_id}:`, err);
   });
-  return { delivered: true, runId: pendingRunIdFor(row.task_id, runId, sendStartedAt), pending: true };
+  return { delivered: true, runId: await pendingRunIdFor(row.task_id, runId, sendStartedAt), pending: true };
 }
 
 /**
@@ -8532,11 +9107,11 @@ async function sendInputWith(
  * teardown, a restore, a floor probe — or a fold/queue path that never mints
  * synchronously) it is the run the message was addressed to.
  */
-function pendingRunIdFor(taskId: string, addressedRunId: string, sendStartedAt: number): string {
+async function pendingRunIdFor(taskId: string, addressedRunId: string, sendStartedAt: number): Promise<string> {
   try {
-    const current = tasks.get(taskId)?.runId;
+    const current = (await tasks.get(taskId))?.runId;
     if (current && current !== addressedRunId) {
-      const run = runs.get(current);
+      const run = await runs.get(current);
       if (run && run.startedAt >= sendStartedAt) return current;
     }
   } catch (err) {
@@ -8557,12 +9132,12 @@ function pendingRunIdFor(taskId: string, addressedRunId: string, sendStartedAt: 
  * `restashPasteWithheldText` skips a task that is gone or archived, in which
  * case the toast says the text was NOT saved.
  */
-function settleLateSend(taskId: string, rawLine: string, result: SendInputResult): void {
+async function settleLateSend(taskId: string, rawLine: string, result: SendInputResult): Promise<void> {
   if (result.delivered) return;
   const savedToBacklog = result.withheld === true
     ? result.savedToBacklog === true
-    : restashPasteWithheldText(taskId, rawLine);
-  emitGlobal({ kind: "send-failed", taskId, reason: result.reason, savedToBacklog, ts: Date.now() });
+    : await restashPasteWithheldText(taskId, rawLine);
+  await emitGlobal({ kind: "send-failed", taskId, reason: result.reason, savedToBacklog, ts: Date.now() });
 }
 
 /**
@@ -8584,8 +9159,8 @@ async function sendInputInner(
   const imported = importedSessionOf(task);
   if (imported) {
     const heldElsewhere = imported.kind === "opencode"
-      ? tasks.importedOpencodeSessionHeldElsewhere(row.task_id, imported.sessionId)
-      : tasks.importedSessionHeldElsewhere(row.task_id, imported.sessionId);
+      ? await tasks.importedOpencodeSessionHeldElsewhere(row.task_id, imported.sessionId)
+      : await tasks.importedSessionHeldElsewhere(row.task_id, imported.sessionId);
     if (heldElsewhere) {
       return {
         delivered: false,
@@ -8614,7 +9189,7 @@ async function sendInputInner(
     // The claim belongs to "Switch to next account" (idle or at turn end):
     // hold the message like a swap window does and deliver it after the move
     // (a pipeline handoff reminder must not be refused and block its step).
-    const heldRunId = tasks.get(row.task_id)?.runId ?? task.runId;
+    const heldRunId = (await tasks.get(row.task_id))?.runId ?? task.runId;
     if (!heldRunId) return { delivered: false, reason: "the task is starting" };
     const hidden = isHiddenContinuationUserText(line);
     pushSwapFollowUp(row.task_id, hidden ? stripHarnessStackContinuation(line) : line, hidden);
@@ -8629,7 +9204,7 @@ async function sendInputInner(
   // not the decision: each kind's `send*Turn` re-checks in the same
   // synchronous section as its busy/idle decision, because a continuation can
   // still be adopted (or a turn started) during the awaits in between.
-  if (onlyIfIdle && isAnyRunOfTaskLive(row.task_id)) return idleOnlyBusyResult();
+  if (onlyIfIdle && await isAnyRunOfTaskLive(row.task_id)) return idleOnlyBusyResult();
 
   // A run start or a harness-stack swap holds the task's claim: no competing
   // turn may be minted. Hold the text; `attachDoneHandler` drains it onto the
@@ -8637,7 +9212,7 @@ async function sendInputInner(
   // Writing one here too (on the OLD/displaced run) duplicated the message
   // once the drain sent it on the successor.
   if (swapWindowTaskIds.has(row.task_id) && !bypassSwapHold) {
-    const heldRunId = tasks.get(row.task_id)?.runId ?? task.runId;
+    const heldRunId = (await tasks.get(row.task_id))?.runId ?? task.runId;
     if (!heldRunId) return { delivered: false, reason: "the task is starting" };
     // Only agetor's own hidden remainder can arrive here wrapped (the S1
     // refusal stops every user path): hold its words with the flag, so a
@@ -8657,20 +9232,27 @@ async function sendInputInner(
   // (review S8). A claim someone else holds means a start/swap owns the task
   // and runs its own prepare; the per-kind dispatch below handles the message
   // against that owner as before.
-  if (!startingTaskIds.has(row.task_id) && harnessStacks.resolveForTask(task)) {
+  // The claim is re-checked after the stack lookup's await and taken in the
+  // same synchronous step, so a start that claimed meanwhile is never shared
+  // (and then released by this path's `finally`).
+  if (
+    !startingTaskIds.has(row.task_id)
+    && (await harnessStacks.resolveForTask(task))
+    && !startingTaskIds.has(row.task_id)
+  ) {
     startingTaskIds.add(row.task_id);
     let prepared: Awaited<ReturnType<typeof prepareTaskHarness>>;
     try {
       prepared = await prepareTaskHarnessForUser(row.task_id, { manual: true });
       if (prepared.ok && prepared.moved) await dropSessionAfterAccountMove(row.task_id, prepared.moved.from);
     } finally {
-      releaseStartingClaim(row.task_id);
+      await releaseStartingClaim(row.task_id);
     }
     if (!prepared.ok) return { delivered: false, reason: prepared.error ?? "no usable account in this stack" };
     if (prepared.moved) {
-      task = tasks.get(row.task_id) ?? task;
+      task = await tasks.get(row.task_id) ?? task;
       const noteRunId = task.runId;
-      if (noteRunId) for (const warning of prepared.warnings ?? []) saveStatusLineQuietly(noteRunId, row.task_id, warning);
+      if (noteRunId) for (const warning of prepared.warnings ?? []) await saveStatusLineQuietly(noteRunId, row.task_id, warning);
     }
   }
 
@@ -8682,7 +9264,7 @@ async function sendInputInner(
   // PATCH-able while a message sits in the queue), so this is the early
   // gate, not the only one.
   {
-    const taskHarness = resolveHarness(task.agent);
+    const taskHarness = await resolveHarness(task.agent);
     if (taskHarness?.kind === "codex" || taskHarness?.kind === "copilot") {
       const floorError = await minCliVersionError(taskHarness, task.model ?? DEFAULT_MODEL[taskHarness.kind]);
       if (floorError !== null) return { delivered: false, reason: floorError };
@@ -8690,7 +9272,7 @@ async function sendInputInner(
   }
 
   if (task.archivedAt != null) {
-    tasks.update(row.task_id, { archivedAt: null });
+    await tasks.update(row.task_id, { archivedAt: null });
   }
 
   // Same race as unarchiveTask/startTask: a deferred archive teardown may
@@ -8715,13 +9297,13 @@ async function sendInputInner(
     // Re-fetch so the restore sees the just-cleared archivedAt (prepareWorkdir
     // doesn't care about it, but keeping the object fresh avoids acting on a
     // stale snapshot).
-    const fresh = tasks.get(row.task_id) ?? task;
+    const fresh = await tasks.get(row.task_id) ?? task;
     try {
       const restored = await prepareTaskWorkdir(fresh);
       if ("error" in restored) {
         return { delivered: false, reason: `worktree restore failed: ${restored.error}` };
       }
-      noteRestoredCheckout(fresh.id, restored);
+      await noteRestoredCheckout(fresh.id, restored);
     } catch (err) {
       const msg = err instanceof Error ? err.message : String(err);
       return { delivered: false, reason: `worktree restore failed: ${msg}` };
@@ -8736,7 +9318,7 @@ async function sendInputInner(
   // `task` fetched above) because the worktree-restore branch just above may
   // have materialized `worktreePath` for the first time; a stale read would
   // expand against a cwd that didn't exist yet.
-  const cwdTask = tasks.get(row.task_id) ?? task;
+  const cwdTask = await tasks.get(row.task_id) ?? task;
   // Keep the pre-expansion text around: a claude paste that gets withheld by
   // the modal guard re-stashes into the task's backlog tray (see
   // `handlePasteWithheld`/`restashPasteWithheldText`), and that re-stash must
@@ -8754,7 +9336,7 @@ async function sendInputInner(
   line = expanded.text;
   const unresolvedRefs = expanded.unresolved;
 
-  const harness = resolveHarness(row.agent);
+  const harness = await resolveHarness(row.agent);
   const kind = harness?.kind;
 
   // Re-check the argv-launch budget AFTER expansion, mirroring `startTask`'s
@@ -8787,7 +9369,7 @@ async function sendInputInner(
   // unless we read the row again in the same turn as the spawn. Spawning
   // anyway leaves an archived task with a live agent; the restart-followup
   // answer route then reports a failed delivery with no reason of its own.
-  const readyToSpawn = tasks.get(row.task_id);
+  const readyToSpawn = await tasks.get(row.task_id);
   if (!readyToSpawn) return { delivered: false, reason: "task not found" };
   if (readyToSpawn.archivedAt != null) {
     return { delivered: false, reason: SEND_ARCHIVED_REASON };
@@ -8965,11 +9547,15 @@ async function sendCodexTurn(
   rawLine: string = line,
   onlyIfIdle = false,
 ): Promise<string | CodexTurnDecline | IdleOnlyBusy | null> {
-  const task = tasks.get(taskId);
+  // One read (task, harness, background-agent hold), then the idle-only check
+  // and the busy/idle decision below with nothing awaited in between, so both
+  // see the run state exactly as it stood at that read.
+  const snap = await readTaskSnapshot(taskId);
+  const task = snap.task;
   if (!task) return null;
   // Idle-only send (`sendInput`'s `onlyIfIdle`): refuse BEFORE the queue push,
   // the user event or a spawn — same synchronous section as the busy check.
-  if (onlyIfIdle && isAnyRunOfTaskLive(taskId)) return { busy: true };
+  if (onlyIfIdle && anyRunOfTaskLiveFrom(taskId, snap)) return { busy: true };
   if (task.runId && active.has(task.runId)) {
     const q = codexTurnQueue.get(taskId) ?? [];
     q.push({ raw: rawLine, expanded: line });
@@ -8978,7 +9564,7 @@ async function sendCodexTurn(
     // away; the queued turn that answers it lands as a later run row.
     const runId = task.runId;
     const data = normalizeUserText(line);
-    saveAndEmit({ runId, taskId, stream: "user", data });
+    await saveAndEmit({ runId, taskId, stream: "user", data });
     return runId;
   }
   return spawnCodexTurnNow(task, taskId, line);
@@ -9125,9 +9711,9 @@ async function spawnCodexTurnNow(
   if (startingTaskIds.has(taskId)) return null;
   startingTaskIds.add(taskId);
   try {
-    const priorThreadId = lastSessionIdForTask(task, "codex_session_id");
+    const priorThreadId = await lastSessionIdForTask(task, "codex_session_id");
     const cwd = task.worktreePath ?? task.workdir;
-    const harness = resolveHarness(task.agent);
+    const harness = await resolveHarness(task.agent);
 
     // Pre-flight 1b — before any state mutation (see this function's doc).
     // The `startingTaskIds` claim above is in-memory only and released by the
@@ -9140,7 +9726,7 @@ async function spawnCodexTurnNow(
 
     const newRunId = randomUUID();
     const now = Date.now();
-    runs.insert({
+    await runs.insert({
       id: newRunId,
       taskId,
       agent: task.agent,
@@ -9160,10 +9746,10 @@ async function spawnCodexTurnNow(
       antigravitySessionId: null,
     });
     const prevColumn: ColumnId = task.column;
-    tasks.update(taskId, { column: "running", runId: newRunId });
+    await tasks.update(taskId, { column: "running", runId: newRunId });
     const stoppedDuringClaim = adoptPendingTaskCancel(taskId, newRunId);
     if (prevColumn !== "running") {
-      emitGlobal({ kind: "column", taskId, runId: newRunId, column: "running", prev: prevColumn, ts: now });
+      await emitGlobal({ kind: "column", taskId, runId: newRunId, column: "running", prev: prevColumn, ts: now });
     }
 
     const kind: AgentKind = harness?.kind ?? "codex";
@@ -9178,9 +9764,9 @@ async function spawnCodexTurnNow(
 
     if (!harness) {
       onChunk("stderr", `harness "${task.agent}" not found — cannot resume`);
-      runs.update(newRunId, { status: "failed", endedAt: Date.now(), exitCode: -1 });
+      await runs.update(newRunId, { status: "failed", endedAt: Date.now(), exitCode: -1 });
       pendingCancelRunIds.delete(newRunId); // an adopted Stop has nothing left to cancel
-      tasks.update(taskId, { column: "ready", runId: null });
+      await tasks.update(taskId, { column: "ready", runId: null });
       return newRunId;
     }
 
@@ -9191,9 +9777,7 @@ async function spawnCodexTurnNow(
       prompt: line,
       cwd,
       onChunk,
-      onSessionId: (sessionId) => {
-        runs.update(newRunId, { codexSessionId: sessionId });
-      },
+      onSessionId: (sessionId) => queueRunPatch(newRunId, { codexSessionId: sessionId }),
       opts: {
         mode: task.mode,
         model: task.model ?? DEFAULT_MODEL[harness.kind],
@@ -9221,17 +9805,17 @@ async function spawnCodexTurnNow(
       // the queue is dropped here (kept in the backlog on a pipeline step).
       // A drained follow-up stopped during the claim goes first, in send
       // order (see this function's doc).
-      if (stoppedDuringClaim && drained && isPipelineStepTaskId(taskId)) {
+      if (stoppedDuringClaim && drained && await isPipelineStepTaskId(taskId)) {
         codexTurnQueue.set(taskId, [drained, ...(codexTurnQueue.get(taskId) ?? [])]);
       }
-      dropQueuedFollowUpsAfterPendingCancel(taskId, newRunId);
+      await dropQueuedFollowUpsAfterPendingCancel(taskId, newRunId);
       return newRunId;
     }
     registerActiveRun(newRunId, taskId, task, agent);
     attachDoneHandler(newRunId, taskId, agent);
     return newRunId;
   } finally {
-    releaseStartingClaim(taskId);
+    await releaseStartingClaim(taskId);
   }
 }
 
@@ -9243,13 +9827,13 @@ async function spawnCodexTurnNow(
 async function drainCodexQueue(taskId: string): Promise<void> {
   const q = codexTurnQueue.get(taskId);
   if (!q || q.length === 0) return;
-  const task = tasks.get(taskId);
+  const task = await tasks.get(taskId);
   // Task vanished, or its agent was switched away from codex while a turn was
   // in flight — abandon the stale queue. Without this guard, draining after a
   // codex→claude switch would spawn the follow-up against the new claude
   // harness with a codex thread id (`claude --resume <codexThreadId>`), which
   // claude rejects.
-  if (!task || resolveHarness(task.agent)?.kind !== "codex") {
+  if (!task || (await resolveHarness(task.agent))?.kind !== "codex") {
     codexTurnQueue.delete(taskId);
     return;
   }
@@ -9272,12 +9856,12 @@ async function drainCodexQueue(taskId: string): Promise<void> {
   // order: the refused line lands on top and the tray reads chronologically.
   // Restash the RAW text (see `QueuedCodexLine`) so the tray's dedupe matches
   // a draft saved with the same `@token`s.
-  for (const item of [...stranded].reverse()) restashPasteWithheldText(taskId, item.raw);
-  const lastRunId = runs.listForTask(taskId)[0]?.id;
+  for (const item of [...stranded].reverse()) await restashPasteWithheldText(taskId, item.raw);
+  const lastRunId = (await runs.listForTask(taskId))[0]?.id;
   if (lastRunId) {
     const what = stranded.length === 1 ? "queued message not sent" : `${stranded.length} queued messages not sent`;
     const data = `${what} — saved to your backlog; resend from the tray after upgrading. ${result.declined}`;
-    saveAndEmit({ runId: lastRunId, taskId, stream: "status", data });
+    await saveAndEmit({ runId: lastRunId, taskId, stream: "status", data });
   }
 }
 
@@ -9309,11 +9893,14 @@ async function sendCursorTurn(
   line: string,
   onlyIfIdle = false,
 ): Promise<string | IdleOnlyBusy | CursorTurnMiss | null> {
-  const task = tasks.get(taskId);
+  // One read, then the idle-only check and the busy/idle decision with
+  // nothing awaited in between (see `sendCodexTurn`).
+  const snap = await readTaskSnapshot(taskId);
+  const task = snap.task;
   if (!task) return null;
   // Idle-only send: refuse before the queue push / user event / spawn (see
   // `sendCodexTurn`).
-  if (onlyIfIdle && isAnyRunOfTaskLive(taskId)) return { busy: true };
+  if (onlyIfIdle && anyRunOfTaskLiveFrom(taskId, snap)) return { busy: true };
   if (task.runId && active.has(task.runId)) {
     const q = cursorTurnQueue.get(taskId) ?? [];
     q.push(line);
@@ -9322,7 +9909,7 @@ async function sendCursorTurn(
     // away; the queued turn that answers it lands as a later run row.
     const runId = task.runId;
     const data = normalizeUserText(line);
-    saveAndEmit({ runId, taskId, stream: "user", data });
+    await saveAndEmit({ runId, taskId, stream: "user", data });
     return runId;
   }
   return spawnCursorTurnNow(task, taskId, line);
@@ -9342,13 +9929,13 @@ async function spawnCursorTurnNow(task: Task, taskId: string, line: string): Pro
   if (startingTaskIds.has(taskId)) return null;
   startingTaskIds.add(taskId);
   try {
-    const priorSessionId = lastSessionIdForTask(task, "cursor_session_id");
+    const priorSessionId = await lastSessionIdForTask(task, "cursor_session_id");
     const cwd = task.worktreePath ?? task.workdir;
-    const harness = resolveHarness(task.agent);
+    const harness = await resolveHarness(task.agent);
 
     const newRunId = randomUUID();
     const now = Date.now();
-    runs.insert({
+    await runs.insert({
       id: newRunId,
       taskId,
       agent: task.agent,
@@ -9368,10 +9955,10 @@ async function spawnCursorTurnNow(task: Task, taskId: string, line: string): Pro
       antigravitySessionId: null,
     });
     const prevColumn: ColumnId = task.column;
-    tasks.update(taskId, { column: "running", runId: newRunId });
+    await tasks.update(taskId, { column: "running", runId: newRunId });
     adoptPendingTaskCancel(taskId, newRunId);
     if (prevColumn !== "running") {
-      emitGlobal({ kind: "column", taskId, runId: newRunId, column: "running", prev: prevColumn, ts: now });
+      await emitGlobal({ kind: "column", taskId, runId: newRunId, column: "running", prev: prevColumn, ts: now });
     }
 
     const kind: AgentKind = harness?.kind ?? "cursor";
@@ -9388,9 +9975,9 @@ async function spawnCursorTurnNow(task: Task, taskId: string, line: string): Pro
 
     if (!harness) {
       onChunk("stderr", `harness "${task.agent}" not found — cannot resume`);
-      runs.update(newRunId, { status: "failed", endedAt: Date.now(), exitCode: -1 });
+      await runs.update(newRunId, { status: "failed", endedAt: Date.now(), exitCode: -1 });
       pendingCancelRunIds.delete(newRunId); // an adopted Stop has nothing left to cancel
-      tasks.update(taskId, { column: "ready", runId: null });
+      await tasks.update(taskId, { column: "ready", runId: null });
       return newRunId;
     }
 
@@ -9401,9 +9988,7 @@ async function spawnCursorTurnNow(task: Task, taskId: string, line: string): Pro
       prompt: line,
       cwd,
       onChunk,
-      onSessionId: (sessionId) => {
-        runs.update(newRunId, { cursorSessionId: sessionId });
-      },
+      onSessionId: (sessionId) => queueRunPatch(newRunId, { cursorSessionId: sessionId }),
       opts: {
         mode: task.mode,
         model: task.model ?? DEFAULT_MODEL[harness.kind],
@@ -9425,25 +10010,28 @@ async function spawnCursorTurnNow(task: Task, taskId: string, line: string): Pro
       cursorTurnQueue.delete(taskId);
       return { declined: message };
     }
-    if (await consumePendingCancel(newRunId, taskId, agent, onChunk, { dropClaudeSession: false })) {
-      // Stop landed while the spawn was in flight (see `pendingCancelRunIds`):
-      // the run is settled `cancelled` and attachDoneHandler never runs, so
-      // the queue is dropped here (kept in the backlog on a pipeline step).
-      dropQueuedFollowUpsAfterPendingCancel(taskId, newRunId);
-      return { declined: "the turn was cancelled before Cursor started" };
-    }
     // Ownership guard, the same rule as `startTaskInner`'s continuation.
     // The ACP handshake is the slow part of this spawn: the run row exists
     // and the child is already up, but `registerActiveRun` has not run, so
     // delete and force-archive (whose `active.has(task.runId)` check is
     // false in this window) do not see a handle to kill. Registering
     // afterwards would leave that child running on a task that is gone,
-    // archived, or no longer on this run.
-    const fresh = tasks.get(taskId);
+    // archived, or no longer on this run. Read before the pending Stop is
+    // consumed, so consuming it and registering happen with nothing awaited
+    // in between (a Stop recorded during the read is not missed).
+    const fresh = await tasks.get(taskId);
+    if (pendingCancelRunIds.has(newRunId)) {
+      await consumePendingCancel(newRunId, taskId, agent, onChunk, { dropClaudeSession: false });
+      // Stop landed while the spawn was in flight (see `pendingCancelRunIds`):
+      // the run is settled `cancelled` and attachDoneHandler never runs, so
+      // the queue is dropped here (kept in the backlog on a pipeline step).
+      await dropQueuedFollowUpsAfterPendingCancel(taskId, newRunId);
+      return { declined: "the turn was cancelled before Cursor started" };
+    }
     if (!fresh || fresh.archivedAt != null || fresh.runId !== newRunId) {
       agent.done.catch(() => {});
       agent.kill();
-      runs.update(newRunId, { status: "cancelled", endedAt: Date.now(), exitCode: -1 });
+      await runs.update(newRunId, { status: "cancelled", endedAt: Date.now(), exitCode: -1 });
       // This run never registers, so nothing will drain the follow-up queue.
       // Delete and archive already dropped it; a runId mismatch means a
       // newer turn owns the task and must keep whatever it queued.
@@ -9454,8 +10042,8 @@ async function spawnCursorTurnNow(task: Task, taskId: string, line: string): Pro
         // itself does not touch the column. Left on `running`, unarchive
         // shows Stop for a process that is already gone and has no handle.
         onChunk("status", "task archived before the agent launched");
-        updateColumn(taskId, newRunId, "ready");
-        emitGlobal({ kind: "run-status", taskId, runId: newRunId, status: "cancelled", ts: Date.now() });
+        await updateColumn(taskId, newRunId, "ready", undefined, { runId: newRunId });
+        await emitGlobal({ kind: "run-status", taskId, runId: newRunId, status: "cancelled", ts: Date.now() });
       }
       return { declined: "the turn was cancelled before Cursor started" };
     }
@@ -9464,7 +10052,7 @@ async function spawnCursorTurnNow(task: Task, taskId: string, line: string): Pro
     attachDoneHandler(newRunId, taskId, agent);
     return newRunId;
   } finally {
-    releaseStartingClaim(taskId);
+    await releaseStartingClaim(taskId);
   }
 }
 
@@ -9476,13 +10064,13 @@ async function spawnCursorTurnNow(task: Task, taskId: string, line: string): Pro
 async function drainCursorQueue(taskId: string): Promise<void> {
   const q = cursorTurnQueue.get(taskId);
   if (!q || q.length === 0) return;
-  const task = tasks.get(taskId);
+  const task = await tasks.get(taskId);
   // Task vanished, or its agent was switched away from cursor while a turn
   // was in flight — abandon the stale queue. Without this guard, draining
   // after a cursor→claude/codex/gemini switch would spawn the follow-up
   // against the new harness with a cursor session id, which the new harness
   // rejects.
-  if (!task || resolveHarness(task.agent)?.kind !== "cursor") {
+  if (!task || (await resolveHarness(task.agent))?.kind !== "cursor") {
     cursorTurnQueue.delete(taskId);
     return;
   }
@@ -9516,11 +10104,14 @@ async function sendGeminiTurn(
   line: string,
   onlyIfIdle = false,
 ): Promise<string | IdleOnlyBusy | null> {
-  const task = tasks.get(taskId);
+  // One read, then the idle-only check and the busy/idle decision with
+  // nothing awaited in between (see `sendCodexTurn`).
+  const snap = await readTaskSnapshot(taskId);
+  const task = snap.task;
   if (!task) return null;
   // Idle-only send: refuse before the queue push / user event / spawn (see
   // `sendCodexTurn`).
-  if (onlyIfIdle && isAnyRunOfTaskLive(taskId)) return { busy: true };
+  if (onlyIfIdle && anyRunOfTaskLiveFrom(taskId, snap)) return { busy: true };
   if (task.runId && active.has(task.runId)) {
     const q = geminiTurnQueue.get(taskId) ?? [];
     q.push(line);
@@ -9529,7 +10120,7 @@ async function sendGeminiTurn(
     // away; the queued turn that answers it lands as a later run row.
     const runId = task.runId;
     const data = normalizeUserText(line);
-    saveAndEmit({ runId, taskId, stream: "user", data });
+    await saveAndEmit({ runId, taskId, stream: "user", data });
     return runId;
   }
   return spawnGeminiTurnNow(task, taskId, line);
@@ -9551,13 +10142,13 @@ async function spawnGeminiTurnNow(task: Task, taskId: string, line: string): Pro
   if (startingTaskIds.has(taskId)) return null;
   startingTaskIds.add(taskId);
   try {
-    const priorSessionId = lastSessionIdForTask(task, "gemini_session_id");
+    const priorSessionId = await lastSessionIdForTask(task, "gemini_session_id");
     const cwd = task.worktreePath ?? task.workdir;
-    const harness = resolveHarness(task.agent);
+    const harness = await resolveHarness(task.agent);
 
     const newRunId = randomUUID();
     const now = Date.now();
-    runs.insert({
+    await runs.insert({
       id: newRunId,
       taskId,
       agent: task.agent,
@@ -9574,10 +10165,10 @@ async function spawnGeminiTurnNow(task: Task, taskId: string, line: string): Pro
       antigravitySessionId: null,
     });
     const prevColumn: ColumnId = task.column;
-    tasks.update(taskId, { column: "running", runId: newRunId });
+    await tasks.update(taskId, { column: "running", runId: newRunId });
     adoptPendingTaskCancel(taskId, newRunId);
     if (prevColumn !== "running") {
-      emitGlobal({ kind: "column", taskId, runId: newRunId, column: "running", prev: prevColumn, ts: now });
+      await emitGlobal({ kind: "column", taskId, runId: newRunId, column: "running", prev: prevColumn, ts: now });
     }
 
     const kind: AgentKind = harness?.kind ?? "gemini";
@@ -9592,9 +10183,9 @@ async function spawnGeminiTurnNow(task: Task, taskId: string, line: string): Pro
 
     if (!harness) {
       onChunk("stderr", `harness "${task.agent}" not found — cannot resume`);
-      runs.update(newRunId, { status: "failed", endedAt: Date.now(), exitCode: -1 });
+      await runs.update(newRunId, { status: "failed", endedAt: Date.now(), exitCode: -1 });
       pendingCancelRunIds.delete(newRunId); // an adopted Stop has nothing left to cancel
-      tasks.update(taskId, { column: "ready", runId: null });
+      await tasks.update(taskId, { column: "ready", runId: null });
       return newRunId;
     }
 
@@ -9610,9 +10201,7 @@ async function spawnGeminiTurnNow(task: Task, taskId: string, line: string): Pro
       // prior session id yet (spawnAgent mints a fresh uuid via
       // crypto.randomUUID() when resumeSessionId is absent, and this is the
       // only way that freshly-minted id gets persisted).
-      onSessionId: (sessionId) => {
-        runs.update(newRunId, { geminiSessionId: sessionId });
-      },
+      onSessionId: (sessionId) => queueRunPatch(newRunId, { geminiSessionId: sessionId }),
       opts: {
         mode: task.mode,
         model: task.model ?? DEFAULT_MODEL[harness.kind],
@@ -9636,14 +10225,14 @@ async function spawnGeminiTurnNow(task: Task, taskId: string, line: string): Pro
       // Stop landed while the spawn was in flight (see `pendingCancelRunIds`):
       // the run is settled `cancelled` and attachDoneHandler never runs, so
       // the queue is dropped here (kept in the backlog on a pipeline step).
-      dropQueuedFollowUpsAfterPendingCancel(taskId, newRunId);
+      await dropQueuedFollowUpsAfterPendingCancel(taskId, newRunId);
       return newRunId;
     }
     registerActiveRun(newRunId, taskId, task, agent);
     attachDoneHandler(newRunId, taskId, agent);
     return newRunId;
   } finally {
-    releaseStartingClaim(taskId);
+    await releaseStartingClaim(taskId);
   }
 }
 
@@ -9655,12 +10244,12 @@ async function spawnGeminiTurnNow(task: Task, taskId: string, line: string): Pro
 async function drainGeminiQueue(taskId: string): Promise<void> {
   const q = geminiTurnQueue.get(taskId);
   if (!q || q.length === 0) return;
-  const task = tasks.get(taskId);
+  const task = await tasks.get(taskId);
   // Task vanished, or its agent was switched away from gemini while a turn
   // was in flight — abandon the stale queue. Without this guard, draining
   // after a gemini→claude switch would spawn the follow-up against the new
   // claude harness with a gemini session id, which claude rejects.
-  if (!task || resolveHarness(task.agent)?.kind !== "gemini") {
+  if (!task || (await resolveHarness(task.agent))?.kind !== "gemini") {
     geminiTurnQueue.delete(taskId);
     return;
   }
@@ -9693,11 +10282,14 @@ async function sendAntigravityTurn(
   line: string,
   onlyIfIdle = false,
 ): Promise<string | IdleOnlyBusy | null> {
-  const task = tasks.get(taskId);
+  // One read, then the idle-only check and the busy/idle decision with
+  // nothing awaited in between (see `sendCodexTurn`).
+  const snap = await readTaskSnapshot(taskId);
+  const task = snap.task;
   if (!task) return null;
   // Idle-only send: refuse before the queue push / user event / spawn (see
   // `sendCodexTurn`).
-  if (onlyIfIdle && isAnyRunOfTaskLive(taskId)) return { busy: true };
+  if (onlyIfIdle && anyRunOfTaskLiveFrom(taskId, snap)) return { busy: true };
   if (task.runId && active.has(task.runId)) {
     const q = antigravityTurnQueue.get(taskId) ?? [];
     q.push(line);
@@ -9706,7 +10298,7 @@ async function sendAntigravityTurn(
     // away; the queued turn that answers it lands as a later run row.
     const runId = task.runId;
     const data = normalizeUserText(line);
-    saveAndEmit({ runId, taskId, stream: "user", data });
+    await saveAndEmit({ runId, taskId, stream: "user", data });
     return runId;
   }
   return spawnAntigravityTurnNow(task, taskId, line);
@@ -9721,13 +10313,13 @@ async function spawnAntigravityTurnNow(task: Task, taskId: string, line: string)
   if (startingTaskIds.has(taskId)) return null;
   startingTaskIds.add(taskId);
   try {
-    const priorSessionId = lastSessionIdForTask(task, "antigravity_session_id");
+    const priorSessionId = await lastSessionIdForTask(task, "antigravity_session_id");
     const cwd = task.worktreePath ?? task.workdir;
-    const harness = resolveHarness(task.agent);
+    const harness = await resolveHarness(task.agent);
 
     const newRunId = randomUUID();
     const now = Date.now();
-    runs.insert({
+    await runs.insert({
       id: newRunId,
       taskId,
       agent: task.agent,
@@ -9744,10 +10336,10 @@ async function spawnAntigravityTurnNow(task: Task, taskId: string, line: string)
       antigravitySessionId: priorSessionId,
     });
     const prevColumn: ColumnId = task.column;
-    tasks.update(taskId, { column: "running", runId: newRunId });
+    await tasks.update(taskId, { column: "running", runId: newRunId });
     adoptPendingTaskCancel(taskId, newRunId);
     if (prevColumn !== "running") {
-      emitGlobal({ kind: "column", taskId, runId: newRunId, column: "running", prev: prevColumn, ts: now });
+      await emitGlobal({ kind: "column", taskId, runId: newRunId, column: "running", prev: prevColumn, ts: now });
     }
 
     const kind: AgentKind = harness?.kind ?? "antigravity";
@@ -9762,9 +10354,9 @@ async function spawnAntigravityTurnNow(task: Task, taskId: string, line: string)
 
     if (!harness) {
       onChunk("stderr", `harness "${task.agent}" not found — cannot resume`);
-      runs.update(newRunId, { status: "failed", endedAt: Date.now(), exitCode: -1 });
+      await runs.update(newRunId, { status: "failed", endedAt: Date.now(), exitCode: -1 });
       pendingCancelRunIds.delete(newRunId); // an adopted Stop has nothing left to cancel
-      tasks.update(taskId, { column: "ready", runId: null });
+      await tasks.update(taskId, { column: "ready", runId: null });
       return newRunId;
     }
 
@@ -9775,9 +10367,7 @@ async function spawnAntigravityTurnNow(task: Task, taskId: string, line: string)
       prompt: line,
       cwd,
       onChunk,
-      onSessionId: (sessionId) => {
-        runs.update(newRunId, { antigravitySessionId: sessionId });
-      },
+      onSessionId: (sessionId) => queueRunPatch(newRunId, { antigravitySessionId: sessionId }),
       opts: {
         mode: task.mode,
         model: task.model ?? DEFAULT_MODEL[harness.kind],
@@ -9793,14 +10383,14 @@ async function spawnAntigravityTurnNow(task: Task, taskId: string, line: string)
       return newRunId;
     }
     if (await consumePendingCancel(newRunId, taskId, agent, onChunk, { dropClaudeSession: false })) {
-      dropQueuedFollowUpsAfterPendingCancel(taskId, newRunId);
+      await dropQueuedFollowUpsAfterPendingCancel(taskId, newRunId);
       return newRunId;
     }
     registerActiveRun(newRunId, taskId, task, agent);
     attachDoneHandler(newRunId, taskId, agent);
     return newRunId;
   } finally {
-    releaseStartingClaim(taskId);
+    await releaseStartingClaim(taskId);
   }
 }
 
@@ -9812,8 +10402,8 @@ async function spawnAntigravityTurnNow(task: Task, taskId: string, line: string)
 async function drainAntigravityQueue(taskId: string): Promise<void> {
   const q = antigravityTurnQueue.get(taskId);
   if (!q || q.length === 0) return;
-  const task = tasks.get(taskId);
-  if (!task || resolveHarness(task.agent)?.kind !== "antigravity") {
+  const task = await tasks.get(taskId);
+  if (!task || (await resolveHarness(task.agent))?.kind !== "antigravity") {
     antigravityTurnQueue.delete(taskId);
     return;
   }
@@ -9850,11 +10440,14 @@ async function sendOpencodeTurn(
   line: string,
   onlyIfIdle = false,
 ): Promise<string | IdleOnlyBusy | null> {
-  const task = tasks.get(taskId);
+  // One read, then the idle-only check and the busy/idle decision with
+  // nothing awaited in between (see `sendCodexTurn`).
+  const snap = await readTaskSnapshot(taskId);
+  const task = snap.task;
   if (!task) return null;
   // Idle-only send: refuse before the queue push / user event / spawn (see
   // `sendCodexTurn`).
-  if (onlyIfIdle && isAnyRunOfTaskLive(taskId)) return { busy: true };
+  if (onlyIfIdle && anyRunOfTaskLiveFrom(taskId, snap)) return { busy: true };
   if (task.runId && active.has(task.runId)) {
     const runId = task.runId;
     // OpenCode 2.x on the agetor-owned server: the message joins the turn that
@@ -9866,7 +10459,7 @@ async function sendOpencodeTurn(
     q.push(line);
     opencodeTurnQueue.set(taskId, q);
     const data = normalizeUserText(line);
-    saveAndEmit({ runId, taskId, stream: "user", data });
+    await saveAndEmit({ runId, taskId, stream: "user", data });
     return runId;
   }
   return spawnOpencodeTurnNow(task, taskId, line);
@@ -9886,12 +10479,14 @@ async function spawnOpencodeTurnNow(task: Task, taskId: string, line: string, al
   // torn down or being deleted (a Stop that is part of the archive, delete or
   // switch hands undelivered messages back while it settles). A send to an
   // archived task un-archives it, and waits out its teardown, before this.
-  if (!canTakeOpencodeTurn(taskId)) return null;
+  if (!await canTakeOpencodeTurn(taskId)) return null;
+  // The read yielded: check the claim again and take it in the same step.
+  if (startingTaskIds.has(taskId)) return null;
   startingTaskIds.add(taskId);
   try {
-    const priorSessionId = lastSessionIdForTask(task, "opencode_session_id");
+    const priorSessionId = await lastSessionIdForTask(task, "opencode_session_id");
     const cwd = task.worktreePath ?? task.workdir;
-    const harness = resolveHarness(task.agent);
+    const harness = await resolveHarness(task.agent);
     // A server-transport turn has no tmux session of its own. The transport is
     // only certain once the version below is in; the last one known decides
     // the row now, and a different answer corrects it.
@@ -9900,7 +10495,7 @@ async function spawnOpencodeTurnNow(task: Task, taskId: string, line: string, al
 
     const newRunId = randomUUID();
     const now = Date.now();
-    runs.insert({
+    await runs.insert({
       id: newRunId,
       taskId,
       agent: task.agent,
@@ -9918,10 +10513,10 @@ async function spawnOpencodeTurnNow(task: Task, taskId: string, line: string, al
       opencodeSessionId: priorSessionId,
     });
     const prevColumn: ColumnId = task.column;
-    tasks.update(taskId, { column: "running", runId: newRunId });
+    await tasks.update(taskId, { column: "running", runId: newRunId });
     adoptPendingTaskCancel(taskId, newRunId);
     if (prevColumn !== "running") {
-      emitGlobal({ kind: "column", taskId, runId: newRunId, column: "running", prev: prevColumn, ts: now });
+      await emitGlobal({ kind: "column", taskId, runId: newRunId, column: "running", prev: prevColumn, ts: now });
     }
 
     const kind: AgentKind = harness?.kind ?? "opencode";
@@ -9931,15 +10526,15 @@ async function spawnOpencodeTurnNow(task: Task, taskId: string, line: string, al
 
     if (!harness) {
       onChunk("stderr", `harness "${task.agent}" not found — cannot resume`);
-      runs.update(newRunId, { status: "failed", endedAt: Date.now(), exitCode: -1 });
+      await runs.update(newRunId, { status: "failed", endedAt: Date.now(), exitCode: -1 });
       pendingCancelRunIds.delete(newRunId); // an adopted Stop has nothing left to cancel
-      tasks.update(taskId, { column: "ready", runId: null });
+      await tasks.update(taskId, { column: "ready", runId: null });
       return newRunId;
     }
 
     const cliVersion = await cachedCliVersion(harness);
     const transport = writeOpencodeTurnOpening(onChunk, harness, task, cliVersion);
-    if (tmuxNameFor(transport) !== guessedTmux) runs.setTmuxSession(newRunId, tmuxNameFor(transport));
+    if (tmuxNameFor(transport) !== guessedTmux) await runs.setTmuxSession(newRunId, tmuxNameFor(transport));
     onChunk(
       "status",
       priorSessionId
@@ -9954,10 +10549,7 @@ async function spawnOpencodeTurnNow(task: Task, taskId: string, line: string, al
       prompt: line,
       cwd,
       onChunk,
-      onSessionId: (sessionId) => {
-        runs.update(newRunId, { opencodeSessionId: sessionId });
-        scheduleOpencodeWatchRefresh();
-      },
+      onSessionId: (sessionId) => queueRunPatch(newRunId, { opencodeSessionId: sessionId }, scheduleOpencodeWatchRefresh),
       opencodeTurnHooks: opencodeTurnHooksFor(harness.id, newRunId, taskId, "spawn"),
       opts: {
         mode: task.mode,
@@ -9979,14 +10571,14 @@ async function spawnOpencodeTurnNow(task: Task, taskId: string, line: string, al
     if (await consumePendingCancel(newRunId, taskId, agent, onChunk, { dropClaudeSession: false })) {
       // Stop landed while the spawn was in flight (see `pendingCancelRunIds`):
       // the queue is dropped here (kept in the backlog on a pipeline step).
-      dropQueuedFollowUpsAfterPendingCancel(taskId, newRunId);
+      await dropQueuedFollowUpsAfterPendingCancel(taskId, newRunId);
       return newRunId;
     }
     registerActiveRun(newRunId, taskId, task, agent);
     attachDoneHandler(newRunId, taskId, agent);
     return newRunId;
   } finally {
-    releaseStartingClaim(taskId);
+    await releaseStartingClaim(taskId);
   }
 }
 
@@ -9998,21 +10590,21 @@ async function spawnOpencodeTurnNow(task: Task, taskId: string, line: string, al
 async function drainOpencodeQueue(taskId: string): Promise<void> {
   const q = opencodeTurnQueue.get(taskId);
   if (!q || q.length === 0) return;
-  const task = tasks.get(taskId);
-  if (!task || deletingTaskIds.has(taskId) || resolveHarness(task.agent)?.kind !== "opencode") {
+  const task = await tasks.get(taskId);
+  if (!task || deletingTaskIds.has(taskId) || (await resolveHarness(task.agent))?.kind !== "opencode") {
     opencodeTurnQueue.delete(taskId);
     return;
   }
   if (launchesFrozenFlag) {
     // This process is exiting (`freezeLaunches`), as in `drainFollowUpQueues`:
     // the queue goes to the tray instead of a turn that would be cut off.
-    stashQueuedFollowUps(taskId, task.runId, "Agetor stopped before it could run");
+    await stashQueuedFollowUps(taskId, task.runId, "Agetor stopped before it could run");
     return;
   }
-  if (!canTakeOpencodeTurn(taskId)) {
+  if (!await canTakeOpencodeTurn(taskId)) {
     // Archived or being torn down: keep the text in the tray (an unarchive
     // shows it), never run it on a card the user put away.
-    keepQueuedOpencodeFollowUps(taskId, task.runId, task.archivedAt != null ? "the task was archived" : "the task is being archived");
+    await keepQueuedOpencodeFollowUps(taskId, task.runId, task.archivedAt != null ? "the task was archived" : "the task is being archived");
     return;
   }
   if (task.runId && active.has(task.runId)) return;
@@ -10023,8 +10615,8 @@ async function drainOpencodeQueue(taskId: string): Promise<void> {
 
 
 /** Whether an OpenCode follow-up turn may start on the task now: it exists, and is not archived, torn down or being deleted. */
-function canTakeOpencodeTurn(taskId: string): boolean {
-  const task = tasks.get(taskId);
+async function canTakeOpencodeTurn(taskId: string): Promise<boolean> {
+  const task = await tasks.get(taskId);
   return task != null && task.archivedAt == null && !isTaskTearingDown(taskId);
 }
 
@@ -10034,20 +10626,17 @@ function canTakeOpencodeTurn(taskId: string): boolean {
  * newest restashed first, an identical draft not added twice, and a status
  * line on `runId` saying why.
  */
-function keepQueuedOpencodeFollowUps(taskId: string, runId: string | null, why: string): void {
+async function keepQueuedOpencodeFollowUps(taskId: string, runId: string | null, why: string): Promise<void> {
   const lines = opencodeTurnQueue.get(taskId) ?? [];
   opencodeTurnQueue.delete(taskId);
   if (lines.length === 0) return;
-  let saved = false;
-  for (const text of [...lines].reverse()) {
-    const task = tasks.get(taskId);
-    if (!task) break;
-    if (!task.backlog.some((item) => item.text === text)) backlog.add(taskId, { text });
-    saved = true;
-  }
+  // The dedupe and the writes are one transaction (op `backlog.stashTexts`,
+  // same rules: newest restashed first, an identical draft not added twice,
+  // nothing kept for a task that is gone).
+  const saved = await op("backlog.stashTexts", [taskId, lines]);
   if (!saved || runId === null) return;
   const what = lines.length === 1 ? "queued message not sent" : `${lines.length} queued messages not sent`;
-  saveAndEmit({ runId, taskId, stream: "status", data: `${what} — ${why}; saved to your backlog, resend from the tray` });
+  await saveAndEmit({ runId, taskId, stream: "status", data: `${what} — ${why}; saved to your backlog, resend from the tray` });
 }
 
 /*
@@ -10064,7 +10653,9 @@ initOpencodeServerOrchestrator({
   launchesFrozen: () => launchesFrozenFlag,
   isTaskTearingDown,
   isTaskBeingDeleted: (taskId) => deletingTaskIds.has(taskId),
+  followUpDrainPending: (runId) => followUpDrainPendingRuns.has(runId),
   resolveHarness,
+  resolveHarnesses: (ids) => op("orchestrator.resolveHarnesses", [ids]),
   taskHarnessId,
   findLastSessionIdForHarness,
   makeChunkHandler,
@@ -10101,13 +10692,13 @@ async function dropOpencodeTask(taskId: string, reason: string): Promise<void> {
   // through a persisted tombstone (migration 083): a deleted task's runs are
   // about to go, and the watch otherwise names only a task's last session (an
   // archived task's older ones, or the old harness's after a switch).
-  tombstoneOpencodeSessionsOfTask(taskId);
+  await tombstoneOpencodeSessionsOfTask(taskId);
   await stopOpencodeServerTurnsOfTask(taskId, reason);
   // With or without a local handle: what the server still runs for the task
   // (its sessions, then their executing subagents) is interrupted over HTTP.
   await interruptOpencodeSessionsOfDroppedTask(taskId);
   await dropOpencodeSession(taskId);
-  orphanRunningOpencodeSubagents(taskId, reason);
+  await orphanRunningOpencodeSubagents(taskId, reason);
   scheduleOpencodeWatchRefresh();
 }
 
@@ -10128,9 +10719,9 @@ async function reattachOpencodeTurn(
   cwd: string,
   onChunk: ReturnType<typeof makeChunkHandler>,
 ): Promise<SpawnedAgent | null> {
-  const harness = resolveHarness(harnessId);
+  const harness = await resolveHarness(harnessId);
   if (!harness) return null;
-  const turn = opencodeTurnOfRun(runId);
+  const turn = await opencodeTurnOfRun(runId);
   const major = turn?.major ?? opencodeMajor(await cachedCliVersion(harness));
   const standalone = turn?.server === "standalone";
   const { onSubagent, beforeSettle } = opencodeDriverHooks({ taskId, runId, harness, cwd, major, standalone });
@@ -10139,7 +10730,7 @@ async function reattachOpencodeTurn(
     runId,
     sessionName,
     onChunk,
-    seenLineUuids: runs.seenLineUuidsForTask(taskId),
+    seenLineUuids: await runs.seenLineUuidsForTask(taskId),
     major,
     onSubagent,
     beforeSettle,
@@ -10208,7 +10799,12 @@ function writeOpencodeTurnOpening(
  * that stores a bare kind reads as that kind's built-in id.
  */
 function taskHarnessId(task: Pick<Task, "agent">): string {
-  return resolveHarness(task.agent)?.id ?? task.agent;
+  // `harnesses.getByIdOrKind(id)` returns the row with that id, or a
+  // synthetic built-in whose id is the same string, or null, so the lookup
+  // this used to make (`?.id ?? task.agent`) always yielded `task.agent`
+  // itself. Answered without a database hop: callers in synchronous gates
+  // (the OpenCode server's turn registry) need it at once.
+  return task.agent;
 }
 
 /**
@@ -10223,16 +10819,17 @@ function taskHarnessId(task: Pick<Task, "agent">): string {
  * across runs (not just the latest) because a row may not have had its id
  * stamped — the prior conversation still resumes from any earlier run.
  */
-export function findLastSessionIdForHarness(taskId: string, column: SessionIdColumn, harnessId: string): string | null {
-  // Single source of the rule (handoff exception + per-account run scoping) in
-  // `harness-session-transfer.ts`, shared with the manual-move path in
-  // `harness-failover.ts` so the two cannot drift.
-  return findSessionIdForHarness(taskId, column, harnessId);
+export async function findLastSessionIdForHarness(taskId: string, column: SessionIdColumn, harnessId: string): Promise<string | null> {
+  // Single source of the rule (handoff exception + per-account run scoping):
+  // `findSessionIdForHarness` in `harness-session-transfer.ts`, built on its
+  // pure `handoffSessionWins` / `sessionFromRuns` and shared with the
+  // manual-move path in `harness-failover.ts`, so the two cannot drift.
+  return await findSessionIdForHarness(taskId, column, harnessId);
 }
 
 /** {@link findLastSessionIdForHarness} for the task's current harness. */
-function lastSessionIdForTask(task: Task, column: SessionIdColumn): string | null {
-  return findLastSessionIdForHarness(task.id, column, taskHarnessId(task));
+async function lastSessionIdForTask(task: Task, column: SessionIdColumn): Promise<string | null> {
+  return await findLastSessionIdForHarness(task.id, column, taskHarnessId(task));
 }
 
 /**
@@ -10281,11 +10878,14 @@ async function sendCopilotTurn(
   rawLine: string = line,
   onlyIfIdle = false,
 ): Promise<string | CopilotTurnDecline | IdleOnlyBusy | null> {
-  const task = tasks.get(taskId);
+  // One read, then the idle-only check and the busy/idle decision with
+  // nothing awaited in between (see `sendCodexTurn`).
+  const snap = await readTaskSnapshot(taskId);
+  const task = snap.task;
   if (!task) return null;
   // Idle-only send: refuse before the queue push / user event / spawn (see
   // `sendCodexTurn`).
-  if (onlyIfIdle && isAnyRunOfTaskLive(taskId)) return { busy: true };
+  if (onlyIfIdle && anyRunOfTaskLiveFrom(taskId, snap)) return { busy: true };
   if (task.runId && active.has(task.runId)) {
     const q = copilotTurnQueue.get(taskId) ?? [];
     q.push({ raw: rawLine, expanded: line });
@@ -10294,7 +10894,7 @@ async function sendCopilotTurn(
     // away; the queued turn that answers it lands as a later run row.
     const runId = task.runId;
     const data = normalizeUserText(line);
-    saveAndEmit({ runId, taskId, stream: "user", data });
+    await saveAndEmit({ runId, taskId, stream: "user", data });
     return runId;
   }
   return spawnCopilotTurnNow(task, taskId, line);
@@ -10303,20 +10903,14 @@ async function sendCopilotTurn(
 /** Most-recent copilot session id the task has on THIS harness (a different
  *  harness has a different `COPILOT_HOME`, which can't see it). The shared
  *  harness-scoped lookup, so a legacy bare-kind `agent` value still matches. */
-function findLastCopilotSessionId(taskId: string, harnessId: string): string | null {
-  return findLastSessionIdForHarness(taskId, "copilot_session_id", harnessId);
+async function findLastCopilotSessionId(taskId: string, harnessId: string): Promise<string | null> {
+  return await findLastSessionIdForHarness(taskId, "copilot_session_id", harnessId);
 }
 
 /** Harness id of the task's most recent copilot session recorded on a harness
  *  OTHER than `harnessId`, or null. Only used to explain why nothing resumes. */
-function findCopilotSessionHarnessElsewhere(taskId: string, harnessId: string): string | null {
-  const row = db.query<{ agent: string }, [string, string]>(
-    `SELECT agent FROM runs
-     WHERE task_id = ? AND agent != ? AND copilot_session_id IS NOT NULL
-     ORDER BY started_at DESC, rowid DESC
-     LIMIT 1`,
-  ).get(taskId, harnessId);
-  return row?.agent ?? null;
+async function findCopilotSessionHarnessElsewhere(taskId: string, harnessId: string): Promise<string | null> {
+  return await op("orchestrator.copilotSessionAgentElsewhere", [taskId, harnessId]);
 }
 
 /** Test seam: under `AGETOR_COPILOT_DRIVER=fake` nothing writes
@@ -10348,8 +10942,8 @@ function copilotSessionDirExists(harness: Harness, sessionId: string): boolean {
  * from this account's `COPILOT_HOME`. Copilot always gets a `--session-id`
  * (the prior id when resuming, else a fresh uuid minted by `spawnAgent`).
  */
-function resolveCopilotResume(taskId: string, harness: Harness): { sessionId: string | null; note: string } {
-  const own = findLastCopilotSessionId(taskId, harness.id);
+async function resolveCopilotResume(taskId: string, harness: Harness): Promise<{ sessionId: string | null; note: string }> {
+  const own = await findLastCopilotSessionId(taskId, harness.id);
   if (own) {
     if (copilotSessionDirExists(harness, own)) {
       return { sessionId: own, note: `resuming GitHub Copilot session ${own.slice(0, 8)}…` };
@@ -10359,7 +10953,7 @@ function resolveCopilotResume(taskId: string, harness: Harness): { sessionId: st
       note: `previous Copilot session ${own.slice(0, 8)}… not found for this account — starting fresh`,
     };
   }
-  const elsewhere = findCopilotSessionHarnessElsewhere(taskId, harness.id);
+  const elsewhere = await findCopilotSessionHarnessElsewhere(taskId, harness.id);
   if (elsewhere) {
     return {
       sessionId: null,
@@ -10382,7 +10976,7 @@ async function spawnCopilotTurnNow(task: Task, taskId: string, line: string): Pr
   startingTaskIds.add(taskId);
   try {
     const cwd = task.worktreePath ?? task.workdir;
-    const harness = resolveHarness(task.agent);
+    const harness = await resolveHarness(task.agent);
 
     // Pre-flight 1b — before any state mutation.
     if (harness) {
@@ -10390,12 +10984,12 @@ async function spawnCopilotTurnNow(task: Task, taskId: string, line: string): Pr
       if (floorError !== null) return { declined: floorError };
     }
 
-    const resume = harness ? resolveCopilotResume(taskId, harness) : { sessionId: null, note: "no prior GitHub Copilot session — starting fresh" };
+    const resume = harness ? await resolveCopilotResume(taskId, harness) : { sessionId: null, note: "no prior GitHub Copilot session — starting fresh" };
     const priorSessionId = resume.sessionId;
 
     const newRunId = randomUUID();
     const now = Date.now();
-    runs.insert({
+    await runs.insert({
       id: newRunId,
       taskId,
       agent: task.agent,
@@ -10416,10 +11010,10 @@ async function spawnCopilotTurnNow(task: Task, taskId: string, line: string): Pr
       copilotSessionId: priorSessionId,
     });
     const prevColumn: ColumnId = task.column;
-    tasks.update(taskId, { column: "running", runId: newRunId });
+    await tasks.update(taskId, { column: "running", runId: newRunId });
     adoptPendingTaskCancel(taskId, newRunId);
     if (prevColumn !== "running") {
-      emitGlobal({ kind: "column", taskId, runId: newRunId, column: "running", prev: prevColumn, ts: now });
+      await emitGlobal({ kind: "column", taskId, runId: newRunId, column: "running", prev: prevColumn, ts: now });
     }
 
     const kind: AgentKind = harness?.kind ?? "copilot";
@@ -10429,9 +11023,9 @@ async function spawnCopilotTurnNow(task: Task, taskId: string, line: string): Pr
 
     if (!harness) {
       onChunk("stderr", `harness "${task.agent}" not found — cannot resume`);
-      runs.update(newRunId, { status: "failed", endedAt: Date.now(), exitCode: -1 });
+      await runs.update(newRunId, { status: "failed", endedAt: Date.now(), exitCode: -1 });
       pendingCancelRunIds.delete(newRunId); // an adopted Stop has nothing left to cancel
-      tasks.update(taskId, { column: "ready", runId: null });
+      await tasks.update(taskId, { column: "ready", runId: null });
       return newRunId;
     }
 
@@ -10442,9 +11036,7 @@ async function spawnCopilotTurnNow(task: Task, taskId: string, line: string): Pr
       prompt: line,
       cwd,
       onChunk,
-      onSessionId: (sessionId) => {
-        runs.update(newRunId, sessionIdPatchFor(harness.kind, sessionId));
-      },
+      onSessionId: (sessionId) => queueRunPatch(newRunId, sessionIdPatchFor(harness.kind, sessionId)),
       copilotSubagents: makeCopilotSubagentSink(newRunId, taskId),
       opts: {
         mode: task.mode,
@@ -10467,14 +11059,14 @@ async function spawnCopilotTurnNow(task: Task, taskId: string, line: string): Pr
     if (await consumePendingCancel(newRunId, taskId, agent, onChunk, { dropClaudeSession: false })) {
       // Stop landed while the spawn was in flight (see `pendingCancelRunIds`):
       // the queue is dropped here (kept in the backlog on a pipeline step).
-      dropQueuedFollowUpsAfterPendingCancel(taskId, newRunId);
+      await dropQueuedFollowUpsAfterPendingCancel(taskId, newRunId);
       return newRunId;
     }
     registerActiveRun(newRunId, taskId, task, agent);
     attachDoneHandler(newRunId, taskId, agent);
     return newRunId;
   } finally {
-    releaseStartingClaim(taskId);
+    await releaseStartingClaim(taskId);
   }
 }
 
@@ -10488,8 +11080,8 @@ async function spawnCopilotTurnNow(task: Task, taskId: string, line: string): Pr
 async function drainCopilotQueue(taskId: string): Promise<void> {
   const q = copilotTurnQueue.get(taskId);
   if (!q || q.length === 0) return;
-  const task = tasks.get(taskId);
-  if (!task || resolveHarness(task.agent)?.kind !== "copilot") {
+  const task = await tasks.get(taskId);
+  if (!task || (await resolveHarness(task.agent))?.kind !== "copilot") {
     copilotTurnQueue.delete(taskId);
     return;
   }
@@ -10511,12 +11103,12 @@ async function drainCopilotQueue(taskId: string): Promise<void> {
   // `backlog.add` PREPENDS, so restash in reverse send order: the refused line
   // lands on top and the tray reads chronologically. RAW text, so the tray's
   // dedupe matches a draft saved with the same `@token`s.
-  for (const item of [...stranded].reverse()) restashPasteWithheldText(taskId, item.raw);
-  const lastRunId = runs.listForTask(taskId)[0]?.id;
+  for (const item of [...stranded].reverse()) await restashPasteWithheldText(taskId, item.raw);
+  const lastRunId = (await runs.listForTask(taskId))[0]?.id;
   if (lastRunId) {
     const what = stranded.length === 1 ? "queued message not sent" : `${stranded.length} queued messages not sent`;
     const data = `${what} — saved to your backlog; resend from the tray after upgrading. ${result.declined}`;
-    saveAndEmit({ runId: lastRunId, taskId, stream: "status", data });
+    await saveAndEmit({ runId: lastRunId, taskId, stream: "status", data });
   }
 }
 
@@ -10582,6 +11174,16 @@ function insertBySendOrder(q: QueuedFxLine[], item: QueuedFxLine): void {
  * lands there with the rest, but the handler reports `false`. Returns whether
  * the text will be sent as the next turn — the driver only tells the user
  * "sending it as the next turn" when it will.
+ *
+ * The driver asks synchronously, so the task row is not read here: a delete
+ * or archive in progress is known in memory (`isTaskTearingDown`), and the
+ * entry is queued at once, in send order, before `done` resolves. Whether the
+ * task still exists, is unarchived and is still on `harnessId` is then read in
+ * the run's event queue (the done handler waits for that queue before its
+ * drain); an entry that fails it is taken back out of the queue. So the
+ * handler always answers `false` and writes the driver's "sending it as the
+ * next turn" line (`FX_STEER_DROPPED_STATUS`) itself, in the slot the driver
+ * would have written it, and only when the check passed.
  */
 function fxSteerDroppedHandler(taskId: string, runId: string, harnessId: string): (text: string) => boolean {
   return (text) => {
@@ -10593,19 +11195,38 @@ function fxSteerDroppedHandler(taskId: string, runId: string, harnessId: string)
     // queue clear already ran) but the row still exists — `deleteTask` kills
     // the run and `dropFxSession`s before `tasks.delete`.
     if (isTaskTearingDown(taskId)) return false;
-    const task = tasks.get(taskId);
-    if (!task || task.archivedAt != null) return false;
-    const current = resolveHarness(task.agent);
-    if (current?.kind !== "fx" || current.id !== harnessId) return false;
+    const entry: QueuedFxLine = { line: text, seq, echoed: true };
     const q = fxTurnQueue.get(taskId) ?? [];
-    insertBySendOrder(q, { line: text, seq, echoed: true });
+    insertBySendOrder(q, entry);
     fxTurnQueue.set(taskId, q);
-    // Exiting (`freezeLaunches`): the drain stashes it into the backlog
-    // instead of sending it as the next turn, so don't announce that.
-    if (launchesFrozenFlag) return false;
     // The driver calls this before `done` resolves, so the handle is still
     // registered: a stopped step's queue goes to the backlog, not a turn.
-    return !(active.get(runId)?.cancelled === true && task.pipelineParentId != null);
+    const cancelled = active.get(runId)?.cancelled === true;
+    // Exiting (`freezeLaunches`): the drain stashes it into the backlog
+    // instead of sending it as the next turn, so it is not announced.
+    const frozen = launchesFrozenFlag;
+    saveAndEmit(
+      { runId, taskId, stream: "status", data: FX_STEER_DROPPED_STATUS },
+      async () => {
+        const snap = await readTaskSnapshot(taskId);
+        const task = snap.task;
+        const valid = task != null && task.archivedAt == null && snap.harness?.kind === "fx" && snap.harness.id === harnessId;
+        if (!valid) {
+          const queued = fxTurnQueue.get(taskId);
+          const at = queued?.indexOf(entry) ?? -1;
+          if (queued && at >= 0) {
+            queued.splice(at, 1);
+            if (queued.length === 0) fxTurnQueue.delete(taskId);
+          }
+          return false;
+        }
+        if (frozen) return false;
+        return !(cancelled && task.pipelineParentId != null);
+      },
+    ).catch((err: unknown) => {
+      console.warn(`[agetor] checking a dropped fx steer for task ${taskId} failed:`, err);
+    });
+    return false;
   };
 }
 
@@ -10637,8 +11258,8 @@ const resumingTaskIds = new Set<string>();
  * fresh on every call (no caching) — this only ever runs at pause-record time
  * and re-arm time, not on any hot path.
  */
-function fxAutoResumePrefs(): { enabled: boolean; delayMs: number } {
-  const { enabled, delaySec } = parseFxAutoResumePrefs(preferences.list());
+async function fxAutoResumePrefs(): Promise<{ enabled: boolean; delayMs: number }> {
+  const { enabled, delaySec } = parseFxAutoResumePrefs(await preferences.list());
   let delayMs = delaySec * 1000;
   const envOverride = process.env.AGETOR_FX_AUTO_RESUME_DELAY_MS;
   if (envOverride !== undefined) {
@@ -10663,7 +11284,9 @@ function armFxAutoResumeTimer(taskId: string, at: number): void {
   const handle = setTimeout(() => {
     if (fxAutoResumeTimers.get(taskId) !== handle) return;
     fxAutoResumeTimers.delete(taskId);
-    void fireFxAutoResume(taskId, at);
+    fireFxAutoResume(taskId, at).catch((err: unknown) => {
+      console.warn(`[agetor] fx auto-resume for task ${taskId} failed:`, err);
+    });
   }, delayMs);
   handle.unref();
   fxAutoResumeTimers.set(taskId, handle);
@@ -10688,9 +11311,9 @@ function cancelFxAutoResumeTimer(taskId: string): void {
  *  fresh), `reconcileTaskSession` (agent switch), `archiveTask`, and
  *  `deleteTask`. Contrast `cancelFxAutoResume`, the user-facing cancel that
  *  keeps the row (just nulls its schedule) and leaves a breadcrumb. */
-function clearFxRecovery(taskId: string): void {
+async function clearFxRecovery(taskId: string): Promise<void> {
   cancelFxAutoResumeTimer(taskId);
-  tasks.setFxRecovery(taskId, null);
+  await tasks.setFxRecovery(taskId, null);
 }
 
 /** Append a plain status line to an already-settled (or otherwise
@@ -10701,15 +11324,15 @@ function clearFxRecovery(taskId: string): void {
  *  Exported for `pipeline-runner.ts`'s handoff-reminder status lines, which
  *  land on a step task's run from outside any spawn — `runs.appendEvent`
  *  alone would persist the line but never reach a live SSE subscriber. */
-export function appendRunStatusLine(taskId: string, runId: string, data: string): void {
-  saveAndEmit({ runId, taskId, stream: "status", data });
+export async function appendRunStatusLine(taskId: string, runId: string, data: string): Promise<void> {
+  await saveAndEmit({ runId, taskId, stream: "status", data });
 }
 
 /** @deprecated thin fx-named alias of {@link appendRunStatusLine} — kept so
  *  every existing fx call site reads unchanged; new callers should use the
  *  generic export directly. */
-function appendFxStatusLine(taskId: string, runId: string, data: string): void {
-  appendRunStatusLine(taskId, runId, data);
+async function appendFxStatusLine(taskId: string, runId: string, data: string): Promise<void> {
+  await appendRunStatusLine(taskId, runId, data);
 }
 
 /**
@@ -10727,12 +11350,14 @@ async function sendFxTurn(
   line: string,
   onlyIfIdle = false,
 ): Promise<string | IdleOnlyBusy | null> {
-  const task = tasks.get(taskId);
+  const snap = await readTaskSnapshot(taskId);
+  const task = snap.task;
   if (!task) return null;
   // Idle-only send: refuse before ANY side effect — including the auto-resume
   // timer cancel below, the steer attempt and the queue push (see
-  // `sendCodexTurn`).
-  if (onlyIfIdle && isAnyRunOfTaskLive(taskId)) return { busy: true };
+  // `sendCodexTurn`). Decided from one read with nothing awaited before the
+  // busy/idle decision.
+  if (onlyIfIdle && anyRunOfTaskLiveFrom(taskId, snap)) return { busy: true };
   // A follow-up message is an implicit cancel of any pending auto-resume
   // schedule (plan §3.4 / T2 item 8) — whichever branch below runs, the
   // pause chain is over. The full row clear happens once the turn actually
@@ -10766,7 +11391,7 @@ async function sendFxTurn(
     // away; a queued turn that answers it lands as a later run row.
     const runId = task.runId;
     const data = normalizeUserText(line);
-    saveAndEmit({ runId, taskId, stream: "user", data });
+    await saveAndEmit({ runId, taskId, stream: "user", data });
     return runId;
   }
   // `spawnFxRun` now returns `{ runId, spawned, error? }` (Phase 8 review
@@ -10840,13 +11465,13 @@ async function spawnFxRun(
   if (startingTaskIds.has(taskId)) return null;
   startingTaskIds.add(taskId);
   try {
-    const priorSessionId = lastSessionIdForTask(task, "fx_session_id");
+    const priorSessionId = await lastSessionIdForTask(task, "fx_session_id");
     const cwd = task.worktreePath ?? task.workdir;
-    const harness = resolveHarness(task.agent);
+    const harness = await resolveHarness(task.agent);
 
     const newRunId = randomUUID();
     const now = Date.now();
-    runs.insert({
+    await runs.insert({
       id: newRunId,
       taskId,
       agent: task.agent,
@@ -10866,10 +11491,10 @@ async function spawnFxRun(
       origin: "continueRecovery" in turn && turn.origin === "auto" ? "auto-resume" : null,
     });
     const prevColumn: ColumnId = task.column;
-    tasks.update(taskId, { column: "running", runId: newRunId });
+    await tasks.update(taskId, { column: "running", runId: newRunId });
     adoptPendingTaskCancel(taskId, newRunId);
     if (prevColumn !== "running") {
-      emitGlobal({ kind: "column", taskId, runId: newRunId, column: "running", prev: prevColumn, ts: now });
+      await emitGlobal({ kind: "column", taskId, runId: newRunId, column: "running", prev: prevColumn, ts: now });
     }
 
     const kind: AgentKind = harness?.kind ?? "fx";
@@ -10886,7 +11511,7 @@ async function spawnFxRun(
       // A fresh follow-up turn is spawning — the pause chain (if any) is
       // over: whatever checkpoint fx had, this new prompt supersedes it, and
       // there's nothing left to auto-resume (plan §3 T2 item 7).
-      clearFxRecovery(taskId);
+      await clearFxRecovery(taskId);
     } else {
       // `resumeFxRecovery` already checked `lastSessionIdForTask(task, "fx_session_id")` is
       // non-null before ever calling this — `priorSessionId` here is a
@@ -10910,18 +11535,18 @@ async function spawnFxRun(
       // resume may have just mutated the row moments ago in `resumeFxRecovery`
       // (plan §3 T2 item 7).
       cancelFxAutoResumeTimer(taskId);
-      const currentRec = tasks.get(taskId)?.fxRecovery;
+      const currentRec = (await tasks.get(taskId))?.fxRecovery;
       if (currentRec) {
-        tasks.setFxRecovery(taskId, { ...currentRec, autoResume: null, autoResumeStopped: undefined });
+        await tasks.setFxRecovery(taskId, { ...currentRec, autoResume: null, autoResumeStopped: undefined });
       }
     }
 
     if (!harness) {
       const error = `harness "${task.agent}" not found — cannot resume`;
       onChunk("stderr", error);
-      runs.update(newRunId, { status: "failed", endedAt: Date.now(), exitCode: -1 });
+      await runs.update(newRunId, { status: "failed", endedAt: Date.now(), exitCode: -1 });
       pendingCancelRunIds.delete(newRunId); // an adopted Stop has nothing left to cancel
-      tasks.update(taskId, { column: "ready", runId: null });
+      await tasks.update(taskId, { column: "ready", runId: null });
       return { runId: newRunId, spawned: false, error };
     }
 
@@ -10932,9 +11557,7 @@ async function spawnFxRun(
       prompt: "line" in turn ? turn.line : "",
       cwd,
       onChunk,
-      onSessionId: (sessionId) => {
-        runs.update(newRunId, { fxSessionId: sessionId });
-      },
+      onSessionId: (sessionId) => queueRunPatch(newRunId, { fxSessionId: sessionId }),
       onSteerDropped: fxSteerDroppedHandler(taskId, newRunId, harness.id),
       opts: {
         mode: task.mode,
@@ -10963,14 +11586,14 @@ async function spawnFxRun(
       // Stop landed while the spawn was in flight (see `pendingCancelRunIds`):
       // the run is settled `cancelled` and attachDoneHandler never runs, so
       // the queue is dropped here (kept in the backlog on a pipeline step).
-      dropQueuedFollowUpsAfterPendingCancel(taskId, newRunId);
+      await dropQueuedFollowUpsAfterPendingCancel(taskId, newRunId);
       return { runId: newRunId, spawned: false, error: "cancelled by user before the agent launched" };
     }
     registerActiveRun(newRunId, taskId, task, agent);
     attachDoneHandler(newRunId, taskId, agent);
     return { runId: newRunId, spawned: true };
   } finally {
-    releaseStartingClaim(taskId);
+    await releaseStartingClaim(taskId);
   }
 }
 
@@ -10982,12 +11605,12 @@ async function spawnFxRun(
 async function drainFxQueue(taskId: string): Promise<void> {
   const q = fxTurnQueue.get(taskId);
   if (!q || q.length === 0) return;
-  const task = tasks.get(taskId);
+  const task = await tasks.get(taskId);
   // Task vanished, or its agent was switched away from fx while a turn was
   // in flight — abandon the stale queue. Without this guard, draining after
   // an fx→claude switch would spawn the follow-up against the new claude
   // harness with an fx session id, which claude rejects.
-  if (!task || resolveHarness(task.agent)?.kind !== "fx") {
+  if (!task || (await resolveHarness(task.agent))?.kind !== "fx") {
     fxTurnQueue.delete(taskId);
     return;
   }
@@ -11013,18 +11636,16 @@ async function drainFxQueue(taskId: string): Promise<void> {
  * (`isFxRecoveryResumable`) — same two SQL lookups `resumeFxRecovery` always
  * ran, just named and reusable now.
  */
-function latestResumableFxPause(taskId: string): { runId: string; payload: FxRecoveryPayload } | null {
-  const latestRun = db.query<{ id: string; status: string; agent: string }, [string]>(
-    `SELECT id, status, agent FROM runs WHERE task_id = ? ORDER BY started_at DESC, id DESC LIMIT 1`,
-  ).get(taskId);
+async function latestResumableFxPause(taskId: string): Promise<{ runId: string; payload: FxRecoveryPayload } | null> {
+  const latestRun = await op("orchestrator.latestRunById", [taskId]);
   if (!latestRun || latestRun.status !== "failed") return null;
   // Harness-scoped (D-15): a pause recorded by another fx harness belongs to
   // that account's session, which this harness can't continue — the resume
   // would pick this harness's own session id (or none).
-  const task = tasks.get(taskId);
-  if (!task || (resolveHarness(latestRun.agent)?.id ?? latestRun.agent) !== taskHarnessId(task)) return null;
+  const task = await tasks.get(taskId);
+  if (!task || ((await resolveHarness(latestRun.agent))?.id ?? latestRun.agent) !== taskHarnessId(task)) return null;
 
-  const sentinel = runs.lastStatusDataWithPrefix(latestRun.id, FX_RECOVERY_STATUS_PREFIX);
+  const sentinel = await runs.lastStatusDataWithPrefix(latestRun.id, FX_RECOVERY_STATUS_PREFIX);
   const payload = sentinel ? parseFxRecoveryPayload(sentinel.slice(FX_RECOVERY_STATUS_PREFIX.length)) : null;
   if (!payload || !isFxRecoveryResumable(payload)) return null;
 
@@ -11037,7 +11658,7 @@ function latestResumableFxPause(taskId: string): { runId: string; payload: FxRec
  *  unknown too, so the boot sweep, a detached auto-resume and a manual
  *  Resume keep today's behaviour instead of rejecting. */
 async function fxCliVersion(task: Task): Promise<string | null> {
-  const harness = resolveHarness(task.agent);
+  const harness = await resolveHarness(task.agent);
   if (harness?.kind !== "fx") return null;
   try {
     return await cachedCliVersion(harness);
@@ -11047,8 +11668,8 @@ async function fxCliVersion(task: Task): Promise<string | null> {
 }
 
 /** Same, without probing: the last version `checkHarness` saw, or `null`. */
-function peekFxCliVersion(task: Task): string | null {
-  const harness = resolveHarness(task.agent);
+async function peekFxCliVersion(task: Task): Promise<string | null> {
+  const harness = await resolveHarness(task.agent);
   return harness?.kind === "fx" ? peekCachedCliVersion(harness) : null;
 }
 
@@ -11082,29 +11703,29 @@ function peekFxCliVersion(task: Task): string | null {
  * own settlement) — a run that recovered, or failed for an unrelated reason,
  * or succeeded outright, all end the chain the same way.
  */
-function noteFxRunSettled(task: Task | null, runId: string, newStatus: RunStatus): void {
-  if (!task || resolveHarness(task.agent)?.kind !== "fx") return;
+async function noteFxRunSettled(task: Task | null, runId: string, newStatus: RunStatus): Promise<void> {
+  if (!task || (await resolveHarness(task.agent))?.kind !== "fx") return;
   const taskId = task.id;
-  const pause = newStatus === "failed" ? latestResumableFxPause(taskId) : null;
+  const pause = newStatus === "failed" ? await latestResumableFxPause(taskId) : null;
   if (pause && pause.runId === runId) {
     // fx 0.0.15+ can't continue the pause, so record nothing: no badge, no
     // auto-resume, and RunPanel drops its Resume button on the same version.
     // Synchronous, so it reads the last probed version (the start pre-flight
     // primed it); unknown keeps today's behaviour.
-    if (!fxSupportsContinueRecovery(peekFxCliVersion(task))) {
-      appendFxStatusLine(taskId, runId, FX_RESUME_UNSUPPORTED_TEXT);
-      if (tasks.get(taskId)?.fxRecovery != null) clearFxRecovery(taskId);
+    if (!fxSupportsContinueRecovery(await peekFxCliVersion(task))) {
+      await appendFxStatusLine(taskId, runId, FX_RESUME_UNSUPPORTED_TEXT);
+      if ((await tasks.get(taskId))?.fxRecovery != null) await clearFxRecovery(taskId);
       return;
     }
-    recordFxPause(taskId, runId, pause.payload);
+    await recordFxPause(taskId, runId, pause.payload);
     return;
   }
   // Freshness matters here: `task.fxRecovery` may already be behind by the
   // time this runs (earlier settlement steps in the same handler — column
   // update, plan detection — could have touched the row), so re-read before
   // deciding whether a stale row needs clearing.
-  const fresh = tasks.get(taskId);
-  if (fresh?.fxRecovery != null) clearFxRecovery(taskId);
+  const fresh = await tasks.get(taskId);
+  if (fresh?.fxRecovery != null) await clearFxRecovery(taskId);
 }
 
 /**
@@ -11137,8 +11758,8 @@ function noteFxRunSettled(task: Task | null, runId: string, newStatus: RunStatus
  *     documents the intent ("we stopped AT the cap") instead of leaning on
  *     an incidental equality between a counter and a constant.
  */
-function recordFxPause(taskId: string, runId: string, payload: FxRecoveryPayload): void {
-  const prev = tasks.get(taskId)?.fxRecovery ?? null;
+async function recordFxPause(taskId: string, runId: string, payload: FxRecoveryPayload): Promise<void> {
+  const prev = (await tasks.get(taskId))?.fxRecovery ?? null;
   const autoResumeCount = prev?.autoResumeCount ?? 0;
 
   const base: TaskFxRecovery = {
@@ -11160,29 +11781,29 @@ function recordFxPause(taskId: string, runId: string, payload: FxRecoveryPayload
   // THAT turn also pauses, but skip the schedule/status-line/event — there's
   // nothing here for the user to act on (plan §3 T2 item 4).
   if ((fxTurnQueue.get(taskId)?.length ?? 0) > 0) {
-    tasks.setFxRecovery(taskId, base);
+    await tasks.setFxRecovery(taskId, base);
     return;
   }
 
-  const prefs = fxAutoResumePrefs();
+  const prefs = await fxAutoResumePrefs();
   if (!prefs.enabled) {
     // `disabled`: the ordinal that would have run — see this function's
     // "attempt convention" doc.
     const attempt = autoResumeCount + 1;
-    tasks.setFxRecovery(taskId, { ...base, autoResumeStopped: "disabled" });
-    appendFxStatusLine(taskId, runId, "auto-resume disabled in Settings — resume manually");
-    emitGlobal({ kind: "fx-auto-resume", taskId, state: "disabled", attempt, max: FX_AUTO_RESUME_MAX, ts: Date.now() });
+    await tasks.setFxRecovery(taskId, { ...base, autoResumeStopped: "disabled" });
+    await appendFxStatusLine(taskId, runId, "auto-resume disabled in Settings — resume manually");
+    await emitGlobal({ kind: "fx-auto-resume", taskId, state: "disabled", attempt, max: FX_AUTO_RESUME_MAX, ts: Date.now() });
     return;
   }
 
   if (autoResumeCount >= FX_AUTO_RESUME_MAX) {
-    tasks.setFxRecovery(taskId, { ...base, autoResumeStopped: "exhausted" });
-    appendFxStatusLine(
+    await tasks.setFxRecovery(taskId, { ...base, autoResumeStopped: "exhausted" });
+    await appendFxStatusLine(
       taskId,
       runId,
       `auto-resume gave up after ${FX_AUTO_RESUME_MAX} attempts — resume manually once the limit clears`,
     );
-    emitGlobal({
+    await emitGlobal({
       kind: "fx-auto-resume",
       taskId,
       state: "exhausted",
@@ -11201,9 +11822,9 @@ function recordFxPause(taskId: string, runId: string, payload: FxRecoveryPayload
   // `scheduled`: the ordinal being armed — see this function's "attempt
   // convention" doc.
   const attempt = autoResumeCount + 1;
-  tasks.setFxRecovery(taskId, { ...base, autoResume: { at, attempt, max: FX_AUTO_RESUME_MAX, delaySec } });
-  appendFxStatusLine(taskId, runId, `auto-resume scheduled in ${delaySec} s (${attempt}/${FX_AUTO_RESUME_MAX})`);
-  emitGlobal({ kind: "fx-auto-resume", taskId, state: "scheduled", at, attempt, max: FX_AUTO_RESUME_MAX, ts: Date.now() });
+  await tasks.setFxRecovery(taskId, { ...base, autoResume: { at, attempt, max: FX_AUTO_RESUME_MAX, delaySec } });
+  await appendFxStatusLine(taskId, runId, `auto-resume scheduled in ${delaySec} s (${attempt}/${FX_AUTO_RESUME_MAX})`);
+  await emitGlobal({ kind: "fx-auto-resume", taskId, state: "scheduled", at, attempt, max: FX_AUTO_RESUME_MAX, ts: Date.now() });
   armFxAutoResumeTimer(taskId, at);
 }
 
@@ -11227,33 +11848,41 @@ function recordFxPause(taskId: string, runId: string, payload: FxRecoveryPayload
  * the notice/badge can tell the two apart.
  */
 async function fireFxAutoResume(taskId: string, at: number): Promise<void> {
-  const before = tasks.get(taskId);
+  const before = await tasks.get(taskId);
   if (!before) return;
   // Probed before the re-validation below, so nothing can change between
   // those checks and acting on them.
   const supported = fxSupportsContinueRecovery(await fxCliVersion(before));
-  const task = tasks.get(taskId);
+  const task = await tasks.get(taskId);
   const rec = task?.fxRecovery ?? null;
   if (!task || !rec?.autoResume || rec.autoResume.at !== at) return;
   if (task.archivedAt != null) return;
   if (task.runId && active.has(task.runId)) return;
   if (!supported) {
     // fx was upgraded to 0.0.15+ after this pause was scheduled.
-    clearFxRecovery(taskId);
-    appendFxStatusLine(taskId, rec.runId, `auto-resume skipped — ${FX_RESUME_UNSUPPORTED_TEXT}`);
+    await clearFxRecovery(taskId);
+    await appendFxStatusLine(taskId, rec.runId, `auto-resume skipped — ${FX_RESUME_UNSUPPORTED_TEXT}`);
     return;
   }
 
   const { max } = rec.autoResume;
   const attempt = rec.autoResumeCount + 1;
-  tasks.setFxRecovery(taskId, { ...rec, autoResume: null, autoResumeCount: attempt });
-  emitGlobal({ kind: "fx-auto-resume", taskId, state: "fired", attempt, max, ts: Date.now() });
+  // Compare-and-set against the state just validated: a Cancel (or anything
+  // else) that changed the schedule since that read wins, and this firing
+  // stands down instead of resuming a pause the user cancelled.
+  const claimed = await op("orchestrator.fxRecoveryCas", [
+    taskId,
+    JSON.stringify(rec),
+    { ...rec, autoResume: null, autoResumeCount: attempt },
+  ]);
+  if (!claimed) return;
+  await emitGlobal({ kind: "fx-auto-resume", taskId, state: "fired", attempt, max, ts: Date.now() });
 
   const result = await resumeFxRecovery(taskId, { origin: "auto", attempt, max });
   if (!result.ok) {
-    appendFxStatusLine(taskId, rec.runId, `auto-resume could not start: ${result.error}`);
-    const latest = tasks.get(taskId)?.fxRecovery;
-    if (latest) tasks.setFxRecovery(taskId, { ...latest, autoResumeStopped: "failed" });
+    await appendFxStatusLine(taskId, rec.runId, `auto-resume could not start: ${result.error}`);
+    const latest = (await tasks.get(taskId))?.fxRecovery;
+    if (latest) await tasks.setFxRecovery(taskId, { ...latest, autoResumeStopped: "failed" });
   }
 }
 
@@ -11283,15 +11912,27 @@ async function fireFxAutoResume(taskId: string, at: number): Promise<void> {
  * the actual off switch — toggling it off is what stops every future
  * schedule from being armed at all, on this task and every other one.
  */
-export function cancelFxAutoResume(taskId: string, reason: "cancelled" | "stopped"): boolean {
-  const rec = tasks.get(taskId)?.fxRecovery ?? null;
+export async function cancelFxAutoResume(taskId: string, reason: "cancelled" | "stopped"): Promise<boolean> {
   cancelFxAutoResumeTimer(taskId);
-  if (!rec?.autoResume) return false;
+  // Compare-and-set against the state read: a firing that claimed the
+  // schedule first (or any other write since the read) is re-read, and a
+  // schedule that is no longer pending is nothing to cancel.
+  let rec: TaskFxRecovery | null = null;
+  for (let attempt = 0; ; attempt++) {
+    rec = (await tasks.get(taskId))?.fxRecovery ?? null;
+    if (!rec?.autoResume) return false;
+    const written = await op("orchestrator.fxRecoveryCas", [
+      taskId,
+      JSON.stringify(rec),
+      { ...rec, autoResume: null, autoResumeStopped: "cancelled" },
+    ]);
+    if (written) break;
+    if (attempt >= 4) return false;
+  }
 
   const { attempt, max } = rec.autoResume;
-  tasks.setFxRecovery(taskId, { ...rec, autoResume: null, autoResumeStopped: "cancelled" });
-  appendFxStatusLine(taskId, rec.runId, "auto-resume cancelled");
-  emitGlobal({ kind: "fx-auto-resume", taskId, state: "cancelled", attempt, max, ts: Date.now() });
+  await appendFxStatusLine(taskId, rec.runId, "auto-resume cancelled");
+  await emitGlobal({ kind: "fx-auto-resume", taskId, state: "cancelled", attempt, max, ts: Date.now() });
   return true;
 }
 
@@ -11301,8 +11942,8 @@ export function cancelFxAutoResume(taskId: string, reason: "cancelled" | "stoppe
  * run, so the pipeline Stop must count it as something it can stop — otherwise
  * the Stop 409s and the retry fires after the user asked for silence.
  */
-export function hasPendingHarnessRetry(taskId: string): boolean {
-  const exhausted = tasks.get(taskId)?.harnessState?.allExhausted;
+export async function hasPendingHarnessRetry(taskId: string): Promise<boolean> {
+  const exhausted = (await tasks.get(taskId))?.harnessState?.allExhausted;
   if (!exhausted) return false;
   return exhausted.inFlight === true || exhausted.nextAttemptAt > 0;
 }
@@ -11315,8 +11956,8 @@ export function hasPendingHarnessRetry(taskId: string): boolean {
  * limit starts a fresh cap); the retry spawn's own outcome handling sees the
  * run cancelled and clears anything left. Returns whether there was one.
  */
-export function cancelHarnessRetryForTask(taskId: string, line = "automatic account retry cancelled"): boolean {
-  const task = tasks.get(taskId);
+export async function cancelHarnessRetryForTask(taskId: string, line = "automatic account retry cancelled"): Promise<boolean> {
+  const task = await tasks.get(taskId);
   cancelAutoRetry(taskId);
   const exhausted = task?.harnessState?.allExhausted;
   if (!task || !exhausted) return false;
@@ -11324,16 +11965,16 @@ export function cancelHarnessRetryForTask(taskId: string, line = "automatic acco
   // the loop marker goes, with no "retry cancelled" claim and no stash (the
   // live successor carries the follow-ups).
   if (exhausted.inFlight && exhausted.attemptRunId && active.has(exhausted.attemptRunId)) {
-    patchTaskState(taskId, { allExhausted: null });
+    await patchTaskState(taskId, { allExhausted: null });
     return true;
   }
   // The retry will never run: the follow-ups it would have replayed after the
   // original prompt go back to the tray (once — the marker is cleared first),
   // together with messages typed while it was armed, which would otherwise be
   // stranded in memory until a later, unrelated turn.
-  endCleanRetry(taskId, () => stashSwapFollowUps(taskId));
-  patchTaskState(taskId, { allExhausted: null });
-  if (task.runId) saveStatusLineQuietly(task.runId, taskId, line);
+  await endCleanRetry(taskId, () => stashSwapFollowUps(taskId));
+  await patchTaskState(taskId, { allExhausted: null });
+  if (task.runId) await saveStatusLineQuietly(task.runId, taskId, line);
   return true;
 }
 
@@ -11361,23 +12002,23 @@ export function cancelHarnessRetryForTask(taskId: string, line = "automatic acco
  * an upgrade doesn't leave a paused badge and a Resume that can only fail.
  */
 export async function rearmFxAutoResumes(): Promise<number> {
-  const rows = tasks.listFxRecovery();
+  const rows = await tasks.listFxRecovery();
   const now = Date.now();
   let armed = 0;
   let staggerIndex = 0;
   for (const { id: taskId, fxRecovery: rec } of rows) {
-    const task = tasks.get(taskId);
+    const task = await tasks.get(taskId);
     if (task && !fxSupportsContinueRecovery(await fxCliVersion(task))) {
-      clearFxRecovery(taskId);
+      await clearFxRecovery(taskId);
       if (rec.autoResume) {
-        appendFxStatusLine(taskId, rec.runId, `auto-resume cancelled — ${FX_RESUME_UNSUPPORTED_TEXT}`);
+        await appendFxStatusLine(taskId, rec.runId, `auto-resume cancelled — ${FX_RESUME_UNSUPPORTED_TEXT}`);
       }
       continue;
     }
     if (!rec.autoResume) continue;
-    const pause = latestResumableFxPause(taskId);
+    const pause = await latestResumableFxPause(taskId);
     if (!pause || pause.runId !== rec.runId) {
-      tasks.setFxRecovery(taskId, null);
+      await tasks.setFxRecovery(taskId, null);
       continue;
     }
     const schedule = rec.autoResume;
@@ -11386,7 +12027,7 @@ export async function rearmFxAutoResumes(): Promise<number> {
     if (at <= now) {
       at = now + 5000 + staggerIndex * 2000;
       staggerIndex++;
-      tasks.setFxRecovery(taskId, { ...rec, autoResume: { ...schedule, at } });
+      await tasks.setFxRecovery(taskId, { ...rec, autoResume: { ...schedule, at } });
     }
     armFxAutoResumeTimer(taskId, at);
     armed++;
@@ -11475,17 +12116,17 @@ export async function resumeFxRecovery(
   }
   resumingTaskIds.add(taskId);
   try {
-    let task = tasks.get(taskId);
+    let task = await tasks.get(taskId);
     if (!task) return { ok: false, status: 404, error: "not found" };
     if (task.archivedAt != null) return { ok: false, status: 400, error: "task is archived" };
-    if (resolveHarness(task.agent)?.kind !== "fx") {
+    if ((await resolveHarness(task.agent))?.kind !== "fx") {
       return { ok: false, status: 400, error: "only fx tasks can resume a paused response" };
     }
     // fx 0.0.15+ answers `continueRecovery` with -32602 on every ACP session
     // agetor opens, so refuse before minting a run row, and drop the pause so
     // the badge and menu entry go too. Re-read after the probe's await.
     const supported = fxSupportsContinueRecovery(await fxCliVersion(task));
-    task = tasks.get(taskId);
+    task = await tasks.get(taskId);
     if (!task) return { ok: false, status: 404, error: "not found" };
     if (task.archivedAt != null) return { ok: false, status: 400, error: "task is archived" };
     // The entry check above ran before the probe's await; a freeze can land
@@ -11494,18 +12135,18 @@ export async function resumeFxRecovery(
     // manual-resume side effects below from running on a core that is exiting).
     if (launchesFrozenFlag) return { ok: false, status: 409, error: LAUNCHES_FROZEN_REASON };
     if (!supported) {
-      if (task.fxRecovery != null) clearFxRecovery(taskId);
+      if (task.fxRecovery != null) await clearFxRecovery(taskId);
       return { ok: false, status: 400, error: FX_RESUME_UNSUPPORTED_TEXT };
     }
     if ((task.runId && active.has(task.runId)) || startingTaskIds.has(taskId)) {
       return { ok: false, status: 409, error: "a turn is already in flight for this task" };
     }
 
-    if (!latestResumableFxPause(taskId)) {
+    if (!await latestResumableFxPause(taskId)) {
       return { ok: false, status: 400, error: "no paused fx response to resume" };
     }
 
-    if (lastSessionIdForTask(task, "fx_session_id") === null) {
+    if (await lastSessionIdForTask(task, "fx_session_id") === null) {
       return { ok: false, status: 400, error: "no fx session to resume" };
     }
 
@@ -11520,8 +12161,8 @@ export async function resumeFxRecovery(
       cancelFxAutoResumeTimer(taskId);
       const rec = task.fxRecovery;
       if (rec?.autoResume) {
-        tasks.setFxRecovery(taskId, { ...rec, autoResume: null, autoResumeStopped: undefined });
-        task = tasks.get(taskId) ?? task;
+        await tasks.setFxRecovery(taskId, { ...rec, autoResume: null, autoResumeStopped: undefined });
+        task = await tasks.get(taskId) ?? task;
       }
     }
 
@@ -11662,13 +12303,13 @@ const PASTE_OUTCOME_TIMEOUT_MS = 15_000;
  * stashes anything itself, so there's no double-stash. `stashed` reads what
  * that re-stash returned: claude-tmux fires `onPasteOutcome` (which settles
  * `pasteOutcome`) and then `onPasteFailure` in the same synchronous call, so
- * the hook has run by the time this `await` resumes; `null` (it never ran)
- * reads as not saved.
+ * the hook has started the re-stash by the time this `await` resumes, and its
+ * promise is awaited here; `null` (it never ran) reads as not saved.
  */
 async function resolveClaudeTurnOutcome(
   runId: string,
   pasteOutcome: Promise<{ ok: boolean; op?: string; stderr?: string }> | undefined,
-  stashed: () => boolean | null = () => null,
+  stashed: () => Promise<boolean> | null = () => null,
 ): Promise<ClaudeTurnResult> {
   if (!pasteOutcome) return { runId, delivered: true };
   // `clearTimeout` once the race settles — whichever side wins, the loser's
@@ -11684,7 +12325,7 @@ async function resolveClaudeTurnOutcome(
   clearTimeout(timer!);
   if (!outcome || outcome.ok) return { runId, delivered: true };
   if (outcome.op === "modal-guard") {
-    return { runId, delivered: false, withheld: true, savedToBacklog: stashed() === true };
+    return { runId, delivered: false, withheld: true, savedToBacklog: (await stashed()) === true };
   }
   // Prefer the driver's own descriptive `stderr` (finding #5, §10 re-review)
   // — e.g. "paste dropped: the session was torn down or replaced before the
@@ -11736,7 +12377,7 @@ async function sendClaudeTurn(
   rawLine?: string,
   onlyIfIdle = false,
 ): Promise<ClaudeTurnResult | null> {
-  if (!tasks.get(taskId)) return null;
+  if (!await tasks.get(taskId)) return null;
 
   // Route to the live-session paste path unless we're SURE the session is
   // dead. `sessionLiveness` (not the raw `sessionExists` boolean it replaces
@@ -11766,7 +12407,10 @@ async function sendClaudeTurn(
   // per-task "starting" slot first — see `startingTaskIds`'s doc (near
   // `startTask`) for why this is needed now that `sessionLiveness` above is
   // a genuine await.
-  const task = tasks.get(taskId);
+  // One read, then the refusals, the idle-only check and the claim with
+  // nothing awaited in between.
+  const snap = await readTaskSnapshot(taskId);
+  const task = snap.task;
   if (!task) return null;
   // The `has-session` await above is where a freeze or an archive can land.
   const refusal = claudeSendRefusal(task, onlyIfIdle);
@@ -11774,7 +12418,7 @@ async function sendClaudeTurn(
   // Idle-only send: a fake-driver or no-state task can still have an active
   // run here (`hasSessionState` is false for it), and minting would create a
   // second concurrent run. Refuse before the claim and any run-row insert.
-  if (onlyIfIdle && isAnyRunOfTaskLive(taskId)) {
+  if (onlyIfIdle && anyRunOfTaskLiveFrom(taskId, snap)) {
     return { runId: task.runId ?? "", delivered: false, busy: true };
   }
   if (startingTaskIds.has(taskId)) {
@@ -11823,8 +12467,17 @@ async function sendTurnInExistingSession(
   // `task.runId` and registers `active` synchronously) is invisible to any
   // snapshot taken before the await. `drainSessionJsonl` is a no-op without a
   // live session and never fires a staged end_turn.
+  //
+  // With the database on another thread the task row is one read; the
+  // decision below runs synchronously after it. A continuation the drain
+  // just adopted registers in `active` at once, but its run row and the
+  // task's `run_id` are written through the run's queue, so the read can
+  // still name the previous run: `currentClaudeRunOf` falls back to that
+  // adopted run, and the message folds into it as before.
   drainSessionJsonl(taskId);
-  const task = tasks.get(taskId);
+  await awaitContinuationOpen(taskId);
+  const snap = await readTaskSnapshot(taskId);
+  const task = snap.task;
   if (!task) {
     return { runId: "", delivered: false, withheld: false, reason: "internal: task lookup failed" };
   }
@@ -11841,19 +12494,20 @@ async function sendTurnInExistingSession(
   // forever. `active.has(task.runId)` is true iff the latest run hasn't
   // resolved yet (registerActiveRun adds; attachDoneHandler deletes on done) —
   // a more reliable "in flight" signal than the polled `task.column`.
-  const busy = !!task.runId && active.has(task.runId);
+  const currentRunId = currentClaudeRunOf(task);
+  const busy = currentRunId !== null;
   // Idle-only send (the pipeline handoff reminder): never fold into, queue
   // behind or interleave with a working session. Any live run of the task
   // (including one displaced as `task.runId`), or turn activity the session
   // itself still tracks (in flight, a queued slot, a continuation awaiting
   // content), refuses with no side effects — nothing below has run yet.
-  if (opts.onlyIfIdle && (isAnyRunOfTaskLive(taskId) || sessionHasTurn(taskId))) {
+  if (opts.onlyIfIdle && (anyRunOfTaskLiveFrom(taskId, snap) || sessionHasTurn(taskId))) {
     return { runId: task.runId ?? "", delivered: false, busy: true };
   }
-  if (busy && task.runId) {
-    const activeRunId = task.runId;
+  if (busy && currentRunId) {
+    const activeRunId = currentRunId;
     // What `handlePasteWithheld` reported, for `savedToBacklog`.
-    let stashed: boolean | null = null;
+    let stashed: Promise<boolean> | null = null;
     // `onPasteFailure` covers T7's paste guard (docs/plans/model-effort-
     // local-command-turns.md §10): a blocking claude modal was still on the
     // pane when the queued paste's grace window elapsed, so this follow-up
@@ -11863,7 +12517,7 @@ async function sendTurnInExistingSession(
     // before the paste's real outcome is known.
     const pasted = await pasteFollowUp(taskId, line, {
       onPasteFailure: (outcome) => {
-        stashed = handlePasteWithheld(taskId, activeRunId, rawLine ?? line, outcome);
+        stashed = handlePasteWithheldQuietly(taskId, activeRunId, rawLine ?? line, outcome);
       },
     });
     // `pasteFollowUp` returns `false` only when no live session exists (falls
@@ -11883,7 +12537,7 @@ async function sendTurnInExistingSession(
       // queued message (see `cancelRun`) and this bubble has no reply. That's the
       // same optimism `sendTurn` already runs with; the bubble correctly reflects
       // that the user did send the message.
-      saveAndEmit({ runId: activeRunId, taskId, stream: "user", data });
+      await saveAndEmit({ runId: activeRunId, taskId, stream: "user", data });
       return resolveClaudeTurnOutcome(activeRunId, pasted.pasteOutcome, () => stashed);
     }
   }
@@ -11899,7 +12553,7 @@ async function sendTurnInExistingSession(
   // freeze or an archive may have landed during it, so look again — freshly —
   // before claiming. (With no await since the check at the top this is the
   // same answer, read again.)
-  const latest = tasks.get(taskId);
+  const latest = await tasks.get(taskId);
   if (!latest) {
     return { runId: task.runId ?? "", delivered: false, withheld: false, reason: "internal: task lookup failed" };
   }
@@ -11923,8 +12577,8 @@ async function sendTurnInExistingSession(
     // which run row they belong to.
     const newRunId = randomUUID();
     const now = Date.now();
-    const inheritedSessionId = lastSessionIdForTask(task, "claude_session_id");
-    runs.insert({
+    const inheritedSessionId = await lastSessionIdForTask(task, "claude_session_id");
+    await runs.insert({
       id: newRunId,
       taskId,
       agent: task.agent,
@@ -11945,24 +12599,24 @@ async function sendTurnInExistingSession(
       antigravitySessionId: null,
     });
     const prevColumn: ColumnId = task.column;
-    tasks.update(taskId, { column: "running", runId: newRunId });
+    await tasks.update(taskId, { column: "running", runId: newRunId });
     adoptPendingTaskCancel(taskId, newRunId);
     if (prevColumn !== "running") {
-      emitGlobal({ kind: "column", taskId, runId: newRunId, column: "running", prev: prevColumn, ts: now });
+      await emitGlobal({ kind: "column", taskId, runId: newRunId, column: "running", prev: prevColumn, ts: now });
     }
 
-    const harness = resolveHarness(task.agent);
+    const harness = await resolveHarness(task.agent);
     const kind: AgentKind = harness?.kind ?? "claude-code";
     const onChunk = makeChunkHandler(newRunId, taskId, kind, task.mode);
     onChunk("user", normalizeUserText(line));
 
     // What `handlePasteWithheld` reported, for `savedToBacklog`.
-    let stashed: boolean | null = null;
+    let stashed: Promise<boolean> | null = null;
     const agent = await sendTurn(taskId, line, onChunk, {
       onPasteFailure: (outcome) => {
-        stashed = handlePasteWithheld(taskId, newRunId, rawLine ?? line, outcome);
+        stashed = handlePasteWithheldQuietly(taskId, newRunId, rawLine ?? line, outcome);
       },
-      harnessFailover: harnessFailoverEnabledFor(tasks.get(taskId)),
+      harnessFailover: await harnessFailoverEnabledFor(await tasks.get(taskId)),
     });
     // Stop landed while the paste was in flight (see `pendingCancelRunIds`):
     // interrupt the turn (Ctrl+C, the session stays alive — same as a normal
@@ -11975,7 +12629,7 @@ async function sendTurnInExistingSession(
     attachDoneHandler(newRunId, taskId, agent);
     return resolveClaudeTurnOutcome(newRunId, agent.pasteOutcome, () => stashed);
   } finally {
-    releaseStartingClaim(taskId);
+    await releaseStartingClaim(taskId);
   }
 }
 
@@ -12059,12 +12713,27 @@ async function sendTurnInExistingSession(
  * `SendInputResult.savedToBacklog` so no surface claims a save that didn't
  * happen.
  */
-function handlePasteWithheld(
+/** {@link handlePasteWithheld} from claude-tmux's synchronous `onPasteFailure`
+ *  hook: the re-stash starts at once, its promise is what the send's outcome
+ *  awaits, and a failure is logged and reads as not saved. */
+function handlePasteWithheldQuietly(
   taskId: string,
   runId: string,
   text: string,
   outcome: { ok: false; op: string; phase?: "pre-paste" | "pre-enter" | "composer-dirty"; stderr: string },
-): boolean {
+): Promise<boolean> {
+  return handlePasteWithheld(taskId, runId, text, outcome).catch((err: unknown) => {
+    console.warn(`[agetor] re-stashing a withheld paste for task ${taskId} failed:`, err);
+    return false;
+  });
+}
+
+async function handlePasteWithheld(
+  taskId: string,
+  runId: string,
+  text: string,
+  outcome: { ok: false; op: string; phase?: "pre-paste" | "pre-enter" | "composer-dirty"; stderr: string },
+): Promise<boolean> {
   let data: string;
   let saved: boolean;
   if (outcome.op !== "modal-guard") {
@@ -12076,26 +12745,26 @@ function handlePasteWithheld(
     // over a generic "the paste … failed" line that would otherwise misread
     // a dropped op (session disposed/respawned mid-flight) as an ordinary
     // tmux subprocess failure.
-    saved = restashPasteWithheldText(taskId, text);
+    saved = await restashPasteWithheldText(taskId, text);
     data = `message saved to your backlog — ${outcome.stderr || "the paste to claude's session failed"}; resend from the tray`;
   } else if (outcome.phase === "pre-enter") {
     // Re-stashed (finding #3, §10 re-review) — see this function's doc.
-    saved = restashPasteWithheldText(taskId, text);
+    saved = await restashPasteWithheldText(taskId, text);
     data =
       "paste withheld: claude opened a prompt before your message was sent — it's saved to your backlog (claude's input box will be cleared before your next send); resend from the tray";
   } else if (outcome.phase === "composer-dirty") {
-    saved = restashPasteWithheldText(taskId, text);
+    saved = await restashPasteWithheldText(taskId, text);
     data = "paste withheld: claude's input box still holds an earlier message — saved this one to your backlog; resend from the tray once claude is idle";
   } else {
     // "pre-paste", or a missing phase (an older/synthesized outcome) —
     // nothing reached the pane at all.
-    saved = restashPasteWithheldText(taskId, text);
+    saved = await restashPasteWithheldText(taskId, text);
     data = "message saved to your backlog — claude is waiting on a prompt; answer it and send the message from the tray";
   }
   // The re-stash is skipped for a task archived (or deleted) underneath the
   // send — never claim a save that didn't happen.
   if (!saved) data = "message not delivered — the task was archived before it could be saved to your backlog";
-  saveAndEmit({ runId, taskId, stream: "status", data });
+  await saveAndEmit({ runId, taskId, stream: "status", data });
   return saved;
 }
 
@@ -12107,19 +12776,18 @@ function handlePasteWithheld(
  *  Returns whether the text is now in the tray (freshly added, or already
  *  there); `false` when it was skipped — `settleLateSend` reports that
  *  truthfully in `send-failed.savedToBacklog`. */
-function restashPasteWithheldText(taskId: string, text: string): boolean {
-  const task = tasks.get(taskId);
-  if (!task || task.archivedAt != null) {
-    console.warn(`[agetor] handlePasteWithheld: task ${taskId} not found or archived — skipping backlog re-stash`);
-    return false;
-  }
+async function restashPasteWithheldText(taskId: string, text: string): Promise<boolean> {
   // Scan the WHOLE backlog, not just `task.backlog[0]` (finding #3, §10
   // re-review) — a repeated withhold of the same message is the common case
   // this dedupes, but the item can easily have moved off the front by then
   // (another draft added in between, or a manual reorder), and checking only
   // the front would silently let a duplicate through in exactly that case.
-  const alreadyStashed = task.backlog.some((item) => item.text === text);
-  if (!alreadyStashed) backlog.add(taskId, { text });
+  // The scan and the add are one transaction (op `orchestrator.restashText`).
+  const outcome = await op("orchestrator.restashText", [taskId, text]);
+  if (outcome === "skipped") {
+    console.warn(`[agetor] handlePasteWithheld: task ${taskId} not found or archived — skipping backlog re-stash`);
+    return false;
+  }
   return true;
 }
 
@@ -12131,29 +12799,23 @@ function restashPasteWithheldText(taskId: string, text: string): boolean {
  * before this batch is skipped (an overlapping stash path re-stashing the
  * same message). Returns how many were added.
  */
-function stashFollowUpBatch(taskId: string, textsInAddOrder: readonly string[]): number {
-  const task = tasks.get(taskId);
-  if (!task || task.archivedAt != null || textsInAddOrder.length === 0) return 0;
-  const before = new Set(task.backlog.map((item) => item.text));
-  let added = 0;
-  for (const text of textsInAddOrder) {
-    if (before.has(text)) continue;
-    backlog.add(taskId, { text });
-    added++;
-  }
-  return added;
+async function stashFollowUpBatch(taskId: string, textsInAddOrder: readonly string[]): Promise<number> {
+  if (textsInAddOrder.length === 0) return 0;
+  // The dedupe read and the writes are one transaction (op
+  // `orchestrator.stashBatch`), so two overlapping stashes can't both add.
+  return await op("orchestrator.stashBatch", [taskId, [...textsInAddOrder]]);
 }
 
 /** Test hook: exercise `handlePasteWithheld` directly against a real task
  *  row without driving a full tmux paste-failure scenario. Not part of the
  *  public surface. */
-export function __handlePasteWithheldForTest(
+export async function __handlePasteWithheldForTest(
   taskId: string,
   runId: string,
   text: string,
   outcome: { ok: false; op: string; phase?: "pre-paste" | "pre-enter" | "composer-dirty"; stderr: string },
-): boolean {
-  return handlePasteWithheld(taskId, runId, text, outcome);
+): Promise<boolean> {
+  return await handlePasteWithheld(taskId, runId, text, outcome);
 }
 
 /**
@@ -12213,54 +12875,83 @@ function startContinuationRun(
   // tailer's `lastChunk` routing, then `sendTurn` pushes its slot and the
   // rest of the (folded) turn lands on the minted run.
   if (startingTaskIds.has(taskId)) return null;
-  const task = tasks.get(taskId);
-  if (!task || task.archivedAt != null) return null;
-  if (resolveHarness(task.agent)?.kind !== "claude-code") return null;
+  // claude-tmux asks synchronously and dispatches the triggering line right
+  // after, so the decision is made from what this process knows now: the task
+  // is not being archived or deleted, and a run of it registered in this
+  // process (the session being tailed is that run's). Whether the row still
+  // exists, is unarchived and is still a Claude Code task is checked again
+  // when the run row is written (below); a task that fails that check gets no
+  // run, and the adopted turn is dropped quietly (`declinedContinuationRuns`).
+  if (isTaskTearingDown(taskId)) return null;
+  const known = registeredRunTasks.get(taskId);
+  if (!known) return null;
 
   const newRunId = randomUUID();
   const now = Date.now();
-  const inheritedSessionId = lastSessionIdForTask(task, "claude_session_id");
-  runs.insert({
-    id: newRunId,
-    taskId,
-    agent: task.agent,
-    status: "running",
-    startedAt: now,
-    endedAt: null,
-    exitCode: null,
-    tmuxSession: sessionNameFor(taskId),
-    // Keeps its pre-stamp (T7/P-3): see the sibling insert above (a real, recorded
-    // session id; a legacy one heals in `spawnAgent`).
-    claudeSessionId: inheritedSessionId,
-    codexSessionId: null,
-    cursorSessionId: null,
-    geminiSessionId: null,
-    fxSessionId: null,
-    antigravitySessionId: null,
-    origin: "continuation",
+  openingContinuationRuns.set(taskId, newRunId);
+  const onChunk = makeChunkHandler(newRunId, taskId, "claude-code", known.mode);
+  // The run row and the column flip are the first entry on the run's queue,
+  // so every chunk the hooks receive is saved after the row exists, and the
+  // opening status line lands before the `running` column event goes out (the
+  // pipeline runner's `running` listener reads it to tell a turn typed in the
+  // terminal from an automatic one).
+  const opened = appendAndEmit(
+    newRunId,
+    async (): Promise<{ prevColumn: ColumnId | null } | null> => {
+      const task = await tasks.get(taskId);
+      if (!task || task.archivedAt != null) return null;
+      if ((await resolveHarness(task.agent))?.kind !== "claude-code") return null;
+      const inheritedSessionId = await lastSessionIdForTask(task, "claude_session_id");
+      // Continuation turns always pull the card to `running`, regardless of
+      // prior column (mirrors the idle branch above, and matches the owner
+      // decision in the plan: the session genuinely resumed talking, so the
+      // card must reflect that live activity).
+      const prevColumn = await op("orchestrator.insertRunAndPoint", [{
+        id: newRunId,
+        taskId,
+        agent: task.agent,
+        status: "running",
+        startedAt: now,
+        endedAt: null,
+        exitCode: null,
+        tmuxSession: sessionNameFor(taskId),
+        // Keeps its pre-stamp (T7/P-3): see the sibling insert above (a real, recorded
+        // session id; a legacy one heals in `spawnAgent`).
+        claudeSessionId: inheritedSessionId,
+        codexSessionId: null,
+        cursorSessionId: null,
+        geminiSessionId: null,
+        fxSessionId: null,
+        antigravitySessionId: null,
+        origin: "continuation",
+      }]);
+      return { prevColumn };
+    },
+    (outcome) => {
+      if (openingContinuationRuns.get(taskId) === newRunId) openingContinuationRuns.delete(taskId);
+      if (!outcome) declinedContinuationRuns.add(newRunId);
+    },
+  ).catch((err: unknown) => {
+    if (openingContinuationRuns.get(taskId) === newRunId) openingContinuationRuns.delete(taskId);
+    declinedContinuationRuns.add(newRunId);
+    console.warn(`[agetor] opening a continuation run for task ${taskId} failed:`, err);
+    return null;
   });
-  const prevColumn: ColumnId = task.column;
-  // Continuation turns always pull the card to `running`, regardless of
-  // prior column (mirrors the idle branch above, and matches the owner
-  // decision in the plan: the session genuinely resumed talking, so the
-  // card must reflect that live activity).
-  tasks.update(taskId, { column: "running", runId: newRunId });
-
-  const harness = resolveHarness(task.agent);
-  const kind: AgentKind = harness?.kind ?? "claude-code";
-  const onChunk = makeChunkHandler(newRunId, taskId, kind, task.mode);
-  // The opening status line names the trigger, and the pipeline runner's
-  // `running` column listener reads it to tell a turn typed in the terminal
-  // from an automatic one — so it must exist before that event goes out.
   onChunk("status", CONTINUATION_STATUS_TEXT[trigger] ?? CONTINUATION_STATUS_TEXT.notification);
-  if (prevColumn !== "running") {
-    emitGlobal({ kind: "column", taskId, runId: newRunId, column: "running", prev: prevColumn, ts: now });
-  }
+  const announced = appendAndEmit(newRunId, () => opened, (outcome) => {
+    if (outcome && outcome.prevColumn !== "running") {
+      void emitGlobal({ kind: "column", taskId, runId: newRunId, column: "running", prev: outcome.prevColumn, ts: now });
+    }
+  }).then(() => undefined, () => undefined);
+  continuationOpens.set(taskId, announced);
+  void announced.then(() => {
+    if (continuationOpens.get(taskId) === announced) continuationOpens.delete(taskId);
+  });
 
   return {
     onChunk,
     onAdopted: (handle) => {
-      registerActiveRun(newRunId, taskId, task, handle);
+      registerActiveRun(newRunId, taskId, known, handle);
       attachDoneHandler(newRunId, taskId, handle);
     },
   };
@@ -12311,7 +13002,7 @@ async function spawnResumedSession(
     // never throws itself, and the continuation catches its own errors), so
     // this catch can't fire for anything the continuation is responsible
     // for — no double-delete risk.
-    releaseStartingClaim(taskId);
+    await releaseStartingClaim(taskId);
     throw err;
   }
 }
@@ -12321,12 +13012,12 @@ async function spawnResumedSessionInner(
   taskId: string,
   line: string,
 ): Promise<{ runId: string; pending?: true }> {
-  const priorSessionId = lastSessionIdForTask(task, "claude_session_id");
+  const priorSessionId = await lastSessionIdForTask(task, "claude_session_id");
   const cwd = task.worktreePath ?? task.workdir;
 
   const newRunId = randomUUID();
   const now = Date.now();
-  runs.insert({
+  await runs.insert({
     id: newRunId,
     taskId,
     agent: task.agent,
@@ -12346,13 +13037,13 @@ async function spawnResumedSessionInner(
     antigravitySessionId: null,
   });
   const prevColumn: ColumnId = task.column;
-  tasks.update(taskId, { column: "running", runId: newRunId });
+  await tasks.update(taskId, { column: "running", runId: newRunId });
   adoptPendingTaskCancel(taskId, newRunId);
   if (prevColumn !== "running") {
-    emitGlobal({ kind: "column", taskId, runId: newRunId, column: "running", prev: prevColumn, ts: now });
+    await emitGlobal({ kind: "column", taskId, runId: newRunId, column: "running", prev: prevColumn, ts: now });
   }
 
-  const harness = resolveHarness(task.agent);
+  const harness = await resolveHarness(task.agent);
   const kind: AgentKind = harness?.kind ?? "claude-code";
   const onChunk = makeChunkHandler(newRunId, taskId, kind, task.mode);
   onChunk("user", normalizeUserText(line));
@@ -12365,12 +13056,12 @@ async function spawnResumedSessionInner(
 
   if (!harness) {
     onChunk("stderr", `harness "${task.agent}" not found — cannot resume`);
-    runs.update(newRunId, { status: "failed", endedAt: Date.now(), exitCode: -1 });
+    await runs.update(newRunId, { status: "failed", endedAt: Date.now(), exitCode: -1 });
     pendingCancelRunIds.delete(newRunId); // an adopted Stop has nothing left to cancel
-    tasks.update(taskId, { column: "ready", runId: null });
+    await tasks.update(taskId, { column: "ready", runId: null });
     // No continuation was ever created for this run — release the claim
     // `sendClaudeTurn` took before calling in, right here.
-    releaseStartingClaim(taskId);
+    await releaseStartingClaim(taskId);
     return { runId: newRunId };
   }
 
@@ -12385,9 +13076,7 @@ async function spawnResumedSessionInner(
         prompt: line,
         cwd,
         onChunk,
-        onSessionId: (sessionId) => {
-          runs.update(newRunId, { claudeSessionId: sessionId });
-        },
+        onSessionId: (sessionId) => queueRunPatch(newRunId, { claudeSessionId: sessionId }),
         opts: {
           mode: task.mode,
           model: task.model ?? DEFAULT_MODEL[harness.kind],
@@ -12401,10 +13090,12 @@ async function spawnResumedSessionInner(
       // the idle branch of sendInput) — nothing to drop on failure here;
       // `spawnAgentOrFail`'s own catch already recorded the run failed and
       // bounced the task back to `ready`.
-      // Consume a Stop that landed while the spawn was in flight (see
-      // `pendingCancelRunIds`) on every settle path, agent or not.
-      const cancelledWhilePending = pendingCancelRunIds.delete(newRunId);
-      if (!agent) return;
+      if (!agent) {
+        // Consume a Stop that landed while the spawn was in flight (see
+        // `pendingCancelRunIds`) on every settle path, agent or not.
+        pendingCancelRunIds.delete(newRunId);
+        return;
+      }
 
       // Ownership guard: by the time the spawn settles the task may have
       // been deleted, archived, or this run may no longer be the task's
@@ -12414,24 +13105,27 @@ async function spawnResumedSessionInner(
       // force-archive (`archiveTask`'s `active.has(task.runId)` guard is
       // false during this exact pending window, since `registerActiveRun`
       // hasn't run yet) must be treated the same as delete/replace here.
-      const fresh = tasks.get(taskId);
+      const fresh = await tasks.get(taskId);
+      // Consumed after the read, in the same synchronous step as the
+      // registration below: a Stop recorded during the read is seen here.
+      const cancelledWhilePending = pendingCancelRunIds.delete(newRunId);
       if (!fresh || fresh.archivedAt != null || fresh.runId !== newRunId || cancelledWhilePending) {
         agent.kill();
         await dropSession(taskId);
-        runs.update(newRunId, { status: "cancelled", endedAt: Date.now(), exitCode: -1 });
+        await runs.update(newRunId, { status: "cancelled", endedAt: Date.now(), exitCode: -1 });
         if (cancelledWhilePending && fresh && fresh.runId === newRunId) {
           onChunk("status", "cancelled by user before the agent launched");
-          updateColumn(taskId, newRunId, "ready");
+          await updateColumn(taskId, newRunId, "ready", undefined, { runId: newRunId });
         } else if (fresh?.archivedAt != null && fresh.runId === newRunId) {
           // Same settlement as `startTaskInner`: archive does not move the
           // column, and this run never registers, so nothing else will.
           onChunk("status", "task archived before the agent launched");
-          updateColumn(taskId, newRunId, "ready");
+          await updateColumn(taskId, newRunId, "ready", undefined, { runId: newRunId });
         }
         // H1: same terminal emit as `startTaskInner`'s continuation — this
         // run never registers, so nothing else will ever announce it.
         if (fresh && fresh.runId === newRunId) {
-          emitGlobal({ kind: "run-status", taskId, runId: newRunId, status: "cancelled", ts: Date.now() });
+          await emitGlobal({ kind: "run-status", taskId, runId: newRunId, status: "cancelled", ts: Date.now() });
         }
         return;
       }
@@ -12444,7 +13138,7 @@ async function spawnResumedSessionInner(
       // e.g. the ownership-guard cleanup above.
       console.warn(`[agetor] detached claude resume spawn failed for task ${taskId} run ${newRunId}:`, err);
     } finally {
-      releaseStartingClaim(taskId);
+      await releaseStartingClaim(taskId);
     }
   })();
 
@@ -12745,7 +13439,7 @@ export async function createTask(
     // entry in this repository holding the branch is a collision too.
     const entryRootOf = memoAsync(repoRoot);
     let collision = false;
-    for (const t of tasks.list()) {
+    for (const t of await tasks.list()) {
       if (t.archivedAt) continue;
       if (t.workdir === workdir && t.branch === existingBranch) {
         collision = true;
@@ -12807,7 +13501,7 @@ export async function createTask(
     if (input.agentProfileId?.trim()) {
       return { error: "a task can't bind both a pipeline and an agent" };
     }
-    pipeline = pipelines.get(requestedPipelineId);
+    pipeline = await pipelines.get(requestedPipelineId);
     if (!pipeline) return { error: "unknown pipeline" };
     // Validate the stored graph here too (the table's read path returns a
     // hand-edited/corrupted graph unmodified when it is only shape-safe) —
@@ -12822,7 +13516,7 @@ export async function createTask(
       // A human gate legitimately has no agent; it spawns nothing.
       if (step.type === "human") continue;
       if (!step.agentProfileId) return { error: `step "${step.name}" has no agent` };
-      if (!agentProfiles.get(step.agentProfileId)) {
+      if (!await agentProfiles.get(step.agentProfileId)) {
         return { error: `agent for step "${step.name}" no longer exists` };
       }
     }
@@ -12841,7 +13535,7 @@ export async function createTask(
     // Caller-validated snapshot wins over a re-read (see CreateTaskInternal).
     profile = internal.resolvedAgentProfile;
   } else if (requestedProfileId) {
-    profile = agentProfiles.get(requestedProfileId);
+    profile = await agentProfiles.get(requestedProfileId);
     if (!profile) {
       return { error: `unknown agent profile "${requestedProfileId}"` };
     }
@@ -12855,7 +13549,7 @@ export async function createTask(
   // `pipeline`'s start step has an `agentProfileId` that resolves, so the
   // `agentProfiles.get` here can't fail.
   const pipelineStartProfile: AgentProfile | null = pipeline
-    ? agentProfiles.get(resolveStartStep(pipeline.graph)!.agentProfileId!)
+    ? await agentProfiles.get(resolveStartStep(pipeline.graph)!.agentProfileId!)
     : null;
   const defaultsProfile: AgentProfile | null = profile ?? pipelineStartProfile;
 
@@ -12865,7 +13559,7 @@ export async function createTask(
   // omits `agent` entirely. A bound profile's own harness always wins over
   // `input.agent`.
   const agentId = defaultsProfile ? defaultsProfile.harness : (input.agent ?? "claude-code");
-  const harness = resolveHarness(agentId);
+  const harness = await resolveHarness(agentId);
   if (!harness) {
     return { error: `unknown harness "${agentId}"` };
   }
@@ -12957,7 +13651,7 @@ export async function createTask(
       }
       desired = rendered;
     } else {
-      const config = projects.get(branchScopeDir)?.branchConfig ?? DEFAULT_BRANCH_CONFIG;
+      const config = (await projects.get(branchScopeDir))?.branchConfig ?? DEFAULT_BRANCH_CONFIG;
       desired = renderBranchTemplate(branchPattern(config, taskType), ctx);
       // Defensive: a hand-edited/corrupt config shouldn't hard-fail task
       // creation — fall back to the legacy scheme if it produced an illegal name.
@@ -12984,7 +13678,7 @@ export async function createTask(
       // and resolving them would spawn a `git rev-parse` per pinned path on
       // every single-repository create.
       const taken = new Set<string>();
-      for (const set of (await branchesPinnedByOtherTasks(id, tasks.list())).values()) {
+      for (const set of (await branchesPinnedByOtherTasks(id, await tasks.list())).values()) {
         for (const b of set) taken.add(b);
       }
       plannedBranch = await ensureUniqueBranch(workdirRoot, desired, taken);
@@ -13006,7 +13700,7 @@ export async function createTask(
       repositories.map((r) => [r.path, resolvedSet && resolvedSet.ok ? (resolvedSet.repositoriesRoots.get(r.path) ?? r.path) : r.path]),
     );
     const desired = plannedBranch ?? branchName({ id, title: input.title });
-    const taken = await branchesPinnedByOtherTasks(id, tasks.list(), { resolveRoot: repoRoot });
+    const taken = await branchesPinnedByOtherTasks(id, await tasks.list(), { resolveRoot: repoRoot });
     // Bounded like the worktree engine's own per-repository fan-out: each
     // `ensureUniqueBranch` spawns git, and N repositories must not start N
     // at once.
@@ -13075,7 +13769,7 @@ export async function createTask(
     ? snapshotFromProfile(profile, { kind: harness.kind, label: harness.label }, now)
     : null;
 
-  const task = tasks.insert({
+  const task = await tasks.insert({
     id,
     title: input.title,
     prompt: input.prompt,
@@ -13163,7 +13857,7 @@ export async function createTask(
       const snapshotPath = join(snapshotDir, ISSUE_SNAPSHOT_FILENAME(parsedIssue.number));
       writeFileSync(snapshotPath, input.issueSnapshot);
       if (!task.references.some((r) => r.path === snapshotPath)) {
-        const updated = tasks.update(task.id, {
+        const updated = await tasks.update(task.id, {
           references: [...task.references, { path: snapshotPath, isDirectory: false }],
         });
         if (updated) return { task: updated };
@@ -13200,9 +13894,11 @@ function enqueueArchiveTeardown(
   task: Task,
   opts?: { force?: boolean },
 ): { promise: Promise<void>; result: () => WorktreeTeardownResult | undefined } {
-  const kind = resolveHarness(task.agent)?.kind;
   let result: WorktreeTeardownResult | undefined;
+  // Enqueued synchronously, so `isTaskTearingDown` holds from the call on;
+  // the harness of the enqueue-time row is resolved when the job runs.
   const promise = enqueueTeardownMany(task.id, teardownKeysForTask(task), async () => {
+    const kind = (await resolveHarness(task.agent))?.kind;
     // `enqueueTeardown` only guarantees this job runs after everything already
     // queued for `task.workdir` — it can sit behind other jobs for seconds,
     // and `task` was captured at ENQUEUE time by every call site (fresh
@@ -13233,7 +13929,7 @@ function enqueueArchiveTeardown(
     // report a bogus failure for every delete of a *running* worktree. A
     // handle that's present and NOT cancelled is the real signal: a run
     // that started after we enqueued, which we must not tear down under.
-    const cur = tasks.get(task.id);
+    const cur = await tasks.get(task.id);
     const liveHandle = cur?.runId ? active.get(cur.runId) : undefined;
     if (!cur || cur.archivedAt == null || (liveHandle && !liveHandle.cancelled)) {
       result = { removed: false, reason: "failed" };
@@ -13281,11 +13977,11 @@ function enqueueArchiveTeardown(
         for (const repo of repos) {
           if (!repo.worktreePath || !existsSync(repo.worktreePath)) continue;
           const live = await readCheckoutBranch(repo.worktreePath);
-          if (live.ok) tasks.setRepositoryCheckout(cur.id, repo.name, live.branch);
+          if (live.ok) await tasks.setRepositoryCheckout(cur.id, repo.name, live.branch);
         }
       } else if (cur.worktreePath && existsSync(cur.worktreePath)) {
         const live = await readCheckoutBranch(cur.worktreePath);
-        if (live.ok) tasks.setCheckoutBranch(cur.id, live.branch);
+        if (live.ok) await tasks.setCheckoutBranch(cur.id, live.branch);
       }
     }
     result = cur.pipelineParentId
@@ -13348,7 +14044,7 @@ export async function archiveTask(
   taskId: string,
   opts?: { force?: boolean; stopRun?: boolean; forceWorktree?: boolean; awaitTeardown?: boolean; fromPipeline?: boolean },
 ): Promise<{ task: Task; teardown?: WorktreeTeardownResult } | { error: string } | ArchiveUncommittedChanges> {
-  const task = tasks.get(taskId);
+  const task = await tasks.get(taskId);
   if (!task) return { error: "task not found" };
   // Pipeline step tasks can't be archived individually (D9, docs/plans/pipelines.md)
   // — their lifecycle belongs to the parent pipeline task. `fromPipeline` is
@@ -13360,7 +14056,7 @@ export async function archiveTask(
   // M7: exempt an ORPHANED step (its parent row no longer exists) — there is
   // no pipeline task left to "act on instead", so refusing here would leave
   // it permanently unarchivable.
-  if (task.pipelineParentId && !opts?.fromPipeline && !isOrphanedPipelineStep(task)) {
+  if (task.pipelineParentId && !opts?.fromPipeline && !await isOrphanedPipelineStep(task)) {
     return { error: `step task belongs to a pipeline — act on the pipeline task ${task.pipelineParentId} instead` };
   }
   if (task.column !== "done" && !opts?.force) {
@@ -13400,12 +14096,12 @@ export async function archiveTask(
   // archive request was rejected. Copied session files stay on disk so an
   // unarchive can still resume, and the retention sweep removes them after
   // the archived-history threshold (plan assumption 19).
-  stashSwapFollowUps(taskId);
+  await stashSwapFollowUps(taskId);
   swapCancelRequested.delete(taskId);
-  clearFailoverState(taskId);
+  await clearFailoverState(taskId);
   if (task.runId && active.has(task.runId)) {
-    stopActiveHandle(active.get(task.runId)!, "task archived");
-  } else if (opts?.stopRun && backgroundAgentsHoldTask(taskId)) {
+    await stopActiveHandle(active.get(task.runId)!, "task archived");
+  } else if (opts?.stopRun && await backgroundAgentsHoldTask(taskId)) {
     await stopHeldTask(taskId, "task archived");
   }
   // Idle archive (a restarted Cursor question, a done-column archive, a
@@ -13453,8 +14149,15 @@ export async function archiveTask(
     }
     return { task };
   }
-  const updated = tasks.update(taskId, { archivedAt: Date.now() });
+  const updated = await tasks.update(taskId, { archivedAt: Date.now() });
   if (!updated) return { error: "task not found" };
+  // An archived task's session is torn down below: nothing is tailed for it
+  // any more, so nothing may adopt a continuation for it.
+  registeredRunTasks.delete(taskId);
+  // An archived step's cards are cancelled above, so drop its cached parent
+  // (interactions.ts); an unarchived step re-learns it through the fallback
+  // lookup, which also nudges the parent's badge.
+  forgetPipelineParent(taskId);
   // Pipeline parent (D9, docs/plans/pipelines.md): archive every non-archived
   // step task first — `cascadePipelineArchive` is best-effort per step (a
   // step that fails to archive is logged, not thrown), so one stuck step
@@ -13477,7 +14180,7 @@ export async function archiveTask(
   fxTurnQueue.delete(taskId);
   // Same for a pending fx auto-resume schedule — an archived task has
   // nothing left to resume (plan §3 T2 item 8).
-  clearFxRecovery(taskId);
+  await clearFxRecovery(taskId);
   // Deferred: the actual teardown (tmux kill, terminal shells, worktree
   // detach) is pushed onto this task's source-workdir teardown queue rather
   // than awaited here, so `archiveTask` can flip the DB column and return in
@@ -13511,15 +14214,15 @@ export async function archiveTask(
  * (`PreparedWorkdir.unknownCheckouts`): their checkout is only the input
  * snapshot, not a reading, so the stored value is kept.
  */
-export function recordPreparedRepositoryCheckouts(
+export async function recordPreparedRepositoryCheckouts(
   taskId: string,
   repos: TaskRepository[],
   unknown: readonly string[] = [],
-): void {
+): Promise<void> {
   for (const repo of repos) {
     if (!repo.worktreePath) continue;
     if (unknown.includes(repo.name)) continue;
-    tasks.setRepositoryCheckout(taskId, repo.name, repo.checkoutBranch ?? null);
+    await tasks.setRepositoryCheckout(taskId, repo.name, repo.checkoutBranch ?? null);
   }
 }
 
@@ -13533,22 +14236,22 @@ export function recordPreparedRepositoryCheckouts(
  * re-attach sets `warning`, and later prepares take the reuse path, so this
  * is the one chance to say it.
  */
-export function noteRestoredCheckout(taskId: string, prepared: PreparedWorkdir): void {
+export async function noteRestoredCheckout(taskId: string, prepared: PreparedWorkdir): Promise<void> {
   if (prepared.repositories) {
-    // Persist the re-materialized per-repo paths/branches/checkouts.
-    tasks.setRepositories(taskId, prepared.repositories);
-    // `setRepositories` deliberately keeps a stored checkout (a concurrent
-    // settle/archive write must win over this older snapshot); a live read
-    // from THIS prepare is the freshest value at this point, so record it via
-    // the dedicated compare-then-write setter.
-    recordPreparedRepositoryCheckouts(taskId, prepared.repositories, prepared.unknownCheckouts);
+    // Persist the re-materialized per-repo paths/branches/checkouts, in one
+    // transaction (op `orchestrator.recordRepositories`). `setRepositories`
+    // deliberately keeps a stored checkout (a concurrent settle/archive write
+    // must win over this older snapshot); a live read from THIS prepare is the
+    // freshest value at this point, so it is recorded via the dedicated
+    // compare-then-write setter.
+    await op("orchestrator.recordRepositories", [taskId, prepared.repositories, [...(prepared.unknownCheckouts ?? [])]]);
   } else {
     const checkout = recordableCheckout(prepared);
-    if (checkout !== undefined) tasks.setCheckoutBranch(taskId, checkout);
+    if (checkout !== undefined) await tasks.setCheckoutBranch(taskId, checkout);
   }
   if (!prepared.warning) return;
-  const latest = runs.listForTask(taskId)[0];
-  if (latest) appendRunStatusLine(taskId, latest.id, prepared.warning);
+  const latest = (await runs.listForTask(taskId))[0];
+  if (latest) await appendRunStatusLine(taskId, latest.id, prepared.warning);
   else console.warn(`[agetor] task ${taskId}: ${prepared.warning}`);
 }
 
@@ -13584,7 +14287,7 @@ function repositoriesNeverMaterialized(task: Task): boolean {
  * way; a later send/start/terminal-open retries the restore lazily.
  */
 export async function unarchiveTask(taskId: string): Promise<{ task: Task } | { error: string }> {
-  const task = tasks.get(taskId);
+  const task = await tasks.get(taskId);
   if (!task) return { error: "task not found" };
   if (task.archivedAt == null) return { task };
   // Wait out any teardown archiveTask deferred for this task BEFORE deciding
@@ -13594,13 +14297,13 @@ export async function unarchiveTask(taskId: string): Promise<{ task: Task } | { 
   // recreated it), leaving the task unarchived but pointing at a directory
   // that's about to vanish out from under it.
   await pendingTeardown(taskId);
-  const updated = tasks.update(taskId, { archivedAt: null });
+  const updated = await tasks.update(taskId, { archivedAt: null });
   if (!updated) return { error: "task not found" };
   // A pipeline run kept mutating while archived (`persist` skips the column
   // mirror, m8) — a gate reached then would leave the card on whatever column
   // it held before archiving. A pending gate forces Review now that the row
   // is live again (other statuses keep the owner's parked column).
-  restorePipelineGateColumn(taskId);
+  await restorePipelineGateColumn(taskId);
   // A step row's worktree belongs to its pipeline parent (D2) — restoring
   // it here (were a step row ever unarchived on its own, which the normal
   // UI never does) would be redundant at best and racy at worst against the
@@ -13611,7 +14314,7 @@ export async function unarchiveTask(taskId: string): Promise<{ task: Task } | { 
       if ("error" in restored) {
         console.warn(`[agetor] unarchiveTask: worktree restore failed for ${taskId}: ${restored.error}`);
       } else {
-        noteRestoredCheckout(taskId, restored);
+        await noteRestoredCheckout(taskId, restored);
       }
     } catch (err) {
       console.warn(`[agetor] unarchiveTask: worktree restore failed for ${taskId}:`, err);
@@ -13640,10 +14343,10 @@ export type RemoveTaskRepositoryResult =
  * again inside it, against the row as it stands once every earlier teardown,
  * removal and prepare has settled.
  */
-function repositoryRemovalRefusal(
+async function repositoryRemovalRefusal(
   task: Task,
   name: string,
-): Exclude<RemoveTaskRepositoryResult, { task: Task }> | { entry: TaskRepository } {
+): Promise<Exclude<RemoveTaskRepositoryResult, { task: Task }> | { entry: TaskRepository }> {
   if (task.pipelineParentId) {
     return {
       status: 409,
@@ -13657,11 +14360,21 @@ function repositoryRemovalRefusal(
   const repos = task.repositories ?? [];
   const entry = repos.find((r) => r.name === name);
   if (!entry) return { status: 404, error: `unknown repository "${name}"` };
-  const stepRunning = task.pipelineId != null && (
-    task.pipelineRun?.status === "running"
-    || tasks.stepsForParent(task.id).some((step) => step.column === "running" || isTaskRunLive(step.id))
-  );
-  if (task.column === "running" || isTaskRunLive(task.id) || stepRunning) {
+  let stepRunning = false;
+  if (task.pipelineId != null) {
+    if (task.pipelineRun?.status === "running") {
+      stepRunning = true;
+    } else {
+      // A pipeline's own steps: a handful of rows, one liveness read each.
+      for (const step of await tasks.stepsForParent(task.id)) {
+        if (step.column === "running" || await isTaskRunLive(step.id)) {
+          stepRunning = true;
+          break;
+        }
+      }
+    }
+  }
+  if (task.column === "running" || await isTaskRunLive(task.id) || stepRunning) {
     return {
       status: 409,
       code: "running",
@@ -13707,9 +14420,9 @@ function repositoryRemovalRefusal(
  * prepare lock (so no prepare is mid-flight on the checkout being removed).
  */
 export async function removeTaskRepository(taskId: string, name: string): Promise<RemoveTaskRepositoryResult> {
-  const initial = tasks.get(taskId);
+  const initial = await tasks.get(taskId);
   if (!initial) return { status: 404, error: "task not found" };
-  const early = repositoryRemovalRefusal(initial, name);
+  const early = await repositoryRemovalRefusal(initial, name);
   if (!("entry" in early)) return early;
   return enqueueRepositoryRemoval(taskId, teardownKeysForTask(initial), () =>
     withTaskPrepareLock(taskId, () => removeTaskRepositoryNow(taskId, name)),
@@ -13717,9 +14430,9 @@ export async function removeTaskRepository(taskId: string, name: string): Promis
 }
 
 async function removeTaskRepositoryNow(taskId: string, name: string): Promise<RemoveTaskRepositoryResult> {
-  const task = tasks.get(taskId);
+  const task = await tasks.get(taskId);
   if (!task) return { status: 404, error: "task not found" };
-  const checked = repositoryRemovalRefusal(task, name);
+  const checked = await repositoryRemovalRefusal(task, name);
   if (!("entry" in checked)) return checked;
   const { entry } = checked;
 
@@ -13739,51 +14452,39 @@ async function removeTaskRepositoryNow(taskId: string, name: string): Promise<Re
     };
   }
   // The detach awaited git; a start can't have begun meanwhile (it waits on
-  // this job through `pendingTeardown`), so the row read above still holds.
-  const remaining = (tasks.get(taskId)?.repositories ?? task.repositories ?? []).filter((r) => r.name !== name);
-  db.transaction(() => {
-    tasks.setRepositories(taskId, remaining);
-    if (task.issueRepoPath != null && task.issueRepoPath === entry.path) {
-      tasks.clearIssueRepoPath(taskId, entry.path);
-    }
-    // Step rows copy the parent's set (D2/M6) and check every entry's
-    // checkout before they launch; drop the entry there too, so a resumed or
-    // returned step doesn't refuse over a checkout that is gone on purpose.
-    if (task.pipelineId != null) {
-      for (const step of tasks.stepsForParent(taskId)) {
-        if (!isMultiRepoTask(step) || !(step.repositories ?? []).some((r) => r.name === name)) continue;
-        tasks.setRepositories(step.id, (step.repositories ?? []).filter((r) => r.name !== name));
-        if (step.issueRepoPath != null && step.issueRepoPath === entry.path) {
-          tasks.clearIssueRepoPath(step.id, entry.path);
-        }
-      }
-    }
-  })();
+  // this job through `pendingTeardown`). One transaction (op
+  // `orchestrator.removeRepository`) reads the row fresh and writes the
+  // remaining set, clears `issueRepoPath` when it named this repository, and
+  // does the same on every step row of a pipeline parent: step rows copy the
+  // parent's set (D2/M6) and check every entry's checkout before they launch,
+  // so a resumed or returned step doesn't refuse over a checkout that is gone
+  // on purpose.
+  await op("orchestrator.removeRepository", [taskId, name, entry.path]);
 
   const line = entry.branch
     ? `removed repository ${name} from this task (branch ${entry.branch} kept)`
     : `removed repository ${name} from this task`;
-  noteRepositoryRemoved(task, line);
-  const updated = tasks.get(taskId);
+  await noteRepositoryRemoved(task, line);
+  const updated = await tasks.get(taskId);
   return updated ? { task: updated } : { status: 404, error: "task not found" };
 }
 
 /** Put the removal's status line on the task's latest run — for a pipeline
  *  parent (no runs of its own), its latest step's — or the console when
  *  nothing has run yet (there is no event stream to write it to). */
-function noteRepositoryRemoved(task: Task, line: string): void {
+async function noteRepositoryRemoved(task: Task, line: string): Promise<void> {
   let latest: { taskId: string; runId: string; startedAt: number } | null = null;
-  const own = runs.listForTask(task.id)[0];
+  const own = (await runs.listForTask(task.id))[0];
   if (own) latest = { taskId: task.id, runId: own.id, startedAt: own.startedAt };
   if (!latest && task.pipelineId != null) {
-    for (const step of tasks.stepsForParent(task.id)) {
-      const run = runs.listForTask(step.id)[0];
+    for (const step of await tasks.stepsForParent(task.id)) {
+      const run = (await runs.listForTask(step.id))[0];
       if (run && (!latest || run.startedAt > latest.startedAt)) {
         latest = { taskId: step.id, runId: run.id, startedAt: run.startedAt };
       }
     }
   }
-  if (latest) appendRunStatusLine(latest.taskId, latest.runId, line);
+  if (latest) await appendRunStatusLine(latest.taskId, latest.runId, line);
   else console.log(`[agetor] task ${task.id}: ${line}`);
 }
 
@@ -13930,7 +14631,7 @@ export async function teardownBranchesForTask(task: Task): Promise<TaskTeardownP
   const repos = task.repositories ?? [];
   if (isMultiRepoTask(task) && repos.length > 0 && task.isolation === "worktree" && !task.pipelineParentId) {
     const plans: RepoTeardownPlan[] = [];
-    const allTasks = tasks.list();
+    const allTasks = await tasks.list();
     const rootOf = memoAsync(repoRoot);
     const defaultBranchOf = memoAsync(resolveDefaultBranchName);
     for (const repo of repos) {
@@ -13994,7 +14695,7 @@ export async function teardownBranchesForTask(task: Task): Promise<TaskTeardownP
   const defaultBranch = root ? await resolveDefaultBranchName(root) : null;
   // The same walk the multi-repository path uses: an archived multi task in
   // this repository holds its entries' branches here too.
-  const heldByOthers = await branchesHeldByOtherTasks(task.id, task.workdir, root, tasks.list(), memoAsync(repoRoot));
+  const heldByOthers = await branchesHeldByOtherTasks(task.id, task.workdir, root, await tasks.list(), memoAsync(repoRoot));
   const plan = planTeardownBranches({
     taskBranch,
     branchSource: task.branchSource,
@@ -14022,27 +14723,46 @@ export async function teardownBranchesForTask(task: Task): Promise<TaskTeardownP
  * teardown below.
  */
 export async function deleteTask(taskId: string, opts?: { fromPipeline?: boolean }): Promise<void> {
-  const task = tasks.get(taskId);
-  if (!task) return;
+  // Claim the teardown synchronously (before the first await) so a concurrent
+  // terminal/start/continuation sees it while the row is read. A delete that
+  // turns out to be refused (no such task, a pipeline step) gives the claim
+  // back, unless another delete of the same task already held it.
+  const claimedHere = !deletingTaskIds.has(taskId);
+  deletingTaskIds.add(taskId);
+  const refuse = (): void => {
+    if (claimedHere) deletingTaskIds.delete(taskId);
+  };
+  let task: Task | null;
+  try {
+    task = await tasks.get(taskId);
+  } catch (err) {
+    refuse();
+    throw err;
+  }
+  if (!task) {
+    refuse();
+    return;
+  }
   // M7: exempt an ORPHANED step (its parent row no longer exists) — same
-  // rationale as the matching exemption in `archiveTask`. Checked before the
-  // teardown claim so a refused delete never marks the task as tearing down.
-  if (task.pipelineParentId && !opts?.fromPipeline && !isOrphanedPipelineStep(task)) {
+  // rationale as the matching exemption in `archiveTask`. A refused delete
+  // never leaves the task marked as tearing down.
+  if (task.pipelineParentId && !opts?.fromPipeline && !await isOrphanedPipelineStep(task).catch((err: unknown) => {
+    refuse();
+    throw err;
+  })) {
+    refuse();
     console.warn(`[agetor] refusing to delete pipeline step task ${taskId} directly — delete the pipeline task ${task.pipelineParentId} instead`);
     return;
   }
-  // Claim the teardown synchronously (before the first await) so a concurrent
-  // terminal/start sees it.
-  deletingTaskIds.add(taskId);
   // Delete ends failover. The copied provider-session files are removed at the
   // very end, immediately before `tasks.delete` (not here): every step below —
   // the pipeline cascade, the teardown, the issue snapshot removal — can throw,
   // and on a failed delete the task row survives (the parent tombstone is
   // rolled back). Removing the copies first would leave the surviving task
   // unable to resume its transferred conversation (review R8-S1).
-  stashSwapFollowUps(taskId);
+  await stashSwapFollowUps(taskId);
   swapCancelRequested.delete(taskId);
-  clearFailoverState(taskId);
+  await clearFailoverState(taskId);
   // M-R7: `cascadePipelineDelete` tombstones the parent id FIRST (so a
   // racing launch bails) — but a throw anywhere between that tombstone and
   // the `tasks.delete` at the bottom (a step delete, a teardown, the issue
@@ -14065,13 +14785,16 @@ export async function deleteTask(taskId: string, opts?: { fromPipeline?: boolean
   // children blocked on agetor unblock immediately. Done before dropSession
   // so the curl / fetch awaiters return before tmux kills them.
   cancelPendingForTask(taskId, "task deleted");
+  forgetPipelineParent(taskId);
+  registeredRunTasks.delete(taskId);
+  heldProbeAnswers.delete(taskId);
   // Kill the task's tmux session before tearing down the worktree so we don't
   // leave an orphaned session behind. For claude it outlives individual runs;
   // for codex/cursor/gemini it only exists during an in-flight turn —
   // dropCodexSession/dropCursorSession/dropGeminiSession also clear any
   // in-memory tailer. fx has no tmux session at all (ACP/stdio) — dropFxSession
   // just clears its in-memory state. No-op when no session exists.
-  const deleteKind = resolveHarness(task.agent)?.kind;
+  const deleteKind = (await resolveHarness(task.agent))?.kind;
   codexTurnQueue.delete(taskId);
   cursorTurnQueue.delete(taskId);
   geminiTurnQueue.delete(taskId);
@@ -14081,7 +14804,7 @@ export async function deleteTask(taskId: string, opts?: { fromPipeline?: boolean
   fxTurnQueue.delete(taskId);
   // Same for a pending fx auto-resume schedule, before the task row itself
   // goes (plan §3 T2 item 8).
-  clearFxRecovery(taskId);
+  await clearFxRecovery(taskId);
   // A wake still waiting on a settling turn has nothing left to wake.
   dropDeferredOpencodeWake(taskId);
   // Routed through the same per-workdir teardown queue archiveTask uses —
@@ -14120,7 +14843,7 @@ export async function deleteTask(taskId: string, opts?: { fromPipeline?: boolean
     // its path since `task` was captured — the stale snapshot would leave
     // that directory and its branch behind.
     if (!task.pipelineParentId) {
-      const cur = tasks.get(taskId) ?? task;
+      const cur = await tasks.get(taskId) ?? task;
       const plan = await teardownBranchesForTask(cur);
       // Multi-repository rows carry one plan per repository; pass it through
       // so a checkout that drifted onto another branch is removed too (the
@@ -14134,8 +14857,10 @@ export async function deleteTask(taskId: string, opts?: { fromPipeline?: boolean
   // under `dataDir` this task might own. Best-effort: a task without one
   // (the common case) makes this a no-op, and a failure here shouldn't block
   // the delete itself.
+  // Async (`fs.promises.rm`): a large snapshot directory must not hold the
+  // main thread.
   try {
-    rmSync(join(dataDir, "issue-threads", taskId), { recursive: true, force: true });
+    await rm(join(dataDir, "issue-threads", taskId), { recursive: true, force: true });
   } catch (e) {
     console.warn(`[agetor] failed to remove issue thread snapshot dir for task ${taskId}:`, e);
   }
@@ -14148,7 +14873,7 @@ export async function deleteTask(taskId: string, opts?: { fromPipeline?: boolean
   } catch (err) {
     console.warn(`[agetor] cleaning copied sessions for deleted task ${taskId} failed:`, err);
   }
-  tasks.delete(taskId);
+  await tasks.delete(taskId);
   } catch (err) {
     if (isPipelineParent) tombstonedPipelineParents.delete(taskId);
     throw err;
@@ -14180,7 +14905,7 @@ export function discardRefusedWorktree(
   prepared: { worktreePath: string; branch: string | null; repositories?: TaskRepository[] },
 ): Promise<void> {
   return enqueueTeardownMany(task.id, teardownKeysForTask(task), async () => {
-    const cur = tasks.get(task.id);
+    const cur = await tasks.get(task.id);
     if (cur && cur.archivedAt == null) return;
     // The workspace root counts as materialized whenever any nested checkout
     // was created; both detach/remove are idempotent when a child is gone.
@@ -14227,9 +14952,9 @@ export function discardRefusedWorktree(
  * Fire-and-forget from the caller's perspective — returns the count enqueued,
  * not a promise, since it only needs to kick the jobs off.
  */
-export function sweepArchivedTeardowns(): number {
+export async function sweepArchivedTeardowns(): Promise<number> {
   let enqueued = 0;
-  for (const task of tasks.list()) {
+  for (const task of await tasks.list()) {
     if (task.archivedAt == null) continue;
     // A step task's `worktreePath` is a copy of its pipeline parent's — the
     // parent's own row (also archived, also swept by this same loop) is
@@ -14253,9 +14978,9 @@ export function sweepArchivedTeardowns(): number {
         // and is async. Enqueue once it answers; this sweep stays synchronous
         // for its boot caller, and such a job is not in the returned count.
         void workspaceHasOnlyAgetorScratch(workspacePathFor(task))
-          .then((onlyScratchLeft) => {
+          .then(async (onlyScratchLeft) => {
             if (!onlyScratchLeft) return;
-            const cur = tasks.get(task.id);
+            const cur = await tasks.get(task.id);
             if (!cur || cur.archivedAt == null) return;
             if (cur.runId && active.has(cur.runId)) return;
             enqueueArchiveTeardown(cur);
@@ -14338,19 +15063,28 @@ export async function reapIdleSessions(): Promise<{ reaped: string[] }> {
   reapInFlight = true;
   try {
     const reaped: string[] = [];
-    const candidateIds = tasks
-      .list()
+    const all = await tasks.list();
+    // Every distinct harness of the board resolved in one hop, not one per task.
+    const agents = [...new Set(all.map((t) => t.agent))];
+    const kinds = new Map(
+      (await op("orchestrator.resolveHarnesses", [agents])).map((h, i) => [agents[i]!, h?.kind ?? null] as const),
+    );
+    const candidateIds = all
       .filter(
         (t) =>
           t.archivedAt == null
-          && resolveHarness(t.agent)?.kind === "claude-code"
+          && kinds.get(t.agent) === "claude-code"
           && (hasSessionState(t.id) || t.runId != null),
       )
       .map((t) => t.id);
 
-    const isReapable = (task: Task): boolean => {
+    // Decided from one read of the task (its hold included) plus the
+    // in-memory run and interaction state, with nothing awaited in between.
+    const isReapable = (snap: TaskSnapshot): snap is TaskSnapshot & { task: Task } => {
+      const task = snap.task;
+      if (!task) return false;
       if (task.runId && active.has(task.runId)) return false;
-      if (isTaskHeldByBackgroundAgents(task)) return false;
+      if (snap.held) return false;
       // `isTaskHeldByBackgroundAgents` only covers the `running`-column
       // #92 hold (main run succeeded, subagents still finishing) — it
       // requires `task.column === "running"`. Since #93
@@ -14361,7 +15095,7 @@ export async function reapIdleSessions(): Promise<{ reaped: string[] }> {
       // `running`), so re-check independently of column/hold state — a
       // task with any running subagent row must never have its tmux
       // session reaped out from under agents still writing to it.
-      if (subagents.hasRunning(task.id)) return false;
+      if (snap.runningSubagents) return false;
       if (countPendingForTask(task.id) > 0) return false;
       return true;
     };
@@ -14372,8 +15106,9 @@ export async function reapIdleSessions(): Promise<{ reaped: string[] }> {
       // before the kill below.
       await Bun.sleep(0);
 
-      const task = tasks.get(taskId);
-      if (!task || !isReapable(task)) continue;
+      const snap = await readTaskSnapshot(taskId);
+      if (!isReapable(snap)) continue;
+      const task = snap.task;
 
       const idleInfo = sessionIdleInfo(taskId);
       let idleLongEnough: boolean;
@@ -14407,15 +15142,16 @@ export async function reapIdleSessions(): Promise<{ reaped: string[] }> {
       // Re-check immediately before the kill against a fresh row — closes
       // the window between the idle check above (which may itself have
       // awaited a yield or a tmux probe) and the kill below.
-      const fresh = tasks.get(taskId);
-      if (!fresh || !isReapable(fresh)) continue;
+      const freshSnap = await readTaskSnapshot(taskId);
+      if (!isReapable(freshSnap)) continue;
+      const fresh = freshSnap.task;
 
       await dropSession(taskId);
       reaped.push(taskId);
 
-      const recent = runs.listForTask(taskId)[0];
+      const recent = (await runs.listForTask(taskId))[0];
       if (recent) {
-        const data = lastSessionIdForTask(fresh, "claude_session_id")
+        const data = await lastSessionIdForTask(fresh, "claude_session_id")
           ? "session hibernated after 30m idle — next message will resume it"
           : "session hibernated after 30m idle — no saved session id, next message starts a fresh context";
         // Idempotence backstop: a re-reap regression (e.g. the tmux 3.6a
@@ -14429,8 +15165,8 @@ export async function reapIdleSessions(): Promise<{ reaped: string[] }> {
         // treat as "already reaped, skip" — both the append AND the emit,
         // since an emit without persistence would still paint a new chip
         // client-side on every sweep.
-        if (runs.lastEventData(recent.id) !== data) {
-          saveAndEmit({ runId: recent.id, taskId, stream: "status", data });
+        if (await runs.lastEventData(recent.id) !== data) {
+          await saveAndEmit({ runId: recent.id, taskId, stream: "status", data });
         }
       }
     }
@@ -14462,18 +15198,18 @@ export async function reapIdleSessions(): Promise<{ reaped: string[] }> {
  * Returns `[]` when `WORKTREES_DIR` doesn't exist yet (no worktree has ever
  * been created). Non-directory entries and dotfiles are skipped.
  */
-export function listWorktrees(): WorktreeInfo[] {
+export async function listWorktrees(): Promise<WorktreeInfo[]> {
   let entries: string[];
   try {
     entries = readdirSync(WORKTREES_DIR);
   } catch {
     return [];
   }
-  const taskById = new Map(tasks.list().map((t) => [t.id, t]));
+  const taskById = new Map((await tasks.list()).map((t) => [t.id, t]));
   // One grouped query for the whole listing (same pattern the `/tasks` route
   // uses, backed by migration 042's partial index) instead of a per-row
   // lookup — cheap enough to run unconditionally, unlike a git subprocess.
-  const runningByTask = subagents.runningCountsByTask();
+  const runningByTask = await subagents.runningCountsByTask();
   const out: WorktreeInfo[] = [];
   for (const name of entries) {
     if (name.startsWith(".")) continue;
@@ -14661,7 +15397,7 @@ export async function deleteOrphanWorktree(id: string): Promise<{ ok: true } | {
   // single-repository worktree, and on a case-insensitive volume `<task>__API`
   // is the live `api` checkout under another spelling. Only the task's own
   // archive/delete teardown may remove anything under its directory.
-  if (tasks.get(owningTaskId)) {
+  if (await tasks.get(owningTaskId)) {
     return { error: "this worktree is owned by an active task — archive the task instead" };
   }
 
@@ -14728,7 +15464,7 @@ export async function worktreeGitStatus(id: string): Promise<WorktreeGitStatus |
   const resolved = resolveWorktreeRef(id);
   if (!resolved.ok) return resolved;
 
-  const owningTask = tasks.get(resolved.value.taskId);
+  const owningTask = await tasks.get(resolved.value.taskId);
   let dir: string;
   let baseRef: string | null;
   if (resolved.value.repoName) {
@@ -14793,4 +15529,21 @@ export async function worktreeGitStatus(id: string): Promise<WorktreeGitStatus |
 function pendingFxAutoResume(taskId: string): boolean {
   return fxAutoResumeTimers.has(taskId);
 }
-export const __testing = { spawnFxRun, pendingFxAutoResume, noteFxRunSettled };
+/** Test seams for the account-switch claim's live-run refusal: register / drop
+ *  an `active` handle for a task without driving a real spawn. */
+function registerActiveRunForTest(runId: string, taskId: string): void {
+  active.set(runId, { taskId, agent: "claude-code", kill: () => {}, cancelled: false, apiError: false, limitHit: null, limitRecorded: null, sessionDied: false, unknownCommand: false } as unknown as ActiveRun);
+}
+function dropActiveRunForTest(runId: string): void {
+  active.delete(runId);
+}
+/** Stand-in for a claim holder that already owns the task while a turn ends
+ *  (the real claim now refuses a live run): takes the switch claim with no
+ *  live-run check. */
+function holdSwitchClaimForTest(taskId: string): boolean {
+  if (startingTaskIds.has(taskId)) return false;
+  startingTaskIds.add(taskId);
+  accountSwitchTaskIds.add(taskId);
+  return true;
+}
+export const __testing = { spawnFxRun, pendingFxAutoResume, noteFxRunSettled, registerActiveRunForTest, dropActiveRunForTest, holdSwitchClaimForTest };

@@ -12,7 +12,7 @@ import {
 } from "node:fs";
 import { StringDecoder } from "node:string_decoder";
 import path from "node:path";
-import { dataDir } from "./db.ts";
+import { dataDir } from "./db-path.ts";
 import { resolveTmuxBin, tmuxSocketArgs, spawnTmuxNewSession, tmuxEnv } from "./tmux-resolution.ts";
 import { coreSpawn } from "./core-spawn.ts";
 import { openReadNoFollow, readTextNoFollow } from "./no-follow.ts";

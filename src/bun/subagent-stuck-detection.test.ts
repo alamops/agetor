@@ -185,17 +185,18 @@ test("W2: an async-launch tool_result stub does not settle the row (only a real 
   writeSubagent(subagentsDir, agentId, toolUseId);
 
   const w = attachSubagentWatcher({ taskId, jsonlPath, manual: true });
+  await w.ready;
   const t0 = Date.now();
-  w.pump(t0); // discovers the file — row starts running
+  await w.pump(t0); // discovers the file — row starts running
   expect(subagents.get(agentId)!.status).toBe("running");
 
   appendFileSync(jsonlPath, asyncStubLine(toolUseId, agentId));
-  w.pump(t0 + 1);
+  await w.pump(t0 + 1);
   expect(subagents.get(agentId)!.status).toBe("running");
   expect(settleCalls.length).toBe(0);
 
   // Even well past the classic idle window, the stub alone must never settle it.
-  w.pump(t0 + 60_000);
+  await w.pump(t0 + 60_000);
   expect(subagents.get(agentId)!.status).toBe("running");
   expect(settleCalls.length).toBe(0);
 
@@ -218,18 +219,19 @@ test("W2 + W3: after the async stub retires the tool_result key, a queue-operati
   writeSubagent(subagentsDir, agentId, toolUseId);
 
   const w = attachSubagentWatcher({ taskId, jsonlPath, manual: true });
+  await w.ready;
   const t0 = Date.now();
-  w.pump(t0);
+  await w.pump(t0);
   expect(subagents.get(agentId)!.status).toBe("running");
 
   appendFileSync(jsonlPath, asyncStubLine(toolUseId, agentId));
-  w.pump(t0 + 1);
+  await w.pump(t0 + 1);
   expect(subagents.get(agentId)!.status).toBe("running");
 
   // The queue-operation notification is the async agent's real completion
   // receipt — AID matches the subagent row's own id.
   appendFileSync(jsonlPath, notificationLine(agentId));
-  w.pump(t0 + 2);
+  await w.pump(t0 + 2);
   const settled = subagents.get(agentId)!;
   expect(settled.status).toBe("completed");
   expect(settled.endedAt).not.toBeNull();
@@ -239,8 +241,8 @@ test("W2 + W3: after the async stub retires the tool_result key, a queue-operati
   expect(finished[0]!.subagentId).toBe(agentId);
 
   // Further pumps must not re-settle or re-emit.
-  w.pump(t0 + 60_000);
-  w.pump(t0 + 120_000);
+  await w.pump(t0 + 60_000);
+  await w.pump(t0 + 120_000);
   expect(subagents.get(agentId)!.status).toBe("completed");
   expect(settleCalls).toEqual([taskId]);
   expect(captured.filter((e) => e.stream === "subagent" && JSON.parse(e.data).phase === "finished").length).toBe(1);
@@ -276,13 +278,14 @@ test("W3 restart-safe: a notification already on disk before attach settles a pr
   writeFileSync(jsonlPath, notificationLine(agentId));
 
   const w = attachSubagentWatcher({ taskId, jsonlPath, manual: true });
-  w.pump(Date.now());
+  await w.ready;
+  await w.pump(Date.now());
   const row = subagents.get(agentId)!;
   expect(row.status).toBe("completed");
   expect(settleCalls).toEqual([taskId]);
 
   // Idempotent on later pumps too.
-  w.pump(Date.now() + 1);
+  await w.pump(Date.now() + 1);
   expect(subagents.get(agentId)!.status).toBe("completed");
   expect(settleCalls).toEqual([taskId]);
 
@@ -315,9 +318,10 @@ test("W1: a completed row's pre-existing unseen-uuid line does not resurrect it 
   // Fresh attach = rehydration path: replayFloor is pinned to the file's
   // CURRENT size, so everything already on disk reads as replay.
   const w = attachSubagentWatcher({ taskId, jsonlPath, manual: true });
+  await w.ready;
   const t0 = Date.now();
-  w.pump(t0);
-  w.pump(t0 + 5_000);
+  await w.pump(t0);
+  await w.pump(t0 + 5_000);
   const row = subagents.get(agentId)!;
   expect(row.status).toBe("completed");
   const started = captured.filter((e) => e.stream === "subagent" && JSON.parse(e.data).phase === "started");
@@ -347,8 +351,9 @@ test("W1: bytes appended AFTER attach (beyond the replay floor) still flip a com
   });
 
   const w = attachSubagentWatcher({ taskId, jsonlPath, manual: true });
+  await w.ready;
   const t0 = Date.now();
-  w.pump(t0); // pure replay — stays completed (pinned by the previous test too)
+  await w.pump(t0); // pure replay — stays completed (pinned by the previous test too)
   expect(subagents.get(agentId)!.status).toBe("completed");
 
   // Genuinely new bytes, appended after the watcher's offset already caught
@@ -357,7 +362,7 @@ test("W1: bytes appended AFTER attach (beyond the replay floor) still flip a com
   // every cycle, so resume detection no longer depends on the real
   // `fs.watch` dir watcher firing its async callback.
   appendFileSync(file, continuingTurnLine());
-  w.pump(t0 + 1);
+  await w.pump(t0 + 1);
   expect(subagents.get(agentId)!.status).toBe("running");
   const started = captured.filter((e) => e.stream === "subagent" && JSON.parse(e.data).phase === "started");
   expect(started.length).toBe(1);
@@ -383,11 +388,12 @@ test("W4: a running row with no end_turn and no signals on disk settles complete
   const file = writeSubagent(subagentsDir, agentId, null);
 
   const w = attachSubagentWatcher({ taskId, jsonlPath, manual: true });
+  await w.ready;
   const t0 = Date.now();
-  w.pump(t0); // discovers the file, running
+  await w.pump(t0); // discovers the file, running
   expect(subagents.get(agentId)!.status).toBe("running");
 
-  w.pump(t0 + 11 * 60_000);
+  await w.pump(t0 + 11 * 60_000);
   const row = subagents.get(agentId)!;
   expect(row.status).toBe("completed");
   expect(settleCalls).toEqual([taskId]);
@@ -403,7 +409,7 @@ test("W4: a running row with no end_turn and no signals on disk settles complete
   // look stale again the instant it flips, undoing the very resume this
   // assertion is checking for.
   appendFileSync(file, continuingTurnLine());
-  w.pump();
+  await w.pump();
   expect(subagents.get(agentId)!.status).toBe("running");
 
   w.detach();
@@ -423,11 +429,12 @@ test("W4: does not fire before the stale threshold", async () => {
   writeSubagent(subagentsDir, agentId, null);
 
   const w = attachSubagentWatcher({ taskId, jsonlPath, manual: true });
+  await w.ready;
   const t0 = Date.now();
-  w.pump(t0);
+  await w.pump(t0);
   expect(subagents.get(agentId)!.status).toBe("running");
 
-  w.pump(t0 + 5 * 60_000);
+  await w.pump(t0 + 5 * 60_000);
   expect(subagents.get(agentId)!.status).toBe("running");
   expect(settleCalls.length).toBe(0);
 
@@ -463,7 +470,8 @@ test("end-to-end T4 scenario: a stuck sync subagent settles via the real tool_re
   writeFileSync(jsonlPath, toolResultLine(toolUseId));
 
   const w1 = attachSubagentWatcher({ taskId, jsonlPath, manual: true });
-  w1.pump(Date.now());
+  await w1.ready;
+  await w1.pump(Date.now());
   expect(subagents.get(agentId)!.status).toBe("completed");
   expect(settleCalls).toEqual([taskId]);
   w1.detach();
@@ -473,10 +481,11 @@ test("end-to-end T4 scenario: a stuck sync subagent settles via the real tool_re
   // from offset 0 on every reattach used to flip a completed row back to
   // running via `tailFile`'s resume-detection (D2 in the plan doc).
   const w2 = attachSubagentWatcher({ taskId, jsonlPath, manual: true });
+  await w2.ready;
   const t1 = Date.now();
-  w2.pump(t1);
-  w2.pump(t1 + 1_000);
-  w2.pump(t1 + 60_000);
+  await w2.pump(t1);
+  await w2.pump(t1 + 1_000);
+  await w2.pump(t1 + 60_000);
   expect(subagents.get(agentId)!.status).toBe("completed");
   expect(settleCalls).toEqual([taskId]); // never re-fired
   w2.detach();

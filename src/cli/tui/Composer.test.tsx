@@ -14,7 +14,7 @@ import { buildFileEntries } from "../../shared/at-file-filter.ts";
 import * as realAtComplete from "./at-complete.ts";
 const realAtCompleteSnapshot = { ...realAtComplete };
 let suggestCalls = 0;
-mock.module("./at-complete.ts", () => ({
+void mock.module("./at-complete.ts", () => ({
   ...realAtCompleteSnapshot,
   suggestAtEntries: (...args: Parameters<typeof realAtComplete.suggestAtEntries>) => {
     suggestCalls++;
@@ -22,7 +22,7 @@ mock.module("./at-complete.ts", () => ({
   },
 }));
 afterAll(() => {
-  mock.module("./at-complete.ts", () => realAtCompleteSnapshot);
+  void mock.module("./at-complete.ts", () => realAtCompleteSnapshot);
 });
 
 const wait = (ms = 30) => new Promise((r) => setTimeout(r, ms));

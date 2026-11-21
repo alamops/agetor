@@ -22,7 +22,7 @@
  */
 import { homedir } from "node:os";
 import { CLAUDE_SESSIONS_LAUNCH_SCAN_PREF, type AppEvent } from "../shared/types.ts";
-import { claudeSessionSeen, harnesses, hiddenClaudeSessionIds, hiddenOpencodeSessionIds, preferences } from "./db.ts";
+import { claudeSessionSeen, harnesses, hiddenClaudeSessionIds, hiddenOpencodeSessionIds, preferences } from "./db-async.ts";
 import {
   claudeConfigDirsToScan,
   discoverAgetorWorktreeRoots,
@@ -48,15 +48,15 @@ function sessionHome(): string {
   return process.env.HOME || homedir();
 }
 
-export function claudeSessionScanOptions(): ScanClaudeSessionsOptions {
+export async function claudeSessionScanOptions(): Promise<ScanClaudeSessionsOptions> {
   const homeDir = sessionHome();
   return {
     homeDir,
-    harnesses: harnesses.list()
+    harnesses: (await harnesses.list())
       .filter((h) => h.kind === "claude-code")
       .map((h) => ({ id: h.id, kind: h.kind, home: h.home, env: h.env, bin: h.bin })),
-    worktreeRoots: discoverAgetorWorktreeRoots(homeDir),
-    ownedSessionIds: hiddenClaudeSessionIds(),
+    worktreeRoots: await discoverAgetorWorktreeRoots(homeDir),
+    ownedSessionIds: await hiddenClaudeSessionIds(),
   };
 }
 
@@ -72,25 +72,27 @@ function opencodeNoticeFor(ids: readonly string[]): AppEvent {
  *  that just connected, then record their ids as seen. Ids imported since
  *  the scan are dropped first. Called by the `/app/events` route right after
  *  it subscribes. */
-export function flushPendingClaudeSessionsNotice(send: (e: AppEvent) => void): void {
+export async function flushPendingClaudeSessionsNotice(send: (e: AppEvent) => void): Promise<void> {
+  // Both held lists are taken and cleared before the first await, so a second
+  // flush (another client connecting) cannot send the same notice twice.
   const held = pendingNotice;
   pendingNotice = null;
+  const heldOpencode = pendingOpencodeNotice;
+  pendingOpencodeNotice = null;
   if (held) {
-    const hidden = hiddenClaudeSessionIds();
+    const hidden = await hiddenClaudeSessionIds();
     const ids = held.filter((id) => !hidden.has(id));
     if (ids.length > 0) {
       send(noticeFor(ids));
-      claudeSessionSeen.add(ids, SEEN_CAP);
+      await claudeSessionSeen.add(ids, SEEN_CAP);
     }
   }
-  const heldOpencode = pendingOpencodeNotice;
-  pendingOpencodeNotice = null;
   if (heldOpencode) {
-    const hidden = hiddenOpencodeSessionIds();
+    const hidden = await hiddenOpencodeSessionIds();
     const ids = heldOpencode.filter((id) => !hidden.has(id));
     if (ids.length > 0) {
       send(opencodeNoticeFor(ids));
-      claudeSessionSeen.add(ids, SEEN_CAP);
+      await claudeSessionSeen.add(ids, SEEN_CAP);
     }
   }
 }
@@ -105,29 +107,29 @@ export async function startClaudeSessionLaunchScan(deps?: {
   scan?: typeof scanClaudeSessions;
   scanOpencode?: typeof scanOpencodeSessions;
 }): Promise<void> {
-  const scanOff = preferences.get(CLAUDE_SESSIONS_LAUNCH_SCAN_PREF) === "0";
+  const scanOff = (await preferences.get(CLAUDE_SESSIONS_LAUNCH_SCAN_PREF)) === "0";
   try {
     // Resume inserts a missing seed run before it returns (that write sits
     // ahead of the transcript read). Ownership for the toast is read after
     // that insert. A snapshot taken before it misses the new run id.
-    await resumeIncompleteImports(claudeSessionScanOptions());
+    await resumeIncompleteImports(await claudeSessionScanOptions());
   } catch (err) {
     console.error("[agetor] claude session import resume failed:", err);
   }
   if (scanOff) return;
   try {
-    const opts = claudeSessionScanOptions();
-    await refreshClaudeSessionLiveness(claudeConfigDirsToScan(opts), process.env, opts.harnesses, opts.homeDir);
+    const opts = await claudeSessionScanOptions();
+    await refreshClaudeSessionLiveness(await claudeConfigDirsToScan(opts), process.env, opts.harnesses, opts.homeDir);
     const scan = deps?.scan ?? scanClaudeSessions;
     const sessions = await scan(opts);
-    const known = claudeSessionSeen.ids();
+    const known = await claudeSessionSeen.ids();
     const fresh = sessions.filter((s) => s.importable && !known.has(s.sessionId)).map((s) => s.sessionId);
     if (fresh.length > 0) {
       if (!hasAppEventListeners()) {
         pendingNotice = fresh;
       } else {
         broadcastAppEvent(noticeFor(fresh));
-        claudeSessionSeen.add(fresh, SEEN_CAP);
+        await claudeSessionSeen.add(fresh, SEEN_CAP);
       }
     }
   } catch (err) {
@@ -136,7 +138,7 @@ export async function startClaudeSessionLaunchScan(deps?: {
   try {
     const scan = deps?.scanOpencode ?? scanOpencodeSessions;
     const sessions = await scan();
-    const known = claudeSessionSeen.ids();
+    const known = await claudeSessionSeen.ids();
     const fresh = sessions.filter((s) => s.importable && !known.has(s.sessionId)).map((s) => s.sessionId);
     // A session listed under two harnesses is one id in the notice.
     const unique = [...new Set(fresh)];
@@ -146,7 +148,7 @@ export async function startClaudeSessionLaunchScan(deps?: {
       return;
     }
     broadcastAppEvent(opencodeNoticeFor(unique));
-    claudeSessionSeen.add(unique, SEEN_CAP);
+    await claudeSessionSeen.add(unique, SEEN_CAP);
   } catch (err) {
     console.error("[agetor] opencode session launch scan failed:", err);
   }

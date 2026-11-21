@@ -166,6 +166,6 @@ test.skipIf(!HAVE_TMUX)("follow-up to a task whose session outlived the process 
   } finally {
     // Dispose any state + kill whatever session is now named for this task
     // (the survivor, or the short-lived echo session the resume spawned).
-    dropSession(taskId);
+    await dropSession(taskId);
   }
 });

@@ -61,11 +61,11 @@ function fixture(opts: {
       if (opts.turnOn instanceof Error) throw opts.turnOn;
       return opts.turnOn ?? status({ state: "running", registration: "enabled" });
     },
-    getRemoteAccess: () => ({ enabled: opts.remoteEnabled, preview: true }),
-    setRemoteAccessOff: () => {
+    getRemoteAccess: async () => ({ enabled: opts.remoteEnabled, preview: true }),
+    setRemoteAccessOff: async () => {
       calls.push("setRemoteAccessOff");
     },
-    setRemoteAccessOnFromNativeBox: () => {
+    setRemoteAccessOnFromNativeBox: async () => {
       calls.push("setRemoteAccessOnFromNativeBox");
     },
   };

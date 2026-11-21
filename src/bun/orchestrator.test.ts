@@ -141,6 +141,11 @@ test("sendInput folds a follow-up into the in-flight run instead of stranding a 
   const { db, runs } = await import("./db.ts");
   const claudeTmux = await import("./claude-tmux.ts");
 
+  // Hold the fake claude turn open (agents.ts reads this at spawn time) so the
+  // follow-up below lands while R1 is still in flight. The 20ms default is a
+  // race a loaded machine loses; this makes the fold deterministic.
+  const savedTurnMs = process.env.AGETOR_FAKE_CLAUDE_TURN_MS;
+  process.env.AGETOR_FAKE_CLAUDE_TURN_MS = "600";
   const created = await createTask({
     title: "fold-while-busy",
     prompt: "first message",
@@ -188,11 +193,16 @@ test("sendInput folds a follow-up into the in-flight run instead of stranding a 
 
     // Let R1's fake turn resolve, then confirm the task recovered out of
     // "running" (no stranding) and still has just the one run row.
-    await new Promise((r) => setTimeout(r, 120));
     const { tasks } = await import("./db.ts");
+    const deadline = Date.now() + 15_000;
+    while (tasks.get(task.id)?.column === "running" && Date.now() < deadline) {
+      await new Promise((r) => setTimeout(r, 25));
+    }
     expect(tasks.get(task.id)?.column).not.toBe("running");
     expect(runs.listForTask(task.id).length).toBe(1);
   } finally {
+    if (savedTurnMs === undefined) delete process.env.AGETOR_FAKE_CLAUDE_TURN_MS;
+    else process.env.AGETOR_FAKE_CLAUDE_TURN_MS = savedTurnMs;
     claudeTmux.__forTest.uninstallSession(task.id);
     db.run(`DELETE FROM tasks WHERE id = ?`, [task.id]);
   }

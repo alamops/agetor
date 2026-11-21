@@ -979,7 +979,7 @@ export async function removeCopiedPathsDetailed(
   root: string,
   kind: HarnessStackKind,
   sessionId: string,
-  opts: { shouldStop?: () => boolean } = {},
+  opts: { shouldStop?: () => boolean | Promise<boolean> } = {},
 ): Promise<RemoveCopiesResult> {
   const resolvedRoot = path.resolve(root);
   const out: RemoveCopiesResult = { removed: [], gone: [], retained: [], rejected: [] };
@@ -992,9 +992,9 @@ export async function removeCopiedPathsDetailed(
     return out;
   }
   let lastYield = Date.now();
-  // Nothing else runs between two yields, so `shouldStop` is asked before the
-  // first file and again after every yield: its answer cannot change in
-  // between, and each unlink follows a check with no await in between.
+  // `shouldStop` is asked before the first file and again after every yield.
+  // It may be async (a database read); an async one must return an answer that
+  // is current at its last synchronous look, as the orphan sweep's does.
   let mustCheck = true;
   for (let i = 0; i < valid.length; i++) {
     const p = valid[i]!;
@@ -1003,7 +1003,7 @@ export async function removeCopiedPathsDetailed(
       lastYield = Date.now();
       mustCheck = true;
     }
-    if (mustCheck && opts.shouldStop?.()) {
+    if (mustCheck && (await opts.shouldStop?.())) {
       out.retained.push(...valid.slice(i));
       break;
     }

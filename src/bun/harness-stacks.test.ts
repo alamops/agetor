@@ -58,16 +58,16 @@ function input(members: string[], extra: Partial<{ label: string; mirrorMode: "f
 }
 
 describe("harnessStacks", () => {
-  test("create/list/get keeps order and rejects a second membership", () => {
-    const stack = stacks.harnessStacks.create(input(["stack-a", "stack-b"]));
+  test("create/list/get keeps order and rejects a second membership", async () => {
+    const stack = await stacks.harnessStacks.create(input(["stack-a", "stack-b"]));
     expect(stack.members.map((m) => m.harnessId)).toEqual(["stack-a", "stack-b"]);
-    expect(stacks.harnessStacks.list().some((s) => s.id === stack.id)).toBe(true);
-    expect(() => stacks.harnessStacks.create(input(["stack-b", "stack-c"]))).toThrow();
-    stacks.harnessStacks.delete(stack.id);
-    expect(stacks.harnessStacks.get(stack.id)).toBeNull();
+    expect((await stacks.harnessStacks.list()).some((s) => s.id === stack.id)).toBe(true);
+    await expect(stacks.harnessStacks.create(input(["stack-b", "stack-c"]))).rejects.toThrow();
+    await stacks.harnessStacks.delete(stack.id);
+    expect(await stacks.harnessStacks.get(stack.id)).toBeNull();
   });
 
-  test("runtime reads skip member warnings; list and create/update compute them (C6)", () => {
+  test("runtime reads skip member warnings; list and create/update compute them (C6)", async () => {
     // The hot path (`get`/`getByMember`/`resolveForTask`, read on every swap,
     // retry, start and send) must not run install probes, login evidence (a
     // keychain lookup on macOS) or the catalog.
@@ -79,7 +79,7 @@ describe("harnessStacks", () => {
         return false;
       },
     });
-    const created = stacks.harnessStacks.create(input(["stack-a", "stack-b"]));
+    const created = await stacks.harnessStacks.create(input(["stack-a", "stack-b"]));
     try {
       expect(created.warnings.map((w) => w.code)).toContain("full-mirror-hooks");
       expect(created.warnings.map((w) => w.code)).toContain("member-logged-out");
@@ -93,69 +93,69 @@ describe("harnessStacks", () => {
         services.push(service);
         return false;
       } });
-      expect(stacks.harnessStacks.get(created.id)!.warnings).toEqual([]);
-      expect(stacks.harnessStacks.getByMember("stack-b")!.warnings).toEqual([]);
-      expect(stacks.harnessStacks.resolveForTask({ id: "t", agent: "stack-a", harnessState: null } as never)!.stack.warnings)
+      expect((await stacks.harnessStacks.get(created.id))!.warnings).toEqual([]);
+      expect((await stacks.harnessStacks.getByMember("stack-b"))!.warnings).toEqual([]);
+      expect((await stacks.harnessStacks.resolveForTask({ id: "t", agent: "stack-a", harnessState: null } as never))!.stack.warnings)
         .toEqual([]);
       expect(services).toEqual([]);
 
-      const listed = stacks.harnessStacks.list().find((s) => s.id === created.id)!;
+      const listed = (await stacks.harnessStacks.list()).find((s) => s.id === created.id)!;
       expect(listed.warnings.map((w) => w.code)).toContain("member-logged-out");
       expect(services.length).toBeGreaterThan(0);
-      expect(stacks.harnessStacks.get(created.id, { warnings: true })!.warnings.map((w) => w.code))
+      expect((await stacks.harnessStacks.get(created.id, { warnings: true }))!.warnings.map((w) => w.code))
         .toContain("full-mirror-hooks");
 
-      const updated = stacks.harnessStacks.update(created.id, { mirrorMode: "safe" });
+      const updated = await stacks.harnessStacks.update(created.id, { mirrorMode: "safe" });
       expect(updated.warnings.map((w) => w.code)).not.toContain("full-mirror-hooks");
       expect(updated.warnings.map((w) => w.code)).toContain("member-logged-out");
     } finally {
-      stacks.harnessStacks.delete(created.id);
+      await stacks.harnessStacks.delete(created.id);
       stacks.setLoginEvidenceDepsForTests(null);
     }
   });
 
-  test("validateMemberRoot refuses an edit that aliases another member's root (C9)", () => {
-    const stack = stacks.harnessStacks.create(input(["stack-a", "stack-b"]));
+  test("validateMemberRoot refuses an edit that aliases another member's root (C9)", async () => {
+    const stack = await stacks.harnessStacks.create(input(["stack-a", "stack-b"]));
     try {
       // Not a member of any stack: nothing to check.
-      expect(stacks.harnessStacks.validateMemberRoot("stack-c", { kind: "claude-code", home: homes[0]!, env: {} }))
+      expect(await stacks.harnessStacks.validateMemberRoot("stack-c", { kind: "claude-code", home: homes[0]!, env: {} }))
         .toBeNull();
       // A fresh, distinct root is fine.
       const fresh = mkdtempSync(path.join(tmpdir(), "agetor-member-root-"));
-      expect(stacks.harnessStacks.validateMemberRoot("stack-b", { kind: "claude-code", home: fresh, env: {} }))
+      expect(await stacks.harnessStacks.validateMemberRoot("stack-b", { kind: "claude-code", home: fresh, env: {} }))
         .toBeNull();
       // Its own current root is fine (it is not compared with itself).
-      expect(stacks.harnessStacks.validateMemberRoot("stack-b", { kind: "claude-code", home: homes[1]!, env: {} }))
+      expect(await stacks.harnessStacks.validateMemberRoot("stack-b", { kind: "claude-code", home: homes[1]!, env: {} }))
         .toBeNull();
       // The primary's root, directly, through a symlink, or via the env map.
-      expect(stacks.harnessStacks.validateMemberRoot("stack-b", { kind: "claude-code", home: homes[0]!, env: {} }))
+      expect(await stacks.harnessStacks.validateMemberRoot("stack-b", { kind: "claude-code", home: homes[0]!, env: {} }))
         .toContain("stack-a");
       const link = path.join(mkdtempSync(path.join(tmpdir(), "agetor-member-link-")), "alias");
       symlinkSync(homes[0]!, link);
-      expect(stacks.harnessStacks.validateMemberRoot("stack-b", { kind: "claude-code", home: link, env: {} }))
+      expect(await stacks.harnessStacks.validateMemberRoot("stack-b", { kind: "claude-code", home: link, env: {} }))
         .toContain("share its config directory");
-      expect(stacks.harnessStacks.validateMemberRoot("stack-b", {
+      expect(await stacks.harnessStacks.validateMemberRoot("stack-b", {
         kind: "claude-code",
         home: fresh,
         env: { CLAUDE_CONFIG_DIR: homes[0]! },
       })).toContain("stack-a");
       // A kind change would leave the stack's kind.
-      expect(stacks.harnessStacks.validateMemberRoot("stack-b", { kind: "codex", home: fresh, env: {} }))
+      expect(await stacks.harnessStacks.validateMemberRoot("stack-b", { kind: "codex", home: fresh, env: {} }))
         .toContain("remove it from the stack");
     } finally {
-      stacks.harnessStacks.delete(stack.id);
+      await stacks.harnessStacks.delete(stack.id);
     }
   });
 
-  test("update reorders and can remove a member", () => {
-    const stack = stacks.harnessStacks.create(input(["stack-a", "stack-b", "stack-c"]));
-    const reordered = stacks.harnessStacks.update(stack.id, { members: ["stack-c", "stack-a"] });
+  test("update reorders and can remove a member", async () => {
+    const stack = await stacks.harnessStacks.create(input(["stack-a", "stack-b", "stack-c"]));
+    const reordered = await stacks.harnessStacks.update(stack.id, { members: ["stack-c", "stack-a"] });
     expect(reordered.members.map((m) => m.harnessId)).toEqual(["stack-c", "stack-a"]);
-    expect(stacks.harnessStacks.getByMember("stack-b")).toBeNull();
-    stacks.harnessStacks.delete(stack.id);
+    expect(await stacks.harnessStacks.getByMember("stack-b")).toBeNull();
+    await stacks.harnessStacks.delete(stack.id);
   });
 
-  test("blockers: mixed kinds, unknown account, duplicate, same home", () => {
+  test("blockers: mixed kinds, unknown account, duplicate, same home", async () => {
     dbm.harnesses.insert({
       id: "codex-x",
       kind: "codex",
@@ -163,13 +163,13 @@ describe("harnessStacks", () => {
       home: mkdtempSync(path.join(tmpdir(), "agetor-codex-x-")),
       env: {},
     } as never);
-    const mixed = stacks.validateInput({ ...input([]), members: ["stack-a", "codex-x"] });
+    const mixed = await stacks.validateInput({ ...input([]), members: ["stack-a", "codex-x"] });
     expect(mixed.blockers.map((b) => b.code)).toContain("mixed-kinds");
 
-    const unknown = stacks.validateInput(input(["stack-a", "ghost"]));
+    const unknown = await stacks.validateInput(input(["stack-a", "ghost"]));
     expect(unknown.blockers.map((b) => b.code)).toContain("unknown-harness");
 
-    const dup = stacks.validateInput(input(["stack-a", "stack-a"]));
+    const dup = await stacks.validateInput(input(["stack-a", "stack-a"]));
     expect(dup.blockers.map((b) => b.code)).toContain("duplicate-member");
 
     // Two DIFFERENT aliases pointing at the same real directory are not
@@ -182,74 +182,74 @@ describe("harnessStacks", () => {
       home: homes[0]!,
       env: {},
     } as never);
-    const sameHome = stacks.validateInput(input(["stack-a", "stack-a-copy"])).blockers.map((b) => b.code);
+    const sameHome = (await stacks.validateInput(input(["stack-a", "stack-a-copy"]))).blockers.map((b) => b.code);
     expect(sameHome).toContain("same-home");
     expect(sameHome).not.toContain("duplicate-member");
   });
 
-  test("warnings: one member, >10 members, full mirror hooks", () => {
-    const one = stacks.validateInput(input(["stack-a"]));
+  test("warnings: one member, >10 members, full mirror hooks", async () => {
+    const one = await stacks.validateInput(input(["stack-a"]));
     expect(one.blockers).toEqual([]);
     expect(one.warnings.map((w) => w.code)).toContain("too-few-members");
     expect(one.warnings.map((w) => w.code)).toContain("full-mirror-hooks");
-    const safe = stacks.validateInput({ ...input(["stack-a"]), mirrorMode: "safe" });
+    const safe = await stacks.validateInput({ ...input(["stack-a"]), mirrorMode: "safe" });
     expect(safe.warnings.map((w) => w.code)).not.toContain("full-mirror-hooks");
   });
 
-  test("clearLimitState accountWideOnly leaves per-model rows", () => {
-    stacks.harnessStacks.clearLimitState("stack-a");
+  test("clearLimitState accountWideOnly leaves per-model rows", async () => {
+    await stacks.harnessStacks.clearLimitState("stack-a");
     const base = { reason: "quota" as const, resetAtMs: Date.now() + 60_000, message: "m", source: "claude-api-error" as const };
-    stacks.harnessStacks.setLimitState("stack-a", base);
-    stacks.harnessStacks.setLimitState("stack-a", { ...base, model: "m1" });
-    stacks.harnessStacks.clearLimitState("stack-a", { accountWideOnly: true });
-    const left = stacks.harnessStacks.listLimitStates().filter((l) => l.harnessId === "stack-a");
+    await stacks.harnessStacks.setLimitState("stack-a", base);
+    await stacks.harnessStacks.setLimitState("stack-a", { ...base, model: "m1" });
+    await stacks.harnessStacks.clearLimitState("stack-a", { accountWideOnly: true });
+    const left = (await stacks.harnessStacks.listLimitStates()).filter((l) => l.harnessId === "stack-a");
     expect(left.map((l) => l.model)).toEqual(["m1"]);
-    stacks.harnessStacks.clearLimitState("stack-a");
+    await stacks.harnessStacks.clearLimitState("stack-a");
   });
 
-  test("cooldown upsert, isCooling, prune and clear", () => {
-    stacks.harnessStacks.clearLimitState("stack-a");
+  test("cooldown upsert, isCooling, prune and clear", async () => {
+    await stacks.harnessStacks.clearLimitState("stack-a");
     const now = 1_000_000;
-    stacks.harnessStacks.setLimitState("stack-a", {
+    await stacks.harnessStacks.setLimitState("stack-a", {
       reason: "quota",
       resetAtMs: now + 60_000,
       message: "usage limit",
       source: "claude-pane",
     }, now);
-    expect(stacks.harnessStacks.isCooling("stack-a", now + 1000)?.reason).toBe("quota");
-    expect(stacks.harnessStacks.isCooling("stack-a", now + 60_001)).toBeNull();
+    expect((await stacks.harnessStacks.isCooling("stack-a", now + 1000))?.reason).toBe("quota");
+    expect(await stacks.harnessStacks.isCooling("stack-a", now + 60_001)).toBeNull();
     // Reads filter expired rows out of the payload but never DELETE: the row
     // stays until the boot sweep or the next write prunes it.
-    expect(stacks.harnessStacks.listLimitStates(now + 1000).map((s) => s.harnessId)).toContain("stack-a");
-    expect(stacks.harnessStacks.listLimitStates(now + 60_001)).toEqual([]);
-    expect(stacks.harnessStacks.getLimitState("stack-a", { now: now + 1000 })).not.toBeNull();
-    stacks.harnessStacks.setLimitState("stack-b", {
+    expect((await stacks.harnessStacks.listLimitStates(now + 1000)).map((s) => s.harnessId)).toContain("stack-a");
+    expect(await stacks.harnessStacks.listLimitStates(now + 60_001)).toEqual([]);
+    expect(await stacks.harnessStacks.getLimitState("stack-a", { now: now + 1000 })).not.toBeNull();
+    await stacks.harnessStacks.setLimitState("stack-b", {
       reason: "quota",
       resetAtMs: now + 120_000,
       message: "usage limit",
       source: "claude-pane",
     }, now + 60_001);
-    expect(stacks.harnessStacks.getLimitState("stack-a")).toBeNull();
-    stacks.harnessStacks.clearLimitState("stack-b");
-    stacks.harnessStacks.pruneExpired(now + 60_001);
-    expect(stacks.harnessStacks.getLimitState("stack-a")).toBeNull();
+    expect(await stacks.harnessStacks.getLimitState("stack-a")).toBeNull();
+    await stacks.harnessStacks.clearLimitState("stack-b");
+    await stacks.harnessStacks.pruneExpired(now + 60_001);
+    expect(await stacks.harnessStacks.getLimitState("stack-a")).toBeNull();
 
-    stacks.harnessStacks.setLimitState("stack-a", {
+    await stacks.harnessStacks.setLimitState("stack-a", {
       reason: "rate_limit",
       resetAtMs: null,
       message: "429",
       source: "claude-api-error",
     }, now);
-    const state = stacks.harnessStacks.getLimitState("stack-a", { now })!;
+    const state = (await stacks.harnessStacks.getLimitState("stack-a", { now }))!;
     expect(state.exhaustedUntilMs).toBe(now + stacks.HARNESS_RATE_LIMIT_COOLDOWN_MS);
-    stacks.harnessStacks.clearLimitState("stack-a");
-    expect(stacks.harnessStacks.getLimitState("stack-a")).toBeNull();
+    await stacks.harnessStacks.clearLimitState("stack-a");
+    expect(await stacks.harnessStacks.getLimitState("stack-a")).toBeNull();
   });
 
-  test("a fallback cooldown never shortens a later provider reset", () => {
-    stacks.harnessStacks.clearLimitState("stack-a");
+  test("a fallback cooldown never shortens a later provider reset", async () => {
+    await stacks.harnessStacks.clearLimitState("stack-a");
     const now = 2_000_000;
-    stacks.harnessStacks.setLimitState("stack-a", {
+    await stacks.harnessStacks.setLimitState("stack-a", {
       reason: "quota",
       resetAtMs: now + 3 * 60 * 60_000,
       message: "usage limit",
@@ -257,31 +257,31 @@ describe("harnessStacks", () => {
     }, now);
     // A later rate limit with no reset time would otherwise fall back to 60s
     // and free the account long before the provider reset.
-    stacks.harnessStacks.setLimitState("stack-a", {
+    await stacks.harnessStacks.setLimitState("stack-a", {
       reason: "rate_limit",
       resetAtMs: null,
       message: "429",
       source: "claude-api-error",
     }, now + 1000);
-    expect(stacks.harnessStacks.getLimitState("stack-a", { now: now + 1000 })!.exhaustedUntilMs)
+    expect((await stacks.harnessStacks.getLimitState("stack-a", { now: now + 1000 }))!.exhaustedUntilMs)
       .toBe(now + 3 * 60 * 60_000);
     // A provider reset is authoritative even when it is earlier than the
     // stored fallback.
-    stacks.harnessStacks.clearLimitState("stack-a");
-    stacks.harnessStacks.setLimitState("stack-a", {
+    await stacks.harnessStacks.clearLimitState("stack-a");
+    await stacks.harnessStacks.setLimitState("stack-a", {
       reason: "rate_limit",
       resetAtMs: null,
       message: "429",
       source: "claude-api-error",
     }, now);
-    stacks.harnessStacks.setLimitState("stack-a", {
+    await stacks.harnessStacks.setLimitState("stack-a", {
       reason: "quota",
       resetAtMs: now + 30_000,
       message: "usage limit",
       source: "claude-pane",
     }, now);
-    expect(stacks.harnessStacks.getLimitState("stack-a", { now: now + 1000 })!.exhaustedUntilMs).toBe(now + 30_000);
-    stacks.harnessStacks.clearLimitState("stack-a");
+    expect((await stacks.harnessStacks.getLimitState("stack-a", { now: now + 1000 }))!.exhaustedUntilMs).toBe(now + 30_000);
+    await stacks.harnessStacks.clearLimitState("stack-a");
   });
 
   test("home-less built-ins resolve the process-level config overrides", () => {
@@ -306,9 +306,9 @@ describe("harnessStacks", () => {
     }
   });
 
-  test("resolveForTask follows the current membership and falls back to the recorded stack", () => {
+  test("resolveForTask follows the current membership and falls back to the recorded stack", async () => {
     const taskId = randomUUID();
-    const stack = stacks.harnessStacks.create(input(["stack-a", "stack-b"]));
+    const stack = await stacks.harnessStacks.create(input(["stack-a", "stack-b"]));
     dbm.tasks.insert({
       id: taskId,
       title: "resolve",
@@ -339,7 +339,7 @@ describe("harnessStacks", () => {
       archivedAt: null,
     } as never);
     const task = dbm.tasks.get(taskId)!;
-    expect(stacks.harnessStacks.resolveForTask(task)?.current).toBe("stack-a");
+    expect((await stacks.harnessStacks.resolveForTask(task))?.current).toBe("stack-a");
     dbm.tasks.setHarnessState(taskId, {
       stackId: stack.id,
       position: 0,
@@ -348,33 +348,33 @@ describe("harnessStacks", () => {
       allExhausted: null,
       lastMove: null,
     });
-    expect(stacks.harnessStacks.resolveForTask(dbm.tasks.get(taskId)!)?.stack.id).toBe(stack.id);
+    expect((await stacks.harnessStacks.resolveForTask(dbm.tasks.get(taskId)!))?.stack.id).toBe(stack.id);
 
     // The account is edited into a DIFFERENT stack while the recorded state
     // still names the old one. The current membership must win: failover (and
     // the next manual Run) follows the account, never the stale train.
-    const other = stacks.harnessStacks.create({ ...input(["stack-c"]), label: "other" });
-    stacks.harnessStacks.update(stack.id, { members: ["stack-b"] });
-    stacks.harnessStacks.update(other.id, { members: ["stack-c", "stack-a"] });
-    const moved = stacks.harnessStacks.resolveForTask(dbm.tasks.get(taskId)!)!;
+    const other = await stacks.harnessStacks.create({ ...input(["stack-c"]), label: "other" });
+    await stacks.harnessStacks.update(stack.id, { members: ["stack-b"] });
+    await stacks.harnessStacks.update(other.id, { members: ["stack-c", "stack-a"] });
+    const moved = (await stacks.harnessStacks.resolveForTask(dbm.tasks.get(taskId)!))!;
     expect(moved.stack.id).toBe(other.id);
     expect(moved.position).toBe(1);
     expect(moved.orphaned).toBe(false);
 
     // Removed from every stack mid-flight: the recorded stack still resolves
     // (orphaned) so nothing silently starts fresh on the next turn.
-    stacks.harnessStacks.update(other.id, { members: ["stack-c"] });
-    const orphaned = stacks.harnessStacks.resolveForTask(dbm.tasks.get(taskId)!);
+    await stacks.harnessStacks.update(other.id, { members: ["stack-c"] });
+    const orphaned = await stacks.harnessStacks.resolveForTask(dbm.tasks.get(taskId)!);
     expect(orphaned?.orphaned).toBe(true);
     expect(orphaned?.stack.id).toBe(stack.id);
 
-    stacks.harnessStacks.delete(other.id);
-    stacks.harnessStacks.delete(stack.id);
+    await stacks.harnessStacks.delete(other.id);
+    await stacks.harnessStacks.delete(stack.id);
     expect(dbm.tasks.get(taskId)?.harnessState).toBeNull();
     dbm.tasks.delete(taskId);
   });
 
-  test("deleting a stack member re-packs the surviving ranks (R13-M1)", () => {
+  test("deleting a stack member re-packs the surviving ranks (R13-M1)", async () => {
     // Deleting a member account used to drop its row through the (since
     // removed, migration 085) FK cascade and leave a gap in the stored
     // position (0, 2). The swap divider then rendered an impossible "3/2" and
@@ -392,12 +392,12 @@ describe("harnessStacks", () => {
         env: {},
       } as never);
     }
-    const stack = stacks.harnessStacks.create(input(ids));
+    const stack = await stacks.harnessStacks.create(input(ids));
     expect(stack.members.map((m) => m.position)).toEqual([0, 1, 2]);
 
     // Delete the PRIMARY through the harness row (`harnesses.delete`).
     dbm.harnesses.delete("ren-a");
-    const after = stacks.harnessStacks.get(stack.id)!;
+    const after = (await stacks.harnessStacks.get(stack.id))!;
     expect(after.members.map((m) => m.harnessId)).toEqual(["ren-b", "ren-c"]);
     expect(after.members.map((m) => m.position)).toEqual([0, 1]);
     // The stored ranks are re-packed too, not merely hidden by the reader.
@@ -442,7 +442,7 @@ describe("harnessStacks", () => {
       updatedAt: Date.now(),
       archivedAt: null,
     } as never);
-    const resolved = stacks.harnessStacks.resolveForTask(dbm.tasks.get(taskId)!)!;
+    const resolved = (await stacks.harnessStacks.resolveForTask(dbm.tasks.get(taskId)!))!;
     expect(resolved.position).toBe(1);
     expect(resolved.stack.members.length).toBe(2);
     expect(resolved.position + 1).toBeLessThanOrEqual(resolved.stack.members.length);
@@ -453,10 +453,10 @@ describe("harnessStacks", () => {
       `UPDATE harness_stack_members SET position = 2 WHERE stack_id = ? AND harness_id = ?`,
       [stack.id, "ren-c"],
     );
-    expect(stacks.harnessStacks.get(stack.id)!.members.map((m) => m.position)).toEqual([0, 1]);
+    expect((await stacks.harnessStacks.get(stack.id))!.members.map((m) => m.position)).toEqual([0, 1]);
 
     dbm.tasks.delete(taskId);
-    stacks.harnessStacks.delete(stack.id);
+    await stacks.harnessStacks.delete(stack.id);
     dbm.harnesses.delete("ren-b");
     dbm.harnesses.delete("ren-c");
   });
@@ -469,7 +469,7 @@ describe("harnessStacks", () => {
     expect(stacks.effectiveHome(builtin)).toContain(".claude");
   });
 
-  test("effective homes honor the harness env map's CLAUDE_CONFIG_DIR / CODEX_HOME", () => {
+  test("effective homes honor the harness env map's CLAUDE_CONFIG_DIR / CODEX_HOME", async () => {
     // `harnessEnv` layers the env map over the home-derived value, so the CLI
     // really reads the override. The resolver must agree, or the mirror and a
     // session transfer target the wrong directory (a swap then blocks on
@@ -519,7 +519,7 @@ describe("harnessStacks", () => {
       home: mkdtempSync(path.join(tmpdir(), "agetor-env-claude-home2-")),
       env: { CLAUDE_CONFIG_DIR: overrideDir },
     } as never);
-    const clash = stacks.validateInput(input(["env-claude-override", "env-claude-same-root"]));
+    const clash = await stacks.validateInput(input(["env-claude-override", "env-claude-same-root"]));
     expect(clash.blockers.map((b) => b.code)).toContain("same-home");
   }, 15_000);
 });
@@ -936,15 +936,15 @@ describe("loginEvidence", () => {
     expect(stacks.loginEvidence({ kind: "codex", home: null, env: { HOME: realHome } } as never)).toBe(true);
   });
 
-  test("a process-level cloud credential warns on stack creation (R15-S2)", () => {
+  test("a process-level cloud credential warns on stack creation (R15-S2)", async () => {
     const previous = process.env.AWS_SECRET_ACCESS_KEY;
     const selector = process.env.CLAUDE_CODE_USE_BEDROCK;
     process.env.AWS_SECRET_ACCESS_KEY = "aws-secret";
     try {
       // No selector: the AWS key is not Claude's, so no warning.
-      expect(stacks.validateInput(input(["stack-a", "stack-b"])).warnings.some((w) => w.code === "process-provider-key")).toBe(false);
+      expect((await stacks.validateInput(input(["stack-a", "stack-b"]))).warnings.some((w) => w.code === "process-provider-key")).toBe(false);
       process.env.CLAUDE_CODE_USE_BEDROCK = "1";
-      const warnings = stacks.validateInput(input(["stack-a", "stack-b"])).warnings;
+      const warnings = (await stacks.validateInput(input(["stack-a", "stack-b"]))).warnings;
       const warning = warnings.find((w) => w.code === "process-provider-key");
       expect(warning?.message).toContain("AWS_SECRET_ACCESS_KEY");
     } finally {
@@ -957,7 +957,7 @@ describe("loginEvidence", () => {
     const github = process.env.GITHUB_TOKEN;
     process.env.GITHUB_TOKEN = "gh-token";
     try {
-      const warnings = stacks.validateInput(input(["stack-a", "stack-b"])).warnings;
+      const warnings = (await stacks.validateInput(input(["stack-a", "stack-b"]))).warnings;
       expect(warnings.some((w) => w.code === "process-provider-key")).toBe(false);
     } finally {
       if (github === undefined) delete process.env.GITHUB_TOKEN;
@@ -975,59 +975,59 @@ describe("per-model cooldowns, conditional clear and optimistic edits (087)", ()
     model,
   });
 
-  test("a model row only cools tasks on that model; the later-expiring of account and model wins", () => {
+  test("a model row only cools tasks on that model; the later-expiring of account and model wins", async () => {
     const hs = stacks.harnessStacks;
-    hs.clearLimitState("stack-a");
+    await hs.clearLimitState("stack-a");
     const now = 5_000_000;
-    hs.setLimitState("stack-a", sig("m1", now + 10_000), now);
-    expect(hs.isCooling("stack-a", now + 1, "m1")?.model).toBe("m1");
-    expect(hs.isCooling("stack-a", now + 1, "m2")).toBeNull();
-    expect(hs.isCooling("stack-a", now + 1)).toBeNull();
-    hs.setLimitState("stack-a", sig(null, now + 50_000), now);
-    expect(hs.getLimitState("stack-a", { model: "m1", now: now + 1 })?.exhaustedUntilMs).toBe(now + 50_000);
-    expect(hs.getLimitState("stack-a", { model: "m1", now: now + 1 })?.model).toBeNull();
-    expect(hs.listLimitStates(now + 1).map((s) => s.model).sort()).toEqual([null, "m1"].sort());
+    await hs.setLimitState("stack-a", sig("m1", now + 10_000), now);
+    expect((await hs.isCooling("stack-a", now + 1, "m1"))?.model).toBe("m1");
+    expect(await hs.isCooling("stack-a", now + 1, "m2")).toBeNull();
+    expect(await hs.isCooling("stack-a", now + 1)).toBeNull();
+    await hs.setLimitState("stack-a", sig(null, now + 50_000), now);
+    expect((await hs.getLimitState("stack-a", { model: "m1", now: now + 1 }))?.exhaustedUntilMs).toBe(now + 50_000);
+    expect((await hs.getLimitState("stack-a", { model: "m1", now: now + 1 }))?.model).toBeNull();
+    expect((await hs.listLimitStates(now + 1)).map((s) => s.model).sort()).toEqual([null, "m1"].sort());
     // The model row's own fallback applies; the account row (50s) stays a separate row.
-    hs.setLimitState("stack-a", { ...sig("m1", 0), resetAtMs: null, reason: "rate_limit" }, now + 1);
-    expect(hs.getLimitState("stack-a", { model: "m1", now: now + 2 })?.exhaustedUntilMs)
+    await hs.setLimitState("stack-a", { ...sig("m1", 0), resetAtMs: null, reason: "rate_limit" }, now + 1);
+    expect((await hs.getLimitState("stack-a", { model: "m1", now: now + 2 }))?.exhaustedUntilMs)
       .toBe(now + 1 + stacks.HARNESS_RATE_LIMIT_COOLDOWN_MS);
-    expect(hs.getLimitState("stack-a", { model: "m1", now: now + 2 })?.model).toBe("m1");
-    hs.clearLimitState("stack-a");
-    expect(hs.listLimitStates(now + 1).filter((s) => s.harnessId === "stack-a")).toEqual([]);
+    expect((await hs.getLimitState("stack-a", { model: "m1", now: now + 2 }))?.model).toBe("m1");
+    await hs.clearLimitState("stack-a");
+    expect((await hs.listLimitStates(now + 1)).filter((s) => s.harnessId === "stack-a")).toEqual([]);
   });
 
-  test("clearLimitState with startedAtMs spares a limit recorded after the turn started and other models", () => {
+  test("clearLimitState with startedAtMs spares a limit recorded after the turn started and other models", async () => {
     const hs = stacks.harnessStacks;
-    hs.clearLimitState("stack-a");
+    await hs.clearLimitState("stack-a");
     const now = 6_000_000;
-    hs.setLimitState("stack-a", sig(null, now + 9000), now + 100);
-    hs.setLimitState("stack-a", sig("m1", now + 9000), now - 100);
-    hs.setLimitState("stack-a", sig("m2", now + 9000), now - 100);
-    hs.clearLimitState("stack-a", { startedAtMs: now, model: "m1" });
-    const left = hs.listLimitStates(now).filter((s) => s.harnessId === "stack-a").map((s) => s.model);
+    await hs.setLimitState("stack-a", sig(null, now + 9000), now + 100);
+    await hs.setLimitState("stack-a", sig("m1", now + 9000), now - 100);
+    await hs.setLimitState("stack-a", sig("m2", now + 9000), now - 100);
+    await hs.clearLimitState("stack-a", { startedAtMs: now, model: "m1" });
+    const left = (await hs.listLimitStates(now)).filter((s) => s.harnessId === "stack-a").map((s) => s.model);
     expect(left.sort()).toEqual([null, "m2"].sort());
-    hs.clearLimitState("stack-a", { startedAtMs: now + 100 });
-    expect(hs.listLimitStates(now).filter((s) => s.harnessId === "stack-a").map((s) => s.model)).toEqual(["m2"]);
-    hs.clearLimitState("stack-a", { model: "m2" });
-    expect(hs.listLimitStates(now).filter((s) => s.harnessId === "stack-a")).toEqual([]);
+    await hs.clearLimitState("stack-a", { startedAtMs: now + 100 });
+    expect((await hs.listLimitStates(now)).filter((s) => s.harnessId === "stack-a").map((s) => s.model)).toEqual(["m2"]);
+    await hs.clearLimitState("stack-a", { model: "m2" });
+    expect((await hs.listLimitStates(now)).filter((s) => s.harnessId === "stack-a")).toEqual([]);
   });
 
-  test("update with a stale expectedUpdatedAt throws StackChangedError carrying the stored stack", () => {
-    const stack = stacks.harnessStacks.create(input(["stack-a", "stack-b"]));
-    const edited = stacks.harnessStacks.update(stack.id, { label: "one", expectedUpdatedAt: stack.updatedAt });
+  test("update with a stale expectedUpdatedAt throws StackChangedError carrying the stored stack", async () => {
+    const stack = await stacks.harnessStacks.create(input(["stack-a", "stack-b"]));
+    const edited = await stacks.harnessStacks.update(stack.id, { label: "one", expectedUpdatedAt: stack.updatedAt });
     expect(edited.updatedAt).toBeGreaterThan(stack.updatedAt);
     let caught: unknown;
     try {
-      stacks.harnessStacks.update(stack.id, { label: "two", expectedUpdatedAt: stack.updatedAt });
+      await stacks.harnessStacks.update(stack.id, { label: "two", expectedUpdatedAt: stack.updatedAt });
     } catch (err) {
       caught = err;
     }
     expect(caught).toBeInstanceOf(stacks.StackChangedError);
     expect((caught as InstanceType<typeof stacks.StackChangedError>).current.label).toBe("one");
-    expect(stacks.harnessStacks.get(stack.id)?.label).toBe("one");
+    expect((await stacks.harnessStacks.get(stack.id))?.label).toBe("one");
     // Omitted = last write wins.
-    expect(stacks.harnessStacks.update(stack.id, { label: "three" }).label).toBe("three");
-    stacks.harnessStacks.delete(stack.id);
+    expect((await stacks.harnessStacks.update(stack.id, { label: "three" })).label).toBe("three");
+    await stacks.harnessStacks.delete(stack.id);
   });
 
   test("cloud credential keys are login evidence only under a provider selector, and then unknown", () => {
@@ -1052,75 +1052,75 @@ describe("TT-B: cooldown reads never write, same-millisecond edits conflict, clo
   const rowCount = () =>
     dbm.db.query<{ n: number }, [string]>(`SELECT COUNT(*) AS n FROM harness_limit_state WHERE harness_id = ?`).get("stack-c")!.n;
 
-  test("getLimitState, isCooling and listLimitStates never DELETE an expired row (a GET must not write)", () => {
+  test("getLimitState, isCooling and listLimitStates never DELETE an expired row (a GET must not write)", async () => {
     const hs = stacks.harnessStacks;
-    hs.clearLimitState("stack-c");
+    await hs.clearLimitState("stack-c");
     const now = 9_000_000;
-    hs.setLimitState("stack-c", sigFor(null, now + 1000), now);
-    hs.setLimitState("stack-c", sigFor("m1", now + 1000), now);
+    await hs.setLimitState("stack-c", sigFor(null, now + 1000), now);
+    await hs.setLimitState("stack-c", sigFor("m1", now + 1000), now);
     expect(rowCount()).toBe(2);
     const later = now + 5000;
-    expect(hs.getLimitState("stack-c", { now: later, model: "m1" })).toBeNull();
-    expect(hs.isCooling("stack-c", later, "m1")).toBeNull();
-    expect(hs.listLimitStates(later).filter((s) => s.harnessId === "stack-c")).toEqual([]);
+    expect(await hs.getLimitState("stack-c", { now: later, model: "m1" })).toBeNull();
+    expect(await hs.isCooling("stack-c", later, "m1")).toBeNull();
+    expect((await hs.listLimitStates(later)).filter((s) => s.harnessId === "stack-c")).toEqual([]);
     // Observed through the changes counter as well as the row count.
     const before = dbm.db.query<{ n: number }, []>(`SELECT total_changes() AS n`).get()!.n;
-    hs.getLimitState("stack-c", { now: later });
-    hs.listLimitStates(later);
+    await hs.getLimitState("stack-c", { now: later });
+    await hs.listLimitStates(later);
     expect(dbm.db.query<{ n: number }, []>(`SELECT total_changes() AS n`).get()!.n).toBe(before);
     expect(rowCount()).toBe(2);
-    hs.clearLimitState("stack-c");
+    await hs.clearLimitState("stack-c");
   });
 
-  test("a provider reset replaces the stored row for the same (account, model) and a fallback keeps the later one per model", () => {
+  test("a provider reset replaces the stored row for the same (account, model) and a fallback keeps the later one per model", async () => {
     const hs = stacks.harnessStacks;
-    hs.clearLimitState("stack-c");
+    await hs.clearLimitState("stack-c");
     const now = 9_500_000;
-    hs.setLimitState("stack-c", sigFor("m1", now + 50_000), now);
-    hs.setLimitState("stack-c", sigFor("m1", now + 20_000), now + 1);
-    expect(hs.getLimitState("stack-c", { model: "m1", now: now + 2 })?.exhaustedUntilMs).toBe(now + 20_000);
+    await hs.setLimitState("stack-c", sigFor("m1", now + 50_000), now);
+    await hs.setLimitState("stack-c", sigFor("m1", now + 20_000), now + 1);
+    expect((await hs.getLimitState("stack-c", { model: "m1", now: now + 2 }))?.exhaustedUntilMs).toBe(now + 20_000);
     // A fallback for a DIFFERENT model must not touch the m1 row.
-    hs.setLimitState("stack-c", { ...sigFor("m2", 0), resetAtMs: null, reason: "rate_limit" }, now + 3);
-    expect(hs.getLimitState("stack-c", { model: "m1", now: now + 4 })?.exhaustedUntilMs).toBe(now + 20_000);
-    hs.clearLimitState("stack-c");
+    await hs.setLimitState("stack-c", { ...sigFor("m2", 0), resetAtMs: null, reason: "rate_limit" }, now + 3);
+    expect((await hs.getLimitState("stack-c", { model: "m1", now: now + 4 }))?.exhaustedUntilMs).toBe(now + 20_000);
+    await hs.clearLimitState("stack-c");
   });
 
-  test("two edits inside one millisecond still conflict, and the refused write does not happen", () => {
-    const stack = stacks.harnessStacks.create(input(["stack-a", "stack-b"], { label: "same-ms" }));
+  test("two edits inside one millisecond still conflict, and the refused write does not happen", async () => {
+    const stack = await stacks.harnessStacks.create(input(["stack-a", "stack-b"], { label: "same-ms" }));
     const realNow = Date.now;
     try {
       // The clock reads at or before the stored stamp, as two edits in one
       // millisecond would: a stamp of `now` alone would repeat.
       Date.now = () => stack.updatedAt;
-      const first = stacks.harnessStacks.update(stack.id, { label: "editor-a", expectedUpdatedAt: stack.updatedAt });
+      const first = await stacks.harnessStacks.update(stack.id, { label: "editor-a", expectedUpdatedAt: stack.updatedAt });
       expect(first.updatedAt).toBeGreaterThan(stack.updatedAt);
-      expect(() =>
+      await expect(
         stacks.harnessStacks.update(stack.id, { label: "editor-b", expectedUpdatedAt: stack.updatedAt }),
-      ).toThrow(stacks.StackChangedError);
-      expect(stacks.harnessStacks.get(stack.id)?.label).toBe("editor-a");
+      ).rejects.toThrow(stacks.StackChangedError);
+      expect((await stacks.harnessStacks.get(stack.id))?.label).toBe("editor-a");
     } finally {
       Date.now = realNow;
-      stacks.harnessStacks.delete(stack.id);
+      await stacks.harnessStacks.delete(stack.id);
     }
   });
 
-  test("an account delete bumps the stack's updated_at, so a stale editor conflicts (D16)", () => {
+  test("an account delete bumps the stack's updated_at, so a stale editor conflicts (D16)", async () => {
     const ids = ["x", "y", "z"].map((n) => `d16-${n}-${randomUUID().slice(0, 6)}`);
     for (const id of ids) {
       const home = mkdtempSync(path.join(tmpdir(), "agetor-d16-"));
       homes.push(home);
       dbm.harnesses.insert({ id, kind: "claude-code", label: id, home, env: {} } as never);
     }
-    const stack = stacks.harnessStacks.create(input(ids, { label: "d16" }));
+    const stack = await stacks.harnessStacks.create(input(ids, { label: "d16" }));
     dbm.harnesses.delete(ids[1]!);
-    const after = stacks.harnessStacks.get(stack.id)!;
+    const after = (await stacks.harnessStacks.get(stack.id))!;
     expect(after.updatedAt).toBeGreaterThan(stack.updatedAt);
     expect(after.members.map((m) => m.harnessId)).toEqual([ids[0]!, ids[2]!]);
-    expect(() => stacks.harnessStacks.update(stack.id, { label: "stale", expectedUpdatedAt: stack.updatedAt })).toThrow(
+    await expect(stacks.harnessStacks.update(stack.id, { label: "stale", expectedUpdatedAt: stack.updatedAt })).rejects.toThrow(
       stacks.StackChangedError,
     );
-    expect(stacks.harnessStacks.get(stack.id)?.label).toBe("d16");
-    stacks.harnessStacks.delete(stack.id);
+    expect((await stacks.harnessStacks.get(stack.id))?.label).toBe("d16");
+    await stacks.harnessStacks.delete(stack.id);
     dbm.harnesses.delete(ids[0]!);
     dbm.harnesses.delete(ids[2]!);
   });

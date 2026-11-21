@@ -157,9 +157,9 @@ test("freezeLaunches: new starts, sends and fx resumes are refused; queued follo
   expect(queued.delivered).toBe(true);
   expect(runs.listForTask(taskId)).toHaveLength(1);
 
-  freezeLaunches();
+  await freezeLaunches();
   expect(launchesFrozen()).toBe(true);
-  freezeLaunches(); // idempotent
+  await freezeLaunches(); // idempotent
 
   // The queued line is in the tray now, with a status line on the run.
   expect((tasks.get(taskId)?.backlog ?? []).map((b) => b.text)).toEqual(["queued before the freeze"]);

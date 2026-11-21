@@ -298,11 +298,11 @@ export interface OpencodeDriverDeps {
   }): void;
   syncChild(a: { taskId: string; runId: string; client: OpencodeClient; childSessionId: string }): Promise<void>;
   /** Child sessions of this task whose subagent row is `running`, or `orphaned` recently enough to re-check (`listOpenOpencodeChildSessions`). */
-  openChildSessions(taskId: string): string[];
+  openChildSessions(taskId: string): string[] | Promise<string[]>;
   /** Child sessions of this task whose subagent row is settled, or orphaned past the re-check window: never followed again. */
-  settledChildSessions(taskId: string): string[];
+  settledChildSessions(taskId: string): string[] | Promise<string[]>;
   /** Record, before the interrupt POST, that agetor itself is interrupting this child session (durable: survives a core restart). */
-  noteChildStoppedByAgetor(a: { taskId: string; childSessionId: string }): void;
+  noteChildStoppedByAgetor(a: { taskId: string; childSessionId: string }): void | Promise<void>;
   /** The HTTP client factory (a test wraps it to watch what the driver asks of the client). */
   createClient: typeof createOpencodeClient;
   /**
@@ -348,11 +348,21 @@ export function setOpencodeSteerRequeueHandler(fn: SteerRequeueHandler | null): 
   return prev;
 }
 
+/** Start a queued subagent-row write whose completion the caller does not wait for. */
+function fireAndLog(p: Promise<unknown>, what: string): void {
+  p.catch((e: unknown) => {
+    console.error(`[opencode-driver] could not ${what}:`, e);
+  });
+}
+
 const defaultDeps: OpencodeDriverDeps = {
   ensureServer: (spec: OpencodeServerSpec) => ensureOpencodeServer(spec),
-  registerChild: (a) => registerOpencodeChildSession(a),
-  ingestChildChunks: (a) => ingestOpencodeChildChunks(a),
-  settleChild: (a) => settleOpencodeChild(a),
+  // The subagent-row writes are queued per task inside opencode-subagents.ts (register,
+  // then chunks, then settle land in the order reported), so these synchronous hooks
+  // start the write and move on.
+  registerChild: (a) => { fireAndLog(registerOpencodeChildSession(a), "register a child session"); },
+  ingestChildChunks: (a) => { fireAndLog(ingestOpencodeChildChunks(a), "ingest child chunks"); },
+  settleChild: (a) => { fireAndLog(settleOpencodeChild(a), "settle a child session"); },
   syncChild: (a) => syncOpencodeChildFromServer(a),
   openChildSessions: (taskId) => listOpenOpencodeChildSessions(taskId),
   settledChildSessions: (taskId) => listSettledOpencodeChildSessions(taskId),
@@ -362,8 +372,8 @@ const defaultDeps: OpencodeDriverDeps = {
     if (steerRequeueHandler) steerRequeueHandler(a);
     else console.warn(`[opencode-driver] ${a.texts.length + a.uncertain.length} undelivered steer(s) of run ${a.runId} had nowhere to go`);
   },
-  orphanChildrenOfTask: (taskId) => void orphanRunningOpencodeChildrenOfTask(taskId),
-  orphanChild: (taskId, childSessionId) => void orphanOpencodeChild(taskId, childSessionId),
+  orphanChildrenOfTask: (taskId) => { fireAndLog(orphanRunningOpencodeChildrenOfTask(taskId), "orphan the task's child rows"); },
+  orphanChild: (taskId, childSessionId) => { fireAndLog(orphanOpencodeChild(taskId, childSessionId), "orphan a child row"); },
   inboxItemCancelled: (key, sid, id) => opencodeInboxItemCancelled(key, sid, id),
   waitInboxItemCancelled: (key, sid, id, ms) => waitOpencodeInboxItemCancelled(key, sid, id, ms),
 };
@@ -1241,9 +1251,9 @@ function createTurn(a: Omit<OpencodeServerTurnArgs, "prompt" | "title" | "resume
   }
 
   /** This task's settled child sessions: read once per pass (a sync, a re-list, a Stop) and shared by its steps. */
-  function loadSettledRows(): ReadonlySet<string> {
+  async function loadSettledRows(): Promise<ReadonlySet<string>> {
     try {
-      return new Set(deps.settledChildSessions(taskId));
+      return new Set(await deps.settledChildSessions(taskId));
     } catch (e) {
       console.error("[opencode-driver] could not list settled subagent rows:", e);
       return new Set();
@@ -1280,11 +1290,14 @@ function createTurn(a: Omit<OpencodeServerTurnArgs, "prompt" | "title" | "resume
    * toward `CHILD_SYNC_MAX` (a task with many finished subagents still reaches its live one).
    * `settledRows` is the pass's one read of the settled rows, shared with the re-lists around it.
    */
-  async function syncChildren(settledRows: ReadonlySet<string> = loadSettledRows()): Promise<void> {
+  async function syncChildren(settledRowsArg?: ReadonlySet<string>): Promise<void> {
     if (!client || !sessionId) return;
     const c = client;
     const root = sessionId;
-    const open = new Set(deps.openChildSessions(taskId));
+    const settledRows = settledRowsArg ?? await loadSettledRows();
+    // The client and session may have been dropped while the rows were read.
+    if (!client || !sessionId) return;
+    const open = new Set(await deps.openChildSessions(taskId));
     const queue: Array<{ id: string; depth: number }> = [{ id: root, depth: 0 }];
     /** Dedupe only. */
     const seen = new Set<string>([root]);
@@ -1357,7 +1370,7 @@ function createTurn(a: Omit<OpencodeServerTurnArgs, "prompt" | "title" | "resume
       await yieldTick();
     }
     // What the sync settled no longer holds a lingering turn open.
-    const stillOpen = new Set(deps.openChildSessions(taskId));
+    const stillOpen = new Set(await deps.openChildSessions(taskId));
     for (const id of toSync) {
       const st = children.get(id);
       if (st && !st.settled && !stillOpen.has(id)) st.settled = true;
@@ -1539,7 +1552,7 @@ function createTurn(a: Omit<OpencodeServerTurnArgs, "prompt" | "title" | "resume
    * read of the settled rows serves all three steps.
    */
   async function relistAndSync(c: OpencodeClient): Promise<void> {
-    const settledRows = loadSettledRows();
+    const settledRows = await loadSettledRows();
     const listed = await relistCards(c, settledRows);
     if (!canAct()) return;
     await syncChildren(settledRows);
@@ -1632,9 +1645,10 @@ function createTurn(a: Omit<OpencodeServerTurnArgs, "prompt" | "title" | "resume
    */
   async function relistCards(
     c: OpencodeClient,
-    settledRows: ReadonlySet<string> = loadSettledRows(),
+    settledRowsArg?: ReadonlySet<string>,
     only?: string[],
   ): Promise<Set<string>> {
+    const settledRows = settledRowsArg ?? await loadSettledRows();
     const listed = new Set<string>();
     for (const sid of only ?? cardSessions(settledRows)) {
       if (!canAct()) return listed;
@@ -1962,8 +1976,8 @@ function createTurn(a: Omit<OpencodeServerTurnArgs, "prompt" | "title" | "resume
     const c = stopClient;
     const sid = sessionId;
     if (!c || !sid) return;
-    const settledRows = loadSettledRows();
-    const openRows = new Set(deps.openChildSessions(taskId));
+    const settledRows = await loadSettledRows();
+    const openRows = new Set(await deps.openChildSessions(taskId));
     const ids = new Set<string>();
     for (const [id, st] of children) if (!st.settled) ids.add(id);
     try {
@@ -1980,7 +1994,7 @@ function createTurn(a: Omit<OpencodeServerTurnArgs, "prompt" | "title" | "resume
         // Before the call, durably: the parent's "subagent cancelled" wake can arrive before the interrupt
         // answers, or in the next core after a restart.
         try {
-          deps.noteChildStoppedByAgetor({ taskId, childSessionId: id });
+          await deps.noteChildStoppedByAgetor({ taskId, childSessionId: id });
         } catch (e) {
           console.error("[opencode-driver] could not note a stopped child:", e);
         }
@@ -2414,7 +2428,7 @@ function createTurn(a: Omit<OpencodeServerTurnArgs, "prompt" | "title" | "resume
     // A request a previous (lingering) driver closed without replying gets its card again.
     refreshOwned();
     // Children of an earlier turn whose subagent row is still open: follow them (and linger for them).
-    const open = new Set(deps.openChildSessions(taskId));
+    const open = new Set(await deps.openChildSessions(taskId));
     for (const o of lastOwned) {
       if (o.isChild && open.has(o.sessionId)) ensureChild(o.sessionId, o.childOf ?? sid, o.depth, { background: true });
     }

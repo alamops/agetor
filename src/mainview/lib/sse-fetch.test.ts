@@ -419,3 +419,39 @@ describe("openEventStream", () => {
     });
   });
 });
+
+describe("onOpen / onClose (connection state)", () => {
+  test("open on a 2xx body, close when it fails, open again on reconnect", async () => {
+    const timers = fakeTimers();
+    const bodies = [controlledBody(), controlledBody()];
+    let n = 0;
+    const log: string[] = [];
+    const stop = openEventStream(
+      "http://x/events",
+      { onOpen: () => log.push("open"), onClose: () => log.push("close"), onError: () => log.push("error") },
+      { fetch: (async () => streamResponse(bodies[n++]!.body)) as unknown as typeof fetch, setTimeout: timers.setTimeout, clearTimeout: timers.clearTimeout, random: () => 0.5 },
+    );
+    await settle();
+    expect(log).toEqual(["open"]);
+    bodies[0]!.fail(new Error("drop"));
+    await settle();
+    expect(log).toEqual(["open", "close", "error"]);
+    timers.fire();
+    await settle();
+    expect(log).toEqual(["open", "close", "error", "open"]);
+    stop();
+  });
+
+  test("a bad status never opens, so never closes", async () => {
+    const timers = fakeTimers();
+    const log: string[] = [];
+    const stop = openEventStream(
+      "http://x/events",
+      { onOpen: () => log.push("open"), onClose: () => log.push("close") },
+      { fetch: (async () => new Response("no", { status: 503 })) as unknown as typeof fetch, setTimeout: timers.setTimeout, clearTimeout: timers.clearTimeout, random: () => 0.5 },
+    );
+    await settle();
+    expect(log).toEqual([]);
+    stop();
+  });
+});

@@ -283,7 +283,7 @@ test("live orchestrator wiring: a non-terminal monitor body leaves the row and t
   // <event> text doesn't match MONITOR_TERMINAL_EVENT_RE. This is exactly
   // what dispatchLine forwards for every intermediate event a live Monitor
   // reports; it must NOT be treated as a completion receipt.
-  real(
+  await real(
     taskId,
     monitorId,
     `<task-notification>\n<task-id>${monitorId}</task-id>\n<event>build still running</event>\n</task-notification>`,
@@ -295,7 +295,7 @@ test("live orchestrator wiring: a non-terminal monitor body leaves the row and t
   // Terminal: the verified live shape for a timed-out Monitor
   // (docs/plans/claude-code-monitors-hold-running.md §2: "same envelope with
   // `<event>[Monitor timed out — re-arm if needed.]</event>`").
-  real(
+  await real(
     taskId,
     monitorId,
     `<task-notification>\n<task-id>${monitorId}</task-id>\n<event>[Monitor timed out — re-arm if needed.]</event>\n</task-notification>`,
@@ -347,7 +347,7 @@ test("live orchestrator wiring: a bg_session row still settles unconditionally o
   // never applies the terminal-vs-activity rule to it: any body naming its
   // id is still, unconditionally, its completion receipt (today's exact
   // pre-existing behavior for a bg-shell/session id).
-  real(
+  await real(
     taskId,
     bgId,
     `<task-notification>\n<task-id>${bgId}</task-id>\n<event>some ordinary progress line</event>\n</task-notification>`,

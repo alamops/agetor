@@ -10,7 +10,7 @@ import { open } from "node:fs/promises";
 import { homedir } from "node:os";
 import path from "node:path";
 import { createHash } from "node:crypto";
-import { runs, tasks } from "./db.ts";
+import { runs, tasks } from "./db-async.ts";
 import { effectiveClaudeConfigDir } from "./harness-discovery.ts";
 import { beginLagLabel } from "./event-loop-lag.ts";
 import { attachSubagentWatcher, detachWatcherFor, orphanRunningSubagents, subagentActivityWithin, type SubagentWatcherHandle } from "./claude-subagents.ts";
@@ -301,12 +301,16 @@ function activeRunProbeSafe(taskId: string): string | null {
  * again for its terminal one — the callee needs the body to tell the two
  * apart instead of treating every naming of the id as a completion receipt.
  */
-let backgroundTaskSettledFn:
-  | ((taskId: string, agentId: string, body: string, lineTimestampMs?: number | null) => void)
-  | null = null;
+type BackgroundTaskSettledFn = (
+  taskId: string,
+  agentId: string,
+  body: string,
+  lineTimestampMs?: number | null,
+) => void | Promise<void>;
+let backgroundTaskSettledFn: BackgroundTaskSettledFn | null = null;
 export function setBackgroundTaskSettledHandler(
-  fn: ((taskId: string, agentId: string, body: string, lineTimestampMs?: number | null) => void) | null,
-): ((taskId: string, agentId: string, body: string, lineTimestampMs?: number | null) => void) | null {
+  fn: BackgroundTaskSettledFn | null,
+): BackgroundTaskSettledFn | null {
   const prev = backgroundTaskSettledFn;
   backgroundTaskSettledFn = fn;
   return prev;
@@ -323,7 +327,14 @@ function fireBackgroundTaskSettled(
   lineTimestampMs: number | null = null,
 ): void {
   try {
-    backgroundTaskSettledFn?.(taskId, agentId, body, lineTimestampMs);
+    // The handler's DB work is async: the tailer does not wait for it (and its
+    // own ordering is the handler's concern), but a rejection must be logged.
+    const pending = backgroundTaskSettledFn?.(taskId, agentId, body, lineTimestampMs);
+    if (pending) {
+      void pending.catch((e: unknown) => {
+        console.error(`[claude-tmux] background-task-settled hook rejected for task ${taskId}:`, e);
+      });
+    }
   } catch (e) {
     console.error(`[claude-tmux] background-task-settled hook threw for task ${taskId}:`, e);
   }
@@ -1305,7 +1316,7 @@ export function mapJsonlEventToChunks(
  * the previous value lets that case suppress the chunk when nothing
  * actually changed.
  */
-function mapParsedEventToChunks(
+export function mapParsedEventToChunks(
   evt: ParsedJsonlEvent,
   onChunk: ChunkHandler,
   includeUuidForApiError = false,
@@ -2098,15 +2109,22 @@ function resetStallClock(state: SessionState): void {
  *  alive, so the check keeps running even when fs.watch goes quiet. Emits on
  *  the active turn's chunk handler (falling back to the last known one), the
  *  same routing `signalSessionDeath` uses. */
-function checkTurnStall(state: SessionState): void {
+async function checkTurnStall(state: SessionState): Promise<void> {
   const thresholdMs = turnStallMs();
   const quietMs = Date.now() - Math.max(state.lastJsonlAppendAt, state.stallFloorAt);
+  const inFlight = turnInFlight(state);
+  // The subagent probe (an async DB read plus a stat per running row) runs only
+  // when the outcome could depend on it: a turn in flight whose transcript has
+  // been quiet past the threshold. Same laziness as the old thunk.
+  const subagentsFresh = inFlight && quietMs >= thresholdMs
+    ? await subagentActivityWithin(state.taskId, thresholdMs)
+    : false;
   const outcome = stallTickOutcome({
-    turnInFlight: turnInFlight(state),
+    turnInFlight: inFlight,
     quietMs,
     thresholdMs,
     fired: state.stallFired,
-    subagentsFresh: () => subagentActivityWithin(state.taskId, thresholdMs),
+    subagentsFresh: () => subagentsFresh,
   });
   if (outcome === "none") return;
   if (outcome === "clear-silent") {
@@ -2385,11 +2403,12 @@ const ADD_DIR_KEY_GAP_MS = 150;
  * allow-list, matchers and card. No-op unless `AGETOR_CLAUDE_DRIVER=fake`.
  * `onKeys` receives every key name (and typed text) the card drive sends.
  */
-export function registerFakePromptPane(taskId: string, pane: FakePromptPane): void {
+export async function registerFakePromptPane(taskId: string, pane: FakePromptPane): Promise<void> {
   if (process.env.AGETOR_CLAUDE_DRIVER !== "fake") return;
   fakePromptPanes.set(taskId, pane);
-  const runId = tasks.get(taskId)?.runId;
-  if (!runId) return;
+  const runId = (await tasks.get(taskId))?.runId;
+  // The pane may have been cleared (the turn killed) while the row was read.
+  if (!runId || fakePromptPanes.get(taskId) !== pane) return;
   const lines = pane.text.split("\n");
   const tail = redactPaneSecrets(lines.slice(Math.max(0, lines.length - SCRAPE_TAIL_LINES)).join("\n"));
   const match = pickScrapeMatch(tail, { paneWorking: false, paneIdle: false, watchdogArmed: false, boot: true });
@@ -4666,8 +4685,10 @@ async function pollAskModalStillUp(
 
 async function collectAndRegisterAskCard(state: SessionState, firstTail: string): Promise<void> {
   if (state.askCollecting || state.askCardId) return;
-  const runId = tasks.get(state.taskId)?.runId;
+  const runId = (await tasks.get(state.taskId))?.runId;
   if (!runId) return;
+  // Re-check after the await: another tick may have started collecting.
+  if (state.askCollecting || state.askCardId) return;
   state.askCollecting = true;
   try {
     // Cheap first attempt: the JSONL tool_use. Claude writes it only when the
@@ -5267,11 +5288,13 @@ export interface JsonlReplayLine {
  * the whole stream — splitting a file across calls would fire a staged
  * `end_turn` at each slice's EOF. `pull` may return the next line
  * synchronously; a promise means the next chunk is still being read.
+ * `onProgress` runs at every slice boundary and once at the end; it may return
+ * a promise, which is awaited before the replay goes on.
  */
 export async function replayJsonlLines(
   pull: () => JsonlReplayLine | null | Promise<JsonlReplayLine | null>,
   onChunk: ChunkHandler,
-  opts?: { sliceMs?: number; onProgress?: (bytesConsumed: number) => void },
+  opts?: { sliceMs?: number; onProgress?: (bytesConsumed: number) => void | Promise<void> },
 ): Promise<void> {
   const sliceMs = opts?.sliceMs ?? 20;
   const state = makeSessionState({
@@ -5291,13 +5314,15 @@ export async function replayJsonlLines(
     if (piece.line.trim()) dispatchLine(state, piece.line);
     consumed += piece.bytes;
     if (Date.now() - sliceStart >= sliceMs) {
-      opts?.onProgress?.(consumed);
+      // Awaited: a caller that stores what the slice produced (a session
+      // import's batch) finishes doing so before the next slice starts.
+      await opts?.onProgress?.(consumed);
       await new Promise((r) => setImmediate(r));
       sliceStart = Date.now();
     }
   }
   if (state.pendingEndTurn) firePendingEndTurn(state);
-  opts?.onProgress?.(consumed);
+  await opts?.onProgress?.(consumed);
 }
 
 function isReplayPromise(
@@ -8509,8 +8534,12 @@ async function scrapeOnce(state: SessionState): Promise<void> {
   // interaction so the run panel can scope correctly; without one the
   // prompt would float unattached. Idle tasks (no run) skip — there's
   // nothing for the user to react to without an active session anyway.
-  const runId = tasks.get(state.taskId)?.runId;
+  const runId = (await tasks.get(state.taskId))?.runId;
   if (!runId) return;
+  // The lookup above is a database round trip: re-run the guards that were
+  // checked before it, so an overlapping tick cannot register a duplicate card.
+  if (state.drivingPrompt) return;
+  if (findTmuxPromptByFingerprint(state.taskId, match.fingerprint)) return;
 
   registerTmuxPrompt({
     taskId: state.taskId,
@@ -8687,7 +8716,11 @@ function signalSessionDeath(state: SessionState): void {
   // would otherwise hold the task in `running` forever waiting on an agent
   // that no longer exists. Release it the same way the run itself is
   // released above.
-  orphanRunningSubagents(state.taskId);
+  // Sync context (a death handler): the DB flip and the settle hook it fires
+  // need no ordering against anything after this line, so run it detached.
+  void orphanRunningSubagents(state.taskId).catch((e: unknown) => {
+    console.error(`[claude-tmux] orphaning subagents failed for task ${state.taskId}:`, e);
+  });
 }
 
 /**
@@ -9272,12 +9305,16 @@ function armPollTimer(state: SessionState, delayMs: number = POLL_FAST_MS): void
     // way, if `state.pollTimer` isn't this handle anymore, this chain is
     // stale — don't run its flush.
     if (state.pollTimer !== handle) return;
-    void flush(state).finally(() => {
+    void flush(state).finally(async () => {
       // Watchdog tick before the superseded-chain guard: a stalled session's
       // stall/resume transitions must not depend on which poll chain
       // survives a rearm race. Cheap when nothing is wrong (pure arithmetic;
       // the subagent statSync probe only runs past the threshold).
-      checkTurnStall(state);
+      try {
+        await checkTurnStall(state);
+      } catch (e) {
+        console.error(`[claude-tmux] stall check failed for task ${state.taskId}:`, e);
+      }
       if (state.pollTimer !== handle) return;
       const idleMs = Date.now() - state.lastActivityAt;
       armPollTimer(state, idleMs >= POLL_IDLE_AFTER_MS ? POLL_SLOW_MS : POLL_FAST_MS);
@@ -9339,13 +9376,14 @@ async function attachTailer(state: SessionState): Promise<{ watcherMs: number }>
   // dispose a prior handle first so a re-attach (reconcileOrphans defensive
   // overwrite) can't leave two watchers polling the same dir.
   state.subagentWatcher?.detach();
+  const attachRunId = (await tasks.get(state.taskId))?.runId;
   const watcher = attachSubagentWatcher({
     taskId: state.taskId,
     jsonlPath: state.jsonlPath,
     // For stall attribution only (the watcher's lag labels name the run);
     // `task.runId` is set before any spawn/reattach reaches here, and an
     // unknown run just means an unattributed label.
-    runId: tasks.get(state.taskId)?.runId ?? undefined,
+    runId: attachRunId ?? undefined,
     onApiError: (info) => signalSubagentApiError(state, info),
   });
   state.subagentWatcher = watcher;
@@ -10141,7 +10179,7 @@ async function spawnClaudeViaTmuxInner(opts: ClaudeLaunchOptions): Promise<Spawn
           }
           // Need an active run to attach the interaction to. The orchestrator
           // sets task.runId before spawning, so this is populated by boot time.
-          const runId = tasks.get(opts.taskId)?.runId;
+          const runId = (await tasks.get(opts.taskId))?.runId;
           if (!runId) continue;
           registerTmuxPrompt({
             taskId: opts.taskId,
@@ -10346,7 +10384,7 @@ export async function reattachSession(opts: ReattachOptions): Promise<SpawnedAge
   // runs in `finally`, so a throw or the `null` early return can't leak it.
   const endLagLabel = beginLagLabel(`reattach session · task ${opts.taskId}`, {
     taskId: opts.taskId,
-    runId: tasks.get(opts.taskId)?.runId ?? undefined,
+    runId: (await tasks.get(opts.taskId))?.runId ?? undefined,
   });
   try {
     return await reattachSessionBody(opts);
@@ -10385,6 +10423,8 @@ async function reattachSessionBody(opts: ReattachOptions): Promise<SpawnedAgent 
   // Conservatively assume not (bypassEnabled defaults to false) — cycling
   // to bypass after a restart needs a respawn (claude requires the flag
   // at launch anyway).
+  const reattachRunId = (await tasks.get(opts.taskId))?.runId ?? null;
+  const reattachRunLineUuids = reattachRunId ? await runs.seenLineUuidsForRun(reattachRunId) : new Set<string>();
   const state = makeSessionState({
     taskId: opts.taskId,
     sessionName,
@@ -10398,10 +10438,7 @@ async function reattachSessionBody(opts: ReattachOptions): Promise<SpawnedAgent 
     // Empty when this task has no run row yet — not `undefined`, which would
     // stage every historical end_turn. Imported uuids live on the seed run,
     // so they are absent from this set.
-    currentRunLineUuids: (() => {
-      const runId = tasks.get(opts.taskId)?.runId ?? null;
-      return runId ? runs.seenLineUuidsForRun(runId) : new Set<string>();
-    })(),
+    currentRunLineUuids: reattachRunLineUuids,
     onEndOfTurn: () => resolveDone?.(0),
     // Seed the chip-suppression baseline from the task's mode so the
     // offset-0 JSONL replay doesn't re-announce a mode the prior process
@@ -11674,7 +11711,7 @@ export async function dropSession(taskId: string): Promise<void> {
     // reattached). Without this the boot-armed watcher outlives the task it
     // belongs to, polling a directory that delete/archive is about to remove.
     detachWatcherFor(taskId);
-    orphanRunningSubagents(taskId);
+    await orphanRunningSubagents(taskId);
   }
   await killTaskSession(taskId);
 }
@@ -11731,7 +11768,12 @@ function disposeSessionState(state: SessionState | undefined, orphanSubagents = 
   // this stops us TAILING the subagent files, never the agent itself.
   state.subagentWatcher?.detach();
   state.subagentWatcher = null;
-  if (orphanSubagents) orphanRunningSubagents(state.taskId);
+  // Sync context (session teardown): detached, nothing after it depends on the flip.
+  if (orphanSubagents) {
+    void orphanRunningSubagents(state.taskId).catch((e: unknown) => {
+      console.error(`[claude-tmux] orphaning subagents failed for task ${state.taskId}:`, e);
+    });
+  }
   state.onEndOfTurn = null;
   state.pendingEndTurn = null;
   state.lastLocalCommandName = null;

@@ -1,4 +1,4 @@
-import { beforeAll, expect, test } from "bun:test";
+import { afterAll, beforeAll, expect, test } from "bun:test";
 import { appendFileSync, mkdirSync, mkdtempSync, rmSync, symlinkSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import path from "node:path";
@@ -7,6 +7,12 @@ import path from "node:path";
 // which opens + migrates on module load).
 const DATA_DIR = mkdtempSync(path.join(tmpdir(), "agetor-usage-data-"));
 process.env.AGETOR_DATA_DIR = DATA_DIR;
+
+// Every fixture dir (some hold 11 MB files) is removed when the file ends.
+const fixtureDirs: string[] = [];
+afterAll(() => {
+  for (const d of fixtureDirs) rmSync(d, { recursive: true, force: true });
+});
 
 let mod: typeof import("./account-usage.ts");
 beforeAll(async () => {
@@ -44,6 +50,7 @@ function assistantLine(opts: {
 
 function makeAccount(): { configDir: string; file: string } {
   const configDir = mkdtempSync(path.join(tmpdir(), "agetor-usage-acct-"));
+  fixtureDirs.push(configDir);
   const proj = path.join(configDir, "projects", "-home-u-repo");
   mkdirSync(proj, { recursive: true });
   return { configDir, file: path.join(proj, "session-1.jsonl") };
@@ -79,7 +86,7 @@ test("parseUsageLine flags malformed JSON as an error, not a throw", () => {
 
 // --- scan + rollups --------------------------------------------------------------
 
-test("scan counts usage lines once, skips noise, and reports parse errors", () => {
+test("scan counts usage lines once, skips noise, and reports parse errors", async () => {
   const { configDir, file } = makeAccount();
   writeFileSync(
     file,
@@ -90,11 +97,11 @@ test("scan counts usage lines once, skips noise, and reports parse errors", () =
       assistantLine({ id: "m1", requestId: "r1", output: 999 }) +
       assistantLine({ id: "m2", requestId: "r2", input: 7, output: 3 }),
   );
-  const result = mod.scanAccountUsage(configDir);
+  const result = await mod.scanAccountUsage(configDir);
   expect(result.eventsCounted).toBe(2);
   expect(result.parseErrors).toBe(1);
 
-  const summary = mod.accountUsageSummary(configDir);
+  const summary = await mod.accountUsageSummary(configDir);
   expect(summary.configDir).toBe(configDir);
   expect(summary.today).toEqual({
     inputTokens: 17,
@@ -105,106 +112,174 @@ test("scan counts usage lines once, skips noise, and reports parse errors", () =
   });
 });
 
-test("re-scanning is idempotent (cursor) and a full re-read is idempotent too (usage_seen)", () => {
+test("re-scanning is idempotent (cursor) and a full re-read is idempotent too (usage_seen)", async () => {
   const { configDir, file } = makeAccount();
   writeFileSync(file, assistantLine({ id: "m1" }));
-  expect(mod.scanAccountUsage(configDir).eventsCounted).toBe(1);
-  expect(mod.scanAccountUsage(configDir).eventsCounted).toBe(0);
+  expect((await mod.scanAccountUsage(configDir)).eventsCounted).toBe(1);
+  expect((await mod.scanAccountUsage(configDir)).eventsCounted).toBe(0);
   // Truncate/rewrite: size < offset resets the cursor to 0; recounting the
   // same message is absorbed by the dedupe table.
   writeFileSync(file, assistantLine({ id: "m1" }));
-  expect(mod.scanAccountUsage(configDir).eventsCounted).toBe(0);
-  expect(mod.accountUsageSummary(configDir).today.messageCount).toBe(1);
+  expect((await mod.scanAccountUsage(configDir)).eventsCounted).toBe(0);
+  expect((await mod.accountUsageSummary(configDir)).today.messageCount).toBe(1);
 });
 
-test("a partially-flushed line is not consumed until its newline arrives", () => {
+test("a partially-flushed line is not consumed until its newline arrives", async () => {
   const { configDir, file } = makeAccount();
   const full = assistantLine({ id: "m1" });
   writeFileSync(file, full.slice(0, 40)); // no trailing newline
-  expect(mod.scanAccountUsage(configDir).eventsCounted).toBe(0);
+  expect((await mod.scanAccountUsage(configDir)).eventsCounted).toBe(0);
   appendFileSync(file, full.slice(40));
-  expect(mod.scanAccountUsage(configDir).eventsCounted).toBe(1);
+  expect((await mod.scanAccountUsage(configDir)).eventsCounted).toBe(1);
 });
 
-test("appended lines are picked up incrementally", () => {
+test("appended lines are picked up incrementally", async () => {
   const { configDir, file } = makeAccount();
   writeFileSync(file, assistantLine({ id: "m1" }));
-  mod.scanAccountUsage(configDir);
+  await mod.scanAccountUsage(configDir);
   appendFileSync(file, assistantLine({ id: "m2" }));
-  expect(mod.scanAccountUsage(configDir).eventsCounted).toBe(1);
+  expect((await mod.scanAccountUsage(configDir)).eventsCounted).toBe(1);
 });
 
-test("rollups survive the raw transcript being deleted (retention)", () => {
+test("rollups survive the raw transcript being deleted (retention)", async () => {
   const { configDir, file } = makeAccount();
   writeFileSync(file, assistantLine({ id: "m1", input: 42 }));
-  mod.scanAccountUsage(configDir);
+  await mod.scanAccountUsage(configDir);
   rmSync(file);
-  const summary = mod.accountUsageSummary(configDir);
+  const summary = await mod.accountUsageSummary(configDir);
   expect(summary.today.inputTokens).toBe(42);
 });
 
-test("time windows: an old event lands in neither today nor last7d; per-day rows keep it", () => {
+test("time windows: an old event lands in neither today nor last7d; per-day rows keep it", async () => {
   const { configDir, file } = makeAccount();
   writeFileSync(
     file,
     assistantLine({ id: "old", ts: NINE_DAYS_AGO, input: 1000, model: "claude-sonnet-5" }) +
       assistantLine({ id: "new", input: 1 }),
   );
-  mod.scanAccountUsage(configDir);
-  const summary = mod.accountUsageSummary(configDir);
+  await mod.scanAccountUsage(configDir);
+  const summary = await mod.accountUsageSummary(configDir);
   expect(summary.today.inputTokens).toBe(1);
   expect(summary.last7d.inputTokens).toBe(1);
-  const days = mod.accountUsageDays(configDir, 30);
+  const days = await mod.accountUsageDays(configDir, 30);
   expect(days.some((d) => d.model === "claude-sonnet-5" && d.inputTokens === 1000)).toBe(true);
 });
 
-test("unknown model ids aggregate under 'unknown' instead of being dropped", () => {
+test("unknown model ids aggregate under 'unknown' instead of being dropped", async () => {
   const { configDir, file } = makeAccount();
   const line = JSON.parse(assistantLine({ id: "m1" }));
   delete line.message.model;
   writeFileSync(file, JSON.stringify(line) + "\n");
-  mod.scanAccountUsage(configDir);
-  expect(mod.accountUsageDays(configDir).some((d) => d.model === "unknown")).toBe(true);
+  await mod.scanAccountUsage(configDir);
+  expect((await mod.accountUsageDays(configDir)).some((d) => d.model === "unknown")).toBe(true);
 });
 
-test("subdirectories (subagent transcripts) are included in the scan", () => {
+test("subdirectories (subagent transcripts) are included in the scan", async () => {
   const { configDir } = makeAccount();
   const sub = path.join(configDir, "projects", "-home-u-repo", "session-1", "subagents");
   mkdirSync(sub, { recursive: true });
   writeFileSync(path.join(sub, "agent-1.jsonl"), assistantLine({ id: "sub1" }));
-  expect(mod.scanAccountUsage(configDir).eventsCounted).toBe(1);
+  expect((await mod.scanAccountUsage(configDir)).eventsCounted).toBe(1);
 });
 
-test("a missing projects dir is a clean no-op", () => {
+test("a missing projects dir is a clean no-op", async () => {
   const configDir = mkdtempSync(path.join(tmpdir(), "agetor-usage-empty-"));
-  const result = mod.scanAccountUsage(configDir);
+  fixtureDirs.push(configDir);
+  const result = await mod.scanAccountUsage(configDir);
   expect(result).toEqual({ filesScanned: 0, eventsCounted: 0, parseErrors: 0, budgetExhausted: false });
 });
 
-test("the byte budget truncates a pass and the next pass resumes from the cursor", () => {
+test("the byte budget truncates a pass and the next pass resumes from the cursor", async () => {
   const { configDir, file } = makeAccount();
   const lineA = assistantLine({ id: "b1" });
   const lineB = assistantLine({ id: "b2" });
   writeFileSync(file, lineA + lineB);
   // Budget covers line A but cuts into line B: only A is counted, the pass
   // reports exhaustion, and the cursor stops at A's newline.
-  const first = mod.scanAccountUsage(configDir, lineA.length + 10);
+  const first = await mod.scanAccountUsage(configDir, lineA.length + 10);
   expect(first.eventsCounted).toBe(1);
   expect(first.budgetExhausted).toBe(true);
   // Unbudgeted follow-up picks up line B exactly once.
-  const second = mod.scanAccountUsage(configDir);
+  const second = await mod.scanAccountUsage(configDir);
   expect(second.eventsCounted).toBe(1);
   expect(second.budgetExhausted).toBe(false);
-  expect(mod.scanAccountUsage(configDir).eventsCounted).toBe(0);
-  expect(mod.accountUsageSummary(configDir).today.messageCount).toBe(2);
+  expect((await mod.scanAccountUsage(configDir)).eventsCounted).toBe(0);
+  expect((await mod.accountUsageSummary(configDir)).today.messageCount).toBe(2);
 });
 
-test("a projects/ folder swapped for a symlink is never listed", () => {
+test("a transcript larger than one 8 MB read is folded in fully, exactly once, across several reads", async () => {
+  const { configDir, file } = makeAccount();
+  // ~11 MB of distinct usage lines: more than one MAX_READ_BYTES slice, so a
+  // line straddles the slice boundary and must be carried, not split or lost.
+  const lines: string[] = [];
+  let bytes = 0;
+  for (let i = 0; bytes < 11 * 1024 * 1024; i++) {
+    const line = assistantLine({ id: `big-${i}`, requestId: `req-${i}`, input: 1, output: 2, cacheWrite: 3, cacheRead: 4 });
+    lines.push(line);
+    bytes += line.length;
+  }
+  writeFileSync(file, lines.join(""));
+  const first = await mod.scanAccountUsage(configDir);
+  expect(first.parseErrors).toBe(0);
+  expect(first.budgetExhausted).toBe(false);
+  expect(first.eventsCounted).toBe(lines.length);
+  const summary = await mod.accountUsageSummary(configDir);
+  expect(summary.today.messageCount).toBe(lines.length);
+  expect(summary.today.inputTokens).toBe(lines.length);
+  expect(summary.today.cacheReadTokens).toBe(lines.length * 4);
+  // Nothing is re-counted by a second pass or by a forced full re-read.
+  expect((await mod.scanAccountUsage(configDir)).eventsCounted).toBe(0);
+});
+
+test("a budget smaller than a big file resumes across passes without gaps or double counts", async () => {
+  const { configDir, file } = makeAccount();
+  const lines = Array.from({ length: 200 }, (_, i) => assistantLine({ id: `bud-${i}`, requestId: `r-${i}` }));
+  writeFileSync(file, lines.join(""));
+  const budget = Math.floor(lines.join("").length / 3);
+  let counted = 0;
+  for (let pass = 0; pass < 10; pass++) {
+    const r = await mod.scanAccountUsage(configDir, budget);
+    counted += r.eventsCounted;
+    if (!r.budgetExhausted) break;
+  }
+  expect(counted).toBe(200);
+});
+
+test("a line larger than the pass budget is skipped once, persisted across passes, and later files are still scanned", async () => {
+  const { configDir, file } = makeAccount();
+  const budget = 64 * 1024;
+  const before = [assistantLine({ id: "ov-a" }), assistantLine({ id: "ov-b" })];
+  const after = Array.from({ length: 5 }, (_, i) => assistantLine({ id: `ov-after-${i}` }));
+  // One 300 KB line with no structure, several budgets long.
+  const huge = "x".repeat(300 * 1024) + "\n";
+  writeFileSync(file, before.join("") + huge + after.join(""));
+  const second = path.join(path.dirname(file), "session-2.jsonl");
+  writeFileSync(second, assistantLine({ id: "ov-second" }));
+
+  let counted = 0;
+  let parseErrors = 0;
+  let passes = 0;
+  for (; passes < 60; passes++) {
+    const r = await mod.scanAccountUsage(configDir, budget);
+    counted += r.eventsCounted;
+    parseErrors += r.parseErrors;
+    if (!r.budgetExhausted) break;
+  }
+  expect(passes).toBeLessThan(60);
+  // 2 before + 5 after + the second file; the oversized line is one error.
+  expect(counted).toBe(8);
+  expect(parseErrors).toBe(1);
+  // Converged: nothing is re-read or re-counted.
+  expect(await mod.scanAccountUsage(configDir, budget)).toMatchObject({ eventsCounted: 0, parseErrors: 0 });
+});
+
+test("a projects/ folder swapped for a symlink is never listed", async () => {
   const configDir = mkdtempSync(path.join(tmpdir(), "agetor-usage-acct-"));
   const elsewhere = mkdtempSync(path.join(tmpdir(), "agetor-usage-target-"));
+  fixtureDirs.push(configDir, elsewhere);
   const proj = path.join(elsewhere, "-home-u-repo");
   mkdirSync(proj, { recursive: true });
   writeFileSync(path.join(proj, "session-1.jsonl"), assistantLine({ id: "linked-m1" }));
   symlinkSync(elsewhere, path.join(configDir, "projects"));
-  expect(mod.scanAccountUsage(configDir)).toMatchObject({ filesScanned: 0, eventsCounted: 0 });
+  expect(await mod.scanAccountUsage(configDir)).toMatchObject({ filesScanned: 0, eventsCounted: 0 });
 });

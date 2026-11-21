@@ -35,3 +35,26 @@ test("runCapture still returns a normal answer whole", async () => {
   const res = await runCapture(["/bin/echo", "hello"], { timeoutMs: BUDGET_MS });
   expect(res).toEqual({ ok: true, stdout: "hello\n" });
 });
+
+test("writing to a child that already exited leaves no unhandled rejection (write and flush both swallow a broken pipe)", async () => {
+  const unhandled: unknown[] = [];
+  const onUnhandled = (e: unknown) => { unhandled.push(e); };
+  process.on("unhandledRejection", onUnhandled);
+  try {
+    await runJsonLineSession({
+      cmd: ["/usr/bin/true"],
+      timeoutMs: 5_000,
+      start(write) {
+        // Keep writing after the child is gone: the broken pipe surfaces as a
+        // rejected write or flush, which nobody awaits.
+        const big = "x".repeat(1 << 16);
+        for (let i = 0; i < 20; i++) setTimeout(() => write({ big }), 20 * i);
+      },
+      onMessage() {},
+    });
+    await new Promise((r) => setTimeout(r, 600));
+  } finally {
+    process.off("unhandledRejection", onUnhandled);
+  }
+  expect(unhandled).toEqual([]);
+});

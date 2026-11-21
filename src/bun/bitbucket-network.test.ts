@@ -78,8 +78,8 @@ beforeEach(() => {
 
 // Every exported entry point now opens with a `bitbucketServerError` guard
 // (docs/plans/per-host-git-api-bases.md) that resolves `repo.remoteHost`
-// through `apiHostForRemote` (git-provider.ts, `ssh -G` under the hood).
-// `AGETOR_SSH_BIN` and `apiHostForRemote`'s module-level cache are reset
+// through `resolveForgeApiHost` (git-provider.ts, `ssh -G` under the hood).
+// `AGETOR_SSH_BIN` and `resolveForgeApiHost`'s module-level cache are reset
 // after every test in this file so a Server-host stub set by one test can
 // never leak a stale resolution into another test — this file's own tests,
 // or a sibling *.test.ts file sharing the same `bun test` process.
@@ -95,7 +95,7 @@ afterEach(() => {
 });
 
 /** Writes an executable stub standing in for `ssh`, mirroring
- *  git-provider.test.ts's `writeSshStub` — `apiHostForRemote` invokes it as
+ *  git-provider.test.ts's `writeSshStub` — `resolveForgeApiHost` invokes it as
  *  `<stub> -G -- <host>`, so `$3` is the (lowercased) host argument. */
 function writeSshStub(script: string): string {
   const dir = mkdtempSync(path.join(tmpdir(), "agetor-bb-ssh-stub-"));
@@ -1173,7 +1173,7 @@ test("updateBitbucketIssue maps state:'closed' to 'resolved' and state:'open' pa
 // Bitbucket Server/DC speaks a structurally different REST API
 // (`/rest/api/1.0`) than Bitbucket Cloud — this module is Cloud-only, so
 // every exported entry point now rejects a repo whose remote resolves (via
-// `apiHostForRemote`) to anything other than `bitbucket.org`, before making
+// `resolveForgeApiHost`) to anything other than `bitbucket.org`, before making
 // any network call. These tests exercise four representative entry points
 // (a read, a blob fetch with its own `status` field, a detail fetch, and a
 // mutation) plus the alias-resolves-to-cloud happy path; every other

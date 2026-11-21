@@ -21,13 +21,13 @@ const pragma = async (name: string): Promise<unknown> => {
 };
 
 test("the connection uses a 64 MiB page cache", async () => {
-  const { SQLITE_CACHE_KIB } = await import("./db.ts");
+  const { SQLITE_CACHE_KIB } = await import("./db-core/connection.ts");
   expect(SQLITE_CACHE_KIB).toBe(65536);
   expect(await pragma("cache_size")).toBe(-SQLITE_CACHE_KIB);
 });
 
 test("the connection memory-maps up to 256 MiB of the file", async () => {
-  const { DB_MMAP_SIZE_BYTES } = await import("./db.ts");
+  const { DB_MMAP_SIZE_BYTES } = await import("./db-core/connection.ts");
   expect(DB_MMAP_SIZE_BYTES).toBe(256 * 1024 * 1024);
   expect(await pragma("mmap_size")).toBe(DB_MMAP_SIZE_BYTES);
 });
@@ -35,20 +35,6 @@ test("the connection memory-maps up to 256 MiB of the file", async () => {
 test("temp b-trees stay in memory", async () => {
   // 2 = MEMORY.
   expect(await pragma("temp_store")).toBe(2);
-});
-
-test("the task-list change signal's TEMP objects survive the temp_store setting", async () => {
-  // Changing `temp_store` drops every TEMP object on the connection, so it
-  // must run before db.ts creates the `GET /tasks` cache's version table and
-  // triggers.
-  const { db, taskListDataVersion } = await import("./db.ts");
-  const names = db
-    .query<{ name: string }, []>(`SELECT name FROM sqlite_temp_master WHERE type IN ('table', 'trigger')`)
-    .all()
-    .map((r) => r.name);
-  expect(names).toContain("task_list_version");
-  expect(names.some((n) => n.startsWith("task_list_version_tasks_"))).toBe(true);
-  expect(typeof taskListDataVersion()).toBe("string");
 });
 
 test("the durability settings are unchanged", async () => {

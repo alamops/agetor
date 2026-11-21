@@ -2,7 +2,7 @@ import { existsSync, lstatSync, mkdirSync, realpathSync } from "node:fs";
 import { rm } from "node:fs/promises";
 import { createHash } from "node:crypto";
 import path from "node:path";
-import { dataDir } from "./db.ts";
+import { dataDir } from "./db-path.ts";
 import { coreSpawn } from "./core-spawn.ts";
 import { readTextNoFollow } from "./no-follow.ts";
 import { readFileBytes } from "./core-file-read.ts";

@@ -40,10 +40,10 @@ let previousFloor: string | undefined;
 let db: typeof import("./db.ts");
 let orch: typeof import("./orchestrator.ts");
 let restoreHarnesses: () => void;
-/** Tasks this file created. `bun test` shares one db.ts singleton across every
- *  file, so teardown deletes only these, never other files' leftovers (deleting
- *  every task there blew the 5 s afterAll budget in a full run). */
-const ownTaskIds: string[] = [];
+// Only the tasks this file made: `bun test` shares one db.ts singleton across
+// files, so sweeping `db.tasks.list()` in afterAll would delete (and tear down
+// worktrees of) every other file's leftovers and can outlast the hook timeout.
+const createdTaskIds: string[] = [];
 
 beforeAll(async () => {
   db = await import("./db.ts");
@@ -62,7 +62,7 @@ afterAll(async () => {
   const codexFloors = MODEL_MIN_CLI_VERSION.codex as Record<string, string>;
   if (previousFloor === undefined) delete codexFloors[MODEL];
   else codexFloors[MODEL] = previousFloor;
-  for (const id of ownTaskIds) await orch.deleteTask(id).catch(() => {});
+  for (const id of createdTaskIds) await orch.deleteTask(id).catch(() => {});
   await Bun.sleep(150);
   restoreHarnesses();
   for (const key of ENV_KEYS) {
@@ -71,12 +71,12 @@ afterAll(async () => {
   }
   rmSync(BIN_DIR, { recursive: true, force: true });
   rmTestDataDir(DATA_DIR);
-});
+}, 20_000);
 
-async function waitFor(fn: () => boolean, ms = 8000): Promise<boolean> {
+async function waitFor(fn: () => boolean | Promise<boolean>, ms = 8000): Promise<boolean> {
   const deadline = Date.now() + ms;
   while (Date.now() < deadline) {
-    if (fn()) return true;
+    if (await fn()) return true;
     await Bun.sleep(10);
   }
   return fn();
@@ -84,7 +84,7 @@ async function waitFor(fn: () => boolean, ms = 8000): Promise<boolean> {
 
 test("Stop on a failed card with running background agents, while a Run holds the start claim, cancels the turn that start mints (A2)", async () => {
   const taskId = randomUUID();
-  ownTaskIds.push(taskId);
+  createdTaskIds.push(taskId);
   const workdir = mkdtempSync(path.join(DATA_DIR, "wd-"));
   db.tasks.insert({
     id: taskId, title: "hold scope claim", prompt: "work", agent: "codex", workdir, isolation: "none", taskType: "task",
@@ -107,13 +107,13 @@ test("Stop on a failed card with running background agents, while a Run holds th
     description: "background review", spawnDepth: 1, sourcePath: path.join(DATA_DIR, `${subagentId}.jsonl`),
     status: "running", startedAt: Date.now() - 1000, endedAt: null,
   } as never);
-  expect(orch.backgroundAgentsHoldTask(taskId)).toBe(true);
+  expect(await orch.backgroundAgentsHoldTask(taskId)).toBe(true);
 
   // Retry on the blocked card: the start holds the claim through the floor
   // probe, before any run row exists.
   const started = orch.startTask(taskId);
-  expect(await waitFor(() => orch.isTaskRunLive(taskId) && db.runs.listForTask(taskId).length === 1)).toBe(true);
-  expect(orch.backgroundAgentsHoldTask(taskId)).toBe(true);
+  expect(await waitFor(async () => await orch.isTaskRunLive(taskId) && db.runs.listForTask(taskId).length === 1)).toBe(true);
+  expect(await orch.backgroundAgentsHoldTask(taskId)).toBe(true);
 
   // The UI's Stop names the card's current (failed) run.
   expect(await orch.cancelRun(failedRunId)).toBe(true);

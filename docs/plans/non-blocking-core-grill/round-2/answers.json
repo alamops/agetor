@@ -1,0 +1,100 @@
+{
+  "version": 1,
+  "formId": "non-blocking-core-grill-r2",
+  "title": "Grill round 2 — the full async DB worker",
+  "round": 2,
+  "mode": "served",
+  "specFile": "questions.json",
+  "specSha256": "c09cee2753084cd551976d89c6e83275041aacbe064c0d5a5a1d0bf432b33366",
+  "submittedAt": "2026-11-20T02:17:58.489Z",
+  "receivedAt": "2026-11-20T02:17:58.617Z",
+  "answeredBy": null,
+  "summary": {
+    "total": 7,
+    "answered": 7,
+    "skipped": 0,
+    "unanswered": 0,
+    "optionalLeftBlank": 0,
+    "notApplicable": 0,
+    "acceptedRecommendations": 5,
+    "overrodeRecommendations": [
+      "full-async-scope",
+      "delivery-r2"
+    ],
+    "oneWayDoorsNotAnswered": [],
+    "withNotes": [],
+    "needsAnswer": [],
+    "complete": true
+  },
+  "answers": {
+    "full-async-scope": {
+      "n": 1,
+      "title": "Full async DB worker: all of it in this run, or the foundation plus the hot paths first?",
+      "type": "single",
+      "status": "answered",
+      "impact": "blocking",
+      "value": "all-now",
+      "display": "All of it, in this run",
+      "acceptedRecommendation": false,
+      "recommended": "staged"
+    },
+    "delivery-r2": {
+      "n": 2,
+      "title": "Given that size, still one PR?",
+      "type": "single",
+      "status": "answered",
+      "impact": "shape",
+      "value": "one-pr",
+      "display": "Yes, one PR",
+      "acceptedRecommendation": false,
+      "recommended": "stack"
+    },
+    "transactions": {
+      "n": 3,
+      "title": "How should the 25 multi-statement transactions work once every query is async?",
+      "type": "single",
+      "status": "answered",
+      "impact": "shape",
+      "value": "named-ops",
+      "display": "Atomic operations inside the worker",
+      "acceptedRecommendation": true
+    },
+    "ordering": {
+      "n": 4,
+      "title": "Event ordering",
+      "type": "confirm",
+      "status": "answered",
+      "impact": "shape",
+      "value": "A per-run emit queue: inserts are sent to the worker in order, and each row's live send happens when its insert resolves, strictly in id order. Hot loops (subagent transcript lines) insert in batches of one transaction per chunk.",
+      "acceptedRecommendation": true
+    },
+    "tests": {
+      "n": 5,
+      "title": "Test strategy",
+      "type": "confirm",
+      "status": "answered",
+      "impact": "shape",
+      "value": "Under `bun test` the worker runs in-process (same async API, no thread) by default, and test fixtures keep their synchronous setup calls through a test-only facade on the same connection, so the ~5,980 test calls don't change. A dedicated suite runs the real Worker thread end to end.",
+      "acceptedRecommendation": true
+    },
+    "worker-failure": {
+      "n": 6,
+      "title": "If the DB worker crashes",
+      "type": "confirm",
+      "status": "answered",
+      "impact": "shape",
+      "value": "The main thread restarts it automatically; calls in flight reject with a clear error (routes answer 503 'database restarting'); the crash and restart are written to core.log. /health keeps answering throughout.",
+      "acceptedRecommendation": true
+    },
+    "boot": {
+      "n": 7,
+      "title": "Boot order",
+      "type": "confirm",
+      "status": "answered",
+      "impact": "minor",
+      "value": "The worker opens the DB and runs migrations before the boot gate opens; /health and /info answer immediately as today, every other route waits for the gate as it does now.",
+      "acceptedRecommendation": true
+    }
+  },
+  "generalNotes": null
+}

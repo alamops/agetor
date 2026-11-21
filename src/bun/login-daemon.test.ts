@@ -222,7 +222,7 @@ function standInApp(dir: string, port: number): { stop(): void } {
   );
   return {
     stop() {
-      server.stop(true);
+      void server.stop(true);
     },
   };
 }

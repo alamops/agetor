@@ -330,6 +330,16 @@ describe("stateful handler: \"Pipeline needs you\" for a block with no step ques
   const ask = (state: "pending" | "resolved", id: string, step = "s1"): GlobalEvent =>
     ({ kind: "interaction", taskId: step, runId: "r", state, interactionId: id, ts: 1, pipelineParentId: "p1" }) as GlobalEvent;
 
+  test("taskIdsFor names every task the next event can read: its own, its parent, and the owed-alert steps", () => {
+    const { handle } = harness({ p1: { column: "blocked", pipelineRun: { status: "blocked", blocked: [] } } });
+    expect(handle.taskIdsFor(ask("pending", "q1", "s1")).sort()).toEqual(["p1", "s1"]);
+    // A pending question on a blocked run owes the parent's alert; answering it records the step.
+    handle(ask("pending", "q1", "s1"));
+    handle(ask("resolved", "q1", "s1"));
+    expect(handle.taskIdsFor({ kind: "run-status", taskId: "s2", runId: "r", status: "succeeded", ts: 1 } as GlobalEvent).sort())
+      .toEqual(["p1", "s1", "s2"]);
+  });
+
   test("a pipeline-reason block with nothing pending posts once; the pipeline event that follows does not re-post", () => {
     const { posted, handle } = harness({ p1: { column: "blocked", pipelineRun: { status: "blocked", blocked: [{ taskId: "s1", stepId: "a", kind: "step-failed", message: "x" }] } } });
     handle(blockedCol());

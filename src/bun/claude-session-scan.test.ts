@@ -12,6 +12,8 @@ const {
   clearClaudeSessionLivenessCache,
   clearClaudeSessionMetaCache,
   claudeConfigDirsToScan,
+  defaultListLive,
+  readClaudeRegistry,
   findClaudeSession,
   refreshClaudeSessionLiveness,
   scanClaudeSessions,
@@ -65,7 +67,7 @@ function userLine(cwd: string, text: string, extra: Record<string, unknown> = {}
 
 const harnessFor = (configDir: string) => [{ id: "claude-code", kind: "claude-code", home: configDir }];
 
-test("a harness env CLAUDE_CONFIG_DIR is the scanned root, not its home", () => {
+test("a harness env CLAUDE_CONFIG_DIR is the scanned root, not its home", async () => {
   const root = home();
   const cwd = path.join(root, "repo-env");
   mkdirSync(cwd, { recursive: true });
@@ -77,7 +79,7 @@ test("a harness env CLAUDE_CONFIG_DIR is the scanned root, not its home", () => 
     cwd,
     lines: [userLine(cwd, "env account")],
   });
-  const dirs = claudeConfigDirsToScan({
+  const dirs = await claudeConfigDirsToScan({
     homeDir: root,
     env: {},
     harnesses: [{
@@ -488,5 +490,52 @@ test("a symlinked projects/ or sessions/ folder is not listed", async () => {
   expect(rows).toEqual([]);
   expect(read).toEqual([]);
   const { readClaudeRegistry } = await import("./claude-session-scan.ts");
-  expect(readClaudeRegistry(config)).toEqual([]);
+  expect(await readClaudeRegistry(config)).toEqual([]);
+});
+
+test("discoverAgetorWorktreeRoots lists only .agetor data dirs that hold agetor.sqlite", async () => {
+  const root = home();
+  for (const name of [".agetor", ".agetor-dev", ".agetor-empty", ".other"]) {
+    mkdirSync(path.join(root, name), { recursive: true });
+  }
+  writeFileSync(path.join(root, ".agetor", "agetor.sqlite"), "");
+  writeFileSync(path.join(root, ".agetor-dev", "agetor.sqlite"), "");
+  writeFileSync(path.join(root, ".other", "agetor.sqlite"), "");
+  const { discoverAgetorWorktreeRoots } = await import("./claude-session-scan.ts");
+  const roots = (await discoverAgetorWorktreeRoots(root)).sort();
+  expect(roots).toEqual([path.join(root, ".agetor", "worktrees"), path.join(root, ".agetor-dev", "worktrees")].sort());
+  expect(await discoverAgetorWorktreeRoots(path.join(root, "missing"))).toEqual([]);
+});
+
+test("claudeConfigDirsToScan finds .claude* dirs under home, de-duplicated, skipping missing ones", async () => {
+  const root = home();
+  mkdirSync(path.join(root, ".claude"), { recursive: true });
+  mkdirSync(path.join(root, ".claude-work"), { recursive: true });
+  const dirs = await claudeConfigDirsToScan({
+    homeDir: root,
+    env: { CLAUDE_CONFIG_DIR: path.join(root, "gone") },
+    harnesses: [],
+  });
+  expect(dirs.sort()).toEqual([path.join(root, ".claude"), path.join(root, ".claude-work")]);
+});
+
+test("the registry reader refuses an oversized planted sessions/*.json instead of reading it whole", async () => {
+  const root = home();
+  const dir = path.join(root, "sessions");
+  mkdirSync(dir, { recursive: true });
+  writeFileSync(path.join(dir, "ok.json"), JSON.stringify({ sessionId: "s-ok", pid: 1 }));
+  // Valid JSON, but 2 MB: past the 64 KB cap, so it must be skipped unread.
+  writeFileSync(path.join(dir, "big.json"), JSON.stringify({ sessionId: "s-big", pad: "x".repeat(2 * 1024 * 1024) }));
+  const records = await readClaudeRegistry(root);
+  expect(records.map((r) => r.sessionId)).toEqual(["s-ok"]);
+});
+
+test("the agents stub file is capped too: an oversized one yields no agents", async () => {
+  const root = home();
+  const small = path.join(root, "small.json");
+  const big = path.join(root, "big.json");
+  writeFileSync(small, JSON.stringify({ agents: [{ sessionId: "a1" }] }));
+  writeFileSync(big, JSON.stringify({ agents: [{ sessionId: "a1" }], pad: "x".repeat(2 * 1024 * 1024) }));
+  expect(await defaultListLive(root, { AGETOR_CLAUDE_AGENTS_JSON: small })).toEqual([{ sessionId: "a1", kind: null }]);
+  expect(await defaultListLive(root, { AGETOR_CLAUDE_AGENTS_JSON: big })).toEqual([]);
 });

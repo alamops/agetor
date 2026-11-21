@@ -28,7 +28,7 @@
  * (`INLINE_SQL_OUTSIDE_DB`).
  */
 import { test, expect, beforeAll, afterAll, describe } from "bun:test";
-import { mkdtempSync } from "node:fs";
+import { mkdtempSync, readdirSync } from "node:fs";
 import { tmpdir } from "node:os";
 import path from "node:path";
 import { randomUUID } from "node:crypto";
@@ -234,6 +234,8 @@ function invocationTable(s: Seed): Record<string, Invocation[]> {
   const anchor = { maxEvents: 3000, maxBytes: 16 * 1024 * 1024 };
   return {
     "runs.events": [{ label: "events(runId)", run: () => runs.events(s.runId) }],
+    "runs.mainTextEvents": [{ label: "mainTextEvents(runId)", run: () => runs.mainTextEvents(s.runId) }],
+    "runs.firstMainStatusData": [{ label: "firstMainStatusData(runId)", run: () => runs.firstMainStatusData(s.runId) }],
     "runs.lastEventData": [{ label: "lastEventData(runId)", run: () => runs.lastEventData(s.runId) }],
     "runs.lastToolUseData": [{ label: "lastToolUseData(runId)", run: () => runs.lastToolUseData(s.runId) }],
     "runs.mainUserRows": [{ label: "mainUserRows(runId)", run: () => runs.mainUserRows(s.runId) }],
@@ -310,6 +312,22 @@ function invocationTable(s: Seed): Record<string, Invocation[]> {
       {
         label: "appendEvent with an explicit ts",
         run: () => runs.appendEvent(s.runId, "status", "plan-guard append ts", null, null, 1_700_000_000_000),
+      },
+    ],
+    "runs.appendEvents": [
+      {
+        label: "appendEvents batch (keyed, unkeyed, subagent)",
+        run: () =>
+          runs.appendEvents(s.runId, [
+            { stream: "status", data: "plan-guard batch 0" },
+            { stream: "assistant", data: "plan-guard batch 1", lineUuid: `pg-${randomUUID()}`, subagentId: s.subagentId },
+          ]),
+      },
+    ],
+    "runs.firstStatusDataWithPrefixes": [
+      {
+        label: "firstStatusDataWithPrefixes(runIds, prefixes)",
+        run: () => runs.firstStatusDataWithPrefixes([s.runId, s.runId], ["opencode 2.x · server=", "opencode 1.x · server="]),
       },
     ],
     "runs.seenLineUuidsForTask": [
@@ -635,5 +653,51 @@ describe("run_events reads outside db.ts", () => {
       if (/FROM run_events/i.test(normalized) || /JOIN run_events/i.test(normalized)) offenders.push(file);
     }
     expect(offenders, `move these run_events reads into db.ts: ${offenders.join(", ")}`).toEqual([]);
+  });
+});
+
+/**
+ * The toString() sweep above sees only methods of the db-core modules. A named
+ * op (`src/bun/db-core/ops/*.ts`, run whole inside the database worker) can
+ * carry its own SQL, which that sweep never reaches. So every SQL string
+ * literal in the op files that names `run_events` is planned here too, and the
+ * set of op files allowed to hold one is pinned: a new one must be added on
+ * purpose, with its plan checked by this test.
+ */
+describe("run_events SQL inside db-core/ops", () => {
+  // File -> why it may name run_events. Reads belong in db-core/runs.ts.
+  const OPS_FILES_WITH_RUN_EVENTS_SQL: Record<string, string> = {
+    "orchestrator-ops.ts": "orchestrator.orphanRuns: a plain INSERT of the orphaned status line (no read path)",
+  };
+
+  async function opSqlLiterals(): Promise<{ file: string; sql: string }[]> {
+    const dir = path.join(import.meta.dir, "db-core", "ops");
+    const out: { file: string; sql: string }[] = [];
+    for (const file of readdirSync(dir).filter((f) => f.endsWith(".ts") && !f.endsWith(".test.ts"))) {
+      const src = await Bun.file(path.join(dir, file)).text();
+      // Template literals and plain "..." / '...' string literals alike.
+      for (const m of src.matchAll(/`([^`]*)`|"((?:[^"\\\n]|\\.)*)"|'((?:[^'\\\n]|\\.)*)'/g)) {
+        const sql = m[1] ?? m[2] ?? m[3] ?? "";
+        if (/\brun_events\b/.test(sql) && /\b(SELECT|INSERT|UPDATE|DELETE)\b/i.test(sql)) out.push({ file, sql });
+      }
+    }
+    return out;
+  }
+
+  test("only the pinned op files hold run_events SQL, and the sweep is not vacuous", async () => {
+    const literals = await opSqlLiterals();
+    const files = [...new Set(literals.map((l) => l.file))].sort();
+    expect(files).toEqual(Object.keys(OPS_FILES_WITH_RUN_EVENTS_SQL).sort());
+  });
+
+  test("no run_events statement in an op SCANs run_events", async () => {
+    const failures: string[] = [];
+    for (const { file, sql } of await opSqlLiterals()) {
+      const names = runEventsNames(sql);
+      for (const detail of explain(sql)) {
+        if (isRunEventsScan(detail, names)) failures.push(`${file}: full scan of run_events — "${detail}" in: ${sql.replace(/\s+/g, " ")}`);
+      }
+    }
+    expect(failures, failures.join("\n")).toEqual([]);
   });
 });

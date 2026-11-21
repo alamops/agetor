@@ -1,5 +1,6 @@
-import { coreSpawnSync } from "./core-spawn.ts";
-import { existsSync, readdirSync, statSync } from "node:fs";
+import { coreSpawn } from "./core-spawn.ts";
+import { existsSync, readdirSync } from "node:fs";
+import { stat } from "node:fs/promises";
 import path from "node:path";
 
 /**
@@ -55,7 +56,69 @@ export function parseLoginShellProbe(stdout: string): LoginShellProbe {
   };
 }
 
-function readLoginShellPath(): LoginShellProbe {
+/** Wall-clock budget for one login-shell probe. */
+const PROBE_TIMEOUT_MS = 2000;
+/** Cap on probe stdout kept in memory (an rc file that echoes endlessly). */
+const PROBE_MAX_STDOUT_BYTES = 1024 * 1024;
+
+/**
+ * Run the user's login shell with `-ilc <script>` without blocking the main
+ * thread and return what it printed on stdout, or null when it could not be
+ * spawned. Same budget as the old synchronous probe: after PROBE_TIMEOUT_MS the
+ * child is killed and whatever it had already printed is returned (the markers
+ * may well have made it out before a hanging rc line). Never throws.
+ */
+async function runLoginShell(shell: string, script: string): Promise<string | null> {
+  let proc: ReturnType<typeof coreSpawn>;
+  try {
+    // coreSpawn: the login shell sources rc files an agent can plant, so it
+    // runs through the disclaim wrapper like every other core spawn (P2/P3).
+    proc = coreSpawn([shell, "-ilc", script], {
+      env: { ...process.env, AGETOR_PATH_PROBE: "1" },
+      stdin: "ignore",
+      stdout: "pipe",
+      stderr: "ignore",
+    });
+  } catch {
+    return null;
+  }
+  const decoder = new TextDecoder();
+  let out = "";
+  let bytes = 0;
+  const reader = (proc.stdout as ReadableStream<Uint8Array>).getReader();
+  const pump = (async () => {
+    try {
+      for (;;) {
+        const { done, value } = await reader.read();
+        if (done) break;
+        bytes += value.byteLength;
+        if (bytes > PROBE_MAX_STDOUT_BYTES) break;
+        out += decoder.decode(value, { stream: true });
+      }
+    } catch {
+      /* stream cancelled by the timeout below */
+    }
+  })();
+  let timer: ReturnType<typeof setTimeout> | undefined;
+  const timedOut = new Promise<"timeout">((resolve) => {
+    timer = setTimeout(() => resolve("timeout"), PROBE_TIMEOUT_MS);
+  });
+  const finished = Promise.all([pump, proc.exited]).then(() => "done" as const);
+  const winner = await Promise.race([finished, timedOut]);
+  if (timer) clearTimeout(timer);
+  if (winner === "timeout" || bytes > PROBE_MAX_STDOUT_BYTES) {
+    try {
+      proc.kill(9);
+    } catch {
+      /* already gone */
+    }
+    // A grandchild may keep the pipe open; stop reading rather than wait on it.
+    await reader.cancel().catch(() => {});
+  }
+  return out;
+}
+
+async function readLoginShellPath(): Promise<LoginShellProbe> {
   const empty: LoginShellProbe = { path: null, fnmDir: null };
   const shell = process.env.SHELL;
   if (!shell) return empty;
@@ -75,26 +138,13 @@ function readLoginShellPath(): LoginShellProbe {
     `printf '%s' '${MARKER_START}'; printf '%s' "$PATH"; printf '%s' '${MARKER_END}'; ` +
     `printf '%s' '${FNM_START}'; printf '%s' "$FNM_DIR"; printf '%s' '${FNM_END}'`;
 
-  let result;
-  try {
-    // coreSpawnSync: the login shell sources rc files an agent can plant, so it
-    // runs through the disclaim wrapper like every other core spawn (P2/P3).
-    result = coreSpawnSync(shell, ["-ilc", script], {
-      env: { ...process.env, AGETOR_PATH_PROBE: "1" },
-      stdio: ["ignore", "pipe", "pipe"],
-      encoding: "utf8",
-      timeout: 2000,
-    });
-  } catch {
-    return empty;
-  }
-
-  // Don't gate on `result.status` — interactive shells routinely exit nonzero
+  // Don't gate on the exit status — interactive shells routinely exit nonzero
   // when stdin isn't a TTY (zsh -i complains, nvm.sh's `complete` builtin
   // bails, oh-my-zsh's update check ENOENTs, etc). As long as the markers
   // made it to stdout, the values between them are what we want.
-  if (!result || typeof result.stdout !== "string") return empty;
-  return parseLoginShellProbe(result.stdout);
+  const stdout = await runLoginShell(shell, script);
+  if (stdout === null) return empty;
+  return parseLoginShellProbe(stdout);
 }
 
 /** Strict command-name allowlist: only the CLIs we ship support for. Prevents
@@ -117,7 +167,9 @@ type ProbeableCommand = (typeof PROBEABLE_COMMANDS)[number];
  * so the caller can log a useful hint when the user's `claude` is actually an
  * alias the binary check can't follow.
  */
-function probeCommandDir(cmd: ProbeableCommand): { dir: string | null; aliased: boolean } {
+async function probeCommandDir(
+  cmd: ProbeableCommand,
+): Promise<{ dir: string | null; aliased: boolean }> {
   const shell = process.env.SHELL;
   if (!shell) return { dir: null, aliased: false };
 
@@ -125,23 +177,12 @@ function probeCommandDir(cmd: ProbeableCommand): { dir: string | null; aliased: 
   // rules out metacharacters — belt-and-braces against an allowlist edit
   // that adds something exotic.
   const safe = JSON.stringify(cmd);
-  let result;
-  try {
-    result = coreSpawnSync(
-      shell,
-      ["-ilc", `type -p ${safe} 2>/dev/null; echo "---"; type ${safe} 2>/dev/null || true`],
-      {
-        env: { ...process.env, AGETOR_PATH_PROBE: "1" },
-        stdio: ["ignore", "pipe", "ignore"],
-        encoding: "utf8",
-        timeout: 2000,
-      },
-    );
-  } catch {
-    return { dir: null, aliased: false };
-  }
-
-  const stdout = String(result?.stdout ?? "").trim();
+  const raw = await runLoginShell(
+    shell,
+    `type -p ${safe} 2>/dev/null; echo "---"; type ${safe} 2>/dev/null || true`,
+  );
+  if (raw === null) return { dir: null, aliased: false };
+  const stdout = raw.trim();
   const [pathSection, typeSection = ""] = stdout.split("---").map((s) => s.trim());
   // `type -p` prints the absolute path on success; nothing on alias/function/miss.
   const filePath = pathSection?.split("\n").pop()?.trim() ?? "";
@@ -151,7 +192,7 @@ function probeCommandDir(cmd: ProbeableCommand): { dir: string | null; aliased: 
 
   if (!filePath || !filePath.startsWith("/")) return { dir: null, aliased };
   try {
-    if (!statSync(filePath).isFile()) return { dir: null, aliased };
+    if (!(await stat(filePath)).isFile()) return { dir: null, aliased };
   } catch {
     return { dir: null, aliased };
   }
@@ -236,9 +277,9 @@ export function defaultDevPaths(): string[] {
  * dev locations. Idempotent — safe to call multiple times. Returns the new
  * PATH so callers can log it during debugging.
  */
-export function rehydratePath(): string {
+export async function rehydratePath(): Promise<string> {
   const current = (process.env.PATH ?? "").split(":").filter(Boolean);
-  const login = readLoginShellPath();
+  const login = await readLoginShellPath();
   // Adopt the login shell's FNM_DIR when our (possibly Finder-minimal) env
   // lacks it, so defaultDevPaths() can enumerate fnm's node versions. Only fnm
   // users reach this — non-fnm shells report an empty FNM_DIR — so it never
@@ -280,7 +321,7 @@ export function rehydratePath(): string {
   // runs after rehydratePath).
   let aliasHint = false;
   if (!Bun.which("claude", { PATH: next })) {
-    const probe = probeCommandDir("claude");
+    const probe = await probeCommandDir("claude");
     if (probe.dir && !seen.has(probe.dir)) {
       seen.add(probe.dir);
       merged.unshift(probe.dir);

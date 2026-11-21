@@ -171,7 +171,7 @@ test("hold: a running workflow container row keeps the task in running after its
   expect(tasks.get(taskId)?.column).toBe("running");
   expect(subagents.hasRunning(taskId)).toBe(true);
 
-  const changed = settleSubagentById(containerId, "completed");
+  const changed = await settleSubagentById(containerId, "completed");
   expect(changed).toBe(true);
 
   expect(subagents.get(containerId)?.status).toBe("completed");
@@ -211,10 +211,10 @@ test("cascade: settling the container settles both running workflow_agent rows, 
       hookCallsForTask++;
       hookSawFullySettled = !subagents.hasRunning(taskId);
     }
-    prevHook?.(tid);
+    return prevHook?.(tid);
   });
   try {
-    const changed = settleSubagentById(containerId, "completed");
+    const changed = await settleSubagentById(containerId, "completed");
     expect(changed).toBe(true);
   } finally {
     setSubagentSettleHook(prevHook);
@@ -267,13 +267,13 @@ test("parked-discovery: a container registered while the card is parked in revie
   setParkedDiscoveryHandler(real);
   if (!real) throw new Error("expected orchestrator.ts to have installed a real parked-discovery handler");
 
-  real(taskId);
+  await real(taskId);
 
   expect(tasks.get(taskId)?.column).toBe("running");
   expect(subagents.hasRunning(taskId)).toBe(true);
 
   // Hygiene: leave nothing running for this task.
-  settleSubagentById(containerId, "completed");
+  await settleSubagentById(containerId, "completed");
   expect(tasks.get(taskId)?.column).toBe("review");
 });
 
@@ -298,7 +298,7 @@ test("orphan: orphanRunningSubagents flips the container and its agent rows to o
   expect(tasks.get(taskId)?.column).toBe("running");
   expect(subagents.hasRunning(taskId)).toBe(true);
 
-  orphanRunningSubagents(taskId);
+  await orphanRunningSubagents(taskId);
 
   const container = subagents.get(containerId);
   const agent = subagents.get(agentA);
@@ -380,7 +380,7 @@ test("notification: the real setBackgroundTaskSettledHandler wiring settles a co
   setBackgroundTaskSettledHandler(real);
   if (!real) throw new Error("expected orchestrator.ts to have installed a real background-task-settled handler");
 
-  real(
+  await real(
     taskId,
     containerId,
     `<task-notification>\n<task-id>${containerId}</task-id>\n<status>completed</status>\n<summary>Workflow finished</summary>\n</task-notification>`,

@@ -13,7 +13,8 @@
  * `deleteForHarness` is called by `harnesses.delete`'s SQL and by account
  * cleanup.
  */
-import { db } from "./db.ts";
+import { op } from "./db-async.ts";
+import type { ProvenanceDbRow, SourceDbRow } from "./db-core/ops/harness-mirror-ops.ts";
 
 export interface MirrorProvenanceRow {
   harnessId: string;
@@ -30,20 +31,6 @@ export interface MirrorProvenanceRow {
   backupRef: string | null;
   updatedAt: number;
 }
-
-type ProvenanceDbRow = {
-  harness_id: string;
-  stack_id: string | null;
-  scope: string;
-  path: string;
-  key: string;
-  value_hash: string | null;
-  src_mtime_ms: number | null;
-  src_size: number | null;
-  preexisted: number;
-  backup_ref: string | null;
-  updated_at: number;
-};
 
 function toRow(row: ProvenanceDbRow): MirrorProvenanceRow {
   return {
@@ -62,63 +49,39 @@ function toRow(row: ProvenanceDbRow): MirrorProvenanceRow {
 }
 
 export const mirrorProvenance = {
-  upsert(row: MirrorProvenanceRow): void {
-    db.run(
-      `INSERT INTO harness_mirror_provenance
-         (harness_id, stack_id, scope, path, key, value_hash, src_mtime_ms, src_size, preexisted, backup_ref, updated_at)
-       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-       ON CONFLICT(harness_id, path, key) DO UPDATE SET
-         stack_id = excluded.stack_id,
-         scope = excluded.scope,
-         value_hash = excluded.value_hash,
-         src_mtime_ms = excluded.src_mtime_ms,
-         src_size = excluded.src_size,
-         preexisted = excluded.preexisted,
-         backup_ref = excluded.backup_ref,
-         updated_at = excluded.updated_at`,
-      [
-        row.harnessId, row.stackId, row.scope, row.path, row.key, row.valueHash,
-        row.srcMtimeMs, row.srcSize, row.preexisted ? 1 : 0, row.backupRef, row.updatedAt,
-      ],
-    );
+  async upsert(row: MirrorProvenanceRow): Promise<void> {
+    await op("mirrorProvenance.upsert", [[
+      row.harnessId, row.stackId, row.scope, row.path, row.key, row.valueHash,
+      row.srcMtimeMs, row.srcSize, row.preexisted ? 1 : 0, row.backupRef, row.updatedAt,
+    ]]);
   },
-  get(harnessId: string, path: string, key = ""): MirrorProvenanceRow | null {
-    const row = db
-      .query<ProvenanceDbRow, [string, string, string]>(
-        `SELECT * FROM harness_mirror_provenance WHERE harness_id = ? AND path = ? AND key = ?`,
-      )
-      .get(harnessId, path, key);
+  async get(harnessId: string, path: string, key = ""): Promise<MirrorProvenanceRow | null> {
+    const row = await op("mirrorProvenance.get", [harnessId, path, key]);
     return row ? toRow(row) : null;
   },
-  list(harnessId: string): MirrorProvenanceRow[] {
-    return db
-      .query<ProvenanceDbRow, [string]>(
-        `SELECT * FROM harness_mirror_provenance WHERE harness_id = ? ORDER BY path ASC, key ASC`,
-      )
-      .all(harnessId)
-      .map(toRow);
+  async list(harnessId: string): Promise<MirrorProvenanceRow[]> {
+    return (await op("mirrorProvenance.list", [harnessId])).map(toRow);
   },
-  listForPath(harnessId: string, path: string): MirrorProvenanceRow[] {
-    return db
-      .query<ProvenanceDbRow, [string, string]>(
-        `SELECT * FROM harness_mirror_provenance WHERE harness_id = ? AND path = ? ORDER BY key ASC`,
-      )
-      .all(harnessId, path)
-      .map(toRow);
+  async listForPath(harnessId: string, path: string): Promise<MirrorProvenanceRow[]> {
+    return (await op("mirrorProvenance.listForPath", [harnessId, path])).map(toRow);
   },
-  remove(harnessId: string, path: string, key = ""): void {
-    db.run(`DELETE FROM harness_mirror_provenance WHERE harness_id = ? AND path = ? AND key = ?`, [harnessId, path, key]);
+  async remove(harnessId: string, path: string, key = ""): Promise<void> {
+    await op("mirrorProvenance.remove", [harnessId, path, key]);
   },
-  removeForPath(harnessId: string, path: string): void {
-    db.run(`DELETE FROM harness_mirror_provenance WHERE harness_id = ? AND path = ?`, [harnessId, path]);
+  async removeForPath(harnessId: string, path: string): Promise<void> {
+    await op("mirrorProvenance.removeForPath", [harnessId, path]);
   },
   /** Every row of the account except those for `path` (a Claude account whose
    *  config folder moved while its `.claude.json` folder did not). */
-  removeAllButPath(harnessId: string, path: string): void {
-    db.run(`DELETE FROM harness_mirror_provenance WHERE harness_id = ? AND path <> ?`, [harnessId, path]);
+  async removeAllButPath(harnessId: string, path: string): Promise<void> {
+    await op("mirrorProvenance.removeAllButPath", [harnessId, path]);
   },
-  deleteForHarness(harnessId: string): void {
-    db.run(`DELETE FROM harness_mirror_provenance WHERE harness_id = ?`, [harnessId]);
+  async deleteForHarness(harnessId: string): Promise<void> {
+    await op("mirrorProvenance.deleteForHarness", [harnessId]);
+  },
+  /** Fingerprint of the account's mirror records; see `harnesses.updateGuarded`. */
+  signature(harnessId: string): Promise<string> {
+    return op("mirrorProvenance.signature", [harnessId]);
   },
 };
 
@@ -171,16 +134,6 @@ export interface MirrorSourceRow {
   updatedAt: number;
 }
 
-type SourceDbRow = {
-  harness_id: string;
-  primary_id: string;
-  primary_root: string;
-  primary_config: string;
-  backup_root: string | null;
-  backup_config: string | null;
-  updated_at: number;
-};
-
 /** One row per backup account; untrusted like provenance rows. Its folders are
  *  only compared and checked for existence (resolved lexically, never stat'ed
  *  inside a macOS-protected folder), never read from or written to, so a
@@ -188,10 +141,8 @@ type SourceDbRow = {
  *  or a Restore drop this same account's own mirror records and saved
  *  originals (never a file in any account folder). */
 export const mirrorSources = {
-  get(harnessId: string): MirrorSourceRow | null {
-    const row = db
-      .query<SourceDbRow, [string]>(`SELECT * FROM harness_mirror_sources WHERE harness_id = ?`)
-      .get(harnessId);
+  async get(harnessId: string): Promise<MirrorSourceRow | null> {
+    const row: SourceDbRow | null = await op("mirrorSources.get", [harnessId]);
     return row
       ? {
         harnessId: row.harness_id,
@@ -204,31 +155,18 @@ export const mirrorSources = {
       }
       : null;
   },
-  set(row: MirrorSourceRow): void {
-    db.run(
-      `INSERT INTO harness_mirror_sources
-         (harness_id, primary_id, primary_root, primary_config, backup_root, backup_config, updated_at)
-       VALUES (?, ?, ?, ?, ?, ?, ?)
-       ON CONFLICT(harness_id) DO UPDATE SET
-         primary_id = excluded.primary_id,
-         primary_root = excluded.primary_root,
-         primary_config = excluded.primary_config,
-         backup_root = excluded.backup_root,
-         backup_config = excluded.backup_config,
-         updated_at = excluded.updated_at`,
-      [row.harnessId, row.primaryId, row.primaryRoot, row.primaryConfig, row.backupRoot, row.backupConfig, row.updatedAt],
-    );
+  async set(row: MirrorSourceRow): Promise<void> {
+    await op("mirrorSources.set", [
+      row.harnessId, row.primaryId, row.primaryRoot, row.primaryConfig, row.backupRoot, row.backupConfig, row.updatedAt,
+    ]);
   },
-  deleteForHarness(harnessId: string): void {
-    db.run(`DELETE FROM harness_mirror_sources WHERE harness_id = ?`, [harnessId]);
+  async deleteForHarness(harnessId: string): Promise<void> {
+    await op("mirrorSources.deleteForHarness", [harnessId]);
   },
 };
 
 /** Distinct harness ids with at least one provenance row (the primary key
  *  index covers the scan). */
-export function harnessIdsWithProvenance(): string[] {
-  return db
-    .query<{ harness_id: string }, []>(`SELECT DISTINCT harness_id FROM harness_mirror_provenance`)
-    .all()
-    .map((r) => r.harness_id);
+export function harnessIdsWithProvenance(): Promise<string[]> {
+  return op("mirrorProvenance.harnessIds", []);
 }

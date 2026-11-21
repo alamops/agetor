@@ -14,8 +14,8 @@
  * No side effects at module load.
  */
 
-import { tasks } from "./db.ts";
-import { countPendingForTask } from "./interactions.ts";
+import { tasks } from "./db-async.ts";
+import { countPendingForTask, pendingCountsByTask } from "./interactions.ts";
 import { subscribeGlobal } from "./orchestrator.ts";
 import type { GlobalEvent } from "../shared/types.ts";
 import {
@@ -29,20 +29,26 @@ import {
  * step's events are retargeted to its parent (D16), so a step maps to its
  * parent. Anything else — including an unknown id — maps to itself.
  */
-export function notificationTargetTaskId(taskId: string): string {
+export async function notificationTargetTaskId(taskId: string): Promise<string> {
   try {
-    return tasks.get(taskId)?.pipelineParentId ?? taskId;
+    return (await tasks.get(taskId))?.pipelineParentId ?? taskId;
   } catch {
     return taskId;
   }
 }
 
 /** Pending questions for a task; for a pipeline parent, its own plus every step's. */
-export function pendingInteractionsFor(taskId: string): number {
-  let n = countPendingForTask(taskId);
+export async function pendingInteractionsFor(
+  taskId: string,
+  /** The in-memory counts to judge by. Taken at call time by default; an event
+   *  handler passes the snapshot it took when the event fired, so the count is
+   *  the one at that moment and not after the database reads below. */
+  counts: ReadonlyMap<string, number> = pendingCountsByTask(),
+): Promise<number> {
+  let n = counts.get(taskId) ?? 0;
   try {
-    if (tasks.get(taskId)?.pipelineId) {
-      for (const step of tasks.stepsForParent(taskId)) n += countPendingForTask(step.id);
+    if ((await tasks.get(taskId))?.pipelineId) {
+      for (const step of await tasks.stepsForParent(taskId)) n += counts.get(step.id) ?? 0;
     }
   } catch {
     // A db hiccup must not turn into a removal: report "still pending".
@@ -62,14 +68,17 @@ export function pendingInteractionsFor(taskId: string): number {
  *   own column change never removes the parent's entry; the parent's own
  *   column events cover it.
  */
-export function removalForEvent(
+export async function removalForEvent(
   ev: GlobalEvent,
-  deps: { pendingFor?: (taskId: string) => number } = {},
-): TaskNotificationRemoval | null {
+  deps: { pendingFor?: (taskId: string) => number | Promise<number> } = {},
+): Promise<TaskNotificationRemoval | null> {
+  // Snapshot before any await: `fanoutResolved` runs after the card left its
+  // map, so this count already excludes it, and a later event must not change it.
+  const counts = pendingCountsByTask();
   if (ev.kind === "interaction" && ev.state === "resolved") {
     const target = ev.pipelineParentId ?? ev.taskId;
-    const pendingFor = deps.pendingFor ?? pendingInteractionsFor;
-    if (pendingFor(target) > 0) return null;
+    const pendingFor = deps.pendingFor ?? ((id: string) => pendingInteractionsFor(id, counts));
+    if ((await pendingFor(target)) > 0) return null;
     return { taskId: target, ifKinds: ANSWERED_REMOVAL_KINDS };
   }
   if (ev.kind === "column" && ev.prev === "blocked" && ev.column !== "blocked" && !ev.pipelineParentId) {
@@ -91,11 +100,15 @@ export function installNotificationRemovalHooks(
   remove: (r: TaskNotificationRemoval) => void,
 ): () => void {
   return subscribeGlobal((ev) => {
-    try {
-      const removal = removalForEvent(ev);
-      if (removal) remove(removal);
-    } catch (err) {
-      console.error("[agetor] notification removal hook failed:", err);
-    }
+    // The subscriber is sync (the bus ignores a return value), so the async
+    // decision runs detached and logs its own failure.
+    void (async () => {
+      try {
+        const removal = await removalForEvent(ev);
+        if (removal) remove(removal);
+      } catch (err) {
+        console.error("[agetor] notification removal hook failed:", err);
+      }
+    })();
   });
 }

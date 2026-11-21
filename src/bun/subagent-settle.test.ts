@@ -197,7 +197,7 @@ test("settleSubagentById settles the row, emits the lifecycle event, and release
   const captured: RunEvent[] = [];
   setSubagentEmitter((e) => captured.push(e));
 
-  const changed = settleSubagentById(agentId, "completed");
+  const changed = await settleSubagentById(agentId, "completed");
   expect(changed).toBe(true);
 
   // DB half: row settled.
@@ -229,7 +229,7 @@ test("settleSubagentById is idempotent on repeat: second call is a no-op, task s
   const captured: RunEvent[] = [];
   setSubagentEmitter((e) => captured.push(e));
 
-  expect(settleSubagentById(agentId, "completed")).toBe(true);
+  expect(await settleSubagentById(agentId, "completed")).toBe(true);
   expect(tasks.get(taskId)!.column).toBe("review");
   const eventCountAfterFirst = captured.length;
 
@@ -238,7 +238,7 @@ test("settleSubagentById is idempotent on repeat: second call is a no-op, task s
   // straight back to review).
   tasks.update(taskId, { column: "running" });
 
-  expect(settleSubagentById(agentId, "completed")).toBe(false);
+  expect(await settleSubagentById(agentId, "completed")).toBe(false);
   expect(captured.length).toBe(eventCountAfterFirst); // no new lifecycle event
   expect(tasks.get(taskId)!.column).toBe("running"); // untouched by the no-op
 });
@@ -252,8 +252,8 @@ test("settleSubagentById on an agentId matching no subagent row is a clean no-op
   setSubagentEmitter((e) => captured.push(e));
 
   let changed: boolean | undefined;
-  expect(() => {
-    changed = settleSubagentById(`no-such-background-agent-${randomUUID()}`, "completed");
+  expect(async () => {
+    changed = await settleSubagentById(`no-such-background-agent-${randomUUID()}`, "completed");
   }).not.toThrow();
   expect(changed).toBe(false);
   expect(captured.length).toBe(0); // no lifecycle event
@@ -271,7 +271,7 @@ test("settleSubagentById on an agentId matching no subagent row is a clean no-op
  *  `setSubagentSettleHook`): swap in a throwaway, read back the previous
  *  value (the real handler), then immediately put it back so no other test
  *  file in this shared process ever observes the wiring changed. */
-async function getRealParkedDiscoveryHandler(): Promise<(taskId: string) => void> {
+async function getRealParkedDiscoveryHandler(): Promise<(taskId: string) => unknown> {
   const { setParkedDiscoveryHandler } = await import("./claude-subagents.ts");
   const real = setParkedDiscoveryHandler(() => {});
   setParkedDiscoveryHandler(real);
@@ -284,7 +284,7 @@ test("pullBackParkedTask: a review card whose latest run succeeded is pulled bac
   const { taskId, runId } = await seedTask({ column: "review", runStatus: "succeeded" });
   const pullBackParkedTask = await getRealParkedDiscoveryHandler();
 
-  pullBackParkedTask(taskId);
+  await pullBackParkedTask(taskId);
 
   expect(tasks.get(taskId)!.column).toBe("running");
   const events = runs.events(runId);
@@ -299,7 +299,7 @@ for (const column of ["done", "blocked", "ready", "backlog"] as const) {
     const { taskId } = await seedTask({ column, runStatus: "succeeded" });
     const pullBackParkedTask = await getRealParkedDiscoveryHandler();
 
-    pullBackParkedTask(taskId);
+    await pullBackParkedTask(taskId);
 
     expect(tasks.get(taskId)!.column).toBe(column);
   });
@@ -310,7 +310,7 @@ test("pullBackParkedTask: a review card whose latest run FAILED is left untouche
   const { taskId } = await seedTask({ column: "review", runStatus: "failed" });
   const pullBackParkedTask = await getRealParkedDiscoveryHandler();
 
-  pullBackParkedTask(taskId);
+  await pullBackParkedTask(taskId);
 
   expect(tasks.get(taskId)!.column).toBe("review");
 });

@@ -28,9 +28,10 @@ import {
 } from "./disclaim.ts";
 
 export interface DisclaimSwitchDeps {
-  /** Raw stored `disclaimSpawnedAgents` value, or null when never set. */
-  readPref(): string | null;
-  writePref(v: string): void;
+  /** Raw stored `disclaimSpawnedAgents` value, or null when never set. A
+   *  rejection counts as an unreadable preference (the switch stays on). */
+  readPref(): string | null | Promise<string | null>;
+  writePref(v: string): void | Promise<void>;
   /** App only: ask the user whether to keep isolation off. `true` = "Keep it
    *  off"; `false` = "Turn it back on" (also the default / cancel result). */
   confirmKeepOff?: () => boolean | Promise<boolean>;
@@ -56,7 +57,7 @@ export async function initDisclaimSwitch(
 
   let stored: string | null;
   try {
-    stored = deps.readPref();
+    stored = await deps.readPref();
   } catch (err) {
     // An unreadable preference can't request "off"; stay on.
     deps.log(
@@ -99,7 +100,7 @@ export async function initDisclaimSwitch(
   }
   // "Turn it back on": persist it so the next launch doesn't ask again.
   try {
-    deps.writePref("true");
+    await deps.writePref("true");
   } catch (err) {
     deps.log(
       `[agetor] couldn't store ${DISCLAIM_PREF_KEY}=true (${errMessage(err)}) — isolation is on for this launch`,

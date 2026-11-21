@@ -121,7 +121,7 @@ test("a delivered SendUserFile tool_use/tool_result pair persists sentFiles sour
   const { events, stop } = collectFilesSentEvents();
   const before = tasks.get(id)!;
 
-  __dispatchChunkForTest(
+  await __dispatchChunkForTest(
     runId,
     id,
     "claude-code",
@@ -135,7 +135,7 @@ test("a delivered SendUserFile tool_use/tool_result pair persists sentFiles sour
   // Both requested files have a matching attachment here (an attachment can
   // itself carry a relative path — entries are sourced from attachments, so
   // this also exercises relative-path resolution on that source).
-  __dispatchChunkForTest(
+  await __dispatchChunkForTest(
     runId,
     id,
     "claude-code",
@@ -188,14 +188,14 @@ test("attachments are the authoritative delivered set: a request for 2 files who
   const runId = await startAndGetRunId(id);
   const { events, stop } = collectFilesSentEvents();
 
-  __dispatchChunkForTest(
+  await __dispatchChunkForTest(
     runId,
     id,
     "claude-code",
     "tool_use",
     toolUse("toolu_s1", "SendUserFile", { files: ["/abs/a.png", "/abs/b.md"], caption: null, status: null }),
   );
-  __dispatchChunkForTest(
+  await __dispatchChunkForTest(
     runId,
     id,
     "claude-code",
@@ -227,14 +227,14 @@ test("a non-error 'Declined' SendUserFile result (claude-tmux.ts's interrupt rew
   const runId = await startAndGetRunId(id);
   const { events, stop } = collectFilesSentEvents();
 
-  __dispatchChunkForTest(
+  await __dispatchChunkForTest(
     runId,
     id,
     "claude-code",
     "tool_use",
     toolUse("toolu_s1", "SendUserFile", { files: ["/abs/a.png"], caption: null, status: null }),
   );
-  __dispatchChunkForTest(
+  await __dispatchChunkForTest(
     runId,
     id,
     "claude-code",
@@ -257,15 +257,15 @@ test("dispatching the same delivered pair a second time is idempotent — no dup
   const runId = await startAndGetRunId(id);
   const { events, stop } = collectFilesSentEvents();
 
-  const dispatchOnce = () => {
-    __dispatchChunkForTest(
+  const dispatchOnce = async () => {
+    await __dispatchChunkForTest(
       runId,
       id,
       "claude-code",
       "tool_use",
       toolUse("toolu_s1", "SendUserFile", { files: ["/abs/a.png"], caption: null, status: "normal" }),
     );
-    __dispatchChunkForTest(
+    await __dispatchChunkForTest(
       runId,
       id,
       "claude-code",
@@ -274,10 +274,10 @@ test("dispatching the same delivered pair a second time is idempotent — no dup
     );
   };
 
-  dispatchOnce();
+  await dispatchOnce();
   expect(tasks.get(id)!.sentFiles?.length).toBe(1);
 
-  dispatchOnce();
+  await dispatchOnce();
   stop();
 
   expect(tasks.get(id)!.sentFiles?.length).toBe(1);
@@ -294,14 +294,14 @@ test("an errored SendUserFile result persists nothing and fires no files-sent ev
   const runId = await startAndGetRunId(id);
   const { events, stop } = collectFilesSentEvents();
 
-  __dispatchChunkForTest(
+  await __dispatchChunkForTest(
     runId,
     id,
     "claude-code",
     "tool_use",
     toolUse("toolu_s1", "SendUserFile", { files: ["/tmp/some-dir"], caption: null, status: null }),
   );
-  __dispatchChunkForTest(
+  await __dispatchChunkForTest(
     runId,
     id,
     "claude-code",
@@ -337,7 +337,7 @@ test("map-miss fallback: a tool_use appended straight to the DB (bypassing the h
   );
 
   const { events, stop } = collectFilesSentEvents();
-  __dispatchChunkForTest(
+  await __dispatchChunkForTest(
     runId,
     id,
     "claude-code",
@@ -361,7 +361,7 @@ test("a tool_result whose text merely resembles a delivery confirmation, with no
   const runId = await startAndGetRunId(id);
   const { events, stop } = collectFilesSentEvents();
 
-  __dispatchChunkForTest(
+  await __dispatchChunkForTest(
     runId,
     id,
     "claude-code",
@@ -389,14 +389,14 @@ test("sent-files detection is not gated on agent kind — a non-claude chunk sha
   const runId = await startAndGetRunId(id);
   const { events, stop } = collectFilesSentEvents();
 
-  __dispatchChunkForTest(
+  await __dispatchChunkForTest(
     runId,
     id,
     "fx",
     "tool_use",
     toolUse("call1:sent-files", "SendUserFile", { files: ["/abs/from-fx.png"], caption: null, status: "normal" }),
   );
-  __dispatchChunkForTest(
+  await __dispatchChunkForTest(
     runId,
     id,
     "fx",
@@ -422,7 +422,7 @@ test("an unrelated tool_use (no SendUserFile marker) does not touch sentFiles", 
   const { id } = await newClaudeTask();
   const runId = await startAndGetRunId(id);
 
-  __dispatchChunkForTest(runId, id, "claude-code", "tool_use", toolUse("toolu_1", "Read", { file_path: "/tmp/x" }));
+  await __dispatchChunkForTest(runId, id, "claude-code", "tool_use", toolUse("toolu_1", "Read", { file_path: "/tmp/x" }));
   expect(tasks.get(id)!.sentFiles).toBeNull();
 
   await settle();

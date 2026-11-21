@@ -23,7 +23,7 @@ import type {
 import { GIT_HOST_TOKENS_SECTION } from "../shared/types.ts";
 import { contentTypeForPreviewPath, MAX_BLOB_PREVIEW_BYTES } from "../shared/attachments.ts";
 import { MAX_DIFF_FILES, parseGitDiff } from "./git-diff.ts";
-import { apiHostForRemote, bitbucketCreds, type BitbucketCreds } from "./git-provider.ts";
+import { bitbucketCreds, type BitbucketCreds, resolveForgeApiHost } from "./git-provider.ts";
 
 /**
  * Bitbucket Cloud (api.bitbucket.org, REST 2.0) adapter
@@ -86,12 +86,12 @@ const BITBUCKET_PAGELEN = 30;
  * found" 404 instead of an actionable "wrong product" error — exactly
  * today's failure mode.
  *
- * `apiHostForRemote` (git-provider.ts) resolves `repo.remoteHost` through
+ * `resolveForgeApiHost` (git-provider.ts) resolves `repo.remoteHost` through
  * `~/.ssh/config` the same way `gitlabHost`/`gitlabApiBase` do in gitlab.ts:
  * `bitbucket.org` itself short-circuits to itself, and an alias whose
  * `HostName` is `bitbucket.org` (or one of Bitbucket's alternate SSH
  * hostnames, `altssh.bitbucket.org`/`ssh.bitbucket.org`) also resolves to
- * `bitbucket.org` — both pass. It's sync, never throws, and caches its own
+ * `bitbucket.org` — both pass. It is async, never throws, and caches its own
  * resolution per host, so calling this at the top of every entry point below
  * costs nothing beyond the first `ssh -G` shellout for a given remote host.
  *
@@ -126,8 +126,8 @@ const BITBUCKET_PAGELEN = 30;
  * needs this exact Server/DC-rejection rule for a pasted clone URL before
  * this adapter is ever reached.
  */
-export function bitbucketServerError(repo: ProviderRepoInfo): string | null {
-  const resolved = apiHostForRemote(repo.remoteHost).toLowerCase();
+export async function bitbucketServerError(repo: ProviderRepoInfo): Promise<string | null> {
+  const resolved = (await resolveForgeApiHost(repo.remoteHost)).toLowerCase();
   if (resolved === "bitbucket.org") return null;
   // Dotless: ssh has nothing to tell us (no matching config entry, no dot to
   // even suggest a domain) — cannot be a Server/DC FQDN. Fail open.
@@ -663,7 +663,7 @@ export async function listBitbucketItems(
   repo: ProviderRepoInfo,
   opts: ListBitbucketItemsOptions,
 ): Promise<BitbucketListResponse> {
-  const serverError = bitbucketServerError(repo);
+  const serverError = await bitbucketServerError(repo);
   if (serverError) return { ok: false, error: serverError };
   const creds = await bitbucketCreds(repo.remoteHost);
   const page = Number.isInteger(opts.page) && (opts.page as number) > 0 ? (opts.page as number) : 1;
@@ -726,7 +726,7 @@ export async function listBitbucketItems(
  *  doc comment) — the facade fills it in from local git the same way for
  *  every provider. */
 export async function getBitbucketPullDefaults(repo: ProviderRepoInfo): Promise<BitbucketPullDefaultsResponse> {
-  const serverError = bitbucketServerError(repo);
+  const serverError = await bitbucketServerError(repo);
   if (serverError) return { ok: false, error: serverError };
   const creds = await bitbucketCreds(repo.remoteHost);
   const res = await fetchBitbucket(repoBasePath(repo), creds, "application/json");
@@ -751,7 +751,7 @@ export async function createBitbucketPull(
   repo: ProviderRepoInfo,
   input: CreateBitbucketPullInput,
 ): Promise<BitbucketIssueResponse> {
-  const serverError = bitbucketServerError(repo);
+  const serverError = await bitbucketServerError(repo);
   if (serverError) return { ok: false, error: serverError };
   const creds = await bitbucketCreds(repo.remoteHost);
   const title = input.title.trim();
@@ -849,7 +849,7 @@ export async function listBitbucketBranches(
   repo: ProviderRepoInfo,
   opts: { maxPages?: number } = {},
 ): Promise<{ ok: true; branches: ForgeBranch[]; truncated: boolean } | BitbucketError> {
-  const serverError = bitbucketServerError(repo);
+  const serverError = await bitbucketServerError(repo);
   if (serverError) return { ok: false, error: serverError };
   const creds = await bitbucketCreds(repo.remoteHost);
   const maxPages = Math.max(1, Math.min(opts.maxPages ?? BITBUCKET_BRANCH_LIST_MAX_PAGES, 20));
@@ -890,7 +890,7 @@ export async function getBitbucketBranch(
   repo: ProviderRepoInfo,
   name: string,
 ): Promise<{ ok: true; branch: ForgeBranch | null } | BitbucketError> {
-  const serverError = bitbucketServerError(repo);
+  const serverError = await bitbucketServerError(repo);
   if (serverError) return { ok: false, error: serverError };
   const trimmed = name.trim();
   if (!trimmed) return { ok: false, error: "branch name required" };
@@ -910,7 +910,7 @@ export async function getBitbucketBranch(
 export async function getBitbucketDefaultBranch(
   repo: ProviderRepoInfo,
 ): Promise<{ ok: true; name: string } | BitbucketError> {
-  const serverError = bitbucketServerError(repo);
+  const serverError = await bitbucketServerError(repo);
   if (serverError) return { ok: false, error: serverError };
   const creds = await bitbucketCreds(repo.remoteHost);
   const res = await fetchBitbucket(repoBasePath(repo), creds, "application/json");
@@ -930,7 +930,7 @@ export async function getBitbucketDefaultBranch(
  *  200-file caps) — `parseGitDiff` tolerates a truncated unified diff either
  *  way (it just yields fewer/partial hunks). */
 export async function getBitbucketPullDiff(repo: ProviderRepoInfo, number: number): Promise<BitbucketDiffResponse> {
-  const serverError = bitbucketServerError(repo);
+  const serverError = await bitbucketServerError(repo);
   if (serverError) return { ok: false, error: serverError };
   const creds = await bitbucketCreds(repo.remoteHost);
   if (!Number.isInteger(number) || number <= 0) return { ok: false, error: "pull request number must be positive" };
@@ -1173,7 +1173,7 @@ export async function getBitbucketPullBlob(
   relPath: string,
   side: "old" | "new",
 ): Promise<BitbucketBlobResult> {
-  const serverError = bitbucketServerError(repo);
+  const serverError = await bitbucketServerError(repo);
   if (serverError) return { ok: false, error: serverError, status: 501 };
   if (!Number.isInteger(number) || number <= 0) {
     return { ok: false, error: "pull request number must be positive", status: 400 };
@@ -1304,7 +1304,7 @@ export async function listBitbucketComments(
   number: number,
   kind: GitHubItemKind,
 ): Promise<BitbucketCommentsResponse> {
-  const serverError = bitbucketServerError(repo);
+  const serverError = await bitbucketServerError(repo);
   if (serverError) return { ok: false, error: serverError };
   const creds = await bitbucketCreds(repo.remoteHost);
   if (!Number.isInteger(number) || number <= 0) return { ok: false, error: "item number must be positive" };
@@ -1345,7 +1345,7 @@ export async function createBitbucketComment(
   kind: GitHubItemKind,
   body: string,
 ): Promise<BitbucketCommentResponse> {
-  const serverError = bitbucketServerError(repo);
+  const serverError = await bitbucketServerError(repo);
   if (serverError) return { ok: false, error: serverError };
   const creds = await bitbucketCreds(repo.remoteHost);
   if (!Number.isInteger(number) || number <= 0) return { ok: false, error: "item number must be positive" };
@@ -1379,7 +1379,7 @@ export async function listBitbucketPullReviewComments(
   repo: ProviderRepoInfo,
   number: number,
 ): Promise<BitbucketPullReviewCommentsResponse> {
-  const serverError = bitbucketServerError(repo);
+  const serverError = await bitbucketServerError(repo);
   if (serverError) return { ok: false, error: serverError };
   const creds = await bitbucketCreds(repo.remoteHost);
   if (!Number.isInteger(number) || number <= 0) return { ok: false, error: "pull request number must be positive" };
@@ -1417,7 +1417,7 @@ export async function createBitbucketPullLineComment(
   number: number,
   input: CreateBitbucketPullLineCommentInput,
 ): Promise<BitbucketPullLineCommentResponse> {
-  const serverError = bitbucketServerError(repo);
+  const serverError = await bitbucketServerError(repo);
   if (serverError) return { ok: false, error: serverError };
   const creds = await bitbucketCreds(repo.remoteHost);
   if (!Number.isInteger(number) || number <= 0) return { ok: false, error: "pull request number must be positive" };
@@ -1457,7 +1457,7 @@ export async function replyBitbucketLineComment(
   commentId: number,
   body: string,
 ): Promise<BitbucketPullLineCommentResponse> {
-  const serverError = bitbucketServerError(repo);
+  const serverError = await bitbucketServerError(repo);
   if (serverError) return { ok: false, error: serverError };
   const creds = await bitbucketCreds(repo.remoteHost);
   if (!Number.isInteger(number) || number <= 0) return { ok: false, error: "pull request number must be positive" };
@@ -1487,7 +1487,7 @@ export async function replyBitbucketLineComment(
  *  purely to fill that field — same two-request shape as
  *  `getGitHubPullChecks`, just for a different reason. */
 export async function getBitbucketPullChecks(repo: ProviderRepoInfo, number: number): Promise<BitbucketChecksResponse> {
-  const serverError = bitbucketServerError(repo);
+  const serverError = await bitbucketServerError(repo);
   if (serverError) return { ok: false, error: serverError };
   const creds = await bitbucketCreds(repo.remoteHost);
   if (!Number.isInteger(number) || number <= 0) return { ok: false, error: "pull request number must be positive" };
@@ -1661,7 +1661,7 @@ export async function getBitbucketPullMergeability(
   repo: ProviderRepoInfo,
   number: number,
 ): Promise<BitbucketMergeabilityResponse> {
-  const serverError = bitbucketServerError(repo);
+  const serverError = await bitbucketServerError(repo);
   if (serverError) return { ok: false, error: serverError };
   if (!Number.isInteger(number) || number <= 0) return { ok: false, error: "pull request number must be positive" };
   const creds = await bitbucketCreds(repo.remoteHost);
@@ -1688,7 +1688,7 @@ export async function getBitbucketPullMergeability(
  *  other adapter function — the facade (`git-host.ts`) stitches it on via
  *  `withSourcePath`. */
 export async function getBitbucketPullDetail(repo: ProviderRepoInfo, number: number): Promise<BitbucketIssueResponse> {
-  const serverError = bitbucketServerError(repo);
+  const serverError = await bitbucketServerError(repo);
   if (serverError) return { ok: false, error: serverError };
   if (!Number.isInteger(number) || number <= 0) return { ok: false, error: "pull request number must be positive" };
   const creds = await bitbucketCreds(repo.remoteHost);
@@ -1719,7 +1719,7 @@ export async function getBitbucketIssueThread(
   id: number,
   includeComments = true,
 ): Promise<BitbucketIssueThreadResponse> {
-  const serverError = bitbucketServerError(repo);
+  const serverError = await bitbucketServerError(repo);
   if (serverError) return { ok: false, error: serverError };
   if (!Number.isInteger(id) || id <= 0) return { ok: false, error: "issue number must be positive" };
   const creds = await bitbucketCreds(repo.remoteHost);
@@ -1769,7 +1769,7 @@ export async function mergeBitbucketPull(
   number: number,
   method: GitHubPullMergeMethod,
 ): Promise<BitbucketPullMergeResponse> {
-  const serverError = bitbucketServerError(repo);
+  const serverError = await bitbucketServerError(repo);
   if (serverError) return { ok: false, error: serverError };
   const creds = await bitbucketCreds(repo.remoteHost);
   if (!Number.isInteger(number) || number <= 0) return { ok: false, error: "pull request number must be positive" };
@@ -1798,7 +1798,7 @@ export async function mergeBitbucketPull(
  *  the only terminal non-merge state a pull request can reach via the API,
  *  so this is what `closeGitHubPull`'s call sites map onto. */
 export async function closeBitbucketPull(repo: ProviderRepoInfo, number: number): Promise<BitbucketActionResponse> {
-  const serverError = bitbucketServerError(repo);
+  const serverError = await bitbucketServerError(repo);
   if (serverError) return { ok: false, error: serverError };
   const creds = await bitbucketCreds(repo.remoteHost);
   if (!Number.isInteger(number) || number <= 0) return { ok: false, error: "pull request number must be positive" };
@@ -1822,7 +1822,7 @@ export async function closeBitbucketPull(repo: ProviderRepoInfo, number: number)
  *  PATCH), a decline is terminal. Always returns a friendly, actionable error
  *  rather than attempting a request that Bitbucket would reject anyway. */
 export async function reopenBitbucketPull(repo: ProviderRepoInfo, _number: number): Promise<BitbucketActionResponse> {
-  const serverError = bitbucketServerError(repo);
+  const serverError = await bitbucketServerError(repo);
   if (serverError) return { ok: false, error: serverError };
   return { ok: false, error: "declined pull requests cannot be reopened on Bitbucket" };
 }
@@ -1841,7 +1841,7 @@ export async function reviewBitbucketPull(
   verdict: GitHubPullReviewEvent,
   body?: string,
 ): Promise<BitbucketActionResponse> {
-  const serverError = bitbucketServerError(repo);
+  const serverError = await bitbucketServerError(repo);
   if (serverError) return { ok: false, error: serverError };
   const creds = await bitbucketCreds(repo.remoteHost);
   if (!Number.isInteger(number) || number <= 0) return { ok: false, error: "pull request number must be positive" };
@@ -1894,7 +1894,7 @@ export async function createBitbucketIssue(
   repo: ProviderRepoInfo,
   input: CreateBitbucketIssueInput,
 ): Promise<BitbucketIssueResponse> {
-  const serverError = bitbucketServerError(repo);
+  const serverError = await bitbucketServerError(repo);
   if (serverError) return { ok: false, error: serverError };
   const creds = await bitbucketCreds(repo.remoteHost);
   const title = input.title.trim();
@@ -1941,7 +1941,7 @@ export async function updateBitbucketIssue(
   number: number,
   patch: UpdateBitbucketIssueInput,
 ): Promise<BitbucketIssueResponse> {
-  const serverError = bitbucketServerError(repo);
+  const serverError = await bitbucketServerError(repo);
   if (serverError) return { ok: false, error: serverError };
   const creds = await bitbucketCreds(repo.remoteHost);
   if (!Number.isInteger(number) || number <= 0) return { ok: false, error: "issue number must be positive" };
@@ -1998,7 +1998,7 @@ function bitbucketViewerAccessHint(status: number, message: string, repo: Provid
  *  means an anonymous "" login rather than an error, same no-token behavior
  *  as the GitHub counterpart). */
 export async function getBitbucketViewer(repo: ProviderRepoInfo): Promise<BitbucketViewerResponse> {
-  const serverError = bitbucketServerError(repo);
+  const serverError = await bitbucketServerError(repo);
   if (serverError) return { ok: false, error: serverError };
   const creds = await bitbucketCreds(repo.remoteHost);
   if (!creds) return { ok: true, login: "" };

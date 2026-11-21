@@ -15,6 +15,9 @@ process.env.AGETOR_CODEX_DRIVER = "fake";
 process.env.AGETOR_CODEX_BIN = "/bin/echo";
 
 beforeAll(async () => {
+  // These tests rely on the fake's default ~20ms resolve window; another file
+  // in the same `bun test` process may have set a longer one.
+  delete process.env.AGETOR_FAKE_CODEX_RESOLVE_DELAY_MS;
   await import("./db.ts");
 });
 
@@ -94,6 +97,10 @@ test("sendInput (codex, busy) queues the follow-up; it spawns after the active t
   // fake's ~20ms resolve window: a follow-up sent in the same tick as start
   // lands while the first turn is still active, so it must queue (no new row
   // yet) and then drain into a second run once the first resolves.
+  // Hold the turn open (the fake's resolve-delay seam) so a loaded host can't
+  // resolve it before the follow-up lands; removed again in the finally below.
+  process.env.AGETOR_FAKE_CODEX_RESOLVE_DELAY_MS = "300";
+  try {
   const { createTask, startTask, sendInput } = await import("./orchestrator.ts");
   const { runs, harnesses } = await import("./db.ts");
   harnesses.setEnabled("codex", true);
@@ -124,6 +131,11 @@ test("sendInput (codex, busy) queues the follow-up; it spawns after the active t
   expect(runs.listForTask(taskId).length).toBe(1);
 
   // After both turns drain, there are exactly two run rows.
-  await settle(200);
+  const deadline = Date.now() + 5000;
+  while (runs.listForTask(taskId).length < 2 && Date.now() < deadline) await settle(25);
+  await settle(100);
   expect(runs.listForTask(taskId).length).toBe(2);
+  } finally {
+    delete process.env.AGETOR_FAKE_CODEX_RESOLVE_DELAY_MS;
+  }
 });

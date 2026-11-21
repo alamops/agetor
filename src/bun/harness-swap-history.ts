@@ -7,31 +7,11 @@
  */
 import { randomUUID } from "node:crypto";
 import type { HarnessSwapEvent, HarnessSwapHistoryPage, HarnessSwapTrigger } from "../shared/types.ts";
-import { db } from "./db.ts";
+import { op } from "./db-async.ts";
+import type { SwapDbRow as SwapRow } from "./db-core/ops/harness-mirror-ops.ts";
 
 export const SWAP_HISTORY_DEFAULT_LIMIT = 50;
 export const SWAP_HISTORY_MAX_LIMIT = 200;
-
-type SwapRow = {
-  id: string;
-  stack_id: string;
-  task_id: string | null;
-  task_title: string | null;
-  from_harness_id: string | null;
-  from_label: string | null;
-  to_harness_id: string | null;
-  to_label: string | null;
-  trigger: string;
-  reason: string | null;
-  source: string | null;
-  message: string | null;
-  model: string | null;
-  resets_at_ms: number | null;
-  from_run_id: string | null;
-  to_run_id: string | null;
-  continuation: string | null;
-  at: number;
-};
 
 const TRIGGERS: ReadonlySet<string> = new Set<HarnessSwapTrigger>([
   "limit", "retry", "manual", "scheduled", "unavailable", "boot-resume", "blocked",
@@ -103,40 +83,22 @@ function decodeCursor(cursor: string | null | undefined): { at: number; id: stri
 }
 
 export const harnessSwapEvents = {
-  insert(e: Omit<HarnessSwapEvent, "id" | "at"> & { at?: number }): HarnessSwapEvent {
+  async insert(e: Omit<HarnessSwapEvent, "id" | "at"> & { at?: number }): Promise<HarnessSwapEvent> {
     assertValid(e);
     const id = randomUUID();
     const at = e.at ?? Date.now();
-    db.run(
-      `INSERT INTO harness_swap_events
-         (id, stack_id, task_id, task_title, from_harness_id, from_label, to_harness_id, to_label,
-          trigger, reason, source, message, model, resets_at_ms, from_run_id, to_run_id, continuation, at)
-       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
-      [
-        id, e.stackId, e.taskId, e.taskTitle, e.fromHarnessId, e.fromLabel, e.toHarnessId, e.toLabel,
-        e.trigger, e.reason, e.source, e.message, e.model, e.resetsAtMs, e.fromRunId, e.toRunId, e.continuation, at,
-      ],
-    );
+    await op("swapEvents.insert", [[
+      id, e.stackId, e.taskId, e.taskTitle, e.fromHarnessId, e.fromLabel, e.toHarnessId, e.toLabel,
+      e.trigger, e.reason, e.source, e.message, e.model, e.resetsAtMs, e.fromRunId, e.toRunId, e.continuation, at,
+    ]]);
     return { ...e, id, at };
   },
   /** Newest first by `(at, id)`; `before` is the previous page's `nextCursor`. */
-  page(stackId: string, opts: { limit?: number; before?: string | null } = {}): HarnessSwapHistoryPage {
+  async page(stackId: string, opts: { limit?: number; before?: string | null } = {}): Promise<HarnessSwapHistoryPage> {
     const requested = Number.isFinite(opts.limit) ? Math.floor(opts.limit as number) : SWAP_HISTORY_DEFAULT_LIMIT;
     const limit = Math.min(Math.max(requested, 1), SWAP_HISTORY_MAX_LIMIT);
     const cursor = decodeCursor(opts.before);
-    const rows = cursor
-      ? db
-          .query<SwapRow, [string, number, string, number]>(
-            `SELECT * FROM harness_swap_events
-              WHERE stack_id = ? AND (at, id) < (?, ?)
-              ORDER BY at DESC, id DESC LIMIT ?`,
-          )
-          .all(stackId, cursor.at, cursor.id, limit + 1)
-      : db
-          .query<SwapRow, [string, number]>(
-            `SELECT * FROM harness_swap_events WHERE stack_id = ? ORDER BY at DESC, id DESC LIMIT ?`,
-          )
-          .all(stackId, limit + 1);
+    const rows = await op("swapEvents.page", [stackId, cursor, limit + 1]);
     const hasMore = rows.length > limit;
     const kept = rows.slice(0, limit);
     // The cursor comes from the last RAW row so a dropped (invalid) row at the
@@ -145,10 +107,7 @@ export const harnessSwapEvents = {
     const events = kept.map(toEvent).filter((ev): ev is HarnessSwapEvent => ev !== null);
     return { events, nextCursor: hasMore && lastRaw ? encodeCursor(lastRaw.at, lastRaw.id) : null };
   },
-  countForStack(stackId: string): number {
-    const row = db
-      .query<{ n: number }, [string]>(`SELECT COUNT(*) AS n FROM harness_swap_events WHERE stack_id = ?`)
-      .get(stackId);
-    return row?.n ?? 0;
+  countForStack(stackId: string): Promise<number> {
+    return op("swapEvents.countForStack", [stackId]);
   },
 };

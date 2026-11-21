@@ -1,8 +1,17 @@
-import { test, expect } from "bun:test";
+import { test, expect, afterEach } from "bun:test";
 import { mkdtempSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import path from "node:path";
 import { randomUUID } from "node:crypto";
+
+// A turn slot / sendTurn the test starts is the code under test: a rejection of
+// it is a failure, not noise. Collected here, asserted empty after every test
+// (an empty `.catch(() => {})` would hide it).
+const backgroundErrors: unknown[] = [];
+const noteBackgroundError = (e: unknown): void => { backgroundErrors.push(e); };
+afterEach(() => {
+  expect(backgroundErrors.splice(0)).toEqual([]);
+});
 
 // Pre-set AGETOR_DATA_DIR before claude-tmux.ts's transitive db.ts import.
 process.env.AGETOR_DATA_DIR = mkdtempSync(path.join(tmpdir(), "agetor-tmux-unknown-cmd-"));
@@ -184,7 +193,7 @@ test("signalUnknownCommand: does NOT clear scrape/death timers (session stays al
   state.scrapeTimer = scrapeTimer;
   state.deathTimer = deathTimer;
   try {
-    __forTest.pushTurnSlot(state, rec.onChunk);
+    void __forTest.pushTurnSlot(state, rec.onChunk).catch(noteBackgroundError);
     state.pendingSlashToken = "/skill-creator";
 
     signalUnknownCommand(state);

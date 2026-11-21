@@ -41,6 +41,11 @@ export interface EventStreamHandlers {
   onMessage?(data: string): void;
   /** Named frames, keyed by the `event:` field. */
   events?: Record<string, (data: string) => void>;
+  /** A connection was established (2xx with a body). Fires on every reconnect. */
+  onOpen?(): void;
+  /** An established connection ended (clean end or error), before the
+   *  reconnect is scheduled. Never fires for a connection that never opened. */
+  onClose?(): void;
   /** Every failure: a network error or a bad HTTP status. */
   onError?(e: unknown): void;
 }
@@ -107,6 +112,13 @@ export function openEventStream(
     } catch { /* a throwing error handler must not kill the reader */ }
   };
 
+  let open = false;
+  const markClosed = (): void => {
+    if (!open) return;
+    open = false;
+    try { handlers.onClose?.(); } catch { /* see reportError */ }
+  };
+
   const dispatch = (frame: SseFrame): void => {
     if (frame.retry !== undefined) serverRetryMs = frame.retry;
     // Before the control-frame return below: an id-only block must advance the
@@ -170,6 +182,8 @@ export function openEventStream(
 
       // Established: a later failure starts the backoff from the bottom again.
       attempt = 0;
+      open = true;
+      try { handlers.onOpen?.(); } catch { /* see reportError */ }
       const decoder = new TextDecoder();
       const parser = createSseParser();
       const reader = res.body.getReader();
@@ -186,9 +200,11 @@ export function openEventStream(
       const tail = decoder.decode();
       if (tail !== "") for (const frame of parser.push(tail)) dispatch(frame);
       if (closed) return;
+      markClosed();
       scheduleReconnect();
     } catch (e) {
       if (closed) return; // our own abort
+      markClosed();
       reportError(e);
       scheduleReconnect();
     }

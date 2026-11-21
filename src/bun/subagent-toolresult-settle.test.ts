@@ -151,17 +151,18 @@ test("settles a subagent whose own file never got end_turn once the main JSONL s
   writeFileSync(jsonlPath, toolUseLaunchLine(toolUseId));
 
   const w = attachSubagentWatcher({ taskId, jsonlPath, manual: true });
+  await w.ready;
   const t0 = Date.now();
-  w.pump(t0);
+  await w.pump(t0);
   // No end_turn in its own file, no tool_result yet — must stay running even
   // way past the idle threshold (this is exactly the pre-fix wedged state).
-  w.pump(t0 + 60_000);
+  await w.pump(t0 + 60_000);
   expect(subagents.get(agentId)!.status).toBe("running");
   expect(settleCalls.length).toBe(0);
 
   // The parent's completion receipt lands in the MAIN transcript.
   appendFileSync(jsonlPath, toolResultLine(toolUseId));
-  w.pump(t0 + 60_001);
+  await w.pump(t0 + 60_001);
   const settled = subagents.get(agentId)!;
   expect(settled.status).toBe("completed");
   expect(settled.endedAt).not.toBeNull();
@@ -171,8 +172,8 @@ test("settles a subagent whose own file never got end_turn once the main JSONL s
   expect(finished[0]!.subagentId).toBe(agentId);
 
   // Idempotency: further pumps re-read nothing and must not re-settle/re-emit.
-  w.pump(t0 + 120_000);
-  w.pump(t0 + 180_000);
+  await w.pump(t0 + 120_000);
+  await w.pump(t0 + 180_000);
   expect(settleCalls).toEqual([taskId]);
   expect(captured.filter((e) => e.stream === "subagent" && JSON.parse(e.data).phase === "finished").length).toBe(1);
 
@@ -208,7 +209,8 @@ test("boot repair: a pre-fix running row with NULL tool_use_id is backfilled fro
   // Fresh attach = the boot path (orchestrator's held-task pass arms exactly
   // this): rehydrate → backfill from meta → first-cycle scan from offset 0.
   const w = attachSubagentWatcher({ taskId, jsonlPath, manual: true });
-  w.pump(Date.now());
+  await w.ready;
+  await w.pump(Date.now());
   const row = subagents.get(agentId)!;
   expect(row.toolUseId).toBe(toolUseId);
   expect(row.status).toBe("completed");
@@ -236,9 +238,10 @@ test("no false settle: the launching tool_use line and a <tool-use-id> notificat
     toolUseLaunchLine(toolUseId) + notificationLine(toolUseId) + toolResultLine(`toolu_other_${randomUUID()}`));
 
   const w = attachSubagentWatcher({ taskId, jsonlPath, manual: true });
+  await w.ready;
   const t0 = Date.now();
-  w.pump(t0);
-  w.pump(t0 + 60_000);
+  await w.pump(t0);
+  await w.pump(t0 + 60_000);
   expect(subagents.get(agentId)!.status).toBe("running");
   expect(settleCalls.length).toBe(0);
 
@@ -256,17 +259,18 @@ test("meta without toolUseId degrades gracefully: unaffected by tool_results, st
   writeFileSync(jsonlPath, toolResultLine(`toolu_unrelated_${randomUUID()}`));
 
   const w = attachSubagentWatcher({ taskId, jsonlPath, manual: true });
+  await w.ready;
   const t0 = Date.now();
-  w.pump(t0);
-  w.pump(t0 + 30_000);
+  await w.pump(t0);
+  await w.pump(t0 + 30_000);
   expect(subagents.get(agentId)!.status).toBe("running");
   expect(subagents.get(agentId)!.toolUseId ?? null).toBeNull();
 
   // The classic path still works for it.
   appendFileSync(file,
     JSON.stringify({ type: "assistant", isSidechain: true, uuid: `end-${randomUUID()}`, message: { role: "assistant", stop_reason: "end_turn", content: [{ type: "text", text: "done" }] } }) + "\n");
-  w.pump(t0 + 30_001);
-  w.pump(t0 + 90_000);
+  await w.pump(t0 + 30_001);
+  await w.pump(t0 + 90_000);
   expect(subagents.get(agentId)!.status).toBe("completed");
 
   w.detach();
@@ -285,7 +289,8 @@ test("resume flip-back is gated by the replay floor: pre-reattach growth stays s
   writeFileSync(jsonlPath, toolResultLine(toolUseId));
 
   const w = attachSubagentWatcher({ taskId, jsonlPath, manual: true });
-  w.pump(Date.now());
+  await w.ready;
+  await w.pump(Date.now());
   expect(subagents.get(agentId)!.status).toBe("completed");
   // One "started" lifecycle from `w`'s own discovery of the file, before it
   // ever settled — the baseline every later count is compared against, since
@@ -305,8 +310,9 @@ test("resume flip-back is gated by the replay floor: pre-reattach growth stays s
     JSON.stringify({ type: "assistant", isSidechain: true, uuid: `r-${randomUUID()}`, message: { role: "assistant", stop_reason: "tool_use", content: [{ type: "tool_use", id: "t9", name: "Bash", input: { command: "ls" } }] } }) + "\n");
   w.detach();
   const w2 = attachSubagentWatcher({ taskId, jsonlPath, manual: true });
+  await w2.ready;
   const t1 = Date.now();
-  w2.pump(t1);
+  await w2.pump(t1);
   expect(subagents.get(agentId)!.status).toBe("completed");
   // The gap-grown line's content still made it through...
   expect(captured.some((e) => e.stream === "tool_use" && e.subagentId === agentId)).toBe(true);
@@ -314,7 +320,7 @@ test("resume flip-back is gated by the replay floor: pre-reattach growth stays s
   // never flipped back to running.
   expect(startedForAgent()).toBe(1);
   // Stays settled on further pumps too, not just the first.
-  w2.pump(t1 + 60_000);
+  await w2.pump(t1 + 60_000);
   expect(subagents.get(agentId)!.status).toBe("completed");
   expect(startedForAgent()).toBe(1);
   w2.detach();
@@ -334,9 +340,10 @@ test("resume flip-back is gated by the replay floor: pre-reattach growth stays s
   });
 
   const w3 = attachSubagentWatcher({ taskId, jsonlPath, manual: true });
+  await w3.ready;
   writeFileSync(file2,
     JSON.stringify({ type: "assistant", isSidechain: true, uuid: `r2-${randomUUID()}`, message: { role: "assistant", stop_reason: "tool_use", content: [{ type: "tool_use", id: "t10", name: "Bash", input: { command: "ls" } }] } }) + "\n");
-  w3.pump(Date.now());
+  await w3.pump(Date.now());
   expect(subagents.get(agentId2)!.status).toBe("running");
   expect(
     captured.some(
@@ -367,14 +374,15 @@ test("late discovery rewinds the scan: a tool_result consumed before its agent's
   writeFileSync(jsonlPath, toolResultLine(toolUseB));
 
   const w = attachSubagentWatcher({ taskId, jsonlPath, manual: true });
+  await w.ready;
   const t0 = Date.now();
-  w.pump(t0); // A pending → scan reads (and passes) B's tool_result
+  await w.pump(t0); // A pending → scan reads (and passes) B's tool_result
   expect(subagents.get(agentA)!.status).toBe("running");
 
   // B's file materializes late (readdir-visibility race). discover() must
   // rewind the scan offset so B's already-consumed tool_result is re-read.
   writeSubagent(subagentsDir, agentB, toolUseB);
-  w.pump(t0 + 1);
+  await w.pump(t0 + 1);
   expect(subagents.get(agentB)!.status).toBe("completed");
   expect(subagents.get(agentA)!.status).toBe("running"); // no collateral settle
   expect(settleCalls).toEqual([taskId]);

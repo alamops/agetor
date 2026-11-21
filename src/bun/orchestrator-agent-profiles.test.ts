@@ -408,7 +408,7 @@ test("effectiveAgentProfile: null for a plain task; live before any run; snapsho
   });
   if ("error" in plain) throw new Error(plain.error);
   try {
-    expect(effectiveAgentProfile(plain.task)).toBeNull();
+    expect(await effectiveAgentProfile(plain.task)).toBeNull();
   } finally {
     db.run(`DELETE FROM tasks WHERE id = ?`, [plain.task.id]);
   }
@@ -437,7 +437,7 @@ test("effectiveAgentProfile: null for a plain task; live before any run; snapsho
     agentProfiles.update(liveProfile.id, { model: "model-v2", instructions: "v2" });
     const freshTask = tasks.get(liveTaskId);
     if (!freshTask) throw new Error("task vanished");
-    const resolved = effectiveAgentProfile(freshTask);
+    const resolved = await effectiveAgentProfile(freshTask);
     expect(resolved).not.toBeNull();
     if (resolved) {
       expect(resolved.source).toBe("live");
@@ -468,7 +468,7 @@ test("effectiveAgentProfile: null for a plain task; live before any run; snapsho
 
     const afterRunTask = tasks.get(liveTaskId);
     if (!afterRunTask) throw new Error("task vanished");
-    const afterRun = effectiveAgentProfile(afterRunTask);
+    const afterRun = await effectiveAgentProfile(afterRunTask);
     expect(afterRun).not.toBeNull();
     if (afterRun) {
       expect(afterRun.source).toBe("snapshot");
@@ -502,7 +502,7 @@ test("effectiveAgentProfile: null for a plain task; live before any run; snapsho
     agentProfiles.delete(deletedProfile.id);
     const freshTask = tasks.get(deletedTaskId);
     if (!freshTask) throw new Error("task vanished");
-    const resolved = effectiveAgentProfile(freshTask);
+    const resolved = await effectiveAgentProfile(freshTask);
     expect(resolved).not.toBeNull();
     if (resolved) {
       expect(resolved.source).toBe("snapshot");
@@ -538,7 +538,7 @@ test("effectiveAgentProfile: null for a plain task; live before any run; snapsho
     agentProfiles.update(orphanHarnessProfile.id, { harness: "not-a-real-harness-id" });
     const freshTask = tasks.get(orphanTaskId);
     if (!freshTask) throw new Error("task vanished");
-    const resolved = effectiveAgentProfile(freshTask);
+    const resolved = await effectiveAgentProfile(freshTask);
     expect(resolved).not.toBeNull();
     if (resolved) {
       expect(resolved.source).toBe("snapshot");
@@ -835,6 +835,40 @@ test("sendInput on a task with a profile does not inject the preamble — the fo
     expect(followUpUser?.data).not.toContain("This should never leak");
   } finally {
     db.run(`DELETE FROM tasks WHERE id = ?`, [taskId]);
+    agentProfiles.delete(profile.id);
+  }
+});
+
+test("the first-start copy-down is guarded: a profile detached after the read is not re-attached (review N1)", async () => {
+  const { createTask } = await import("./orchestrator.ts");
+  const { db, agentProfiles, tasks } = await import("./db.ts");
+  const { op } = await import("./db-rpc.ts");
+  const profile = agentProfiles.insert({
+    name: uniqueProfileName("copydown-guard"), harness: "claude-code", model: "m-guard", effort: "high",
+    mode: "auto", speed: "off", maxMode: false, instructions: "i", skills: [],
+  });
+  try {
+    const created = await createTask({ title: "guard", prompt: "p", workdir: process.cwd(), isolation: "none", agentProfileId: profile.id });
+    if ("error" in created) throw new Error(created.error);
+    const taskId = created.task.id;
+    const snapshot = created.task.agentProfile!;
+    const fields = { agent: "claude-code", model: "m-after-detach", effort: "high", mode: "auto", speed: "off" as const, maxMode: false, opencodeServer: "shared" as const };
+
+    // The user detaches between the read and the write.
+    tasks.setAgentProfile(taskId, null, null);
+    expect(await op("orchestrator.copyDownProfile", [taskId, fields, snapshot])).toBeNull();
+    const detached = tasks.get(taskId)!;
+    expect(detached.agentProfileId).toBeNull();
+    expect(detached.agentProfile).toBeNull();
+    expect(detached.model).toBe("m-guard");
+
+    // Still bound: the copy-down applies.
+    tasks.setAgentProfile(taskId, profile.id, snapshot);
+    const applied = await op("orchestrator.copyDownProfile", [taskId, fields, snapshot]);
+    expect(applied?.model).toBe("m-after-detach");
+    expect(tasks.get(taskId)!.agentProfileId).toBe(profile.id);
+    db.run(`DELETE FROM tasks WHERE id = ?`, [taskId]);
+  } finally {
     agentProfiles.delete(profile.id);
   }
 });

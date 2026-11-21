@@ -700,6 +700,51 @@ async function gatePaths(
   return jsonResponse(body, status, opts.cors(req));
 }
 
+/**
+ * A database call that failed because the database worker crashed and is
+ * restarting (`DbRestartingError`) or cannot be reached (`DbUnavailableError`;
+ * both in `db-rpc.ts`). Matched by name so this module stays free of the
+ * database layer: `db-rpc.ts` creates both on the main thread and sets `name`.
+ * A handler that catches every error to answer its own 500 rethrows these, so
+ * the routes layer answers them (see {@link applyRoutePolicy}).
+ */
+export function isDbWorkerError(err: unknown): err is Error {
+  return err instanceof Error && (err.name === "DbRestartingError" || err.name === "DbUnavailableError");
+}
+
+/** The 503 a route answers when its database call hit a worker crash, or the
+ *  database is unavailable. `Retry-After: 1` goes only on a safe method (GET,
+ *  HEAD): the outcome of a write that was in flight is unknown, so the answer
+ *  to any other method must not invite a third-party retry. */
+function dbWorkerErrorResponse(err: Error, req: Request, opts: RoutePolicyOptions): Response {
+  if (err.name === "DbRestartingError") {
+    const safe = req.method === "GET" || req.method === "HEAD";
+    return jsonResponse(
+      { error: "database restarting", code: "db-restarting" },
+      503,
+      safe ? { ...opts.cors(req), "retry-after": "1" } : opts.cors(req),
+    );
+  }
+  return jsonResponse({ error: "database unavailable", code: "db-unavailable" }, 503, opts.cors(req));
+}
+
+/** Run a route handler, answering a database worker failure (thrown or
+ *  rejected) with its 503. Any other error propagates unchanged. Never
+ *  retries: the failed call's outcome is unknown (db-rpc.ts, OUTCOME UNKNOWN). */
+async function runHandler(
+  handler: Handler,
+  req: Request,
+  rest: unknown[],
+  opts: RoutePolicyOptions,
+): Promise<Response> {
+  try {
+    return await handler(req, ...rest);
+  } catch (err) {
+    if (isDbWorkerError(err)) return dbWorkerErrorResponse(err, req, opts);
+    throw err;
+  }
+}
+
 function wrapHandler(
   handler: Handler,
   policy: RoutePolicy,
@@ -717,9 +762,9 @@ function wrapHandler(
     if (req.method === "OPTIONS") {
       return functionValued
         ? new Response(null, { headers: opts.cors(req) })
-        : handler(req, ...rest);
+        : runHandler(handler, req, rest, opts);
     }
-    if (policy.callers === "public") return handler(req, ...rest);
+    if (policy.callers === "public") return runHandler(handler, req, rest, opts);
 
     const caller = resolveCaller(req, policy);
     if (caller === null) {
@@ -741,7 +786,7 @@ function wrapHandler(
       if (refused) return refused;
     }
     callers.set(req, caller);
-    return handler(req, ...rest);
+    return runHandler(handler, req, rest, opts);
   };
 }
 
@@ -754,7 +799,11 @@ function wrapHandler(
  * `public` passes → no valid credential → 401 → CLI token on a desktop-only
  * route → 501 (`headless501` on a headless core) or 403 `desktop-only` → CLI
  * token with `pathParams` → the path gate (403 `path-not-accessible`) → the
- * handler, with the caller readable through `callerOf(req)`.
+ * handler, with the caller readable through `callerOf(req)`. A handler whose
+ * database call failed on a worker crash answers 503: `DbRestartingError` →
+ * `{error: "database restarting", code: "db-restarting"}` (with `Retry-After: 1` on GET and HEAD only),
+ * `DbUnavailableError` → `{error: "database unavailable", code: "db-unavailable"}`
+ * ({@link isDbWorkerError}); every other error propagates.
  *
  * Throws, so the server refuses to start, when a route key has no policy
  * entry, a (non-`conditional`) entry has no route, a function-valued route has

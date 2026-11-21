@@ -1,6 +1,6 @@
 import { mkdirSync } from "node:fs";
 import path from "node:path";
-import { dataDir, harnesses, preferences } from "./db.ts";
+import { dataDir, harnesses, preferences } from "./db-async.ts";
 import { harnessEnv, resolveBin } from "./agents.ts";
 import { cachedCliVersion, checkHarness, peekCachedCliVersion } from "./agent-status.ts";
 import { copilotHome } from "./copilot-home.ts";
@@ -79,9 +79,8 @@ const DEFAULT_PERIODIC_MS = 15 * 60_000;
  * app-server discovery landing (codex's catalog is account-scoped exactly
  * like fx's — see `discoverCodex`'s doc comment in agent-discovery.ts).
  */
-function discoveryTargets(): HarnessTarget[] {
-  return harnesses
-    .list()
+async function discoveryTargets(): Promise<HarnessTarget[]> {
+  return (await harnesses.list())
     .filter((h) => h.enabled !== false && isPerHarnessKind(h.kind))
     .map((h) => ({ harnessId: h.id, kind: h.kind as PerHarnessKind, env: harnessEnv(h), bin: resolveBin(h) }));
 }
@@ -118,12 +117,13 @@ function modelsForHarness(harnessId: string, kind: AgentKind): DiscoveredModel[]
  * ids that changed — never throws (a broadcast failure or a DB hiccup here
  * must never fail the refresh call that triggered it).
  */
-function publishIfChanged(): void {
+async function publishIfChanged(): Promise<void> {
   try {
+    const rows = await harnesses.list();
     const isFirstPublish = previousSnapshot === null;
     const current = new Map<string, string>();
     const changed: string[] = [];
-    for (const h of harnesses.list()) {
+    for (const h of rows) {
       if (h.enabled === false) continue;
       const key = snapshotKey(modelsForHarness(h.id, h.kind));
       current.set(h.id, key);
@@ -279,10 +279,18 @@ let hydrated = false;
 /** Latest `{available, version, loggedIn}` per harness id, from `noteHarnessStatuses`. */
 const knownStatus = new Map<string, { available: boolean; version: string | null; loggedIn: boolean | null }>();
 
-/** The harness whose state a cache slot reflects. */
+/** Harness rows by id, for the synchronous settle hook (`settleCatalog` is called
+ *  from inside a probe's settle and cannot await). Reloaded at the start of every
+ *  refresh and status note, so it is as fresh as the sweep that uses it. */
+let harnessCache = new Map<string, Harness>();
+
+async function refreshHarnessCache(): Promise<void> {
+  harnessCache = new Map((await harnesses.list()).map((h) => [h.id, h]));
+}
+
+/** The harness whose state a cache slot reflects (a kind's built-in row has the kind as its id). */
 function harnessForKey(key: DiscoveryCacheKey): Harness | null {
-  if (key.scope === "harness") return harnesses.get(key.harnessId);
-  return harnesses.get(key.kind);
+  return harnessCache.get(key.scope === "harness" ? key.harnessId : key.kind) ?? null;
 }
 
 function currentCliVersion(harness: Harness | null): string | null {
@@ -301,8 +309,14 @@ function persistCatalog(prefKey: string, models: DiscoveredModel[], cliVersion: 
   if (have && have.fingerprint === fingerprint && have.cliVersion === cliVersion) return;
   try {
     const value: StoredCatalog = { v: 1, cliVersion, savedAt: Date.now(), models: clean };
-    preferences.set(prefKey, JSON.stringify(value));
+    // `persisted` moves now so an identical settle right behind this one writes
+    // nothing; the write itself is posted (the settle hook is synchronous) and
+    // the worker applies it in call order, ahead of any later drop of this key.
     persisted.set(prefKey, { cliVersion, fingerprint });
+    void preferences.set(prefKey, JSON.stringify(value)).catch((err) => {
+      persisted.delete(prefKey);
+      console.error("[agetor] could not persist the model catalog:", err instanceof Error ? err.message : err);
+    });
   } catch (err) {
     console.error("[agetor] could not persist the model catalog:", err instanceof Error ? err.message : err);
   }
@@ -310,9 +324,8 @@ function persistCatalog(prefKey: string, models: DiscoveredModel[], cliVersion: 
 
 function dropPersisted(prefKey: string): void {
   persisted.delete(prefKey);
-  try {
-    preferences.delete(prefKey);
-  } catch { /* nothing to drop */ }
+  // Posted, not awaited (called from the synchronous settle hook).
+  void preferences.delete(prefKey).catch(() => { /* nothing to drop */ });
 }
 
 /**
@@ -364,17 +377,25 @@ function settleCatalog(
 }
 
 /**
- * Seed the in-memory caches from the persisted catalogs, once, synchronously
- * (before the first sweep's first `await`) so a `GET /agent-models` right
- * after boot already has rows. Rows that fail validation are ignored; harness
+ * Seed the in-memory caches from the persisted catalogs, once, before the first
+ * probe, so a `GET /agent-models` right after boot has rows as soon as the read
+ * lands. Concurrent callers share the one read. Rows that fail validation are ignored; harness
  * keys are honored only for an existing, enabled harness. A built-in
  * per-harness kind's harness row also seeds its kind-level slot.
  */
-function hydrateFromStore(): void {
-  if (hydrated) return;
+let hydrating: Promise<void> | null = null;
+
+function hydrateFromStore(): Promise<void> {
+  if (hydrated) return hydrating ?? Promise.resolve();
   hydrated = true;
+  hydrating = hydrateNow().finally(() => { hydrating = null; });
+  return hydrating;
+}
+
+async function hydrateNow(): Promise<void> {
   try {
-    for (const [prefKey, value] of Object.entries(preferences.list())) {
+    await refreshHarnessCache();
+    for (const [prefKey, value] of Object.entries(await preferences.list())) {
       if (!prefKey.startsWith(MODEL_CATALOG_PREF_PREFIX)) continue;
       const rest = prefKey.slice(MODEL_CATALOG_PREF_PREFIX.length);
       const stored = parseStored(value);
@@ -386,7 +407,7 @@ function hydrateFromStore(): void {
         if (stored.models.length > 0) seedDiscoveryCache({ scope: "kind", kind: kind as AgentKind }, stored.models);
       } else if (rest.startsWith("harness:")) {
         const harnessId = rest.slice("harness:".length);
-        const harness = harnesses.get(harnessId);
+        const harness = harnessCache.get(harnessId);
         if (!harness || harness.enabled === false || !isPerHarnessKind(harness.kind)) continue;
         persisted.set(prefKey, { cliVersion: stored.cliVersion, fingerprint: JSON.stringify(stored.models) });
         if (stored.models.length === 0) continue;
@@ -424,7 +445,7 @@ function probeCwd(): string | undefined {
 async function kindTargets(opts: { sweep?: boolean } = {}): Promise<Partial<Record<AgentKind, KindProbeTarget>>> {
   const out: Partial<Record<AgentKind, KindProbeTarget>> = {};
   const cwd = probeCwd();
-  const claude = harnesses.get("claude-code");
+  const claude = await harnesses.get("claude-code");
   if (claude && claude.enabled !== false) {
     let skip = false;
     try {
@@ -435,7 +456,7 @@ async function kindTargets(opts: { sweep?: boolean } = {}): Promise<Partial<Reco
     }
     out["claude-code"] = { env: harnessEnv(claude), bin: resolveBin(claude), ...(cwd ? { cwd } : {}), skip };
   }
-  const copilot = harnesses.get("copilot");
+  const copilot = await harnesses.get("copilot");
   if (copilot && copilot.enabled !== false) {
     // A boot or periodic sweep never re-opens an ACP session for a catalog
     // it already holds: `session/new` can leave a record under the user's
@@ -493,11 +514,11 @@ function installSettleHook(): void {
 export async function refreshAllModels(): Promise<void> {
   try {
     installSettleHook();
-    // Synchronous, before the first await: the persisted catalog is served
-    // from the moment the sweep starts, not after its probes finish.
-    hydrateFromStore();
+    // The persisted catalog is served as soon as it is read, before the probes run.
+    await hydrateFromStore();
+    await refreshHarnessCache();
     await refreshDiscoveredModels({ fxHarnesses: discoveryTargets, kindTargets: () => kindTargets({ sweep: true }) });
-    publishIfChanged();
+    await publishIfChanged();
   } catch (err) {
     console.error("[agetor] model discovery failed:", err);
   }
@@ -519,11 +540,12 @@ export async function refreshAllModels(): Promise<void> {
  * a logged no-op.
  */
 export async function refreshHarnessModels(harnessId: string): Promise<void> {
-  const harness = harnesses.get(harnessId);
+  const harness = await harnesses.get(harnessId);
   if (!harness) return;
   try {
     installSettleHook();
-    hydrateFromStore();
+    await hydrateFromStore();
+    await refreshHarnessCache();
     if (isPerHarnessKind(harness.kind)) {
       await refreshHarnessTarget({
         harnessId: harness.id,
@@ -538,7 +560,7 @@ export async function refreshHarnessModels(harnessId: string): Promise<void> {
     } else {
       await refreshKindModels(harness.kind);
     }
-    publishIfChanged();
+    await publishIfChanged();
   } catch (err) {
     console.error("[agetor] model discovery failed:", err);
   }
@@ -555,7 +577,7 @@ export async function refreshHarnessModels(harnessId: string): Promise<void> {
  * route used to call just to exercise its own pruning-by-absence logic.
  * Never throws, matching every other scheduler entry point.
  */
-export function noteHarnessRemoved(harnessId: string): void {
+export async function noteHarnessRemoved(harnessId: string): Promise<void> {
   try {
     pruneHarnessDiscovery(harnessId);
     dropPersisted(`${MODEL_CATALOG_PREF_PREFIX}harness:${harnessId}`);
@@ -567,7 +589,7 @@ export function noteHarnessRemoved(harnessId: string): void {
       clearTimeout(timer);
       pendingDebounce.delete(harnessId);
     }
-    publishIfChanged();
+    await publishIfChanged();
   } catch (err) {
     console.error("[agetor] model discovery failed:", err);
   }
@@ -581,9 +603,9 @@ export function noteHarnessRemoved(harnessId: string): void {
  * false until the first full sweep has settled, so the webview's boot-race
  * retry can tell "hasn't run yet" apart from "ran and found nothing".
  */
-export function getHarnessModelMap(): { ready: boolean; byHarness: Record<string, DiscoveredModel[]> } {
+export async function getHarnessModelMap(): Promise<{ ready: boolean; byHarness: Record<string, DiscoveredModel[]> }> {
   const byHarness: Record<string, DiscoveredModel[]> = {};
-  for (const h of harnesses.list()) {
+  for (const h of await harnesses.list()) {
     if (h.enabled === false) continue;
     byHarness[h.id] = modelsForHarness(h.id, h.kind);
   }
@@ -607,7 +629,7 @@ const pendingDebounce = new Map<string, ReturnType<typeof setTimeout>>();
  *  different (non-null) CLI version than the one just observed. */
 function storedVersionDiffers(s: HarnessStatus): boolean {
   if (!s.version) return false;
-  const harness = harnesses.get(s.harnessId);
+  const harness = harnessCache.get(s.harnessId);
   if (!harness) return false;
   const prefKey = isPerHarnessKind(harness.kind)
     ? `${MODEL_CATALOG_PREF_PREFIX}harness:${harness.id}`
@@ -658,8 +680,10 @@ function scheduleDebouncedRefresh(harnessId: string): void {
  * for the next poll — this is the backstop for any harness removal that
  * doesn't route through it.) Never throws.
  */
-export function noteHarnessStatuses(statuses: HarnessStatus[]): void {
+export async function noteHarnessStatuses(statuses: HarnessStatus[]): Promise<void> {
   try {
+    // One harness read up front: `storedVersionDiffers` below is synchronous.
+    await refreshHarnessCache();
     const seen = new Set<string>();
     for (const s of statuses) {
       seen.add(s.harnessId);
@@ -726,6 +750,8 @@ export function stopPeriodicDiscovery(): void {
 
 function resetForTests(): void {
   hydrated = false;
+  hydrating = null;
+  harnessCache = new Map();
   persisted.clear();
   knownStatus.clear();
   setDiscoverySettleHook(null);

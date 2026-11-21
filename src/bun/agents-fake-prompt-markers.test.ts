@@ -118,7 +118,7 @@ describe("registerFakePromptPane / clearFakePromptPane", () => {
     delete process.env.AGETOR_CLAUDE_DRIVER;
     try {
       const taskId = randomUUID();
-      registerFakePromptPane(taskId, { text: "Press Enter to continue…", onKeys: () => { throw new Error("must not be reached"); } });
+      await registerFakePromptPane(taskId, { text: "Press Enter to continue…", onKeys: () => { throw new Error("must not be reached"); } });
       expect(activeTmuxPromptsForTask(taskId)).toEqual([]);
       clearFakePromptPane(taskId);
     } finally {
