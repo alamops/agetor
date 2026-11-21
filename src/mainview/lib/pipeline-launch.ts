@@ -5,7 +5,7 @@
  * The server is authoritative — `createTask`/`startPipelineRun` re-validate
  * the graph, the start step and the harness gates on every launch (see
  * `src/bun/orchestrator.ts`'s "pipeline" block and `startTaskInner`). This
- * helper exists so the dialog can block **Create & start** and explain why
+ * helper exists so the dialog can block **Run task** and explain why
  * BEFORE submitting: `createAndStartTask` rolls a created parent back when
  * the start fails, so a bad graph or an unavailable harness would otherwise
  * cost a create-then-delete round trip and surface only as a submit error.

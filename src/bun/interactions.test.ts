@@ -1350,3 +1350,83 @@ test("the fallback parent lookup nudges the PARENT's decoration so its folded ba
     db.run(`DELETE FROM tasks WHERE id IN ('fb-parent', 'fb-step')`);
   }
 });
+
+/* ── answerKind / held / pane-text redaction (docs/plans/claude-enter-to-confirm-prompts.md T2) ── */
+
+test("registerTmuxPrompt masks a typed OAuth code in the stored, broadcast and listed pane text", async () => {
+  const { registerTmuxPrompt, listPendingForTask, setBroadcaster } = await import("./interactions.ts");
+  const broadcasted: unknown[] = [];
+  setBroadcaster((req) => broadcasted.push(req));
+  const { req } = registerTmuxPrompt({
+    taskId: "tRedact", runId: "rR",
+    paneText: "Browser didn't open?\n Paste code here if prompted > abc123-synthetic#xyz",
+    choices: [], fingerprint: "fp-redact", answerKind: "code",
+  });
+  expect(req.paneText).toContain("Paste code here if prompted > ••••");
+  expect(JSON.stringify(req)).not.toContain("abc123");
+  expect(JSON.stringify(broadcasted)).not.toContain("abc123");
+  expect(JSON.stringify(listPendingForTask("tRedact"))).not.toContain("abc123");
+  setBroadcaster(() => {});
+});
+
+test("registerTmuxPrompt leaves a pane text without a code prompt byte-identical", async () => {
+  const { registerTmuxPrompt } = await import("./interactions.ts");
+  const text = "Do you want to proceed?\n ❯ 1. Yes\n   2. No";
+  const { req } = registerTmuxPrompt({
+    taskId: "tRedactNone", runId: "rR", paneText: text,
+    choices: [{ key: "1", label: "Yes" }, { key: "2", label: "No" }], fingerprint: "fp-redact-none",
+  });
+  expect(req.paneText).toBe(text);
+});
+
+test("registerTmuxPrompt carries answerKind enter/code and held, and omits them for a plain choice card", async () => {
+  const { registerTmuxPrompt } = await import("./interactions.ts");
+  const enter = registerTmuxPrompt({
+    taskId: "tKind", runId: "rK", paneText: "Login successful. Press Enter to continue…",
+    choices: [], fingerprint: "fp-kind-enter", answerKind: "enter",
+  }).req;
+  expect(enter.answerKind).toBe("enter");
+  expect(enter.held).toBeUndefined();
+  const code = registerTmuxPrompt({
+    taskId: "tKind", runId: "rK", paneText: "Paste code here if prompted >",
+    choices: [], fingerprint: "fp-kind-code", answerKind: "code",
+  }).req;
+  expect(code.answerKind).toBe("code");
+  const held = registerTmuxPrompt({
+    taskId: "tKind", runId: "rK", paneText: "x",
+    choices: [{ key: "1", label: "No, exit" }, { key: "2", label: "Yes, add it" }],
+    fingerprint: "fp-kind-held", held: true,
+  }).req;
+  expect(held.held).toBe(true);
+  expect(held.answerKind).toBeUndefined();
+  const plain = registerTmuxPrompt({
+    taskId: "tKind", runId: "rK", paneText: "x", choices: [{ key: "1", label: "Y" }], fingerprint: "fp-kind-plain",
+    answerKind: "choice",
+  }).req;
+  expect(plain.answerKind).toBeUndefined();
+  expect(JSON.parse(JSON.stringify(enter)).answerKind).toBe("enter");
+});
+
+test("registerTmuxPrompt refuses answerKind enter/code with choices or unparsable", async () => {
+  const { registerTmuxPrompt } = await import("./interactions.ts");
+  for (const answerKind of ["enter", "code"] as const) {
+    expect(() => registerTmuxPrompt({
+      taskId: "tKindBad", runId: "r", paneText: "x", choices: [{ key: "1", label: "Y" }],
+      fingerprint: `fp-bad-${answerKind}-1`, answerKind,
+    })).toThrow(/takes no choices/);
+    expect(() => registerTmuxPrompt({
+      taskId: "tKindBad", runId: "r", paneText: "x", choices: [], unparsable: true,
+      fingerprint: `fp-bad-${answerKind}-2`, answerKind,
+    })).toThrow(/never unparsable/);
+  }
+});
+
+test("the answer sentinels are reserved: a choice key may not start with __", async () => {
+  const { registerTmuxPrompt, TMUX_ENTER_ANSWER, TMUX_CODE_ANSWER } = await import("./interactions.ts");
+  expect(TMUX_ENTER_ANSWER).toBe("__enter__");
+  expect(TMUX_CODE_ANSWER).toBe("__code__");
+  expect(() => registerTmuxPrompt({
+    taskId: "tSent", runId: "r", paneText: "x", choices: [{ key: TMUX_ENTER_ANSWER, label: "x" }, { key: "2", label: "y" }],
+    fingerprint: "fp-sent",
+  })).toThrow(/reserved/);
+});

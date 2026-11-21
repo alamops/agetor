@@ -1,8 +1,9 @@
-import { useEffect, useMemo, useRef, useState } from "react";
+import { useEffect, useId, useMemo, useRef, useState } from "react";
 import type { Dispatch, ReactNode, RefObject, SetStateAction } from "react";
 import { api, type AvailableCommand, type AvailableExtension } from "@/lib/api";
 import { mergeAgentCapabilities } from "@/lib/agent-capabilities";
 import { Textarea } from "@/components/ui/textarea";
+import { FieldLabel } from "@/components/ui/field";
 import { cn } from "@/lib/utils";
 import type { SavedPrompt, TaskReference } from "../../../shared/types.ts";
 import {
@@ -29,7 +30,7 @@ import {
 } from "@/lib/use-project-files";
 import { mapWithConcurrency } from "@/lib/map-with-concurrency";
 import { spliceAtSelection, readCaret, restoreCaret } from "@/lib/textarea-insert";
-import { unresolvedAtTokens, isSafeClientRelPath, isListedPath } from "@/lib/at-highlight";
+import { unresolvedAtTokens, isSafeClientRelPath, isListedPath, isHandleLikeAtToken } from "@/lib/at-highlight";
 import { multiScopeStatTargets } from "@/lib/at-scope-targets";
 
 /** Stable empty set so clearing the on-disk override doesn't churn state
@@ -504,6 +505,12 @@ export interface PromptComposerProps {
    *  `"prompt-textarea"`, matching every existing consumer/e2e locator;
    *  RunPanel uses `"send-textarea"` to stay distinguishable. */
   textareaTestId?: string;
+  /** Accessible name for the textarea when `label` is `null` (no visible
+   *  `<label>`): RunPanel's send box passes "Message". */
+  textareaAriaLabel?: string;
+  /** Right-aligned cluster at the END of the toolbar row, after `actions` —
+   *  RunPanel puts its Send button here so the actions and Send share a row. */
+  toolbarEnd?: ReactNode;
   /**
    * External override for the hint line normally driven by
    * `activeCapture.dropHint`. `undefined` (the default) leaves that
@@ -514,7 +521,7 @@ export interface PromptComposerProps {
    */
   hint?: string | null;
   /** Extra className merged (via `cn`) onto the hint paragraph's default
-   *  `"text-[10px] text-muted-foreground"` — applies whether the rendered
+   *  `"text-3xs text-muted-foreground"` — applies whether the rendered
    *  text comes from `hint` or from `activeCapture.dropHint`. RunPanel
    *  passes `"mt-1"` so its dock's hint line keeps the same rendered class
    *  list it had before this prop existed. */
@@ -564,6 +571,8 @@ export function PromptComposer({
   onFocus,
   textareaClassName,
   textareaTestId = "prompt-textarea",
+  textareaAriaLabel,
+  toolbarEnd,
   hint,
   hintClassName,
 }: PromptComposerProps) {
@@ -650,7 +659,9 @@ export function PromptComposer({
   // default classes the same way regardless of which source the text came
   // from — see that prop's doc.
   const hintText = hint !== undefined ? hint : activeCapture.dropHint;
-  const hintClass = cn("text-[10px] text-muted-foreground", hintClassName);
+  const hintClass = cn("text-3xs text-muted-foreground", hintClassName);
+  // The label row's `<label htmlFor>` points here (the textarea's id).
+  const textareaId = `prompt-composer-${useId()}`;
 
   const referencesPicker = (
     <ReferencesPicker
@@ -723,7 +734,9 @@ export function PromptComposer({
   const unlistedTokens = useMemo(() => {
     if (!hasFileScope || projectFiles.loading || projectFiles.error) return [];
     if (projectFiles.entries.length === 0) return [];
-    return unresolvedAtTokens(value, projectFiles.validPaths).filter((t) => !extensionNames.has(t.path));
+    return unresolvedAtTokens(value, projectFiles.validPaths).filter(
+      (t) => !extensionNames.has(t.path) && !isHandleLikeAtToken(t.path),
+    );
   }, [hasFileScope, projectFiles.loading, projectFiles.error, projectFiles.entries.length, projectFiles.validPaths, value, extensionNames]);
   // Paths the live-scope stat check confirmed on disk, keyed by token path
   // with any trailing "/" stripped.
@@ -967,7 +980,9 @@ export function PromptComposer({
       {hasFileScope && <AtHighlightBackdrop textareaRef={ref} value={value} validPaths={highlightValidPaths} />}
       <Textarea
         ref={ref}
+        id={textareaId}
         data-testid={textareaTestId}
+        aria-label={label === null ? textareaAriaLabel : undefined}
         placeholder={placeholder}
         value={value}
         onChange={(e) => { onChange(e.target.value); if (activeCapture.dropHint) activeCapture.clearDropHint(); }}
@@ -1033,8 +1048,8 @@ export function PromptComposer({
       <div className={innerClassName}>
         {notice}
         {toolbar && (
-          <div className="flex items-center justify-between gap-2">
-            {label !== null && <label className="text-muted-foreground">{label}</label>}
+          <div className="flex flex-wrap items-center justify-between gap-x-2 gap-y-1.5">
+            {label !== null && <FieldLabel htmlFor={textareaId}>{label}</FieldLabel>}
             <ExtensionPicker
               extensions={extensions}
               savedPrompts={savedPrompts}
@@ -1046,13 +1061,14 @@ export function PromptComposer({
               align={actions ? "left" : "right"}
               disabled={disabled || !fileScope?.dir?.trim()}
             />
-            {actions && <div className="flex items-center gap-2">{actions}</div>}
+            {actions && <div className="flex flex-wrap items-center gap-1.5">{actions}</div>}
+            {toolbarEnd && <div className="ml-auto flex shrink-0 items-center gap-2">{toolbarEnd}</div>}
           </div>
         )}
         {textareaRow}
         {hintText && <p className={hintClass}>{hintText}</p>}
         {unresolvedWarning && (
-          <p data-testid="at-unresolved-warning" className={cn("text-[10px] text-warning", hintClassName)}>
+          <p data-testid="at-unresolved-warning" className={cn("text-3xs text-warning", hintClassName)}>
             {unresolvedWarning}
           </p>
         )}

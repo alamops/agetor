@@ -1,9 +1,11 @@
 import { useEffect, useRef, useState, type KeyboardEvent } from "react";
-import { AlertCircle, Loader2, X } from "lucide-react";
+import { AlertCircle, Loader2 } from "lucide-react";
 import { toast } from "sonner";
 import { ApiError, api } from "@/lib/api";
 import { Button } from "@/components/ui/button";
-import { Dialog } from "@/components/ui/dialog";
+import { Dialog, DialogBody, DialogClose, DialogFooter, DialogHeader, DialogTitle } from "@/components/ui/dialog";
+import { Field, FieldLabel } from "@/components/ui/field";
+import { Notice } from "@/components/ui/notice";
 import { Input } from "@/components/ui/input";
 import { Select } from "@/components/ui/select";
 import { Switch } from "@/components/ui/switch";
@@ -293,7 +295,7 @@ export function CloneProjectDialog({ open, onClose, onCloned }: Props) {
       onClose={busy ? () => {} : onClose}
       labelledBy="clone-project-title"
       initialFocusRef={urlRef}
-      className="flex max-h-[85vh] w-full max-w-lg flex-col p-0"
+      className="flex max-h-[calc(100vh-2rem)] w-full max-w-lg flex-col p-0"
     >
       {/* `display: contents` keeps this test-id wrapper out of the flex
        *  layout below — header/body/footer still act as direct flex items
@@ -302,27 +304,14 @@ export function CloneProjectDialog({ open, onClose, onCloned }: Props) {
        *  find the whole dialog by. Dialog's own props don't forward
        *  arbitrary data-* attributes onto the panel. */}
       <div data-testid="clone-project-dialog" className="contents">
-        <header className="flex items-center justify-between border-b border-border/60 px-4 py-3">
-          <h2 id="clone-project-title" className="text-sm font-semibold">
-            Clone repository
-          </h2>
-          <Button
-            size="icon"
-            variant="ghost"
-            onClick={onClose}
-            disabled={busy}
-            aria-label="Close"
-            className="size-7"
-          >
-            <X className="size-4" />
-          </Button>
-        </header>
+        <DialogHeader className="items-center">
+          <DialogTitle id="clone-project-title">Clone repository</DialogTitle>
+          <DialogClose onClick={onClose} disabled={busy} />
+        </DialogHeader>
 
-        <div className="min-h-0 flex-1 space-y-4 overflow-y-auto px-4 py-4 text-sm">
-          <div className="space-y-1.5">
-            <label htmlFor="clone-provider" className="text-xs font-medium text-muted-foreground">
-              Provider
-            </label>
+        <DialogBody className="space-y-4 text-sm">
+          <Field controlId="clone-provider">
+            <FieldLabel>Provider</FieldLabel>
             <Select
               id="clone-provider"
               data-testid="clone-provider"
@@ -343,17 +332,15 @@ export function CloneProjectDialog({ open, onClose, onCloned }: Props) {
             <p
               id="clone-provider-hint"
               aria-live="polite"
-              className={unsupportedHost ? "text-[11px] text-warning" : "text-[11px] text-muted-foreground"}
+              className={unsupportedHost ? "text-2xs text-warning" : "text-2xs text-muted-foreground"}
               data-testid="clone-provider-detected"
             >
               {providerHint}
             </p>
-          </div>
+          </Field>
 
-          <div className="space-y-1.5">
-            <label htmlFor="clone-url" className="text-xs font-medium text-muted-foreground">
-              Repository
-            </label>
+          <Field controlId="clone-url">
+            <FieldLabel>Repository</FieldLabel>
             <Input
               id="clone-url"
               data-testid="clone-url"
@@ -368,12 +355,10 @@ export function CloneProjectDialog({ open, onClose, onCloned }: Props) {
               spellCheck={false}
               disabled={busy}
             />
-          </div>
+          </Field>
 
-          <div className="space-y-1.5">
-            <label htmlFor="clone-dest" className="text-xs font-medium text-muted-foreground">
-              Destination folder
-            </label>
+          <Field controlId="clone-dest">
+            <FieldLabel>Destination folder</FieldLabel>
             <Input
               id="clone-dest"
               data-testid="clone-dest"
@@ -387,12 +372,12 @@ export function CloneProjectDialog({ open, onClose, onCloned }: Props) {
               spellCheck={false}
               disabled={busy}
             />
-          </div>
+          </Field>
 
           <label className="flex cursor-pointer items-center justify-between gap-3">
             <span className="min-w-0">
-              <span className="block text-xs font-medium">Explain this repo</span>
-              <span className="block text-[11px] text-muted-foreground">
+              <span className="block text-sm font-medium">Explain this repo</span>
+              <span className="block text-2xs text-muted-foreground">
                 Runs a task that writes an ELI5.md guide at the repo root
               </span>
             </span>
@@ -424,21 +409,21 @@ export function CloneProjectDialog({ open, onClose, onCloned }: Props) {
                 // live picker state afterwards — a mid-flight change would
                 // persist picks that never launched.
                 <fieldset disabled={busy} className="m-0 min-w-0 space-y-3 border-0 p-0">
-                  <TaskLaunchPickers launch={launch} />
+                  <TaskLaunchPickers launch={launch} layout="flat" />
 
                   {!launch.effectiveStatus && (
-                    <div role="alert" className="text-[11px] text-muted-foreground">
+                    <div role="alert" className="text-2xs text-muted-foreground">
                       No enabled harness to run the explainer on — enable one in Settings → Harnesses,
                       or turn off "Explain this repo" to clone without it.
                     </div>
                   )}
 
                   {overage && (
-                    <div role="alert" className="rounded-md border border-warning/40 bg-warning/10 p-2 text-[11px] text-warning">
+                    <Notice tone="warning" role="alert">
                       This prompt is {Math.ceil(overage.bytes / 1024)} KB — {selectedHarnessLabel}'s
                       one-shot launch caps prompts at {Math.floor(overage.limit / 1024)} KB. Pick
                       another agent or harness, or turn off "Explain this repo".
-                    </div>
+                    </Notice>
                   )}
                 </fieldset>
               )}
@@ -449,7 +434,7 @@ export function CloneProjectDialog({ open, onClose, onCloned }: Props) {
             <p
               role="alert"
               data-testid="clone-error"
-              className="rounded-md border border-destructive/40 bg-destructive/10 px-3 py-2 text-xs text-destructive"
+              className="rounded-md border border-danger/40 bg-danger/10 px-3 py-2 text-xs text-danger"
             >
               {error}
             </p>
@@ -490,9 +475,9 @@ export function CloneProjectDialog({ open, onClose, onCloned }: Props) {
               className="h-1.5 w-full accent-primary"
             />
           </div>
-        </div>
+        </DialogBody>
 
-        <div className="flex shrink-0 justify-end gap-2 border-t border-border/60 px-4 py-3">
+        <DialogFooter>
           {busy ? (
             // Replaces the plain "Cancel" (close) button's role while a
             // clone is in flight — Escape/backdrop still can't abandon it
@@ -503,21 +488,20 @@ export function CloneProjectDialog({ open, onClose, onCloned }: Props) {
             <Button
               data-testid="clone-cancel"
               variant="ghost"
-              size="sm"
               onClick={() => void cancelClone()}
               disabled={cancelling}
             >
               {cancelling ? "Cancelling…" : "Cancel clone"}
             </Button>
           ) : (
-            <Button variant="ghost" size="sm" onClick={onClose} disabled={busy}>
+            <Button variant="ghost" onClick={onClose} disabled={busy}>
               Cancel
             </Button>
           )}
-          <Button data-testid="clone-submit" size="sm" onClick={() => void submit()} disabled={!canSubmit}>
+          <Button data-testid="clone-submit" onClick={() => void submit()} disabled={!canSubmit}>
             {busy ? "Cloning…" : "Clone"}
           </Button>
-        </div>
+        </DialogFooter>
       </div>
     </Dialog>
   );

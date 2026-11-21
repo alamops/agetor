@@ -46,9 +46,10 @@ function setup(
 }
 
 describe("status mapping", () => {
-  test("404 missing, 413 too-large, everything else error", () => {
+  test("404 missing, 413 too-large, 403 denied, everything else error", () => {
     expect(statusForHttp(404)).toBe("missing");
     expect(statusForHttp(413)).toBe("too-large");
+    expect(statusForHttp(403)).toBe("denied");
     expect(statusForHttp(400)).toBe("error");
     expect(statusForHttp(401)).toBe("error");
     expect(statusForHttp(500)).toBe("error");
@@ -57,6 +58,7 @@ describe("status mapping", () => {
   test.each([
     [404, "missing"],
     [413, "too-large"],
+    [403, "denied"],
     [500, "error"],
   ] as const)("a %d answer settles as %s with no src", async (status, expected) => {
     const t = setup(() => new Response("x", { status }));
@@ -165,17 +167,20 @@ describe("sharing and refcounting", () => {
     expect(t.cache.get("u").status).toBe("ok");
   });
 
-  test("failures are forgotten on last release so the next consumer retries", async () => {
-    const t = setup(() => new Response("x", { status: 500 }));
-    const unsub = t.cache.subscribe("u", () => {});
-    await settle();
-    unsub();
-    expect(t.cache.size()).toBe(0);
-    expect(t.live()).toHaveLength(0);
-    t.cache.subscribe("u", () => {});
-    await settle();
-    expect(t.fetched).toEqual(["u", "u"]);
-  });
+  test.each([500, 403] as const)(
+    "a %d failure is forgotten on last release so the next consumer retries",
+    async (status) => {
+      const t = setup(() => new Response("x", { status }));
+      const unsub = t.cache.subscribe("u", () => {});
+      await settle();
+      unsub();
+      expect(t.cache.size()).toBe(0);
+      expect(t.live()).toHaveLength(0);
+      t.cache.subscribe("u", () => {});
+      await settle();
+      expect(t.fetched).toEqual(["u", "u"]);
+    },
+  );
 });
 
 describe("in-flight fetches", () => {
@@ -513,7 +518,7 @@ describe("held box after a status change (heldBoxAfterStatus)", () => {
   test("a failed re-fetch forgets the box, so a later release shows the placeholder", () => {
     // Regression: the stale box was kept, so once the failed image left the
     // view it flipped from the placeholder back to its old size.
-    for (const status of ["missing", "error", "too-large"] as const) {
+    for (const status of ["missing", "error", "too-large", "denied"] as const) {
       const after = heldBoxAfterStatus(box, box.url, true, status);
       expect(after).toBeNull();
       expect(heldBoxFor(after, box.url, false, "loading")).toBeNull();

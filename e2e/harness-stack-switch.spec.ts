@@ -8,6 +8,7 @@ import {
   createStackViaApi,
   deleteAll,
   gotoApp,
+  headerSettingsButton,
   removeLimitStates,
   seedLimitState,
 } from "./helpers";
@@ -123,6 +124,13 @@ async function trainOn(
 
 function dbOf(backend: E2EBackend): Database {
   return new Database(path.join(backend.dataDir, "agetor.sqlite"), { readonly: true });
+}
+
+/** Picks an account in the New Task form's Harness picker by its (prefix of its) label. */
+async function pickAccount(form: Locator, label: string): Promise<void> {
+  await form.getByTestId("launch-harness-picker-trigger").click();
+  const popover = form.page().getByTestId("launch-harness-picker-popover");
+  await popover.getByRole("option", { name: new RegExp(`^${label}`) }).click();
 }
 
 test.describe("stack account switching (shared backend)", () => {
@@ -270,8 +278,7 @@ test.describe("stack account switching (shared backend)", () => {
     const { a } = await trainOn(backend, tag, { shared: true });
     await gotoApp(page, backend.bootBase);
     const form = page.locator("aside").first();
-    const pick = form.getByRole("button", { name: new RegExp(`^${a}`) });
-    await pick.click();
+    await pickAccount(form, a);
     // Healthy primary: no hint.
     await expect(form.getByTestId("launch-stack-fallback-hint")).toHaveCount(0);
 
@@ -285,8 +292,8 @@ test.describe("stack account switching (shared backend)", () => {
     });
     expect(patch.status).toBe(200);
     await page.reload();
-    await expect(page.getByTitle("Settings", { exact: true })).toBeVisible();
-    await form.getByRole("button", { name: new RegExp(`^${a}`) }).click();
+    await expect(headerSettingsButton(page)).toBeVisible();
+    await pickAccount(form, a);
     const hint = form.getByTestId("launch-stack-fallback-hint");
     await expect(hint).toBeVisible();
     await expect(hint).toContainText("the run starts on the next usable account in its stack");

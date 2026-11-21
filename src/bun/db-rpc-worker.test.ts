@@ -121,6 +121,7 @@ describe("worker lifecycle", () => {
       expect(pragma("cache_size")).toBe(-65536);
       expect(pragma("busy_timeout")).toBe(5000);
       expect(Number(pragma("mmap_size"))).toBeGreaterThan(0);
+      expect(pragma("temp_store")).toBe(2);
     } finally {
       wdb.close();
     }

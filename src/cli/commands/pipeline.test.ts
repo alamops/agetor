@@ -884,6 +884,17 @@ test("pipelineStatusLines: status/progress header, blocked, active, and history 
   expect(text).toContain("succeeded");
 });
 
+test("pipelineStatusLines: a looping done run prints Done with its run counts", () => {
+  const run = pipelineRun();
+  // s1 ran three times and s2 twice; both distinct steps finished.
+  const rec = (seq: number, stepId: string) => ({
+    seq, stepId, taskId: `t${seq}`, startedAt: seq, endedAt: seq + 1, outcome: "succeeded" as const, handoff: null, nextStepIds: [],
+  });
+  const done = { ...run, status: "done" as const, active: [], blocked: [], history: [rec(1, "s1"), rec(2, "s2"), rec(3, "s1"), rec(4, "s1"), rec(5, "s2")] };
+  const text = pipelineStatusLines(task({ pipelineRun: done }), []).join("\n");
+  expect(text).toContain("steps: ✓ Done (5 step runs · 3 re-runs)");
+});
+
 test("pipelineStatusLines: the task title and block messages are free text (escapeFreeText)", () => {
   const run = pipelineRun();
   const t = task({

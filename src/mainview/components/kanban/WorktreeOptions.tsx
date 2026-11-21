@@ -1,7 +1,10 @@
-import { type Dispatch, type SetStateAction, useEffect, useMemo, useState } from "react";
-import { GitBranch, SlidersHorizontal } from "lucide-react";
+import { type Dispatch, type ReactNode, type SetStateAction, useEffect, useId, useMemo, useState } from "react";
+import { ChevronRight, GitBranch, SlidersHorizontal } from "lucide-react";
 import { api, type BranchNamingConfig } from "@/lib/api";
 import { Input } from "@/components/ui/input";
+import { Button } from "@/components/ui/button";
+import { Switch } from "@/components/ui/switch";
+import { Field, FieldDescription, FieldLabel, fieldDescriptionId } from "@/components/ui/field";
 import { cn } from "@/lib/utils";
 import { IDENTIFIER_INPUT_PROPS } from "@/lib/identifier-input";
 import { branchFieldState, type BranchFieldState } from "@/lib/branch-field";
@@ -257,52 +260,101 @@ type Props =
       onReposChange: Dispatch<SetStateAction<RepoSelection[]>>;
       /** A project that must stay selected (the issue dialog's own repo). */
       lockedPath?: string | null;
+      /** Wraps the Branch name field, so a surface can place it behind a "More
+       *  options" disclosure. Defaults to rendering it inline. Only called while
+       *  the task is isolated. */
+      renderBranchName?: (node: ReactNode) => ReactNode;
     }
   | { locked: { branch: string; projectPath?: string } };
 
 /**
- * Renders the worktree block. Live variant (`{ state, repos, … }`): Select
- * Projects → one read-only Branch summary line per project → Isolate →
- * (while isolated) the branch-name field + `BranchNamingDialog`. Locked variant (`{ locked }`): the
- * PR-conflicts modal, where the PR's head branch is checked out as-is in its
- * own worktree — a disabled Select Projects control showing the PR's repo, a
- * read-only branch row, and a checked/disabled isolate checkbox.
+ * Renders the worktree block. Live variant (`{ state, repos, … }`): the Projects
+ * field (Select Projects) → one clickable `Branch · <project>` row per project →
+ * the Isolate switch → (while isolated) the Branch name field with its settings
+ * gear and `BranchNamingDialog`. Locked variant (`{ locked }`): the PR-conflicts
+ * modal, where the PR's head branch is checked out as-is in its own worktree — a
+ * disabled Projects field showing the PR's repo, a read-only branch field, and a
+ * checked, disabled Isolate switch.
  */
 export function WorktreeOptions(props: Props) {
-  if ("locked" in props) {
-    const { branch, projectPath } = props.locked;
-    return (
-      <div data-testid="worktree-options-locked" className="space-y-3">
+  if ("locked" in props) return <LockedWorktreeOptions {...props.locked} />;
+  return <LiveWorktreeOptions {...props} />;
+}
+
+/** The PR-conflicts variant (see {@link WorktreeOptions}). Ids are per instance: the
+ *  New Task panel is always mounted next to an open dialog, so a fixed id would collide. */
+function LockedWorktreeOptions({ branch, projectPath }: { branch: string; projectPath?: string }) {
+  const uid = useId();
+  return (
+    <div data-testid="worktree-options-locked" className="space-y-3">
+      <Field controlId={`${uid}-projects`}>
+        <FieldLabel>Projects</FieldLabel>
         <SelectProjectsButton
+          id={`${uid}-projects`}
           label={projectPath ? projectDisplayName(projectPath) : "Project"}
           onClick={() => {}}
           locked
         />
+      </Field>
 
-        <div className="min-w-0 space-y-1">
-          <label className="text-muted-foreground">Branch</label>
-          <Input
-            data-testid="locked-branch"
-            readOnly
-            value={branch}
-            className="font-mono text-[11px]"
-          />
-          <p className="text-[10px] text-muted-foreground">PR head branch — checked out as-is.</p>
-        </div>
+      <Field controlId={`${uid}-branch`}>
+        <FieldLabel>Branch</FieldLabel>
+        <Input
+          id={`${uid}-branch`}
+          data-testid="locked-branch"
+          readOnly
+          value={branch}
+          aria-describedby={fieldDescriptionId(`${uid}-branch`)}
+          className="font-mono text-xs"
+        />
+        <FieldDescription>PR head branch — checked out as-is.</FieldDescription>
+      </Field>
 
-        <label
-          className="flex cursor-default items-center gap-1.5 opacity-80"
-          title="Always isolated — the PR's head branch is checked out in its own worktree, so your checkout stays clean."
-        >
-          <input type="checkbox" checked disabled data-testid="isolate-toggle" />
-          <GitBranch className="size-3" />
+      <IsolateRow
+        checked
+        disabled
+        onChange={() => {}}
+        title="Always isolated — the PR's head branch is checked out in its own worktree, so your checkout stays clean."
+        note={null}
+      />
+    </div>
+  );
+}
+
+/** The Isolate switch with its associated label (`getByLabel("Isolate (worktree)")`). */
+function IsolateRow({
+  checked,
+  disabled,
+  onChange,
+  title,
+  note,
+}: {
+  checked: boolean;
+  disabled: boolean;
+  onChange: (v: boolean) => void;
+  title: string;
+  note: string | null;
+}) {
+  const id = `${useId()}-isolate`;
+  return (
+    <Field controlId={id} className="space-y-1">
+      <div className="flex min-h-9 items-center justify-between gap-3 rounded-md border border-input bg-background px-3" title={title}>
+        <FieldLabel className="flex min-w-0 flex-1 cursor-pointer items-center gap-1.5 text-sm font-normal text-foreground">
+          <GitBranch className="size-3.5 shrink-0 text-muted-foreground" aria-hidden />
           <span>Isolate (worktree)</span>
-        </label>
+        </FieldLabel>
+        <Switch
+          id={id}
+          data-testid="isolate-toggle"
+          checked={checked}
+          disabled={disabled}
+          aria-describedby={note ? fieldDescriptionId(id) : undefined}
+          onCheckedChange={onChange}
+        />
       </div>
-    );
-  }
-
-  return <LiveWorktreeOptions {...props} />;
+      {note ? <FieldDescription>{note}</FieldDescription> : null}
+    </Field>
+  );
 }
 
 function LiveWorktreeOptions({
@@ -310,8 +362,10 @@ function LiveWorktreeOptions({
   repos,
   onReposChange,
   lockedPath,
+  renderBranchName,
 }: Extract<Props, { state: WorktreeOptionsState }>) {
   const [selectOpen, setSelectOpen] = useState(false);
+  const uid = useId();
   const {
     setIsolate,
     forceIsolate,
@@ -338,9 +392,78 @@ function LiveWorktreeOptions({
   const names = useMemo(() => selectionNames(repos), [repos]);
   const labels = useMemo(() => projectRowLabels(repos.map((repo) => repo.path)), [repos]);
 
+  const branchNameField = effectiveIsolate ? (
+    <Field controlId={`${uid}-branch-name`}>
+      <FieldLabel>Branch name</FieldLabel>
+      <div className="relative">
+        <Input
+          id={`${uid}-branch-name`}
+          data-testid="branch-name-input"
+          {...IDENTIFIER_INPUT_PROPS}
+          aria-invalid={!branchValidation.ok || undefined}
+          aria-describedby={
+              [!branchValidation.ok ? `${uid}-branch-name-error` : null, repos.length > 1 ? fieldDescriptionId(`${uid}-branch-name`) : null]
+                .filter(Boolean)
+                .join(" ") || undefined
+            }
+          value={branchField.displayValue}
+          onChange={(e) => { setBranchOverride(e.target.value); setBranchDirty(true); }}
+          placeholder="feature/my-task"
+          className={cn(
+            "pr-10 font-mono text-xs",
+            !branchValidation.ok && "border-danger focus-visible:ring-danger",
+          )}
+          title="Git branch the worktree will use. Live-resolved from this project's nomenclature (title, type, project name); edit to override, or use the settings button to change the pattern."
+        />
+        <Button
+          type="button"
+          variant="ghost"
+          size="sm"
+          onClick={() => setBranchSettingsOpen(true)}
+          disabled={!workdir.trim()}
+          title="Branch naming settings for this project"
+          aria-label="Configure branch naming"
+          className="absolute right-1 top-1/2 h-7 w-7 -translate-y-1/2 px-0 text-muted-foreground"
+        >
+          <SlidersHorizontal className="size-3.5" aria-hidden />
+        </Button>
+      </div>
+      {!branchValidation.ok ? (
+        <p id={`${uid}-branch-name-error`} role="alert" className="text-2xs text-danger">{branchValidation.reason}</p>
+      ) : branchDirty && hasBranchTemplateTags(branchOverride) ? (
+        <p className="truncate font-mono text-2xs text-muted-foreground" title={branchField.resolved}>
+          → {branchField.resolved}
+        </p>
+      ) : null}
+      {branchDirty && (
+        <Button
+          type="button"
+          variant="ghost"
+          size="sm"
+          onClick={() => setBranchDirty(false)}
+          className="h-8 px-2 text-muted-foreground"
+        >
+          Reset to pattern
+        </Button>
+      )}
+      {repos.length > 1 ? (
+        <FieldDescription>
+          This name is used in every project, with a `-N` fallback where it is already taken.
+        </FieldDescription>
+      ) : null}
+    </Field>
+  ) : null;
+
   return (
     <div data-testid="worktree-options" className="space-y-3">
-      <SelectProjectsButton label={projectSelectionLabel(repos)} onClick={() => setSelectOpen(true)} />
+      <Field controlId={`${uid}-projects`}>
+        <FieldLabel>Projects</FieldLabel>
+        <SelectProjectsButton
+          id={`${uid}-projects`}
+          label={projectSelectionLabel(repos)}
+          onClick={() => setSelectOpen(true)}
+        />
+      </Field>
       <SelectProjectsDialog
         open={selectOpen}
         onClose={() => setSelectOpen(false)}
@@ -351,7 +474,7 @@ function LiveWorktreeOptions({
       />
 
       {repos.length === 0 ? (
-        <p data-testid="select-projects-empty" className="text-[11px] text-muted-foreground">
+        <p data-testid="select-projects-empty" className="text-2xs text-muted-foreground">
           Select a project to choose its branch and worktree options.
         </p>
       ) : (
@@ -364,106 +487,43 @@ function LiveWorktreeOptions({
           data-testid="selected-branches"
           onClick={() => setSelectOpen(true)}
           title="Change the branch for each project in Select projects"
-          className="block w-full space-y-1 rounded-md px-1 py-0.5 text-left transition-colors hover:bg-accent/40 focus-visible:outline-none focus-visible:ring-1 focus-visible:ring-ring"
+          className="group flex w-full items-center gap-2 rounded-md border border-input bg-background px-3 py-1.5 text-left transition-colors hover:bg-accent/40 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring"
         >
-          {repos.map((repo, i) => {
-            const ref = repo.baseRef?.trim();
-            return (
-              <span key={repo.path} data-testid={`branch-row-${names[i]}`} className="flex min-w-0 items-center gap-2 text-[11px]">
-                <span className="min-w-0 flex-1 truncate text-muted-foreground" title={repo.path}>
-                  {`Branch · ${labels[i]}`}
+          <span className="min-w-0 flex-1 space-y-1">
+            {repos.map((repo, i) => {
+              const ref = repo.baseRef?.trim();
+              return (
+                <span key={repo.path} data-testid={`branch-row-${names[i]}`} className="flex min-w-0 items-center gap-2 text-xs">
+                  <span className="min-w-0 flex-1 truncate text-muted-foreground" title={repo.path}>
+                    {`Branch · ${labels[i]}`}
+                  </span>
+                  <span
+                    className={cn(
+                      "flex min-w-0 max-w-[60%] shrink-0 items-center gap-1 font-mono",
+                      !ref && "text-muted-foreground",
+                    )}
+                    title={ref ?? "The project's current branch when the task starts"}
+                  >
+                    <GitBranch className="size-3 shrink-0" aria-hidden />
+                    <span className="truncate">{ref ?? "current branch"}</span>
+                  </span>
                 </span>
-                <span
-                  className={cn(
-                    "flex min-w-0 max-w-[60%] shrink-0 items-center gap-1 font-mono",
-                    !ref && "text-muted-foreground",
-                  )}
-                  title={ref ?? "The project's current branch when the task starts"}
-                >
-                  <GitBranch className="size-3 shrink-0" aria-hidden />
-                  <span className="truncate">{ref ?? "current branch"}</span>
-                </span>
-              </span>
-            );
-          })}
+              );
+            })}
+          </span>
+          <ChevronRight aria-hidden className="size-3.5 shrink-0 text-muted-foreground group-hover:text-foreground" />
         </button>
       )}
 
-      <div className="space-y-1">
-        <label
-          className={cn("flex items-center gap-1.5", forceIsolate ? "cursor-default" : "cursor-pointer")}
-          title={forceIsolate ? forcedIsolateTitle : isolateTitle}
-        >
-          <input
-            type="checkbox"
-            checked={effectiveIsolate}
-            disabled={forceIsolate}
-            onChange={(e) => setIsolate(e.target.checked)}
-            data-testid="isolate-toggle"
-          />
-          <GitBranch className="size-3" />
-          <span>Isolate (worktree)</span>
-        </label>
-        {forceIsolate ? (
-          <p className="pl-5 text-[10px] text-muted-foreground">
-            Always on when more than one project is selected.
-          </p>
-        ) : null}
-      </div>
+      <IsolateRow
+        checked={effectiveIsolate}
+        disabled={forceIsolate}
+        onChange={setIsolate}
+        title={forceIsolate ? forcedIsolateTitle : isolateTitle}
+        note={forceIsolate ? "Always on when more than one project is selected." : null}
+      />
 
-      {effectiveIsolate && (
-        <div className="space-y-1">
-          <label className="text-muted-foreground">Branch name</label>
-          <div className="relative">
-            <Input
-              data-testid="branch-name-input"
-              {...IDENTIFIER_INPUT_PROPS}
-              value={branchField.displayValue}
-              onChange={(e) => { setBranchOverride(e.target.value); setBranchDirty(true); }}
-              placeholder="feature/my-task"
-              className={cn(
-                "pr-9 font-mono text-[11px]",
-                !branchValidation.ok && "border-destructive focus-visible:ring-destructive",
-              )}
-              title="Git branch the worktree will use. Live-resolved from this project's nomenclature (title, type, project name); edit to override, or use the settings button to change the pattern."
-            />
-            <button
-              type="button"
-              onClick={() => setBranchSettingsOpen(true)}
-              disabled={!workdir.trim()}
-              title="Branch naming settings for this project"
-              aria-label="Configure branch naming"
-              className="absolute right-1 top-1/2 -translate-y-1/2 text-muted-foreground transition-colors hover:text-foreground disabled:opacity-40"
-            >
-              <SlidersHorizontal className="size-3.5" />
-            </button>
-          </div>
-          {!branchValidation.ok ? (
-            <p className="text-[10px] text-destructive">{branchValidation.reason}</p>
-          ) : branchDirty && hasBranchTemplateTags(branchOverride) ? (
-            <p
-              className="text-[10px] font-mono text-muted-foreground truncate"
-              title={branchField.resolved}
-            >
-              → {branchField.resolved}
-            </p>
-          ) : null}
-          {branchDirty && (
-            <button
-              type="button"
-              onClick={() => setBranchDirty(false)}
-              className="text-[10px] text-muted-foreground underline underline-offset-2 hover:text-foreground"
-            >
-              Reset to pattern
-            </button>
-          )}
-          {repos.length > 1 ? (
-            <p className="text-[10px] text-muted-foreground">
-              This name is used in every project, with a `-N` fallback where it is already taken.
-            </p>
-          ) : null}
-        </div>
-      )}
+      {branchNameField ? (renderBranchName ? renderBranchName(branchNameField) : branchNameField) : null}
 
       <BranchNamingDialog
         open={branchSettingsOpen}

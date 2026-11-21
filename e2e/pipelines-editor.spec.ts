@@ -283,8 +283,8 @@ test.describe("pipelines editor", () => {
     panel = await openStepPanel(editor, node0);
     const picker = panel.getByTestId("agent-profile-picker");
     await picker.getByTestId("agent-profile-picker-trigger").click();
-    await expect(picker.getByTestId("agent-profile-picker-popover")).toBeVisible();
-    await picker.locator(`[data-testid="agent-profile-picker-row"][data-profile-id="${alpha.id}"]`).click();
+    await expect(page.getByTestId("agent-profile-picker-popover")).toBeVisible();
+    await page.locator(`[data-testid="agent-profile-picker-row"][data-profile-id="${alpha.id}"]`).click();
     await expect(node0.locator('[data-testid="agent-profile-card"]')).toContainText(alpha.name);
 
     // Reuse Alpha for StepC too (same simple picker interaction — kept
@@ -293,7 +293,7 @@ test.describe("pipelines editor", () => {
     panel = await openStepPanel(editor, node2);
     const picker2 = panel.getByTestId("agent-profile-picker");
     await picker2.getByTestId("agent-profile-picker-trigger").click();
-    await picker2.locator(`[data-testid="agent-profile-picker-row"][data-profile-id="${alpha.id}"]`).click();
+    await page.locator(`[data-testid="agent-profile-picker-row"][data-profile-id="${alpha.id}"]`).click();
     await expect(node2.locator('[data-testid="agent-profile-card"]')).toContainText(alpha.name);
 
     // Assign Alpha to StepB too, via the same picker path. Deliberately NOT
@@ -305,7 +305,7 @@ test.describe("pipelines editor", () => {
     panel = await openStepPanel(editor, node1);
     const picker3 = panel.getByTestId("agent-profile-picker");
     await picker3.getByTestId("agent-profile-picker-trigger").click();
-    await picker3.locator(`[data-testid="agent-profile-picker-row"][data-profile-id="${alpha.id}"]`).click();
+    await page.locator(`[data-testid="agent-profile-picker-row"][data-profile-id="${alpha.id}"]`).click();
     await expect(node1.locator('[data-testid="agent-profile-card"]')).toContainText(alpha.name);
 
     // ---- Connect StepA -> StepB, StepB -> StepC via the panel's select ----
@@ -835,14 +835,14 @@ test.describe("pipelines editor", () => {
     const name0 = await panel.getByTestId("pipeline-step-name").inputValue();
     let picker = panel.getByTestId("agent-profile-picker");
     await picker.getByTestId("agent-profile-picker-trigger").click();
-    await picker.locator(`[data-testid="agent-profile-picker-row"][data-profile-id="${alpha.id}"]`).click();
+    await page.locator(`[data-testid="agent-profile-picker-row"][data-profile-id="${alpha.id}"]`).click();
     await expect(node0.locator('[data-testid="agent-profile-card"]')).toContainText(alpha.name);
 
     panel = await openStepPanel(editor, node2);
     const name2 = await panel.getByTestId("pipeline-step-name").inputValue();
     picker = panel.getByTestId("agent-profile-picker");
     await picker.getByTestId("agent-profile-picker-trigger").click();
-    await picker.locator(`[data-testid="agent-profile-picker-row"][data-profile-id="${alpha.id}"]`).click();
+    await page.locator(`[data-testid="agent-profile-picker-row"][data-profile-id="${alpha.id}"]`).click();
     await expect(node2.locator('[data-testid="agent-profile-card"]')).toContainText(alpha.name);
 
     // Use "New agent…" on the THIRD step.

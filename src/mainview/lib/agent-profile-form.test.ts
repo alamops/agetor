@@ -1,4 +1,6 @@
 import { describe, expect, test } from "bun:test";
+import { readFileSync } from "node:fs";
+import path from "node:path";
 import {
   agentProfileTextDirty,
   duplicateAgentName,
@@ -166,5 +168,28 @@ describe("trackLaunchInteractions", () => {
     expect(launch.setMaxMode).toBe(original);
     expect(tracked.kind).toBe("opencode");
     expect(tracked.maxMode).toBe(false);
+  });
+});
+
+describe("the launch view only changes picks through tracked setters", () => {
+  // The picker VIEW (and its children) may call exactly the setters the dirtiness tracker wraps,
+  // plus the profile / pipeline selection setters the Settings form hides. A setter the tracker
+  // does not wrap would let an edit change the form without marking it dirty.
+  const HIDDEN_IN_SETTINGS = new Set(["setAgentProfileId", "setPipelineId"]);
+  const dir = path.join(import.meta.dir, "..", "components", "kanban");
+  const files = ["TaskLaunchPickers.tsx", "HarnessPicker.tsx", "ModeControl.tsx"].map((f) => readFileSync(path.join(dir, f), "utf8"));
+
+  test("every launch.<setter> the view calls is wrapped by LAUNCH_INTERACTION_SETTERS or hidden in Settings", () => {
+    const wrapped = new Set(Object.keys(LAUNCH_INTERACTION_SETTERS));
+    const used = new Set<string>();
+    for (const src of files) for (const m of src.matchAll(/\blaunch\.(set\w+|switchAgent)\b/g)) used.add(m[1]!);
+    const unwrapped = [...used].filter((n) => !wrapped.has(n) && !HIDDEN_IN_SETTINGS.has(n));
+    expect(unwrapped).toEqual([]);
+  });
+
+  test("every wrapped setter is actually reachable from the view (so the tracker has something to track)", () => {
+    const used = new Set<string>();
+    for (const src of files) for (const m of src.matchAll(/\blaunch\.(set\w+|switchAgent)\b/g)) used.add(m[1]!);
+    for (const setter of Object.keys(LAUNCH_INTERACTION_SETTERS)) expect(used.has(setter)).toBe(true);
   });
 });

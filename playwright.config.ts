@@ -1,4 +1,26 @@
+import { tmpdir } from "node:os";
 import { defineConfig, devices } from "@playwright/test";
+import { createRunTmpdir, removeRunTmpdir } from "./src/test-run-tmpdir.ts";
+
+/**
+ * One temp root per e2e run (`src/test-run-tmpdir.ts`). Specs and fixtures
+ * `mkdtemp` workdirs, repos and stubs under `os.tmpdir()` and many never
+ * remove them; pointing `TMPDIR` at a run root that `e2e/global-teardown.ts`
+ * deletes keeps them from piling up. This file is also loaded by every
+ * worker: the root is created once, in the runner process, and workers (and
+ * the backends they spawn) inherit it through `AGETOR_E2E_RUN_TMPDIR` and
+ * `TMPDIR`. A root left by a killed run is swept by the next run.
+ * `AGETOR_TEST_KEEP_TMPDIR=1` opts out; `AGETOR_TEST_RETAIN_TMPDIR=1` keeps
+ * the root for inspection.
+ */
+if (!process.env.AGETOR_E2E_RUN_TMPDIR && process.env.AGETOR_TEST_KEEP_TMPDIR !== "1") {
+  const runRoot = createRunTmpdir(tmpdir(), "agt-e2e-run-");
+  process.env.AGETOR_E2E_RUN_TMPDIR = runRoot;
+  process.env.TMPDIR = runRoot;
+  // Backstop for a runtime that fires `exit`; the global teardown is the
+  // primary cleanup.
+  if (process.env.AGETOR_TEST_RETAIN_TMPDIR !== "1") process.on("exit", () => removeRunTmpdir(runRoot));
+}
 
 /**
  * E2E harness for the theme, font-size, and quote-on-select features
@@ -77,6 +99,7 @@ export const E2E_BASE_URL = `http://localhost:${E2E_VITE_PORT}`;
 
 export default defineConfig({
   testDir: "e2e",
+  globalTeardown: "./e2e/global-teardown.ts",
   fullyParallel: false,
   // `fullyParallel: false` only serializes tests WITHIN a file — Playwright
   // still gives each spec file its own worker, and (since e2e/fixtures.ts)
@@ -91,7 +114,13 @@ export default defineConfig({
     trace: "retain-on-failure",
     screenshot: "only-on-failure",
   },
-  projects: [{ name: "chromium", use: { ...devices["Desktop Chrome"] } }],
+  projects: [
+    { name: "chromium", use: { ...devices["Desktop Chrome"] } },
+    // WKWebView, the app's real target, is WebKit. The board-card bounds spec
+    // is the one layout guardrail that runs in both engines; every other spec
+    // stays Chromium-only. Needs `playwright install webkit` once.
+    { name: "webkit", use: { ...devices["Desktop Safari"] }, testMatch: /task-card-bounds\.spec\.ts/ },
+  ],
   webServer: {
     command: E2E_VITE_PORT === 5173 ? "bun run hmr" : `bunx vite --port ${E2E_VITE_PORT}`,
     url: E2E_BASE_URL,

@@ -174,7 +174,7 @@ export function ExtensionPicker({
   const insert = (row: Row) => insertText(row.tag === "ext" ? row.ext.insert : row.prompt.content);
 
   return (
-    <div ref={rootRef} className="relative">
+    <div ref={rootRef} className="relative min-w-0">
       <button
         type="button"
         data-testid="extension-picker-trigger"
@@ -182,14 +182,14 @@ export function ExtensionPicker({
         onClick={() => setOpen((o) => !o)}
         title="Insert an MCP server, skill, plugin, or agent reference, or a saved prompt"
         className={cn(
-          "inline-flex items-center gap-1 rounded-md border border-border/60 bg-card/40 px-2 py-1 text-[11px] text-muted-foreground",
-          "hover:bg-accent/40 hover:text-foreground disabled:opacity-50 disabled:hover:bg-card/40 disabled:hover:text-muted-foreground",
+          "inline-flex h-8 max-w-full items-center gap-1.5 rounded-md border border-input bg-background px-2.5 text-xs text-muted-foreground",
+          "transition-colors hover:bg-accent/40 hover:text-foreground focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring disabled:cursor-not-allowed disabled:opacity-50 disabled:hover:bg-background disabled:hover:text-muted-foreground",
           open && "bg-accent/40 text-foreground",
         )}
       >
-        <Blocks className="size-3" />
-        <span>MCP · Skills · Plugins · Agents · Prompts</span>
-        <ChevronDown className={cn("size-3 transition-transform", open && "rotate-180")} />
+        <Blocks className="size-3.5 shrink-0" aria-hidden />
+        <span className="min-w-0 truncate">MCP · Skills · Plugins · Agents · Prompts</span>
+        <ChevronDown aria-hidden className={cn("size-3.5 shrink-0 transition-transform", open && "rotate-180")} />
       </button>
 
       {open && (
@@ -229,12 +229,12 @@ export function ExtensionPicker({
                 }
               }}
               placeholder="Search…"
-              className="w-full rounded bg-muted/40 px-2 py-1 text-[11px] outline-none placeholder:text-muted-foreground"
+              className="w-full rounded bg-muted/40 px-2 py-1 text-2xs outline-none placeholder:text-muted-foreground"
             />
           </div>
           <div ref={listRef} className="max-h-64 overflow-y-auto py-1">
             {grouped.length === 0 ? (
-              <p className="px-3 py-2 text-[11px] text-muted-foreground">
+              <p className="px-3 py-2 text-2xs text-muted-foreground">
                 {extensions.length === 0 && (savedPrompts?.length ?? 0) === 0
                   ? "No MCP servers, skills, plugins, or agents found for this project, and no saved prompts."
                   : "No matches."}
@@ -246,7 +246,7 @@ export function ExtensionPicker({
                 const base = grouped.slice(0, gi).reduce((n, x) => n + x.rows.length, 0);
                 return (
                 <div key={g.key}>
-                  <div className="flex items-center gap-1.5 px-3 pb-0.5 pt-1.5 text-[10px] font-medium uppercase tracking-wide text-muted-foreground">
+                  <div className="flex items-center gap-1.5 px-3 pb-0.5 pt-1.5 text-3xs font-medium uppercase tracking-wide text-muted-foreground">
                     <g.Icon className="size-3 opacity-70" />
                     {g.label}
                   </div>
@@ -263,7 +263,7 @@ export function ExtensionPicker({
                           onMouseDown={(ev) => { ev.preventDefault(); insert(row); }}
                           onMouseEnter={() => setActive(idx)}
                           className={cn(
-                            "flex w-full items-start gap-2 px-3 py-1.5 text-left text-[11px]",
+                            "flex w-full items-start gap-2 px-3 py-1.5 text-left text-2xs",
                             idx === active ? "bg-accent text-accent-foreground" : "hover:bg-accent/40",
                           )}
                         >
@@ -273,7 +273,7 @@ export function ExtensionPicker({
                                 <span className="font-mono">{row.ext.insert}</span>
                                 <span
                                   className={cn(
-                                    "rounded px-1 py-px text-[10px] uppercase tracking-wide",
+                                    "rounded px-1 py-px text-3xs uppercase tracking-wide",
                                     row.ext.source === "project"
                                       ? "bg-primary/20 text-primary"
                                       : "bg-muted text-muted-foreground",

@@ -1,0 +1,248 @@
+{
+  "version": 1,
+  "formId": "claude-enter-to-confirm-prompts-grill-r1",
+  "title": "Grill — Claude Code \"Enter to confirm\" prompts",
+  "round": 1,
+  "mode": "served",
+  "specFile": "questions.json",
+  "specSha256": "47965b948b1eebf56b2a6d05b188fef83171d92e59eef38fc4c4432f28b5c5d8",
+  "submittedAt": "2026-11-17T15:00:09.766Z",
+  "receivedAt": "2026-11-17T15:00:09.776Z",
+  "answeredBy": null,
+  "summary": {
+    "total": 20,
+    "answered": 20,
+    "skipped": 0,
+    "unanswered": 0,
+    "optionalLeftBlank": 0,
+    "notApplicable": 0,
+    "acceptedRecommendations": 13,
+    "overrodeRecommendations": [
+      "adddir-policy",
+      "paste-code",
+      "retry-semantics",
+      "pipeline-surface",
+      "other-harnesses",
+      "login-capture"
+    ],
+    "oneWayDoorsNotAnswered": [],
+    "withNotes": [
+      "adddir-policy",
+      "login-case"
+    ],
+    "needsAnswer": [],
+    "complete": true
+  },
+  "answers": {
+    "adddir-policy": {
+      "n": 1,
+      "title": "How should agetor handle Claude's startup \"Adding a new directory\" dialog for a multi-repo task's own repository checkouts?",
+      "type": "single",
+      "status": "answered",
+      "oneWayDoor": true,
+      "impact": "blocking",
+      "value": "auto-setting",
+      "display": "Auto-confirm as above, behind a setting (default on)",
+      "acceptedRecommendation": false,
+      "recommended": "auto-scoped",
+      "note": "btw, use this change to also update settings General UI, it's getting polluted"
+    },
+    "login-case": {
+      "n": 2,
+      "title": "Which Login situation(s) did you actually hit, the ones that made you name Login in the request?",
+      "type": "multi",
+      "status": "answered",
+      "impact": "blocking",
+      "value": [
+        "midsession",
+        "boot-default"
+      ],
+      "display": "`/login` typed mid-session in a running task; A task started while my default Claude account was logged out or expired",
+      "note": "but should cover all cases"
+    },
+    "logged-out-boot": {
+      "n": 3,
+      "title": "When a task starts and Claude isn't logged in (theme picker → login method → browser → paste code → \"Press Enter to continue\"), what should agetor do?",
+      "type": "single",
+      "status": "answered",
+      "impact": "blocking",
+      "value": "both",
+      "display": "Pre-flight AND cards",
+      "acceptedRecommendation": true
+    },
+    "paste-code": {
+      "n": 4,
+      "title": "The OAuth \"Paste code here if prompted >\" screen asks for typed text. How should agetor handle it?",
+      "type": "single",
+      "status": "answered",
+      "impact": "shape",
+      "value": "textbox",
+      "display": "A text box on the card that types the code into the pane",
+      "acceptedRecommendation": false,
+      "recommended": "terminal"
+    },
+    "enter-card": {
+      "n": 5,
+      "title": "For screens that only want Enter (\"Login successful. Press Enter to continue…\", \"Security notes … Press Enter to continue…\", \"Press Enter to retry.\"), what should the card do?",
+      "type": "single",
+      "status": "answered",
+      "impact": "blocking",
+      "value": "continue-btn",
+      "display": "A \"Continue (press Enter)\" button",
+      "acceptedRecommendation": true
+    },
+    "retry-semantics": {
+      "n": 6,
+      "title": "When a run's Claude never wrote its session file (a failed boot), what should the next \"try again\" or follow-up do?",
+      "type": "single",
+      "status": "answered",
+      "impact": "blocking",
+      "value": "both",
+      "display": "Both",
+      "acceptedRecommendation": false,
+      "recommended": "check-then-fresh"
+    },
+    "families": {
+      "n": 7,
+      "title": "Which members of the Enter-to-confirm family are in this change?",
+      "type": "multi",
+      "status": "answered",
+      "impact": "shape",
+      "value": [
+        "adddir-startup",
+        "held",
+        "cutoff",
+        "midsession-dir",
+        "enter-only",
+        "onboarding",
+        "all-verbs"
+      ],
+      "display": "Startup \"Adding a new directory\" (the incident); The \"held\" footer after a refused key (`Esc to exit · To add it, press ↓ to Yes, then Enter`), at startup and mid-session; Cut-off dialogs: long paths push an `Adding: <path>` line below the footer and nothing matches (P10); Mid-session `/add-dir` and `/cd` dialogs (`No, leave it out`, `No, stay put`, `Yes, move here`, `Yes, trust it and apply them`): cards, safe to drive; Enter-only screens: Login successful, Security notes, Press Enter to retry; Theme picker and login method at boot (per the Login answer above); Widen the footer match to every `Enter to <verb>` hint in claude's binary, each backed by a captured or binary-extracted fixture",
+      "acceptedRecommendation": true
+    },
+    "held-recovery": {
+      "n": 8,
+      "title": "When Claude refuses a confirm (the dialog goes \"held\"), what should agetor do?",
+      "type": "single",
+      "status": "answered",
+      "impact": "shape",
+      "value": "split",
+      "display": "Retry the auto-confirmed ones, re-card the user-answered ones",
+      "acceptedRecommendation": true
+    },
+    "pipeline-surface": {
+      "n": 9,
+      "title": "The incident was a pipeline step. Where did you see its \"Claude is asking\" card, and is that right?",
+      "type": "single",
+      "status": "answered",
+      "impact": "shape",
+      "value": "fine",
+      "display": "I saw it where I expected (the parent and/or the step); nothing to change",
+      "acceptedRecommendation": false,
+      "recommended": "missed"
+    },
+    "other-harnesses": {
+      "n": 10,
+      "title": "Codex and Copilot get the same `--add-dir` for multi-repo tasks. Check them for their own trust prompts in this change?",
+      "type": "single",
+      "status": "answered",
+      "impact": "shape",
+      "value": "spike",
+      "display": "Spike them in this change; fix whatever shows up",
+      "acceptedRecommendation": false,
+      "recommended": "out"
+    },
+    "login-capture": {
+      "n": 11,
+      "title": "\"Login successful. Press Enter to continue…\" was taken from claude's binary, not seen live. Can you help capture it?",
+      "type": "single",
+      "status": "answered",
+      "impact": "minor",
+      "value": "binary",
+      "display": "No, build it from the binary strings and a reconstructed pane",
+      "acceptedRecommendation": false,
+      "recommended": "live"
+    },
+    "acceptance": {
+      "n": 12,
+      "title": "What has to pass before you'd call this done?",
+      "type": "multi",
+      "status": "answered",
+      "impact": "shape",
+      "value": [
+        "unit",
+        "boot-int",
+        "resume",
+        "e2e-card",
+        "live-smoke"
+      ],
+      "display": "Unit fixtures for every captured pane (2.1.326, tagged by version) in `claude-tmux-scraper.test.ts`; A boot-poller integration test on the stub-tmux seam: two identical dialogs, a held refusal, the long-prompt paste, the add-dir auto-confirm; A test that a missing session file means a fresh start, not `--resume`; A Playwright e2e for the \"Continue (press Enter)\" card through a new fake-driver prompt marker; A live smoke on a headless dev core (port 4319, `~/.agetor-dev`): a multi-repo task over 2 untrusted scratch repos, plus a follow-up after hibernation",
+      "acceptedRecommendation": true
+    },
+    "status-line": {
+      "n": 13,
+      "title": "Visibility of an add-dir auto-confirm",
+      "type": "confirm",
+      "status": "answered",
+      "value": "A run status line per repository, e.g. `auto-confirmed Claude's \"Adding a new directory\" prompt for <repo-name>`, like the existing trust-folder status",
+      "acceptedRecommendation": true
+    },
+    "timing": {
+      "n": 14,
+      "title": "Keystroke timing for every dialog agetor drives",
+      "type": "confirm",
+      "status": "answered",
+      "value": "Wait ≥500 ms after the dialog first appears, re-read the cursor from the live pane right before sending, ≥150 ms between Down and Enter, and confirm the dialog is gone (not held) before reporting success",
+      "acceptedRecommendation": true
+    },
+    "card-reread": {
+      "n": 15,
+      "title": "Card clicks drive from the live cursor",
+      "type": "confirm",
+      "status": "answered",
+      "value": "`dismissTmuxPrompt` re-reads the pane before sending and drives from the current cursor, not the one recorded at registration. If the pane no longer shows the same dialog, it refuses with a clear error",
+      "acceptedRecommendation": true
+    },
+    "boot-ticks": {
+      "n": 16,
+      "title": "Boot poller stability",
+      "type": "confirm",
+      "status": "answered",
+      "value": "Expire `recentlyAnsweredFingerprints` at boot after the same 3 s the runtime scraper uses. A suppressed sighting still keeps the boot window open. Unparsable cards need 3 stable ticks at boot, as at runtime",
+      "acceptedRecommendation": true
+    },
+    "paste-defer": {
+      "n": 17,
+      "title": "Long-prompt paste while a dialog is up",
+      "type": "confirm",
+      "status": "answered",
+      "value": "While the boot poller sees any startup dialog, the deferred paste keeps waiting and doesn't fail the run. It only fails when the boot itself times out, with the pane in the error",
+      "acceptedRecommendation": true
+    },
+    "pane-size": {
+      "n": 18,
+      "title": "Cut-off dialogs",
+      "type": "confirm",
+      "status": "answered",
+      "value": "Match the cut-off shape (the `Adding: <path>` trailer below the footer). Don't resize the boot pane in this change",
+      "acceptedRecommendation": true
+    },
+    "docs": {
+      "n": 19,
+      "title": "Docs updated in the same change",
+      "type": "confirm",
+      "status": "answered",
+      "value": "`docs/architecture/harness-claude-code.md` (boot poller, consent table, held state, Enter-only card), `docs/architecture/multi-repo-tasks.md` (add-dir trust), and the `STARTUP_CONSENT_DIALOGS` / `MODAL_FOOTER_RE` comments",
+      "acceptedRecommendation": true
+    },
+    "scrub-brief": {
+      "n": 20,
+      "title": "Client names in the investigation brief",
+      "type": "confirm",
+      "status": "answered",
+      "value": "Before committing, replace the real client repository names and paths in the investigation brief (its incident log and Appendix A pane) with synthetic ones (`repo-a` … `repo-e`), and keep them out of fixtures and the plan",
+      "acceptedRecommendation": true
+    }
+  },
+  "generalNotes": null
+}

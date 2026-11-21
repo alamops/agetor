@@ -263,24 +263,24 @@ test.describe("pipelines run: New Task form picker", () => {
 
     await gotoApp(page, backend.bootBase);
     const form = page.locator("aside").first();
-    const picker = form.getByTestId("new-task-pipeline-picker").getByTestId("pipeline-picker");
-    await expect(form.getByText("Agent", { exact: true })).toBeVisible();
+    const picker = form.getByTestId("launch-pipeline-picker").getByTestId("pipeline-picker");
+    await expect(form.getByTestId("agent-profile-picker")).toBeVisible();
 
     await picker.getByTestId("pipeline-picker-trigger").click();
-    const popover = picker.getByTestId("pipeline-picker-popover");
+    const popover = page.getByTestId("pipeline-picker-popover");
     await expect(popover).toBeVisible();
     await popover.locator(`[data-testid="pipeline-picker-row"][data-pipeline-id="${id}"]`).click();
     await expect(popover).toBeHidden();
 
-    const summary = form.getByTestId("new-task-pipeline-summary");
+    const summary = form.getByTestId("launch-pipeline-summary");
     await expect(summary).toBeVisible();
     await expect(summary).toContainText(pipelineName);
     await expect(summary).toContainText("1 step");
-    await expect(form.getByText("Agent", { exact: true })).toHaveCount(0);
+    await expect(form.getByTestId("agent-profile-picker")).toHaveCount(0);
 
-    await summary.getByTestId("new-task-pipeline-clear").click();
-    await expect(form.getByTestId("new-task-pipeline-summary")).toHaveCount(0);
-    await expect(form.getByText("Agent", { exact: true })).toBeVisible();
+    await summary.getByTestId("launch-pipeline-change").click();
+    await expect(form.getByTestId("launch-pipeline-summary")).toHaveCount(0);
+    await expect(form.getByTestId("agent-profile-picker")).toBeVisible();
     await expect(picker.getByTestId("pipeline-picker-trigger")).toContainText("No pipeline");
   });
 });

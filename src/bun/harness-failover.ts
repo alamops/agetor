@@ -30,7 +30,7 @@ import { HARNESS_QUOTA_STALE_MS, harnessQuotaLooksExhausted, harnessQuotaResetAt
 import { getHarnessDiscoveredModels } from "./agent-discovery.ts";
 import { preflightCatalogFor } from "./model-discovery.ts";
 import { CLI_AUTHORITATIVE_CATALOG_KINDS, modelCatalogVerdict } from "../shared/model-catalog.ts";
-import { peekCachedCliVersion } from "./agent-status.ts";
+import { CLAUDE_LOGIN_HINT, peekCachedCliVersion, peekClaudeLoggedIn, refreshClaudeAuth } from "./agent-status.ts";
 import { cliVersionSatisfies } from "../shared/cli-version.ts";
 import { harnesses, harnessUsage, op, runs, tasks, type SessionIdColumn } from "./db-async.ts";
 import { harnessStacks, loginEvidence, memberInstalled } from "./harness-stacks.ts";
@@ -318,6 +318,39 @@ export async function clearFailoverState(taskId: string): Promise<void> {
 
 export type { NextMemberPlan };
 
+/** The reason a logged-out account is skipped with (also the status line's). */
+export const NOT_LOGGED_IN_REASON = "not logged in";
+
+/**
+ * Warm the Claude login cache for every account in the task's stack so the
+ * planners below (`planNextMember`, `planRetryMember`,
+ * `planManualSwitchTarget`, `memberUnusableReason`) can skip a logged-out
+ * account from the cache alone: the probes run in parallel, capped at 5 s in
+ * all, and fail open. A task outside a stack is a no-op. Call it before planning.
+ */
+export async function warmStackLogins(
+  task: Pick<Task, "id" | "agent" | "harnessState">,
+  opts?: { fresh?: boolean },
+): Promise<void> {
+  const resolved = await harnessStacks.resolveForTask(task);
+  if (!resolved) return;
+  const members = (await Promise.all(resolved.stack.members.map((m) => harnesses.getByIdOrKind(m.harnessId))))
+    .filter((h): h is NonNullable<typeof h> => h != null);
+  await refreshClaudeAuth(members, undefined, opts);
+}
+
+/** The "skipped <account>: not logged in" status lines for a plan's skipped
+ *  members (a stack's logged-out account is skipped like an exhausted one). */
+export async function loggedOutSkipLines(skipped: ReadonlyArray<{ harnessId: string; reason: string }>): Promise<string[]> {
+  const lines: string[] = [];
+  for (const s of skipped) {
+    if (s.reason !== NOT_LOGGED_IN_REASON) continue;
+    const label = (await harnesses.getByIdOrKind(s.harnessId))?.label ?? s.harnessId;
+    lines.push(`skipped ${label}: ${NOT_LOGGED_IN_REASON}`);
+  }
+  return lines;
+}
+
 /**
  * Why a member cannot run this task's turn right now, or null when it can.
  * Deliberately cheap: no fresh CLI probe on the hot path — the cached version
@@ -328,7 +361,10 @@ export async function memberUnusableReason(member: { harnessId: string; enabled:
   const harness = await harnesses.getByIdOrKind(member.harnessId);
   if (!harness) return "account no longer exists";
   if (!memberInstalled(harness)) return "CLI not installed";
-  if (loginEvidence(harness) === false) return "logged out";
+  // `loginEvidence` is the file/keychain check; `peekClaudeLoggedIn` is the
+  // cached `claude auth status` answer (warmed by `warmStackLogins` before
+  // every planner). Both fail open: `null` means "cannot tell", never "out".
+  if (loginEvidence(harness) === false || peekClaudeLoggedIn(harness) === false) return NOT_LOGGED_IN_REASON;
   // The model the turn would really run: a default-model task (null) resolves
   // exactly like `startTask` does, so a backup that cannot serve the default
   // model is skipped too.
@@ -941,7 +977,7 @@ export async function moveTaskToMember(args: MoveTaskToMemberArgs): Promise<Move
  *
  * `forceOffCurrent` is for a start pre-flight that failed on the current
  * account even though the cached member snapshot looked usable (a fresh-auth
- * probe or the per-model CLI floor is newer than the 15 s status cache). It
+ * probe or the per-model CLI floor is newer than the 60 s status cache). It
  * treats the current account as unusable for this turn and moves to a backup
  * exactly like a disabled/logged-out member would.
  */
@@ -949,11 +985,33 @@ export async function prepareTaskHarness(
   taskId: string,
   opts: { manual: boolean; forceOffCurrent?: boolean; forceReason?: string } = { manual: true },
 ): Promise<PrepareResult> {
+  return prepareTaskHarnessPass(taskId, opts, false);
+}
+
+/** One pass of {@link prepareTaskHarness}. `freshAuth` re-probes every
+ *  account's login instead of reading the 60 s cache: a manual start that the
+ *  cache says is logged out everywhere gets one fresh pass before it is
+ *  refused, so logging in and pressing Start again works at once. */
+async function prepareTaskHarnessPass(
+  taskId: string,
+  opts: { manual: boolean; forceOffCurrent?: boolean; forceReason?: string },
+  freshAuth: boolean,
+): Promise<PrepareResult> {
+  const before = await tasks.get(taskId);
+  if (!before) return { ok: false, error: "task not found" };
+  if (!(await harnessStacks.resolveForTask(before))) return { ok: true };
+  if ((await runs.hasRunning(taskId)) || (await hooks?.isTaskHeld?.(taskId))) return { ok: true };
+  await warmStackLogins(before, { fresh: freshAuth });
+  // The probe awaited: plan from the task and stack as they are NOW (an
+  // account switch, a stack edit or a member change may have landed meanwhile).
   const task = await tasks.get(taskId);
   if (!task) return { ok: false, error: "task not found" };
   const resolved = await harnessStacks.resolveForTask(task);
   if (!resolved) return { ok: true };
-  if ((await runs.hasRunning(taskId)) || (await hooks?.isTaskHeld?.(taskId))) return { ok: true };
+  // A turn may have started, or background agents taken hold, while the probe ran.
+  const busy = async (): Promise<boolean> =>
+    (await runs.hasRunning(taskId)) || Boolean(await hooks?.isTaskHeld?.(taskId));
+  if (await busy()) return { ok: true };
   const { stack, current } = resolved;
   // A stack of fewer than two accounts behaves exactly like a lone account:
   // no failover state, and the normal pre-flight error (with its login help)
@@ -974,6 +1032,11 @@ export async function prepareTaskHarness(
     : member
       ? await memberUnusableReason(member, task)
       : "account left the stack";
+  // The cache (60 s) may predate a login the user just did on THIS account:
+  // never move a manual start off it on a cached "logged out".
+  if (opts.manual && !freshAuth && unusable === NOT_LOGGED_IN_REASON) {
+    return prepareTaskHarnessPass(taskId, opts, true);
+  }
   if (!unusable) {
     if (opts.manual) {
       // A manual turn is a fresh lap and clears the exhausted countdown. It
@@ -1011,6 +1074,12 @@ export async function prepareTaskHarness(
     usable: (m) => facts.unusable.get(m.harnessId) ?? null,
   });
   if (plan.kind !== "next") {
+    // Every account refused for the same reason: the login. Say how to fix it.
+    if (plan.kind === "none-usable" && plan.reasons.length > 0 && plan.reasons.every((r) => r.reason === NOT_LOGGED_IN_REASON)) {
+      // The cache may predate a login the user just did: ask again before refusing.
+      if (opts.manual && !freshAuth) return prepareTaskHarnessPass(taskId, opts, true);
+      return { ok: false, error: `every account in this stack is ${NOT_LOGGED_IN_REASON} — ${CLAUDE_LOGIN_HINT}` };
+    }
     return { ok: false, error: "no usable account in this stack — enable, install or log in to one" };
   }
   const to = plan.member.harnessId;
@@ -1029,6 +1098,9 @@ export async function prepareTaskHarness(
     sessionId: await latestSessionForAccount(task, fromHarness.kind, current),
     cwd: task.worktreePath ?? task.workdir,
     history: { trigger: "unavailable", reason },
+    // Re-checked after the mirror and transfer awaits: a task that went live
+    // or got held meanwhile keeps its account (the message queues behind it).
+    beforeCommit: async () => !(await busy()),
     state: () => ({
       stackId: stack.id,
       position: plan.member.position,
@@ -1046,14 +1118,25 @@ export async function prepareTaskHarness(
     // blocks on the same condition.
     return { ok: false, error: `could not move the conversation to ${toHarness.label}: ${moved.message}` };
   }
+  // Declined by `beforeCommit`: nothing was written, so report no move (the
+  // caller must not drop the session of an account the task never left).
+  if (moved.kind === "aborted") return { ok: true };
   // A manual move supersedes any armed all-exhausted retry. The timer callback
   // would no-op on the cleared state, but leaving the handle in the map keeps
   // a dangling timer for up to 24 h; cancel it like the no-move branch does.
   cancelAutoRetry(taskId);
+  // The walk starts AFTER the current account, so `plan.skipped` never lists
+  // it: a logged-out current account is named here, ahead of the others.
+  const skipLines = await loggedOutSkipLines([
+    ...(unusable === NOT_LOGGED_IN_REASON ? [{ harnessId: current, reason: unusable }] : []),
+    ...plan.skipped,
+  ]);
   return {
     ok: true,
     moved: { from: current, to },
-    ...(moved.warnings.length > 0 ? { warnings: moved.warnings } : {}),
+    ...(moved.warnings.length > 0 || skipLines.length > 0
+      ? { warnings: [...skipLines, ...moved.warnings] }
+      : {}),
   };
 }
 

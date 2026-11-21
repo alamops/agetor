@@ -1,78 +1,50 @@
-import { useEffect, useMemo, useRef, useState } from "react";
-import {
-  ChevronLeft,
-  ChevronRight,
-  ClipboardList,
-  Code2,
-  RefreshCw,
-  Workflow,
-} from "lucide-react";
-import { api, type AgentModelMap } from "@/lib/api";
-import {
-  buildModelOptions,
-  CLI_AUTHORITATIVE_CATALOG_KINDS,
-  effortOptionsFor,
-  resolveDefaultEffort,
-  resolveDefaultModel,
-  seedModelStep,
-  speedNoticeFor,
-  speedOptionsFor,
-  speedTiersKnown,
-} from "../../../shared/model-catalog.ts";
-import { isSpeed } from "../../../shared/speed.ts";
+import { useCallback, useEffect, useMemo, useRef, useState } from "react";
+import { ChevronLeft, ChevronRight } from "lucide-react";
+import type { AgentModelMap } from "@/lib/api";
 import { promptByteOverage } from "../../../shared/prompt-limits.ts";
 import { composeLaunchPrompt } from "../../../shared/agent-profile.ts";
-import { resolveStartStep } from "../../../shared/pipeline.ts";
-import { Button } from "@/components/ui/button";
 import { Input } from "@/components/ui/input";
-import { Select } from "@/components/ui/select";
-import { SearchSelect } from "@/components/ui/search-select";
+import { Field, FieldLabel } from "@/components/ui/field";
 import { InfoTip } from "@/components/ui/info-tip";
-import { Switch } from "@/components/ui/switch";
-import { cn, formatTokens } from "@/lib/utils";
+import { Notice } from "@/components/ui/notice";
+import { ResizeHandle } from "@/components/ui/resize-handle";
+import { cn } from "@/lib/utils";
 import {
-  AGENT_OPTIONS,
-  CODE_PLAN_MODE,
-  DEFAULT_EFFORT,
-  DEFAULT_MODEL,
   DEFAULT_TASK_TYPE,
-  cursorModelSupportsMaxMode,
-  defaultModeFor,
-  supportedEfforts,
-  supportedModes,
-  type AgentKind,
-  type AgentProfile,
   type AgentStatus,
   type Harness,
   type HarnessStack,
   type Isolation,
-  type Pipeline,
   type Speed,
   type TaskReference,
   type TaskType,
 } from "../../../shared/types.ts";
-import { AgentIcon } from "./AgentIcon";
-import { StackPositionChip } from "./StackBadge";
-import { AgentProfileCard } from "./AgentProfileCard";
-import { AgentProfilePicker } from "./AgentProfilePicker";
-import { HarnessAuthHint } from "./HarnessAuthHint";
-import { stackBackupCanServe } from "@/lib/stack-launch";
-import { PipelinePicker } from "@/components/pipelines";
-import { showsSpeedPicker, SpeedPicker } from "./SpeedPicker";
 import { useProjectSelection } from "./ProjectSelection";
 import { repositoryFileScopes } from "@/lib/repo-selection";
 import { selectionPayload } from "@/lib/worktree-payload";
 import { TaskTypePicker } from "./TaskTypePicker";
 import { captureDroppedOrPastedItems } from "./ReferencesPicker";
 import { PromptComposer, usePromptCapture } from "./PromptComposer";
-import { useWorktreeOptions, WorktreeOptions } from "./WorktreeOptions";
+import { useWorktreeOptions } from "./WorktreeOptions";
+import { TaskLaunchPickers, useTaskLaunch } from "./TaskLaunchPickers";
+import { WorkspaceSection } from "./WorkspaceSection";
+import { LaunchFooter } from "./LaunchFooter";
+import { launchGate, submitPicks } from "@/lib/launch-state";
+import { useSubmitShortcut } from "@/lib/use-submit-shortcut";
 import {
   NEW_TASK_PANEL_COLLAPSED_KEY,
   readCollapsed,
   writeCollapsed,
 } from "@/lib/panel-collapse";
-
-const initialMode = (kind: AgentKind) => defaultModeFor(kind);
+import {
+  NEW_TASK_PANEL_DEFAULT_WIDTH,
+  NEW_TASK_PANEL_MAX_WIDTH,
+  NEW_TASK_PANEL_MIN_BOARD_WIDTH,
+  NEW_TASK_PANEL_MIN_WIDTH,
+  clampNewTaskPanelWidth,
+  readNewTaskPanelWidth,
+  writeNewTaskPanelWidth,
+} from "@/lib/panel-width";
 
 interface Props {
   onSubmit: (
@@ -112,29 +84,14 @@ interface Props {
   ) => void;
   agents: AgentStatus[];
   /** Registered harnesses — built-ins plus user aliases. The agent picker
-   *  renders one button per harness. */
+   *  renders one row per harness. */
   harnesses: Harness[];
   /** Harness account stacks, for the account position chip. */
   stacks?: HarnessStack[];
-  /** Saved agent profiles — powers the `AgentProfilePicker` above the
-   *  harness grid ("one selection": picking one hides the manual
-   *  harness/mode/model/effort block). */
-  profiles: AgentProfile[];
   /** "Manage agents…" footer row in the profile picker's popover — opens
-   *  Settings on the Agents section. */
+   *  Settings on the Agents section. The profile and pipeline lists themselves
+   *  come from the module caches `useTaskLaunch` reads (App mounts them at boot). */
   onOpenSettingsAgents: (profileId?: string) => void;
-  /** Saved pipelines — powers the `PipelinePicker` above the Agent picker
-   *  ("one selection" with the agent profile: picking a pipeline hides the
-   *  Agent picker and the manual harness/mode/model/effort block). */
-  pipelines: Pipeline[];
-  /** True once `pipelines` has resolved at least once (mirrors
-   *  `usePipelines()`'s own `loaded` flag) — lets the stale-selection guard
-   *  below (m19) tell "not fetched yet" apart from "fetched, and it's
-   *  genuinely empty" so a fast picker click can't be raced by a still-empty
-   *  cache and cleared right back out. Optional for callers that don't
-   *  thread it through — an empty, not-yet-`loaded` list is then treated the
-   *  same as a loaded empty list (the pre-existing behavior). */
-  pipelinesLoaded?: boolean;
   /** "Manage pipelines…" footer row in the pipeline picker's popover —
    *  opens the full-page pipelines list. */
   onOpenPipelines: () => void;
@@ -165,7 +122,11 @@ interface Props {
   focusNonce?: number;
 }
 
-export function NewTaskForm({ onSubmit, agents, harnesses, stacks = [], profiles, onOpenSettingsAgents, pipelines, pipelinesLoaded, onOpenPipelines, agentModels, harnessModels, onRefreshModels, focusNonce }: Props) {
+
+/** Width of the collapsed icon rail. */
+const RAIL_WIDTH = 44;
+
+export function NewTaskForm({ onSubmit, agents, harnesses, stacks = [], onOpenSettingsAgents, onOpenPipelines, agentModels, harnessModels, onRefreshModels, focusNonce }: Props) {
   // Collapsed = thin icon rail; the board's `flex-1` <main> takes the freed
   // width on its own. Seeded synchronously from localStorage (lazy initial
   // state) so a restart repaints in the state the user left it in — an async
@@ -176,6 +137,25 @@ export function NewTaskForm({ onSubmit, agents, harnesses, stacks = [], profiles
   useEffect(() => {
     writeCollapsed(NEW_TASK_PANEL_COLLAPSED_KEY, collapsed);
   }, [collapsed]);
+  // Resizable width (320–560, default 384), read synchronously for the same
+  // reason as `collapsed`. `resizing` turns the width transition off while a
+  // drag is in flight, so the panel follows the pointer without lag.
+  // The width the user chose (stored, dragged or reset to), limited only to the panel's own
+  // 320-560 range: a smaller window clamps what is shown, never this, so widening the window
+  // again gives the chosen width back, even in a session that started narrow.
+  const [storedWidth] = useState(() => readNewTaskPanelWidth(Number.POSITIVE_INFINITY));
+  const preferredWidth = useRef(storedWidth);
+  const [width, setWidth] = useState(() =>
+    clampNewTaskPanelWidth(storedWidth, typeof window === "undefined" ? 1440 : window.innerWidth),
+  );
+  const [resizing, setResizing] = useState(false);
+  useEffect(() => {
+    // A smaller window re-clamps the panel so the board keeps its room.
+    const onResize = () => setWidth(clampNewTaskPanelWidth(preferredWidth.current, window.innerWidth));
+    window.addEventListener("resize", onResize);
+    return () => window.removeEventListener("resize", onResize);
+  }, []);
+  const asideRef = useRef<HTMLElement>(null);
   const titleRef = useRef<HTMLInputElement>(null);
   // Transient "look here" ring around the panel root, driven by `focusNonce`.
   const [spotlight, setSpotlight] = useState(false);
@@ -210,41 +190,17 @@ export function NewTaskForm({ onSubmit, agents, harnesses, stacks = [], profiles
   const [title, setTitle] = useState("");
   const [prompt, setPrompt] = useState("");
   const [taskType, setTaskType] = useState<TaskType>(DEFAULT_TASK_TYPE);
-  // Selected agent profile ("one selection" — see `AgentProfilePicker`):
-  // null means "No agent — pick harness manually", the form's default (no
-  // last-used-profile preference — plan D12). Reset to null after a
-  // successful submit, same as every other field below.
-  const [agentProfileId, setAgentProfileId] = useState<string | null>(null);
-  // Selected pipeline ("one selection" with the agent profile — D1/D5,
-  // docs/plans/pipelines.md): null means "no pipeline — pick an agent (or
-  // harness) manually". Reset to null after a successful submit, same as
-  // every other field below. Mutually exclusive with `agentProfileId` —
-  // each picker's `onChange` below clears the other.
-  const [pipelineId, setPipelineId] = useState<string | null>(null);
-  // Soft-deleted harnesses are excluded from the picker and the default-
-  // fallback logic. The full `harnesses` list is still used for
-  // `selectedHarness` lookup so the resolved kind stays correct even for a
-  // currently-selected-but-disabled harness (edge case during a refresh).
-  const availableHarnesses = useMemo(
-    () => harnesses.filter((h) => h.enabled),
-    [harnesses],
-  );
-  // Selected harness id (free-form string). Defaults to the built-in
-  // claude-code; replaced on first preferences load by `defaultHarness`.
-  const [agent, setAgent] = useState<string>("claude-code");
-  const selectedHarness = useMemo(
-    () => harnesses.find((h) => h.id === agent) ?? null,
-    [harnesses, agent],
-  );
-  // Resolve kind for the form's mode/model/effort logic. Falls back to
-  // claude-code (back-compat) when the harness list hasn't loaded yet or
-  // the selected id was deleted out-of-band.
-  const kind: AgentKind = selectedHarness?.kind ?? "claude-code";
-  // Latest kind for the mount-once preference seed below: the user can switch
-  // harness before `listPreferences()` resolves, and the seed must then fill
-  // the form from the kind now selected, not the kind at mount.
-  const kindRef = useRef(kind);
-  kindRef.current = kind;
+
+  // The launch state — harness / mode / model / effort / speed / max-mode, the
+  // agent profile and pipeline "one selection", the remembered per-kind picks and
+  // the model catalog — comes from the ONE hook every launch surface shares
+  // (`lib/use-task-launch.ts`). The panel feeds it App's live data, so the 15 s
+  // harness refresh and the SSE-driven catalog updates keep reaching it.
+  const launch = useTaskLaunch(true, {
+    withPipelines: true,
+    source: { harnesses, agents, stacks, agentModels, harnessModels, refreshModels: onRefreshModels },
+  });
+
   // Combined project selection (single + multi): `repos` is the single source
   // of truth for the selection *and* every per-project base ref, and `workdir`
   // is derived from its first entry. Nothing is selected on a cold start — the
@@ -254,57 +210,16 @@ export function NewTaskForm({ onSubmit, agents, harnesses, stacks = [], profiles
   // selection (and every chosen ref) is kept for the next task.
   const { repos, setRepos, workdir, multiRepo } = useProjectSelection({ autoSelect: true });
   // Owns the isolate toggle (forced for 2+) and the branch-name field state —
-  // see `WorktreeOptions.tsx`. Declared here (before the mode/model state) since
-  // `wt.effectiveIsolate` is read further down by the `fileScope` memo passed to
-  // `<PromptComposer fileScope={…}>`.
+  // see `WorktreeOptions.tsx`. Declared before the `fileScope` memo below, which
+  // reads `wt.effectiveIsolate`.
   const wt = useWorktreeOptions({ workdir, title, taskType, forceIsolate: multiRepo });
-  const [mode, setMode] = useState<string>(initialMode("claude-code"));
-  const [model, setModel] = useState<string>(DEFAULT_MODEL["claude-code"]);
-  // `null` is reserved for the Haiku-style "model doesn't accept effort" case.
-  // Every other state is a real effort id from EFFORT_OPTIONS.
-  const [effort, setEffort] = useState<string | null>(DEFAULT_EFFORT["claude-code"]);
-  const [speed, setSpeed] = useState<Speed>("off");
-  const [maxMode, setMaxMode] = useState(false);
-  // Spins the Model label's ↻ button while a manual `onRefreshModels` probe
-  // is in flight for the currently-selected harness.
-  const [refreshingModels, setRefreshingModels] = useState(false);
-  // Auto-select the default harness once it (and the harness list) loads.
-  // We only force-switch when the *current* selection isn't valid for the
-  // loaded list — so a user mid-edit doesn't get their pick stolen. The
-  // `seededDefaultRef` guard means we read `preferences.defaultHarness`
-  // at most once per mount; the parent's 15s harness-refresh re-runs the
-  // effect, but it short-circuits on the harness-membership check from
-  // then on.
-  const seededDefaultRef = useRef(false);
-  useEffect(() => {
-    if (availableHarnesses.length === 0) return;
-    if (availableHarnesses.some((h) => h.id === agent)) return;
-    if (seededDefaultRef.current) {
-      // We've already seeded once; the selected alias was just deleted or
-      // disabled. Fall back to the first available harness without
-      // re-fetching prefs.
-      setAgent(availableHarnesses[0]!.id);
-      return;
-    }
-    seededDefaultRef.current = true;
-    void api.listPreferences().then((prefs) => {
-      const want = prefs.defaultHarness;
-      if (want && availableHarnesses.some((h) => h.id === want)) {
-        setAgent(want);
-      } else {
-        setAgent(availableHarnesses[0]!.id);
-      }
-    }).catch(() => {
-      setAgent(availableHarnesses[0]!.id);
-    });
-  }, [availableHarnesses, agent]);
   const [references, setReferences] = useState<TaskReference[]>([]);
   const [dragging, setDragging] = useState(false);
   const promptRef = useRef<HTMLTextAreaElement>(null);
   // `@` file-reference scope: a live tree when isolation is off (the agent
   // will run directly in `workdir`), or the pinned base ref's tracked files
   // when isolation is on (the worktree doesn't exist yet — see
-  // `docs/plans/at-file-references.md` §3.3). Memoized so `useProjectFiles`'s
+  // `docs/architecture/at-file-references.md`). Memoized so `useProjectFiles`'s
   // effect (keyed on `scope.dir`/`scope.ref`) doesn't see a new object
   // identity — and therefore doesn't refire — on every unrelated re-render.
   const fileScope = useMemo(() => {
@@ -326,387 +241,57 @@ export function NewTaskForm({ onSubmit, agents, harnesses, stacks = [], profiles
   // `capture` seam doc for why this needs real `useState` dispatchers.
   const capture = usePromptCapture({ textareaRef: promptRef, setPrompt, setReferences });
 
-  // Per-kind cache so switching aliases-of-the-same-kind preserves the prior
-  // picks (mode/model/effort are kind-specific, not alias-specific).
-  // Reads/writes happen synchronously inside `switchAgent` — no effects, so
-  // no transient wrong-slot writes on render commit.
-  // A remembered `lastModel:<kind>` the curated list does not carry (a model
-  // only the CLI's catalog lists), held until discovery shows it is real, and
-  // the kinds whose model the user has already chosen by hand this session.
-  const pendingSeed = useRef<Partial<Record<AgentKind, { model: string; effort: string | null; applied?: boolean }>>>({});
-  const modelTouched = useRef<Partial<Record<AgentKind, boolean>>>({});
-  // True once the remembered picks above have been read (or failed to read):
-  // the seed effect below re-runs on it, because the catalog rows can land
-  // BEFORE the preferences do, and a remembered model only the catalog knows
-  // would then never be applied.
-  const [prefsLoaded, setPrefsLoaded] = useState(false);
-  const agentCache = useRef<Record<AgentKind, { mode: string; model: string; effort: string | null; speed: Speed; maxMode: boolean }>>({
-    "claude-code": { mode: initialMode("claude-code"), model: DEFAULT_MODEL["claude-code"], effort: DEFAULT_EFFORT["claude-code"], speed: "off", maxMode: false },
-    "codex": { mode: initialMode("codex"), model: DEFAULT_MODEL["codex"], effort: DEFAULT_EFFORT["codex"], speed: "off", maxMode: false },
-    "cursor": { mode: initialMode("cursor"), model: DEFAULT_MODEL["cursor"], effort: DEFAULT_EFFORT["cursor"], speed: "off", maxMode: false },
-    "gemini": { mode: initialMode("gemini"), model: DEFAULT_MODEL["gemini"], effort: DEFAULT_EFFORT["gemini"], speed: "off", maxMode: false },
-    "antigravity": { mode: initialMode("antigravity"), model: DEFAULT_MODEL["antigravity"], effort: DEFAULT_EFFORT["antigravity"], speed: "off", maxMode: false },
-    "fx": { mode: initialMode("fx"), model: DEFAULT_MODEL["fx"], effort: DEFAULT_EFFORT["fx"], speed: "off", maxMode: false },
-    "opencode": { mode: initialMode("opencode"), model: DEFAULT_MODEL["opencode"], effort: DEFAULT_EFFORT["opencode"], speed: "off", maxMode: false },
-    "copilot": { mode: initialMode("copilot"), model: DEFAULT_MODEL["copilot"], effort: DEFAULT_EFFORT["copilot"], speed: "off", maxMode: false },
-  });
-
-  // Seed mode + model + effort defaults from the last submitted picks,
-  // per kind. Persisted server-side as `lastMode:<kind>` etc. Fires once.
-  // Stored ids are validated against the current option set so a stale
-  // sentinel (e.g. the old `"default"` placeholder) doesn't reselect
-  // nothing — invalid values fall back to the per-kind defaults.
-  //
-  // `lastEffort:<kind>` is validated against the model we just restored from
-  // `lastModel:<kind>` (or the per-kind default when that pref is missing).
-  // The two prefs are always written together in `submit`, so in practice
-  // they describe a matched (model, effort) pair; if a partial write ever
-  // strands an effort against a model that doesn't support it, the
-  // validation collapses it to the kind's default.
-  useEffect(() => {
-    let cancelled = false;
-    void api.listPreferences().then((prefs) => {
-      if (cancelled) return;
-      const seed = (a: AgentKind) => {
-        const md = prefs[`lastMode:${a}`];
-        const m = prefs[`lastModel:${a}`];
-        const e = prefs[`lastEffort:${a}`];
-        const sp = prefs[`lastSpeed:${a}`];
-        const mm = prefs[`lastMaxMode:${a}`];
-        if (md && AGENT_OPTIONS[a].modes.some((x) => x.id === md)) {
-          agentCache.current[a].mode = md;
-        }
-        if (m && !CLI_AUTHORITATIVE_CATALOG_KINDS.has(a) && AGENT_OPTIONS[a].models.some((x) => x.id === m)) {
-          agentCache.current[a].model = m;
-        } else if (m) {
-          // A remembered model the curated list does not carry (one the
-          // CLI's own catalog added): this seed runs before discovery has
-          // loaded, so hold it and let the effect below apply it once the
-          // rows show the model is real — and only if the user has not
-          // already picked one.
-          pendingSeed.current[a] = { model: m, effort: e ?? null };
-        }
-        if (e && !pendingSeed.current[a]) {
-          // No discovered-efforts argument here: this seed effect runs once
-          // on mount with `[]` deps, before harness discovery has resolved,
-          // so the discovered rows are still empty at this point and the
-          // discovered efforts would always read back `null` — effectively
-          // dead. Validate against the curated table only; the render-path
-          // `efforts` below (keyed on `effortsKey`, which reacts to
-          // `agentModels`/`harnessModels` updates) is the authoritative
-          // check once discovery actually lands.
-          const supported = supportedEfforts(a, agentCache.current[a].model);
-          if (supported.some((x) => x.id === e)) {
-            agentCache.current[a].effort = e;
-          } else if (supported.length === 0) {
-            agentCache.current[a].effort = null;
-          }
-        }
-        if (isSpeed(sp)) {
-          agentCache.current[a].speed = sp;
-        }
-        if (mm === "true" || mm === "false") {
-          agentCache.current[a].maxMode = mm === "true";
-        }
-      };
-      seed("claude-code");
-      seed("codex");
-      seed("cursor");
-      seed("gemini");
-      seed("antigravity");
-      seed("fx");
-      seed("opencode");
-      seed("copilot");
-      const active = agentCache.current[kindRef.current];
-      setMode(active.mode);
-      setModel(active.model);
-      setEffort(active.effort);
-      setSpeed(active.speed);
-      setMaxMode(active.maxMode);
-      setPrefsLoaded(true);
-    }).catch(() => {
-      /* preferences failure is non-fatal — defaults stay */
-      if (!cancelled) setPrefsLoaded(true);
-    });
-    return () => { cancelled = true; };
-    // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, []);
-
-  const switchAgent = (nextId: string) => {
-    if (nextId === agent) return;
-    const next = harnesses.find((h) => h.id === nextId);
-    const nextKind = next?.kind ?? "claude-code";
-    // Stash the current picks under the current kind, then restore the
-    // next kind's picks. Aliases of the same kind share the cache slot, so
-    // a swap claude-work ↔ claude-personal keeps the user's last pick.
-    agentCache.current[kind] = { mode, model, effort, speed, maxMode };
-    const saved = agentCache.current[nextKind];
-    setAgent(nextId);
-    setMode(saved.mode);
-    setModel(saved.model);
-    setEffort(saved.effort);
-    setSpeed(saved.speed);
-    setMaxMode(saved.maxMode);
-  };
-
-  const selectedStatus = agents.find((a) => a.harnessId === agent);
-  // The chosen account can't start on its own but its stack has a usable
-  // backup the core moves to: the launch pickers say so instead of showing a
-  // red "not installed" box next to an enabled Create button.
-  const stackFallback = stackBackupCanServe(agent, stacks, harnesses, agents);
-  // `auto` is only valid on models that support real `--permission-mode auto`
-  // (all current claude models); other models would error at spawn. supportedModes
-  // filters the dropdown so the user can't pick an incompatible combo.
-  const modes = supportedModes(kind, model);
-  // Merge the curated list with whatever this harness's CLI catalog
-  // discovery surfaced, per the shared rules in `mergeModelOptions` (plan
-  // `fx-model-catalog-refresh.md` §3 D3). Prefer the per-harness catalog
-  // (keyed by harness id — distinguishes a second `fx-2` account from the
-  // built-in fx harness) over the kind-level map, which only exists as a
-  // fallback for an older daemon predating `GET /agent-models/harnesses`.
-  const discoveredForAgent = harnessModels[agent] ?? agentModels[kind] ?? [];
-  const models = buildModelOptions(kind, {
-    discovered: discoveredForAgent,
-    selected: model,
-    loggedIn: selectedStatus?.loggedIn ?? null,
-  });
-  const modelsKey = models.filter((m) => !m.unlisted).map((m) => m.id).join(",");
-  // Effort options depend on both kind and model — re-derived each render
-  // so a model switch immediately narrows the dropdown. When the new model
-  // doesn't accept any effort (Haiku 4.5), effort drops to `null` and the
-  // dropdown disables itself. Otherwise we re-pin to the default effort
-  // (`resolveDefaultEffort`: the kind default when offered, else the CLI's own
-  // default, else the first row). The CLI's own discovered per-model efforts
-  // win over the curated table. There's no prior intent to retain here (a new
-  // task doesn't exist yet), so this uses the discovered-wins set strictly.
-  // Reads from `models` (the merged rows just above), not the raw
-  // `harnessModels`/`agentModels` maps, so a logged-out harness's discovery
-  // is distrusted here the same way `mergeModelOptions` rule 7 distrusts it
-  // for the Model picker — rule 8 stays a single source.
-  const efforts = effortOptionsFor(kind, model, models);
-  const effortsKey = efforts.map((o) => o.id).join(",");
-  const maxModeAvailable = kind === "cursor" && cursorModelSupportsMaxMode(model);
-  // Speed tiers the selected kind/model/effort offers (`speedOptionsFor`,
-  // always starting with "off"): cursor's Fast variant follows the
-  // model/effort pair; fx's Fast/Ultrafast, codex's service tier and
-  // claude's Fast mode come only from the discovered catalog's per-model
-  // flags (rule 8 copies them onto the merged row).
-  const speedOptions = speedOptionsFor(kind, model, effort, models);
-  // The tiers are only trustworthy once discovery has a catalog for this
-  // harness (and rule 7 isn't distrusting it for a logged-out harness) —
-  // until then a discovered-tier model reads `["off"]` and must not reset a
-  // stored tier.
-  const tiersKnown = speedTiersKnown(kind, discoveredForAgent, selectedStatus?.loggedIn ?? null);
-  const speedNotice = speedNoticeFor(kind, model, speed, models);
-  // A user model change: reset a tier the new model doesn't offer, but only
-  // when the tiers are known (plan §3.1, D16) — never on load or while
-  // discovery is still empty. The effect below handles an effort change.
-  const changeModel = (next: string) => {
-    modelTouched.current[kind] = true;
-    setModel(next);
-    if (speed === "off" || !tiersKnown) return;
-    const nextOptions = speedOptionsFor(kind, next, effort, models);
-    if (!nextOptions.includes(speed)) setSpeed("off");
-  };
-  // Apply a remembered model the curated list lacked (or the CLI's own
-  // default) once the loaded rows show it is real — unless the user has
-  // already chosen one. Never fights a later manual pick.
-  useEffect(() => {
-    if (!prefsLoaded || modelTouched.current[kind]) return;
-    const pending = pendingSeed.current[kind];
-    const step = pending
-      ? seedModelStep(kind, pending.model, models, discoveredForAgent, selectedStatus?.loggedIn ?? null)
-      : null;
-    // Not carried yet: wait while discovery has nothing trustworthy for this harness.
-    if (step?.action === "wait") return;
-    if (pending && step?.action === "apply") {
-      if (!pending.applied) {
-        pending.applied = true;
-        agentCache.current[kind].model = step.model;
-        setModel(step.model);
-        const offered = effortOptionsFor(kind, step.model, models);
-        if (pending.effort && offered.some((o) => o.id === pending.effort)) setEffort(pending.effort);
-      }
-      // A codex/copilot model only the frozen curated rows vouch for stays
-      // pending: a trusted catalog that then lacks it sends the form back to the
-      // default below, instead of leaving it on a model the CLI refuses.
-      if (step.confirmed) delete pendingSeed.current[kind];
-      return;
-    }
-    // No remembered pick (or a trusted catalog lacking it): start on the owner's
-    // default model, or the CLI's own when its trusted catalog lacks that one.
-    if (step?.action !== "default" && model !== DEFAULT_MODEL[kind]) return;
-    const preferred = resolveDefaultModel(kind, discoveredForAgent, selectedStatus?.loggedIn ?? null);
-    agentCache.current[kind].model = preferred;
-    if (preferred !== model) setModel(preferred);
-    // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [kind, modelsKey, prefsLoaded]);
-  useEffect(() => {
-    if (efforts.length === 0) {
-      if (effort !== null) setEffort(null);
-      return;
-    }
-    if (effort !== null && efforts.some((e) => e.id === effort)) return;
-    const fallback = resolveDefaultEffort(kind, model, models);
-    setEffort(fallback);
-    // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [kind, model, effortsKey]);
-  // A tier the (known) options no longer include falls back to Off: after a
-  // model or effort change on cursor, or once a kind's catalog has loaded.
-  const speedKey = tiersKnown ? speedOptions.join(",") : null;
-  useEffect(() => {
-    if (speedKey === null || speed === "off") return;
-    if (!speedKey.split(",").includes(speed)) setSpeed("off");
-  }, [speedKey, speed]);
-  useEffect(() => {
-    if (!maxModeAvailable && maxMode) setMaxMode(false);
-  }, [maxModeAvailable, maxMode]);
-  useEffect(() => {
-    if (!modes.some((m) => m.id === mode)) {
-      const fallback = modes[0]?.id;
-      if (fallback) setMode(fallback);
-    }
-    // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [kind, model]);
-  const selectedModeHint = modes.find((m) => m.id === mode)?.hint;
-  const codePlan = CODE_PLAN_MODE[kind];
-  const primary: "code" | "plan" = mode === codePlan.plan ? "plan" : "code";
-
-  // Clicking the Code pill while already in a code-bucket mode is a no-op —
-  // otherwise we'd reset an explicit acceptEdits/ask choice back to auto.
-  const onClickCode = () => {
-    if (primary === "code") return;
-    setMode(codePlan.code);
-  };
-  const onClickPlan = () => {
-    if (primary === "plan") return;
-    setMode(codePlan.plan);
-  };
-
-  const selectedHarnessLabel = selectedHarness?.label ?? agent;
-
-  // "One selection" (plan D5): a chosen profile replaces the manual
-  // harness/mode/model/effort block everywhere below. `selectedProfile` is
-  // `null` both for "no agent picked" and for a stale id the picker's own
-  // effect is about to clear.
-  const selectedProfile = agentProfileId ? (profiles.find((p) => p.id === agentProfileId) ?? null) : null;
-  // A profile can disappear out from under an open form (deleted in
-  // Settings elsewhere) — fall back to "No agent" rather than submit a
-  // dangling id. Guarded on a non-empty `profiles` so the brief
-  // not-yet-loaded window (cache still `[]`) can't spuriously clear a
-  // selection the user just made.
-  useEffect(() => {
-    if (agentProfileId && profiles.length > 0 && !profiles.some((p) => p.id === agentProfileId)) {
-      setAgentProfileId(null);
-    }
-  }, [profiles, agentProfileId]);
-
-  // "One selection" (plan D1/D5): a chosen pipeline replaces the Agent
-  // picker AND the manual harness/mode/model/effort block below with a
-  // compact summary card. Same stale-selection guard as the profile picker
-  // above — a pipeline deleted elsewhere falls back to "No pipeline".
-  const selectedPipeline = pipelineId ? (pipelines.find((p) => p.id === pipelineId) ?? null) : null;
-  // (m19) Stale-selection guard: clear a selected pipeline that no longer
-  // exists once we actually KNOW the list doesn't contain it — gated on the
-  // `pipelinesLoaded` flag rather than `pipelines.length > 0`, since the old
-  // length check could never fire while the loaded list was genuinely empty
-  // (a deleted-out-from-under-us pipeline leaving zero rows behind would
-  // never get cleared). A caller that doesn't thread `pipelinesLoaded`
-  // through falls back to treating an empty list as "loaded and not
-  // present" (clears), same as before for the common empty case, but still
-  // won't clear against a non-empty not-yet-fetched list.
-  const pipelinesKnownLoaded = pipelinesLoaded ?? pipelines.length === 0;
-  useEffect(() => {
-    if (pipelineId && pipelinesKnownLoaded && !pipelines.some((p) => p.id === pipelineId)) {
-      setPipelineId(null);
-    }
-  }, [pipelines, pipelineId, pipelinesKnownLoaded]);
-  // The pipeline's start step — `resolveStartStep` (nit4) handles the
-  // ambiguous-graph case (no `startStepId` and either zero or multiple
-  // no-incoming-edge candidates) by returning `null` instead of guessing at
-  // `steps[0]`, matching the runner's own entry-point resolution — and its
-  // bound agent profile, shown in the summary card and used to resolve the
-  // launch payload's `agent` field below (the server recomputes this from
-  // the pipeline itself; sending it here just keeps the request body
-  // self-consistent, same rationale as `selectedProfile`'s values above).
-  const pipelineStartStep = selectedPipeline ? resolveStartStep(selectedPipeline.graph) : null;
-  const pipelineStartStepProfile = pipelineStartStep?.agentProfileId
-    ? (profiles.find((p) => p.id === pipelineStartStep.agentProfileId) ?? null)
-    : null;
-  const pipelineStartStepHarness = pipelineStartStepProfile
-    ? (harnesses.find((h) => h.id === pipelineStartStepProfile.harness) ?? null)
-    : null;
-  const selectedProfileHarness = selectedProfile
-    ? (harnesses.find((h) => h.id === selectedProfile.harness) ?? null)
-    : null;
-  // Resolve the kind/label the launch actually uses: the selected profile's
-  // harness when one is picked, else the manually-picked harness — read by
-  // the gemini argv-budget check right below and by the overage warning.
-  // The harness id a launch will ACTUALLY run under — the composer's
-  // skills/MCP/slash discovery and the submit payload must both read this,
-  // never the hidden manual `agent`, while a profile OR a pipeline is
-  // selected. A pipeline task's `agent` is a best-effort echo of its start
-  // step's harness (the server recomputes it from the pipeline itself, see
-  // `startTask`) — falls back to the hidden manual `agent` picker when the
-  // start step has no resolvable profile yet.
-  const effectiveAgent = selectedPipeline
-    ? (pipelineStartStepProfile?.harness ?? agent)
-    : selectedProfile ? selectedProfile.harness : agent;
-  const effectiveKind: AgentKind = selectedProfile ? (selectedProfileHarness?.kind ?? "claude-code") : kind;
-  const effectiveHarnessLabel = selectedProfile
-    ? (selectedProfileHarness?.label ?? selectedProfile.harness)
-    : selectedHarnessLabel;
-  // `AgentStatus` for whichever harness a launch will ACTUALLY run under —
-  // mirrors `useTaskLaunch`'s `effectiveStatus` (finding F2-3). NewTaskForm
-  // keeps its own state instead of the shared hook, so this is the local
-  // equivalent: `selectedStatus` stays pinned to the manual `agent` picker
-  // and goes stale once a profile hides that block, so the availability/
-  // auth hint below must read from this instead.
-  const effectiveStatus = selectedProfile
-    ? agents.find((a) => a.harnessId === selectedProfile.harness)
-    : selectedStatus;
-
+  // The label the overage warning and the Run gate name: the harness a launch
+  // will ACTUALLY run under (the selected profile's, a pipeline's start step's,
+  // else the manual pick).
+  const { overageKind, overageLabel } = launch;
   // Gemini's one-shot tmux launch has no deferred-paste fallback for an
-  // oversized prompt — surfaced here (and blocking submit) rather than
-  // letting it fail at spawn time. Mirrors CreateTaskFromIssueDialog's guard.
-  // Includes the agent-instructions preamble (`composeLaunchPrompt`) so this
-  // pre-check sees the same bytes `startTask` will actually send. For a
-  // pipeline task the manual `effectiveKind` is meaningless (each step runs
-  // its own profile's harness), so the check keys on the START step's bound
-  // profile instead (L-A8): a gemini-bound start step is still a one-shot
-  // `-p <prompt>` argv launch, and the raw prompt is a strict LOWER bound on
-  // what it will receive — `composeStepPrompt` wraps it with the handoff
-  // contract and delegation guidance — so a raw prompt already over the cap
-  // is guaranteed to fail at launch. No resolvable start-step profile yet →
-  // nothing to check.
-  const overageKind: AgentKind | null = selectedPipeline
-    ? (pipelineStartStepHarness?.kind ?? null)
-    : effectiveKind;
-  const overageLabel = selectedPipeline
-    ? (pipelineStartStepHarness?.label ?? pipelineStartStepProfile?.harness ?? "the start step's harness")
-    : effectiveHarnessLabel;
+  // oversized prompt — surfaced here (and blocking submit) rather than letting
+  // it fail at spawn time. Includes the agent-instructions preamble
+  // (`composeLaunchPrompt`) so this pre-check sees the same bytes `startTask`
+  // will actually send. For a pipeline task the check keys on the START step's
+  // bound harness (L-A8); no resolvable start-step profile yet → nothing to check.
   const promptOverage = overageKind === null
     ? null
-    : selectedPipeline
+    : launch.selectedPipeline
       ? promptByteOverage(overageKind, prompt)
-      : promptByteOverage(overageKind, composeLaunchPrompt(selectedProfile, prompt));
+      : promptByteOverage(overageKind, composeLaunchPrompt(launch.selectedProfile, prompt));
 
-  const canSubmit =
-    title.trim() && prompt.trim() && repos.length > 0 && wt.valid
-    && promptOverage == null;
+  // The single Run / backlog rule for every launch surface (S5): Run also needs
+  // a launchable harness and a ready pipeline; Add to backlog stays available.
+  const gate = launchGate({
+    title,
+    prompt,
+    requireTitle: true,
+    reposCount: repos.length,
+    worktreeValid: wt.valid,
+    overage: promptOverage != null,
+    effectiveLaunchable: launch.effectiveLaunchable,
+    effectiveHarnessLabel: launch.harnesses.find((h) => h.id === launch.effectiveAgent)?.label ?? launch.effectiveAgent,
+    effectiveReason: launch.effectiveStatus?.reason ?? null,
+    statusKnown: launch.effectiveStatus !== undefined,
+    pipelineSelected: launch.selectedPipeline !== null,
+    pipelineReady: launch.pipelineReady,
+    pipelineState: launch.pipelineState,
+    pipelineProblem: launch.pipelineProblem,
+  });
 
   const submit = ({ start }: { start: boolean }) => {
-    if (!canSubmit) return;
+    if (start ? !gate.canRun : !gate.canBacklog) return;
+    const agentFields = submitPicks({
+      kind: launch.kind,
+      picks: { mode: launch.mode, model: launch.model, effort: launch.effort, speed: launch.speed, maxMode: launch.maxMode },
+      profile: launch.selectedProfile,
+    });
     onSubmit(
       {
         title: title.trim(),
         prompt: prompt.trim(),
-        // When a profile is selected, the manual agent/mode/model/effort/
-        // speed/maxMode state above is hidden and stale — send the profile's
-        // own values instead. The server re-resolves and overrides these
-        // from the profile anyway (`createTask`); sending them here too
-        // keeps the request body self-consistent for any other consumer.
-        agent: effectiveAgent,
+        // The harness id a launch will ACTUALLY run under — a selected profile's
+        // or a pipeline's start step's, else the manual pick. The server
+        // re-resolves and overrides from the profile/pipeline anyway; sending
+        // them here keeps the request body self-consistent.
+        agent: launch.effectiveAgent,
         // `selectionPayload` is the single mapping from the combined selection
         // to workdir/isolation/baseRef/branch/repositories: one project keeps
         // the historical single-repository shape, 2+ always sends worktree
@@ -716,55 +301,56 @@ export function NewTaskForm({ onSubmit, agents, harnesses, stacks = [], profiles
           isolate: wt.effectiveIsolate,
           branchSubmitValue: wt.branchField.submitValue,
         }),
-        // model is always an explicit option id. effort is too, except for
-        // the Haiku-style "model doesn't accept effort" case which sends null.
-        mode: selectedProfile ? selectedProfile.mode : mode,
-        model: selectedProfile ? selectedProfile.model : model,
-        effort: selectedProfile ? selectedProfile.effort : effort,
-        speed: selectedProfile ? selectedProfile.speed : (kind === "cursor" || kind === "fx" ? speed : "off"),
-        maxMode: selectedProfile ? selectedProfile.maxMode : (kind === "cursor" ? maxMode : false),
+        // model is always an explicit option id. effort is too, except for the
+        // Haiku-style "model doesn't accept effort" case which sends null.
+        ...agentFields,
         references,
         taskType,
-        // Omit entirely when no profile/pipeline is selected — an explicit
-        // `null` still round-trips through the server's own accept-null
-        // handling, but a body that never mentions the key at all is the
-        // simplest contract for every consumer of this payload shape
-        // (finding F2-1). Mutually exclusive by construction — each
-        // picker's `onChange` clears the other — so at most one of these
-        // spreads ever contributes a key.
-        ...(pipelineId ? { pipelineId } : {}),
-        ...(agentProfileId ? { agentProfileId } : {}),
+        // Omit entirely when no profile/pipeline is selected — a body that
+        // never mentions the key at all is the simplest contract for every
+        // consumer of this payload shape (finding F2-1). Mutually exclusive by
+        // construction (the hook's one-selection invariant).
+        ...(launch.pipelineId ? { pipelineId: launch.pipelineId } : {}),
+        ...(launch.agentProfileId ? { agentProfileId: launch.agentProfileId } : {}),
       },
       { start },
     );
-    // Remember the model + effort for next time, per kind (aliases of the
-    // same kind share cache). Fire-and-forget — preferences failures
-    // shouldn't block the user. Also write into the in-memory cache so a
-    // same-session agent switch sees the latest pick. Skipped entirely while
-    // a profile or a pipeline is selected — those aren't the user's manual
-    // picks, and there's no "last used profile"/"last used pipeline"
-    // preference (plan D12).
-    if (!selectedProfile && !selectedPipeline) {
-      agentCache.current[kind] = { mode, model, effort, speed, maxMode };
-      void api.setPreference(`lastMode:${kind}`, mode).catch(() => {});
-      void api.setPreference(`lastModel:${kind}`, model).catch(() => {});
-      if (effort !== null) void api.setPreference(`lastEffort:${kind}`, effort).catch(() => {});
-      // The tier as it stands after any fall-back to Off, for every kind, so a
-      // tier the model could not offer never lingers in the memory.
-      void api.setPreference(`lastSpeed:${kind}`, speed).catch(() => {});
-      void api.setPreference(`lastMaxMode:${kind}`, String(kind === "cursor" && maxMode)).catch(() => {});
-    }
+    // Remember the picks for next time, per kind (aliases of one kind share the
+    // cache). Fire-and-forget; skipped while a profile or pipeline is selected —
+    // those aren't the user's manual picks, and there's no "last used profile"
+    // or "last used pipeline" preference (plan D12).
+    launch.rememberPicks();
     setTitle("");
     setPrompt("");
     setReferences([]);
     capture.clearDropHint();
     wt.resetAfterSubmit();
     // The project selection and its per-project refs stay for the next task.
-    setAgentProfileId(null);
-    setPipelineId(null);
+    launch.setAgentProfileId(null);
+    launch.setPipelineId(null);
     // Keep the selection, `model`, `effort`, `mode` set on purpose — the next
     // task should default to the same projects + picks the user just used.
   };
+
+  // Cmd/Ctrl+Enter runs the task from anywhere inside the panel.
+  useSubmitShortcut(asideRef, () => submit({ start: true }), gate.canRun);
+
+  const onResizeChange = useCallback((w: number) => {
+    setResizing(true);
+    setWidth(w);
+  }, []);
+  const onResizeCommit = useCallback((w: number) => {
+    setResizing(false);
+    preferredWidth.current = w;
+    setWidth(w);
+    writeNewTaskPanelWidth(w);
+  }, []);
+  const onResizeReset = useCallback(() => {
+    preferredWidth.current = NEW_TASK_PANEL_DEFAULT_WIDTH;
+    // Shown within the window like every other width; the saved one is the plain default.
+    setWidth(clampNewTaskPanelWidth(NEW_TASK_PANEL_DEFAULT_WIDTH, window.innerWidth));
+    writeNewTaskPanelWidth(NEW_TASK_PANEL_DEFAULT_WIDTH);
+  }, []);
 
   // Sidebar-wide drag/drop — anything dropped on the form (not just the
   // ReferencesPicker) gets added to the references list. The inner picker
@@ -792,18 +378,22 @@ export function NewTaskForm({ onSubmit, agents, harnesses, stacks = [], profiles
     capture.handleResult(result);
   };
 
+  const panelWidth = collapsed ? RAIL_WIDTH : width;
+
   return (
     <aside
+      ref={asideRef}
+      data-testid="new-task-panel"
       onDragOver={onAsideDragOver}
       onDragLeave={onAsideDragLeave}
       onDrop={onAsideDrop}
+      style={{ width: panelWidth }}
       className={cn(
         // Width is the only animated property — <main> next door is flex-1,
         // so the board reclaims the space in the same frame with no resize
-        // logic on that side.
+        // logic on that side. Off while dragging the resize handle.
         "relative flex h-full shrink-0 flex-col border-r border-border/60 bg-card text-card-foreground",
-        "transition-[width] duration-200 ease-out motion-reduce:transition-none",
-        collapsed ? "w-11" : "w-80",
+        !resizing && "transition-[width] duration-200 ease-out motion-reduce:transition-none",
         // `!collapsed` is belt-and-braces: onAsideDragOver already refuses to
         // arm `dragging` on the rail, this also drops a stale ring if the
         // panel is collapsed while one is showing.
@@ -816,9 +406,9 @@ export function NewTaskForm({ onSubmit, agents, harnesses, stacks = [], profiles
     >
       {/* VS Code-style collapse control: straddles the border between the
           sidebar and the board (half of it overhangs into the board's p-4
-          gutter, so it never covers a card). z-20 keeps it above the board
-          and below dialogs/overlays (z-50). top-3 centers it on the 44px
-          header row ("New task" title) so it's found where users look. */}
+          gutter, so it never covers a card). z-20 keeps it above the board and
+          the resize handle (z-10), and below dialogs/overlays (z-50). top-3
+          centers it on the 44px header row ("New task" title). */}
       <button
         type="button"
         onClick={() => setCollapsed((c) => !c)}
@@ -832,11 +422,23 @@ export function NewTaskForm({ onSubmit, agents, harnesses, stacks = [], profiles
           : <ChevronLeft className="size-3.5" />}
       </button>
 
-      {/* Clip layer: the contents keep their natural width (w-11 rail / w-80
-          form) and get cut off by this box while the aside's width animates,
-          instead of reflowing every field through 200ms of intermediate
-          widths. It can't live on the <aside> itself — that would clip the
-          toggle button's overhang. */}
+      {!collapsed && (
+        <ResizeHandle
+          testId="new-task-panel-resize"
+          label="Resize new task panel"
+          value={width}
+          min={NEW_TASK_PANEL_MIN_WIDTH}
+          max={Math.max(NEW_TASK_PANEL_MIN_WIDTH, Math.min(NEW_TASK_PANEL_MAX_WIDTH, (typeof window === "undefined" ? 1440 : window.innerWidth) - NEW_TASK_PANEL_MIN_BOARD_WIDTH))}
+          onChange={onResizeChange}
+          onCommit={onResizeCommit}
+          onReset={onResizeReset}
+        />
+      )}
+
+      {/* Clip layer: the contents keep their natural width (rail / form) and get
+          cut off by this box while the aside's width animates, instead of
+          reflowing every field through 200ms of intermediate widths. It can't
+          live on the <aside> itself — that would clip the toggle button's overhang. */}
       <div className="min-h-0 flex-1 overflow-hidden">
         {collapsed ? (
           /* Icon rail. Deliberately a plain vertical stack: future quick-action
@@ -849,45 +451,41 @@ export function NewTaskForm({ onSubmit, agents, harnesses, stacks = [], profiles
               type="button"
               onClick={() => setCollapsed(false)}
               title="Expand new task panel"
-              className="rounded-md px-1 py-2 text-[11px] font-semibold tracking-wide text-muted-foreground transition-colors [writing-mode:vertical-rl] hover:text-foreground"
+              className="rounded-md px-1 py-2 text-2xs font-semibold tracking-wide text-muted-foreground transition-colors [writing-mode:vertical-rl] hover:text-foreground"
             >
               New task
             </button>
           </div>
         ) : (
-          <div className="flex h-full w-80 flex-col">
-            <div className="flex shrink-0 items-center justify-between border-b border-border/60 px-4 py-3">
+          <div className="flex h-full flex-col" style={{ width }}>
+            <div className="flex shrink-0 items-center border-b border-border/60 px-4 py-3">
               <div className="flex items-center gap-1.5">
-                <span className="text-sm font-semibold">New task</span>
+                <h2 className="text-sm font-semibold">New task</h2>
                 <InfoTip
                   label="How these fields fit together"
                   text="A task is a unit of agent work. Type, Title and Prompt say what to do. Project, Branch and Isolate say where — with Isolate on, work happens on a fresh branch in a separate worktree, so your checkout stays clean. Harness, Mode, Model and Effort pick which agent runs it and how much autonomy it gets. Defaults are sensible — a title, a prompt and a project are enough to start."
                 />
               </div>
-              {selectedStatus?.available && selectedStatus.version && (
-                <span className="text-[11px] text-muted-foreground">
-                  {selectedStatus.version}
-                </span>
-              )}
             </div>
 
-            <div className="flex-1 space-y-3 overflow-y-auto px-4 py-3 text-xs">
+            <div className="flex-1 space-y-4 overflow-y-auto px-4 py-3">
               <TaskTypePicker value={taskType} onChange={setTaskType} />
 
-              <div className="space-y-1">
-                <label className="text-muted-foreground">Title</label>
+              <Field controlId="launch-title">
+                <FieldLabel>Title</FieldLabel>
                 <Input
+                  id="launch-title"
                   ref={titleRef}
                   placeholder="Short description"
                   value={title}
                   onChange={(e) => setTitle(e.target.value)}
                 />
-              </div>
+              </Field>
 
               <PromptComposer
                 value={prompt}
                 onChange={setPrompt}
-                agent={effectiveAgent}
+                agent={launch.effectiveAgent}
                 references={references}
                 onReferencesChange={setReferences}
                 fileScope={fileScope}
@@ -896,383 +494,38 @@ export function NewTaskForm({ onSubmit, agents, harnesses, stacks = [], profiles
                 capture={capture}
                 startingFolder={workdir || undefined}
                 footer={promptOverage && (
-                  <div className="rounded-md border border-warning/40 bg-warning/10 p-2 text-[11px] text-warning">
+                  <Notice tone="warning">
                     This prompt is {Math.ceil(promptOverage.bytes / 1024)} KB — {overageLabel}'s
                     one-shot launch caps prompts at {Math.floor(promptOverage.limit / 1024)} KB. Pick
                     another harness or trim the prompt.
-                  </div>
+                  </Notice>
                 )}
               />
 
               {/* One Select Projects control for the whole project/branch
-                  section: full-width button → per-project Branch rows →
-                  Isolate → Branch name. No separate single-project picker and
-                  no separate Repositories control. */}
-              <WorktreeOptions
-                state={wt}
-                repos={repos}
-                onReposChange={setRepos}
+                  section: Projects → per-project Branch rows → Isolate →
+                  (More options) Branch name. */}
+              <WorkspaceSection surface="panel" state={wt} repos={repos} onReposChange={setRepos} />
+
+              {/* "One selection" (plan D1/D5): a picked pipeline replaces the
+                  profile picker AND the manual harness/mode/model/effort block
+                  with a summary card; a picked profile replaces the manual
+                  block with its own card. */}
+              <TaskLaunchPickers
+                launch={launch}
+                layout="sections"
+                surface="panel"
+                onManageProfiles={() => onOpenSettingsAgents()}
+                onManagePipelines={onOpenPipelines}
               />
-
-              {/* "One selection" (plan D1/D5): a picked pipeline replaces
-                  the Agent picker AND the entire manual harness/mode/model/
-                  effort block below with a compact summary card — nothing
-                  under here is read from when `selectedPipeline` is set
-                  (see `submit`). Selecting a pipeline clears any selected
-                  agent profile (`onChange` below), and vice versa. */}
-              <div className="space-y-1" data-testid="new-task-pipeline-picker">
-                <label className="text-muted-foreground">Pipeline</label>
-                <PipelinePicker
-                  value={pipelineId}
-                  onChange={(id) => {
-                    setPipelineId(id);
-                    if (id) setAgentProfileId(null);
-                  }}
-                  pipelines={pipelines}
-                  onManage={onOpenPipelines}
-                />
-              </div>
-
-              {selectedPipeline ? (
-                <div
-                  data-testid="new-task-pipeline-summary"
-                  className="space-y-1 rounded-md border border-border bg-muted/30 p-2"
-                >
-                  <div className="flex items-center justify-between gap-2">
-                    <span className="flex min-w-0 items-center gap-1.5 text-xs font-medium">
-                      <Workflow className="size-3.5 shrink-0 text-info" aria-hidden />
-                      <span className="truncate">{selectedPipeline.name}</span>
-                    </span>
-                    <button
-                      type="button"
-                      data-testid="new-task-pipeline-clear"
-                      onClick={() => setPipelineId(null)}
-                      className="shrink-0 text-[11px] text-muted-foreground hover:text-foreground hover:underline"
-                    >
-                      Change
-                    </button>
-                  </div>
-                  <p className="text-[11px] text-muted-foreground">
-                    {selectedPipeline.graph.steps.length} step{selectedPipeline.graph.steps.length === 1 ? "" : "s"}
-                    {pipelineStartStepProfile && <> · starts with {pipelineStartStepProfile.name}</>}
-                  </p>
-                </div>
-              ) : (
-              <>
-              <div className="space-y-1">
-                <label className="text-muted-foreground">Agent</label>
-                <AgentProfilePicker
-                  value={agentProfileId}
-                  onChange={(id) => {
-                    setAgentProfileId(id);
-                    if (id) setPipelineId(null);
-                  }}
-                  profiles={profiles}
-                  // Full list, not `availableHarnesses` — the picker/card
-                  // resolve each profile's icon+label from this and need to
-                  // resolve a disabled harness too so they can render the
-                  // "(harness disabled)" marker rather than falling back to
-                  // a bare id (finding F2-4; the harness BUTTON grid a few
-                  // lines below stays scoped to `availableHarnesses` on
-                  // purpose — you can't launch onto a disabled harness).
-                  harnesses={harnesses}
-                  onManage={onOpenSettingsAgents}
-                />
-              </div>
-
-              {/* "One selection" (plan D5): a picked profile replaces the
-                  entire manual harness/mode/model/effort(/speed/max) block
-                  below with its own card — nothing under here is read from
-                  when `selectedProfile` is set (see `submit`). */}
-              {selectedProfile ? (
-                <>
-                  <AgentProfileCard profile={selectedProfile} harnesses={harnesses} variant="selected" />
-                  {/* Same availability/auth hint the manual branch below
-                   *  shows, but keyed off `effectiveStatus` (the PROFILE's
-                   *  harness) — a profile whose harness is unavailable or
-                   *  logged out must not leave a blocked Start with no
-                   *  visible reason (finding F2-3). */}
-                  {effectiveStatus && !effectiveStatus.available && (
-                    <div
-                      data-testid="agent-profile-harness-unavailable"
-                      className="rounded-md border border-destructive/40 bg-destructive/10 p-2 text-[11px] text-destructive-foreground"
-                    >
-                      <div className="font-medium">{effectiveStatus.reason}</div>
-                      {effectiveStatus.installHint && (
-                        <div className="mt-1 font-mono opacity-80">
-                          {effectiveStatus.installHint}
-                        </div>
-                      )}
-                    </div>
-                  )}
-                  <HarnessAuthHint status={effectiveStatus} />
-                </>
-              ) : (
-              <>
-              <div className="space-y-1">
-                <label className="text-muted-foreground">Harness</label>
-                <div className="grid grid-cols-2 gap-1">
-                  {availableHarnesses.map((h) => {
-                    const status = agents.find((s) => s.harnessId === h.id);
-                    const available = status?.available ?? true;
-                    return (
-                      <Button
-                        key={h.id}
-                        size="sm"
-                        variant={agent === h.id ? "default" : "outline"}
-                        onClick={() => switchAgent(h.id)}
-                        // Account email + today's token burn come first: with
-                        // two claude harnesses, "which account is this and
-                        // does it have headroom" is the decision being made.
-                        title={
-                          [
-                            status?.account?.email,
-                            status?.usage &&
-                              `today ${formatTokens(status.usage.today.inputTokens + status.usage.today.outputTokens)} tok`,
-                            status?.reason,
-                            status?.loggedIn === false ? (status.authHelp ?? "Not logged in") : null,
-                            status?.path,
-                            status?.version,
-                          ]
-                            .filter(Boolean)
-                            .join(" — ") || h.id
-                        }
-                        className="justify-start"
-                      >
-                        <AgentIcon kind={h.kind} className="mr-1" />
-                        <span className="truncate">{h.label}</span>
-                        <StackPositionChip stacks={stacks} harnessId={h.id} />
-                        <span
-                          className={cn(
-                            "ml-auto inline-block size-1.5 rounded-full",
-                            available ? "bg-success-solid" : "bg-danger-solid",
-                          )}
-                        />
-                      </Button>
-                    );
-                  })}
-                </div>
-              </div>
-
-              <div className="space-y-1">
-                <label className="text-muted-foreground">Mode</label>
-                <div className="grid grid-cols-2 gap-1">
-                  <Button
-                    size="sm"
-                    variant={primary === "code" ? "default" : "outline"}
-                    onClick={onClickCode}
-                    title="Execute changes (auto / accept edits / ask all live under Code — pick the exact variant below)."
-                  >
-                    <Code2 className="mr-1 size-3.5" />
-                    Code
-                  </Button>
-                  <Button
-                    size="sm"
-                    variant={primary === "plan" ? "default" : "outline"}
-                    onClick={onClickPlan}
-                    title={
-                      kind === "codex"
-                        ? "Codex has no native plan mode — routed to 'ask' so nothing auto-executes."
-                        : kind === "cursor"
-                        ? "Routed to cursor-agent's --mode plan — a real read-only planning mode. Approving the plan switches the task to Auto (force)."
-                        : kind === "copilot"
-                        ? "Routed to Copilot's --mode plan — approving the plan switches the task to Auto"
-                        : kind === "gemini"
-                        ? "Routed to gemini's --approval-mode plan — a real read-only mode, no changes made."
-                        : kind === "antigravity"
-                        ? "Routed to agy's --mode plan — a real read-only planning mode."
-                        : kind === "opencode"
-                        ? "Routed to OpenCode's Plan agent — no file edits, but shell commands still run."
-                        : kind === "fx"
-                        ? "fx has no native plan mode — routed to 'ask': only pre-approved rules run; anything else surfaces as an approval card in the run panel."
-                        : "Plan only — agent describes what it would do without making changes."
-                    }
-                  >
-                    <ClipboardList className="mr-1 size-3.5" />
-                    Plan
-                  </Button>
-                </div>
-                <div className="flex items-center gap-1.5">
-                  <SearchSelect
-                    value={mode}
-                    onChange={setMode}
-                    items={modes.map((m) => ({ value: m.id, label: m.label, hint: m.hint }))}
-                    searchable={false}
-                    wrapHints
-                    placement="bottom"
-                    className="min-w-0 flex-1"
-                    triggerClassName="h-8 text-xs"
-                  />
-                  {selectedModeHint && <InfoTip text={selectedModeHint} label="About this mode" />}
-                </div>
-              </div>
-
-              <div className="grid grid-cols-2 gap-2">
-                <div className="min-w-0 space-y-1">
-                  <div className="flex items-center gap-1">
-                    <label className="text-muted-foreground">Model</label>
-                    <button
-                      type="button"
-                      title="Refresh model list"
-                      aria-label="Refresh model list"
-                      data-testid="refresh-models"
-                      disabled={refreshingModels}
-                      className={cn(
-                        "text-muted-foreground hover:text-foreground disabled:cursor-not-allowed disabled:opacity-50",
-                        refreshingModels && "animate-spin",
-                      )}
-                      onClick={async () => {
-                        setRefreshingModels(true);
-                        try {
-                          await onRefreshModels(agent);
-                        } catch {
-                          // The SSE / ready-retry paths also refetch — a
-                          // failed manual probe just leaves the list as-is.
-                        } finally {
-                          setRefreshingModels(false);
-                        }
-                      }}
-                    >
-                      <RefreshCw className="size-3" />
-                    </button>
-                  </div>
-                  <Select
-                    value={model}
-                    onChange={(e) => changeModel(e.target.value)}
-                    className="h-8"
-                  >
-                    {models.map((m) => (
-                      <option key={m.id} value={m.id} title={m.unlisted ? m.hint : undefined}>{m.label}</option>
-                    ))}
-                  </Select>
-                </div>
-                <div className="min-w-0 space-y-1">
-                  <label className="text-muted-foreground">Effort</label>
-                  <Select
-                    value={effort ?? ""}
-                    onChange={(e) => setEffort(e.target.value)}
-                    title={
-                      efforts.length === 0
-                        ? "This model doesn't accept a reasoning-effort flag."
-                        : kind === "claude-code"
-                          ? "Appends a thinking keyword (think / think hard / ultrathink) to the prompt."
-                          : "Reasoning effort — higher = slower but more thorough."
-                    }
-                    className="h-8"
-                    disabled={efforts.length === 0}
-                  >
-                    {efforts.length === 0 ? (
-                      <option value="">n/a</option>
-                    ) : (
-                      efforts.map((m) => (
-                        <option key={m.id} value={m.id}>{m.label}</option>
-                      ))
-                    )}
-                  </Select>
-                </div>
-              </div>
-
-              {kind === "cursor" && (maxModeAvailable || maxMode) && (
-                <div className="grid grid-cols-2 gap-2">
-                  {(maxModeAvailable || maxMode) && (
-                    <label className="flex h-8 items-center justify-between rounded-md border border-border px-2 text-xs">
-                      <span>Max Mode</span>
-                      <Switch
-                        checked={maxMode}
-                        onCheckedChange={setMaxMode}
-                        disabled={!maxModeAvailable}
-                        aria-label="Use Cursor Max Mode context"
-                      />
-                    </label>
-                  )}
-                </div>
-              )}
-
-              {showsSpeedPicker(speedOptions, speed) && (
-                <div className="space-y-1">
-                  <label className="text-muted-foreground">Speed</label>
-                  <SpeedPicker
-                    testId="new-task-speed"
-                    options={speedOptions}
-                    value={speed}
-                    onChange={setSpeed}
-                    {...speedNotice}
-                  />
-                </div>
-              )}
-
-              {/* Fable models (5, 5.1, 5.2, …) sit above Opus in the picker but bill at
-                  2x the usage — surface that under the model row so the cost is
-                  obvious before Create. Family check (not an exact id) so every
-                  point release picks this up with no code change. */}
-              {kind === "claude-code" && model?.startsWith("fable-") && (
-                <div className="text-[11px] text-muted-foreground">
-                  {models.find((m) => m.id === model)?.label ?? model} uses 2x the usage of Opus.
-                </div>
-              )}
-
-              {/* Mythos models are Fable's access-gated twin — same 2x usage, plus
-                  the Project Glasswing requirement, so both need calling out here. */}
-              {kind === "claude-code" && model?.startsWith("mythos-") && (
-                <div className="text-[11px] text-muted-foreground">
-                  {models.find((m) => m.id === model)?.label ?? model} uses 2x the usage of Opus and requires approved-org (Project Glasswing) access.
-                </div>
-              )}
-
-              {/* Surfacing a missing-agent error inline so the user sees install
-                  guidance before they hit Create and get a delayed failure. */}
-              {selectedStatus && !selectedStatus.available && !stackFallback && (
-                <div className="rounded-md border border-destructive/40 bg-destructive/10 p-2 text-[11px] text-destructive-foreground">
-                  <div className="font-medium">{selectedStatus.reason}</div>
-                  {selectedStatus.installHint && (
-                    <div className="mt-1 font-mono opacity-80">
-                      {selectedStatus.installHint}
-                    </div>
-                  )}
-                </div>
-              )}
-
-              {/* Not blocking — Create/Run still work and the run pre-flight
-                  reports the actionable error if the turn actually needs
-                  credentials. This is a heads-up, not a disable. */}
-              <HarnessAuthHint status={selectedStatus} />
-              {stackFallback && selectedStatus && (!selectedStatus.available || selectedStatus.loggedIn === false) && (
-                <p data-testid="launch-stack-fallback-hint" className="text-[11px] text-muted-foreground">
-                  This account can't start right now — the run starts on the next usable account in its stack.
-                </p>
-              )}
-              </>
-              )}
-              </>
-              )}
             </div>
 
-            <div className="flex shrink-0 gap-2 border-t border-border/60 px-4 py-3">
-              <Button
-                variant="outline"
-                onClick={() => submit({ start: false })}
-                className="flex-1"
-                disabled={!canSubmit}
-                title={
-                  workdir.trim()
-                    ? "Create the task but don't start it — it sits in Backlog until you start it manually."
-                    : "Pick a project first."
-                }
-              >
-                To backlog
-              </Button>
-              <Button
-                onClick={() => submit({ start: true })}
-                className="flex-1"
-                disabled={!canSubmit}
-                title={
-                  workdir.trim()
-                    ? "Create the task in Ready and hand it to the agent — it'll flip to Running once the harness starts executing."
-                    : "Pick a project first."
-                }
-              >
-                Run task
-              </Button>
+            <div className="shrink-0 border-t border-border/60 px-4 py-3">
+              <LaunchFooter
+                primary={{ label: "Run task", onClick: () => submit({ start: true }), disabled: !gate.canRun, testId: "launch-run" }}
+                secondary={{ label: "Add to backlog", onClick: () => submit({ start: false }), disabled: !gate.canBacklog, testId: "launch-backlog" }}
+                reason={gate.runBlockedReason}
+              />
             </div>
           </div>
         )}

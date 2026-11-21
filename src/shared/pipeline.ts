@@ -1667,34 +1667,112 @@ export function stepNameById(g: PipelineGraph, id: string): string {
   return g.steps.find((s) => s.id === id)?.name ?? id;
 }
 
-/**
- * Summarize a run's progress for a board-card badge: `completed` counts
- * history entries that finished normally (`succeeded` or
- * `advanced-manually`), `active` is the number of currently-running/blocked
- * executions, and `total` is the snapshot's step count (0 before the first
- * Run). `label` is `"<completed>/<total>"`, with the first active step's
- * name appended (`" · <name>"`) whenever at least one execution is active.
- */
-export function pipelineStepProgress(run: PipelineRunState): { completed: number; active: number; total: number; label: string } {
-  // `returned` is deliberately not "completed": a Return is a loop decision,
-  // not work finished. An accepted gate is recorded `succeeded`, so it
-  // counts like any agent execution.
-  const completed = run.history.filter((h) => h.outcome === "succeeded" || h.outcome === "advanced-manually").length;
-  const active = run.active.length;
-  const total = run.snapshot?.graph.steps.length ?? 0;
+/** The step a run is on right now, as {@link pipelineStepProgress} reports it. */
+export interface PipelineProgressCurrent {
+  /** `"step"` for a live execution, `"gate"` for a pending human review. */
+  kind: "step" | "gate";
+  stepId: string;
+  name: string;
+  /** Further executions (or gates) running beside this one — a fan-out. */
+  more: number;
+}
 
-  let label = `${completed}/${total}`;
-  const firstActive = run.active[0];
-  if (firstActive) {
-    const name = run.snapshot ? stepNameById(run.snapshot.graph, firstActive.stepId) : firstActive.stepId;
-    label += ` · ${name}`;
-  } else {
-    const gate = run.humanSteps?.[0];
-    if (gate) {
-      const name = run.snapshot ? stepNameById(run.snapshot.graph, gate.stepId) : gate.stepId;
-      label += ` · ${name}`;
+export interface PipelineStepProgress {
+  /** Distinct snapshot steps with a `succeeded` / `advanced-manually` record. */
+  completed: number;
+  /** `run.active.length`. */
+  active: number;
+  /** Snapshot step count (0 before the first Run). */
+  total: number;
+  /** `run.status === "done"`. */
+  done: boolean;
+  /** Agent executions this run: history records that spawned a task (a human
+   *  gate spawns none), plus any active entry not yet recorded in history. */
+  executions: number;
+  /** `executions` minus the distinct steps those executions ran (never < 0). */
+  reruns: number;
+  /** `active[0]` (else the first pending gate), or null when nothing is live. */
+  current: PipelineProgressCurrent | null;
+  /** `"✓ Done"` for a finished run, else `"<completed>/<total>"`. */
+  countLabel: string;
+  /** `countLabel`, plus ` · <current name>` while a run is not done. */
+  label: string;
+  /** `"13 step runs · 3 re-runs"`; empty before the first execution. */
+  runsLabel: string;
+}
+
+/**
+ * Summarize a run's progress for a board card, the run view, `agetor show`,
+ * `agetor pipeline status`, `agetor ls` and the TUI — the one implementation.
+ *
+ * `completed` counts DISTINCT steps (present in the snapshot graph) that
+ * finished normally, never executions: a Code Review ⇄ Bug Fix loop re-runs
+ * steps, and counting executions made a ten-step run read `13/10`. A run
+ * that finished without taking a branch reads `✓ Done`, not `9/10`, so
+ * `countLabel` follows the run's status once it is `done`. The execution
+ * count is kept separately (`executions`, `reruns`, `runsLabel`) for tooltips
+ * and text output.
+ */
+export function pipelineStepProgress(run: PipelineRunState): PipelineStepProgress {
+  const graph = run.snapshot?.graph ?? null;
+  const total = graph?.steps.length ?? 0;
+  const inGraph = new Set(graph?.steps.map((s) => s.id) ?? []);
+
+  // `returned` is deliberately not "completed": a Return is a loop decision,
+  // not work finished. An accepted gate is recorded `succeeded`, so it counts
+  // like any agent step.
+  const completedSteps = new Set<string>();
+  for (const h of run.history) {
+    if ((h.outcome === "succeeded" || h.outcome === "advanced-manually") && inGraph.has(h.stepId)) {
+      completedSteps.add(h.stepId);
     }
   }
+  const completed = completedSteps.size;
+  const active = run.active.length;
+  const done = run.status === "done";
 
-  return { completed, active, total, label };
+  // A live execution is already in `history` (outcome null); the extra check
+  // only guards a row written before that was true.
+  const executed = run.history.filter((h) => h.taskId !== null);
+  const stepIds = new Set(executed.map((h) => h.stepId));
+  let executions = executed.length;
+  for (const a of run.active) {
+    if (!executed.some((h) => h.taskId === a.taskId && h.seq === a.seq)) {
+      executions += 1;
+      stepIds.add(a.stepId);
+    }
+  }
+  const reruns = Math.max(0, executions - stepIds.size);
+
+  const nameOf = (stepId: string) => (graph ? stepNameById(graph, stepId) : stepId);
+  const gates = run.humanSteps ?? [];
+  let current: PipelineProgressCurrent | null = null;
+  const firstActive = run.active[0];
+  const firstGate = gates[0];
+  if (firstActive) {
+    current = { kind: "step", stepId: firstActive.stepId, name: nameOf(firstActive.stepId), more: run.active.length - 1 };
+  } else if (firstGate) {
+    current = { kind: "gate", stepId: firstGate.stepId, name: nameOf(firstGate.stepId), more: gates.length - 1 };
+  }
+
+  const countLabel = done ? "✓ Done" : `${completed}/${total}`;
+  const label = done || !current ? countLabel : `${countLabel} · ${current.name}`;
+  const runsLabel = executions === 0
+    ? ""
+    : `${executions} step run${executions === 1 ? "" : "s"}${reruns > 0 ? ` · ${reruns} re-run${reruns === 1 ? "" : "s"}` : ""}`;
+
+  return { completed, active, total, done, executions, reruns, current, countLabel, label, runsLabel };
+}
+
+/**
+ * The progress text in the run view's header. The status badge beside it
+ * already says "Done", so a finished run shows only the execution counts
+ * (`13 step runs · 3 re-runs`); any other run shows `<n>/<total> · <current>`
+ * followed by them. A finished run with no executions falls back to the count
+ * label rather than rendering an empty span.
+ */
+export function pipelineRunHeaderText(progress: PipelineStepProgress): string {
+  // No snapshot yet (an idle run before its first Run): `0/0` says nothing.
+  const showCount = !progress.done && progress.total > 0;
+  return [showCount ? progress.label : "", progress.runsLabel].filter(Boolean).join(" · ") || (progress.done ? progress.label : "");
 }

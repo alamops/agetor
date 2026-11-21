@@ -1,0 +1,123 @@
+{
+  "version": 1,
+  "formId": "app-bar-redesign-grill-r2",
+  "title": "Grill round 2 — App bar redesign: the aggregate button",
+  "round": 2,
+  "mode": "served",
+  "specFile": "questions.json",
+  "specSha256": "8907dc0704bf46fe459b282821549e16ccbeed87de167e58e9211314d591795d",
+  "submittedAt": "2026-11-18T21:28:52.775Z",
+  "receivedAt": "2026-11-18T21:28:52.784Z",
+  "answeredBy": null,
+  "summary": {
+    "total": 8,
+    "answered": 8,
+    "skipped": 0,
+    "unanswered": 0,
+    "optionalLeftBlank": 0,
+    "notApplicable": 0,
+    "acceptedRecommendations": 7,
+    "overrodeRecommendations": [
+      "button-content"
+    ],
+    "oneWayDoorsNotAnswered": [],
+    "withNotes": [],
+    "needsAnswer": [],
+    "complete": true
+  },
+  "answers": {
+    "button-content": {
+      "n": 1,
+      "title": "What should the aggregate button itself show in the bar?",
+      "type": "multi",
+      "status": "answered",
+      "impact": "blocking",
+      "value": [
+        "dot",
+        "text",
+        "count",
+        "meter",
+        "percent",
+        "badge",
+        "reset"
+      ],
+      "display": "A status dot: the worst state across accounts (red unavailable, amber logged out or cooling, green ok); The text \"Harnesses\"; The count of enabled accounts (\"7\"); One usage meter (Q2 decides which); That meter's percentage as text (\"82%\"); The failover badge: tasks waiting for quota or mid-swap (round 1: `failover-activity = badge`); \"until 14:30\" when every account that can run is out of quota",
+      "acceptedRecommendation": false,
+      "recommended": [
+        "dot",
+        "text",
+        "meter",
+        "badge",
+        "reset"
+      ]
+    },
+    "button-meter": {
+      "n": 2,
+      "title": "Which usage does the button's meter show?",
+      "type": "single",
+      "status": "answered",
+      "impact": "shape",
+      "value": "capacity",
+      "display": "The tightest \"what can still run\" figure: stacks count by headroom, accounts in no stack by their own meter",
+      "acceptedRecommendation": true
+    },
+    "stack-meters": {
+      "n": 3,
+      "title": "In the panel's stack section, where do the headroom meter and the primary's meter go?",
+      "type": "single",
+      "status": "answered",
+      "impact": "shape",
+      "value": "header-headroom",
+      "display": "Stack heading: headroom. Member rows: each member's own meter (the primary's included)",
+      "acceptedRecommendation": true
+    },
+    "panel-order": {
+      "n": 4,
+      "title": "Your priority ranking was stacks, running, problem, built-in. With one aggregate button nothing overflows, so how should it order the panel?",
+      "type": "single",
+      "status": "answered",
+      "impact": "shape",
+      "value": "ranked",
+      "display": "Stacks first; then accounts in no stack ordered running → problem → DB order",
+      "acceptedRecommendation": true
+    },
+    "runpanel-test": {
+      "n": 5,
+      "title": "Two of your answers conflict: RunPanel is kept as is, but the accepted test says the always-visible actions are clickable while RunPanel is open. Which one gives way?",
+      "type": "single",
+      "status": "answered",
+      "impact": "shape",
+      "value": "fix-test",
+      "display": "Keep RunPanel as is. With it open, the test asserts no sideways scroll and a usable aggregate button, and that every action is still reachable through the native menu",
+      "acceptedRecommendation": true
+    },
+    "c-panel-accounts": {
+      "n": 6,
+      "title": "Account rows in the panel",
+      "type": "confirm",
+      "status": "answered",
+      "impact": "minor",
+      "value": "Each account row (in a stack or not) shows its icon, its full label, a status with text, the plan, every meter with % and reset, \"updated N ago\" (dimmed when stale), cooldown chips and a Refresh button, as today's per-chip popover does. Kinds without usage support (OpenCode) show the existing explanation.",
+      "acceptedRecommendation": true
+    },
+    "c-badge": {
+      "n": 7,
+      "title": "The failover badge",
+      "type": "confirm",
+      "status": "answered",
+      "impact": "minor",
+      "value": "The badge counts tasks whose `harnessState` has `allExhausted` or `pendingSwap` set. The panel lists them under their stack (\"waiting for quota until 14:30\" / \"switching to <account>\"), and clicking one opens that task.",
+      "acceptedRecommendation": true
+    },
+    "c-collapse": {
+      "n": 8,
+      "title": "What collapses as the window narrows",
+      "type": "confirm",
+      "status": "answered",
+      "impact": "minor",
+      "value": "Measured fit (it re-measures on resize and on zoom), in this order: the wordmark hides first, then Import sessions moves into ⋯ More, then the button's \"Harnesses\" text hides (its dot, meter and badge stay). The logo, the aggregate button, Settings, Pipelines, Git, Worktrees and More never hide, and the document never scrolls sideways at any width.",
+      "acceptedRecommendation": true
+    }
+  },
+  "generalNotes": null
+}

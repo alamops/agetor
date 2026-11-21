@@ -1738,6 +1738,10 @@ against a core that predates `cancelled` it decides from the task as read
 before the request), the `⇄` marker in `agetor ls` and the TUI header, the `switch:`
 line in `agetor show`, and the card badge ("switch scheduled").
 
+## Logged-out Claude accounts
+
+A Claude Code account that `claude auth status` reports logged out (`{"loggedIn": false}`, exit 1) is skipped like an exhausted one: `memberUnusableReason` returns `not logged in` when either `loginEvidence` (the file/keychain check) or `peekClaudeLoggedIn` (the cached probe) says so, and `null` ("cannot tell") stays usable (fail-open). The probe is async and the planners are sync, so `warmStackLogins(task)` warms the cache (every account in the stack, in parallel, capped at 5 s). `prepareTaskHarness`, the limit swap and the all-exhausted retry await it before they plan, and each re-reads the task afterwards. A plain Stop during the retry's warm-up (recorded on its window as `swapCancelRequested`) ends the retry there, like a Stop caught by its `beforeCommit`: the countdown and its exhausted state end and the card stays blocked, instead of a wait plan re-arming it. `prepareTaskHarness` leaves a task that went live or got held during the probe alone, and its move carries a `beforeCommit` that declines (`aborted`, reported as no move, so the start drops no session) when the task goes live or gets held during the mirror or transfer. A manual start that the cache says is logged out everywhere re-probes every account once before it is refused. A start that moves off a logged-out CURRENT account says so (`skipped <account>: not logged in`, ahead of any skipped backups): the walk starts after the current account, so `plan.skipped` alone never names it. The two manual-switch paths (`switchTaskAccountNow`, `applyScheduledSwitch`) only start it without awaiting: each checks the task's state and takes its claim in one synchronous run that an await would split, so a start could slip in between (the `/harnesses` poll keeps the cache warm in the app, and a cold cache fails open). A skipped account gets the run status line `skipped <account label>: not logged in`; when every account is logged out the start is refused with the login hint (`run \`claude auth login\`, or open a terminal for this account from Settings → Harnesses`). The probe, its cache and its `.claude.json` rule are in [harnesses.md](harnesses.md#claude-code-login-pre-flight).
+
 ## Swap history
 
 `harness_swap_events` (migration 087) is a per-stack, append-only log of every
@@ -1867,6 +1871,7 @@ account move and every blocked outcome. The trigger per path is the table under
   identifiers, `escapeFreeText` for provider messages and titles) — a
   switch/continue line cannot repaint the log. A hidden continuation prints
   nothing (not even a blank line).
+- **App bar.** One **Harnesses** button (worst-state dot, enabled count, the tightest quota meter, a failover badge, "until HH:MM" when nothing can run) opens a panel grouped by stack: each live stack shows its members' state dots, headroom meter, earliest reset, the tasks failing over (click opens the task), Refresh, Manage stack… and Swap history (Settings → Harnesses on that stack's history). The rules live once in `src/mainview/lib/harness-bar.ts`; see [app-bar.md](app-bar.md).
 - **Webview.** *Settings → Harnesses* is the one page for accounts and stacks (the
   "Stacks" sidebar entry is gone; an old `stacks` deep link opens Harnesses).
   Each stack is a card of its accounts, primary first, with Edit, History and
@@ -1922,7 +1927,7 @@ account move and every blocked outcome. The trigger per path is the table under
   While the retry run itself is
   live the banner reads "Running on <account> after a quota reset (attempt n/3)."
   with no Run now (`src/mainview/lib/harness-stack-banner.ts`). The launch pickers
-  (`NewTaskForm`) say "This account can't start right now — the run starts on the
+  (`TaskLaunchPickers`, directly under the Harness picker) say "This account can't start right now — the run starts on the
   next usable account in its stack" instead of a red "not installed" box when
   `stackBackupCanServe`.
 - **Launch surfaces**: a launch is never refused client-side on an account
@@ -1935,7 +1940,9 @@ account move and every blocked outcome. The trigger per path is the table under
   surface shows an `n/m` position or "fails over" copy for it (webview, CLI,
   TUI, notifications); the card badge shows only a live state word. The rule
   lives once in `stackPositionText` (`src/shared/harness-stack.ts`), which the
-  CLI and the webview's `stackPositionFor` both use.
+  CLI and the webview's `stackPositionFor` both use. The app bar is stricter:
+  it treats a stack as live only with two or more **enabled** members
+  (`buildHarnessBarModel`, [app-bar.md](app-bar.md)).
 - **Notifications**: `harness-swap` is a quiet kind and its text omits the
   `(n/m)` position for a stack of fewer than two accounts (webview toast,
   headless core and CLI `--notify`, all by the one-account rule above);

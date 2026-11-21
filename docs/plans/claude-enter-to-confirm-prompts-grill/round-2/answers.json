@@ -1,0 +1,136 @@
+{
+  "version": 1,
+  "formId": "claude-enter-to-confirm-prompts-grill-r2",
+  "title": "Grill round 2 — Claude Code \"Enter to confirm\" prompts",
+  "round": 2,
+  "mode": "served",
+  "specFile": "questions.json",
+  "specSha256": "b9a413c1d21423eb37351c4092ab2c765020f6f97ee8183e757d30f36d5780de",
+  "submittedAt": "2026-11-17T16:00:57.883Z",
+  "receivedAt": "2026-11-17T16:00:57.959Z",
+  "answeredBy": null,
+  "summary": {
+    "total": 11,
+    "answered": 10,
+    "skipped": 0,
+    "unanswered": 0,
+    "optionalLeftBlank": 1,
+    "notApplicable": 0,
+    "acceptedRecommendations": 8,
+    "overrodeRecommendations": [
+      "autotrust-cli",
+      "paste-code-caller"
+    ],
+    "oneWayDoorsNotAnswered": [],
+    "withNotes": [],
+    "needsAnswer": [],
+    "complete": true
+  },
+  "answers": {
+    "general-cleanup": {
+      "n": 1,
+      "title": "You wrote \"use this change to also update settings General UI, it's getting polluted\". What should General become?",
+      "type": "single",
+      "status": "answered",
+      "impact": "shape",
+      "value": "move-and-group",
+      "display": "Move harness-specific rows to the Harnesses page, and group what's left in General under headings",
+      "acceptedRecommendation": true
+    },
+    "general-mock": {
+      "n": 2,
+      "title": "Got a sketch or screenshot of how you want General to look? Drop it here.",
+      "type": "upload",
+      "status": "unanswered",
+      "optional": true,
+      "impact": "minor"
+    },
+    "autotrust-cli": {
+      "n": 3,
+      "title": "Who may turn the \"Auto-trust a task's repositories\" setting back ON?",
+      "type": "single",
+      "status": "answered",
+      "oneWayDoor": true,
+      "impact": "blocking",
+      "value": "both",
+      "display": "App and CLI alike",
+      "acceptedRecommendation": false,
+      "recommended": "app-on-cli-off"
+    },
+    "paste-code-caller": {
+      "n": 4,
+      "title": "The new OAuth-code text box sends a login code through agetor's API. Who may submit it?",
+      "type": "single",
+      "status": "answered",
+      "oneWayDoor": true,
+      "impact": "blocking",
+      "value": "app-and-cli",
+      "display": "App, `agetor answer --text` and the TUI",
+      "acceptedRecommendation": false,
+      "recommended": "app-only"
+    },
+    "paste-code-handling": {
+      "n": 5,
+      "title": "How the typed code is handled",
+      "type": "confirm",
+      "status": "answered",
+      "value": "A single line, at most 512 characters, no control characters. It is sent with `tmux send-keys -l` (literal) and then Enter. It is never written to run_events, a status line, a log or an error message, and a boot-timeout pane dump masks the paste-code line. The text box is offered only on the `Paste code here if prompted >` screen; no other card gets free text",
+      "acceptedRecommendation": true
+    },
+    "stack-logged-out": {
+      "n": 6,
+      "title": "Your note says \"should cover all cases\". When a harness-stack account is logged out, what should happen?",
+      "type": "single",
+      "status": "answered",
+      "impact": "shape",
+      "value": "skip",
+      "display": "Skip a logged-out account like an exhausted one",
+      "acceptedRecommendation": true
+    },
+    "preflight-details": {
+      "n": 7,
+      "title": "The Claude Code login pre-flight",
+      "type": "confirm",
+      "status": "answered",
+      "value": "A spike first proves that `claude auth status` writes nothing, needs no network, and gives a parseable logged-out signal. It is probed with the harness's own env (`CLAUDE_CONFIG_DIR`), with a 5 s cap, and it fails open (only an explicit logged-out refuses). The header status dot shows \"logged out\" for Claude Code as it does for fx. If the spike shows it writes or is unreliable, the pre-flight is dropped and the onboarding cards alone cover login, and that is reported back to you",
+      "acceptedRecommendation": true
+    },
+    "copilot-install": {
+      "n": 8,
+      "title": "Copilot CLI isn't installed on this machine. How should its part of the spike run?",
+      "type": "single",
+      "status": "answered",
+      "impact": "shape",
+      "value": "fake-provider",
+      "display": "Use the opt-in real-binary test path (`copilot-real-binary.test.ts`, fake provider)",
+      "acceptedRecommendation": true
+    },
+    "spike-fix-bound": {
+      "n": 9,
+      "title": "\"Fix whatever shows up\": if the codex or copilot spike finds a problem that isn't an Enter-to-confirm prompt, is fixing it part of this change?",
+      "type": "single",
+      "status": "answered",
+      "impact": "shape",
+      "value": "any-adddir",
+      "display": "Fix anything that breaks a multi-repo task's extra directories on those two harnesses",
+      "acceptedRecommendation": true
+    },
+    "retry-both": {
+      "n": 10,
+      "title": "What \"Both\" means for retry after a failed boot",
+      "type": "confirm",
+      "status": "answered",
+      "value": "The session id is recorded on the run only once Claude's session file appears. A boot that fails leaves the run with no id, so the next turn starts fresh. Separately, every resume first checks that the recorded session file exists, and if it doesn't, starts fresh under the same id (`--session-id`). That heals runs already in the DB. Harness-stack swap and transfer read the id only after it's recorded, and a test covers that order",
+      "acceptedRecommendation": true
+    },
+    "setting-scope": {
+      "n": 11,
+      "title": "Scope of the auto-trust setting",
+      "type": "confirm",
+      "status": "answered",
+      "value": "One setting for the Claude Code kind (`claude_auto_trust_repositories`, default on), applying to every Claude Code account. If the codex or copilot spike finds an equivalent prompt, it uses the same setting, renamed \"Auto-trust a task's repositories\" without the harness name. Turning it off brings back the card for each dialog",
+      "acceptedRecommendation": true
+    }
+  },
+  "generalNotes": null
+}

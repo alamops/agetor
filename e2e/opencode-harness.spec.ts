@@ -3,6 +3,7 @@ import { mkdirSync } from "node:fs";
 import path from "node:path";
 import { test, expect, type APIRequestContext, type E2EBackend, type Locator, type Page } from "./fixtures";
 import { gotoApp, selectProject } from "./helpers";
+import { modelField, pickHarness, type PickerHandle } from "./launch-helpers";
 
 /**
  * E2E coverage for the OpenCode harness (docs/plans/add-opencode-harness.md
@@ -176,14 +177,12 @@ async function openTask(page: Page, title: string): Promise<Locator> {
 }
 
 async function selectHarness(page: Page, label: string): Promise<void> {
-  const button = newTaskFormPanel(page).getByRole("button", { name: label, exact: true });
-  await expect(button).toBeVisible({ timeout: CONVERGE_TIMEOUT });
-  await button.click();
+  await pickHarness(newTaskFormPanel(page), label);
 }
 
 /** The New Task form's Model `<select>` (see e2e/fx-models.spec.ts). */
-function newTaskModelSelect(page: Page): Locator {
-  return newTaskFormPanel(page).getByTestId("refresh-models").locator("xpath=../..").locator("select");
+function newTaskModelSelect(page: Page): PickerHandle {
+  return modelField(newTaskFormPanel(page));
 }
 
 /** Types a follow-up into the run panel's composer and sends it. */
@@ -253,8 +252,8 @@ test.describe("OpenCode harness (fake driver + stub CLI)", () => {
 
     // The model is the pinned sentinel, the server picker sits at Shared.
     const modelSelect = newTaskModelSelect(page);
-    await expect(modelSelect).toHaveValue("opencode-default", { timeout: CONVERGE_TIMEOUT });
-    await expect(modelSelect.locator("option:checked")).toHaveText("OpenCode default");
+    await modelSelect.expectValue("opencode-default", { timeout: CONVERGE_TIMEOUT });
+    await expect(modelSelect.trigger).toContainText("OpenCode default");
     await expectNoServerPicker(form);
 
     await selectProject(page, form, projectName);
@@ -263,7 +262,7 @@ test.describe("OpenCode harness (fake driver + stub CLI)", () => {
     await form.getByPlaceholder("Short description").fill(formTaskTitle);
     await form.getByTestId("prompt-textarea").fill(prompt);
     await form.getByTestId("worktree-options").getByTestId("isolate-toggle").uncheck();
-    await form.getByRole("button", { name: "To backlog", exact: true }).click();
+    await form.getByRole("button", { name: "Add to backlog", exact: true }).click();
 
     let row: Record<string, any> | null = null;
     await expect(async () => {
@@ -400,7 +399,7 @@ test.describe("OpenCode harness (fake driver + stub CLI)", () => {
     // New Task form on that harness: no picker and no locked-home note.
     await gotoApp(page, backend.bootBase);
     await selectHarness(page, label);
-    await expect(newTaskModelSelect(page)).toBeVisible({ timeout: CONVERGE_TIMEOUT });
+    await expect(newTaskModelSelect(page).trigger).toBeVisible({ timeout: CONVERGE_TIMEOUT });
     await expectNoServerPicker(newTaskFormPanel(page));
 
     // A task on it still runs against the harness's own home (the `run`

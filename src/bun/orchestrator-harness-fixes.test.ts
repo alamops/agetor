@@ -912,6 +912,49 @@ describe("a Stop during an all-exhausted retry (R-S14)", () => {
     await stacks.harnessStacks.delete(stack.id);
   }, 20_000);
 
+  test("a plain Stop during the retry's login warm-up ends the retry instead of re-arming its countdown", async () => {
+    const [a, b] = ids("warmstop", 2);
+    alias(a);
+    alias(b);
+    const stack = await stacks.harnessStacks.create({ label: "warmstop", kind: "claude-code", members: [a, b] });
+    // Both accounts still cooling: left alone, this retry would plan a wait and re-arm.
+    await stacks.harnessStacks.setLimitState(a, { reason: "quota", resetAtMs: Date.now() + 600_000, message: "x", source: "claude-pane" });
+    await stacks.harnessStacks.setLimitState(b, { reason: "quota", resetAtMs: Date.now() + 600_000, message: "x", source: "claude-pane" });
+    const task = makeTask(a, "p");
+    const lastRun = insertRun(task.id, a, { status: "failed", exitCode: -1 });
+    db.tasks.update(task.id, { runId: lastRun, column: "blocked" });
+    const at = Date.now();
+    db.tasks.setHarnessState(task.id, {
+      stackId: stack.id, position: 0, count: 2, tried: [a, b], pendingSwap: null, lastMove: null,
+      allExhausted: exhausted(at, { attempts: 1, nextAttemptAt: at }),
+    });
+    let stopped = null as boolean | null;
+    let hooked = false;
+    const prev = orch.__setHarnessSwapSettleHookForTest(async (taskId, _runId, phase) => {
+      if (taskId !== task.id || phase !== "retry-after-warm") return;
+      orch.__setHarnessSwapSettleHookForTest(null);
+      hooked = true;
+      stopped = await orch.cancelRun(lastRun);
+    });
+    try {
+      failover.armAutoRetry(task.id, at);
+      await waitFor(() => stopped !== null && db.tasks.get(task.id)!.harnessState?.allExhausted == null);
+    } finally {
+      orch.__setHarnessSwapSettleHookForTest(prev);
+      await stacks.harnessStacks.clearLimitState(a);
+      await stacks.harnessStacks.clearLimitState(b);
+    }
+    expect(hooked).toBe(true);
+    expect(stopped).toBe(true);
+    const after = db.tasks.get(task.id)!;
+    expect(after.agent).toBe(a);
+    expect(db.runs.listForTask(task.id)).toHaveLength(1);
+    expect(after.column).toBe("blocked");
+    expect(after.harnessState?.allExhausted ?? null).toBeNull();
+    expect(failover.hasArmedAutoRetry(task.id)).toBe(false);
+    await stacks.harnessStacks.delete(stack.id);
+  }, 20_000);
+
   test("a Stop the retry never consumed does not cancel a later, unrelated failover", async () => {
     const [a, b] = ids("stalestop", 2);
     alias(a);

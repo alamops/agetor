@@ -74,6 +74,9 @@ interface ButtonProps {
   locked?: boolean;
   disabled?: boolean;
   className?: string;
+  /** `id` of the button, so a `<label htmlFor>` names the control. */
+  id?: string;
+  "aria-describedby"?: string;
 }
 
 /**
@@ -82,10 +85,12 @@ interface ButtonProps {
  * carries the selected count. In the locked variant it renders the fixed
  * project's name, disabled, with a lock icon.
  */
-export function SelectProjectsButton({ label, onClick, locked = false, disabled = false, className }: ButtonProps) {
+export function SelectProjectsButton({ label, onClick, locked = false, disabled = false, className, id, "aria-describedby": describedBy }: ButtonProps) {
   return (
     <button
       type="button"
+      id={id}
+      aria-describedby={describedBy}
       data-testid="select-projects-button"
       onClick={onClick}
       disabled={disabled || locked}
@@ -96,8 +101,8 @@ export function SelectProjectsButton({ label, onClick, locked = false, disabled 
           : "Pick one or more projects and the branch each one starts from (with Pull and Fetch)."
       }
       className={cn(
-        "flex w-full items-center gap-2 rounded-md border border-border/60 bg-background px-2 py-1.5 text-left text-xs",
-        "transition-colors hover:bg-accent/60 focus-visible:outline-none focus-visible:ring-1 focus-visible:ring-ring",
+        "flex h-9 w-full items-center gap-2 rounded-md border border-input bg-background px-3 py-1 text-left text-sm shadow-sm",
+        "transition-colors hover:bg-accent/40 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring",
         "disabled:cursor-not-allowed disabled:opacity-60 disabled:hover:bg-background",
         className,
       )}

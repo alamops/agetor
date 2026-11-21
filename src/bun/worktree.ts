@@ -2687,3 +2687,28 @@ export async function detachWorktree(
   const removed = !existsSync(task.worktreePath);
   return removed ? { removed } : { removed, reason: "failed" };
 }
+
+/**
+ * The checkouts of `task` an archive would discard uncommitted work in: a
+ * checkout with uncommitted changes, or one whose status can't be read (it
+ * can't be proved clean). `null` when there is nothing to lose (no worktree,
+ * none on disk, all clean). `repositories` names each such repository of a
+ * multi-repository task and is empty for a single one. Uses the same
+ * checkout location as {@link detachWorktree}; a checkout the detach would
+ * leave alone anyway (refused path, source repository gone) is not counted.
+ */
+export async function findUncommittedCheckouts(task: Task): Promise<{ repositories: string[] } | null> {
+  const repos = task.repositories ?? [];
+  if (isMultiRepoTask(task) && repos.length > 0) {
+    const workspace = workspacePathFor(task);
+    const names: string[] = [];
+    for (const repo of repos) {
+      const { wt, root, refused } = await locateRepositoryCheckout(task, workspace, repo);
+      if (refused || !wt || !root || !existsSync(wt)) continue;
+      if ((await hasUncommittedChanges(wt)) !== false) names.push(repo.name);
+    }
+    return names.length > 0 ? { repositories: names } : null;
+  }
+  if (!task.worktreePath || !existsSync(task.worktreePath)) return null;
+  return (await hasUncommittedChanges(task.worktreePath)) !== false ? { repositories: [] } : null;
+}

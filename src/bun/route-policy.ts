@@ -142,7 +142,7 @@ const GH_BODY = cli({ pathParams: BODY_PATH });
 
 const EXEMPT_DB = "DB only: reads or writes the project row keyed by the path string, touches no file";
 const EXEMPT_REFS_RESOLVE =
-  "the route's own answer comes from probePaths(paths, callerOf(req)): for the CLI token every stat runs in a disclaimed child";
+  "the route's own answer comes from probePaths(paths, callerOf(req)): for the CLI token every stat runs in a disclaimed child; an app caller with previewTwins: true (the user's own drop or paste, sent only by capture-refs) also gets in-process preview twins of the resolved images (docs/architecture/security.md, Preview twins), never the CLI token";
 const EXEMPT_SESSION_IMPORT =
   "no path in the request: the cwd comes from the transcript and is gated in the handler via the importer's gateCwd option";
 const EXEMPT_OPENCODE_SESSION_IMPORT =

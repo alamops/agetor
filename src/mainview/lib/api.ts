@@ -102,6 +102,7 @@ import type {
   TaskReference,
   TaskType,
   TerminalTab,
+  TmuxPromptAnswerBody,
   UpdateStatus,
   WorktreeGitStatus,
   WorktreeInfo,
@@ -302,7 +303,17 @@ export interface PendingTmuxPrompt {
    *  Chrome startup prompt). Display-only: `choices[].key` is still what the
    *  answer route validates. See `tmuxChoiceLabel`. */
   hideKeys?: boolean;
+  /** What the card asks of the user (absent ≡ `"choice"`): `"enter"` is an
+   *  Enter-only screen (a Continue button), `"code"` the OAuth code prompt (a
+   *  one-line text box). Both carry empty `choices`. */
+  answerKind?: "choice" | "enter" | "code";
+  /** True when the dialog refused the first confirm and the card was
+   *  re-registered: the first click did not take, choose again. */
+  held?: boolean;
 }
+
+/** Body of `POST /tmux-prompts/:id/answer` (the shared exact-one type). */
+export type { TmuxPromptAnswerBody };
 
 /** The ACP tool call an fx permission request is asking about — mirrors
  *  `FxPermissionToolCall` on the server (`src/bun/interactions.ts`). Only
@@ -652,7 +663,7 @@ export const api = {
   defaults: () => j<AppDefaults>("/defaults"),
   info: () => j<{ version: string }>("/info"),
   /** Toggle the window's macOS "zoom" state. Wired up to double-click on
-   *  the app bar in App.tsx because Electrobun's drag region doesn't
+   *  the app bar (components/app-bar/AppBar.tsx) because Electrobun's drag region doesn't
    *  implement the native title-bar double-click gesture. */
   toggleWindowZoom: () =>
     j<{ ok: boolean; skipped?: string }>("/window/toggle-zoom", { method: "POST" }),
@@ -1026,12 +1037,34 @@ export const api = {
       method: "POST",
       body: JSON.stringify({ paths }),
     }).then((r) => r.refs),
+  /** `resolveRefs` for the `file://` paths of the user's OWN drop or paste
+   *  (`capture-refs` rung 1, and nothing else): the same stat, plus
+   *  `previewTwins: true`, which asks the core to also write a preview twin of
+   *  each image so its thumbnail survives macOS's privacy block on the folder
+   *  (docs/architecture/security.md, "Preview twins"). `names` are the basenames
+   *  of the `File`s the same drop/paste carried; the core twins only a path one
+   *  of them vouches for, so a `file://` line in dragged text (agent output)
+   *  can't make it copy a file the user never dropped. Every other caller of
+   *  `/refs/resolve` names agent-chosen paths and must keep using
+   *  `resolveRefs`, which never sends the flag. */
+  resolveCapturedRefs: (paths: string[], names: string[]) =>
+    j<{ refs: TaskReference[] }>("/refs/resolve", {
+      method: "POST",
+      body: JSON.stringify({ paths, names, previewTwins: true }),
+    }).then((r) => r.refs),
   /** Recover the real paths of the drag/drop that just ended, off the macOS
    *  drag pasteboard — WKWebView exposes no `file://` URLs on a drop, so this
    *  is the fallback for non-image files/folders dragged from Finder. The
-   *  server stats each (directory-ness correct, nonexistent dropped). */
-  dragRefs: () =>
-    j<{ refs: TaskReference[] }>("/refs/drag", { method: "POST" }).then((r) => r.refs),
+   *  server stats each (directory-ness correct, nonexistent dropped).
+   *  `names` are the basenames of the `File`s the drop carried; the core
+   *  writes preview twins only for non-uploadable images those names vouch
+   *  for, so a drag pasteboard an agent rewrote mid-drag can't make it copy a
+   *  file the user never dropped. */
+  dragRefs: (names: string[]) =>
+    j<{ refs: TaskReference[] }>("/refs/drag", {
+      method: "POST",
+      body: JSON.stringify({ names }),
+    }).then((r) => r.refs),
   listBranches: (dir: string) =>
     j<BranchInfo[]>(`/projects/branches?path=${encodeURIComponent(dir)}`),
   /** `git fetch --all --prune` on the project so newly pushed remote branches
@@ -2184,8 +2217,9 @@ export const api = {
    *  tag. `url` is typically one of `taskDiffBlobUrl`'s / `pullBlobUrl`'s
    *  token-less outputs; the header is the only credential. Throws an `Error` whose
    *  message distinguishes a missing blob ("missing", 404) from one over
-   *  the server's size cap ("too-large", 413) from any other failure, so
-   *  callers can render a matching empty state. */
+   *  the server's size cap ("too-large", 413) from one the core couldn't read
+   *  ("denied", 403) from any other failure, so callers can render a matching
+   *  empty state. */
   fetchBlobBytes: async (url: string): Promise<ArrayBuffer> => {
     const res = await fetch(url, {
       headers: { "authorization": `Bearer ${API_TOKEN}` },
@@ -2193,6 +2227,7 @@ export const api = {
     if (!res.ok) {
       if (res.status === 404) throw new Error("missing");
       if (res.status === 413) throw new Error("too-large");
+      if (res.status === 403) throw new Error("denied");
       throw new Error(`${res.status} ${res.statusText}`);
     }
     return res.arrayBuffer();
@@ -2279,11 +2314,13 @@ export const api = {
   /** Answer a tmux-pane-scraped REPL prompt. `key` must be one of the
    *  keys advertised on the request — the server validates against the
    *  recorded set before injecting keystrokes via `tmux send-keys`. */
-  answerTmuxPrompt: (id: string, body: { key: string } | { reject: true }) =>
-    j<{ ok: boolean }>(`/tmux-prompts/${id}/answer`, {
+  answerTmuxPrompt: (id: string, body: TmuxPromptAnswerBody) =>
+    // `retry: false`: a replayed answer would type the keys (an Enter, an OAuth
+    // code) into the pane a second time.
+    j<{ ok: boolean; error?: string; held?: boolean }>(`/tmux-prompts/${id}/answer`, {
       method: "POST",
       body: JSON.stringify(body),
-    }),
+    }, { retry: false }),
   /** Answer an fx ACP permission request. `{ optionId }` must be one of the
    *  option ids the request advertised — the server validates against the
    *  recorded set before echoing it back into the ACP RPC reply.

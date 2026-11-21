@@ -27,17 +27,26 @@ export function isFindShortcut(e: FindShortcutKey, isMac: boolean): boolean {
 }
 
 /**
+ * An open popover that owns the keyboard: every `[data-popover-open]` carrier
+ * except those marked `data-popover-keys="escape-only"`, which only want Escape
+ * yielded to them. The one definition of that convention for document- and
+ * form-level shortcuts (the find chord here, the launch forms' Cmd/Ctrl+Enter
+ * in `submit-shortcut.ts`); see docs/architecture/prompt-composer.md.
+ */
+export const KEYBOARD_OWNING_POPOVERS = '[data-popover-open]:not([data-popover-keys="escape-only"])';
+
+/**
  * Selector for the layers that outrank the find chord: a modal dialog
  * (`[role="dialog"][aria-modal="true"]`) or an open popover
  * (`[data-popover-open]`) — so ⌘F doesn't hijack the browser/OS's own find
  * behavior, or a dialog's own input, while one of those is up. Popovers
  * marked `data-popover-keys="escape-only"` (SlashAutocomplete,
- * AtFileAutocomplete, ExtensionPicker) are excluded from the guard: they
- * only want Escape yielded to them, so ⌘F stays live while the `/` or `@`
- * menu or the Extensions popover is open (see the `data-popover-keys`
+ * AtFileAutocomplete, ExtensionPicker, the app bar's Harnesses panel) are
+ * excluded from the guard: they only want Escape yielded to them, so ⌘F stays
+ * live while the `/` or `@` menu, the Extensions popover or the Harnesses
+ * panel is open (see the `data-popover-keys`
  * convention documented in
  * docs/architecture/prompt-composer.md, and this exact string previously inline in RunPanel.tsx's
  * Cmd/Ctrl+F handler).
  */
-export const FIND_SHORTCUT_BLOCKING_LAYERS =
-  '[role="dialog"][aria-modal="true"], [data-popover-open]:not([data-popover-keys="escape-only"])';
+export const FIND_SHORTCUT_BLOCKING_LAYERS = `[role="dialog"][aria-modal="true"], ${KEYBOARD_OWNING_POPOVERS}`;

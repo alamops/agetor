@@ -3,6 +3,11 @@ import type { Database } from "bun:sqlite";
 /** The pragmas every Agetor SQLite connection runs with. Shared by `db.ts`
  *  (the test / in-process connection) and the worker's connection so the two
  *  cannot drift. */
+/** SQLite page cache for every Agetor connection, in KiB (64 MiB). */
+export const SQLITE_CACHE_KIB = 65_536;
+/** Most of the database file SQLite reads through a memory map (256 MiB). */
+export const DB_MMAP_SIZE_BYTES = 256 * 1024 * 1024;
+
 export function applyConnectionPragmas(conn: Database, busyTimeoutMs = 5000): void {
   conn.exec("PRAGMA journal_mode = WAL;");
   // WAL + NORMAL is SQLite's documented sweet spot for a local single-writer
@@ -16,11 +21,18 @@ export function applyConnectionPragmas(conn: Database, busyTimeoutMs = 5000): vo
   // up is that a kernel panic mid-stream may roll back the final commit(s).
   conn.exec("PRAGMA synchronous = NORMAL;");
   conn.exec("PRAGMA foreign_keys = ON;");
-  // 64 MB page cache (negative = KiB) and a 256 MB memory map: the board's
-  // projection and the run-events reads stay in memory instead of re-reading
-  // pages (docs/plans/non-blocking-core.md, T8).
-  conn.exec("PRAGMA cache_size = -65536;");
-  conn.exec("PRAGMA mmap_size = 268435456;");
+  // 64 MiB page cache (negative = KiB) instead of SQLite's 2 MiB default, and a
+  // 256 MiB memory map: the board's projection and the run-events reads stay in
+  // memory instead of re-reading pages (docs/architecture/persistence.md). The
+  // map serves reads from the OS file cache without the extra copy into
+  // SQLite's buffers (macOS reclaims those pages under memory pressure); the
+  // trade-off is that a disk read error surfaces as SIGBUS rather than
+  // SQLITE_IOERR. `temp_store = MEMORY` keeps GROUP BY / ORDER BY scratch
+  // b-trees off disk; changing it drops every TEMP object already on the
+  // connection, so it runs here, before anything else touches the connection.
+  conn.exec(`PRAGMA cache_size = ${-SQLITE_CACHE_KIB};`);
+  conn.exec(`PRAGMA mmap_size = ${DB_MMAP_SIZE_BYTES};`);
+  conn.exec("PRAGMA temp_store = MEMORY;");
   // The worker's connection owns this file in production, so a writer never
   // contends with another Agetor connection. The wait covers the rare external
   // one: the `sqlite3` CLI, a backup, or Compact's `wal_checkpoint(TRUNCATE)`

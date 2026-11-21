@@ -1,0 +1,13 @@
+# claude 2.1.326 · binary (heading and closing line from the binary; bullets reconstructed — plan A4)
+
+ Security notes:
+
+ 1. Claude can make mistakes
+    You should always review Claude's responses, especially when
+    running code.
+
+ 2. Due to prompt injection risks, only use it with code you trust
+    For more details see:
+    https://docs.claude.com/s/claude-code-security
+
+ Press Enter to continue…

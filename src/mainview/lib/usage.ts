@@ -1,9 +1,10 @@
 /**
- * Pure presentation logic for the per-harness usage tracker (topbar chip
- * mini-bar + popover). No DOM, no React, no I/O — mirrors the split in
- * `font-size.ts` / `todo-progress.ts`: this module derives the numbers and
- * labels; the components (`UsageMeter.tsx`, `UsagePopover.tsx`, D2) do the
- * actual rendering.
+ * Pure presentation logic for the per-harness usage tracker (the app bar's
+ * Harnesses button meter and Harnesses panel rows). No DOM, no React, no I/O —
+ * mirrors the split in `font-size.ts` / `todo-progress.ts`: this module
+ * derives the numbers and labels; the components under
+ * `components/app-bar/` (`BarMeter`, `AccountUsageRow`) do the actual
+ * rendering. Account and stack state is derived in `harness-bar.ts`.
  */
 import { USAGE_CRIT_PERCENT, USAGE_WARN_PERCENT, type QuotaMeter } from "../../shared/types.ts";
 
@@ -24,7 +25,7 @@ export function warnTier(usedPercent: number): WarnTier {
 
 /**
  * The meter with the highest `usedPercent` in a snapshot's `meters` list —
- * this is what the topbar chip's mini-bar renders (worst case drives the
+ * this is what a usage meter renders (worst case drives the
  * warn color). Ties keep the first occurrence. `null` for an empty list.
  */
 export function worstMeter(meters: QuotaMeter[]): QuotaMeter | null {
@@ -72,7 +73,8 @@ export function clampPercent(p: number): number {
 
 /**
  * Filter a list of agent statuses down to the ones whose harness is
- * `enabled` — this is what drives the window topbar's chip list. An agent
+ * `enabled` — this is the enabled set behind the app bar's Harnesses button
+ * and panel (`buildHarnessBarModel` in `harness-bar.ts`). An agent
  * whose harness id has no matching row (or whose row is disabled) is
  * dropped, same as today's `harness?.enabled ?? false` inline check.
  * Enabled-but-unavailable/logged-out harnesses still pass through; this

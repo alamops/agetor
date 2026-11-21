@@ -6,6 +6,7 @@ import path from "node:path";
 import { test, expect, type APIRequestContext, type E2EBackend, type Locator, type Page } from "./fixtures";
 import { gotoApp } from "./helpers";
 import { startGitHubStub, type GitHubStub, type StubRoute } from "./github-stub";
+import { harnessStatus, pickHarness } from "./launch-helpers";
 
 /**
  * E2E coverage for the "Resolve with Agetor" dialog
@@ -372,7 +373,7 @@ async function createPipelineRest(
 async function pickPipeline(dialog: Locator, pipelineId: string): Promise<void> {
   const picker = dialog.getByTestId("launch-pipeline-picker").getByTestId("pipeline-picker");
   await picker.getByTestId("pipeline-picker-trigger").click();
-  const popover = picker.getByTestId("pipeline-picker-popover");
+  const popover = picker.page().getByTestId("pipeline-picker-popover");
   await expect(popover).toBeVisible({ timeout: CONVERGE_TIMEOUT });
   await popover.locator(`[data-testid="pipeline-picker-row"][data-pipeline-id="${pipelineId}"]`).click();
   await expect(popover).toBeHidden();
@@ -381,9 +382,9 @@ async function pickPipeline(dialog: Locator, pipelineId: string): Promise<void> 
 async function openPipelineManageRow(dialog: Locator): Promise<Locator> {
   const picker = dialog.getByTestId("launch-pipeline-picker").getByTestId("pipeline-picker");
   await picker.getByTestId("pipeline-picker-trigger").click();
-  const popover = picker.getByTestId("pipeline-picker-popover");
+  const popover = picker.page().getByTestId("pipeline-picker-popover");
   await expect(popover).toBeVisible({ timeout: CONVERGE_TIMEOUT });
-  const manage = popover.getByTestId("pipeline-picker-manage");
+  const manage = picker.page().getByTestId("pipeline-picker-manage");
   await expect(manage).toBeVisible();
   return manage;
 }
@@ -406,10 +407,12 @@ test.afterAll(async ({ backend }) => {
     }).catch(() => { /* best-effort cleanup */ });
   }
   for (const fixture of pipelineFixtures.splice(0)) {
-    await fetch(`${backend.apiBase}/pipelines/${fixture.pipelineId}`, {
-      method: "DELETE",
-      headers: { authorization: `Bearer ${backend.apiToken}` },
-    }).catch(() => { /* best-effort cleanup */ });
+    if (fixture.pipelineId) {
+      await fetch(`${backend.apiBase}/pipelines/${fixture.pipelineId}`, {
+        method: "DELETE",
+        headers: { authorization: `Bearer ${backend.apiToken}` },
+      }).catch(() => { /* best-effort cleanup */ });
+    }
     for (const profileId of fixture.profileIds) {
       await fetch(`${backend.apiBase}/agent-profiles/${profileId}`, {
         method: "DELETE",
@@ -574,13 +577,13 @@ test.describe("Resolve with Agetor dialog", () => {
     await gotoApp(page, backend.bootBase);
     const dlg = await openResolveConflictsDialog(page);
 
-    await expect(dlg.getByText("Agent", { exact: true })).toBeVisible();
+    await expect(dlg.getByTestId("agent-profile-picker")).toBeVisible();
     await expect(dlg.getByTestId("launch-pipeline-summary")).toHaveCount(0);
 
     // One-selection: a profile pick, then a pipeline pick, drops the card.
     const agentPicker = dlg.getByTestId("agent-profile-picker");
     await agentPicker.getByTestId("agent-profile-picker-trigger").click();
-    await agentPicker.locator(`[data-testid="agent-profile-picker-row"][data-profile-id="${profileId}"]`).click();
+    await page.locator(`[data-testid="agent-profile-picker-row"][data-profile-id="${profileId}"]`).click();
     // The picker's own trigger renders a chip with the same test id, so the
     // selected card is the last one.
     await expect(dlg.getByTestId("agent-profile-card").last()).toBeVisible();
@@ -592,12 +595,12 @@ test.describe("Resolve with Agetor dialog", () => {
     await expect(summary).toContainText("1 step");
     await expect(summary).toContainText("starts with");
     await expect(dlg.getByTestId("agent-profile-card")).toHaveCount(0);
-    await expect(dlg.getByText("Agent", { exact: true })).toHaveCount(0);
+    await expect(dlg.getByTestId("agent-profile-picker")).toHaveCount(0);
     await expect(dlg.getByTestId("launch-pipeline-problem")).toHaveCount(0);
 
     await summary.getByTestId("launch-pipeline-change").click();
     await expect(dlg.getByTestId("launch-pipeline-summary")).toHaveCount(0);
-    await expect(dlg.getByText("Agent", { exact: true })).toBeVisible();
+    await expect(dlg.getByTestId("agent-profile-picker")).toBeVisible();
     // The profile picked before the pipeline stays cleared — Change restores
     // the manual block, not the profile it replaced (New Task parity).
     await expect(dlg.getByTestId("agent-profile-card")).toHaveCount(0);
@@ -635,7 +638,7 @@ test.describe("Resolve with Agetor dialog", () => {
     createdTaskIds.splice(createdTaskIds.indexOf(task.id), 1);
   });
 
-  test("pipeline picker: an unrunnable pipeline is listed but blocks Create & start", async ({ page, backend }) => {
+  test("pipeline picker: an unrunnable pipeline is listed but blocks Run task", async ({ page, backend }) => {
     test.setTimeout(90_000);
     const suffix = Date.now();
     const pipelineName = `E2E PR unrunnable pipeline ${suffix}`;
@@ -709,7 +712,7 @@ test.describe("Resolve with Agetor dialog", () => {
     const dlg = await openResolveConflictsDialog(page);
 
     // A plain single-agent launch on the unavailable harness is blocked.
-    await dlg.getByRole("button", { name: manualHarnessLabel }).click();
+    await pickHarness(dlg, manualHarnessLabel);
     const hint = dlg.getByTestId("launch-agent-unavailable-hint");
     await expect(hint).toBeVisible({ timeout: CONVERGE_TIMEOUT });
     await expect(hint).toContainText("not found on PATH");
@@ -724,6 +727,162 @@ test.describe("Resolve with Agetor dialog", () => {
     // Change returns to the still-unavailable manual harness — blocked again.
     await dlg.getByTestId("launch-pipeline-change").click();
     await expect(submit).toBeDisabled();
+  });
+
+  test("launch parity: the PR dialog carries the same launch fields, status, gate and layout as the issue dialog", async ({ page, backend }) => {
+    test.setTimeout(120_000);
+    await page.setViewportSize({ width: 1280, height: 900 });
+    const manualHarnessLabel = `Parity Unavailable Harness ${Date.now()}`;
+    const harnessId = await createUnavailableHarnessRest(backend, manualHarnessLabel);
+    trackPipelineFixture("", [], [harnessId]);
+
+    await gotoApp(page, backend.bootBase);
+    const dlg = await openResolveConflictsDialog(page);
+
+    // Labelled fields, the model refresh button and the profile picker's "Manage agents…" row.
+    await expect(dlg.getByTestId("launch-refresh-models")).toBeVisible();
+    await expect(dlg.getByTestId("launch-harness-picker-trigger")).toHaveAccessibleName(/^Harness\b/);
+    await expect(dlg.getByTestId("launch-model-picker-trigger")).toHaveAccessibleName(/^Model\b/);
+    await expect(dlg.getByTestId("launch-effort-picker-trigger")).toHaveAccessibleName(/^Effort\b/);
+    await dlg.getByTestId("agent-profile-picker-trigger").click();
+    await expect(page.getByTestId("agent-profile-picker-manage")).toBeVisible();
+    await page.keyboard.press("Escape");
+    await expect(dlg).toBeVisible();
+
+    // Two columns from md: the prompt on the left, the Workspace / Agent sections on the right,
+    // and the footer in view.
+    const prompt = await dlg.getByTestId("prompt-textarea").boundingBox();
+    const workspace = await dlg.getByTestId("launch-section-workspace").boundingBox();
+    expect(workspace!.x).toBeGreaterThan(prompt!.x + prompt!.width - 8);
+    await expect(dlg.getByTestId("resolve-conflicts-submit")).toBeInViewport();
+
+    // Status dot: the available stub is "ok"; a harness whose binary is missing reads "error".
+    await expect(dlg.getByTestId("launch-harness-picker-trigger").getByTestId("launch-harness-status")).toHaveAttribute("data-tone", "ok", {
+      timeout: CONVERGE_TIMEOUT,
+    });
+    expect(await harnessStatus(dlg, manualHarnessLabel)).toBe("error");
+
+    // Picking it blocks Run with the hint under the picker AND the reason beside the button.
+    await pickHarness(dlg, manualHarnessLabel);
+    await expect(dlg.getByTestId("launch-agent-unavailable-hint")).toContainText("not found on PATH", { timeout: CONVERGE_TIMEOUT });
+    const submit = dlg.getByTestId("resolve-conflicts-submit");
+    await expect(submit).toBeDisabled();
+    const reason = dlg.getByTestId("launch-run-blocked-reason");
+    await expect(reason).toContainText("can't start");
+    // The dialog's Run points at ITS reason, not at the always-mounted panel's.
+    const describedBy = await submit.getAttribute("aria-describedby");
+    expect(describedBy).toBeTruthy();
+    expect(await reason.getAttribute("id")).toBe(describedBy);
+    // The always-mounted panel renders its own reason (its form is empty): ids stay unique.
+    await expect(page.getByTestId("new-task-panel").getByTestId("launch-run-blocked-reason")).toBeVisible();
+    await expect(page.locator(`[id="${describedBy}"]`)).toHaveCount(1);
+  });
+
+  test("a failed harness fetch shows the error, not a footer reason about a form that is not on screen", async ({ page, backend }) => {
+    test.setTimeout(90_000);
+    await gotoApp(page, backend.bootBase);
+
+    // Open the Git dialog on the PR by hand: the shared helper waits for the prompt field, which
+    // a failed fetch never renders.
+    await page.getByRole("button", { name: "Git", exact: true }).click();
+    const gitDialog = page.getByRole("dialog");
+    await expect(gitDialog).toBeVisible();
+    const projectSelect = gitDialog.getByRole("combobox", { name: "Project" });
+    await expect(projectSelect).toBeVisible({ timeout: CONVERGE_TIMEOUT });
+    if ((await projectSelect.inputValue()) !== projectDir) await projectSelect.selectOption({ value: projectDir });
+    await gitDialog.getByRole("button", { name: `#${PR_NUMBER} ${PR_TITLE}` }).click();
+    const resolveButton = gitDialog.getByRole("button", { name: "Resolve with Agetor", exact: true });
+    await expect(resolveButton).toBeVisible({ timeout: CONVERGE_TIMEOUT });
+
+    // The dialog fetches the harnesses itself when it opens; fail that one request.
+    const harnessesUrl = (url: URL) => url.pathname === "/harnesses";
+    await page.route(harnessesUrl, (route) =>
+      route.fulfill({ status: 500, contentType: "application/json", body: JSON.stringify({ error: "harnesses unavailable" }) }),
+    );
+    await resolveButton.click();
+    const dlg = page.getByTestId("resolve-conflicts-dialog");
+    await expect(dlg).toBeVisible({ timeout: CONVERGE_TIMEOUT });
+    await expect(dlg.getByText("harnesses unavailable")).toBeVisible({ timeout: CONVERGE_TIMEOUT });
+    // No form is on screen, so the footer neither says "Add a project" nor "Checking … availability".
+    await expect(dlg.getByTestId("launch-run-blocked-reason")).toHaveCount(0);
+    await expect(dlg.getByTestId("resolve-conflicts-submit")).toBeDisabled();
+    await page.unroute(harnessesUrl);
+  });
+
+  test("manage agents: from a clean draft the row closes both dialogs and opens Settings → Agents", async ({ page, backend }) => {
+    test.setTimeout(90_000);
+    await gotoApp(page, backend.bootBase);
+    const dlg = await openResolveConflictsDialog(page);
+
+    // The PR dialog's own wiring (PullActions → App's openSettingsAgentsFromGit), not the issue one.
+    await dlg.getByTestId("agent-profile-picker-trigger").click();
+    const manage = page.getByTestId("agent-profile-picker-manage");
+    await expect(manage).toBeVisible({ timeout: CONVERGE_TIMEOUT });
+    await manage.click();
+
+    const settings = page.getByRole("dialog").filter({ has: page.locator("#settings-dialog-title") });
+    await expect(settings).toBeVisible({ timeout: CONVERGE_TIMEOUT });
+    await expect(settings.getByRole("button", { name: "Agents", exact: true })).toHaveAttribute("aria-current", "page");
+    // Nothing was typed, so no discard confirm was asked, and no launch or Git dialog is left
+    // stacked under Settings.
+    await expect(page.getByText("Discard this task draft and open Settings → Agents?")).toHaveCount(0);
+    await expect(dlg).toHaveCount(0);
+    await expect(page.getByRole("dialog")).toHaveCount(1);
+  });
+
+  test("while Run task is in flight, the header Close and Cancel are disabled and dimmed; the created task closes the dialog", async ({
+    page,
+    request,
+    backend,
+  }) => {
+    test.setTimeout(90_000);
+    const auth = { authorization: `Bearer ${backend.apiToken}` };
+    const before = new Set(
+      ((await (await request.get(`${backend.apiBase}/tasks`, { headers: auth })).json()) as TaskRow[]).map((t) => t.id),
+    );
+    await gotoApp(page, backend.bootBase);
+    const dlg = await openResolveConflictsDialog(page);
+
+    // Hold the create request so the dialog stays in its busy state until the gate opens.
+    let release!: () => void;
+    const gate = new Promise<void>((r) => (release = r));
+    let held = 0;
+    const tasksUrl = (url: URL) => url.pathname === "/tasks";
+    await page.route(tasksUrl, async (route) => {
+      if (route.request().method() !== "POST") return route.continue();
+      held++;
+      await gate;
+      await route.continue();
+    });
+
+    const submit = dlg.getByTestId("resolve-conflicts-submit");
+    await expect(submit).toBeEnabled({ timeout: CONVERGE_TIMEOUT });
+    await submit.click();
+    // Release the held create even when an assertion below fails, so the route never hangs.
+    try {
+      await expect.poll(() => held, { timeout: CONVERGE_TIMEOUT }).toBe(1);
+
+      const close = dlg.getByRole("button", { name: "Close", exact: true });
+      await expect(close).toBeDisabled();
+      await expect(close).toHaveCSS("opacity", "0.5");
+      await expect(dlg.getByTestId("launch-cancel")).toBeDisabled();
+      await expect(submit).toBeDisabled();
+      await expect(submit).toContainText("Running");
+      await expect(dlg.getByTestId("launch-harness-picker-trigger")).toBeDisabled();
+    } finally {
+      release();
+    }
+    await expect(dlg).toBeHidden({ timeout: CONVERGE_TIMEOUT });
+    await page.unroute(tasksUrl);
+    const cardTitle = `Resolve conflicts: PR #${PR_NUMBER} — ${PR_TITLE}`;
+    let created: TaskRow | undefined;
+    await expect(async () => {
+      const rows = (await (await request.get(`${backend.apiBase}/tasks`, { headers: auth })).json()) as TaskRow[];
+      created = rows.find((t) => t.title === cardTitle && !before.has(t.id));
+      expect(created).toBeTruthy();
+    }).toPass({ timeout: CONVERGE_TIMEOUT });
+    createdTaskIds.push(created!.id);
+    expect(held).toBe(1);
   });
 
   test("pipeline picker: Manage pipelines closes both dialogs, confirming a dirty draft first", async ({ page, backend }) => {

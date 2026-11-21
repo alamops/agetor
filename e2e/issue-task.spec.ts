@@ -1,12 +1,14 @@
 import { execFileSync } from "node:child_process";
-import { existsSync } from "node:fs";
+import { existsSync, mkdirSync } from "node:fs";
 import { mkdir, mkdtemp, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
 import { test, expect, type APIRequestContext, type E2EBackend, type Locator, type Page } from "./fixtures";
-import { dialogBranchPicker, gotoApp, openSelectProjects, selectBaseBranch } from "./helpers";
+import { dialogBranchPicker, gotoApp, openSelectProjects, putPreference, selectBaseBranch } from "./helpers";
 import { startGitHubStub, type GitHubStub, type StubRoute } from "./github-stub";
+import { expectEffort, expectHarness, expectModel, expectSpeed, maxModeToggle, pickHarness } from "./launch-helpers";
+import { plantFakeCodexAppServer, writeFakeCodexCatalog, type FakeCodexModel } from "../src/bun/test-codex-app-server.ts";
 
 /**
  * E2E coverage for "task from a Git issue + its comment thread" via the
@@ -606,7 +608,7 @@ async function createPipelineRest(
 async function pickPipeline(dialog: Locator, pipelineId: string): Promise<void> {
   const picker = dialog.getByTestId("launch-pipeline-picker").getByTestId("pipeline-picker");
   await picker.getByTestId("pipeline-picker-trigger").click();
-  const popover = picker.getByTestId("pipeline-picker-popover");
+  const popover = picker.page().getByTestId("pipeline-picker-popover");
   await expect(popover).toBeVisible({ timeout: CONVERGE_TIMEOUT });
   await popover.locator(`[data-testid="pipeline-picker-row"][data-pipeline-id="${pipelineId}"]`).click();
   await expect(popover).toBeHidden();
@@ -617,9 +619,9 @@ async function pickPipeline(dialog: Locator, pipelineId: string): Promise<void> 
 async function openPipelineManageRow(dialog: Locator): Promise<Locator> {
   const picker = dialog.getByTestId("launch-pipeline-picker").getByTestId("pipeline-picker");
   await picker.getByTestId("pipeline-picker-trigger").click();
-  const popover = picker.getByTestId("pipeline-picker-popover");
+  const popover = picker.page().getByTestId("pipeline-picker-popover");
   await expect(popover).toBeVisible({ timeout: CONVERGE_TIMEOUT });
-  const manage = popover.getByTestId("pipeline-picker-manage");
+  const manage = picker.page().getByTestId("pipeline-picker-manage");
   await expect(manage).toBeVisible();
   return manage;
 }
@@ -995,18 +997,16 @@ test.describe("task from a Git issue", () => {
     const issueTaskDialog = await openIssueTaskDialog(page);
 
     const typePicker = issueTaskDialog.getByTestId("task-type-picker");
-    const taskButton = typePicker.getByRole("button", { name: "Task", exact: true });
-    const bugButton = typePicker.getByRole("button", { name: "Bug", exact: true });
-    const spikeButton = typePicker.getByRole("button", { name: "Spike", exact: true });
+    const taskButton = typePicker.getByRole("radio", { name: "Task", exact: true });
+    const bugButton = typePicker.getByRole("radio", { name: "Bug", exact: true });
+    const spikeButton = typePicker.getByRole("radio", { name: "Spike", exact: true });
 
     // Seeded from the fixture issue's "bug" label (inferTaskTypeFromLabels,
     // src/shared/issue-task.ts) once the thread loads — Bug renders with the
-    // `default` Button variant (`bg-primary` in its class list, per
-    // TaskTypePicker.tsx), Task/Spike stay on the `outline` variant, which
-    // never emits `bg-primary`.
-    await expect(bugButton).toHaveClass(/bg-primary/, { timeout: CONVERGE_TIMEOUT });
-    await expect(taskButton).not.toHaveClass(/bg-primary/);
-    await expect(spikeButton).not.toHaveClass(/bg-primary/);
+    // checked radio of the Type radiogroup (TaskTypePicker.tsx).
+    await expect(bugButton).toBeChecked({ timeout: CONVERGE_TIMEOUT });
+    await expect(taskButton).not.toBeChecked();
+    await expect(spikeButton).not.toBeChecked();
 
     const worktreeOptions = issueTaskDialog.getByTestId("worktree-options");
     const branchNameInput = worktreeOptions.getByTestId("branch-name-input");
@@ -1018,16 +1018,16 @@ test.describe("task from a Git issue", () => {
     // Picking Spike swaps both the selected button and the derived prefix
     // (DEFAULT_BRANCH_CONFIG.rules.spike.prefix === "spike/").
     await spikeButton.click();
-    await expect(spikeButton).toHaveClass(/bg-primary/);
-    await expect(bugButton).not.toHaveClass(/bg-primary/);
+    await expect(spikeButton).toBeChecked();
+    await expect(bugButton).not.toBeChecked();
     await expect(async () => {
       expect(await branchNameInput.inputValue()).toMatch(/^spike\//);
     }).toPass({ timeout: CONVERGE_TIMEOUT });
 
     // Picking Bug back swaps them again (fix/ per DEFAULT_BRANCH_CONFIG).
     await bugButton.click();
-    await expect(bugButton).toHaveClass(/bg-primary/);
-    await expect(spikeButton).not.toHaveClass(/bg-primary/);
+    await expect(bugButton).toBeChecked();
+    await expect(spikeButton).not.toBeChecked();
     await expect(async () => {
       expect(await branchNameInput.inputValue()).toMatch(/^fix\//);
     }).toPass({ timeout: CONVERGE_TIMEOUT });
@@ -1153,7 +1153,7 @@ test.describe("task from a Git issue", () => {
     const issueTaskDialog = await openIssueTaskDialog(page);
 
     // Baseline: the Agent picker is visible and there's no pipeline summary.
-    await expect(issueTaskDialog.getByText("Agent", { exact: true })).toBeVisible();
+    await expect(issueTaskDialog.getByTestId("agent-profile-picker")).toBeVisible();
     await expect(issueTaskDialog.getByTestId("launch-pipeline-summary")).toHaveCount(0);
     await expect(issueTaskDialog.getByTestId("launch-pipeline-picker")).toBeVisible();
 
@@ -1161,7 +1161,7 @@ test.describe("task from a Git issue", () => {
     // profile card (the Agent block disappears entirely behind the summary).
     const agentPicker = issueTaskDialog.getByTestId("agent-profile-picker");
     await agentPicker.getByTestId("agent-profile-picker-trigger").click();
-    await agentPicker.locator(`[data-testid="agent-profile-picker-row"][data-profile-id="${profileId}"]`).click();
+    await page.locator(`[data-testid="agent-profile-picker-row"][data-profile-id="${profileId}"]`).click();
     // The picker's own trigger renders a chip with the same test id, so the
     // selected card is the last one.
     await expect(issueTaskDialog.getByTestId("agent-profile-card").last()).toBeVisible();
@@ -1174,13 +1174,13 @@ test.describe("task from a Git issue", () => {
     await expect(summary).toContainText("1 step");
     await expect(summary).toContainText("starts with");
     await expect(issueTaskDialog.getByTestId("agent-profile-card")).toHaveCount(0);
-    await expect(issueTaskDialog.getByText("Agent", { exact: true })).toHaveCount(0);
+    await expect(issueTaskDialog.getByTestId("agent-profile-picker")).toHaveCount(0);
     await expect(issueTaskDialog.getByTestId("launch-pipeline-problem")).toHaveCount(0);
 
     // Change clears the selection and restores the Agent block.
     await summary.getByTestId("launch-pipeline-change").click();
     await expect(issueTaskDialog.getByTestId("launch-pipeline-summary")).toHaveCount(0);
-    await expect(issueTaskDialog.getByText("Agent", { exact: true })).toBeVisible();
+    await expect(issueTaskDialog.getByTestId("agent-profile-picker")).toBeVisible();
     // The profile picked before the pipeline stays cleared — Change restores
     // the manual block, not the profile it replaced (New Task parity).
     await expect(issueTaskDialog.getByTestId("agent-profile-card")).toHaveCount(0);
@@ -1226,7 +1226,7 @@ test.describe("task from a Git issue", () => {
     createdTaskIds.splice(createdTaskIds.indexOf(task.id), 1);
   });
 
-  test("pipeline picker: an unrunnable pipeline is listed but blocks Create & start", async ({ page, backend }) => {
+  test("pipeline picker: an unrunnable pipeline is listed but blocks Run task", async ({ page, backend }) => {
     test.setTimeout(90_000);
     const suffix = Date.now();
     const pipelineName = `E2E unrunnable pipeline ${suffix}`;
@@ -1311,7 +1311,7 @@ test.describe("task from a Git issue", () => {
 
     // Manually pick the deterministically unavailable harness: a plain
     // single-agent launch must be blocked by it.
-    await issueTaskDialog.getByRole("button", { name: manualHarnessLabel }).click();
+    await pickHarness(issueTaskDialog, manualHarnessLabel);
     const hint = issueTaskDialog.getByTestId("launch-agent-unavailable-hint");
     await expect(hint).toBeVisible({ timeout: CONVERGE_TIMEOUT });
     await expect(hint).toContainText("not found on PATH");
@@ -1409,5 +1409,327 @@ test.describe("task from a Git issue", () => {
     await confirmDialog.getByRole("button", { name: "Cancel", exact: true }).click();
     await expect(issueTaskDialog).toBeVisible();
     await expect(summary).toContainText("develop");
+  });
+
+  test("manage agents: the footer row is reachable by keyboard, confirms a dirty draft, then opens Settings → Agents", async ({ page, backend }) => {
+    test.setTimeout(120_000);
+    await gotoApp(page, backend.bootBase);
+    const issueTaskDialog = await openIssueTaskDialog(page);
+    const summary = issueTaskDialog.getByTestId("worktree-options").getByTestId("selected-branches");
+    await selectBaseBranch(page, issueTaskDialog, projectDir, "develop");
+    await expect(summary).toContainText("develop", { timeout: CONVERGE_TIMEOUT });
+
+    const trigger = issueTaskDialog.getByTestId("agent-profile-picker-trigger");
+    const manage = page.getByTestId("agent-profile-picker-manage");
+    const confirmDialog = page
+      .locator('[role="dialog"]')
+      .filter({ has: page.getByText("Discard this task draft and open Settings → Agents?") });
+
+    // Tab walks from the search box to the footer row (it used to close the popover).
+    await trigger.click();
+    await expect(page.getByTestId("agent-profile-picker-popover")).toBeVisible();
+    await page.keyboard.press("Tab");
+    await expect(manage).toBeFocused();
+    // Shift+Tab walks back to the search box; Tab again and Enter activates the row.
+    await page.keyboard.press("Shift+Tab");
+    await expect(page.getByTestId("agent-profile-picker-search")).toBeFocused();
+    await page.keyboard.press("Tab");
+    await page.keyboard.press("Enter");
+
+    // The draft is dirty (a picked base ref): Cancel keeps the dialog and the ref.
+    await expect(confirmDialog).toBeVisible({ timeout: CONVERGE_TIMEOUT });
+    await confirmDialog.getByRole("button", { name: "Cancel", exact: true }).click();
+    await expect(issueTaskDialog).toBeVisible();
+    await expect(summary).toContainText("develop");
+
+    // Discard closes both dialogs and opens Settings on the Agents section.
+    await trigger.click();
+    await manage.click();
+    await expect(confirmDialog).toBeVisible({ timeout: CONVERGE_TIMEOUT });
+    await confirmDialog.getByRole("button", { name: "Discard draft", exact: true }).click();
+    await expect(issueTaskDialog).toBeHidden({ timeout: CONVERGE_TIMEOUT });
+    const settings = page.getByRole("dialog").filter({ has: page.locator("#settings-dialog-title") });
+    await expect(settings).toBeVisible({ timeout: CONVERGE_TIMEOUT });
+    await expect(settings.getByRole("button", { name: "Agents", exact: true })).toHaveAttribute("aria-current", "page");
+  });
+
+  test("while Run task is in flight, the header Close and Cancel are disabled and dimmed; the created task closes the dialog", async ({
+    page,
+    request,
+    backend,
+  }) => {
+    test.setTimeout(90_000);
+    // Earlier tests in this serial file may still hold a task under the same card title.
+    const listTasks = async () =>
+      (await (
+        await request.get(`${backend.apiBase}/tasks`, { headers: { authorization: `Bearer ${backend.apiToken}` } })
+      ).json()) as Array<{ id: string; title: string; isolation: string }>;
+    const before = new Set((await listTasks()).map((t) => t.id));
+    await gotoApp(page, backend.bootBase);
+    const dlg = await openIssueTaskDialog(page);
+    // In place: no worktree to materialize, the busy state is all this test is about.
+    await dlg.getByTestId("worktree-options").getByTestId("isolate-toggle").uncheck();
+
+    // Hold the create request so the dialog stays in its busy state until the gate opens.
+    let release!: () => void;
+    const gate = new Promise<void>((r) => (release = r));
+    let held = 0;
+    const tasksUrl = (url: URL) => url.pathname === "/tasks";
+    await page.route(tasksUrl, async (route) => {
+      if (route.request().method() !== "POST") return route.continue();
+      held++;
+      await gate;
+      await route.continue();
+    });
+
+    const submit = dlg.getByTestId("issue-task-submit");
+    await expect(submit).toBeEnabled({ timeout: CONVERGE_TIMEOUT });
+    await submit.click();
+    // Release the held create even when an assertion below fails, so the route never hangs.
+    try {
+      await expect.poll(() => held, { timeout: CONVERGE_TIMEOUT }).toBe(1);
+
+      const close = dlg.getByRole("button", { name: "Close", exact: true });
+      await expect(close).toBeDisabled();
+      await expect(close).toHaveCSS("opacity", "0.5");
+      await expect(dlg.getByTestId("launch-cancel")).toBeDisabled();
+      await expect(submit).toBeDisabled();
+      await expect(submit).toContainText("Running");
+      await expect(dlg.getByTestId("launch-harness-picker-trigger")).toBeDisabled();
+    } finally {
+      release();
+    }
+    await expect(dlg).toBeHidden({ timeout: CONVERGE_TIMEOUT });
+    await page.unroute(tasksUrl);
+    let task: { id: string; isolation: string } | undefined;
+    await expect(async () => {
+      task = (await listTasks()).find((t) => t.title === CARD_TITLE && !before.has(t.id));
+      expect(task).toBeTruthy();
+    }).toPass({ timeout: CONVERGE_TIMEOUT });
+    expect(task!.isolation).toBe("none");
+    expect(held).toBe(1);
+    await deleteTask(request, backend, task!.id);
+  });
+
+  test("the footer never asks for a prompt while the thread loads, and says so when the fetch fails", async ({ page, backend }) => {
+    test.setTimeout(90_000);
+    await gotoApp(page, backend.bootBase);
+
+    // Hold the thread: the prompt is still empty, which is not the user's omission.
+    let release!: () => void;
+    const gate = new Promise<void>((r) => (release = r));
+    const threadUrl = (url: URL) => url.pathname === "/github/issue-thread";
+    await page.route(threadUrl, async (route) => {
+      await gate;
+      await route.continue();
+    });
+    const opened = openIssueTaskDialog(page);
+    const dialog = page.getByTestId("issue-task-dialog");
+    const reason = dialog.getByTestId("launch-run-blocked-reason");
+    await expect(reason).toHaveText(/Loading the issue/, { timeout: CONVERGE_TIMEOUT });
+    await expect(reason).not.toContainText("Add a prompt");
+    await expect(dialog.getByTestId("issue-task-submit")).toBeDisabled();
+    release();
+    await opened;
+    await expect(reason).toHaveCount(0);
+    await expect(dialog.getByTestId("issue-task-submit")).toBeEnabled({ timeout: CONVERGE_TIMEOUT });
+
+    // A failed fetch shows the error, not a request for a prompt there is no field for.
+    await page.unroute(threadUrl);
+    await dialog.getByTestId("launch-cancel").click();
+    await expect(dialog).toBeHidden();
+    await page.route(threadUrl, (route) =>
+      route.fulfill({ status: 500, contentType: "application/json", body: JSON.stringify({ error: "thread unavailable" }) }),
+    );
+    await page.getByTestId("issue-work-with-agetor").click();
+    await expect(dialog).toBeVisible({ timeout: CONVERGE_TIMEOUT });
+    await expect(dialog.getByText("thread unavailable")).toBeVisible({ timeout: CONVERGE_TIMEOUT });
+    await expect(dialog.getByTestId("launch-run-blocked-reason")).toHaveCount(0);
+    await expect(dialog.getByTestId("issue-task-submit")).toBeDisabled();
+  });
+
+  test("launch layout: two columns from md with a sticky footer, one column below it", async ({ page, backend }) => {
+    test.setTimeout(90_000);
+    await page.setViewportSize({ width: 1280, height: 900 });
+    await gotoApp(page, backend.bootBase);
+    const dialog = await openIssueTaskDialog(page);
+    const prompt = dialog.getByTestId("prompt-textarea");
+    const workspace = dialog.getByTestId("launch-section-workspace");
+    await expect(workspace).toBeVisible();
+
+    // Wide: the prompt (left) and the Workspace/Agent sections (right) sit side by side.
+    const wide = { prompt: (await prompt.boundingBox())!, workspace: (await workspace.boundingBox())! };
+    expect(wide.workspace.x).toBeGreaterThan(wide.prompt.x + wide.prompt.width - 8);
+
+    // The footer never scrolls away: Run task is in the viewport at the top of the form.
+    const run = dialog.getByTestId("issue-task-submit");
+    await expect(run).toBeInViewport();
+
+    // Narrow: below 768 px it is one column, the sections stack under the prompt, and the
+    // sticky footer is still visible.
+    await page.setViewportSize({ width: 700, height: 900 });
+    await expect(run).toBeInViewport();
+    const narrow = { prompt: (await prompt.boundingBox())!, workspace: (await workspace.boundingBox())! };
+    expect(narrow.workspace.y).toBeGreaterThan(narrow.prompt.y + narrow.prompt.height - 8);
+  });
+
+  test("launch parity: the picker fields are labelled, the refresh button and Manage agents are present", async ({ page, backend }) => {
+    test.setTimeout(90_000);
+    await gotoApp(page, backend.bootBase);
+    const dialog = await openIssueTaskDialog(page);
+    await expect(dialog.getByTestId("launch-refresh-models")).toBeVisible();
+    await expect(dialog.getByTestId("launch-harness-picker-trigger")).toHaveAccessibleName(/^Harness\b/);
+    await expect(dialog.getByTestId("launch-model-picker-trigger")).toHaveAccessibleName(/^Model\b/);
+    await expect(dialog.getByTestId("launch-effort-picker-trigger")).toHaveAccessibleName(/^Effort\b/);
+    // The status dot reads the harness's real state: the e2e backend's Claude Code is the
+    // available stub, so its tone is "ok" — never the "unknown" placeholder.
+    await expect(dialog.getByTestId("launch-harness-picker-trigger").getByTestId("launch-harness-status")).toHaveAttribute("data-tone", "ok", {
+      timeout: CONVERGE_TIMEOUT,
+    });
+    // "Manage agents…" is offered in the Git dialog's profile picker.
+    await dialog.getByTestId("agent-profile-picker-trigger").click();
+    await expect(page.getByTestId("agent-profile-picker-manage")).toBeVisible();
+    await page.keyboard.press("Escape");
+    await expect(dialog).toBeVisible();
+  });
+
+  test("launch parity: ↻ in the dialog re-probes the harness, then refetches both model lists", async ({ page, backend }) => {
+    test.setTimeout(90_000);
+    await gotoApp(page, backend.bootBase);
+    const dialog = await openIssueTaskDialog(page);
+    const refresh = dialog.getByTestId("launch-refresh-models");
+    await expect(refresh).toBeEnabled({ timeout: CONVERGE_TIMEOUT });
+
+    // The dialog fetches for itself (no panel state to borrow), so the round trip is: a per-harness
+    // POST, then a re-read of the kind-level and the per-harness catalogs.
+    const probe = page.waitForRequest((r) => r.method() === "POST" && /\/agent-models\?harness=/.test(r.url()));
+    const kindList = page.waitForRequest((r) => r.method() === "GET" && /\/agent-models$/.test(new URL(r.url()).pathname + new URL(r.url()).search));
+    const harnessList = page.waitForRequest((r) => r.method() === "GET" && /\/agent-models\/harnesses$/.test(new URL(r.url()).pathname));
+    await refresh.click();
+    await Promise.all([probe, kindList, harnessList]);
+    // It settles back to idle and the picker still offers a model.
+    await expect(refresh).toBeEnabled({ timeout: CONVERGE_TIMEOUT });
+    await expect(dialog.getByTestId("launch-model-picker-trigger")).toHaveAttribute("data-value", /.+/);
+  });
+
+  test("launch keyboard: Cmd/Ctrl+Enter runs the task from the dialog, but not while a picker is open", async ({ page, request, backend }) => {
+    test.setTimeout(90_000);
+    await gotoApp(page, backend.bootBase);
+    const dialog = await openIssueTaskDialog(page);
+    const submit = dialog.getByTestId("issue-task-submit");
+    await expect(submit).toBeEnabled({ timeout: CONVERGE_TIMEOUT });
+
+    // A picker is open: the chord is inert, the dialog stays.
+    await dialog.getByTestId("launch-model-picker-trigger").click();
+    await expect(page.getByTestId("launch-model-picker-popover")).toBeVisible();
+    await page.keyboard.press("ControlOrMeta+Enter");
+    await page.waitForTimeout(1_000);
+    // Inert: neither a pick nor a submit — the picker is still open and the dialog stays.
+    await expect(page.getByTestId("launch-model-picker-popover")).toBeVisible();
+    await expect(dialog).toBeVisible();
+    await page.keyboard.press("Escape"); // closes the picker only
+    await expect(page.getByTestId("launch-model-picker-popover")).toHaveCount(0);
+    await expect(dialog).toBeVisible();
+
+    // Picker closed: the chord runs it.
+    await dialog.getByTestId("prompt-textarea").focus();
+    await page.keyboard.press("ControlOrMeta+Enter");
+    await expect(dialog).toBeHidden({ timeout: CONVERGE_TIMEOUT });
+    const task = await awaitCreatedTask(request, backend, CARD_TITLE);
+    expect(task.column).not.toBe("backlog");
+  });
+});
+
+// ---- Remembered picks survive a dialog re-open (self-fetch seeding) ------------------------------
+//
+// `useTaskLaunch` in self-fetch mode (the issue / PR / Clone dialogs are mounted while closed)
+// re-seeds the per-kind pick cache from the remembered preferences on EVERY open. A codex
+// remembered model is a *pending* seed (the catalog must vouch for it), applied by an effect that
+// must therefore re-run per open: with `prefsLoaded` already true and the catalog ids unchanged,
+// a second open used to fall back to the kind's default model and effort.
+
+const CODEX_CATALOG_DEFAULT = "gpt-6.1-sol";
+const CODEX_CLI_ONLY = "gpt-7-e2e";
+const CODEX_CATALOG: FakeCodexModel[] = [
+  { id: CODEX_CLI_ONLY, displayName: "GPT-7 E2E", efforts: ["low", "high"], defaultEffort: "low" },
+  { id: CODEX_CATALOG_DEFAULT, displayName: "GPT-6.1 Sol", efforts: ["low", "medium", "high"], defaultEffort: "medium" },
+];
+const CODEX_STUB_DIR = path.join("/tmp", `agetor-e2e-issue-codex-${process.pid}`);
+const CODEX_STUB_BIN = (() => {
+  mkdirSync(CODEX_STUB_DIR, { recursive: true });
+  const catalogFile = path.join(CODEX_STUB_DIR, "model-list.json");
+  writeFakeCodexCatalog(catalogFile, CODEX_CATALOG);
+  return plantFakeCodexAppServer({ pages: [], dir: CODEX_STUB_DIR, version: "codex-cli 0.166.0", catalogFile });
+})();
+
+test.describe("task from a Git issue: remembered picks seed the dialog", () => {
+  test.use({ backendEnv: { AGETOR_CODEX_BIN: CODEX_STUB_BIN } });
+
+  test("a second open of the issue dialog keeps the remembered codex model and effort", async ({ page, request, freshBackend }) => {
+    test.setTimeout(120_000);
+    const headers = { authorization: `Bearer ${freshBackend.apiToken}`, "content-type": "application/json" };
+    const freshStub = await startGitHubStub(freshBackend.githubStubPort, issueRoutes());
+    try {
+      await registerProject(freshBackend.apiBase, freshBackend.apiToken, projectDir);
+      const enabled = await request.patch(`${freshBackend.apiBase}/harnesses/codex`, { headers, data: { enabled: true } });
+      expect(enabled.ok(), await enabled.text()).toBeTruthy();
+      await expect
+        .poll(
+          async () => {
+            const res = await request.get(`${freshBackend.apiBase}/agent-models/harnesses`, { headers });
+            const body = (await res.json()) as { byHarness: Record<string, { id: string }[]> };
+            return (body.byHarness.codex ?? []).map((m) => m.id);
+          },
+          { timeout: 20_000, message: "the core never loaded the codex stub's model list" },
+        )
+        .toContain(CODEX_CLI_ONLY);
+      await putPreference(request, freshBackend, "defaultHarness", "codex");
+      await putPreference(request, freshBackend, "lastModel:codex", CODEX_CLI_ONLY);
+      await putPreference(request, freshBackend, "lastEffort:codex", "high");
+
+      await gotoApp(page, freshBackend.bootBase);
+      const dialog = await openIssueTaskDialog(page);
+      await expectHarness(dialog, "Codex");
+      await expectModel(dialog, CODEX_CLI_ONLY);
+      await expectEffort(dialog, "high");
+
+      // Close the launch dialog only (the Git dialog and its issue detail stay), then open it again
+      // WITHOUT reloading: the picks are re-seeded from the remembered preferences.
+      await page.keyboard.press("Escape");
+      await expect(dialog).toBeHidden();
+      await page.getByTestId("issue-work-with-agetor").click();
+      const reopened = page.getByTestId("issue-task-dialog");
+      await expect(reopened).toBeVisible({ timeout: CONVERGE_TIMEOUT });
+      await expect(reopened.getByTestId("prompt-textarea")).toBeVisible({ timeout: CONVERGE_TIMEOUT });
+      await expectHarness(reopened, "Codex");
+      await expectModel(reopened, CODEX_CLI_ONLY);
+      await expectEffort(reopened, "high");
+    } finally {
+      await freshStub.close();
+    }
+  });
+
+  test("the dialog seeds the remembered Speed and Max Mode of the remembered harness (cursor)", async ({ page, request, freshBackend }) => {
+    test.setTimeout(120_000);
+    const headers = { authorization: `Bearer ${freshBackend.apiToken}`, "content-type": "application/json" };
+    const freshStub = await startGitHubStub(freshBackend.githubStubPort, issueRoutes());
+    try {
+      await registerProject(freshBackend.apiBase, freshBackend.apiToken, projectDir);
+      const enabled = await request.patch(`${freshBackend.apiBase}/harnesses/cursor`, { headers, data: { enabled: true } });
+      expect(enabled.ok(), await enabled.text()).toBeTruthy();
+      await putPreference(request, freshBackend, "defaultHarness", "cursor");
+      await putPreference(request, freshBackend, "lastModel:cursor", "gpt-5.3-codex");
+      await putPreference(request, freshBackend, "lastSpeed:cursor", "fast");
+      await putPreference(request, freshBackend, "lastMaxMode:cursor", "true");
+
+      await gotoApp(page, freshBackend.bootBase);
+      const dialog = await openIssueTaskDialog(page);
+      await expectHarness(dialog, "Cursor");
+      await expectModel(dialog, "gpt-5.3-codex");
+      await expectSpeed(dialog, "fast");
+      await expect(await maxModeToggle(dialog)).toHaveAttribute("aria-checked", "true");
+    } finally {
+      await freshStub.close();
+    }
   });
 });

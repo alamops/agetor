@@ -226,13 +226,15 @@ function taskCard(page: Page, title: string): Locator {
   return page.locator('[class*="cursor-grab"]').filter({ hasText: title });
 }
 
-/** Click a task card's "View changes (git diff)" icon button (present on
- *  every card, independent of column/run state — TaskCard.tsx:198) and wait
- *  for the resulting dialog to render. */
+/** Open a task card's "View changes" dialog. The card has no Diff button any
+ *  more: it lives in the card's `⋯` menu (present on every card, independent
+ *  of column/run state), so open the menu and pick the entry. Then wait for
+ *  the dialog to render. */
 async function openDiffDialog(page: Page, title: string): Promise<Locator> {
   const card = taskCard(page, title);
   await expect(card).toBeVisible();
-  await card.getByTitle("View changes (git diff)").click();
+  await card.getByTestId("task-card-more").click();
+  await page.getByTestId("task-context-menu").getByRole("menuitem", { name: "View changes" }).click();
   const dialog = page.getByRole("dialog");
   await expect(dialog).toBeVisible();
   await expect(dialog.getByText("Changes")).toBeVisible();
@@ -341,6 +343,111 @@ test.describe("binary diff previews", () => {
     await expect(notesBlock.locator("img")).toHaveCount(0);
     await expect(notesBlock.locator("canvas")).toHaveCount(0);
     await expect(notesBlock.getByText("Binary file — no textual diff.")).toHaveCount(0);
+  });
+
+  test("a new side the core can't read shows the macOS-privacy pane (neutral, not amber), and the old side still renders", async ({
+    page,
+    request,
+    backend,
+  }) => {
+    test.setTimeout(60_000);
+    const dir = await initRepo();
+    const title = `binary-diff-denied-${randomUUID()}`;
+
+    await writeFile(path.join(dir, "image.png"), makePng(4, 4, [220, 40, 40]));
+    await commitAll(dir, "initial commit");
+    await writeFile(path.join(dir, "image.png"), makePng(8, 6, [40, 120, 220]));
+    await createDiffTask(request, backend, title, dir);
+
+    // Real TCC can't be produced in a headless backend, and `chmod 000` can't
+    // stand in here: `git diff` itself must read the working-tree file to list
+    // it, so an unreadable file never reaches the dialog. The core's own 403
+    // (`taskDiffBlob`, `denied`) is pinned by the unit/integration tests; this
+    // test pins what the dialog does with that 403 on the new side.
+    const cors = {
+      "access-control-allow-origin": "*",
+      "access-control-allow-headers": "*",
+      "access-control-allow-methods": "GET, OPTIONS",
+    };
+    await page.route(/\/tasks\/[^/]+\/diff\/blob\?.*side=new/, async (route) => {
+      if (route.request().method() === "OPTIONS") {
+        await route.fulfill({ status: 204, headers: cors });
+        return;
+      }
+      await route.fulfill({
+        status: 403,
+        headers: { ...cors, "content-type": "application/json" },
+        body: JSON.stringify({ error: "not readable" }),
+      });
+    });
+
+    await gotoApp(page, backend.bootBase);
+    const dialog = await openDiffDialog(page, title);
+    const block = fileBlock(dialog, "image.png");
+    await expect(block).toBeVisible();
+
+    const oldImg = block.locator('img[data-src-url*="side=old"]');
+    await expect(oldImg).toHaveCount(1);
+    await expect.poll(() => oldImg.evaluate((el) => (el as HTMLImageElement).naturalWidth)).toBeGreaterThan(0);
+
+    const blocked = block.getByText("Preview blocked by macOS privacy", { exact: false });
+    await expect(blocked).toBeVisible({ timeout: 20_000 });
+    await expect(block.locator('img[data-src-url*="side=new"]')).toHaveCount(0);
+    // Neutral pane: the amber warning style is reserved for a proven 404.
+    const pane = blocked.locator("xpath=ancestor::div[1]");
+    expect(await pane.getAttribute("class")).not.toContain("border-warning");
+    expect(await blocked.getAttribute("class")).not.toContain("text-warning");
+  });
+
+  test("a PDF new side the core can't read shows the macOS-privacy line, and the old side still renders", async ({
+    page,
+    request,
+    backend,
+  }) => {
+    test.setTimeout(60_000); // pdf.js is a lazily-loaded ~1MB chunk; first fetch can be slow.
+    const dir = await initRepo();
+    const title = `binary-diff-pdf-denied-${randomUUID()}`;
+
+    await writeFile(path.join(dir, "doc.pdf"), makePdf(["Committed page one"]));
+    await commitAll(dir, "add pdf");
+    await writeFile(path.join(dir, "doc.pdf"), makePdf(["Modified page one"]));
+    await createDiffTask(request, backend, title, dir);
+
+    // Same stand-in as the image test above: `git diff` can't list an
+    // unreadable file, so the new side's 403 is faked at the network
+    // boundary. The PDF pane fetches through `api.fetchBlobBytes`, which
+    // turns the 403 into "denied".
+    const cors = {
+      "access-control-allow-origin": "*",
+      "access-control-allow-headers": "authorization, content-type, *",
+      "access-control-allow-methods": "GET, OPTIONS",
+    };
+    await page.route(/\/tasks\/[^/]+\/diff\/blob\?.*side=new/, async (route) => {
+      if (route.request().method() === "OPTIONS") {
+        await route.fulfill({ status: 204, headers: cors });
+        return;
+      }
+      await route.fulfill({
+        status: 403,
+        headers: { ...cors, "content-type": "application/json" },
+        body: JSON.stringify({ error: "not readable" }),
+      });
+    });
+
+    await gotoApp(page, backend.bootBase);
+    const dialog = await openDiffDialog(page, title);
+    const block = fileBlock(dialog, "doc.pdf");
+    await expect(block).toBeVisible();
+
+    const blocked = block.getByText("Preview blocked by macOS privacy", { exact: false });
+    await expect(blocked).toBeVisible({ timeout: 20_000 });
+    await expect(block.getByText("Couldn't load PDF", { exact: true })).toHaveCount(0);
+    // Only the old side draws a page.
+    const canvases = block.locator("canvas");
+    await expect(canvases).toHaveCount(1, { timeout: 20_000 });
+    await expect
+      .poll(() => canvases.first().evaluate((el) => (el as HTMLCanvasElement).width), { timeout: 20_000 })
+      .toBeGreaterThan(0);
   });
 
   test("renders a 2-up PDF preview with a working page pager", async ({ page, request, backend }) => {

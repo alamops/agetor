@@ -1,0 +1,318 @@
+{
+  "version": 1,
+  "id": "new-task-ui-ux-grill-r1",
+  "title": "Grill: New Task panel and Git launch dialogs redesign",
+  "skill": "grill",
+  "slug": "new-task-ui-ux",
+  "round": 1,
+  "summary": "There is no spec for this redesign, so this record becomes the contract. It holds **16 decisions** plus a **confirm-or-override list** of 8 defaults.\n\nStart with **Scope & architecture**, because those answers decide how big the plan is: which surfaces change, and whether the panel moves onto the dialogs' shared launch picker. **Layout** and **Visual language** decide what it looks like. **Bugs, copy, process** settles the rest.\n\nThe brief is `docs/plans/new-task-ui-ux-investigation.md`. Baseline screenshots of today's panel and issue dialog are in the investigation step's scratchpad. Your progress is saved in the browser as you go.",
+  "proven": [
+    {
+      "text": "**Two launch-picker implementations have drifted apart. This is the main cause of \"no clear pattern\".** The panel keeps its own harness/mode/model/effort/speed state and markup (`NewTaskForm.tsx:917-1247`). Every dialog (issue, PR conflicts, Clone, Settings → Agents) uses `TaskLaunchPickers`. They differ in the Mode control, model refresh, the status dot, the hint position, the remembered picks, the pipeline preflight and the Manage agents row.",
+      "evidence": [{ "label": "drift table", "path": "docs/plans/new-task-ui-ux-investigation.md", "line": 31 }]
+    },
+    {
+      "text": "**Bug: the panel submits Speed = Off for claude-code and codex even when Fast is picked.** The gate predates wave 4, and no e2e catches it.",
+      "evidence": [{ "path": "src/mainview/components/kanban/NewTaskForm.tsx", "line": 724, "lang": "tsx", "code": "speed: selectedProfile ? selectedProfile.speed : (kind === \"cursor\" || kind === \"fx\" ? speed : \"off\")," }]
+    },
+    {
+      "text": "**Bug: every issue with an author shows a false warning in the issue dialog**: \"`@<author>` doesn't match a project file\". The issue prompt names people as `@login` (`src/shared/issue-task.ts:286`, `:439`), and the composer's warning doesn't exclude handles."
+    },
+    "**Visual audit.** There are 5 control heights and 2 type sizes in one column, and 4 kinds of dropdown (native select, SearchSelect, the Agent/Pipeline popover, the Extension picker). The selected chips use the solid primary-button style, so they look like the Run button. Isolate is a native checkbox while Max Mode is a Switch. No label is associated with its control. Helper text uses fixed `text-[11px]`/`text-[10px]` sizes that don't follow Cmd+/−. There are no sections. Names truncate at `w-80`. The dialog chrome is hand-copied in each dialog.",
+    "**It's a webview-only change.** It needs no route, migration or server change. The create payload stays the same apart from the Speed fix. Light and dark themes must both work (repo rule).",
+    "**Hand-written primitives.** The repo has no Radix and uses Tailwind v3. New primitives (Field/Label, Checkbox or Switch, segmented control, dialog parts) are hand-written in shadcn's shape, not added with `bunx shadcn add`. Every popover inside a dialog keeps the `data-popover-open` Escape contract.",
+    "**Earlier owner decisions still stand.** From the Select Projects grill: one combined control, read-only Branch rows that reopen the dialog, one shared Branch name, the most recent project auto-selected, and the selection kept after submit. **One selection** across Pipeline, Agent and manual harness. **No remembered last-used** agent or pipeline."
+  ],
+  "sections": [
+    {
+      "id": "scope",
+      "title": "Scope & architecture",
+      "intro": "These decide how big the plan is and which files it owns.",
+      "questions": [
+        {
+          "id": "surfaces",
+          "type": "multi",
+          "title": "Which surfaces adopt the new pattern in this change?",
+          "impact": "blocking",
+          "why": "Decides the file set, the e2e specs to update, and whether a 'legacy' variant is needed anywhere.",
+          "context": "The panel and the two Git dialogs are in by definition. The others share components with them. **Clone → \"Explain this repository\"** and **Settings → Agents** render `TaskLaunchPickers`, so they change automatically if it's restyled. **RunPanel's send box** renders `PromptComposer` (`RunPanel.tsx:4985`), so a change to the composer's label row, references strip or warning shows up there too, unless it's gated behind a variant. **Select projects** and **Branch naming** are opened from the panel and from the issue dialog.",
+          "evidence": [
+            { "label": "TaskLaunchPickers consumers", "path": "docs/plans/new-task-ui-ux-investigation.md", "line": 111 },
+            { "label": "PromptComposer consumers (RunPanel is one)", "path": "docs/plans/new-task-ui-ux-investigation.md", "line": 112 }
+          ],
+          "options": [
+            { "id": "select-projects", "label": "Select projects dialog", "consequence": "Adopts the new dialog parts and controls; `select-projects.spec.ts` and `multi-repo-task.spec.ts` locators are updated." },
+            { "id": "branch-naming", "label": "Branch naming dialog (the gear on Branch name)", "consequence": "Small; it adopts the dialog parts and Field." },
+            { "id": "clone", "label": "Clone → \"Explain this repository\"", "consequence": "Gets the new launch picker for free; `clone-project.spec.ts` is updated." },
+            { "id": "settings-agents", "label": "Settings → Agents (agent profile form)", "consequence": "Gets the new launch picker (it hides the profile picker); `agent-profiles*` specs are updated." },
+            { "id": "runpanel-shared-only", "label": "RunPanel send box: shared-primitive changes only", "description": "The send box picks up the new tokens, text sizes and label association through PromptComposer, but its layout doesn't change.", "consequence": "Small regression risk; a send-box screenshot is added to acceptance." },
+            { "id": "runpanel-full", "label": "RunPanel send box: full redesign too", "consequence": "A big extra surface (it has many layout slots); probably a separate ticket." }
+          ],
+          "recommendation": { "value": ["select-projects", "branch-naming", "clone", "settings-agents", "runpanel-shared-only"], "reason": "Every surface that starts a task reads as one pattern. The send box gets only the shared fixes, so this doesn't turn into a RunPanel redesign." }
+        },
+        {
+          "id": "unify",
+          "type": "single",
+          "title": "Should the panel move onto one shared launch-picker component that every dialog uses too?",
+          "impact": "blocking",
+          "why": "This ends the drift for good, and about 450 lines of `NewTaskForm` launch state move into `useTaskLaunch`.",
+          "context": "`NewTaskForm` has its own copy: `agentCache`, seed effects, `switchAgent`, and duplicated JSX at `:917-1247`. Its hidden behaviors would have to move with it, each with a test first: the per-kind cache, pending seeds for catalog-only models, the `modelTouched` guard, the stale profile/pipeline guards, `effectiveStatus` vs `selectedStatus`, and the gemini overage check on the pipeline's start step.",
+          "evidence": [{ "label": "behaviors a move could lose", "path": "docs/plans/new-task-ui-ux-investigation.md", "line": 136 }],
+          "options": [
+            { "id": "one-component", "label": "One shared component (useTaskLaunch + TaskLaunchPickers, redesigned) used by the panel and every dialog", "consequence": "The biggest refactor, but one place to style, one set of tests and no future drift." },
+            { "id": "two-restyled", "label": "Keep two implementations and restyle both to match", "consequence": "Less churn now, but the drift comes back with the next harness feature." },
+            { "id": "panel-only", "label": "Redesign the panel only and leave the dialogs' picker as it is", "consequence": "The panel and the dialogs still look different, which contradicts the goal." }
+          ],
+          "recommendation": { "value": "one-component", "reason": "The drift is the root cause, and the dialogs already prove the shared module works across five consumers." }
+        },
+        {
+          "id": "drift-winners",
+          "type": "multi",
+          "title": "Which of the panel-only or dialog-only behaviors should every surface get?",
+          "impact": "shape",
+          "why": "Each selected item becomes shared behavior with a test. An unselected item is dropped wherever it exists today.",
+          "context": "Each option is a behavior that exists on only one side today. The **Mode control** gets its own question below.",
+          "evidence": [{ "label": "drift table", "path": "docs/plans/new-task-ui-ux-investigation.md", "line": 34, "endLine": 47 }],
+          "options": [
+            { "id": "model-refresh", "label": "Model refresh ↻ (panel only today)" },
+            { "id": "amber-dot", "label": "Three-state status dot: green / amber when logged out / red (dialogs only)" },
+            { "id": "rich-tooltip", "label": "Harness tooltip with account email + today's token burn (panel only)" },
+            { "id": "hint-under-grid", "label": "Unavailable / not-logged-in hint right under the harness picker (dialogs), not at the end of the block (panel)" },
+            { "id": "usage-notes", "label": "Fable / Mythos \"2x usage\" notes (panel only)" },
+            { "id": "per-kind-cache", "label": "Switching harness restores that harness's previous picks (panel); the dialogs reset to defaults" },
+            { "id": "remember-speed-max", "label": "Remember Speed and Max Mode per harness (panel only)" },
+            { "id": "pipeline-preflight", "label": "Pipeline runnability preflight that blocks Run with a reason (dialogs only)" },
+            { "id": "pipeline-hints", "label": "Pipeline loading/error/empty hints (dialogs only)" },
+            { "id": "manage-agents", "label": "\"Manage agents…\" row in the Agent picker (panel only)" },
+            { "id": "gate-run", "label": "Disable **Run task** in the panel when the harness is unavailable; **To backlog** stays enabled (behavior change)", "consequence": "Matches the dialogs' gating. Today the panel lets you click Run, and the start then fails." }
+          ],
+          "recommendation": { "value": ["model-refresh", "amber-dot", "rich-tooltip", "hint-under-grid", "usage-notes", "per-kind-cache", "remember-speed-max", "pipeline-preflight", "pipeline-hints", "manage-agents", "gate-run"], "reason": "Each one is the richer or safer side. Taking them all keeps every feature and ends the drift." }
+        },
+        {
+          "id": "mode-control",
+          "type": "single",
+          "title": "How should Mode be picked?",
+          "impact": "shape",
+          "why": "Today the panel shows two controls for one value: Code/Plan pills plus a select, where picking Plan in the select also flips the pills. The dialogs show a single native select with no hints.",
+          "evidence": [
+            { "label": "panel: pills + SearchSelect", "path": "src/mainview/components/kanban/NewTaskForm.tsx", "line": 1057, "endLine": 1108 },
+            { "label": "dialogs: plain select", "path": "src/mainview/components/kanban/TaskLaunchPickers.tsx", "line": 913, "lang": "tsx", "code": "<label className=\"text-muted-foreground\">Mode</label>\n<Select value={mode} onChange={(e) => setMode(e.target.value)} className=\"h-8\">" }
+          ],
+          "options": [
+            { "id": "segmented-plus-variant", "label": "A Code | Plan segmented control. Under Code, a compact variant picker (Auto / Accept edits / Ask…) with hints, shown only when the harness has more than one Code variant", "preview": "Mode   [ </> Code | ▤ Plan ]\n       Variant  [ Auto            ▾ ]  ⓘ", "consequence": "One value, one obvious control, and plan is one click. The per-harness Plan tooltips stay." },
+            { "id": "single-select", "label": "One Mode picker with hints that lists every mode, Plan included", "consequence": "The simplest option; Plan is two clicks away." },
+            { "id": "keep-panel", "label": "Keep today's panel version (pills + select) everywhere" }
+          ],
+          "recommendation": { "value": "segmented-plus-variant", "reason": "It keeps the one-click Code/Plan the panel has today and removes the redundant second control under Plan." }
+        }
+      ]
+    },
+    {
+      "id": "layout",
+      "title": "Layout & information architecture",
+      "questions": [
+        {
+          "id": "ia",
+          "type": "single",
+          "title": "How should the roughly 16 controls be organised?",
+          "impact": "blocking",
+          "why": "Decides the panel's skeleton, the dialogs' skeleton, and how much e2e churn there is.",
+          "context": "Today it's one flat `space-y-3` column. The header InfoTip explains three groups (what / where / who) that the layout never shows. Form guidance (NN/g, Smashing) says to group into labelled sections and to put rarely changed settings behind progressive disclosure. **Every feature stays reachable either way.**",
+          "options": [
+            { "id": "sections-summary", "label": "Three labelled sections (**Task** · **Workspace** · **Agent**). Workspace and Agent can collapse to a one-line summary that expands on click; the state is remembered in localStorage", "preview": "TASK\n  Type  [Task|Bug|Spike]\n  Title / Prompt / Files\nWORKSPACE  agetor · fix/7c5261 · isolated   ▸\nAGENT      Claude Code · Opus 5.5 · High · Code ▸", "consequence": "Shortest panel. Your usual settings show at a glance and you can change them in one click." },
+            { "id": "sections-open", "label": "Three labelled sections, always expanded", "consequence": "Clearer grouping, but the same length as today." },
+            { "id": "advanced", "label": "Sections plus one \"Advanced\" disclosure (branch name, model/effort/speed, max mode)", "consequence": "Hides settings you may change often; see the next question." },
+            { "id": "flat", "label": "Keep the flat column with better spacing and dividers" }
+          ],
+          "recommendation": { "value": "sections-summary", "reason": "It shows the what/where/who model the InfoTip already explains and shortens the panel without hiding anything behind an unlabeled 'Advanced'." }
+        },
+        {
+          "id": "frequent-fields",
+          "type": "multi",
+          "title": "Which fields do you change on most tasks (more than half)?",
+          "impact": "shape",
+          "why": "Fields you change often stay visible. The others can live in a collapsed summary line.",
+          "options": [
+            { "id": "type", "label": "Type (Task/Bug/Spike)" },
+            { "id": "title", "label": "Title" },
+            { "id": "prompt", "label": "Prompt" },
+            { "id": "files", "label": "Files / Folders" },
+            { "id": "extensions", "label": "MCP · Skills · Plugins · Agents · Prompts" },
+            { "id": "project", "label": "Project(s)" },
+            { "id": "isolate", "label": "Isolate" },
+            { "id": "branch-name", "label": "Branch name" },
+            { "id": "pipeline", "label": "Pipeline" },
+            { "id": "agent", "label": "Agent (profile)" },
+            { "id": "harness", "label": "Harness / account" },
+            { "id": "mode", "label": "Mode (Code/Plan)" },
+            { "id": "model", "label": "Model" },
+            { "id": "effort", "label": "Effort" },
+            { "id": "speed", "label": "Speed / Max Mode" }
+          ],
+          "min": 1,
+          "recommendation": { "value": ["type", "title", "prompt", "files", "project", "pipeline", "harness", "mode"], "reason": "A guess from the screenshots, which show many accounts and pipelines. Please correct it; only you know your habits." }
+        },
+        {
+          "id": "harness-picker",
+          "type": "single",
+          "title": "How should a harness be picked when there are 7 or more accounts?",
+          "impact": "shape",
+          "why": "Your 4 Claude accounts differ mainly in the suffix that the 2-column grid truncates (\"Claude PBS…\", \"Claude …\").",
+          "context": "Today it's a 2-column button grid with an icon, the name, a stack chip (`1/2`) and a status dot. The Agent and Pipeline pickers are already custom popovers with icon rows.",
+          "options": [
+            { "id": "combobox", "label": "A searchable picker in the same style as Agent and Pipeline (rows: icon, full name, stack chip, status dot, account email), with the current choice shown in the trigger", "consequence": "One dropdown family for Agent, Pipeline and Harness. It scales to any number of accounts. Picking takes 2 clicks, not 1." },
+            { "id": "list", "label": "A one-column list of full-width rows (always visible)", "consequence": "No truncation and 1 click, but 7+ rows of height." },
+            { "id": "grid-wider", "label": "Keep the 2-column grid and widen the panel", "consequence": "Still truncates as accounts grow." }
+          ],
+          "recommendation": { "value": "combobox", "reason": "It scales, ends the truncation, and makes Harness consistent with Agent and Pipeline, the pickers it shares its one-selection rule with." }
+        },
+        {
+          "id": "panel-width",
+          "type": "single",
+          "title": "How wide should the New Task panel be?",
+          "impact": "shape",
+          "why": "Today it's a fixed `w-80` (320 px), which truncates branch names, project rows and the Extensions trigger.",
+          "options": [
+            { "id": "resizable", "label": "Resizable with a drag handle, default 384 px, min 320, max 560, the width remembered in localStorage (like the collapse state)", "consequence": "A new handle and one localStorage key; the board gives up the space." },
+            { "id": "w96", "label": "Fixed 384 px (`w-96`)" },
+            { "id": "keep", "label": "Keep 320 px" }
+          ],
+          "recommendation": { "value": "resizable", "reason": "It fixes truncation for long names without forcing the extra width on a small laptop screen." }
+        },
+        {
+          "id": "dialog-layout",
+          "type": "single",
+          "title": "How should the issue and PR-conflict dialogs be laid out?",
+          "impact": "shape",
+          "why": "The issue dialog today is one `max-w-lg` column that repeats the whole panel: a long scroll at 85vh.",
+          "evidence": [{ "label": "baseline screenshot 06/07-issue-dialog (investigation scratchpad)", "path": "docs/plans/new-task-ui-ux-investigation.md", "line": 68 }],
+          "options": [
+            { "id": "two-col", "label": "A wider two-column dialog (about `max-w-4xl`): issue context, Type, Prompt and Files on the left; Workspace and Agent sections on the right; a sticky footer. One column below about 768 px", "consequence": "No long scroll, and the prompt gets room. The same sections as the panel, laid out side by side." },
+            { "id": "one-col-sections", "label": "Keep one column, using the same sections and collapsible summaries as the panel", "consequence": "Shorter than today, but the prompt and settings still compete for height." },
+            { "id": "keep", "label": "Keep today's single column (restyle only)" }
+          ],
+          "recommendation": { "value": "two-col", "reason": "The dialog has the room the sidebar lacks. Two columns put the issue text next to the settings it informs." }
+        }
+      ]
+    },
+    {
+      "id": "visual",
+      "title": "Visual language",
+      "questions": [
+        {
+          "id": "selected-style",
+          "type": "single",
+          "title": "How should a selected toggle (Type, Mode, a harness) look?",
+          "impact": "shape",
+          "why": "Today selected chips use the solid primary-button style (white in dark mode). They're the brightest thing on the panel and compete with the Run task button.",
+          "options": [
+            { "id": "subtle", "label": "Subtle: an accent background, a primary-colored ring/border and normal text; solid primary is reserved for the main action", "consequence": "One clear CTA. It must be checked in both themes." },
+            { "id": "solid", "label": "Keep solid primary for the selected state" }
+          ],
+          "recommendation": { "value": "subtle", "reason": "Standard segmented-control practice: the selected state shouldn't look like a button to press." }
+        },
+        {
+          "id": "dropdown-family",
+          "type": "single",
+          "title": "Should Model, Effort and Mode-variant use the same custom picker as Agent, Pipeline and Harness, or stay native `<select>`?",
+          "impact": "shape",
+          "why": "There are four dropdown kinds today. One family means one trigger style, one popover style and one keyboard behavior.",
+          "context": "Native selects are simple and accessible, but they can't show hints, icons or a disabled reason, and they look different from the custom popovers next to them. 7 e2e specs reach Model and Effort through native-select XPath. Those break either way once the fields move into sections.",
+          "options": [
+            { "id": "custom", "label": "One custom picker family (built from `SearchSelect`) for every dropdown in these surfaces", "consequence": "Consistent look and hints. The e2e specs move to stable test ids. The `data-popover-open` contract is applied to each one." },
+            { "id": "native", "label": "Native select for short lists (Model, Effort, variant) and custom pickers only where rows need icons" }
+          ],
+          "recommendation": { "value": "custom", "reason": "Consistency is the goal, and Model rows benefit from hints such as the 2x-usage note or 'not in this CLI'." }
+        }
+      ]
+    },
+    {
+      "id": "bugs-copy",
+      "title": "Bugs, copy, process",
+      "questions": [
+        {
+          "id": "bugs",
+          "type": "multi",
+          "title": "Which issues found along the way get fixed in this change?",
+          "impact": "shape",
+          "options": [
+            { "id": "speed", "label": "Fast speed dropped for claude-code/codex on New Task submit (`NewTaskForm.tsx:724`), plus a form-submit e2e that pins it" },
+            { "id": "author-warning", "label": "False `@author` warning in the issue dialog" },
+            { "id": "stale-comment", "label": "The stale `TaskLaunchPickers` header comment (\"refactored onto this module in a later change\")" }
+          ],
+          "recommendation": { "value": ["speed", "author-warning", "stale-comment"], "reason": "All are small, and the redesign touches each of these lines anyway. Leaving a known bug in a file you rewrite would leave the change unfinished." }
+        },
+        {
+          "id": "author-fix",
+          "type": "single",
+          "title": "How should the false `@author` warning be fixed?",
+          "impact": "minor",
+          "showIf": { "question": "bugs", "in": ["author-warning"] },
+          "context": "The handles come from `src/shared/issue-task.ts:286` and `:439`. `agetor add --issue` shares that builder, so changing the prompt text changes the CLI's prompt too.",
+          "options": [
+            { "id": "skip-handles", "label": "The composer's warning ignores `@tokens` that don't look like paths (no `/`, no `.`, matches a GitHub login pattern)", "consequence": "Fixes it for typed prompts as well; prompt text unchanged." },
+            { "id": "drop-at", "label": "Write author names without `@` in the issue prompt", "consequence": "Changes the prompt that both the CLI and the UI send." },
+            { "id": "suppress-seeded", "label": "Suppress the warning for text seeded from the issue and keep it for what the user types" }
+          ],
+          "recommendation": { "value": "skip-handles", "reason": "It leaves the prompt the agent sees (and the CLI parity) unchanged and fixes the false positive at its source." }
+        },
+        {
+          "id": "cta",
+          "type": "single",
+          "title": "What should the actions be called, the same in every surface?",
+          "impact": "shape",
+          "why": "Today the panel says \"To backlog\" / \"Run task\", and the dialogs say \"Cancel\" / \"Create & start\" for the same create-and-start action.",
+          "options": [
+            { "id": "run-task", "label": "Primary **Run task** everywhere. Panel secondary: **Add to backlog**. Dialogs: **Cancel** + **Run task**", "consequence": "One verb everywhere. e2e names that change: \"Create & start\" and \"To backlog\"." },
+            { "id": "run-task-backlog-dialogs", "label": "Same, and the dialogs also get **Add to backlog** (creates the task without starting it)", "consequence": "A small new capability for the dialogs." },
+            { "id": "keep", "label": "Keep today's labels" }
+          ],
+          "recommendation": { "value": "run-task", "reason": "One vocabulary without adding scope. Pick the second option if you want to queue issues without starting them." }
+        },
+        {
+          "id": "peer-primitives",
+          "type": "single",
+          "title": "Three peer branches are also redesigning UI (App bar, TaskCard, the file chip). Who owns the new shared primitives and tokens?",
+          "impact": "shape",
+          "why": "All four branches may touch `ui/*`, `index.css`/`tailwind.config.js` tokens, `StackPositionChip` and `AgentIcon`, so expect merge conflicts.",
+          "context": "The investigation messaged those peers (no reply). The likely new primitives here: Field/Label, a Checkbox or Switch for Isolate, a SegmentedControl, Dialog Header/Body/Footer, rem-based small-text tokens.",
+          "options": [
+            { "id": "this-branch-additive", "label": "This branch adds them additively (new files and new tokens only, no edits to existing primitives' defaults) and announces them to the peers", "consequence": "Few conflicts; peers can adopt them later." },
+            { "id": "primitives-first", "label": "A small primitives-only PR merges first, and all four branches build on it", "consequence": "The cleanest, but it blocks on a fifth change." },
+            { "id": "local", "label": "Keep the new pieces local to the New Task components" }
+          ],
+          "recommendation": { "value": "this-branch-additive", "reason": "It unblocks this work without editing what the peers are editing." }
+        },
+        {
+          "id": "acceptance",
+          "type": "multi",
+          "title": "What does done mean?",
+          "impact": "shape",
+          "options": [
+            { "id": "screens", "label": "Before/after screenshots of every in-scope surface in **both themes**, attached to the PR" },
+            { "id": "spec-doc", "label": "A committed component and style spec (sections, control sizes, spacing, selected/disabled/error states, which picker for what) under `docs/architecture/`" },
+            { "id": "a11y", "label": "Accessibility: every control has an associated label, the whole form works by keyboard (Tab order, Escape contract), focus is visible, AA contrast in both themes" },
+            { "id": "e2e-green", "label": "The full e2e suite is green after locator migration, plus new e2e for the form-submit Speed, Cmd+Enter and section collapse" },
+            { "id": "send-box-shot", "label": "A RunPanel send-box screenshot proving no layout regression" }
+          ],
+          "recommendation": { "value": ["screens", "spec-doc", "a11y", "e2e-green", "send-box-shot"], "reason": "A style spec is what keeps the next change from re-creating the drift. Screenshots and a11y prove the result." }
+        }
+      ]
+    },
+    {
+      "id": "confirm",
+      "title": "Confirm or override",
+      "intro": "Defaults I'd bet on. One click each.",
+      "questions": [
+        { "id": "control-size", "type": "confirm", "title": "Control size standard", "impact": "minor", "recommendation": { "value": "One size for every field and toggle in these surfaces: `h-9`, `text-sm` (the primitives' default), with no per-site overrides.", "reason": "Ends the 5 heights. Sections and the wider panel absorb the extra height." } },
+        { "id": "text-tokens", "type": "confirm", "title": "Small text sizes", "impact": "minor", "recommendation": { "value": "Add rem-based tokens (`text-2xs` = 0.6875rem, `text-3xs` = 0.625rem) in `tailwind.config.js` and use them in the in-scope files, so helper text follows Cmd+/−. The other ~490 app-wide `text-[11px]` uses are **out of scope** (a separate sweep).", "reason": "Fixes these surfaces now without an app-wide diff." } },
+        { "id": "isolate-control", "type": "confirm", "title": "Isolate control", "impact": "minor", "recommendation": { "value": "Replace the native checkbox with the hand-rolled `Switch` (as Max Mode uses), label associated, `data-testid=\"isolate-toggle\"` kept.", "reason": "One boolean control everywhere; no blue OS checkbox." } },
+        { "id": "dialog-parts", "type": "confirm", "title": "Dialog parts", "impact": "minor", "recommendation": { "value": "Add `DialogHeader` / `DialogTitle` / `DialogDescription` / `DialogBody` / `DialogFooter` to `ui/dialog.tsx` and adopt them in the in-scope dialogs. Other dialogs adopt them later, when touched.", "reason": "Removes the copy-pasted chrome without editing unrelated dialogs." } },
+        { "id": "cmd-enter", "type": "confirm", "title": "Keyboard submit", "impact": "minor", "recommendation": { "value": "Cmd/Ctrl+Enter triggers **Run task** in the panel and the dialogs (shown as a hint on the button). It is inert while a popover or autocomplete is open, and it does nothing when Run is disabled.", "reason": "Common practice, and there is no shortcut today. Backlog stays a click." } },
+        { "id": "header-version", "type": "confirm", "title": "Panel header CLI version", "impact": "minor", "recommendation": { "value": "Remove the raw CLI `--version` text from the panel header; the version stays in the harness picker's row tooltip.", "reason": "It adds noise and reads \"--version\" with stub binaries." } },
+        { "id": "e2e-churn", "type": "confirm", "title": "e2e locator churn", "impact": "minor", "recommendation": { "value": "Update the ~15 affected specs in the same change. Move DOM-path XPath locators (Model/Effort/Mode) to stable test ids (`new-task-*` / `launch-*` unify to one prefix, e.g. `launch-model-picker`). Keep the accessible names that the e2e asserts unless a decision above renames them.", "reason": "Today's anchors can't survive sections; test ids stop the next redesign from breaking them again." } },
+        { "id": "sidebar-stays", "type": "confirm", "title": "Panel form factor", "impact": "minor", "recommendation": { "value": "The panel stays a left sidebar: always mounted, collapsible to its rail, an aside-wide drop zone, the onboarding spotlight target. The Branch summary row becomes a visibly clickable row, and \"Reset to pattern\" and \"Change\" become small ghost buttons.", "reason": "Keeps the collapse, onboarding and drop-zone contracts, and fixes the low-affordance controls." } }
+      ]
+    }
+  ]
+}

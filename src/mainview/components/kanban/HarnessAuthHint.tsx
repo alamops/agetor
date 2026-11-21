@@ -1,3 +1,4 @@
+import { Notice } from "@/components/ui/notice";
 import type { AgentStatus } from "../../../shared/types.ts";
 
 /**
@@ -13,9 +14,9 @@ import type { AgentStatus } from "../../../shared/types.ts";
 export function HarnessAuthHint({ status }: { status: AgentStatus | undefined }) {
   if (!status?.available || status.loggedIn !== false) return null;
   return (
-    <div className="rounded-md border border-warning/40 bg-warning/10 p-2 text-[11px] text-warning">
+    <Notice tone="warning" data-testid="launch-auth-hint">
       <div className="font-medium">Not logged in</div>
-      {status.authHelp && <div className="mt-1 opacity-80">{status.authHelp}</div>}
-    </div>
+      {status.authHelp && <div className="opacity-80">{status.authHelp}</div>}
+    </Notice>
   );
 }

@@ -56,7 +56,8 @@ Commands:
   attach <id>         attach your terminal to the live tmux session (claude-code)
   shell <id>          open a shell in the task's worktree (--print for the path)
   cancel <id>         stop the active run
-  archive <id>        archive a done task   (unarchive <id> to restore)
+  archive <id>        archive a done task and remove its worktree (--discard-changes
+                      if it has uncommitted changes; unarchive <id> to restore)
   rm <id> [--yes]     delete a task (worktree + branch)
   info                show the connected core's version
   daemon <sub>        start | stop | status | background of the Agetor core

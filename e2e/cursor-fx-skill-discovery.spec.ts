@@ -4,6 +4,7 @@ import { tmpdir } from "node:os";
 import path from "node:path";
 import { test, expect, type Locator, type Page } from "./fixtures";
 import { gotoApp } from "./helpers";
+import { pickHarness } from "./launch-helpers";
 
 /**
  * End-to-end coverage for Cursor and fx skill discovery plus the Agent
@@ -77,11 +78,6 @@ async function openSettingsAgents(page: Page): Promise<Locator> {
   return dialog;
 }
 
-async function pickHarness(scope: Locator, label: string): Promise<void> {
-  const button = scope.getByRole("button", { name: label, exact: true });
-  await button.scrollIntoViewIfNeeded();
-  await button.click();
-}
 
 test.beforeAll(async ({ backend }) => {
   cursorHome = await mkdtemp(path.join(tmpdir(), "agetor-e2e-cursor-home-"));

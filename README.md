@@ -64,7 +64,7 @@ Coding agents are good enough now that the limiting factor is you: one terminal,
 ### Stay in the loop
 
 - **Notifications.** Native macOS notifications link straight to the task that needs you. Cards show an unread dot when the agent has said something new.
-- **Usage meter.** Plan quota for Claude Code, Codex and Cursor accounts, read with the logins those CLIs already have, plus local token rollups.
+- **Usage meter.** Plan quota for Claude Code, Codex and Cursor accounts, read with the logins those CLIs already have, plus local token rollups, shown in the app bar's Harnesses panel, grouped by stack.
 - **Themes and automatic updates.** Auto, dark or light theme. The app is signed, notarized and updates itself in place.
 
 ---
@@ -176,8 +176,8 @@ The installer verifies a SHA-256 checksum and installs a single `agetor` binary 
 
 1. Click **New task** in the left rail.
 2. Select one or more projects (the most recently added one is preselected). In the same dialog, each selected project has its own branch picker with Pull and Fetch, and picking two or more turns on worktree isolation. If a project is a git repository, the task gets its own worktree automatically.
-3. Choose an Agent, or pick a harness, model and mode yourself, then write your prompt.
-4. Click **Run task** to start now, or **To backlog** to queue it.
+3. Write your prompt, then choose an Agent, or pick a harness, model and mode yourself.
+4. Click **Run task** to start now, or **Add to backlog** to queue it.
 
 Click a card to open its run panel. From there you can watch the transcript stream, answer questions, send follow-ups, review the diff, open a terminal, or commit and open a PR once you're happy with the result.
 

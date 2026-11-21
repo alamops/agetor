@@ -67,21 +67,12 @@ function runPanel(page: Page): Locator {
 /** Click the task card by exact title and wait for the panel's open
  *  transition (`translate-x-0`) — for a task with no run the composer still
  *  renders, but the archived case below replaces it with a static footer, so
- *  the class check is the only universal "panel is open" proof.
- *
- *  `forceClick` exists for archived cards only: dnd-kit's `useDraggable` is
- *  `disabled: archived` and stamps `aria-disabled="true"` on the card root, so
- *  Playwright's default click waits for "enabled" and times out even though
- *  the card's own `onClick` (open details) is live. `force` skips just that
- *  actionability wait — the same reason `e2e/font-size.spec.ts` forces its
- *  aria-disabled stepper clicks. */
-async function openTask(
-  page: Page,
-  title: string,
-  opts: { forceClick?: boolean } = {},
-): Promise<Locator> {
+ *  the class check is the only universal "panel is open" proof. An archived
+ *  card takes a plain click too: it is not `aria-disabled`, although dnd-kit
+ *  stamps that from `disabled: archived` (docs/architecture/task-card.md). */
+async function openTask(page: Page, title: string): Promise<Locator> {
   const card = page.getByText(title, { exact: true }).first();
-  await (opts.forceClick ? card.click({ force: true }) : card.click());
+  await card.click();
   const panel = runPanel(page);
   await expect(panel).toHaveClass(/translate-x-0/);
   return panel;
@@ -331,7 +322,7 @@ test.describe("messages backlog collapse", () => {
 
     await gotoApp(page, backend.bootBase);
     await page.getByTitle("Filter by archive state").selectOption("archived");
-    const panel = await openTask(page, title, { forceClick: true });
+    const panel = await openTask(page, title);
     const tray = panel.getByTestId("backlog-tray");
     const toggle = tray.getByTestId("backlog-toggle");
     const list = tray.getByTestId("backlog-list");

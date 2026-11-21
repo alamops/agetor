@@ -4,25 +4,26 @@ import { test, expect, type APIRequestContext, type E2EBackend, type Locator, ty
 import { gotoApp } from "./helpers";
 
 /**
- * E2E coverage for the kanban `TaskCard` header's 3-row layout
- * (src/mainview/components/kanban/TaskCard.tsx `CardHeader`):
+ * E2E coverage for the kanban `TaskCard` body order (layout C1,
+ * docs/architecture/task-card.md; src/mainview/components/kanban/TaskCard.tsx):
  *
- *   row 1 — `justify-between` flex row: left cluster (task-type icon +
- *           conditional count badges), right (the harness badge).
- *   row 2 — only when `model`/`mode` is set: a right-aligned
- *           `[model, mode].join(" · ")` span.
- *   row 3 — the full-width title (`CardTitle`), no longer indented beside
- *           the icon.
+ *   title    — full width, with the task-type icon inline before the text
+ *   identity — ONE text line: agent · model · mode (truncates, never wraps
+ *              into a second row, never sits beside a fixed-width slot)
+ *   status   — the count stats and chips (absent for a task with none)
+ *   preview  — the first prose paragraph of the prompt
+ *   repo · branch, then the actions
  *
  * Seeds a task directly through the backend API (isolation "none", a plain
  * non-git temp dir as workdir — this spec never starts a run, so nothing
  * ever touches the filesystem or spawns an agent) with a task type, model,
- * and mode set, then asserts both presence (every row's content renders)
- * and geometry (the three rows stack in the right order, row 2 is right-
- * aligned, row 3 is full-width) via `boundingBox()` reads — coarse
- * tolerances only, no pixel-perfect assertions, per quote.spec.ts's own
- * "no pixel/screenshot assertions" convention for this harness (WKWebView,
- * the app's real target, renders differently from Chromium).
+ * and mode set, then asserts both presence (every part renders) and
+ * geometry (the parts stack in that order, all left-aligned to the card's
+ * content edge) via `boundingBox()` reads — coarse tolerances only, no
+ * pixel-perfect assertions, per quote.spec.ts's own "no pixel/screenshot
+ * assertions" convention for this harness (WKWebView, the app's real target,
+ * renders differently from Chromium). Every-state overflow checking is
+ * e2e/task-card-bounds.spec.ts's job.
  */
 
 test.describe.configure({ mode: "serial" });
@@ -68,21 +69,6 @@ function taskCard(page: Page, title: string) {
   return page.locator(".cursor-grab").filter({ has: page.getByText(title, { exact: true }) });
 }
 
-/** The row-1 harness badge (`<Badge variant="secondary">` in TaskCard.tsx).
- *  Not locatable via `getByText("claude-code", { exact: true })`:
- *  `@lobehub/icons`' `ClaudeCode.Color` glyph renders a hidden SVG
- *  `<title>Claude Code</title>` node, which DOM `textContent` (what
- *  Playwright's text matching reads) concatenates with the badge's own
- *  `claude-code` text node — the badge's real `textContent` is
- *  `"Claude Codeclaude-code"`, not `"claude-code"`, so an exact match never
- *  hits. `rounded-full` (Badge's pill shape) + `bg-secondary` (this badge's
- *  variant) is unique within the card — every button in `TaskCard.tsx` uses
- *  `rounded-md`, never `rounded-full` — and unambiguously selects the whole
- *  pill (icon + text), which is also what geometry assertions want. */
-function harnessBadge(card: Locator) {
-  return card.locator(".rounded-full.bg-secondary");
-}
-
 /** Bounding boxes are asserted repeatedly below; a thin wrapper keeps every
  *  call site honest about non-null (Playwright returns null only for a
  *  detached/invisible element, which every locator here has already been
@@ -93,99 +79,65 @@ async function box(locator: Locator) {
   return b!;
 }
 
-test.describe("task card header layout", () => {
-  test("renders the type icon, harness badge, model·mode line, and title inside the card", async ({
+test.describe("task card body layout (C1)", () => {
+  test("renders the type icon, identity line, preview and title inside the card", async ({
     page,
     request,
     backend,
   }) => {
-    const title = `header-e2e ${randomUUID()} verify the header layout renders`;
+    const title = `header-e2e ${randomUUID()} verify the card layout renders`;
     await createHeaderTask(request, backend, title);
 
     await gotoApp(page, backend.bootBase);
     const card = taskCard(page, title);
     await expect(card).toBeVisible({ timeout: 10_000 });
 
-    // Row 1, left cluster: task-type icon. "bug" -> TASK_TYPES' "Bug" label
-    // (src/shared/types.ts), applied verbatim as the icon's aria-label.
+    // The type icon sits inline in the title. "bug" -> TASK_TYPES' "Bug"
+    // label (src/shared/types.ts), applied verbatim as the icon's aria-label.
     await expect(card.locator('[aria-label="Bug"]')).toBeVisible();
-
-    // Row 1, right: the harness badge renders `task.agent` verbatim (in
-    // amongst the brand glyph's own hidden SVG <title> text — see
-    // `harnessBadge`'s doc comment — hence `toContainText`, not an exact
-    // match).
-    await expect(harnessBadge(card)).toContainText("claude-code");
-
-    // Row 2: `[model, mode].join(" · ")`.
-    await expect(card.getByText("Opus · auto", { exact: true })).toBeVisible();
-
-    // Row 3: the full title.
     await expect(card.getByText(title, { exact: true })).toBeVisible();
+
+    // Identity: the harness id, then `[model, mode].join(" · ")` — one line.
+    const identity = card.locator('[data-part="identity"]');
+    await expect(identity).toContainText("claude-code");
+    await expect(identity).toContainText("Opus · auto");
+
+    await expect(card.locator('[data-part="preview"]')).toHaveText("investigate and fix the reported defect");
   });
 
-  test("lays the header out as three stacked rows: icon+badge, right-aligned model·mode, full-width title", async ({
-    page,
-    request,
-    backend,
-  }) => {
-    const title = `header-e2e ${randomUUID()} confirm the three row geometry`;
+  test("stacks title, identity and preview in that order, flush left", async ({ page, request, backend }) => {
+    const title = `header-e2e ${randomUUID()} confirm the body order`;
     await createHeaderTask(request, backend, title);
 
     await gotoApp(page, backend.bootBase);
     const card = taskCard(page, title);
     await expect(card).toBeVisible({ timeout: 10_000 });
 
+    const cardTitle = card.locator('[data-part="title"]');
+    const identity = card.locator('[data-part="identity"]');
+    const preview = card.locator('[data-part="preview"]');
     const icon = card.locator('[aria-label="Bug"]');
-    const badge = harnessBadge(card);
-    const modelMode = card.getByText("Opus · auto", { exact: true });
-    const cardTitle = card.getByText(title, { exact: true });
-    await expect(icon).toBeVisible();
-    await expect(badge).toBeVisible();
-    await expect(modelMode).toBeVisible();
     await expect(cardTitle).toBeVisible();
+    await expect(identity).toBeVisible();
+    await expect(preview).toBeVisible();
 
-    const [iconBox, badgeBox, modelModeBox, titleBox] = await Promise.all([
-      box(icon),
-      box(badge),
-      box(modelMode),
+    const [titleBox, identityBox, previewBox, iconBox] = await Promise.all([
       box(cardTitle),
+      box(identity),
+      box(preview),
+      box(icon),
     ]);
 
-    // --- Row 1: type icon and harness badge share a visual row -----------
-    // Vertical overlap (both sit on the same `items-center` flex row) and
-    // the icon comes first (left cluster) with the badge to its right.
-    const iconMidY = iconBox.y + iconBox.height / 2;
-    const badgeMidY = badgeBox.y + badgeBox.height / 2;
-    expect(Math.abs(iconMidY - badgeMidY), "icon and harness badge should sit on the same row").toBeLessThan(8);
-    expect(iconBox.x, "type icon should sit left of the harness badge").toBeLessThan(badgeBox.x);
+    // Strict top-to-bottom order: title < identity < preview.
+    expect(titleBox.y + titleBox.height, "the identity line sits below the title").toBeLessThanOrEqual(identityBox.y + 1);
+    expect(identityBox.y + identityBox.height, "the preview sits below the identity line").toBeLessThanOrEqual(previewBox.y + 1);
 
-    // --- Strict top-y row ordering: row 1 < row 2 < row 3 -----------------
-    expect(modelModeBox.y, "model·mode row should sit below the icon/badge row").toBeGreaterThan(iconBox.y);
-    expect(
-      modelModeBox.y + modelModeBox.height,
-      "model·mode row should sit entirely above the title row",
-    ).toBeLessThan(titleBox.y);
+    // The identity is one line (a 12 px line box plus slack), not a wrapped block.
+    expect(identityBox.height, "identity is a single text line").toBeLessThan(24);
 
-    // --- Row 2 is right-aligned -------------------------------------------
-    // Its right edge tracks the harness badge's right edge (both anchored
-    // to the header's right content edge)...
-    const modelModeRight = modelModeBox.x + modelModeBox.width;
-    const badgeRight = badgeBox.x + badgeBox.width;
-    expect(
-      Math.abs(modelModeRight - badgeRight),
-      "model·mode row's right edge should line up with the harness badge's right edge",
-    ).toBeLessThan(8);
-    // ...and it sits well clear of the header's left content edge (proving
-    // it's right-aligned, not left-aligned like the title below it).
-    expect(
-      modelModeRight - iconBox.x,
-      "model·mode row should be offset well clear of the left content edge",
-    ).toBeGreaterThan(40);
-
-    // --- Row 3 (title) is full-width: its left edge matches row 1's ------
-    expect(
-      Math.abs(titleBox.x - iconBox.x),
-      "title should start at the same left edge as the type icon (no longer indented beside it)",
-    ).toBeLessThan(4);
+    // The type icon leads the title, and every part starts at the same left edge.
+    expect(Math.abs(iconBox.x - titleBox.x), "the type icon starts the title").toBeLessThan(4);
+    expect(Math.abs(identityBox.x - titleBox.x), "identity is flush with the title").toBeLessThan(4);
+    expect(Math.abs(previewBox.x - titleBox.x), "preview is flush with the title").toBeLessThan(4);
   });
 });

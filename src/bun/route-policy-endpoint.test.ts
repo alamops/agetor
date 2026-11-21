@@ -507,6 +507,38 @@ test("disclaim: master on a headless core stores \"false\" but the switch stays 
   }
 });
 
+// ── claude_auto_trust_repositories: no value rule (D14) ─────────────────────
+// Owner decision D14 (docs/plans/claude-enter-to-confirm-prompts-grill.md,
+// security.md "Multiple repositories in one task"): unlike disclaimSpawnedAgents,
+// the CLI token may turn the auto-trust preference on AND off — the database it
+// lives in is agent-writable anyway. Pinned so a value rule is never added by
+// accident.
+test("claude auto-trust: the CLI token may set the preference either way, and the launch gate reads it (D14)", async () => {
+  const { CLAUDE_AUTO_TRUST_PREF, isClaudeAutoTrustOn } = await import("../shared/claude-auto-trust.ts");
+  const saved = mods.db.preferences.get(CLAUDE_AUTO_TRUST_PREF);
+  const put = (base: string, token: string, value: string) =>
+    fetch(`${base}/preferences/${CLAUDE_AUTO_TRUST_PREF}`, {
+      method: "PUT",
+      headers: { ...bearer(token), "content-type": "application/json" },
+      body: JSON.stringify({ value }),
+    });
+  try {
+    for (const base of [APP, HEADLESS]) {
+      const off = await put(base, cli, "0");
+      expect(off.status, base).toBeLessThan(300);
+      expect(mods.db.preferences.get(CLAUDE_AUTO_TRUST_PREF)).toBe("0");
+      expect(isClaudeAutoTrustOn(mods.db.preferences.get(CLAUDE_AUTO_TRUST_PREF))).toBe(false);
+      const on = await put(base, cli, "1");
+      expect(on.status, base).toBeLessThan(300);
+      expect(mods.db.preferences.get(CLAUDE_AUTO_TRUST_PREF)).toBe("1");
+      expect(isClaudeAutoTrustOn(mods.db.preferences.get(CLAUDE_AUTO_TRUST_PREF))).toBe(true);
+    }
+  } finally {
+    if (saved === null) mods.db.preferences.set(CLAUDE_AUTO_TRUST_PREF, "1");
+    else mods.db.preferences.set(CLAUDE_AUTO_TRUST_PREF, saved);
+  }
+});
+
 // ── CLI path gate (D24) ─────────────────────────────────────────────────────
 
 const asRoot = typeof process.getuid === "function" && process.getuid() === 0;

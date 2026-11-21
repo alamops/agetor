@@ -577,7 +577,7 @@ export function pipelineStatusLines(task: Task, steps: Task[]): string[] {
   const progress = pipelineStepProgress(run);
   lines.push(
     `  ${label("pipeline")} ${safe(run.pipelineName)}   ${label("status")} ${colorRunStatus(run.status)}` +
-      `   ${label("steps")} ${safe(progress.label)}`,
+      `   ${label("steps")} ${safe(progress.label)}${progress.runsLabel ? ` (${progress.runsLabel})` : ""}`,
   );
 
   if (run.blocked.length > 0) {

@@ -165,7 +165,7 @@ export async function cmdShow(args: string[], flags: Flags): Promise<void> {
     const progress = pipelineStepProgress(task.pipelineRun);
     out(
       `  ${label("pipeline")} ${escapeControlChars(task.pipelineRun.pipelineName)} (${task.pipelineId})` +
-        `   ${label("status")} ${colorRunStatus(task.pipelineRun.status)}   ${label("steps")} ${escapeControlChars(progress.label)}`,
+        `   ${label("status")} ${colorRunStatus(task.pipelineRun.status)}   ${label("steps")} ${escapeControlChars(progress.label)}${progress.runsLabel ? ` (${progress.runsLabel})` : ""}`,
     );
     // A block message can quote an agent's own handoff text verbatim.
     for (const b of task.pipelineRun.blocked) {

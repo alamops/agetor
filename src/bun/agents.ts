@@ -2,6 +2,7 @@ import { existsSync, mkdirSync, writeFileSync } from "node:fs";
 import { homedir } from "node:os";
 import path from "node:path";import { cursorModelArg, DEFAULT_MODEL, defaultModeFor, FX_PROVIDER_STATUS_PREFIX, FX_RECOVERY_STATUS_PREFIX, FX_SESSION_TITLE_STATUS_PREFIX, FX_USAGE_STATUS_PREFIX, HARNESS_LIMIT_STATUS_PREFIX, MODEL_EFFORT_SUPPORT, SESSION_DIED_STATUS_PREFIX, type AgentKind, type FxRecoveryPayload, type Harness, type OpencodeServerMode, type Speed } from "../shared/types.ts";
 import { classifyHarnessLimitSignal } from "../shared/harness-limits.ts";
+import type { AutoTrustDirectory } from "./claude-prompt-screens.ts";
 import { claudeCliModelFor, claudeIdFromCliModel } from "../shared/claude-model-id.ts";
 import { EFFORT_ID_RE, effortPassesSpawnCheck } from "../shared/effort-check.ts";
 import { DISCOVERED_SPEED_KINDS } from "../shared/speed.ts";
@@ -22,8 +23,11 @@ import { attachSubagentWatcher, settleSubagentById, type SubagentWatcherHandle }
 import {
   CLAUDE_API_ERROR_STATUS_PREFIX,
   CLAUDE_UNKNOWN_COMMAND_STATUS_PREFIX,
+  clearFakePromptPane,
   encodeProjectPath,
+  jsonlPathFor,
   openContinuationRun,
+  registerFakePromptPane,
   spawnClaudeViaTmux,
   toClaudeModeString,
   type ChunkHandler,
@@ -154,6 +158,15 @@ export interface AgentRunOptions {
    * codex, copilot); every other kind ignores it and relies on the cwd.
    */
   extraDirectories?: string[];
+  /**
+   * Claude Code only: the subset of `extraDirectories` agetor may answer
+   * Claude 2.1.326's `Adding a new directory:` trust dialog for (the task's own
+   * checkouts), present only while the "Auto-trust a task's repositories"
+   * preference is on. Set by `withTaskRepositoryRoots`; never consulted by
+   * `buildCommand` (it changes no argv byte), only forwarded to the tmux
+   * driver's boot poller.
+   */
+  autoTrustDirectories?: AutoTrustDirectory[];
   /**
    * Existing session id to resume a prior conversation on a follow-up turn.
    * For claude-code: the JSONL session uuid, resumed via `claude --resume
@@ -1397,6 +1410,32 @@ export const FAKE_CLAUDE_LIMIT_PANE_PROMPT_MARKER = "__agetor_fake_claude_limit_
  *  column flip must NOT pre-empt a stacked swap. */
 export const FAKE_CLAUDE_API_LIMIT_PROMPT_MARKER = "__agetor_fake_claude_api_limit__";
 export const FAKE_CODEX_LIMIT_PROMPT_MARKER = "__agetor_fake_codex_limit__";
+
+/**
+ * Enter-only / OAuth-code card seams (docs/plans/claude-enter-to-confirm-
+ * prompts.md T13). The fake claude turn registers a fake pane
+ * (`registerFakePromptPane`, claude-tmux.ts, honoured only under
+ * `AGETOR_CLAUDE_DRIVER=fake`) that goes through the SAME matcher chain the real
+ * scraper uses, so an e2e drives the real answer route, its closed allow-list,
+ * the matcher and the card. The turn is held until the card is answered:
+ *
+ * - `ENTER`: the pane is the binary-shaped `Login successful. Press Enter to
+ *   continue…`. An `Enter` key clears the pane and completes the turn with the
+ *   assistant text `continued`.
+ * - `PASTE_CODE`: the pane is the OAuth `Paste code here if prompted >` screen.
+ *   The typed text then `Enter` completes the turn with `code received (<n>
+ *   chars)`; the code itself is never emitted anywhere.
+ *
+ * Like every other marker these ride `task.prompt`, since the fixture backend's
+ * env is fixed per worker.
+ */
+export const FAKE_CLAUDE_ENTER_PROMPT_MARKER = "__agetor_fake_claude_enter_prompt__";
+export const FAKE_CLAUDE_PASTE_CODE_PROMPT_MARKER = "__agetor_fake_claude_paste_code__";
+const FAKE_ENTER_ONLY_PANE = "\n Login successful. Press Enter to continue…\n";
+const FAKE_PASTE_CODE_PANE =
+  "\n Browser didn't open? Use the url below to sign in\n\n"
+  + " https://claude.ai/oauth/authorize?code=true&client_id=00000000-0000-0000-0000-000000000000\n\n"
+  + " Paste code here if prompted > \n";
 
 /** Per-task turn counter for the fake failover scenario. Stamped so a
  *  long-lived test process can prune entries for tasks no longer in play — the
@@ -3462,6 +3501,31 @@ async function makeFakeAgent(
       onChunk("status", "turn complete");
       resolveDone(0);
     });
+  } else if (
+    fakeOpts.kind !== "codex"
+    && (prompt.includes(FAKE_CLAUDE_ENTER_PROMPT_MARKER) || prompt.includes(FAKE_CLAUDE_PASTE_CODE_PROMPT_MARKER))
+  ) {
+    // Held until the card is answered; see the marker constants' doc comment.
+    const wantsCode = prompt.includes(FAKE_CLAUDE_PASTE_CODE_PROMPT_MARKER);
+    const typed: string[] = [];
+    const finish = (): void => {
+      if (killed) return;
+      clearFakePromptPane(taskId);
+      onChunk("assistant", wantsCode ? `code received (${typed.join("").length} chars)` : "continued");
+      onChunk("status", "turn complete");
+      resolveDone(0);
+    };
+    after(20, () => {
+      void registerFakePromptPane(taskId, {
+        text: wantsCode ? FAKE_PASTE_CODE_PANE : FAKE_ENTER_ONLY_PANE,
+        onKeys: (keys) => {
+          for (const key of keys) {
+            if (key === "Enter") finish();
+            else typed.push(key); // the OAuth code text: counted, never emitted
+          }
+        },
+      }).catch((err: unknown) => console.warn("[agetor] fake prompt pane failed:", err));
+    });
   } else if (prompt.includes(FAKE_CLAUDE_DONE_REJECT_PROMPT_MARKER)) {
     // Test hook: reject `done` (see FAKE_CLAUDE_DONE_REJECT_PROMPT_MARKER's
     // doc comment). The orchestrator has already echoed the prompt by now;
@@ -3694,6 +3758,7 @@ async function makeFakeAgent(
       // (clearTimeout on an elapsed timer, resolveDone on an already-settled
       // promise).
       for (const t of timers) clearTimeout(t);
+      clearFakePromptPane(taskId);
       realWatcherHandle?.detach();
       realWatcherHandle = undefined;
       // Mirror the real fx driver's settlement discipline: a still-open
@@ -4306,6 +4371,32 @@ export function attachOpencodeServerAgent(
 }
 
 /**
+ * Decide how a claude launch relates to a prior session id.
+ *
+ * - No prior id: a fresh session under a new id (`resume: false`).
+ * - A prior id whose session file exists: `--resume <id>`.
+ * - A prior id whose session file is missing: claude exits 1 on a resume of
+ *   it, and the pane closes with it, so start fresh under the SAME id
+ *   (`--session-id <id>`) and say so. That also heals run rows an older build
+ *   stamped with an id claude never created.
+ *
+ * Pure: `jsonlExists` is injected so the table is unit-testable.
+ */
+export function resolveClaudeResume(a: {
+  resumeSessionId: string | null;
+  jsonlExists: (id: string) => boolean;
+  newId: () => string;
+}): { sessionId: string; resume: boolean; status: string | null } {
+  if (!a.resumeSessionId) return { sessionId: a.newId(), resume: false, status: null };
+  if (a.jsonlExists(a.resumeSessionId)) return { sessionId: a.resumeSessionId, resume: true, status: null };
+  return {
+    sessionId: a.resumeSessionId,
+    resume: false,
+    status: `no saved claude conversation ${a.resumeSessionId.slice(0, 8)}… — starting fresh under the same id`,
+  };
+}
+
+/**
  * Start a new agent run. For claude-code this creates the per-task tmux
  * session (or reuses one that survived a previous run). For codex this is
  * a fresh `Bun.spawn`.
@@ -4357,13 +4448,25 @@ export async function spawnAgent(args: SpawnAgentArgs): Promise<SpawnedAgent> {
     }
     // Pre-generate a session uuid when we're not resuming. The driver will
     // expect claude to write its JSONL at the deterministic path derived
-    // from cwd + this uuid, replacing the previous mtime-poll race.
-    const sessionId = opts.resumeSessionId ?? crypto.randomUUID();
+    // from cwd + this uuid, replacing the previous mtime-poll race. A resume
+    // of an id whose JSONL does not exist (a boot that never wrote it, a row
+    // stamped by an older build) would make claude print "No conversation
+    // found" and exit 1, so it starts fresh under the SAME id instead.
+    const resume = resolveClaudeResume({
+      resumeSessionId: opts.resumeSessionId ?? null,
+      jsonlExists: (id) => existsSync(jsonlPathFor(cwd, id, claudeConfigDirFor(harness))),
+      newId: () => crypto.randomUUID(),
+    });
+    const sessionId = resume.sessionId;
+    if (resume.status) onChunk("status", resume.status);
     const built = buildCommand(harness, prompt, {
       ...opts,
-      sessionId: opts.resumeSessionId ? null : sessionId,
+      resumeSessionId: resume.resume ? sessionId : null,
+      sessionId: resume.resume ? null : sessionId,
     });
-    onSessionId?.(sessionId);
+    // NOT stamped here: the id is recorded only once claude's session file
+    // exists (`onSessionFileReady`), so a boot that never gets that far leaves
+    // no id behind for the next turn to `--resume`.
     return await spawnClaudeViaTmux({
       taskId,
       argv: built.cmd,
@@ -4375,6 +4478,8 @@ export async function spawnAgent(args: SpawnAgentArgs): Promise<SpawnedAgent> {
       mode: opts.mode ?? null,
       deferredPrompt: built.deferredPrompt,
       harnessFailover: opts.harnessFailover === true,
+      autoTrustDirectories: opts.autoTrustDirectories,
+      onSessionFileReady: onSessionId,
     });
   }
 

@@ -61,3 +61,25 @@ export function writeCollapsed(
     /* quota / disabled storage — state simply doesn't persist */
   }
 }
+
+/** The two surfaces that render the launch sections (docs/architecture/task-launch-ui.md):
+ *  the New Task panel, and the Git launch dialogs (issue and PR, which share one state). */
+export type LaunchSurface = "panel" | "dialog";
+
+/** The collapsible sections of a launch surface. */
+export type LaunchSectionId = "workspace" | "agent";
+
+/** Storage key for a launch section's collapsed flag (per surface). */
+export function launchSectionKey(surface: LaunchSurface, section: LaunchSectionId): string {
+  return `agetor:launch:${surface}:${section}:collapsed`;
+}
+
+/** Storage key for a section's "More options" disclosure (per surface). It
+ *  reuses `readCollapsed`/`writeCollapsed`'s `"1"`/`"0"` encoding, where the
+ *  flag means "open" (the disclosure defaults to closed, like a missing key). */
+export function launchMoreKey(surface: LaunchSurface, section: LaunchSectionId): string {
+  return `agetor:launch:${surface}:${section}:more`;
+}
+
+/** Storage key for the New Task panel's resizable width. */
+export const NEW_TASK_PANEL_WIDTH_KEY = "agetor:newTaskPanelWidth";

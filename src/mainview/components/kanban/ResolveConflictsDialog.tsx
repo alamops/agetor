@@ -1,15 +1,19 @@
-import { useEffect, useMemo, useState } from "react";
-import { AlertCircle, GitMerge, Loader2, X } from "lucide-react";
-import { Dialog } from "@/components/ui/dialog";
-import { Button } from "@/components/ui/button";
+import { useEffect, useMemo, useRef, useState } from "react";
+import { AlertCircle, GitMerge, Info, Loader2 } from "lucide-react";
+import { Dialog, DialogBody, DialogClose, DialogDescription, DialogFooter, DialogHeader, DialogTitle } from "@/components/ui/dialog";
+import { Notice } from "@/components/ui/notice";
 import { useConfirm } from "@/components/ui/confirm";
 import { buildResolveConflictsPrompt } from "@/lib/resolve-conflicts-prompt";
 import type { TaskReference } from "../../../shared/types.ts";
 import { composeLaunchPrompt } from "../../../shared/agent-profile.ts";
 import { promptByteOverage } from "../../../shared/prompt-limits.ts";
 import { createAndStartTask, TaskLaunchPickers, useTaskLaunch } from "./TaskLaunchPickers";
-import { WorktreeOptions } from "./WorktreeOptions";
+import { WorkspaceSection } from "./WorkspaceSection";
+import { LaunchFooter } from "./LaunchFooter";
 import { PromptComposer } from "./PromptComposer";
+import { useWorktreeOptions } from "./WorktreeOptions";
+import { launchGate, submitPicks } from "@/lib/launch-state";
+import { useSubmitShortcut } from "@/lib/use-submit-shortcut";
 
 export interface ResolveConflictsContext {
   path: string;
@@ -28,6 +32,9 @@ interface Props {
   /** Closes this dialog (after any draft confirmation) and navigates to the
    *  Pipelines page. Optional so other mounts render no manage row. */
   onManagePipelines?: () => void;
+  /** Closes this dialog (after any draft confirmation) and opens Settings →
+   *  Agents. Optional so other mounts render no manage row. */
+  onManageAgents?: () => void;
 }
 
 /**
@@ -40,7 +47,7 @@ interface Props {
  * References picker) `CreateTaskFromIssueDialog` uses, rather than a bare
  * `Textarea`.
  */
-export function ResolveConflictsDialog({ open, onClose, context, onCreated, onManagePipelines }: Props) {
+export function ResolveConflictsDialog({ open, onClose, context, onCreated, onManagePipelines, onManageAgents }: Props) {
   const launch = useTaskLaunch(open, { withPipelines: true });
   const confirm = useConfirm();
 
@@ -94,26 +101,45 @@ export function ResolveConflictsDialog({ open, onClose, context, onCreated, onMa
         launch.pipelineId ? prompt : composeLaunchPrompt(launch.selectedProfile, prompt),
       );
 
-  const canSubmit =
-    !!context &&
-    prompt.trim().length > 0 &&
-    launch.effectiveLaunchable &&
-    launch.pipelineReady &&
-    !submitting &&
-    overage == null;
+  // The single Run rule (`launchGate`) — the PR's title is derived, so none is
+  // required, and the worktree is locked to the PR head (always valid) — plus
+  // this dialog's own conditions: a context and no submit in flight.
+  const gate = launchGate({
+    title: "",
+    prompt,
+    requireTitle: false,
+    reposCount: context ? 1 : 0,
+    worktreeValid: true,
+    overage: overage != null,
+    effectiveLaunchable: launch.effectiveLaunchable,
+    effectiveHarnessLabel: launch.harnesses.find((h) => h.id === launch.effectiveAgent)?.label ?? launch.effectiveAgent,
+    effectiveReason: launch.effectiveStatus?.reason ?? null,
+    statusKnown: launch.effectiveStatus !== undefined,
+    pipelineSelected: launch.selectedPipeline !== null,
+    pipelineReady: launch.pipelineReady,
+    pipelineState: launch.pipelineState,
+    pipelineProblem: launch.pipelineProblem,
+  });
+  const canSubmit = !!context && !submitting && gate.canRun;
+  // The gate's reason is about the form, which is only on screen once the harnesses have loaded
+  // and the PR still has a resolve context: while they load, after a failed fetch, or once the
+  // PR's state changed, the footer must not ask for a project or a harness the user cannot pick.
+  const formShown = !launch.loading && !launch.loadError && !!context;
+  const footerReason = formShown ? gate.runBlockedReason : launch.loading ? "Loading harnesses…" : null;
 
   // Changed since the dialog opened: the prompt, attached references, or a
   // selected pipeline (the worktree row is locked to the PR head).
   const draftDirty = promptDirty || references.length > 0 || launch.pipelineId !== null;
 
-  /** "Manage pipelines…": confirm before discarding a dirty draft, then close
-   *  this dialog (the inner one) so the App callback can close the Git dialog
-   *  beneath without leaving a stacked overlay above the Pipelines page. */
-  const managePipelines = async () => {
+  /** "Manage pipelines…" / "Manage agents…": confirm before discarding a dirty
+   *  draft, then close this dialog (the inner one) so the App callback can close
+   *  the Git dialog beneath without leaving a stacked overlay above the
+   *  destination page. */
+  const leaveForPage = async (destination: string, navigate: (() => void) | undefined) => {
     if (submitting) return;
     if (draftDirty) {
       const ok = await confirm({
-        title: "Discard this task draft and open Pipelines?",
+        title: `Discard this task draft and open ${destination}?`,
         description: "Your prompt edits, references and selections will be lost.",
         confirmLabel: "Discard draft",
         variant: "destructive",
@@ -121,7 +147,7 @@ export function ResolveConflictsDialog({ open, onClose, context, onCreated, onMa
       if (!ok) return;
     }
     onClose();
-    onManagePipelines?.();
+    navigate?.();
   };
 
   const submit = async () => {
@@ -139,11 +165,12 @@ export function ResolveConflictsDialog({ open, onClose, context, onCreated, onMa
         isolation: "worktree" as const,
         existingBranch: context.headRef,
         references,
-        mode: launch.mode,
-        model: launch.model,
-        effort: launch.effort,
-        speed: launch.speed,
-        maxMode: launch.maxMode,
+        // The same one mapping New Task uses (`submitPicks`).
+        ...submitPicks({
+          kind: launch.kind,
+          picks: { mode: launch.mode, model: launch.model, effort: launch.effort, speed: launch.speed, maxMode: launch.maxMode },
+          profile: launch.selectedProfile,
+        }),
         // Omit entirely when no profile/pipeline is selected (finding F2-1) —
         // see NewTaskForm.submit's matching comment. Mutually exclusive by
         // construction, so the body never carries both.
@@ -161,46 +188,40 @@ export function ResolveConflictsDialog({ open, onClose, context, onCreated, onMa
     }
   };
 
+  // Cmd/Ctrl+Enter runs the task from anywhere inside the dialog.
+  const contentRef = useRef<HTMLDivElement>(null);
+  useSubmitShortcut(contentRef, () => void submit(), canSubmit);
+
   return (
     <Dialog
       open={open}
       onClose={onClose}
       labelledBy="resolve-conflicts-dialog-title"
-      className="flex max-h-[85vh] w-full max-w-lg flex-col p-0"
+      className="flex max-h-[calc(100vh-2rem)] w-full max-w-4xl flex-col p-0 md:h-[min(40rem,calc(100vh-2rem))]"
     >
-      {/* `display: contents` keeps this test-id wrapper out of the flex
-       *  layout below — header/body/footer still act as direct flex items
-       *  of the Dialog panel (which needs that for its max-h/overflow
-       *  scroll region to work), while still giving e2e a stable node to
-       *  find the whole dialog by. Dialog's own props don't forward
+      {/* `display: contents` keeps this test-id wrapper out of the flex layout
+       *  below — header/body/footer still act as direct flex items of the Dialog
+       *  panel (which needs that for its max-h/overflow scroll region to work),
+       *  while still giving e2e a stable node to find the whole dialog by and the
+       *  shortcut a scope to listen on. Dialog's own props don't forward
        *  arbitrary data-* attributes onto the panel. */}
-      <div data-testid="resolve-conflicts-dialog" className="contents">
-        <header className="flex items-start justify-between gap-3 border-b border-border/60 p-3">
+      <div ref={contentRef} data-testid="resolve-conflicts-dialog" className="contents">
+        <DialogHeader>
           <div className="min-w-0">
-            <div id="resolve-conflicts-dialog-title" className="flex items-center gap-2 text-sm font-semibold">
-              <GitMerge className="size-4 shrink-0 text-muted-foreground" />
+            <DialogTitle id="resolve-conflicts-dialog-title" className="flex items-center gap-2">
+              <GitMerge className="size-4 shrink-0 text-muted-foreground" aria-hidden />
               Resolve with Agetor
-            </div>
+            </DialogTitle>
             {context && (
-              <div className="mt-0.5 truncate text-xs text-muted-foreground">
+              <DialogDescription className="truncate">
                 PR #{context.number} — {context.title}
-              </div>
+              </DialogDescription>
             )}
           </div>
-          <Button
-            variant="ghost"
-            size="icon"
-            className="shrink-0"
-            title="Close"
-            aria-label="Close"
-            disabled={submitting}
-            onClick={onClose}
-          >
-            <X className="size-4" />
-          </Button>
-        </header>
+          <DialogClose disabled={submitting} onClick={onClose} title="Close" />
+        </DialogHeader>
 
-        <div className="min-h-0 flex-1 overflow-y-auto p-3 text-xs">
+        <DialogBody className="p-0 md:overflow-hidden">
           {launch.loading && (
             <div className="flex items-center justify-center gap-2 py-8 text-sm text-muted-foreground">
               <Loader2 className="size-4 animate-spin" /> Loading harnesses…
@@ -221,68 +242,66 @@ export function ResolveConflictsDialog({ open, onClose, context, onCreated, onMa
           )}
 
           {!launch.loading && !launch.loadError && !!context && (
-            <div className="space-y-3">
-              {context && (
-                <div className="rounded-md border border-border/60 bg-muted/40 px-3 py-2 text-[11px] text-muted-foreground">
+            // Two columns from the `md` breakpoint (768 px), each scrolling on its
+            // own; one column with one scroll below it. The footer sits outside.
+            <div className="md:grid md:h-full md:min-h-0 md:grid-cols-[minmax(0,1fr)_22rem]">
+              <div className="space-y-4 px-5 py-4 md:min-h-0 md:overflow-y-auto">
+                <Notice tone="info" icon={<Info className="size-3.5" />}>
                   Merges <span className="font-mono">origin/{context.baseRef}</span> into{" "}
                   <span className="font-mono">{context.headRef}</span> in a worktree checked out on that
                   branch. The agent commits locally; it never pushes.
-                </div>
-              )}
+                </Notice>
 
-              <PromptComposer
-                value={prompt}
-                onChange={(v) => { setPrompt(v); setPromptDirty(true); }}
-                agent={launch.effectiveAgent}
-                references={references}
-                onReferencesChange={setReferences}
-                setReferences={setReferences}
-                fileScope={fileScope}
-                startingFolder={context.path}
-                rows={8}
-                footer={overage && (
-                  <div className="rounded-md border border-warning/40 bg-warning/10 p-2 text-[11px] text-warning">
-                    This prompt is {Math.ceil(overage.bytes / 1024)} KB — {launch.overageLabel}'s one-shot
-                    launch caps prompts at {Math.floor(overage.limit / 1024)} KB. Pick another harness or
-                    trim the prompt.
-                  </div>
-                )}
-              />
+                <PromptComposer
+                  value={prompt}
+                  onChange={(v) => { setPrompt(v); setPromptDirty(true); }}
+                  agent={launch.effectiveAgent}
+                  references={references}
+                  onReferencesChange={setReferences}
+                  setReferences={setReferences}
+                  fileScope={fileScope}
+                  startingFolder={context.path}
+                  rows={8}
+                  footer={overage && (
+                    <Notice tone="warning">
+                      This prompt is {Math.ceil(overage.bytes / 1024)} KB — {launch.overageLabel}'s one-shot
+                      launch caps prompts at {Math.floor(overage.limit / 1024)} KB. Pick another harness or
+                      trim the prompt.
+                    </Notice>
+                  )}
+                />
+              </div>
 
-              <WorktreeOptions locked={{ branch: context.headRef, projectPath: context.path }} />
+              <div className="space-y-3 border-t border-border bg-muted/20 px-5 py-4 md:min-h-0 md:overflow-y-auto md:border-l md:border-t-0">
+                <WorkspaceSection
+                  surface="dialog"
+                  locked={{ branch: context.headRef, projectPath: context.path }}
+                />
 
-              <TaskLaunchPickers
-                launch={launch}
-                // `onManagePipelines` is optional (see the prop comment): a
-                // mount without it must render no manage row, not one that
-                // closes this dialog and goes nowhere.
-                onManagePipelines={onManagePipelines ? () => { void managePipelines(); } : undefined}
-                disabled={submitting}
-              />
-
-              {submitError && (
-                <div className="rounded-md border border-destructive/40 bg-destructive/10 p-2 text-[11px] text-destructive-foreground">
-                  {submitError}
-                </div>
-              )}
+                <TaskLaunchPickers
+                  launch={launch}
+                  layout="sections"
+                  surface="dialog"
+                  // The manage rows are optional (see the prop comments): a mount
+                  // without them must render no row, not one that closes this
+                  // dialog and goes nowhere.
+                  onManagePipelines={onManagePipelines ? () => { void leaveForPage("Pipelines", onManagePipelines); } : undefined}
+                  onManageProfiles={onManageAgents ? () => { void leaveForPage("Settings → Agents", onManageAgents); } : undefined}
+                  disabled={submitting}
+                />
+              </div>
             </div>
           )}
-        </div>
+        </DialogBody>
 
-        <div className="flex shrink-0 justify-end gap-2 border-t border-border/60 p-3">
-          <Button variant="outline" onClick={onClose} disabled={submitting}>
-            Cancel
-          </Button>
-          <Button data-testid="resolve-conflicts-submit" onClick={() => void submit()} disabled={!canSubmit}>
-            {submitting ? (
-              <>
-                <Loader2 className="mr-1 size-3.5 animate-spin" /> Creating…
-              </>
-            ) : (
-              "Create & start"
-            )}
-          </Button>
-        </div>
+        <DialogFooter className="block">
+          <LaunchFooter
+            reason={footerReason}
+            error={submitError}
+            cancel={{ label: "Cancel", onClick: onClose, disabled: submitting, testId: "launch-cancel" }}
+            primary={{ label: "Run task", onClick: () => void submit(), disabled: !canSubmit, testId: "resolve-conflicts-submit", busy: submitting }}
+          />
+        </DialogFooter>
       </div>
     </Dialog>
   );

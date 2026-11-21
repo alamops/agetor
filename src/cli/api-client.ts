@@ -41,6 +41,7 @@ import type {
   OpencodeSessionList,
   BackgroundStatus,
   RemoteAccessStatus,
+  TmuxPromptAnswerBody,
 } from "../shared/types.ts";
 import type { NotificationKind } from "../shared/os-notification.ts";
 import type { DiscoveredModel } from "../shared/model-options.ts";
@@ -355,8 +356,14 @@ export class AgetorClient {
   retryOpencodeSessionImport(taskId: string): Promise<{ ok: true }> {
     return this.req("POST", `/tasks/${encodeURIComponent(taskId)}/opencode-session/retry`, undefined, CLONE_TIMEOUT_MS);
   }
-  archiveTask(id: string): Promise<Task> {
-    return this.req("POST", `/tasks/${encodeURIComponent(id)}/archive`);
+  /** `forceWorktree` discards uncommitted changes in the worktree; without it
+   *  a dirty worktree makes the core answer 409 `ArchiveUncommittedChanges`. */
+  archiveTask(id: string, opts: { forceWorktree?: boolean } = {}): Promise<Task> {
+    return this.req(
+      "POST",
+      `/tasks/${encodeURIComponent(id)}/archive`,
+      opts.forceWorktree ? { forceWorktree: true } : undefined,
+    );
   }
   unarchiveTask(id: string): Promise<Task> {
     return this.req("POST", `/tasks/${encodeURIComponent(id)}/unarchive`);
@@ -416,8 +423,8 @@ export class AgetorClient {
   }
   answerTmuxPrompt(
     id: string,
-    body: { key?: string; reject?: boolean },
-  ): Promise<{ ok: boolean; error?: string }> {
+    body: TmuxPromptAnswerBody,
+  ): Promise<{ ok: boolean; error?: string; held?: boolean }> {
     return this.req("POST", `/tmux-prompts/${encodeURIComponent(id)}/answer`, body);
   }
   /** `message` is the reason an OpenCode card's `reject` may carry; the core

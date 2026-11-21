@@ -1,5 +1,6 @@
+import { createHash } from "node:crypto";
 import { existsSync, realpathSync } from "node:fs";
-import { isAbsolute } from "node:path";
+import { isAbsolute, join } from "node:path";
 import { TMUX_MISSING_REASON, type AgentKind, type ClaudeAccount, type Harness, type HarnessStatus } from "../shared/types.ts";
 import { opencodeMajor } from "../shared/opencode.ts";
 import { cliVersionSatisfies } from "../shared/cli-version.ts";
@@ -8,8 +9,9 @@ import { accountUsageSummary } from "./account-usage.ts";
 import { harnesses } from "./db-async.ts";
 import { readClaudeAccount } from "./harness-discovery.ts";
 import { claudeRootFor } from "./harness-config-root.ts";
+import { loginEvidence } from "./harness-stacks.ts";
 import { resolveTmuxBin } from "./tmux-resolution.ts";
-import { coreSpawn } from "./core-spawn.ts";
+import { childEnv, coreSpawn } from "./core-spawn.ts";
 
 const VERSION_PROBE_TIMEOUT_MS = 2000;
 
@@ -434,6 +436,181 @@ async function getCachedStatus(
   return value;
 }
 
+/* ────────────────────────────────────────────────────────────────────────── *
+ * Claude Code login probe
+ * ────────────────────────────────────────────────────────────────────────── */
+
+/** Budget for one `claude auth status` child (it needs no network; ~0.2 s). */
+const CLAUDE_AUTH_PROBE_TIMEOUT_MS = 5_000;
+
+/** The hint a logged-out Claude account carries (`HarnessStatus.authHelp`). */
+export const CLAUDE_LOGIN_HINT =
+  "run `claude auth login`, or open a terminal for this account from Settings → Harnesses";
+
+type ClaudeAuthResult = { loggedIn: boolean | null; authHelp: string | null };
+const CLAUDE_AUTH_UNKNOWN: ClaudeAuthResult = { loggedIn: null, authHelp: null };
+const claudeAuthCache = new Map<string, { value: ClaudeAuthResult; expiresAt: number }>();
+/** Per-key probe generation: only the latest probe started for a key may write
+ *  its answer back, so a slow older probe can never overwrite a newer one. */
+const claudeAuthProbeGen = new Map<string, number>();
+
+/** Env names that decide which credential `claude auth status` reads: an API
+ *  key or OAuth token (`ANTHROPIC_*`, `CLAUDE_*`), a Bedrock or Vertex backend
+ *  and its credentials (`AWS_*`, `GOOGLE_*`, `CLOUD_ML_*`), and `HOME` (the
+ *  macOS keychain the subscription login lives in). Anything else in an
+ *  account's env map leaves the cached answer alone. */
+const CLAUDE_AUTH_ENV_RE = /^(?:ANTHROPIC_|CLAUDE_|AWS_|GOOGLE_|CLOUD_ML_)|^HOME$/;
+
+/** A one-way digest of the auth-relevant env (names and values), so a changed
+ *  key or token re-probes while the secret itself never sits in a map key. */
+function claudeAuthEnvDigest(env: Record<string, string>): string {
+  const relevant = Object.keys(env)
+    .filter((k) => CLAUDE_AUTH_ENV_RE.test(k))
+    .sort()
+    .map((k) => `${k}=${env[k]}`)
+    .join("\n");
+  return relevant === "" ? "-" : createHash("sha256").update(relevant).digest("hex").slice(0, 16);
+}
+
+/** Cache key: the resolved binary, the account's config root and its
+ *  auth-relevant env, so editing an account's home, key or token never
+ *  inherits the old account's answer. */
+function claudeAuthKey(harness: Harness, path: string, env: Record<string, string>): string {
+  const root = claudeRootFor(harness);
+  return `${harness.id}:${path}:${root.configDir}:${root.claudeJsonDir}:${claudeAuthEnvDigest(env)}`;
+}
+
+/**
+ * Ask claude whether this account is logged in, WITHOUT reading the account:
+ * `claude auth status` (JSON by default) prints `{"loggedIn": bool, …}` and
+ * exits 0 or 1 in ~0.2 s with no network and, on an existing config, no
+ * writes (spike 2026-11-17, claude 2.1.326, network denied through
+ * `sandbox-exec`). The same JSON carries `email`, `orgId`, `orgName` and the
+ * subscription, so ONLY `loggedIn` is read and nothing from the child's output
+ * is ever logged, returned or thrown.
+ *
+ * Skipped (falls back to {@link loginEvidence}) when the account's
+ * `.claude.json` does not exist: on a never-launched config dir the command
+ * bootstraps `.claude.json`, a lock directory and `backups/`, and agetor must
+ * never write another program's config on a status poll.
+ *
+ * Fail-open: a timeout, a spawn error, non-JSON output or a missing/non-boolean
+ * `loggedIn` is `null` (unknown), never `false`; only an explicit `false`
+ * refuses a start.
+ */
+async function probeClaudeAuth(
+  harness: Harness,
+  path: string,
+  env: Record<string, string>,
+): Promise<ClaudeAuthResult> {
+  const root = claudeRootFor(harness);
+  if (!existsSync(join(root.claudeJsonDir, ".claude.json"))) {
+    return loginEvidence(harness) === false
+      ? { loggedIn: false, authHelp: CLAUDE_LOGIN_HINT }
+      : CLAUDE_AUTH_UNKNOWN;
+  }
+  let proc: Bun.Subprocess<"ignore", "pipe", "pipe">;
+  try {
+    proc = coreSpawn([path, "auth", "status"], {
+      stdin: "ignore",
+      stdout: "pipe",
+      stderr: "pipe",
+      env: childEnv(env),
+    }) as Bun.Subprocess<"ignore", "pipe", "pipe">;
+  } catch {
+    return CLAUDE_AUTH_UNKNOWN;
+  }
+  let timer: ReturnType<typeof setTimeout> | undefined;
+  // Raced, not just killed: a grandchild can keep the pipe open past the kill.
+  const timedOut = new Promise<null>((resolve) => {
+    timer = setTimeout(() => {
+      try { proc.kill(); } catch { /* already gone */ }
+      resolve(null);
+    }, CLAUDE_AUTH_PROBE_TIMEOUT_MS);
+  });
+  try {
+    // A logged-out account exits 1 and still prints the JSON, so the exit code
+    // is deliberately not consulted.
+    const out = await Promise.race([
+      Promise.all([new Response(proc.stdout).text(), new Response(proc.stderr).text(), proc.exited]).then(([o]) => o),
+      timedOut,
+    ]);
+    if (out === null) return CLAUDE_AUTH_UNKNOWN;
+    const parsed: unknown = JSON.parse(out);
+    if (typeof parsed !== "object" || parsed === null || Array.isArray(parsed)) return CLAUDE_AUTH_UNKNOWN;
+    const loggedIn = (parsed as Record<string, unknown>).loggedIn;
+    if (loggedIn === true) return { loggedIn: true, authHelp: null };
+    if (loggedIn === false) return { loggedIn: false, authHelp: CLAUDE_LOGIN_HINT };
+    return CLAUDE_AUTH_UNKNOWN;
+  } catch {
+    return CLAUDE_AUTH_UNKNOWN;
+  } finally {
+    if (timer) clearTimeout(timer);
+  }
+}
+
+async function getCachedClaudeAuth(
+  harness: Harness,
+  path: string,
+  env: Record<string, string>,
+  opts: { freshAuth?: boolean } | undefined,
+): Promise<ClaudeAuthResult> {
+  const key = claudeAuthKey(harness, path, env);
+  if (!opts?.freshAuth) {
+    const cached = claudeAuthCache.get(key);
+    if (cached && cached.expiresAt > Date.now()) return cached.value;
+  }
+  const gen = (claudeAuthProbeGen.get(key) ?? 0) + 1;
+  claudeAuthProbeGen.set(key, gen);
+  const value = await probeClaudeAuth(harness, path, env);
+  if (claudeAuthProbeGen.get(key) === gen) {
+    claudeAuthCache.set(key, { value, expiresAt: Date.now() + STATUS_CACHE_TTL_MS });
+  }
+  return value;
+}
+
+/**
+ * The cached `loggedIn` of a Claude Code account for a SYNCHRONOUS caller (the
+ * harness-stack planners), or `null` when nothing fresh is cached. Never
+ * probes; {@link refreshClaudeAuth} warms the cache first.
+ */
+export function peekClaudeLoggedIn(harness: Harness): boolean | null {
+  if (harness.kind !== "claude-code") return null;
+  const path = resolveBinPath(resolveBin(harness));
+  if (!path) return null;
+  const cached = claudeAuthCache.get(claudeAuthKey(harness, path, probeEnvFor(harness)));
+  return cached && cached.expiresAt > Date.now() ? cached.value.loggedIn : null;
+}
+
+/**
+ * Warm the login cache for every Claude Code account in `harnesses`, in
+ * parallel, giving up on stragglers after `budgetMs` (their probes keep their
+ * own 5 s cap and still land in the cache). `fresh` re-probes even accounts
+ * with a fresh cached answer. Never throws.
+ */
+export async function refreshClaudeAuth(
+  harnesses: Harness[],
+  budgetMs = CLAUDE_AUTH_PROBE_TIMEOUT_MS,
+  opts?: { fresh?: boolean },
+): Promise<void> {
+  const claude = harnesses.filter((h) => h.kind === "claude-code");
+  if (claude.length === 0) return;
+  const work = Promise.all(
+    claude.map(async (h) => {
+      const path = resolveBinPath(resolveBin(h));
+      if (!path) return;
+      await getCachedClaudeAuth(h, path, probeEnvFor(h), opts?.fresh ? { freshAuth: true } : undefined);
+    }),
+  ).then(() => undefined, () => undefined);
+  let timer: ReturnType<typeof setTimeout> | undefined;
+  const budget = new Promise<void>((resolve) => { timer = setTimeout(resolve, budgetMs); });
+  try {
+    await Promise.race([work, budget]);
+  } finally {
+    if (timer) clearTimeout(timer);
+  }
+}
+
 /**
  * `cachedCliVersion` memo, keyed like `statusCache` (`harness.id:path`).
  * Every OpenCode invocation — `--version` included — writes XDG dirs and
@@ -794,6 +971,13 @@ export async function checkHarness(harness: Harness, opts?: { freshAuth?: boolea
     if (opencodeMajor(version) === 1) notices.push(OPENCODE_V2_AVAILABLE_NOTICE);
   }
 
+  // Claude Code login state (`claude auth status`; see `probeClaudeAuth`).
+  // `available` stays true: a logged-out claude is installed and runnable, the
+  // start pre-flight and the stack planners gate on `loggedIn` separately.
+  if (harness.kind === "claude-code" && version !== null) {
+    ({ loggedIn, authHelp } = await getCachedClaudeAuth(harness, path, env, opts));
+  }
+
   if (harness.kind === "fx" && version !== null) {
     // Run concurrently, not sequentially: probeStatus doesn't actually depend
     // on probeHelp's outcome to execute (only on whether we end up trusting
@@ -886,6 +1070,8 @@ export async function checkAllHarnesses(): Promise<HarnessStatus[]> {
 export const __testing = {
   clearStatusCache: () => {
     statusCache.clear();
+    claudeAuthCache.clear();
+    claudeAuthProbeGen.clear();
     versionCache.clear();
     authCache.clear();
   },

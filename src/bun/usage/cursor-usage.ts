@@ -794,7 +794,7 @@ export async function fetchCursorQuota(
       planType: null,
       status: "unavailable",
       meters: [],
-      // Actionable guidance — rendered verbatim in the topbar popover, so
+      // Actionable guidance — rendered verbatim in the app bar's Harnesses panel, so
       // tell the user exactly how to make usage appear rather than just
       // stating that it can't. When the IDE read itself was skipped (no
       // user refresh in this process yet), say so explicitly rather than implying

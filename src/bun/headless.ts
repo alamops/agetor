@@ -20,6 +20,7 @@ import { initPipelineRunner, reconcilePipelineRuns } from "./pipeline-runner.ts"
 import { adoptOpencodeServers } from "./opencode-server.ts";
 import { startLagMonitor, stopLagMonitor } from "./event-loop-lag.ts";
 import { scheduleRetention, stopRetentionTimers } from "./retention.ts";
+import { requestPreviewTwinSweep } from "./preview-twins.ts";
 import { ensureDisclaimedServer } from "./tmux-resolution.ts";
 import { DISCLAIM_PREF_KEY } from "./disclaim.ts";
 import { initDisclaimSwitch } from "./disclaim-switch.ts";
@@ -533,6 +534,8 @@ export async function runDaemon(): Promise<void> {
   // up and restore/seed work has settled), then every 24 h; each fire reads the
   // preference fresh. Also re-armed on demand by `PUT /preferences/...`.
   scheduleRetention();
+  // Trim the preview-twin cache to its cap (fire-and-forget; never blocks boot).
+  requestPreviewTwinSweep(dataDir);
 
   // A non-loopback bind's warning is printed once by startApiServer, to
   // stderr — which `spawnDaemon` points at this same daemon.log.

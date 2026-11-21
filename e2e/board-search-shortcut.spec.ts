@@ -53,8 +53,8 @@ const HOUR_MS = 60 * 60_000;
 const DAY_MS = 24 * HOUR_MS;
 
 /** A seeded `claude-code` usage snapshot — copied from `claudeCodeQuota()`
- *  in `e2e/usage-tracker.spec.ts` (~lines 40-60), which this test reuses
- *  only to get a real `UsagePopover` on screen; the meter values themselves
+ *  in `e2e/usage-tracker.spec.ts`, which this test reuses
+ *  only to get a real Harnesses panel on screen; the meter values themselves
  *  are irrelevant here. */
 function claudeCodeQuota(): HarnessQuota {
   return {
@@ -284,23 +284,23 @@ test.describe("board search: Cmd/Ctrl+F focus", () => {
     await expect(box).toHaveValue("keep me");
   });
 
-  test("(f) Escape with the usage popover open closes only the popover; the next Escape blurs the box", async ({
+  test("(f) Escape with the Harnesses panel open closes only the panel; the next Escape blurs the box", async ({
     page,
     backend,
   }) => {
-    // `UsagePopover` renders `role="dialog"` WITHOUT `aria-modal` and
-    // WITHOUT `data-popover-open`, so it isn't in
-    // `FIND_SHORTCUT_BLOCKING_LAYERS` — the chord still reaches the board
-    // box while it's open. It IS matched by `KanbanFilters`'s broader
-    // `[role="dialog"], [data-popover-open], [data-quote-open]` Escape
-    // guard, so the box must yield the first Escape to it and only blur on
-    // the second.
+    // The Harnesses panel is `role="dialog"` WITHOUT `aria-modal`, and carries
+    // `data-popover-open` together with `data-popover-keys="escape-only"`, so
+    // it isn't in `FIND_SHORTCUT_BLOCKING_LAYERS` — the chord still reaches
+    // the board box while it's open. It IS matched by `KanbanFilters`'s
+    // broader `[role="dialog"], [data-popover-open], [data-quote-open]`
+    // Escape guard, so the box must yield the first Escape to it and only
+    // blur on the second.
     seedHarnessUsage(backend, claudeCodeQuota());
     await gotoApp(page, backend.bootBase);
 
-    const chip = page.getByRole("banner").getByRole("button", { name: "Claude Code", exact: true });
-    await chip.click();
-    const popover = page.getByRole("dialog", { name: "Claude Code usage" });
+    const button = page.getByRole("banner").getByRole("button", { name: "Harnesses", exact: true });
+    await button.click();
+    const popover = page.getByRole("dialog", { name: "Harnesses" });
     await expect(popover).toBeVisible();
 
     const box = boardSearchBox(page);

@@ -391,8 +391,8 @@ test.describe("agent profiles", () => {
 
     const picker = form.getByTestId("agent-profile-picker");
     await picker.getByTestId("agent-profile-picker-trigger").click();
-    await expect(picker.getByTestId("agent-profile-picker-popover")).toBeVisible();
-    const pickerRow = picker.locator(`[data-testid="agent-profile-picker-row"][data-profile-id="${profileId}"]`);
+    await expect(page.getByTestId("agent-profile-picker-popover")).toBeVisible();
+    const pickerRow = page.locator(`[data-testid="agent-profile-picker-row"][data-profile-id="${profileId}"]`);
     // Row shows harness icon (AgentIcon svg) + name + summary + instructions preview.
     await expect(pickerRow).toContainText(PROFILE_NAME);
     await expect(pickerRow).toContainText("Claude Code");
@@ -637,9 +637,9 @@ test.describe("agent profiles", () => {
     const form = newTaskForm(page);
     const picker = form.getByTestId("agent-profile-picker");
     await picker.getByTestId("agent-profile-picker-trigger").click();
-    await expect(picker.getByTestId("agent-profile-picker-popover")).toBeVisible();
+    await expect(page.getByTestId("agent-profile-picker-popover")).toBeVisible();
     await expect(
-      picker.locator(`[data-testid="agent-profile-picker-row"][data-profile-id="${profileId}"]`),
+      page.locator(`[data-testid="agent-profile-picker-row"][data-profile-id="${profileId}"]`),
     ).toHaveCount(0);
   });
 });

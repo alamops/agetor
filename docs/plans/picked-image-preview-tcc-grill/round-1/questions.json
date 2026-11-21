@@ -1,0 +1,294 @@
+{
+  "version": 1,
+  "id": "picked-image-preview-tcc-grill-r1",
+  "title": "Grill — broken preview for images picked with the Files Picker",
+  "skill": "grill",
+  "slug": "picked-image-preview-tcc",
+  "round": 1,
+  "summary": "**12 decisions** before this gets planned, plus a confirm list of 6 defaults. Start with **Q1, how a user-picked image in a protected folder gets a thumbnail**. It is the only security-posture call, and most of the other questions depend on it.\n\nThe short version of the investigation (`docs/plans/picked-image-preview-tcc-investigation.md`): since #281, `/files/preview` reads image bytes through a *disclaimed* child (`sh` → `stat` → `cat`). macOS TCC denies that child access to `~/Desktop`, `~/Documents` and `~/Downloads` without a prompt, so the core answers **403**. The chip then treats any failure as \"not found\": it turns amber and blocks the click, even though `/open-path` would open the file.\n\nYour progress is saved in the browser as you go.",
+  "proven": [
+    {
+      "text": "**Root cause, proven by a spike.** The disclaimed reader's `stat` succeeds on `~/Desktop/Screenshot … PM.png`, and `cat` then fails immediately with `Operation not permitted` and no prompt. The core maps that to `denied`, then 403. A copy of the same bytes in the scratchpad reads fine.",
+      "evidence": [
+        { "label": "403 on denied", "path": "src/bun/server.ts", "line": 7809, "lang": "ts", "code": "          const opened = await openFileBytes(raw, {\n            followSymlinks: true,\n            ifNoneMatch: req.headers.get(\"if-none-match\"),\n            maxBytes: MAX_FILE_PREVIEW_BYTES,\n          });\n          if (opened.kind === \"missing\") {\n            return json({ error: `not found: ${raw}` }, { status: 404, headers: corsHeaders(req) });\n          }\n          if (opened.kind === \"denied\") {\n            return json({ error: `not readable: ${raw}` }, { status: 403, headers: corsHeaders(req) });\n          }" },
+        { "label": "investigation §2", "path": "docs/plans/picked-image-preview-tcc-investigation.md", "line": 83 }
+      ]
+    },
+    {
+      "text": "**The chip turns any failure into \"not found\" and blocks the click.** `onStatus` calls `onMissing()` on any non-`ok` status. A click on a missing chip opens the not-found dialog without calling `/open-path`.",
+      "evidence": [
+        { "path": "src/mainview/components/kanban/AttachmentChips.tsx", "line": 61, "lang": "tsx", "code": "  const handleClick = async (path: string) => {\n    if (missing.has(path)) {\n      setNotFoundPath(path);\n      return;\n    }" },
+        { "path": "src/mainview/components/kanban/AttachmentChips.tsx", "line": 179, "lang": "tsx", "code": "        onStatus={(status) => {\n          if (status !== \"ok\") onMissing();\n        }}" },
+        { "path": "src/mainview/lib/authed-blob.ts", "line": 46, "lang": "ts", "code": "export function statusForHttp(status: number): Exclude<AuthedBlobStatus, \"loading\" | \"ok\"> {\n  if (status === 404) return \"missing\";\n  if (status === 413) return \"too-large\";\n  return \"error\";\n}" }
+      ]
+    },
+    "**Agents in tmux can read the original picked file.** This grill step runs as Claude Code in Agetor's tmux, and it read `~/Desktop/Screenshot 2026-11-18 at 2.40.41 PM.png` with its Read tool. Your screenshot shows the amber chip. Copying a picked image is therefore **not** needed for claude-code to see it. It only matters for the thumbnail, and possibly for the ACP harnesses (Q11).",
+    "**A Finder drag already copies.** A dragged png/jpg/gif/webp is uploaded to `~/.agetor/screenshots/screenshot-<utc-ts>-<id>.png`, so the original filename is lost. That folder holds **573 files, 117 MB** on your machine, and **nothing ever cleans it** (no retention or delete path touches it).",
+    "**Opening non-image attachments works.** They call `/open-path`, which runs `existsSync` in-process and then LaunchServices. Only thumbnailed images break: attachment chips, markdown images, `SendUserFile` tiles, and binary-diff previews in protected folders.",
+    "**The native open panel runs in the core process.** `/refs/pick` → `openFileDialogLabelled` → `native.openFileDialog`, Electrobun over FFI in Bun. A copy made at pick time is made by the process that holds your intent grant (`com.apple.macl` is on the picked files). Confirm item C1 adds a spike that proves this doesn't prompt.",
+    "**The security constraint behind D26(j) still applies.** User bubbles are rebuilt from the agent-writable claude JSONL, and `agetor.sqlite` is agent-writable. So \"this path is in a user bubble\" is not proof that you picked it. An in-process read keyed on either one reopens the hole #281 closed."
+  ],
+  "sections": [
+    {
+      "id": "mechanism",
+      "title": "How a picked image gets a thumbnail",
+      "intro": "Every option keeps the **honest chip** (Q5–Q7) as the floor: whenever no thumbnail can be shown, the chip says so and still opens the file. The question is what we add on top of it.",
+      "questions": [
+        {
+          "id": "mechanism",
+          "type": "single",
+          "title": "Which mechanism gives user-picked images in protected folders a thumbnail?",
+          "impact": "blocking",
+          "oneWayDoor": true,
+          "why": "Decides whether the agent's prompt path changes, whether new storage appears, and whether the D26(j) boundary moves.",
+          "context": "The investigation recommended **(A) copy and reference the copy**. Since then I proved that agents in tmux read the original fine. That makes A's main cost (the agent gets `~/.agetor/…` instead of your file, so an *\"optimise this image\"* edits a copy) look avoidable. I now recommend a variant of B that needs **no stored mapping**: at pick time, while the core holds your intent grant, copy the bytes to `dataDir/previews/<sha256(path)>.<ext>`. `/files/preview` first tries the original (disclaimed). If that is **denied**, it reads the twin, also disclaimed. An agent that plants a fake twin can only make a thumbnail show bytes it already controls in a non-protected folder. That is the same risk a worktree markdown image carries today, so D26(j) holds.",
+          "options": [
+            { "id": "twin", "label": "Preview twin keyed by path, original path kept in the prompt (B′)", "description": "Copy at pick time to `dataDir/previews/<sha256(path)>.<ext>`. Thumbnails fall back to the twin only when the original read is denied.", "consequence": "The agent and the chip still show your real file name and location. Adds one cache folder that can be evicted (Q4). Old messages get no thumbnail (honest chip)." },
+            { "id": "copy", "label": "Copy and reference the copy (A)", "description": "Same as Finder drag: the prompt carries `~/.agetor/screenshots/…` (or attachments).", "consequence": "Consistent with drag, and every harness can read the copy. The agent never sees or edits your original. The copies are agent inputs, so they can't be evicted." },
+            { "id": "provenance", "label": "In-memory provenance set (C)", "description": "Paths returned by `/refs/pick` this launch are read in-process.", "consequence": "No storage. Every thumbnail disappears after a restart, which is most of the time for long tasks." },
+            { "id": "click", "label": "Click-to-load (D)", "description": "\"Preview blocked by macOS · click to load\". Your click triggers one in-process read.", "consequence": "No storage. An agent can lure you into clicking a path it chose. This moves the D26(j) line." },
+            { "id": "floor-only", "label": "No thumbnail: honest chip only (F)", "description": "Just fix the chip: \"preview unavailable\", and the click opens the file.", "consequence": "Smallest change. Picked Desktop images never show a thumbnail." },
+            { "id": "relax", "label": "Relax D26(j) for reference-block paths (E)", "description": "Read paths listed under `Referenced files/folders:` in-process.", "consequence": "**Reopens the confused-deputy hole**, because bubbles and the DB are agent-writable. Not recommended." }
+          ],
+          "recommendation": { "value": "twin", "reason": "You get a thumbnail without changing what the agent receives or relaxing D26(j), and the twin is a cache that can be evicted, so it never piles up the way screenshots/ does." }
+        },
+        {
+          "id": "entry-points",
+          "type": "multi",
+          "title": "Which entry points create the twin or copy?",
+          "impact": "shape",
+          "showIf": { "question": "mechanism", "in": ["twin", "copy"] },
+          "why": "Each entry point is a server route to touch and test.",
+          "context": "A **Finder drag** of png/jpg/gif/webp already uploads to `screenshots/` (rung 3), so it needs nothing. The others keep original paths today. `/refs/resolve` is `app+cli`, so only the **app** caller may trigger a copy, since a CLI caller is not you clicking.",
+          "evidence": [
+            { "label": "drag pasteboard excludes the 4 uploadable types", "path": "src/mainview/lib/capture-refs.ts", "line": 14, "lang": "ts", "code": "const SCREENSHOT_UPLOADABLE = /\\.(png|jpe?g|gif|webp)$/i;" }
+          ],
+          "options": [
+            { "id": "pick", "label": "Files Picker (`/refs/pick`, files mode)", "consequence": "The reported bug." },
+            { "id": "paste", "label": "Paste of a Finder-copied file (`file://` → `/refs/resolve`, app caller only)", "consequence": "Same symptom today, same fix." },
+            { "id": "drag-other", "label": "Finder drag of a non-uploadable image (heic, svg, bmp, ico, avif via `/refs/drag`)", "consequence": "These keep their original path today and break the same way." }
+          ],
+          "recommendation": { "value": ["pick", "paste", "drag-other"], "reason": "All three are \"the user pointed at this file\" gestures through app-only paths, and skipping one leaves the same broken chip reachable." }
+        },
+        {
+          "id": "extensions",
+          "type": "single",
+          "title": "Which image types get a twin or copy?",
+          "impact": "minor",
+          "showIf": { "question": "mechanism", "in": ["twin", "copy"] },
+          "options": [
+            { "id": "all10", "label": "All 10 `isImagePath` types (png jpg jpeg gif webp svg bmp ico avif heic)", "consequence": "Every chip that tries a thumbnail can get one." },
+            { "id": "four", "label": "Only the 4 `SCREENSHOT_UPLOADABLE` types", "consequence": "heic/svg/avif picks still show the honest chip." }
+          ],
+          "recommendation": { "value": "all10", "reason": "The chip decides whether to thumbnail with `isImagePath`, so the copy rule should match it, or a picked .heic stays broken." }
+        },
+        {
+          "id": "size-cap",
+          "type": "number",
+          "title": "What is the largest file that gets a twin or copy?",
+          "impact": "minor",
+          "showIf": { "question": "mechanism", "in": ["twin", "copy"] },
+          "unit": "MB",
+          "min": 1,
+          "max": 50,
+          "context": "Drag uploads (`/screenshots`) cap at **25 MB**, and `/files/preview` serves up to **50 MB**. Above the cap there is no copy, and the chip shows the honest \"preview unavailable\" state.",
+          "recommendation": { "value": 25, "reason": "Matches the drag-upload cap, so drag and pick behave the same for the same file." }
+        },
+        {
+          "id": "twin-lifetime",
+          "type": "single",
+          "title": "How long do preview twins live?",
+          "impact": "shape",
+          "showIf": { "question": "mechanism", "in": ["twin"] },
+          "why": "Twins are only a cache. Losing one turns that chip into the honest \"preview unavailable\" chip, nothing worse.",
+          "options": [
+            { "id": "lru", "label": "Size-capped cache: evict the oldest past a total cap, swept at boot and after each write", "consequence": "Bounded disk use. Very old messages lose their thumbnails." },
+            { "id": "task", "label": "Delete with the task (when no other task's refs list the path)", "consequence": "Tied to task lifetime. Follow-up refs exist only in events, so the check is approximate." },
+            { "id": "forever", "label": "Keep forever, like screenshots/", "consequence": "Simplest. Grows without bound (screenshots/ is at 117 MB already)." }
+          ],
+          "recommendation": { "value": "lru", "reason": "A cache whose loss is harmless should be bounded by size, not by a lifecycle we would have to approximate." }
+        },
+        {
+          "id": "twin-cap",
+          "type": "number",
+          "title": "What is the total size cap for the preview-twin cache?",
+          "impact": "minor",
+          "showIf": { "question": "twin-lifetime", "in": ["lru"] },
+          "unit": "MB",
+          "min": 50,
+          "max": 5000,
+          "recommendation": { "value": 500, "reason": "Holds about 100 Retina screenshots, roughly 4× today's screenshots/ total, and still small on any Mac." }
+        },
+        {
+          "id": "copy-lifetime",
+          "type": "single",
+          "title": "How long do copies referenced in the prompt live?",
+          "impact": "shape",
+          "showIf": { "question": "mechanism", "in": ["copy"] },
+          "why": "The agent may re-read a copy on any later turn, so it can't be evicted the way a cache can.",
+          "options": [
+            { "id": "forever", "label": "Keep forever, like screenshots/ today", "consequence": "Consistent with drag. Unbounded growth stays an open problem." },
+            { "id": "task", "label": "Delete when the task is deleted", "consequence": "Needs a record of which task owns which copy (a new server-managed column or a folder per task)." }
+          ],
+          "recommendation": { "value": "task", "reason": "Ties the copy to the only thing that reads it, and avoids adding to the 117 MB that nothing cleans." }
+        }
+      ]
+    },
+    {
+      "id": "ui",
+      "title": "The honest chip (the floor in every option)",
+      "intro": "Rule from `AttachmentChips.tsx:73-87` and the original spec (`improve-image-attached-message-ui.md:17`): only a **404** proves a file is gone. Everything else means \"we can't show a preview\", not \"not found\". `SentFilesCard` already follows this rule.",
+      "questions": [
+        {
+          "id": "denied-status",
+          "type": "single",
+          "title": "Should a 403 get its own blob status, with wording about macOS privacy?",
+          "impact": "shape",
+          "options": [
+            { "id": "denied", "label": "New `denied` status (403), separate from `error`", "description": "`statusForHttp(403)` → `denied`. The chip says macOS privacy blocks the preview. Other errors say \"preview unavailable\".", "consequence": "One more union member to wire through `AuthedImg`, `MdImage` and `BinaryFilePreview`. Honest, specific copy." },
+            { "id": "error", "label": "Reuse `error` with one generic \"Preview unavailable\"", "consequence": "Smaller diff. The user doesn't learn why." }
+          ],
+          "recommendation": { "value": "denied", "reason": "A 403 here always means a macOS-protected folder, and saying so tells you the file is fine and why the preview is missing." }
+        },
+        {
+          "id": "chip-look",
+          "type": "single",
+          "title": "How does the \"preview unavailable\" chip look?",
+          "impact": "minor",
+          "options": [
+            { "id": "neutral", "label": "Neutral (muted border, `ImageOff`), amber kept for 404 only", "preview": "[⊘ Screenshot 2026-11-18 at 2.40.41 PM.png]   ← muted, clickable, opens in Preview\n tooltip: \"Preview blocked by macOS privacy (Desktop). Click to open.\"\n\n[⚠ old-shot.png]   ← amber: file is gone (404) → not-found dialog", "consequence": "Amber means \"gone\" again." },
+            { "id": "amber", "label": "Keep amber for every failure, change only the tooltip and the click", "consequence": "Still reads as \"broken\" at a glance." }
+          ],
+          "recommendation": { "value": "neutral", "reason": "Amber is a warning, and the file is fine, so a warning color repeats the misleading signal that started this report." }
+        },
+        {
+          "id": "chip-copy",
+          "type": "longtext",
+          "title": "What do the chip tooltips say? Edit as needed.",
+          "impact": "minor",
+          "recommendation": { "value": "denied (403): \"Preview blocked by macOS privacy — Agetor can't read files in this folder for previews. Click to open.\"\nerror / timeout: \"Preview unavailable. Click to open.\"\ntoo-large (413): \"Too large to preview. Click to open.\"\nmissing (404): \"Image not found: <path>\" (unchanged)", "reason": "Each one says what happened and that the click still works." }
+        },
+        {
+          "id": "surfaces",
+          "type": "multi",
+          "title": "Which surfaces get the 404-vs-other split and the new wording?",
+          "impact": "shape",
+          "context": "`MdImage` keeps its walk over candidate paths (any non-ok moves to the next one), and only its final fallback title changes. Its click already opens. `BinaryFilePreview` is the diff's binary pane. It would only hit 403 for an `isolation: \"none\"` task whose workdir is in a protected folder.",
+          "options": [
+            { "id": "chips", "label": "`AttachmentChips` (the reported bug; the click must reach `/open-path`)" },
+            { "id": "mdimage", "label": "`MdImage` fallback chip (today titled \"Image not found\" for a 403)" },
+            { "id": "sentfiles", "label": "`SentFilesCard` (behavior already right; wording only, for consistency)" },
+            { "id": "binary", "label": "`BinaryFilePreview` pane copy for 403" }
+          ],
+          "recommendation": { "value": ["chips", "mdimage", "sentfiles", "binary"], "reason": "One `denied` status should read the same everywhere it renders; leaving one surface saying \"not found\" is the same bug in another place." }
+        }
+      ]
+    },
+    {
+      "id": "boundaries",
+      "title": "Agent-chosen images, old messages, adjacent risk",
+      "questions": [
+        {
+          "id": "agent-chosen",
+          "type": "single",
+          "title": "How should agent-chosen images in protected folders behave (markdown `![](~/Documents/x.png)`, SendUserFile of a Desktop file)?",
+          "impact": "shape",
+          "oneWayDoor": true,
+          "why": "This is exactly the D26(j) threat: an agent picks a path and the webview fetches it.",
+          "options": [
+            { "id": "honest", "label": "Honest \"blocked\" chip that still opens; no thumbnail", "consequence": "D26(j) unchanged. Your click goes to LaunchServices (the app you chose), never to a core read." },
+            { "id": "click-load", "label": "Offer click-to-load there too", "consequence": "An agent can lure a click that makes Agetor read a protected file in-process." }
+          ],
+          "recommendation": { "value": "honest", "reason": "Agent-chosen paths are the case #281 closed on purpose. Opening the file stays one click away, so there's little to gain from relaxing it." }
+        },
+        {
+          "id": "old-messages",
+          "type": "single",
+          "title": "For messages already sent with protected-folder refs (this pipeline's own prompts included), is \"preview unavailable, click opens\" enough?",
+          "impact": "minor",
+          "context": "Persisted events stay raw, and the core can't read the originals without your gesture, so the only way back to thumbnails is C or D. With B′, re-attaching the same file later would create its twin, and the old chips would then light up too, because the twin is keyed by path.",
+          "options": [
+            { "id": "ok", "label": "Yes: honest chip, click opens", "consequence": "No extra work." },
+            { "id": "need", "label": "No: they must get thumbnails back", "consequence": "Requires C or D on top of the chosen mechanism." }
+          ],
+          "recommendation": { "value": "ok", "reason": "The file opens with one click, and adding a second read path to bring back old thumbnails isn't worth what it costs in security." }
+        },
+        {
+          "id": "acp-read",
+          "type": "single",
+          "title": "Cursor and fx run disclaimed **without** tmux, so they may be unable to read a picked Desktop file at all. In this change?",
+          "impact": "shape",
+          "context": "This is unproven. It follows from the spike, where the disclaimed `cat` was denied, and from the fact that `cursor-acp.ts` and `fx-acp.ts` spawn without tmux. Agents in tmux (claude) read it fine, as shown above. It is a different symptom (the agent can't read the file, rather than a missing thumbnail), but it has the same cause. (A) copy-on-pick would fix it as a side effect. B′ would not.",
+          "options": [
+            { "id": "spike-fix", "label": "In this change: spike it, and if it's broken, fix it here", "consequence": "Bigger scope. The fix shape is unknown until the spike runs." },
+            { "id": "spike-only", "label": "Spike in this change; if broken, open a separate ticket with the evidence", "consequence": "Proves the risk now, keeps this fix focused." },
+            { "id": "out", "label": "Out of scope entirely: separate ticket now", "consequence": "Nothing proven in this change." }
+          ],
+          "recommendation": { "value": "spike-only", "reason": "It is a different user-visible bug in other harnesses. Proving it costs one spike, while fixing it may need its own design (copy for ACP only, or a tmux host)." }
+        },
+        {
+          "id": "binary-scope",
+          "type": "single",
+          "title": "Should `BinaryFilePreview` of an `isolation: \"none\"` task in a protected folder get more than the wording fix?",
+          "impact": "minor",
+          "context": "Those bytes are written by the agent (the diff's new side), so they are agent-chosen, and only the honest-chip treatment is safe there.",
+          "options": [
+            { "id": "wording", "label": "Wording only (via Q8), no thumbnail mechanism", "consequence": "Consistent with Q9." },
+            { "id": "out", "label": "Leave it entirely as is", "consequence": "Keeps today's generic error copy there." }
+          ],
+          "recommendation": { "value": "wording", "reason": "Same `denied` status, same copy, no new read path." }
+        }
+      ]
+    },
+    {
+      "id": "confirm",
+      "title": "Confirm or override",
+      "intro": "These are defaults I'd bet on. One click each.",
+      "questions": [
+        {
+          "id": "c-spike",
+          "type": "confirm",
+          "title": "Pick-time spike before building",
+          "impact": "shape",
+          "recommendation": { "value": "Before the twin or copy work is built, the plan runs a dev-build spike (`~/.agetor-dev`): pick a `~/Desktop` image through the real NSOpenPanel and verify that the core's in-process copy succeeds **without** an \"Agetor would like to access Desktop\" prompt. If it prompts, stop and come back to you with the honest chip only.", "reason": "Investigation assumption 1 (the intent grant covers the core) is consistent with the evidence but not proven." }
+        },
+        {
+          "id": "c-order",
+          "type": "confirm",
+          "title": "Twin lookup order",
+          "impact": "minor",
+          "showIf": { "question": "mechanism", "in": ["twin"] },
+          "recommendation": { "value": "`/files/preview` first tries the original (disclaimed, as today). Only on `denied` does it look up `previews/<sha256(path)>`, read through the same disclaimed `openFileBytes`. A readable original always wins, so the thumbnail stays current.", "reason": "Never shows a stale twin when the real file is readable, and keeps one reader." }
+        },
+        {
+          "id": "c-e2e",
+          "type": "confirm",
+          "title": "Tests",
+          "impact": "shape",
+          "recommendation": { "value": "A new Playwright spec, `e2e/attachment-chips.spec.ts`, with `AGETOR_FAKE_PICK_REFS_DIR` and a `chmod 000` png. It asserts: (1) the chip shows the preview-unavailable state, not amber; (2) a click reaches `/open-path`, not the not-found dialog; (3) a deleted file still shows amber and the not-found dialog; (4) with the twin, a picked file that is then `chmod 000` still thumbnails. Plus unit tests: `statusForHttp(403)`, the twin write/lookup/eviction, and the `/refs/resolve` CLI caller never creating a twin.", "reason": "Nothing pins the chip's behavior on a 403 today (investigation §2), so a naive fix could pass green without proving the UI." }
+        },
+        {
+          "id": "c-docs",
+          "type": "confirm",
+          "title": "Docs",
+          "impact": "minor",
+          "recommendation": { "value": "Update `docs/architecture/security.md` (D26(j) scope: name attachment chips, and state the twin rule), `docs/architecture/markdown-images.md` (403 copy), and `docs/architecture/testing-seams.md` (chmod-000 idiom for chips). Add a dated note to `docs/plans/improve-image-attached-message-ui.md`.", "reason": "CLAUDE.md requires a subsystem doc to change with its behavior." }
+        },
+        {
+          "id": "c-spec",
+          "type": "confirm",
+          "title": "Source of truth",
+          "impact": "minor",
+          "recommendation": { "value": "The plan restates the symptom in-repo (the amber chip, the click that won't open). Your Desktop screenshot is **not** committed.", "reason": "The screenshot only shows Agetor UI, but it lives outside the repo, and a text restatement is enough for review." }
+        },
+        {
+          "id": "c-cli",
+          "type": "confirm",
+          "title": "No CLI/TUI parity work",
+          "impact": "minor",
+          "recommendation": { "value": "`agetor send` builds the same references block but never renders thumbnails, so there is nothing to mirror there.", "reason": "Investigation §5 propagation surface." }
+        }
+      ]
+    }
+  ]
+}

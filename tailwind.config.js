@@ -68,11 +68,20 @@ export default {
         "success-solid": "hsl(var(--success-solid))",
         "danger-solid": "hsl(var(--danger-solid))",
         "warning-solid": "hsl(var(--warning-solid))",
+        "warning-solid-foreground": "hsl(var(--warning-solid-foreground))",
       },
       borderRadius: {
         lg: "var(--radius)",
         md: "calc(var(--radius) - 2px)",
         sm: "calc(var(--radius) - 4px)",
+      },
+      // Rem-based small sizes for new UI (docs/architecture/task-launch-ui.md):
+      // `text-2xs` = helper text, `text-3xs` = meta. They replace the px
+      // literals (`text-[11px]` / `text-[10px]`) so the font-size setting
+      // scales them.
+      fontSize: {
+        "2xs": ["0.6875rem", { lineHeight: "1rem" }],
+        "3xs": ["0.625rem", { lineHeight: "0.875rem" }],
       },
       fontFamily: {
         geist: ['"Geist Variable"', "ui-sans-serif", "system-ui", "sans-serif"],

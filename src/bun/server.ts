@@ -115,17 +115,16 @@ import {
 import { buildTmuxAttachCommand } from "./tmux-attach.ts";
 import { awaitTerminalLaunch, terminalLaunchErrorMessage } from "./terminal-launch.ts";
 import {
+  answerTmuxPromptInPane,
   dismissAskModalForMessage,
-  dismissTmuxPrompt,
   driveAskAnswers,
   healWindowSize,
   jsonlPathFor,
   rebuildEventsFromJsonl,
-  markTmuxPromptAnswered,
   resolveAskCard,
-  sendModalKeys,
   sessionExists,
   sessionNameFor,
+  type PromptAction,
 } from "./claude-tmux.ts";
 import { formatAnswersMessage, planAskAnswers } from "./claude-questions.ts";
 import { CURSOR_ASK_SKIP_FOLLOWUP, cursorAskAnswersFromLabels, formatCursorAskFollowup } from "../shared/cursor-ask.ts";
@@ -144,6 +143,7 @@ import {
   repoRoot,
 } from "./worktree.ts";
 import { isMultiRepoTask } from "../shared/multi-repo.ts";
+import { oauthCodeErrorText, validateOAuthCode } from "../shared/oauth-code.ts";
 import {
   attachSocket,
   closeTerminal,
@@ -153,6 +153,7 @@ import {
   listTerminals,
   writeTerminal,
   resizeTerminal,
+  terminalCountsByTask,
   type TerminalSocketData,
 } from "./terminals.ts";
 import { listAgentCapabilities } from "./commands.ts";
@@ -246,6 +247,9 @@ import {
   findTmuxPromptById,
   getAskQuestionsById,
   listPendingForTask,
+  TMUX_CODE_ANSWER,
+  TMUX_ENTER_ANSWER,
+  pendingCountsByTask,
   type AskQuestionsAnswer,
 } from "./interactions.ts";
 import {
@@ -269,6 +273,7 @@ import {
   parseArchivedHistoryRetentionDays,
   supportedEfforts,
   validateBranchConfig,
+  isArchiveUncommittedChanges,
 } from "../shared/types.ts";
 import type {
   AgentKind,
@@ -321,13 +326,15 @@ import {
   turnOffBackground,
   turnOnBackground,
 } from "./background.ts";
-import { consumePendingOpenTask } from "./pending-open.ts";
+import { consumePendingMenuAction, consumePendingOpenTask } from "./pending-open.ts";
 import {
   binaryPreviewKind,
   contentTypeForPreviewPath,
   isImagePath,
+  isScreenshotUploadablePath,
   MAX_FILE_PREVIEW_BYTES,
 } from "../shared/attachments.ts";
+import { previewTwinPath, writePreviewTwinsForRefs } from "./preview-twins.ts";
 import { AGENT_PROFILE_LIMITS, normalizeSkillName } from "../shared/agent-profile.ts";
 import { LONE_SURROGATE_RE, PIPELINE_CONTROL_CHAR_RE, validatePipelineGraph } from "../shared/pipeline.ts";
 import { BUNDLE_MAX_BYTES, findInvisibleChar } from "../shared/bundle.ts";
@@ -480,6 +487,13 @@ async function taskGitStatusForDir(
     branch: headState.branch,
     isDefaultBranch: headState.isDefaultBranch,
   };
+}
+
+/** The basenames of the `File`s a drop or paste carried, as the webview sent
+ *  them (`names`): strings only, at most 256. A preview twin is written only
+ *  for a path one of these vouches for. */
+function fileNameSet(raw: unknown): Set<string> {
+  return new Set(Array.isArray(raw) ? raw.filter((n): n is string => typeof n === "string").slice(0, 256) : []);
 }
 
 function refsFromPaths(rawPaths: unknown[]): TaskReference[] {
@@ -696,6 +710,13 @@ function authed<F extends (req: any) => Response | Promise<Response>>(fn: F): F 
 // bound to one terminal id, valid for 30 s and consumed by its first use — it
 // is a lookup key, not a derivation of any credential, so a URL that leaks into
 // a log or history is dead before anyone can replay it.
+/** Cards (`TmuxPromptRequest.id`) an answer is being delivered to right now.
+ *  A second answer for the same card while the first is in flight (the app and
+ *  `agetor answer` at once) is refused before it can type into the pane: the
+ *  drive's identity check can't tell an Enter-only or code screen from the
+ *  same screen still on the pane a moment after the first answer. */
+const tmuxAnswersInFlight = new Set<string>();
+
 const WS_TICKET_TTL_MS = 30_000;
 const wsTickets = new Map<string, { terminalId: string; expiresAt: number }>();
 
@@ -4555,7 +4576,7 @@ export function startApiServer(
           json({ version: pkg.version }, { headers: corsHeaders(req) })),
       },
 
-      // Double-clicking the custom app bar in App.tsx hits this route to
+      // Double-clicking the custom app bar (components/app-bar/AppBar.tsx) hits this route to
       // toggle the macOS "zoom" affordance. Electrobun's drag region only
       // wires startWindowMove/stopWindowMove on mousedown/mouseup, so the
       // native double-click-to-zoom gesture never reaches AppKit — the
@@ -6998,7 +7019,11 @@ export function startApiServer(
             awaitTeardown: body.awaitTeardown === true,
           });
           if ("error" in result) {
-            return json(result, { status: 400, headers: corsHeaders(req) });
+            // Uncommitted work would be discarded: 409 with the affected
+            // repositories, so the client can confirm and retry with
+            // `forceWorktree` (`ArchiveUncommittedChanges`).
+            const status = isArchiveUncommittedChanges(result) ? 409 : 400;
+            return json(result, { status, headers: corsHeaders(req) });
           }
           // Archived from any client → its notification goes (D6c). Own id
           // only: a pipeline Restart's internal step archives never reach this
@@ -7729,17 +7754,19 @@ export function startApiServer(
             if (mode === "folder") {
               return json({ refs: refsFromPaths([fakeDir]) }, { headers: corsHeaders(req) });
             }
+            let fakeRefs: TaskReference[];
             try {
               const entries = readdirSync(fakeDir, { withFileTypes: true })
                 .filter((e) => e.isFile())
                 .sort((a, b) => a.name.localeCompare(b.name));
-              return json(
-                { refs: refsFromPaths(entries.map((e) => path.join(fakeDir, e.name))) },
-                { headers: corsHeaders(req) },
-              );
+              fakeRefs = refsFromPaths(entries.map((e) => path.join(fakeDir, e.name)));
             } catch {
               return json({ refs: [] }, { headers: corsHeaders(req) }); // gone / unreadable — cancelled pick
             }
+            // The seam stands in for the panel, so it writes the same preview
+            // twins the native branch does.
+            await writePreviewTwinsForRefs(dataDir, fakeRefs);
+            return json({ refs: fakeRefs }, { headers: corsHeaders(req) });
           }
           if (!native) return notAvailableHeadless(req);
           const paths = await openFileDialogLabelled(native, {
@@ -7751,7 +7778,15 @@ export function startApiServer(
           // Electrobun splits the panel's answer on ",", so a path with a
           // comma arrives in pieces — put them back together; nothing at all
           // means the user cancelled.
-          return json({ refs: refsFromPaths(pickedPaths(paths)) }, { headers: corsHeaders(req) });
+          const picked = refsFromPaths(pickedPaths(paths));
+          // The panel just ran in this process, so the user's pick carries the
+          // intent grant for exactly these files: copy each image into the
+          // preview-twin cache NOW, while this process may read it, so its
+          // thumbnail survives macOS's privacy block on the folder later
+          // (preview-twins.ts; docs/architecture/security.md, "Preview twins").
+          // Folder mode has no files to twin.
+          if (mode === "files") await writePreviewTwinsForRefs(dataDir, picked);
+          return json({ refs: picked }, { headers: corsHeaders(req) });
         }),
       },
 
@@ -7761,9 +7796,30 @@ export function startApiServer(
       // than trusting the webview's view of directory-ness.
       "/refs/resolve": {
         POST: authed(async (req) => {
-          const body = (await req.json().catch(() => ({}))) as { paths?: unknown };
+          const body = (await req.json().catch(() => ({}))) as {
+            paths?: unknown;
+            names?: unknown;
+            previewTwins?: unknown;
+          };
           const raw = Array.isArray(body.paths) ? body.paths : [];
-          return json({ refs: await refsFromPathsForCaller(raw, callerOf(req)) }, { headers: corsHeaders(req) });
+          const caller = callerOf(req);
+          const refs = await refsFromPathsForCaller(raw, caller);
+          // `previewTwins: true` marks the user's own drop or paste
+          // (`api.resolveCapturedRefs`, sent by `capture-refs` only). The other
+          // callers of this route (`SentFilesCard`, handoff artifact chips, `@`
+          // scope) stat paths an AGENT chose, with the app token and no user
+          // action, so they never send it, and the core never reads those in
+          // its own process. The CLI token never gets a twin either way.
+          // Even then a twin is written only for a path whose basename one of
+          // the dropped/pasted `File`s (`names`) vouches for: a `file://` line
+          // in plain text dragged out of the transcript carries no `File`, so
+          // an agent's text can't make the core copy a file the user never
+          // dropped (same check as `/refs/drag`).
+          if (caller === "app" && body.previewTwins === true) {
+            const names = fileNameSet(body.names);
+            await writePreviewTwinsForRefs(dataDir, refs, (ref) => names.has(path.basename(ref.path)));
+          }
+          return json({ refs }, { headers: corsHeaders(req) });
         }),
       },
 
@@ -7773,8 +7829,24 @@ export function startApiServer(
       // drag pasteboard directly instead — it always reflects the drag that
       // just ended, since a drop event fires the instant that drag ends.
       "/refs/drag": {
-        POST: authed((req) => {
-          return json({ refs: refsFromPaths(readDragPasteboardPaths()) }, { headers: corsHeaders(req) });
+        POST: authed(async (req) => {
+          const body = (await req.json().catch(() => ({}))) as { names?: unknown };
+          // Basenames of the `File`s the drop actually carried. The drag
+          // pasteboard is shared state an agent could rewrite mid-drag, so a
+          // preview twin is written only for a pasteboard path one of these
+          // names vouches for.
+          const names = fileNameSet(body.names);
+          const refs = refsFromPaths(readDragPasteboardPaths());
+          // Images `POST /screenshots` can take are uploaded by the webview
+          // (their bytes are copied to a file Agetor owns), so only the other
+          // image types (heic, svg, bmp, ico, avif), which attach by their
+          // original path, need a twin.
+          await writePreviewTwinsForRefs(
+            dataDir,
+            refs,
+            (ref) => !isScreenshotUploadablePath(ref.path) && names.has(path.basename(ref.path)),
+          );
+          return json({ refs }, { headers: corsHeaders(req) });
         }),
       },
 
@@ -7961,11 +8033,29 @@ export function startApiServer(
           // in the core's own process under Agetor's TCC identity (D26(j)).
           // Only regular files (a FIFO named `*.png` would hang the stream).
           // `maxBytes` bounds the memory `settleFileBytes` holds below.
-          const opened = await openFileBytes(raw, {
+          let opened = await openFileBytes(raw, {
             followSymlinks: true,
             ifNoneMatch: req.headers.get("if-none-match"),
             maxBytes: MAX_FILE_PREVIEW_BYTES,
           });
+          // Only when the original is DENIED (on macOS, a TCC-protected
+          // folder the disclaimed reader may not enter) fall back to the
+          // preview twin written when the user picked, dropped or pasted this
+          // path (preview-twins.ts). A readable original always wins, and a
+          // missing, too-large or errored one never falls back. The twin read
+          // is the same disclaimed reader and never follows a symlink, so a
+          // twin an agent planted can only show a regular, non-protected file.
+          if (opened.kind === "denied") {
+            const twin = previewTwinPath(dataDir, raw);
+            if (twin !== null) {
+              const viaTwin = await openFileBytes(twin, {
+                followSymlinks: false,
+                ifNoneMatch: req.headers.get("if-none-match"),
+                maxBytes: MAX_FILE_PREVIEW_BYTES,
+              });
+              if (viaTwin.kind === "ok" || viaTwin.kind === "not-modified") opened = viaTwin;
+            }
+          }
           if (opened.kind === "missing") {
             return json({ error: `not found: ${raw}` }, { status: 404, headers: corsHeaders(req) });
           }
@@ -8312,7 +8402,12 @@ export function startApiServer(
       // it as the user's keypress and dismisses the modal.
       "/tmux-prompts/:id/answer": {
         POST: authed(async (req) => {
-          const body = (await req.json().catch(() => ({}))) as { key?: unknown; reject?: unknown };
+          const body = (await req.json().catch(() => ({}))) as {
+            key?: unknown;
+            reject?: unknown;
+            enter?: unknown;
+            code?: unknown;
+          };
           const pending = findTmuxPromptById(req.params.id);
           if (!pending) {
             // Either the prompt was auto-cancelled (scraper saw the pane
@@ -8320,70 +8415,143 @@ export function startApiServer(
             // the UI can drop the card on its next poll.
             return json({ ok: false }, { headers: corsHeaders(req) });
           }
-          // Reject: the user wants none of the options. Esc the modal and drop
-          // the card. Once no card is pending the message box re-enables, so
-          // the user sends their redirect as a normal, separate turn — no
-          // in-flight Esc-then-send interrupt (which is what corrupts the run
-          // accounting). The modal having been Esc'd, the message reaches claude.
-          if (body.reject === true) {
+          // Closed allow-list. EXACTLY one of `key` (a recorded choice),
+          // `reject`, `enter` (an Enter-only card) or `code` (the OAuth code
+          // card). Anything else is a 400 that never echoes a submitted value:
+          // a key here becomes a keystroke in the user's REPL, and `code` is
+          // free text typed into it.
+          const given = [body.key, body.reject, body.enter, body.code].filter((v) => v !== undefined).length;
+          if (given !== 1) {
+            return json({ error: "exactly one of key, reject, enter or code" }, { status: 400, headers: corsHeaders(req) });
+          }
+          if (tmuxAnswersInFlight.has(pending.id)) {
+            // `code` tells the clients this 409 apart from "the prompt changed".
+            return json(
+              { ok: false, error: "this prompt is already being answered", code: "answer-in-flight" },
+              { status: 409, headers: corsHeaders(req) },
+            );
+          }
+          tmuxAnswersInFlight.add(pending.id);
+          try {
+            const cardKind = pending.answerKind ?? "choice";
+            // Reject: the user wants none of the options. Esc the modal and drop
+            // the card. Once no card is pending the message box re-enables, so
+            // the user sends their redirect as a normal, separate turn — no
+            // in-flight Esc-then-send interrupt (which is what corrupts the run
+            // accounting). The modal having been Esc'd, the message reaches claude.
+            // The Escape goes through the same live-pane drive as every answer:
+            // only while the pane still shows THIS card (an Escape on a pane that
+            // moved on would interrupt claude's turn), and a failed send leaves
+            // the card up.
+            let action: PromptAction;
+            let sentinel: string;
+            if (body.reject !== undefined) {
+              if (body.reject !== true) {
+                return json({ error: "reject must be true" }, { status: 400, headers: corsHeaders(req) });
+              }
+              action = { kind: "reject" };
+              sentinel = "__external__";
+            } else if (body.enter !== undefined) {
+              if (body.enter !== true || cardKind !== "enter") {
+                return json({ error: "this prompt does not take Enter" }, { status: 400, headers: corsHeaders(req) });
+              }
+              action = { kind: "enter" };
+              sentinel = TMUX_ENTER_ANSWER;
+            } else if (body.code !== undefined) {
+              if (cardKind !== "code") {
+                return json({ error: "this prompt does not take a code" }, { status: 400, headers: corsHeaders(req) });
+              }
+              const checked = validateOAuthCode(body.code);
+              if (!checked.ok) {
+                // A fixed sentence per error code: the value is never quoted back.
+                return json({ error: oauthCodeErrorText(checked.error) }, { status: 400, headers: corsHeaders(req) });
+              }
+              action = { kind: "code", code: checked.code };
+              sentinel = TMUX_CODE_ANSWER;
+            } else {
+              const key = typeof body.key === "string" ? body.key : "";
+              if (!key) {
+                return json({ error: "key required" }, { status: 400, headers: corsHeaders(req) });
+              }
+              if (cardKind !== "choice") {
+                return json({ error: "this prompt takes no choice" }, { status: 400, headers: corsHeaders(req) });
+              }
+              // Reject anything not in the recorded choice set — the request
+              // ships the exact keys we want the user to be able to send, and
+              // the UI is the only legitimate caller, so an unknown key here
+              // is an attempt to inject arbitrary keystrokes. Letting it
+              // through would let any code that reaches this endpoint type
+              // into the user's REPL.
+              if (!pending.choices.some((c) => c.key === key)) {
+                return json(
+                  { error: `key '${key}' is not one of the registered choices` },
+                  { status: 400, headers: corsHeaders(req) },
+                );
+              }
+              action = { kind: "choice", key };
+              sentinel = key;
+            }
+            // Drive tmux FIRST. If the session is gone or send-keys
+            // fails, we must not resolve the interaction — doing so would
+            // remove the card from the UI while leaving claude paused on
+            // the modal. The user clicks "Yes", the card vanishes, and
+            // nothing actually happens. Surface the failure so the UI
+            // can leave the card up for retry.
             if (!(await sessionExists(pending.taskId))) {
               return json(
                 { ok: false, error: "tmux session is gone — cancel the run and start a new one" },
                 { status: 410, headers: corsHeaders(req) },
               );
             }
-            await sendModalKeys(pending.taskId, ["Escape"]);
-            markTmuxPromptAnswered(pending.taskId, pending.fingerprint);
-            const ok = answerTmuxPrompt(req.params.id, { key: "__external__" });
-            return json({ ok }, { headers: corsHeaders(req) });
+            const driven = await answerTmuxPromptInPane(pending, action);
+            if (!driven.ok) {
+              if (driven.reason === "no-session") {
+                return json(
+                  { ok: false, error: "tmux session is gone — cancel the run and start a new one" },
+                  { status: 410, headers: corsHeaders(req) },
+                );
+              }
+              if (driven.reason === "dialog-changed") {
+                return json(
+                  { ok: false, error: "the prompt changed on screen — the card will refresh" },
+                  { status: 409, headers: corsHeaders(req) },
+                );
+              }
+              if (driven.reason === "wrong-kind") {
+                return json({ error: "this prompt does not take that answer" }, { status: 400, headers: corsHeaders(req) });
+              }
+              if (driven.reason === "field-not-empty") {
+                // A fixed sentence: whatever is in the field is never quoted.
+                return json(
+                  {
+                    ok: false,
+                    error: "Claude's code field already has text in it — clear it in the terminal, then answer again",
+                    code: "field-not-empty",
+                  },
+                  { status: 409, headers: corsHeaders(req) },
+                );
+              }
+              return json(
+                { ok: false, error: "failed to deliver keystroke to tmux" },
+                { status: 500, headers: corsHeaders(req) },
+              );
+            }
+            // The drive already stamped the fingerprint as just-answered on the
+            // session that received the keys, so the next scrape tick (which may
+            // catch the modal still on screen mid-repaint) doesn't register a
+            // ghost duplicate. See `markTmuxPromptAnswered`.
+            // A refused confirm already replaced this card with a held one. The
+            // card may also have been settled while the add-dir drive verified the
+            // dialog left (the boot poller / scraper sweeps a card whose dialog is
+            // gone): the keys were delivered, so that is still a success, never
+            // `{ ok: false }` (which the CLI and TUI print as "failed").
+            if (!driven.recarded) answerTmuxPrompt(req.params.id, { key: sentinel });
+            // `held`: claude refused the confirm and the card came back; the CLI
+            // and TUI say so instead of "answered" (the app sees the new card).
+            return json({ ok: true, ...(driven.recarded ? { held: true } : {}) }, { headers: corsHeaders(req) });
+          } finally {
+            tmuxAnswersInFlight.delete(pending.id);
           }
-          const key = typeof body.key === "string" ? body.key : "";
-          if (!key) {
-            return json({ error: "key required" }, { status: 400, headers: corsHeaders(req) });
-          }
-          // Reject anything not in the recorded choice set — the request
-          // ships the exact keys we want the user to be able to send, and
-          // the UI is the only legitimate caller, so an unknown key here
-          // is an attempt to inject arbitrary keystrokes. Letting it
-          // through would let any code that reaches this endpoint type
-          // into the user's REPL.
-          if (!pending.choices.some((c) => c.key === key)) {
-            return json(
-              { error: `key '${key}' is not one of the registered choices` },
-              { status: 400, headers: corsHeaders(req) },
-            );
-          }
-          // Drive tmux FIRST. If the session is gone or send-keys
-          // fails, we must not resolve the interaction — doing so would
-          // remove the card from the UI while leaving claude paused on
-          // the modal. The user clicks "Yes", the card vanishes, and
-          // nothing actually happens. Surface the failure so the UI
-          // can leave the card up for retry.
-          if (!(await sessionExists(pending.taskId))) {
-            return json(
-              { ok: false, error: "tmux session is gone — cancel the run and start a new one" },
-              { status: 410, headers: corsHeaders(req) },
-            );
-          }
-          const delivered = await dismissTmuxPrompt(pending.taskId, key, {
-            choices: pending.choices,
-            cursorIndex: pending.cursorIndex,
-            nav: pending.nav,
-            confirmKey: pending.confirmKey,
-          });
-          if (!delivered) {
-            return json(
-              { ok: false, error: "failed to deliver keystroke to tmux" },
-              { status: 500, headers: corsHeaders(req) },
-            );
-          }
-          // Stamp the fingerprint as just-answered before resolving so
-          // the next scrape tick (which may catch the modal still on
-          // screen mid-repaint) doesn't register a ghost duplicate. See
-          // `markTmuxPromptAnswered` for why this is two-step.
-          markTmuxPromptAnswered(pending.taskId, pending.fingerprint);
-          const ok = answerTmuxPrompt(req.params.id, { key });
-          return json({ ok }, { headers: corsHeaders(req) });
         }),
       },
 
@@ -9504,6 +9672,12 @@ export function startApiServer(
             const pendingTaskId = consumePendingOpenTask();
             if (pendingTaskId) {
               send({ type: "open_task", taskId: pendingTaskId, ts: Date.now() });
+            }
+            // Same for a native menu click made with no webview attached
+            // (app-menu.ts parks it for the TTL).
+            const pendingMenuAction = consumePendingMenuAction();
+            if (pendingMenuAction) {
+              send({ type: "menu_action", action: pendingMenuAction, ts: Date.now() });
             }
             // Same for the boot-time "Claude Code sessions found" notice: the
             // launch scan usually finishes before the webview connects.

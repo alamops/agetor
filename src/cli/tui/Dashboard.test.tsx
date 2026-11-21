@@ -2251,3 +2251,39 @@ test("event stream: a same-timestamp askQuestionToolCall revision replaces the p
   expect(frame).not.toContain("Soon");
   unmount();
 });
+
+test("an answer overlay closed while its POST is in flight reports the result but never yanks the mode back", async () => {
+  const taskA = task({ id: "taskA", column: "running", runId: "runA", title: "A", pendingInteractionCount: 1 });
+  let settle: (r: { ok: boolean }) => void = () => {};
+  const client = {
+    listTasks: async () => [taskA],
+    pendingInteractions: async () => [{
+      kind: "tmux_prompt", id: "tp1", taskId: "taskA", runId: "runA", createdAt: 0,
+      paneText: "Login successful. Press Enter to continue…", choices: [], fingerprint: "fp", answerKind: "enter",
+    }],
+    answerTmuxPrompt: () => new Promise<{ ok: boolean }>((resolve) => { settle = resolve; }),
+  } as unknown as AgetorClient;
+  const { lastFrame, stdin, unmount } = render(
+    <Dashboard client={client} core={core} dataDir="/nonexistent-agetor-test" />,
+  );
+  try {
+    await wait(120);
+    stdin.write("g");
+    await wait(120);
+    expect(lastFrame() ?? "").toContain("Continue (press Enter)");
+    stdin.write(ENTER); // posts the answer; the POST hangs
+    await wait(80);
+    stdin.write("\u001b"); // Esc closes the overlay while it is in flight
+    await wait(120);
+    stdin.write("m"); // the user moves on to the compose box
+    await wait(120);
+    expect(lastFrame() ?? "").toContain("→ taskA");
+    settle({ ok: true });
+    await wait(120);
+    const frame = lastFrame() ?? "";
+    expect(frame).toContain("→ taskA"); // still composing
+    expect(flatten(frame)).toContain("✓ answered"); // the result still reached the status line
+  } finally {
+    unmount();
+  }
+});

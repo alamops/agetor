@@ -4,6 +4,7 @@ import { tmpdir } from "node:os";
 import path from "node:path";
 import { test, expect, type E2EBackend, type Locator, type Page } from "./fixtures";
 import { gotoApp, selectProject } from "./helpers";
+import { effortField, modelField, newTaskPanel, openMore, type PickerHandle } from "./launch-helpers";
 
 /**
  * E2E coverage for docs/plans/dynamic-model-catalog.md E1 (acceptance #31, C1,
@@ -68,12 +69,12 @@ function runPanel(page: Page): Locator {
 
 /** The New Task form's Model `<select>` (the refresh button sits in the row
  *  before it, both inside one wrapper — see e2e/fx-models.spec.ts). */
-function modelSelect(page: Page): Locator {
-  return page.getByTestId("refresh-models").locator("xpath=../..").locator("select");
+function modelSelect(page: Page): PickerHandle {
+  return modelField(newTaskPanel(page));
 }
 
-function effortSelect(form: Locator): Locator {
-  return form.getByText("Effort", { exact: true }).locator("xpath=..").locator("select");
+function effortSelect(form: Locator): PickerHandle {
+  return effortField(form);
 }
 
 test.describe("Claude Code model catalog from the CLI", () => {
@@ -99,34 +100,35 @@ test.describe("Claude Code model catalog from the CLI", () => {
       // curated label, rows the CLI did not list come after.
       const select = modelSelect(page);
       await expect
-        .poll(async () => (await select.locator("option").allTextContents())[0], {
+        .poll(async () => (await select.optionLabels())[0], {
           timeout: 20_000,
           message: "the picker never listed the CLI's Opus 6 first",
         })
         .toBe("Opus 6");
-      const labels = await select.locator("option").allTextContents();
+      const labels = await select.optionLabels();
       expect(labels.indexOf("Opus 5.5")).toBeGreaterThan(0);
       expect(labels).toContain("Mythos 5.2"); // curated-only rows are kept
       expect(new Set(labels).size).toBe(labels.length); // no doubled rows
 
       // The owner's default stays on Opus 5.5 (it is in the catalog).
-      await expect(select).toHaveValue("opus-5.5");
+      await select.expectValue("opus-5.5");
 
       // Picking Opus 6 shows ITS ladder, including the effort agetor never heard of.
       await select.selectOption("opus-6");
       const efforts = effortSelect(form);
       await expect
-        .poll(async () => efforts.locator("option").allTextContents(), { timeout: 10_000 })
+        .poll(async () => efforts.optionLabels(), { timeout: 10_000 })
         .toEqual(["Max thinking", "Turbo", "High", "Medium", "Low"]);
 
       // Speed: the model supports Fast, so the control appears with the notice.
-      const speed = form.getByTestId("new-task-speed");
+      await openMore(form);
+      const speed = form.getByTestId("launch-speed");
       await expect(speed).toBeVisible();
-      await form.getByTestId("new-task-speed-fast").click();
-      await expect(form.getByTestId("new-task-speed-hint")).toContainText("Fast mode");
+      await form.getByTestId("launch-speed-fast").click();
+      await expect(form.getByTestId("launch-speed-hint")).toContainText("Fast mode");
       // A model without Fast support takes the control away again and falls back to Off.
       await select.selectOption("opus-5.5");
-      await expect(form.getByTestId("new-task-speed")).toHaveCount(0);
+      await expect(form.getByTestId("launch-speed")).toHaveCount(0);
 
       // A task created on it (through the API, as `agetor add --model opus-6 --effort turbo` would).
       const title = `Opus 6 task ${randomUUID().slice(0, 8)}`;
@@ -173,12 +175,12 @@ test.describe("Claude Code model catalog from the CLI", () => {
       const form = newTaskForm(page);
       await selectProject(page, form, projectName);
       const select = modelSelect(page);
-      await expect(select).toHaveValue("opus-5.5");
-      const labels = await select.locator("option").allTextContents();
+      await select.expectValue("opus-5.5");
+      const labels = await select.optionLabels();
       expect(labels[0]).toBe("Mythos 5.2"); // curated order: nothing discovered
       expect(labels).toContain("Opus 5.5");
       expect(labels).not.toContain("Opus 6");
-      await expect(form.getByTestId("new-task-speed")).toHaveCount(0);
+      await expect(form.getByTestId("launch-speed")).toHaveCount(0);
     });
   });
 });

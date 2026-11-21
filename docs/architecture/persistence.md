@@ -9,7 +9,7 @@ WAL with `synchronous = NORMAL` (crash-consistent, but no fsync per commit — e
 
 **The database worker owns the only production connection** (`docs/plans/non-blocking-core.md`, [core-responsiveness.md](core-responsiveness.md)). The `db` role of `src/bun/core-worker.ts` opens `agetor.sqlite`, runs the migrations and serves every query; the main thread opens none. Production code imports `src/bun/db-async.ts` (same module names as `db.ts`, every method a Promise), never `db.ts` (`src/bun/db-import-guard.test.ts`). The SQL lives in `src/bun/db-core/*.ts` as factories over a connection (`makeTasks(conn)`, …), which both the worker and `db.ts` instantiate.
 
-**Pragmas** (`applyConnectionPragmas`, `src/bun/db-core/connection.ts`, one definition, no per-role split):
+**Pragmas** (`applyConnectionPragmas`, `src/bun/db-core/connection.ts`, one definition, no per-role split; `SQLITE_CACHE_KIB` and `DB_MMAP_SIZE_BYTES` there, pinned by `src/bun/db-pragmas.test.ts` and `db-rpc-worker.test.ts`). On a 4.6 GB DB the 3,363-row task list went from ~1 s at SQLite's defaults to ~0.22 s with the cache and map:
 
 | Pragma | Value | Why |
 |---|---|---|
@@ -17,7 +17,8 @@ WAL with `synchronous = NORMAL` (crash-consistent, but no fsync per commit — e
 | `synchronous` | `NORMAL` | no fsync per commit (above) |
 | `foreign_keys` | `ON` | before `migrate()` runs |
 | `cache_size` | `-65536` (64 MB) | the board's projection and run-events reads stay in memory |
-| `mmap_size` | `268435456` (256 MB) | the same, for a multi-GB file |
+| `mmap_size` | `268435456` (256 MB) | the same, for a multi-GB file: reads come from the OS file cache without a copy (a disk read error surfaces as SIGBUS instead of `SQLITE_IOERR`) |
+| `temp_store` | `MEMORY` | GROUP BY / ORDER BY scratch b-trees stay off disk; set before anything else on the connection, because changing it drops every TEMP object |
 | `busy_timeout` | `5000` ms, every connection | one production connection exists (the worker's), so this only covers the rare external one: the `sqlite3` CLI, a backup, or Compact's `wal_checkpoint(TRUNCATE)` waiting on a reader. It runs on the worker thread, so waiting never blocks the event loop. The `db.ts` singleton (tests, in-process mode) uses the same value |
 
 Write transactions are `BEGIN IMMEDIATE` (`.immediate()` on the transaction, and `tx: true` for a named op), so a writer takes the lock up front instead of failing on a later upgrade. The migration runner checks `_migrations` again inside its own `BEGIN IMMEDIATE`, so two cores starting at once apply each migration once.

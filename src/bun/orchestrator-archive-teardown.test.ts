@@ -477,7 +477,7 @@ test("awaitTeardown: true doesn't resolve until the worktree is actually gone, a
   }
 });
 
-test("awaitTeardown: true on a dirty worktree reports { removed: false, reason: \"dirty\" } and leaves it in place; forceWorktree clears it", async () => {
+test("a dirty worktree refuses the archive with uncommitted-changes and changes nothing; forceWorktree archives and removes it", async () => {
   const { createTask, archiveTask } = await import("./orchestrator.ts");
   const { prepareWorkdir } = await import("./worktree.ts");
   const { db, tasks } = await import("./db.ts");
@@ -502,27 +502,33 @@ test("awaitTeardown: true on a dirty worktree reports { removed: false, reason: 
     const worktreePath = prepared.worktreePath!;
     writeFileSync(path.join(worktreePath, "dirty.txt"), "uncommitted\n");
 
+    // Archive removes the worktree, so without the confirmation it is refused
+    // before anything changes: not archived, the checkout and its file kept.
     const withoutForce = await archiveTask(taskId, { awaitTeardown: true });
-    expect("task" in withoutForce).toBe(true);
-    if (!("task" in withoutForce)) throw new Error(withoutForce.error);
-    expect(withoutForce.teardown).toEqual({ removed: false, reason: "dirty" });
-    expect(existsSync(worktreePath)).toBe(true);
+    expect(withoutForce).toEqual({
+      error: "task has uncommitted changes in its worktree — archiving removes the worktree and discards them; confirm with forceWorktree",
+      code: "uncommitted-changes",
+      repositories: [],
+    });
+    expect(tasks.get(taskId)?.archivedAt).toBeNull();
     expect(existsSync(path.join(worktreePath, "dirty.txt"))).toBe(true);
 
-    // Already archived from the call above — this exercises the
-    // already-archived re-enqueue branch with `forceWorktree` threaded
-    // through to `detachWorktree`'s `force`.
+    // Confirmed: archived, and the dirty checkout is removed with the change.
     const withForce = await archiveTask(taskId, { forceWorktree: true, awaitTeardown: true });
     expect("task" in withForce).toBe(true);
     if (!("task" in withForce)) throw new Error(withForce.error);
+    expect(withForce.task.archivedAt).not.toBeNull();
     expect(withForce.teardown).toEqual({ removed: true });
     expect(existsSync(worktreePath)).toBe(false);
+    // The branch survives for a later unarchive.
+    const branches = Bun.spawnSync(["git", "branch", "--list", prepared.branch!], { cwd: repo });
+    expect(branches.stdout.toString()).toContain(prepared.branch!);
   } finally {
     db.run(`DELETE FROM tasks WHERE id = ?`, [taskId]);
   }
 });
 
-test("steady-state regression: a dirty archived worktree survives every unattended boot sweep and is only cleared by an explicit forced archive", async () => {
+test("steady-state regression: a dirty worktree archived before archives removed it survives every unattended boot sweep and is only cleared by a confirmed archive", async () => {
   const { createTask, archiveTask, pendingTeardown, sweepArchivedTeardowns } = await import("./orchestrator.ts");
   const { prepareWorkdir } = await import("./worktree.ts");
   const { db, tasks } = await import("./db.ts");
@@ -547,11 +553,9 @@ test("steady-state regression: a dirty archived worktree survives every unattend
     const worktreePath = prepared.worktreePath!;
     writeFileSync(path.join(worktreePath, "dirty.txt"), "uncommitted\n");
 
-    // Plain archive — detach skips the dirty checkout, exactly the reported
-    // "delete button does nothing" symptom.
-    const archived = await archiveTask(taskId);
-    if (!("task" in archived)) throw new Error(archived.error);
-    await pendingTeardown(taskId);
+    // An archive from before archives removed dirty worktrees left this row
+    // archived with its dirty checkout on disk. Recreate that state directly.
+    db.run(`UPDATE tasks SET archived_at = ? WHERE id = ?`, [Date.now(), taskId]);
     expect(existsSync(worktreePath)).toBe(true);
 
     // The unattended boot sweep re-enqueues teardown for this row (worktree
@@ -565,8 +569,12 @@ test("steady-state regression: a dirty archived worktree survives every unattend
       expect(existsSync(worktreePath)).toBe(true);
     }
 
-    // Only an explicit, user-confirmed forced archive from the Worktrees page
-    // finally clears it.
+    // A plain repeat archive asks first, like a fresh one, and leaves it.
+    const plain = await archiveTask(taskId, { force: true, awaitTeardown: true });
+    expect(plain).toMatchObject({ code: "uncommitted-changes" });
+    expect(existsSync(path.join(worktreePath, "dirty.txt"))).toBe(true);
+
+    // Only an explicit, user-confirmed archive finally clears it.
     const forced = await archiveTask(taskId, { force: true, forceWorktree: true, awaitTeardown: true });
     expect("task" in forced).toBe(true);
     if (!("task" in forced)) throw new Error(forced.error);
