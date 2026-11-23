@@ -973,11 +973,15 @@ export function PipelineRunView({ taskId, onOpenTask, onBack, onOpenSettingsAgen
         </Tooltip>
         <div className="h-5 w-px shrink-0 bg-border" aria-hidden />
 
-        <div className="flex min-w-0 flex-1 items-center gap-1.5">
+        {/* Shrink order when the bar runs short: the title gives way fastest
+            (shrink-[3]), then the pipeline name and the progress text; the status
+            pill keeps its size. `overflow-hidden` guarantees nothing here can run
+            under the actions. With room to spare, each keeps its full width. */}
+        <div className="flex min-w-0 flex-1 items-center gap-1.5 overflow-hidden">
           <h1
             data-testid="pipeline-run-task-title"
             title={task.title}
-            className="min-w-0 shrink truncate text-sm font-semibold text-foreground"
+            className="min-w-0 shrink-[3] truncate text-sm font-semibold text-foreground"
           >
             {task.title}
           </h1>
@@ -985,7 +989,7 @@ export function PipelineRunView({ taskId, onOpenTask, onBack, onOpenSettingsAgen
           <span
             data-testid="pipeline-run-pipeline-name"
             title={`Pipeline: ${run.pipelineName}`}
-            className="flex min-w-0 max-w-[16rem] shrink-0 items-center gap-1 text-sm text-muted-foreground"
+            className="flex min-w-0 max-w-[16rem] shrink items-center gap-1 text-sm text-muted-foreground"
           >
             <Workflow className="size-3.5 shrink-0 text-info" aria-hidden />
             <span className="truncate">{run.pipelineName}</span>
@@ -1004,10 +1008,10 @@ export function PipelineRunView({ taskId, onOpenTask, onBack, onOpenSettingsAgen
           </Badge>
 
           {progress && pipelineRunHeaderText(progress) !== "" && (
-            // Never squeezed before the title: the title truncates first (its full
-            // text is in its tooltip); the execution counts live in this tooltip.
+            // Squeezed only after the title (its full text is in its tooltip); the
+            // bar hides below `lg`, and the execution counts live in this tooltip.
             <div
-              className="flex shrink-0 items-center gap-2"
+              className="flex min-w-0 shrink items-center gap-2"
               title={[progress.label, progress.runsLabel].filter(Boolean).join(" · ")}
             >
               {!progress.done && progress.total > 0 && (
@@ -1018,7 +1022,7 @@ export function PipelineRunView({ taskId, onOpenTask, onBack, onOpenSettingsAgen
                   aria-valuemax={progress.total}
                   aria-valuenow={progress.completed}
                   data-testid="pipeline-run-progress-bar"
-                  className="h-1.5 w-16 shrink-0 overflow-hidden rounded-full bg-muted"
+                  className="hidden h-1.5 w-16 shrink-0 overflow-hidden rounded-full bg-muted lg:block"
                 >
                   <div
                     className="h-full rounded-full bg-info transition-[width] duration-300 motion-reduce:transition-none"
@@ -1026,14 +1030,14 @@ export function PipelineRunView({ taskId, onOpenTask, onBack, onOpenSettingsAgen
                   />
                 </div>
               )}
-              <span className="max-w-[14rem] truncate text-xs text-muted-foreground" data-testid="pipeline-run-progress">
+              <span className="min-w-0 max-w-[14rem] truncate text-xs text-muted-foreground" data-testid="pipeline-run-progress">
                 {progress.done ? pipelineRunHeaderText(progress) : progress.label}
               </span>
             </div>
           )}
         </div>
 
-        <div className="flex shrink-0 items-center gap-1.5">
+        <div data-testid="pipeline-run-actions" className="flex shrink-0 items-center gap-1.5">
           {actionError && (
             <span role="alert" title={actionError} className="max-w-[18rem] truncate text-xs text-danger">
               {actionError}
