@@ -17,12 +17,14 @@ One component and style pattern for every surface that starts a task, so they ca
 
 ### Section and field order
 
-Panel: **Type**, **Title**, **Prompt** (+ Files / Folders), then the collapsible **Workspace** and **Agent** sections, then the footer. The dialogs put Type and Prompt in the left column and the two sections in a fixed 22 rem right column; each column scrolls on its own, the footer never scrolls.
+Panel: **Type**, **Title**, **Prompt** (its label, then the full-width **MCP · Skills · Plugins · Prompts** picker, then the text box; + Files / Folders), then the collapsible **Workspace** and **Agent** sections, then the footer. The launch surfaces (panel and both Git dialogs) render the composer with `extensionPickerVariant="launch"`: the picker spans the prompt's width and has no Agents group (an agent is picked in the Agent section). RunPanel's send box keeps the compact `toolbar` variant, Agents included. The dialogs put Type and Prompt in the left column and the two sections in a fixed 22 rem right column; each column scrolls on its own, the footer never scrolls.
 
-- **Workspace** (`WorkspaceSection.tsx`): Projects (Select projects), one clickable `Branch · <project>` row per project, the Isolate switch. **More options**: Branch name.
-- **Agent** (`TaskLaunchPickers.tsx`): Pipeline; with no pipeline the selected profile's card, or Harness (with its unavailable / auth / stack-fallback hints directly under it), Code | Plan, Model (with ↻) and Effort, the usage note. **More options**: the agent profile picker ("Manage agents…"), the Approvals picker (the code variants), Speed, Max Mode.
+- **Workspace** (`WorkspaceSection.tsx`): Projects (Select projects, whose search box has a clear (×) button, `select-projects-search-clear`), one clickable `Branch · <project>` row per project, the Isolate switch. **More options**: Branch name.
+- **Agent** (`TaskLaunchPickers.tsx`): Pipeline; with no pipeline the **Agent** (profile) picker ("Manage agents…") right under it, then the selected profile's card, or Harness (with its unavailable / auth / stack-fallback hints directly under it), Model (with ↻) and Effort, the usage note. **More options**: Code | Plan, the Approvals picker (the code variants), Speed, Max Mode.
 
-A collapsed section shows a one-line summary (`lib/launch-summary.ts`): `agetor · current branch · isolated · fix/7c5261`, `Claude Code · Opus 5.5 · High · Code`. A non-default value or an error behind a closed **More options** is announced on its row (`Speed: Fast`, `Branch name is invalid`, danger-toned); nothing that changes the launch hides silently. A selected profile's card stays visible while its picker sits behind More options.
+**A launch always starts in Code.** `seedPickCache` ignores a remembered plan mode, `rememberPickPrefs` writes no `lastMode` for a plan launch (so a remembered code variant survives), `rememberPicks` caches the kind's picks with Code, and the panel switches back to Code after each submit. A Plan pick behind a closed More options is announced on its row (`Mode: Plan`). The `flat` layout (Clone, Settings → Agents) keeps Code | Plan inline between Harness and Model.
+
+A collapsed section shows a one-line summary (`lib/launch-summary.ts`): `agetor · current branch · isolated · fix/7c5261`, `Claude Code · Opus 5.5 · High · Code`. A non-default value or an error behind a closed **More options** is announced on its row (`Speed: Fast`, `Branch name is invalid`, danger-toned); nothing that changes the launch hides silently. A selected profile's card shows right under the Agent picker.
 
 ## One launch state
 
@@ -49,6 +51,7 @@ Every surface renders from `useTaskLaunch` (`lib/use-task-launch.ts`); `lib/laun
 | an inline message | `ui/notice.tsx` (`info`, `warning`, `danger`, `muted`) |
 | rare fields | `ui/disclosure.tsx` via `LaunchSection` / `MoreOptions` |
 | a modal | `ui/dialog.tsx` + `DialogHeader/Title/Description/Body/Footer/Close` |
+| a search box over a list | `ui/search-input.tsx` (`SearchInput`): magnifier, identifier props, and a clear (×) button shown while there is text that refocuses the box |
 | a shortcut hint | `ui/kbd.tsx` (`aria-hidden`, plus `aria-keyshortcuts` on the control) |
 
 A native `<select>` is not used on the launch surfaces, with one exception: Clone's provider select (not part of "Explain this repository"). The native checkboxes that remain are the Select projects rows (multi-select list semantics) and the agent-copy option; both carry `accent-primary`.
@@ -86,6 +89,6 @@ The two Git dialogs share the `dialog` surface keys.
 
 ## Test ids and the e2e helper layer
 
-`new-task-panel`, `new-task-panel-resize`, `launch-section-<workspace|agent>[-toggle|-summary]`, `launch-more-<section>[-region|-note]`, `launch-harness-picker` (+ parts; each row's dot is `launch-harness-status` with `data-tone`), `launch-mode` (`data-mode`, `data-kind`; radios `launch-mode-code|plan`), `launch-mode-variant-picker`, `launch-model-picker`, `launch-refresh-models`, `launch-effort-picker`, `launch-speed[-<tier>|-hint|-note]` (RunPanel's own is `task-speed`), `launch-max-mode-toggle`, `launch-pipeline-picker|summary|change|problem|checking`, `launch-pipelines-loading|error`, `launch-agent-unavailable-hint`, `launch-stack-fallback-hint`, `launch-usage-note`, `launch-run`, `launch-backlog`, `launch-cancel`, `launch-run-blocked-reason`; the dialogs keep `issue-task-submit` / `resolve-conflicts-submit`.
+`new-task-panel`, `new-task-panel-resize`, `extension-picker-trigger`, `select-projects-search[-clear]`, `agent-profiles-search[-clear]` (Settings → Agents; `agent-profiles-no-matches`), `launch-section-<workspace|agent>[-toggle|-summary]`, `launch-more-<section>[-region|-note]`, `launch-harness-picker` (+ parts; each row's dot is `launch-harness-status` with `data-tone`), `launch-mode` (`data-mode`, `data-kind`; radios `launch-mode-code|plan`), `launch-mode-variant-picker`, `launch-model-picker`, `launch-refresh-models`, `launch-effort-picker`, `launch-speed[-<tier>|-hint|-note]` (RunPanel's own is `task-speed`), `launch-max-mode-toggle`, `launch-pipeline-picker|summary|change|problem|checking`, `launch-pipelines-loading|error`, `launch-agent-unavailable-hint`, `launch-stack-fallback-hint`, `launch-usage-note`, `launch-run`, `launch-backlog`, `launch-cancel`, `launch-run-blocked-reason`; the dialogs keep `issue-task-submit` / `resolve-conflicts-submit`.
 
 Specs reach a field through `e2e/launch-helpers.ts` (`pickHarness`, `pickModel`, `modelField(scope).expectValue`, `setPrimaryMode`, `pickSpeed`, `openMore`, …) instead of structural XPath; `gotoApp` opens every More options by default (`launchMoreOpen: false` opts out, as `launch-layout.spec.ts` does).

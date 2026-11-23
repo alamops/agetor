@@ -11,7 +11,7 @@ import { api } from "@/lib/api";
 import { refreshPipelines } from "@/lib/pipelines";
 import { speedNoticeFor } from "../../../shared/model-catalog.ts";
 import { speedLabel } from "../../../shared/speed.ts";
-import { CODE_PLAN_MODE, defaultModeFor } from "../../../shared/types.ts";
+import { defaultModeFor } from "../../../shared/types.ts";
 import { effortTooltip, STACK_FALLBACK_HINT, usageNote } from "@/lib/launch-copy";
 import { agentSummary, moreOptionsNotes } from "@/lib/launch-summary";
 import type { TaskLaunch } from "@/lib/use-task-launch";
@@ -60,11 +60,14 @@ interface Props {
  * (docs/architecture/task-launch-ui.md). Order, in the Agent section:
  *
  *  1. Pipeline — its loading/error/empty hints, or the summary card;
- *  2. with no pipeline: the selected profile's card (always visible), or the
- *     Harness picker with its unavailable / auth / stack-fallback hints directly
- *     under it, then Code | Plan, then Model (with ↻) and Effort, then the usage note;
- *  3. More options: the agent profile picker, the code-variant picker, Speed and
- *     Max Mode (a non-default value is announced on the row while it is closed).
+ *  2. with no pipeline: the Agent (profile) picker, then the selected profile's
+ *     card, or the Harness picker with its unavailable / auth / stack-fallback
+ *     hints directly under it, then Model (with ↻) and Effort, then the usage note;
+ *  3. More options: Code | Plan, the code-variant picker, Speed and Max Mode (a
+ *     non-default value is announced on the row while it is closed).
+ *
+ * The `flat` layout keeps Code | Plan between Harness and Model (Clone, and the
+ * Settings → Agents form, where the mode is part of the record being edited).
  */
 export function TaskLaunchPickers({
   launch,
@@ -232,7 +235,23 @@ export function TaskLaunchPickers({
   }));
   const effortItems: PickerItem[] = efforts.map((e) => ({ value: e.id, label: e.label }));
 
-  const manualBlock = (
+  const modeField = (
+    <div className="space-y-1.5">
+      <Label id={id("mode-label")}>Mode</Label>
+      <ModeControl
+        kind={kind}
+        mode={mode}
+        primary={primaryMode}
+        onModeChange={launch.setMode}
+        disabled={disabled}
+        aria-labelledby={id("mode-label")}
+      />
+    </div>
+  );
+
+  // `withMode`: the flat layout keeps Code | Plan inline; the sections layout
+  // moves it into More options.
+  const manualBlock = (withMode: boolean) => (
     <>
       <Field controlId={id("harness")}>
         <FieldLabel id={id("harness-label")}>Harness</FieldLabel>
@@ -251,17 +270,7 @@ export function TaskLaunchPickers({
         {availabilityHints(selectedStatus, "", fieldDescriptionId(id("harness")))}
       </Field>
 
-      <div className="space-y-1.5">
-        <Label id={id("mode-label")}>Mode</Label>
-        <ModeControl
-          kind={kind}
-          mode={mode}
-          primary={primaryMode}
-          onModeChange={launch.setMode}
-          disabled={disabled}
-          aria-labelledby={id("mode-label")}
-        />
-      </div>
+      {withMode ? modeField : null}
 
       <div className="grid grid-cols-2 gap-2">
         <Field controlId={id("model")} className="min-w-0">
@@ -315,13 +324,19 @@ export function TaskLaunchPickers({
   ) : null;
 
   // ---- 3. More options -----------------------------------------------------------
+  const modeShown = !selectedProfile && !selectedPipeline;
   const variantsShown = !selectedProfile && !selectedPipeline && codeVariants.length > 1;
   const speedShown = !selectedProfile && !selectedPipeline && showsSpeedPicker(speedOptions, speed);
   const maxModeShown = !selectedProfile && !selectedPipeline && kind === "cursor" && (maxModeAvailable || maxMode);
-  const variantLabel =
-    variantsShown && mode !== CODE_PLAN_MODE[kind].plan && mode !== defaultModeFor(kind)
-      ? (modes.find((m) => m.id === mode)?.label ?? mode)
-      : null;
+  // Plan is announced too: Code is the default, so a Plan pick must not hide
+  // behind a closed More options.
+  const variantLabel = !modeShown
+    ? null
+    : primaryMode === "plan"
+      ? "Plan"
+      : variantsShown && mode !== defaultModeFor(kind)
+        ? (modes.find((m) => m.id === mode)?.label ?? mode)
+        : null;
   const notes = moreOptionsNotes({
     speed: speedShown ? speed : null,
     speedLabel: speedLabel(speed),
@@ -372,18 +387,23 @@ export function TaskLaunchPickers({
 
   const moreChildren: ReactNode = (
     <>
-      {selectedPipeline ? null : profilePicker}
+      {modeShown ? modeField : null}
       {variantField}
       {speedField}
       {maxModeField}
     </>
   );
-  const hasMore = !!(!selectedPipeline && profilePicker) || variantsShown || speedShown || maxModeShown;
+  const hasMore = modeShown || variantsShown || speedShown || maxModeShown;
 
   const mainFields = (
     <>
       {pipelineBlock}
-      {selectedPipeline ? null : selectedProfile ? profileBlock : manualBlock}
+      {selectedPipeline ? null : (
+        <>
+          {profilePicker}
+          {selectedProfile ? profileBlock : manualBlock(false)}
+        </>
+      )}
     </>
   );
 
@@ -394,7 +414,7 @@ export function TaskLaunchPickers({
         {selectedPipeline ? null : (
           <>
             {profilePicker}
-            {selectedProfile ? profileBlock : manualBlock}
+            {selectedProfile ? profileBlock : manualBlock(true)}
             {variantField}
             {speedField}
             {maxModeField}

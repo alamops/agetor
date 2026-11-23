@@ -8720,11 +8720,16 @@ function TaskDetails({
           long-lived instance (a re-open inside the exit-animation window, or a
           task switch, never remounts it), so without the key the previous
           task's open state would carry over. */}
-      <details key={task.id} className="border-b border-border/60 px-3 py-2 text-xs">
+      {/* The scroll container is what keeps the send box on screen: a flex item
+          that scrolls has no content-sized minimum, so when the panel runs out
+          of height this block shrinks (and scrolls) first, before anything pins
+          the composer below the fold. Capped at 45vh even when there is room. */}
+      <div data-testid="task-details-scroll" className="max-h-[45vh] min-h-0 shrink overflow-y-auto border-b border-border/60">
+      <details key={task.id} className="px-3 py-2 text-xs">
         <summary className="cursor-pointer text-muted-foreground">
           <span className="text-[10px] uppercase tracking-wide">Task details</span>
         </summary>
-        <div className="mt-2 space-y-2">
+        <div data-testid="task-details-body" className="mt-2 space-y-2">
           <div>
             <div className="text-[10px] uppercase tracking-wide text-muted-foreground">Prompt</div>
             <p className="max-h-48 overflow-y-auto whitespace-pre-wrap text-[11px] leading-snug">{task.prompt}</p>
@@ -8924,6 +8929,7 @@ function TaskDetails({
                 <dd className="min-w-0">
                   <SpeedPicker
                     testId="task-speed"
+                    size="xs"
                     options={speedOptions}
                     value={task.speed}
                     onChange={(speed) => void save({ speed })}
@@ -9118,6 +9124,7 @@ function TaskDetails({
           </dl>
         </div>
       </details>
+      </div>
       <AgentProfileDetailsDialog
         open={profileDialogOpen}
         onClose={() => setProfileDialogOpen(false)}

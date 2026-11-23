@@ -334,7 +334,20 @@ test.describe("pipelines run: executing a run", () => {
     // fake driver's RESOLVE_DELAY_MS under parallel-run load and the first
     // step is already "done" by the time this test looks for "active".
     await openPipelineRunFromBoard(page, backend, title);
+
+    // The top bar leads with the task's title, then the pipeline's name, on one line.
+    const header = page.getByTestId("pipeline-run-header");
+    await expect(header.getByTestId("pipeline-run-task-title")).toHaveText(title);
+    await expect(header.getByTestId("pipeline-run-pipeline-name")).toHaveText("Linear Pipeline");
+    const [titleBox, nameBox] = await Promise.all([
+      header.getByTestId("pipeline-run-task-title").boundingBox(),
+      header.getByTestId("pipeline-run-pipeline-name").boundingBox(),
+    ]);
+    expect(titleBox!.x + titleBox!.width).toBeLessThanOrEqual(nameBox!.x);
+    expect(Math.abs(titleBox!.y + titleBox!.height / 2 - (nameBox!.y + nameBox!.height / 2))).toBeLessThan(4);
+    await expect(header.getByRole("button", { name: "Back to board" })).toBeVisible();
     await startTaskRest(backend, task.id);
+    await expect(header.getByTestId("pipeline-run-progress-bar")).toBeVisible({ timeout: CONVERGE_TIMEOUT });
 
     // Node visuals cycle: A active, then B active (A done), then C active
     // (B done), then all done.

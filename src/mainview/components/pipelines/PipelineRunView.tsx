@@ -1,7 +1,9 @@
 import { useCallback, useEffect, useLayoutEffect, useMemo, useRef, useState } from "react";
 import { ReactFlow, ReactFlowProvider, Background, BackgroundVariant, Controls, useNodesState, useEdgesState } from "@xyflow/react";
 import { AnimatePresence, motion } from "motion/react";
-import { ArrowLeft, CheckCircle2, ChevronDown, RotateCcw, Square, Workflow } from "lucide-react";
+import { ArrowLeft, CheckCircle2, ChevronDown, ChevronRight, RotateCcw, Square, Workflow } from "lucide-react";
+import { Tooltip } from "@/components/ui/tooltip";
+import { cn } from "@/lib/utils";
 import { Badge } from "@/components/ui/badge";
 import { Button } from "@/components/ui/button";
 import { Switch } from "@/components/ui/switch";
@@ -948,29 +950,95 @@ export function PipelineRunView({ taskId, onOpenTask, onBack, onOpenSettingsAgen
 
   return (
     <div data-testid="pipeline-run-view" className="flex h-full min-h-0 w-full flex-col">
-      <div className="flex flex-wrap items-center gap-2 border-b border-border bg-card px-4 py-2.5">
-        <Button type="button" variant="ghost" size="sm" data-testid="pipeline-run-back" onClick={onBack} className="gap-1.5">
-          <ArrowLeft className="size-4" aria-hidden />
-          Back to board
-        </Button>
-        <span className="flex min-w-0 items-center gap-1.5 text-sm font-semibold">
-          <Workflow className="size-4 shrink-0 text-muted-foreground" aria-hidden />
-          <span className="truncate">{run.pipelineName}</span>
-        </span>
-        <Badge
-          variant="secondary"
-          data-testid="pipeline-run-status"
-          className={`border-transparent font-normal ${STATUS_CLASSES[run.status]}`}
-        >
-          {STATUS_LABEL[run.status]}
-        </Badge>
-        {progress && pipelineRunHeaderText(progress) !== "" && (
-          <span className="text-xs text-muted-foreground" data-testid="pipeline-run-progress">
-            {pipelineRunHeaderText(progress)}
+      {/* Top bar: back · task title › pipeline name · status · progress … actions.
+          The task title leads (it is what the user opened); the pipeline name
+          follows as context. Both truncate, never wrap, so the bar keeps one
+          height and the canvas never jumps. */}
+      <header
+        data-testid="pipeline-run-header"
+        className="flex h-12 shrink-0 items-center gap-3 border-b border-border bg-card px-3"
+      >
+        <Tooltip label="Back to board">
+          <Button
+            type="button"
+            variant="ghost"
+            size="icon"
+            data-testid="pipeline-run-back"
+            aria-label="Back to board"
+            onClick={onBack}
+            className="size-8 shrink-0"
+          >
+            <ArrowLeft className="size-4" aria-hidden />
+          </Button>
+        </Tooltip>
+        <div className="h-5 w-px shrink-0 bg-border" aria-hidden />
+
+        <div className="flex min-w-0 flex-1 items-center gap-1.5">
+          <h1
+            data-testid="pipeline-run-task-title"
+            title={task.title}
+            className="min-w-0 shrink truncate text-sm font-semibold text-foreground"
+          >
+            {task.title}
+          </h1>
+          <ChevronRight className="size-3.5 shrink-0 text-muted-foreground/70" aria-hidden />
+          <span
+            data-testid="pipeline-run-pipeline-name"
+            title={`Pipeline: ${run.pipelineName}`}
+            className="flex min-w-0 max-w-[16rem] shrink-0 items-center gap-1 text-sm text-muted-foreground"
+          >
+            <Workflow className="size-3.5 shrink-0 text-info" aria-hidden />
+            <span className="truncate">{run.pipelineName}</span>
           </span>
-        )}
-        <div className="ml-auto flex items-center gap-2">
-          {actionError && <span className="text-xs text-danger">{actionError}</span>}
+
+          <Badge
+            variant="secondary"
+            data-testid="pipeline-run-status"
+            className={cn("ml-1.5 shrink-0 gap-1.5 border-transparent font-medium", STATUS_CLASSES[run.status])}
+          >
+            <span
+              aria-hidden
+              className={cn("size-1.5 rounded-full bg-current", run.status === "running" && "animate-pulse")}
+            />
+            {STATUS_LABEL[run.status]}
+          </Badge>
+
+          {progress && pipelineRunHeaderText(progress) !== "" && (
+            // Never squeezed before the title: the title truncates first (its full
+            // text is in its tooltip); the execution counts live in this tooltip.
+            <div
+              className="flex shrink-0 items-center gap-2"
+              title={[progress.label, progress.runsLabel].filter(Boolean).join(" · ")}
+            >
+              {!progress.done && progress.total > 0 && (
+                <div
+                  role="progressbar"
+                  aria-label="Steps completed"
+                  aria-valuemin={0}
+                  aria-valuemax={progress.total}
+                  aria-valuenow={progress.completed}
+                  data-testid="pipeline-run-progress-bar"
+                  className="h-1.5 w-16 shrink-0 overflow-hidden rounded-full bg-muted"
+                >
+                  <div
+                    className="h-full rounded-full bg-info transition-[width] duration-300 motion-reduce:transition-none"
+                    style={{ width: `${Math.round((progress.completed / progress.total) * 100)}%` }}
+                  />
+                </div>
+              )}
+              <span className="max-w-[14rem] truncate text-xs text-muted-foreground" data-testid="pipeline-run-progress">
+                {progress.done ? pipelineRunHeaderText(progress) : progress.label}
+              </span>
+            </div>
+          )}
+        </div>
+
+        <div className="flex shrink-0 items-center gap-1.5">
+          {actionError && (
+            <span role="alert" title={actionError} className="max-w-[18rem] truncate text-xs text-danger">
+              {actionError}
+            </span>
+          )}
           {showMarkDone && (
             <Button
               type="button"
@@ -981,22 +1049,8 @@ export function PipelineRunView({ taskId, onOpenTask, onBack, onOpenSettingsAgen
               onClick={() => void handleMarkDone()}
               className="gap-1.5"
             >
-              <CheckCircle2 className="size-3.5" aria-hidden />
-              Done
-            </Button>
-          )}
-          {showStop && (
-            <Button
-              type="button"
-              variant="outline"
-              size="sm"
-              data-testid="pipeline-run-stop"
-              disabled={actionBusy}
-              onClick={() => void handleStop()}
-              className="gap-1.5"
-            >
-              <Square className="size-3.5" aria-hidden />
-              Stop
+              <CheckCircle2 className="size-3.5 text-success" aria-hidden />
+              Move to Done
             </Button>
           )}
           {(run.status === "blocked" || run.status === "cancelled") && (
@@ -1016,19 +1070,33 @@ export function PipelineRunView({ taskId, onOpenTask, onBack, onOpenSettingsAgen
           {showRestart && (
             <Button
               type="button"
-              variant="outline"
+              variant="ghost"
               size="sm"
               data-testid="pipeline-run-restart"
               disabled={actionBusy}
               onClick={() => void handleRestart()}
-              className="gap-1.5"
+              className="gap-1.5 text-muted-foreground"
             >
               <RotateCcw className="size-3.5" aria-hidden />
               Restart
             </Button>
           )}
+          {showStop && (
+            <Button
+              type="button"
+              variant="outline"
+              size="sm"
+              data-testid="pipeline-run-stop"
+              disabled={actionBusy}
+              onClick={() => void handleStop()}
+              className="gap-1.5 border-danger/40 text-danger hover:bg-danger/10 hover:text-danger"
+            >
+              <Square className="size-3.5" aria-hidden />
+              Stop
+            </Button>
+          )}
         </div>
-      </div>
+      </header>
 
       <div className="relative flex min-h-0 flex-1">
         <div ref={canvasRef} className="relative min-w-0 flex-1">

@@ -35,6 +35,7 @@ export function SpeedPicker({
   testId,
   fastHint,
   note,
+  size,
 }: {
   options: readonly Speed[];
   value: Speed;
@@ -46,6 +47,8 @@ export function SpeedPicker({
   fastHint?: string;
   /** A short note shown under the control (e.g. "applies on the next run"). */
   note?: string;
+  /** `xs` for a dense row (RunPanel's task details); the launch forms keep the default. */
+  size?: "default" | "sm" | "xs";
 }) {
   if (!showsSpeedPicker(options, value)) return null;
   const offered = options.includes(value);
@@ -70,6 +73,7 @@ export function SpeedPicker({
     <div data-testid={testId} data-value={value}>
       <SegmentedControl
         aria-label="Speed"
+        size={size}
         value={value}
         onChange={(v) => {
           if (v !== value) onChange(v as Speed);

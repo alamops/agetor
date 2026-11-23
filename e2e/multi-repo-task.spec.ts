@@ -596,6 +596,23 @@ test("the terminal section defaults to the workspace and follows the repository 
   await expect(select).toHaveValue(name);
 });
 
+test("opened Task details (the repository list included) never push the send box below the fold", async ({ backend, page }) => {
+  await page.setViewportSize({ width: 1280, height: 640 });
+  await gotoApp(page, backend.bootBase);
+  await page.getByText("Multi repository e2e", { exact: true }).first().click();
+  const send = page.getByTestId("send-textarea");
+  await expect(send).toBeInViewport({ timeout: CONVERGE_TIMEOUT });
+  await page.locator("summary", { hasText: "Task details" }).click();
+  await expect(page.getByTestId("task-details-repositories")).toBeAttached();
+  // The details scroll on their own (capped at 45% of the window) and give up
+  // height first, so the send box stays fully on screen.
+  const scroller = page.getByTestId("task-details-scroll");
+  expect((await scroller.boundingBox())!.height).toBeLessThanOrEqual(640 * 0.45 + 1);
+  await expect(send).toBeInViewport({ ratio: 1 });
+  await page.getByTestId("task-details-repositories").scrollIntoViewIfNeeded();
+  await expect(page.getByTestId("task-details-repositories")).toBeInViewport();
+});
+
 test("the selected repository tab resets on a task switch (sibling of the allPrsBusy reset)", async ({ backend, page }) => {
   // Review S4 regression: `repoTab`/`allPrsBusy` are RunPanelBody-local state
   // and the panel is not remounted between tasks. Without the `[task.id]`
