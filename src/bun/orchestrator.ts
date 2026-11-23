@@ -14191,8 +14191,8 @@ export async function archiveTask(
   // workdir, see `enqueueTeardown`), just off the request's critical path;
   // tasks in a different workdir proceed independently. Callers that must
   // not race a deferred teardown (unarchive, start, delete, terminal open, the boot sweep)
-  // await `pendingTeardown(taskId)` first. `awaitTeardown` is the one opt-in
-  // exception: the Worktrees page explicitly wants to block on this specific
+  // await `pendingTeardown(taskId)` first. `awaitTeardown` is the opt-in
+  // exception: the Worktrees page and `agetor archive` block on this specific
   // teardown to get a truthful result back.
   const { promise, result } = enqueueArchiveTeardown(updated, { force: opts?.forceWorktree });
   if (opts?.awaitTeardown) {

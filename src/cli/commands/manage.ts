@@ -1,14 +1,16 @@
-import { readFileSync } from "node:fs";
+import { existsSync, readFileSync } from "node:fs";
+import { homedir } from "node:os";
 import path from "node:path";
 import { getClient, type Flags } from "../context.ts";
 import { resolveTask } from "../resolve.ts";
-import { c, out, printJson } from "../output.ts";
+import { c, errln, out, printJson } from "../output.ts";
 import { ApiError, type PatchTaskInput } from "../api-client.ts";
 import { COLUMNS, describeArchiveUncommittedChanges, isArchiveUncommittedChanges } from "../../shared/types.ts";
 import { flagValue } from "../args.ts";
 import { parseOpencodeServerFlag, parseSpeedFlag, usageError, warnOpencodeServerFlagIgnored } from "../usage.ts";
-import { escapeControlChars } from "../../shared/terminal-text.ts";
-import type { Task } from "../../shared/types.ts";
+import { escapeControlChars, escapeFreeText } from "../../shared/terminal-text.ts";
+import { isMultiRepoTask } from "../../shared/multi-repo.ts";
+import type { Task, WorktreeTeardownResult } from "../../shared/types.ts";
 
 const COLUMN_IDS = COLUMNS.map((col) => col.id);
 
@@ -150,9 +152,11 @@ export async function cmdArchive(args: string[], flags: Flags): Promise<void> {
   if (!ref) throw usageError("archive");
   const client = await getClient(flags);
   const task = await resolveTask(client, ref);
-  let updated: Task;
+  let updated: Task & { teardown?: WorktreeTeardownResult };
   try {
-    updated = await client.archiveTask(task.id, { forceWorktree: discardChanges });
+    // Wait for the worktree removal so the command reports what happened to
+    // the checkout, not what was queued (issue #315).
+    updated = await client.archiveTask(task.id, { forceWorktree: discardChanges, awaitTeardown: true });
   } catch (e) {
     // Archive removes the worktree; the core refuses when that would discard
     // uncommitted work, and nothing changed. Say why and how to go ahead.
@@ -163,7 +167,103 @@ export async function cmdArchive(args: string[], flags: Flags): Promise<void> {
     throw e;
   }
   if (flags.json) return printJson(updated);
-  out(`${c.gray("archived")} ${c.dim(updated.id.slice(0, 8))}`);
+  out(`${c.green("✓")} archived ${taskLabel(updated)}`);
+  for (const line of archiveReport(task, updated.teardown)) out(line);
+}
+
+/** `<id8>  <title>`, the head of the archive and unarchive reports. */
+function taskLabel(task: Task): string {
+  return `${c.dim(task.id.slice(0, 8))}  ${escapeFreeText(task.title)}`;
+}
+
+/** `path` with the home directory shortened to `~`, escaped for the terminal. */
+export function tildePath(p: string, home: string = homedir()): string {
+  const short = home && (p === home || p.startsWith(home + path.sep)) ? `~${p.slice(home.length)}` : p;
+  return escapeControlChars(short);
+}
+
+/** Why a checkout is still on disk, from its teardown `reason`. */
+function keptReason(reason: WorktreeTeardownResult["reason"]): string {
+  switch (reason) {
+    case "dirty": return "it has uncommitted changes";
+    case "workspace-not-empty": return "it holds files outside its repositories";
+    case "source-missing": return "its source repository no longer exists";
+    default: return "the removal failed";
+  }
+}
+
+const REMOVE_HINT = "Remove it from the Worktrees page, or by hand.";
+
+/**
+ * The lines under `✓ archived <id>` (issue #315): what the archive did to the
+ * task's checkouts, from the teardown outcome the core reports
+ * (`awaitTeardown`) and the row as it was before the archive. A removed
+ * worktree says its branch was kept (unarchive re-creates the worktree from
+ * it); a checkout still on disk is a `!` line with the reason and what to do;
+ * the archive succeeded either way. Nothing to remove (`isolation: "none"`,
+ * never started, a pipeline step, already gone), or a core too old to report
+ * the outcome, adds no lines.
+ */
+export function archiveReport(
+  task: Task,
+  teardown: WorktreeTeardownResult | undefined,
+  home: string = homedir(),
+): string[] {
+  if (!teardown) return [];
+  const gone = (r: WorktreeTeardownResult) => r.reason === "no-worktree" || r.reason === "already-absent";
+  const id8 = task.id.slice(0, 8);
+  const hint = c.dim(`(agetor unarchive ${id8} restores it)`);
+
+  if (!teardown.repositories) {
+    if (!teardown.removed) {
+      if (gone(teardown)) return [];
+      const where = task.worktreePath ? ` ${tildePath(task.worktreePath, home)}` : "";
+      return [
+        `  ${c.yellow("!")} worktree still on disk:${where} ${c.dim(`(${keptReason(teardown.reason)})`)}`,
+        `    ${REMOVE_HINT}`,
+      ];
+    }
+    const rows: [string, string][] = [];
+    if (task.worktreePath) rows.push(["worktree removed", tildePath(task.worktreePath, home)]);
+    else rows.push(["worktree removed", ""]);
+    if (task.branch) rows.push(["branch kept", escapeControlChars(task.branch)]);
+    const width = Math.max(...rows.map(([label]) => label.length));
+    return rows.map(([label, value], i) => {
+      const line = `  ${c.gray(label.padEnd(width))}  ${value}`.trimEnd();
+      return i === rows.length - 1 ? `${line}  ${hint}` : line;
+    });
+  }
+
+  // A multi-repository task: one row per repository that had a checkout. A
+  // problem row carries its `!` in the indent, so the names stay aligned.
+  const branchOf = (name: string) => task.repositories?.find((r) => r.name === name)?.branch ?? null;
+  const pathOf = (name: string) => task.repositories?.find((r) => r.name === name)?.worktreePath ?? null;
+  const shown = teardown.repositories.filter((r) => !gone(r.result) || r.result.removed);
+  const width = Math.max(0, ...shown.map((r) => escapeControlChars(r.name).length));
+  const lines: string[] = [];
+  let stuck = false;
+  for (const { name, result } of shown) {
+    const label = escapeControlChars(name).padEnd(width);
+    if (result.removed) {
+      const branch = branchOf(name);
+      lines.push(`  ${c.bold(label)}  worktree removed${branch ? ` · branch ${escapeControlChars(branch)} kept` : ""}`);
+    } else {
+      stuck = true;
+      const p = pathOf(name);
+      lines.push(
+        `${c.yellow("!")} ${c.bold(label)}  worktree still on disk:${p ? ` ${tildePath(p, home)}` : ""} ${c.dim(`(${keptReason(result.reason)})`)}`,
+      );
+    }
+  }
+  // Every checkout went, but the task workspace survives on other files.
+  if (!teardown.removed && !stuck && !gone(teardown)) {
+    stuck = true;
+    const root = task.worktreePath ?? task.workdir;
+    lines.push(`  ${c.yellow("!")} task workspace still on disk: ${tildePath(root, home)} ${c.dim(`(${keptReason(teardown.reason)})`)}`);
+  }
+  if (stuck) lines.push(`    ${REMOVE_HINT}`);
+  else if (lines.length > 0) lines.push(`  ${hint}`);
+  return lines;
 }
 
 export async function cmdUnarchive(args: string[], flags: Flags): Promise<void> {
@@ -173,5 +273,45 @@ export async function cmdUnarchive(args: string[], flags: Flags): Promise<void> 
   const task = await resolveTask(client, ref);
   const updated = await client.unarchiveTask(task.id);
   if (flags.json) return printJson(updated);
-  out(`${c.green("unarchived")} ${c.dim(updated.id.slice(0, 8))}`);
+  out(`${c.green("✓")} unarchived ${taskLabel(updated)}`);
+  for (const line of unarchiveReport(updated, existsSync)) out(line);
+}
+
+/**
+ * The lines under `✓ unarchived <id>`: whether each worktree is back on disk.
+ * The core re-creates them before it answers, so the CLI (always on the same
+ * machine as the core) checks the paths. A checkout that isn't back is
+ * re-created on the task's next start. A task with no worktree of its own
+ * (`isolation: "none"`, a pipeline step) adds no lines.
+ */
+export function unarchiveReport(
+  task: Task,
+  exists: (p: string) => boolean,
+  home: string = homedir(),
+): string[] {
+  if (task.isolation !== "worktree" || task.pipelineParentId) return [];
+  const id8 = task.id.slice(0, 8);
+  const missingHint = `    ${c.dim(`agetor start ${id8} re-creates it.`)}`;
+  if (!isMultiRepoTask(task)) {
+    if (!task.worktreePath) return [];
+    const p = tildePath(task.worktreePath, home);
+    if (!exists(task.worktreePath)) return [`  ${c.yellow("!")} worktree not re-created: ${p}`, missingHint];
+    const branch = task.branch ? `  ${c.dim(`(branch ${escapeControlChars(task.branch)})`)}` : "";
+    return [`  ${c.gray("worktree re-created")}  ${p}${branch}`];
+  }
+  const repos = (task.repositories ?? []).filter((r) => r.worktreePath);
+  const width = Math.max(0, ...repos.map((r) => escapeControlChars(r.name).length));
+  const lines: string[] = [];
+  let missing = false;
+  for (const r of repos) {
+    const label = c.bold(escapeControlChars(r.name).padEnd(width));
+    if (exists(r.worktreePath!)) {
+      lines.push(`  ${label}  worktree re-created${r.branch ? ` · branch ${escapeControlChars(r.branch)}` : ""}`);
+    } else {
+      missing = true;
+      lines.push(`${c.yellow("!")} ${label}  worktree not re-created: ${tildePath(r.worktreePath!, home)}`);
+    }
+  }
+  if (missing) lines.push(missingHint);
+  return lines;
 }

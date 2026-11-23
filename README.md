@@ -280,7 +280,8 @@ agetor files <id>            # files the agent sent you
 # manage · setup
 agetor edit <id> [flags]     # change title, prompt, harness, model, mode, effort, column…
 agetor move <id> <column>    # e.g. `agetor move <id> done`
-agetor archive <id>          # archive a done task (unarchive to restore)
+agetor archive <id>          # archive a done task: removes its worktree, keeps its branch; refuses a dirty worktree unless --discard-changes
+agetor unarchive <id>        # restore an archived task (re-creates its worktree from the branch)
 agetor rm <id> --yes         # delete a task, its worktree and its branch
 agetor clone <url>           # clone a GitHub/GitLab/Bitbucket repo as a new project
 agetor projects <sub>        # list | add <path> | rm <path> | branches <path>

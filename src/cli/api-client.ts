@@ -8,6 +8,7 @@ import { isTaskDelta, taskDeltaPath } from "../shared/task-delta.ts";
 import type {
   Task,
   Run,
+  WorktreeTeardownResult,
   RunEvent,
   Project,
   Harness,
@@ -120,6 +121,11 @@ const COMPACT_TIMEOUT_MS = 15 * 60_000;
  *  pass is never aborted client-side (a re-run just resumes, trimmed rows are
  *  skipped, but there's no reason to make the user do that). */
 const RETENTION_RUN_TIMEOUT_MS = 15 * 60_000;
+/** `agetor archive` waits for the worktree removal (`awaitTeardown`), which
+ *  queues behind other teardowns of the same repository and runs `git
+ *  worktree remove` on it, and `agetor unarchive` for the `git worktree add`
+ *  that re-creates it; both routes opt out of the server's idle timeout. */
+const ARCHIVE_TIMEOUT_MS = 10 * 60_000;
 
 export class ApiError extends Error {
   constructor(
@@ -357,16 +363,27 @@ export class AgetorClient {
     return this.req("POST", `/tasks/${encodeURIComponent(taskId)}/opencode-session/retry`, undefined, CLONE_TIMEOUT_MS);
   }
   /** `forceWorktree` discards uncommitted changes in the worktree; without it
-   *  a dirty worktree makes the core answer 409 `ArchiveUncommittedChanges`. */
-  archiveTask(id: string, opts: { forceWorktree?: boolean } = {}): Promise<Task> {
+   *  a dirty worktree makes the core answer 409 `ArchiveUncommittedChanges`.
+   *  `awaitTeardown` waits for the worktree removal and returns its outcome as
+   *  `teardown`; a core that predates it leaves `teardown` out. */
+  archiveTask(
+    id: string,
+    opts: { forceWorktree?: boolean; awaitTeardown?: boolean } = {},
+  ): Promise<Task & { teardown?: WorktreeTeardownResult }> {
+    const body = {
+      ...(opts.forceWorktree ? { forceWorktree: true } : {}),
+      ...(opts.awaitTeardown ? { awaitTeardown: true } : {}),
+    };
     return this.req(
       "POST",
       `/tasks/${encodeURIComponent(id)}/archive`,
-      opts.forceWorktree ? { forceWorktree: true } : undefined,
+      Object.keys(body).length > 0 ? body : undefined,
+      opts.awaitTeardown ? ARCHIVE_TIMEOUT_MS : undefined,
     );
   }
+  /** The core re-creates the worktree (`git worktree add`) before it answers. */
   unarchiveTask(id: string): Promise<Task> {
-    return this.req("POST", `/tasks/${encodeURIComponent(id)}/unarchive`);
+    return this.req("POST", `/tasks/${encodeURIComponent(id)}/unarchive`, undefined, ARCHIVE_TIMEOUT_MS);
   }
   getRuns(id: string): Promise<Run[]> {
     return this.req("GET", `/tasks/${encodeURIComponent(id)}/runs`);

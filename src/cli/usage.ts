@@ -175,13 +175,18 @@ export const USAGE: Record<string, string> = {
   archive: `usage: agetor archive <task-id> [--discard-changes]
 
   Archive a done task (unarchive <id> to restore). Archiving removes the
-  task's worktree; its branch and commits are kept. When the worktree has
-  uncommitted changes the archive is refused, unless --discard-changes says
-  to throw them away.`,
+  task's worktree; its branch and commits are kept, and unarchive re-creates
+  the worktree from them. When the worktree has uncommitted changes the
+  archive is refused, unless --discard-changes says to throw them away.
+
+  The command waits for the removal and lists what it removed and kept, with
+  a ! line if a checkout is still on disk. --json prints the archived task
+  with the outcome under "teardown".`,
 
   unarchive: `usage: agetor unarchive <task-id>
 
-  Restore an archived task.`,
+  Restore an archived task. Its worktree is re-created from the branch the
+  archive kept, and the command shows where.`,
 
   diff: `usage: agetor diff <task-id> [--repo <name>]
 
