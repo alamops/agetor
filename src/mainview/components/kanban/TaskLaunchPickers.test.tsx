@@ -44,10 +44,8 @@ describe("TaskLaunchPickers — sections layout", () => {
       "launch-section-agent",
       "launch-section-agent-toggle",
       "launch-pipeline-picker",
+      "agent-profile-picker",
       "launch-harness-picker",
-      "launch-mode",
-      "launch-mode-code",
-      "launch-mode-plan",
       "launch-model-picker",
       "launch-refresh-models",
       "launch-effort-picker",
@@ -56,12 +54,26 @@ describe("TaskLaunchPickers — sections layout", () => {
       expect(html).toContain(`data-testid="${id}"`);
     }
   });
+  test("the Agent picker sits right under Pipeline, above Harness", () => {
+    const at = (id: string) => html.indexOf(`data-testid="${id}"`);
+    expect(at("launch-pipeline-picker")).toBeLessThan(at("agent-profile-picker"));
+    expect(at("agent-profile-picker")).toBeLessThan(at("launch-harness-picker"));
+  });
+  test("Code | Plan sits behind the closed More options", () => {
+    expect(html).not.toContain('data-testid="launch-mode"');
+  });
+  test("a Plan pick is announced on the closed More options row", () => {
+    const plan = renderToStaticMarkup(
+      <TaskLaunchPickers launch={fakeLaunch({ mode: "plan", primaryMode: "plan" })} layout="sections" surface="panel" />,
+    );
+    expect(plan).toContain("Mode: Plan");
+  });
   test("has no native <select> and no aria-pressed segments", () => {
     expect(html).not.toContain("<select");
     expect(html).not.toContain("aria-pressed");
   });
   test("every field has an associated label", () => {
-    for (const name of ["Pipeline", "Harness", "Mode", "Model", "Effort"]) expect(html).toContain(`>${name}</`);
+    for (const name of ["Pipeline", "Agent", "Harness", "Model", "Effort"]) expect(html).toContain(`>${name}</`);
     expect(html).toMatch(/<label[^>]*for="[^"]+"[^>]*id="[^"]*harness-label"|<label[^>]*id="[^"]*harness-label"[^>]*for=/);
   });
 });
@@ -74,6 +86,11 @@ describe("TaskLaunchPickers — flat layout", () => {
     expect(html).toContain('data-testid="launch-harness-picker"');
     expect(html).toContain('data-testid="launch-model-picker"');
     expect(html).not.toContain("<select");
+  });
+  test("keeps Code | Plan inline between Harness and Model", () => {
+    const html = renderToStaticMarkup(<TaskLaunchPickers launch={fakeLaunch()} layout="flat" hideProfilePicker />);
+    expect(html.indexOf("launch-harness-picker")).toBeLessThan(html.indexOf('data-testid="launch-mode"'));
+    expect(html.indexOf('data-testid="launch-mode"')).toBeLessThan(html.indexOf("launch-model-picker"));
   });
   test("Speed and Max Mode render inline for a cursor model that offers them", () => {
     const html = renderToStaticMarkup(

@@ -595,6 +595,15 @@ test("search filters project rows", async ({ page, backend }) => {
   await search.fill(path.basename(repoB));
   await expect(dialog.getByLabel(`Select ${repoB}`, { exact: true })).toBeVisible();
   await expect(dialog.getByLabel(`Select ${repoA}`, { exact: true })).toBeHidden();
+
+  // The × clears the search, shows every project again and keeps the cursor in the box.
+  const clear = dialog.getByTestId("select-projects-search-clear");
+  await clear.click();
+  await expect(search).toHaveValue("");
+  await expect(search).toBeFocused();
+  await expect(clear).toHaveCount(0);
+  await expect(dialog.getByLabel(`Select ${repoA}`, { exact: true })).toBeVisible();
+  await expect(dialog.getByLabel(`Select ${repoB}`, { exact: true })).toBeVisible();
 });
 
 test("Add folder opens at the current selection and selects what it adds", async ({ page, request, freshBackend }) => {

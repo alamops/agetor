@@ -57,12 +57,16 @@ describe("initialPickCache / seedPickCache", () => {
       "lastSpeed:claude-code": "fast",
       "lastMaxMode:cursor": "true",
       "lastMode:gemini": "ask",
+      "lastMode:cursor": "ask",
     });
-    expect(cache["claude-code"].mode).toBe("plan");
+    // A launch always starts in Code: a remembered plan mode is ignored.
+    expect(cache["claude-code"].mode).toBe(defaultModeFor("claude-code"));
     expect(cache["claude-code"].model).toBe(claudeModel);
     expect(cache["claude-code"].speed).toBe("fast");
     expect(cache.cursor.maxMode).toBe(true);
-    expect(cache.gemini.mode).toBe("ask");
+    // gemini's "ask" is its Plan mode, so it is ignored; cursor's "ask" is a code variant and kept.
+    expect(cache.gemini.mode).toBe(defaultModeFor("gemini"));
+    expect(cache.cursor.mode).toBe("ask");
     expect(pending["claude-code"]).toBeUndefined();
   });
 
@@ -119,6 +123,11 @@ describe("rememberPickPrefs", () => {
     ]);
     expect(rememberPickPrefs("claude-code", { ...p, effort: null }).map(([k]) => k)).not.toContain("lastEffort:claude-code");
     expect(rememberPickPrefs("claude-code", p).find(([k]) => k.startsWith("lastSpeed"))![1]).toBe("fast");
+  });
+  test("a plan-mode launch writes no lastMode (a code variant still does)", () => {
+    const p = { mode: CODE_PLAN_MODE.codex.plan, model: "m", effort: null, speed: "off" as const, maxMode: false };
+    expect(rememberPickPrefs("codex", p).map(([k]) => k)).not.toContain("lastMode:codex");
+    expect(rememberPickPrefs("claude-code", { ...p, mode: "acceptEdits" })).toContainEqual(["lastMode:claude-code", "acceptEdits"]);
   });
   test("lastMaxMode is true only for cursor", () => {
     const p = { mode: "auto", model: "m", effort: null, speed: "off" as const, maxMode: true };

@@ -1138,6 +1138,38 @@ test.describe("agent profiles — Settings surface", () => {
     expect(names).not.toContain(`${sourceName} (copy 2)`);
   });
 
+  test("Search filters the agents list, and the × clears it", async ({ page, request, backend }) => {
+    const tag = randomUUID().slice(0, 8);
+    const alpha = await createAgentProfileRest(request, backend, {
+      name: `Search Alpha ${tag}`, harness: "claude-code", model: "sonnet-5", effort: "medium",
+      mode: null, speed: "off", maxMode: false, instructions: "", skills: [],
+    });
+    const beta = await createAgentProfileRest(request, backend, {
+      name: `Search Beta ${tag}`, harness: "claude-code", model: "sonnet-5", effort: "medium",
+      mode: null, speed: "off", maxMode: false, instructions: "", skills: [],
+    });
+    createdProfileIds.push(alpha.id, beta.id);
+
+    await gotoApp(page, backend.bootBase);
+    const dialog = await openSettingsAgents(page);
+    const section = dialog.getByTestId("agent-profiles-section");
+    const row = (id: string) => section.locator(`[data-testid="agent-profile-row"][data-profile-id="${id}"]`);
+    const search = section.getByTestId("agent-profiles-search");
+
+    await search.fill(`alpha ${tag}`);
+    await expect(row(alpha.id)).toBeVisible();
+    await expect(row(beta.id)).toHaveCount(0);
+
+    await search.fill(`nothing-matches-${tag}`);
+    await expect(section.getByTestId("agent-profiles-no-matches")).toBeVisible();
+
+    await section.getByTestId("agent-profiles-search-clear").click();
+    await expect(search).toHaveValue("");
+    await expect(search).toBeFocused();
+    await expect(row(alpha.id)).toBeVisible();
+    await expect(row(beta.id)).toBeVisible();
+  });
+
   test("Duplicate copies cursor speed and max mode without changing the source", async ({ page, request, backend }) => {
     await patchHarness(request, backend, "cursor", { enabled: true });
     try {

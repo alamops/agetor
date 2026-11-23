@@ -511,6 +511,10 @@ export interface PromptComposerProps {
   /** Right-aligned cluster at the END of the toolbar row, after `actions` —
    *  RunPanel puts its Send button here so the actions and Send share a row. */
   toolbarEnd?: ReactNode;
+  /** `ExtensionPicker`'s variant. `"launch"` (the task-launch surfaces) puts
+   *  the label on its own row and the picker full width under it, without the
+   *  Agents group; `"toolbar"` (default) keeps both on one row (RunPanel). */
+  extensionPickerVariant?: "toolbar" | "launch";
   /**
    * External override for the hint line normally driven by
    * `activeCapture.dropHint`. `undefined` (the default) leaves that
@@ -573,6 +577,7 @@ export function PromptComposer({
   textareaTestId = "prompt-textarea",
   textareaAriaLabel,
   toolbarEnd,
+  extensionPickerVariant = "toolbar",
   hint,
   hintClassName,
 }: PromptComposerProps) {
@@ -1047,7 +1052,25 @@ export function PromptComposer({
       {referencesPosition === "before" && referencesPicker}
       <div className={innerClassName}>
         {notice}
-        {toolbar && (
+        {toolbar && extensionPickerVariant === "launch" && (
+          <div className="space-y-1.5">
+            {label !== null && <FieldLabel htmlFor={textareaId}>{label}</FieldLabel>}
+            <ExtensionPicker
+              variant="launch"
+              extensions={extensions}
+              savedPrompts={savedPrompts}
+              onPromptsOpen={reload}
+              value={value}
+              onChange={onChange}
+              textareaRef={ref}
+              placement={placement}
+              disabled={disabled || !fileScope?.dir?.trim()}
+            />
+            {actions && <div className="flex flex-wrap items-center gap-1.5">{actions}</div>}
+            {toolbarEnd && <div className="flex justify-end gap-2">{toolbarEnd}</div>}
+          </div>
+        )}
+        {toolbar && extensionPickerVariant !== "launch" && (
           <div className="flex flex-wrap items-center justify-between gap-x-2 gap-y-1.5">
             {label !== null && <FieldLabel htmlFor={textareaId}>{label}</FieldLabel>}
             <ExtensionPicker

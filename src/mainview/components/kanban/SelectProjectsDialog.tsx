@@ -1,10 +1,9 @@
 import { useEffect, useMemo, useRef, useState } from "react";
-import { FolderGit2, FolderPlus, GitBranch, Import, Loader2, Search, Trash2, TriangleAlert } from "lucide-react";
+import { FolderGit2, FolderPlus, GitBranch, Import, Loader2, Trash2, TriangleAlert } from "lucide-react";
 import { api } from "@/lib/api";
 import { Button } from "@/components/ui/button";
 import { Dialog, DialogBody, DialogFooter, DialogHeader, DialogTitle, DialogDescription } from "@/components/ui/dialog";
-import { Input } from "@/components/ui/input";
-import { IDENTIFIER_INPUT_PROPS } from "@/lib/identifier-input";
+import { SearchInput } from "@/components/ui/search-input";
 import {
   dedupeSelections,
   projectRowLabels,
@@ -297,19 +296,14 @@ export function SelectProjectsDialog({ open, onClose, value, onSave, lockedPath,
         </DialogHeader>
 
         <DialogBody className="space-y-3">
-        <div className="flex items-center gap-2 rounded-md border border-input bg-background px-3">
-          <Search className="size-3.5 shrink-0 text-muted-foreground" aria-hidden />
-          <Input
-            ref={searchRef}
-            data-testid="select-projects-search"
-            {...IDENTIFIER_INPUT_PROPS}
-            value={query}
-            onChange={(e) => setQuery(e.target.value)}
-            placeholder="Search projects…"
-            aria-label="Search projects"
-            className="border-0 px-0 shadow-none focus-visible:ring-0"
-          />
-        </div>
+        <SearchInput
+          ref={searchRef}
+          testId="select-projects-search"
+          value={query}
+          onValueChange={setQuery}
+          placeholder="Search projects…"
+          aria-label="Search projects"
+        />
 
         <div className="space-y-1.5" data-testid="select-projects-list">
           {visible.length === 0 ? (

@@ -79,7 +79,7 @@ test.describe("New Task panel layout", () => {
       "select-projects-button",
       "isolate-toggle",
       "launch-harness-picker",
-      "launch-mode",
+      "agent-profile-picker",
       "launch-model-picker",
       "launch-effort-picker",
     ]) {
@@ -88,7 +88,17 @@ test.describe("New Task panel layout", () => {
     await expect(panel.getByPlaceholder("Short description")).toBeVisible();
     // The rare ones are not rendered until the disclosure opens.
     await expect(panel.getByTestId("branch-name-input")).toHaveCount(0);
-    await expect(panel.getByTestId("agent-profile-picker")).toHaveCount(0);
+    await expect(panel.getByTestId("launch-mode")).toHaveCount(0);
+    // The Agent (profile) picker sits right under Pipeline, above Harness.
+    const order = await panel.locator('[data-testid="launch-pipeline-picker"], [data-testid="agent-profile-picker"], [data-testid="launch-harness-picker"]')
+      .evaluateAll((els) => els.map((el) => el.getAttribute("data-testid")));
+    expect(order).toEqual(["launch-pipeline-picker", "agent-profile-picker", "launch-harness-picker"]);
+    // The composer's MCP / Skills / Plugins / Prompts trigger spans the prompt's width and has no Agents group.
+    const extTrigger = panel.getByTestId("extension-picker-trigger");
+    await expect(extTrigger).toHaveText(/MCP · Skills · Plugins · Prompts/);
+    await expect(extTrigger).not.toContainText("Agents");
+    const [triggerBox, promptBox] = await Promise.all([extTrigger.boundingBox(), panel.getByTestId("prompt-textarea").boundingBox()]);
+    expect(Math.abs(triggerBox!.width - promptBox!.width)).toBeLessThan(2);
 
     // Every field is reachable by its label (a real <label for> / aria-labelledby, not a sibling).
     await expect(panel.getByLabel("Title", { exact: true })).toHaveCount(1);
@@ -96,6 +106,7 @@ test.describe("New Task panel layout", () => {
     await expect(panel.getByLabel("Projects", { exact: true })).toHaveCount(1);
     await expect(panel.getByLabel("Isolate (worktree)", { exact: true })).toHaveCount(1);
     await expect(panel.getByRole("radiogroup", { name: "Type" })).toHaveCount(1);
+    await openMore(panel);
     await expect(panel.getByRole("radiogroup", { name: "Mode" })).toHaveCount(1);
     for (const [id, name] of [
       ["launch-harness-picker-trigger", /^Harness\b/],

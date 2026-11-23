@@ -93,6 +93,8 @@ export function initialPickCache(): PickCache {
  *   becomes a *pending* seed: it is applied once discovery shows it is real.
  * - A remembered effort is validated against the curated table only (discovery
  *   has not landed yet); the render-path effort check is the authority later.
+ * - A launch always starts in Code: a remembered plan mode is ignored (an older
+ *   build, or the CLI, may have stored one), a remembered code variant is kept.
  */
 export function seedPickCache(
   cache: PickCache,
@@ -107,7 +109,7 @@ export function seedPickCache(
     const e = prefs[`lastEffort:${kind}`];
     const sp = prefs[`lastSpeed:${kind}`];
     const mm = prefs[`lastMaxMode:${kind}`];
-    if (md && AGENT_OPTIONS[kind].modes.some((x) => x.id === md)) picks.mode = md;
+    if (md && md !== CODE_PLAN_MODE[kind].plan && AGENT_OPTIONS[kind].modes.some((x) => x.id === md)) picks.mode = md;
     if (m && !CLI_AUTHORITATIVE_CATALOG_KINDS.has(kind) && AGENT_OPTIONS[kind].models.some((x) => x.id === m)) {
       picks.model = m;
     } else if (m) {
@@ -144,12 +146,13 @@ export function switchPicks(
  * The preference writes a launch makes so the next one starts on the same
  * picks (`lastMode`, `lastModel`, `lastEffort` when set, `lastSpeed`,
  * `lastMaxMode`). Max Mode is cursor-only, so any other kind writes `"false"`.
+ * A plan-mode launch writes no `lastMode`: a launch always starts in Code, and
+ * keeping the previous value keeps the user's remembered code variant.
  */
 export function rememberPickPrefs(kind: AgentKind, picks: LaunchPicks): Array<[key: string, value: string]> {
-  const out: Array<[string, string]> = [
-    [`lastMode:${kind}`, picks.mode],
-    [`lastModel:${kind}`, picks.model],
-  ];
+  const out: Array<[string, string]> = [];
+  if (picks.mode !== CODE_PLAN_MODE[kind].plan) out.push([`lastMode:${kind}`, picks.mode]);
+  out.push([`lastModel:${kind}`, picks.model]);
   if (picks.effort !== null) out.push([`lastEffort:${kind}`, picks.effort]);
   out.push([`lastSpeed:${kind}`, picks.speed]);
   out.push([`lastMaxMode:${kind}`, String(kind === "cursor" && picks.maxMode)]);

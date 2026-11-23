@@ -412,6 +412,7 @@ export function CreateTaskFromIssueDialog({ open, onClose, context, onCreated, o
 
                 <PromptComposer
                   value={prompt}
+                  extensionPickerVariant="launch"
                   onChange={(v) => { setPrompt(v); setPromptDirty(true); }}
                   agent={launch.effectiveAgent}
                   references={references}

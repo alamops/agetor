@@ -8,8 +8,8 @@ import {
   writeFakeCodexCatalog,
   type FakeCodexModel,
 } from "../src/bun/test-codex-app-server.ts";
-import { AGENT_OPTIONS, DEFAULT_MODEL } from "../src/shared/types.ts";
-import { modeField, modelField, newTaskPanel, pickHarness, type PickerHandle } from "./launch-helpers";
+import { AGENT_OPTIONS, CODE_PLAN_MODE, DEFAULT_MODEL } from "../src/shared/types.ts";
+import { expectHarness, modeField, modelField, newTaskPanel, openMore, type PickerHandle } from "./launch-helpers";
 
 /**
  * E2E coverage for the codex side of docs/plans/dynamic-model-catalog.md:
@@ -129,24 +129,29 @@ async function optionValues(select: PickerHandle | Locator): Promise<string[]> {
 }
 
 /**
- * Remember `model` (plus a non-default mode, `ask`, whose label is the
- * positive signal that the remembered picks have been read: the model
- * assertions that follow would otherwise pass before a wrong seed lands).
+ * Remember `model`, plus `defaultHarness: codex` as the positive signal that
+ * the remembered picks have been read (the model assertions that follow would
+ * otherwise pass before a wrong seed lands). Codex offers no Code mode besides
+ * its default, so a remembered mode can't be that signal; a remembered `ask`
+ * (codex's Plan) is still stored, and the form must ignore it.
  */
 async function rememberCodexPicks(request: APIRequestContext, backend: E2EBackend, model: string): Promise<void> {
   await putPreference(request, backend, "lastModel:codex", model);
   await putPreference(request, backend, "lastMode:codex", "ask");
+  await putPreference(request, backend, "defaultHarness", "codex");
 }
 
-/** Open the New Task form on the Codex harness and wait until the remembered
- *  picks are applied (the Mode trigger reads codex's `ask` label). */
+/** Open the New Task form and wait until the remembered picks are applied: the
+ *  form lands on Codex by itself (`defaultHarness` applies only once the
+ *  preferences are read, in the same step that seeds the remembered picks), and
+ *  starts in Code even though `lastMode:codex` says `ask`. */
 async function openFormOnCodex(page: Page, backend: E2EBackend, projectName: string): Promise<Locator> {
   await gotoApp(page, backend.bootBase);
   const form = newTaskForm(page);
-  await pickHarness(form, "Codex");
+  await expectHarness(form, "Codex");
   await selectProject(page, form, projectName);
-  // Codex's `ask` mode ("Read-only") is its Plan bucket.
-  await modeField(form).expectValue("ask", { timeout: 15_000 });
+  await openMore(form);
+  await modeField(form).expectValue(CODE_PLAN_MODE.codex.code, { timeout: 15_000 });
   return form;
 }
 

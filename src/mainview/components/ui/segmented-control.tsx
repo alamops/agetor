@@ -17,7 +17,8 @@ export interface SegmentedControlProps {
   "aria-label"?: string;
   "aria-labelledby"?: string;
   testId?: string;
-  size?: "default" | "sm";
+  /** `xs`: a compact inline group sized to its labels (RunPanel's task details). */
+  size?: "default" | "sm" | "xs";
   disabled?: boolean;
   className?: string;
   /** Lay the radios out in a grid of N columns instead of one wrapping row. */
@@ -96,7 +97,7 @@ export function SegmentedControl({
             }}
             className={cn(
               "inline-flex min-w-0 flex-1 items-center justify-center gap-1.5 rounded-md border px-3 text-sm font-medium transition-colors focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring disabled:cursor-not-allowed disabled:opacity-50",
-              size === "sm" ? "h-8 text-xs" : "h-9",
+              size === "xs" ? "h-6 flex-none px-2 text-2xs" : size === "sm" ? "h-8 text-xs" : "h-9",
               checked
                 ? "border-primary/60 bg-accent text-accent-foreground"
                 : "border-input bg-background text-muted-foreground hover:bg-accent/50 hover:text-foreground",

@@ -1,9 +1,10 @@
-import { useState } from "react";
+import { useMemo, useState } from "react";
 import { Download, Plus } from "lucide-react";
 import { toast } from "sonner";
 import { api } from "@/lib/api";
 import { Button } from "@/components/ui/button";
 import { useConfirm } from "@/components/ui/confirm";
+import { SearchInput } from "@/components/ui/search-input";
 import type { AgentProfile, Harness } from "../../../shared/types.ts";
 import { AgentProfileCard } from "@/components/kanban/AgentProfileCard";
 import { useAgentProfiles } from "@/lib/agent-profiles";
@@ -18,6 +19,16 @@ function taskCountLabel(taskCount: number | undefined): string {
   const n = taskCount ?? 0;
   if (n === 0) return "Not used by any task yet";
   return `Used by ${n} task${n === 1 ? "" : "s"}`;
+}
+
+/** Whether `p` matches the Settings → Agents search: every whitespace-separated
+ *  term must appear in the name, the harness (id or label), the model, the
+ *  effort or the instructions, case-insensitively. */
+export function agentProfileMatches(p: AgentProfile, query: string, harnessLabel?: string): boolean {
+  const terms = query.trim().toLowerCase().split(/\s+/).filter(Boolean);
+  if (terms.length === 0) return true;
+  const hay = [p.name, p.harness, harnessLabel ?? "", p.model, p.effort ?? "", p.instructions].join("\n").toLowerCase();
+  return terms.every((t) => hay.includes(t));
 }
 
 interface Props {
@@ -53,6 +64,11 @@ export function AgentProfilesSection({ harnesses, onAdd, onEdit, onDuplicate, on
   const [deletingId, setDeletingId] = useState<string | null>(null);
   const confirm = useConfirm();
   const bundle = useBundleList({ ids: profiles.map((p) => p.id), kind: "agent", onImported });
+  const [query, setQuery] = useState("");
+  const visible = useMemo(
+    () => profiles.filter((p) => agentProfileMatches(p, query, harnesses.find((h) => h.id === p.harness)?.label)),
+    [profiles, query, harnesses],
+  );
 
   const remove = async (p: AgentProfile) => {
     const n = p.taskCount ?? 0;
@@ -96,6 +112,16 @@ export function AgentProfilesSection({ harnesses, onAdd, onEdit, onDuplicate, on
 
       <BundleToolbar {...bundle.toolbarProps} />
 
+      {profiles.length > 0 && (
+        <SearchInput
+          testId="agent-profiles-search"
+          value={query}
+          onValueChange={setQuery}
+          placeholder="Search agents…"
+          aria-label="Search agents"
+        />
+      )}
+
       {loadError && (
         <div className="rounded-md border border-destructive/40 bg-destructive/10 px-3 py-2 text-xs text-destructive-foreground">
           {loadError}
@@ -104,7 +130,7 @@ export function AgentProfilesSection({ harnesses, onAdd, onEdit, onDuplicate, on
 
       {!loading && (
         <div className="space-y-1.5">
-          {profiles.map((p) => (
+          {visible.map((p) => (
             <div
               key={p.id}
               data-testid="agent-profile-row"
@@ -154,6 +180,11 @@ export function AgentProfilesSection({ harnesses, onAdd, onEdit, onDuplicate, on
               </div>
             </div>
           ))}
+          {profiles.length > 0 && visible.length === 0 && (
+            <p data-testid="agent-profiles-no-matches" className="text-xs text-muted-foreground">
+              No agents match "{query.trim()}".
+            </p>
+          )}
           {profiles.length === 0 && (
             <p className="text-xs text-muted-foreground">
               No agents yet. Bundle a harness, model, effort, and instructions into a reusable preset you can

@@ -254,6 +254,7 @@ export function ResolveConflictsDialog({ open, onClose, context, onCreated, onMa
 
                 <PromptComposer
                   value={prompt}
+                  extensionPickerVariant="launch"
                   onChange={(v) => { setPrompt(v); setPromptDirty(true); }}
                   agent={launch.effectiveAgent}
                   references={references}

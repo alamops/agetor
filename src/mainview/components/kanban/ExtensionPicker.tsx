@@ -33,6 +33,11 @@ interface Props {
   /** Fired when the popover opens — lets a caller refetch `savedPrompts` so
    *  edits made in Settings mid-session show up without a remount. */
   onPromptsOpen?: () => void;
+  /** `"toolbar"` (default): a compact trigger in the composer's label row
+   *  (RunPanel's send box). `"launch"`: the task-launch surfaces — a full-width
+   *  trigger and popover, and no Agents group (those surfaces pick an agent
+   *  profile in the Agent section instead). */
+  variant?: "toolbar" | "launch";
 }
 
 const KINDS = [
@@ -41,6 +46,9 @@ const KINDS = [
   { kind: "plugin", label: "Plugins", Icon: Puzzle },
   { kind: "agent", label: "Agents", Icon: Bot },
 ] as const;
+
+/** The groups the `"launch"` variant shows: no Agents. */
+const LAUNCH_KINDS = KINDS.filter((k) => k.kind !== "agent");
 
 /** A group row is either an MCP/skill/plugin/agent entry or a saved prompt — the
  *  tag lets the flattened keyboard-nav list and the row renderer dispatch
@@ -68,7 +76,10 @@ export function ExtensionPicker({
   align = "left",
   disabled,
   onPromptsOpen,
+  variant = "toolbar",
 }: Props) {
+  const launch = variant === "launch";
+  const kinds = launch ? LAUNCH_KINDS : KINDS;
   const [open, setOpen] = useState(false);
   const [query, setQuery] = useState("");
   const [active, setActive] = useState(0);
@@ -117,7 +128,7 @@ export function ExtensionPicker({
     const q = query.trim().toLowerCase();
     const match = (e: AvailableExtension) =>
       !q || (e.name + " " + e.description).toLowerCase().includes(q);
-    const extGroups = KINDS.map(({ kind, label, Icon }) => ({
+    const extGroups = kinds.map(({ kind, label, Icon }) => ({
       key: kind as string,
       label,
       Icon,
@@ -127,7 +138,7 @@ export function ExtensionPicker({
     // Saved Prompts always renders last, after mcp/skill/plugin/agent.
     return [...extGroups, { key: "prompt", label: "Saved Prompts", Icon: BookText, rows: promptRows }]
       .filter((g) => g.rows.length > 0);
-  }, [extensions, savedPrompts, query]);
+  }, [extensions, savedPrompts, query, kinds]);
 
   // Flattened, display-order list so ↑/↓ can move a single highlight across
   // group boundaries; the render derives each row's global index from this.
@@ -174,21 +185,26 @@ export function ExtensionPicker({
   const insert = (row: Row) => insertText(row.tag === "ext" ? row.ext.insert : row.prompt.content);
 
   return (
-    <div ref={rootRef} className="relative min-w-0">
+    <div ref={rootRef} className={cn("relative min-w-0", launch && "w-full")}>
       <button
         type="button"
         data-testid="extension-picker-trigger"
         disabled={disabled}
         onClick={() => setOpen((o) => !o)}
-        title="Insert an MCP server, skill, plugin, or agent reference, or a saved prompt"
+        title={launch
+          ? "Insert an MCP server, skill or plugin reference, or a saved prompt"
+          : "Insert an MCP server, skill, plugin, or agent reference, or a saved prompt"}
         className={cn(
           "inline-flex h-8 max-w-full items-center gap-1.5 rounded-md border border-input bg-background px-2.5 text-xs text-muted-foreground",
+          launch && "w-full",
           "transition-colors hover:bg-accent/40 hover:text-foreground focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring disabled:cursor-not-allowed disabled:opacity-50 disabled:hover:bg-background disabled:hover:text-muted-foreground",
           open && "bg-accent/40 text-foreground",
         )}
       >
         <Blocks className="size-3.5 shrink-0" aria-hidden />
-        <span className="min-w-0 truncate">MCP · Skills · Plugins · Agents · Prompts</span>
+        <span className={cn("min-w-0 truncate", launch && "flex-1 text-left")}>
+          {launch ? "MCP · Skills · Plugins · Prompts" : "MCP · Skills · Plugins · Agents · Prompts"}
+        </span>
         <ChevronDown aria-hidden className={cn("size-3.5 shrink-0 transition-transform", open && "rotate-180")} />
       </button>
 
@@ -202,9 +218,10 @@ export function ExtensionPicker({
           data-popover-keys="escape-only"
           data-testid="extension-picker-popover"
           className={cn(
-            "absolute z-30 w-72 max-w-[90vw] overflow-hidden rounded-md border border-border/60 bg-card text-card-foreground shadow-lg",
+            "absolute z-30 max-w-[90vw] overflow-hidden rounded-md border border-border/60 bg-card text-card-foreground shadow-lg",
+            launch ? "inset-x-0 w-full" : "w-72",
             placement === "above" ? "bottom-full mb-1" : "top-full mt-1",
-            align === "right" ? "right-0" : "left-0",
+            !launch && (align === "right" ? "right-0" : "left-0"),
           )}
         >
           <div className="border-b border-border/60 p-1.5">
@@ -235,8 +252,10 @@ export function ExtensionPicker({
           <div ref={listRef} className="max-h-64 overflow-y-auto py-1">
             {grouped.length === 0 ? (
               <p className="px-3 py-2 text-2xs text-muted-foreground">
-                {extensions.length === 0 && (savedPrompts?.length ?? 0) === 0
-                  ? "No MCP servers, skills, plugins, or agents found for this project, and no saved prompts."
+                {!extensions.some((e) => kinds.some((k) => k.kind === e.kind)) && (savedPrompts?.length ?? 0) === 0
+                  ? launch
+                    ? "No MCP servers, skills or plugins found for this project, and no saved prompts."
+                    : "No MCP servers, skills, plugins, or agents found for this project, and no saved prompts."
                   : "No matches."}
               </p>
             ) : (

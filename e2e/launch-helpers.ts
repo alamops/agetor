@@ -138,10 +138,13 @@ export async function modelLabel(scope: Locator, id: string): Promise<string> {
 
 // ---- Mode ----------------------------------------------------------------------------
 
+/** Code | Plan sits behind the Agent section's More options (opened first). */
 export async function setPrimaryMode(scope: Locator, mode: "code" | "plan"): Promise<void> {
+  await openMore(scope);
   await scope.getByTestId(`launch-mode-${mode}`).click();
 }
 export async function expectPrimaryMode(scope: Locator, mode: "code" | "plan"): Promise<void> {
+  await openMore(scope);
   await expect(scope.getByTestId(`launch-mode-${mode}`)).toBeChecked();
 }
 export async function pickModeVariant(scope: Locator, label: string): Promise<void> {

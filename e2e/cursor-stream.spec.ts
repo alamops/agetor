@@ -4,7 +4,7 @@ import { tmpdir } from "node:os";
 import path from "node:path";
 import { test, expect, type APIRequestContext, type E2EBackend, type Locator, type Page } from "./fixtures";
 import { gotoApp, selectProject } from "./helpers";
-import { modeField, pickHarness } from "./launch-helpers";
+import { modeField, openMore, pickHarness } from "./launch-helpers";
 
 /**
  * E2E coverage for docs/plans/fx-0.0.14-and-cursor-updates.md E3 (D33 flow
@@ -134,7 +134,8 @@ test.describe("cursor stream (worker backend)", () => {
     await pickHarness(form, "Cursor");
     await selectProject(page, form, projectName);
 
-    // Code | Plan: Plan routes to cursor-agent's `--mode plan`.
+    // Code | Plan (in the Agent section's More options): Plan routes to cursor-agent's `--mode plan`.
+    await openMore(form);
     const planButton = form.getByTestId("launch-mode-plan");
     await planButton.click();
     await expect(planButton).toHaveAttribute("title", /--mode plan/);

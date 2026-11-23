@@ -207,7 +207,7 @@ test.describe("New Task panel: assembled launch behaviors", () => {
     await expectPrimaryMode(panel, "code");
   });
 
-  test("P2: a backlog submit remembers mode, model, effort and speed per kind across a reload", async ({ page, request, freshBackend }) => {
+  test("P2: a backlog submit remembers model, effort and speed per kind across a reload, and always starts back in Code", async ({ page, request, freshBackend }) => {
     await enableCodexAndWait(request, freshBackend);
     await waitForClaudeCatalog(request, freshBackend);
     const project = `launch-behaviors-p2-${randomUUID().slice(0, 8)}`;
@@ -250,7 +250,9 @@ test.describe("New Task panel: assembled launch behaviors", () => {
     await expectModel(reloaded, CODEX_FAST);
     await expectEffort(reloaded, "high");
     await expectSpeed(reloaded, "fast");
-    await expectPrimaryMode(reloaded, "plan");
+    // A launch always starts in Code: a Plan pick is never remembered.
+    await expectPrimaryMode(reloaded, "code");
+    expect(prefs["lastMode:codex"]).toBeUndefined();
   });
 
   test("P3: a remembered model only the CLI's catalog knows is applied once the catalog lands", async ({ page, request, freshBackend }) => {

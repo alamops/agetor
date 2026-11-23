@@ -334,7 +334,20 @@ test.describe("pipelines run: executing a run", () => {
     // fake driver's RESOLVE_DELAY_MS under parallel-run load and the first
     // step is already "done" by the time this test looks for "active".
     await openPipelineRunFromBoard(page, backend, title);
+
+    // The top bar leads with the task's title, then the pipeline's name, on one line.
+    const header = page.getByTestId("pipeline-run-header");
+    await expect(header.getByTestId("pipeline-run-task-title")).toHaveText(title);
+    await expect(header.getByTestId("pipeline-run-pipeline-name")).toHaveText("Linear Pipeline");
+    const [titleBox, nameBox] = await Promise.all([
+      header.getByTestId("pipeline-run-task-title").boundingBox(),
+      header.getByTestId("pipeline-run-pipeline-name").boundingBox(),
+    ]);
+    expect(titleBox!.x + titleBox!.width).toBeLessThanOrEqual(nameBox!.x);
+    expect(Math.abs(titleBox!.y + titleBox!.height / 2 - (nameBox!.y + nameBox!.height / 2))).toBeLessThan(4);
+    await expect(header.getByRole("button", { name: "Back to board" })).toBeVisible();
     await startTaskRest(backend, task.id);
+    await expect(header.getByTestId("pipeline-run-progress-bar")).toBeVisible({ timeout: CONVERGE_TIMEOUT });
 
     // Node visuals cycle: A active, then B active (A done), then C active
     // (B done), then all done.
@@ -345,6 +358,18 @@ test.describe("pipelines run: executing a run", () => {
     await expect(stepNode(page, B.id)).toHaveAttribute("data-visual", "done");
     await expect(stepNode(page, C.id)).toHaveAttribute("data-visual", "done", { timeout: CONVERGE_TIMEOUT });
     await expect(page.getByTestId("pipeline-run-status")).toHaveText("Done");
+
+    // A narrow window shrinks the title, pipeline name and progress text; none of
+    // them runs under the actions (Move to Done, Restart).
+    const fullViewport = page.viewportSize()!;
+    await page.setViewportSize({ width: 900, height: fullViewport.height });
+    await expect(header.getByTestId("pipeline-run-restart")).toBeVisible();
+    const actionsBox = (await header.getByTestId("pipeline-run-actions").boundingBox())!;
+    for (const id of ["pipeline-run-status", "pipeline-run-progress", "pipeline-run-pipeline-name", "pipeline-run-task-title"]) {
+      const box = (await header.getByTestId(id).boundingBox())!;
+      expect({ id, right: Math.min(box.x + box.width, actionsBox.x) }).toEqual({ id, right: box.x + box.width });
+    }
+    await page.setViewportSize(fullViewport);
 
     // The handoff token rides the LATEST transition's edge — after the run
     // settles that's B->C (C's own record is terminal), so exactly one

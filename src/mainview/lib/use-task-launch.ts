@@ -27,6 +27,7 @@ import {
   codeVariants as codeVariantsFor,
   harnessStatusTone,
   initialPickCache,
+  modeForPrimary,
   primaryModeOf,
   rememberPickPrefs,
   resolveSeedOutcome,
@@ -703,8 +704,11 @@ export function useTaskLaunch(
     // A profile- or pipeline-backed launch didn't come from manually-picked
     // values — nothing of the user's own intent to remember (owner D12).
     if (agentProfileId || pipelineId) return;
-    pickCache.current[kind] = currentPicks();
-    for (const [key, value] of rememberPickPrefs(kind, currentPicks())) {
+    // A launch always starts in Code (docs/architecture/task-launch-ui.md), so
+    // the cached picks this kind comes back to hold Code, not a Plan pick.
+    const picks = currentPicks();
+    pickCache.current[kind] = { ...picks, mode: modeForPrimary(kind, picks.mode, "code") ?? picks.mode };
+    for (const [key, value] of rememberPickPrefs(kind, picks)) {
       void api.setPreference(key, value).catch(() => {});
     }
   };

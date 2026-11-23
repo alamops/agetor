@@ -29,7 +29,7 @@ import { useWorktreeOptions } from "./WorktreeOptions";
 import { TaskLaunchPickers, useTaskLaunch } from "./TaskLaunchPickers";
 import { WorkspaceSection } from "./WorkspaceSection";
 import { LaunchFooter } from "./LaunchFooter";
-import { launchGate, submitPicks } from "@/lib/launch-state";
+import { launchGate, modeForPrimary, submitPicks } from "@/lib/launch-state";
 import { useSubmitShortcut } from "@/lib/use-submit-shortcut";
 import {
   NEW_TASK_PANEL_COLLAPSED_KEY,
@@ -328,8 +328,12 @@ export function NewTaskForm({ onSubmit, agents, harnesses, stacks = [], onOpenSe
     // The project selection and its per-project refs stay for the next task.
     launch.setAgentProfileId(null);
     launch.setPipelineId(null);
-    // Keep the selection, `model`, `effort`, `mode` set on purpose — the next
-    // task should default to the same projects + picks the user just used.
+    // A launch always starts in Code: a Plan pick (it sits behind More options)
+    // does not carry over to the next task.
+    const codeMode = modeForPrimary(launch.kind, launch.mode, "code");
+    if (codeMode) launch.setMode(codeMode);
+    // Keep the selection, `model`, `effort` and the code variant set on purpose —
+    // the next task should default to the same projects + picks the user just used.
   };
 
   // Cmd/Ctrl+Enter runs the task from anywhere inside the panel.
@@ -463,7 +467,7 @@ export function NewTaskForm({ onSubmit, agents, harnesses, stacks = [], onOpenSe
                 <h2 className="text-sm font-semibold">New task</h2>
                 <InfoTip
                   label="How these fields fit together"
-                  text="A task is a unit of agent work. Type, Title and Prompt say what to do. Project, Branch and Isolate say where — with Isolate on, work happens on a fresh branch in a separate worktree, so your checkout stays clean. Harness, Mode, Model and Effort pick which agent runs it and how much autonomy it gets. Defaults are sensible — a title, a prompt and a project are enough to start."
+                  text="A task is a unit of agent work. Type, Title and Prompt say what to do. Project, Branch and Isolate say where — with Isolate on, work happens on a fresh branch in a separate worktree, so your checkout stays clean. Pipeline, Agent, Harness, Model and Effort pick which agent runs it; Mode (under More options) starts in Code. Defaults are sensible — a title, a prompt and a project are enough to start."
                 />
               </div>
             </div>
@@ -484,6 +488,7 @@ export function NewTaskForm({ onSubmit, agents, harnesses, stacks = [], onOpenSe
 
               <PromptComposer
                 value={prompt}
+                extensionPickerVariant="launch"
                 onChange={setPrompt}
                 agent={launch.effectiveAgent}
                 references={references}
