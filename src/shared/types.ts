@@ -2804,10 +2804,10 @@ export function isArchiveUncommittedChanges(body: unknown): body is ArchiveUncom
  * `POST /tasks/:id/archive` when the caller passes `awaitTeardown: true`.
  *
  * Archive normally defers teardown onto a per-workdir background queue and
- * responds in milliseconds, so the response carries no outcome at all. The
- * Worktrees page's "Archive & delete" is the one caller that needs to know
- * whether the directory is *actually* gone before it refreshes the list — it
- * opts in, and gets this back.
+ * responds in milliseconds, so the response carries no outcome at all. Two
+ * callers need to know whether the directory is *actually* gone, so they opt
+ * in and get this back: the Worktrees page's "Archive & delete", before it
+ * refreshes the list, and `agetor archive`, which reports it (issue #315).
  *
  * `reason` is only meaningful when `removed` is false:
  * - `"dirty"` — the checkout had uncommitted changes and `forceWorktree` was
