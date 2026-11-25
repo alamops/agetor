@@ -1,0 +1,101 @@
+{
+  "$schema": "http://json-schema.org/draft-07/schema#",
+  "type": "object",
+  "properties": {
+    "kind": {
+      "type": "string",
+      "const": "tmux_prompt"
+    },
+    "id": {
+      "type": "string"
+    },
+    "taskId": {
+      "type": "string"
+    },
+    "runId": {
+      "type": "string"
+    },
+    "pipelineParentId": {
+      "type": "string"
+    },
+    "paneText": {
+      "type": "string"
+    },
+    "choices": {
+      "type": "array",
+      "items": {
+        "$ref": "#/definitions/TmuxPromptChoice"
+      }
+    },
+    "cursorIndex": {
+      "type": "number"
+    },
+    "nav": {
+      "type": "string",
+      "enum": [
+        "vertical",
+        "horizontal"
+      ]
+    },
+    "confirmKey": {
+      "type": "string"
+    },
+    "fingerprint": {
+      "type": "string"
+    },
+    "createdAt": {
+      "type": "number"
+    },
+    "unparsable": {
+      "type": "boolean"
+    },
+    "hideKeys": {
+      "type": "boolean"
+    },
+    "answerKind": {
+      "type": "string",
+      "enum": [
+        "choice",
+        "enter",
+        "code"
+      ]
+    },
+    "held": {
+      "type": "boolean"
+    },
+    "identity": {
+      "type": "string"
+    }
+  },
+  "required": [
+    "kind",
+    "id",
+    "taskId",
+    "runId",
+    "paneText",
+    "choices",
+    "fingerprint",
+    "createdAt"
+  ],
+  "additionalProperties": false,
+  "definitions": {
+    "TmuxPromptChoice": {
+      "type": "object",
+      "properties": {
+        "key": {
+          "type": "string"
+        },
+        "label": {
+          "type": "string"
+        }
+      },
+      "required": [
+        "key",
+        "label"
+      ],
+      "additionalProperties": false
+    }
+  },
+  "$id": "https://agetor.dev/schemas/remote/routes/TmuxPromptRequest.json",
+  "title": "TmuxPromptRequest"
+}

@@ -135,11 +135,29 @@ export function installNotificationPolicy(deps: NotificationPolicyDeps): Notific
   };
   const unsubscribe = deps.subscribe((ev) => void handleEvent(ev));
 
-  // Opening a task ends the protection of a forced post made while the window was focused (was `dismissTaskToast`).
+  // What the window shows decides entries too (it used to be the webview's job):
+  //  - opening a task (the run panel, or the full-page pipeline run view) ends the protection of a forced post made while the window
+  //    was focused (was `dismissTaskToast`) and removes the task's Notification Center entry;
+  //  - focus returning to a window that already shows a task clears that task's entry (D6d: the entry may have arrived in the
+  //    background). It does not mark the task seen.
+  const sinkRemove = (taskId: string) => {
+    forced.forget(taskId);
+    for (const sink of [...sinks]) {
+      try {
+        sink.remove?.({ taskId });
+      } catch {
+        /* ignore */
+      }
+    }
+  };
   let lastSelected: string | null = pres.presence().selectedTaskId;
+  let lastFocused = pres.presence().focused;
   const unwatch = pres.onPresenceChange((p) => {
-    if (p.selectedTaskId !== null && p.selectedTaskId !== lastSelected) forced.forget(p.selectedTaskId);
+    const opened = p.selectedTaskId !== null && p.selectedTaskId !== lastSelected;
+    const refocused = p.focused && !lastFocused && p.selectedTaskId !== null;
     lastSelected = p.selectedTaskId;
+    lastFocused = p.focused;
+    if ((opened || refocused) && p.selectedTaskId !== null) sinkRemove(p.selectedTaskId);
   });
 
   const policy: NotificationPolicy = {

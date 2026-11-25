@@ -1,0 +1,395 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://agetor.dev/schemas/remote/messages/request.json",
+  "title": "request",
+  "x-direction": "phone",
+  "type": "object",
+  "properties": {
+    "id": {
+      "type": "string",
+      "maxLength": 64,
+      "minLength": 1,
+      "pattern": "^[A-Za-z0-9._:~-]+$"
+    },
+    "method": {
+      "type": "string",
+      "enum": [
+        "GET",
+        "POST",
+        "PUT",
+        "PATCH",
+        "DELETE"
+      ]
+    },
+    "path": {
+      "type": "string",
+      "maxLength": 2000,
+      "minLength": 1,
+      "pattern": "^\\/[^\\s?#]*$"
+    },
+    "query": {
+      "anyOf": [
+        {
+          "type": "string",
+          "maxLength": 4000,
+          "pattern": "^[^\\s#]*$"
+        },
+        {
+          "type": "null"
+        }
+      ]
+    },
+    "body": {
+      "anyOf": [
+        {
+          "description": "any JSON value, at most 1048576 characters when serialized"
+        },
+        {
+          "type": "null"
+        }
+      ]
+    },
+    "idem": {
+      "anyOf": [
+        {
+          "type": "string",
+          "pattern": "^[0-9a-f]{32}$"
+        },
+        {
+          "type": "null"
+        }
+      ]
+    },
+    "decision": {
+      "anyOf": [
+        {
+          "type": "object",
+          "properties": {
+            "payload": {
+              "type": "object",
+              "properties": {
+                "v": {
+                  "const": 1
+                },
+                "kind": {
+                  "const": "decision"
+                },
+                "deviceId": {
+                  "type": "string",
+                  "pattern": "^[0-9a-f]{32}$"
+                },
+                "sessionHash": {
+                  "type": "string",
+                  "pattern": "^[0-9a-f]{64}$"
+                },
+                "challenge": {
+                  "type": "string",
+                  "pattern": "^[0-9a-f]{32}$"
+                },
+                "route": {
+                  "type": "string",
+                  "maxLength": 400,
+                  "minLength": 3
+                },
+                "target": {
+                  "oneOf": [
+                    {
+                      "type": "object",
+                      "properties": {
+                        "kind": {
+                          "const": "plan"
+                        },
+                        "taskId": {
+                          "type": "string",
+                          "maxLength": 128,
+                          "minLength": 1,
+                          "pattern": "^[A-Za-z0-9._:~-]+$"
+                        },
+                        "planId": {
+                          "type": "string",
+                          "maxLength": 128,
+                          "minLength": 1,
+                          "pattern": "^[A-Za-z0-9._:~-]+$"
+                        }
+                      },
+                      "required": [
+                        "kind",
+                        "taskId",
+                        "planId"
+                      ],
+                      "additionalProperties": false
+                    },
+                    {
+                      "type": "object",
+                      "properties": {
+                        "kind": {
+                          "const": "plan-edit"
+                        },
+                        "taskId": {
+                          "type": "string",
+                          "maxLength": 128,
+                          "minLength": 1,
+                          "pattern": "^[A-Za-z0-9._:~-]+$"
+                        },
+                        "planId": {
+                          "type": "string",
+                          "maxLength": 128,
+                          "minLength": 1,
+                          "pattern": "^[A-Za-z0-9._:~-]+$"
+                        },
+                        "body": {
+                          "type": "string",
+                          "maxLength": 262144
+                        }
+                      },
+                      "required": [
+                        "kind",
+                        "taskId",
+                        "planId",
+                        "body"
+                      ],
+                      "additionalProperties": false
+                    },
+                    {
+                      "type": "object",
+                      "properties": {
+                        "kind": {
+                          "const": "claude-plan"
+                        },
+                        "taskId": {
+                          "type": "string",
+                          "maxLength": 128,
+                          "minLength": 1,
+                          "pattern": "^[A-Za-z0-9._:~-]+$"
+                        },
+                        "promptId": {
+                          "type": "string",
+                          "maxLength": 128,
+                          "minLength": 1,
+                          "pattern": "^[A-Za-z0-9._:~-]+$"
+                        },
+                        "row": {
+                          "type": "string",
+                          "enum": [
+                            "auto",
+                            "manual"
+                          ]
+                        }
+                      },
+                      "required": [
+                        "kind",
+                        "taskId",
+                        "promptId",
+                        "row"
+                      ],
+                      "additionalProperties": false
+                    },
+                    {
+                      "type": "object",
+                      "properties": {
+                        "kind": {
+                          "const": "tmux-card"
+                        },
+                        "taskId": {
+                          "type": "string",
+                          "maxLength": 128,
+                          "minLength": 1,
+                          "pattern": "^[A-Za-z0-9._:~-]+$"
+                        },
+                        "promptId": {
+                          "type": "string",
+                          "maxLength": 128,
+                          "minLength": 1,
+                          "pattern": "^[A-Za-z0-9._:~-]+$"
+                        }
+                      },
+                      "required": [
+                        "kind",
+                        "taskId",
+                        "promptId"
+                      ],
+                      "additionalProperties": false
+                    },
+                    {
+                      "type": "object",
+                      "properties": {
+                        "kind": {
+                          "const": "fx-permission"
+                        },
+                        "taskId": {
+                          "type": "string",
+                          "maxLength": 128,
+                          "minLength": 1,
+                          "pattern": "^[A-Za-z0-9._:~-]+$"
+                        },
+                        "permissionId": {
+                          "type": "string",
+                          "maxLength": 128,
+                          "minLength": 1,
+                          "pattern": "^[A-Za-z0-9._:~-]+$"
+                        }
+                      },
+                      "required": [
+                        "kind",
+                        "taskId",
+                        "permissionId"
+                      ],
+                      "additionalProperties": false
+                    },
+                    {
+                      "type": "object",
+                      "properties": {
+                        "kind": {
+                          "const": "gate"
+                        },
+                        "taskId": {
+                          "type": "string",
+                          "maxLength": 128,
+                          "minLength": 1,
+                          "pattern": "^[A-Za-z0-9._:~-]+$"
+                        },
+                        "stepId": {
+                          "type": "string",
+                          "maxLength": 128,
+                          "minLength": 1,
+                          "pattern": "^[A-Za-z0-9._:~-]+$"
+                        },
+                        "seq": {
+                          "type": "integer",
+                          "minimum": 0,
+                          "maximum": 2147483648
+                        }
+                      },
+                      "required": [
+                        "kind",
+                        "taskId",
+                        "stepId",
+                        "seq"
+                      ],
+                      "additionalProperties": false
+                    },
+                    {
+                      "type": "object",
+                      "properties": {
+                        "kind": {
+                          "const": "fx-resume"
+                        },
+                        "taskId": {
+                          "type": "string",
+                          "maxLength": 128,
+                          "minLength": 1,
+                          "pattern": "^[A-Za-z0-9._:~-]+$"
+                        }
+                      },
+                      "required": [
+                        "kind",
+                        "taskId"
+                      ],
+                      "additionalProperties": false
+                    },
+                    {
+                      "type": "object",
+                      "properties": {
+                        "kind": {
+                          "const": "terminal"
+                        },
+                        "taskId": {
+                          "type": "string",
+                          "maxLength": 128,
+                          "minLength": 1,
+                          "pattern": "^[A-Za-z0-9._:~-]+$"
+                        },
+                        "tmuxSession": {
+                          "type": "string",
+                          "maxLength": 64,
+                          "minLength": 1,
+                          "pattern": "^[A-Za-z0-9._:~-]+$"
+                        }
+                      },
+                      "required": [
+                        "kind",
+                        "taskId",
+                        "tmuxSession"
+                      ],
+                      "additionalProperties": false
+                    }
+                  ]
+                },
+                "contentHash": {
+                  "type": "string",
+                  "maxLength": 71,
+                  "minLength": 71,
+                  "pattern": "^sha256:[0-9a-f]{64}$"
+                },
+                "decision": {
+                  "type": "string",
+                  "enum": [
+                    "approve",
+                    "allow-once",
+                    "accept",
+                    "return",
+                    "resume",
+                    "attach",
+                    "edit"
+                  ]
+                },
+                "comment": {
+                  "anyOf": [
+                    {
+                      "type": "string",
+                      "maxLength": 4000
+                    },
+                    {
+                      "type": "null"
+                    }
+                  ]
+                },
+                "ts": {
+                  "type": "integer",
+                  "minimum": 0,
+                  "maximum": 253402300799999
+                }
+              },
+              "required": [
+                "v",
+                "kind",
+                "deviceId",
+                "sessionHash",
+                "challenge",
+                "route",
+                "target",
+                "contentHash",
+                "decision",
+                "comment",
+                "ts"
+              ],
+              "additionalProperties": false
+            },
+            "sig": {
+              "type": "string",
+              "pattern": "^[0-9a-f]{128}$"
+            }
+          },
+          "required": [
+            "payload",
+            "sig"
+          ],
+          "additionalProperties": false
+        },
+        {
+          "type": "null"
+        }
+      ]
+    }
+  },
+  "required": [
+    "id",
+    "method",
+    "path",
+    "query",
+    "body",
+    "idem",
+    "decision"
+  ],
+  "additionalProperties": false
+}

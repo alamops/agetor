@@ -111,7 +111,6 @@ import type {
 import { TASK_EVENTS_REPLAY_META_EVENT, taskListPath, type TaskDelta, type TaskListOptions } from "../../shared/types.ts";
 import { isTaskDelta, taskDeltaPath } from "../../shared/task-delta.ts";
 import { parseReplayMeta } from "../../shared/task-stream-resume.ts";
-import type { NotificationKind } from "../../shared/os-notification.ts";
 import type { DiscoveredModel } from "../../shared/model-options.ts";
 import type {
   BundleExportResponse,
@@ -2352,31 +2351,13 @@ export const api = {
       `/runs/${runId}/rebuild-events${limit ? `?limit=${limit}` : ""}`,
     ),
 
-  /** Fire a native macOS notification via the Bun process. Fire-and-forget
-   *  — the OS handles display. When `taskId` is provided, the Bun side
-   *  encodes it into an `agetor://task/<id>` deep-link so clicking the
-   *  notification opens straight to that task, not just app focus. */
-  notifyOS: (input: {
-    title: string;
-    body?: string;
-    subtitle?: string;
-    silent?: boolean;
-    taskId?: string;
-    /** The event kind; the core uses it for the entry's urgency (sound) and
-     *  for the reason-scoped removals. */
-    kind?: NotificationKind;
-  }) =>
-    j<{ ok: boolean }>("/notifications", {
-      method: "POST",
+  /** Tell the core what the window shows (focus, the open task, its view). The core decides every OS notification from it
+   *  (src/bun/notification-policy.ts); the webview no longer posts or clears one. Fire-and-forget: `lib/presence-report.ts`
+   *  debounces, dedupes and backs off. */
+  reportPresence: (input: { focused: boolean; selectedTaskId: string | null; view: "run-panel" | "pipeline" | null }) =>
+    j<{ ok: boolean }>("/app/presence", {
+      method: "PUT",
       body: JSON.stringify(input),
-    }),
-
-  /** Remove a task's Notification Center entry (the focused-window update
-   *  path: the in-app toast carries the news, so the older entry goes).
-   *  Fire-and-forget like `notifyOS`; callers `.catch(() => {})`. */
-  clearTaskNotification: (taskId: string) =>
-    j<{ ok: boolean }>(`/notifications/${encodeURIComponent(taskId)}`, {
-      method: "DELETE",
     }),
 
   /** App-wide lifecycle event stream. Live-only (no replay) — subscribers

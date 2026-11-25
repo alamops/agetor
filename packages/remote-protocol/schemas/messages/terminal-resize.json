@@ -1,0 +1,31 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://agetor.dev/schemas/remote/messages/terminal-resize.json",
+  "title": "terminal-resize",
+  "x-direction": "phone",
+  "type": "object",
+  "properties": {
+    "taskId": {
+      "type": "string",
+      "maxLength": 128,
+      "minLength": 1,
+      "pattern": "^[A-Za-z0-9._:~-]+$"
+    },
+    "cols": {
+      "type": "integer",
+      "minimum": 10,
+      "maximum": 500
+    },
+    "rows": {
+      "type": "integer",
+      "minimum": 2,
+      "maximum": 300
+    }
+  },
+  "required": [
+    "taskId",
+    "cols",
+    "rows"
+  ],
+  "additionalProperties": false
+}

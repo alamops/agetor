@@ -1,0 +1,136 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://agetor.dev/schemas/remote/messages/hello.json",
+  "title": "hello",
+  "x-direction": "core",
+  "type": "object",
+  "properties": {
+    "protocolVersion": {
+      "type": "integer",
+      "minimum": 1,
+      "maximum": 1000
+    },
+    "minProtocolVersion": {
+      "type": "integer",
+      "minimum": 1,
+      "maximum": 1000
+    },
+    "deviceId": {
+      "type": "string",
+      "pattern": "^[0-9a-f]{32}$"
+    },
+    "level": {
+      "type": "string",
+      "enum": [
+        "observe",
+        "respond",
+        "operate",
+        "configure"
+      ]
+    },
+    "routes": {
+      "type": "array",
+      "items": {
+        "type": "object",
+        "properties": {
+          "method": {
+            "type": "string",
+            "enum": [
+              "GET",
+              "POST",
+              "PUT",
+              "PATCH",
+              "DELETE"
+            ]
+          },
+          "route": {
+            "type": "string",
+            "maxLength": 200,
+            "minLength": 1
+          },
+          "level": {
+            "type": "string",
+            "enum": [
+              "observe",
+              "respond",
+              "operate",
+              "configure"
+            ]
+          },
+          "stepUp": {
+            "type": "string",
+            "enum": [
+              "none",
+              "unlock",
+              "signed"
+            ]
+          },
+          "rate": {
+            "type": "string",
+            "enum": [
+              "normal",
+              "heavy",
+              "stop"
+            ]
+          }
+        },
+        "required": [
+          "method",
+          "route",
+          "level",
+          "stepUp",
+          "rate"
+        ],
+        "additionalProperties": false
+      },
+      "maxItems": 200
+    },
+    "auditHead": {
+      "anyOf": [
+        {
+          "type": "object",
+          "properties": {
+            "seq": {
+              "type": "integer",
+              "minimum": 0,
+              "maximum": 9007199254740991
+            },
+            "hash": {
+              "type": "string",
+              "pattern": "^[0-9a-f]{64}$"
+            }
+          },
+          "required": [
+            "seq",
+            "hash"
+          ],
+          "additionalProperties": false
+        },
+        {
+          "type": "null"
+        }
+      ]
+    },
+    "clock": {
+      "type": "integer",
+      "minimum": 0,
+      "maximum": 253402300799999
+    },
+    "macName": {
+      "type": "string",
+      "maxLength": 40,
+      "minLength": 1
+    }
+  },
+  "required": [
+    "protocolVersion",
+    "minProtocolVersion",
+    "deviceId",
+    "level",
+    "routes",
+    "auditHead",
+    "clock",
+    "macName"
+  ],
+  "additionalProperties": false
+}

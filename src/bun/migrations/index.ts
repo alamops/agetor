@@ -126,6 +126,9 @@ import m090 from "./090_harness_mirror_backup_folder.sql" with { type: "text" };
 import m091 from "./091_task_repositories.sql" with { type: "text" };
 import m092 from "./092_task_base_branch_and_prs.sql" with { type: "text" };
 import m093 from "./093_task_revs.sql" with { type: "text" };
+import m094 from "./094_remote_devices.sql" with { type: "text" };
+import m095 from "./095_remote_audit.sql" with { type: "text" };
+import m096 from "./096_remote_idempotency.sql" with { type: "text" };
 
 
 import type { Migration } from "../migrate.ts";
@@ -237,4 +240,7 @@ export const migrations: Migration[] = [
   { id: "091_task_repositories", sql: m091, aliases: ["087_task_repositories"] },
   { id: "092_task_base_branch_and_prs", sql: m092 },
   { id: "093_task_revs", sql: m093 },
+  { id: "094_remote_devices", sql: m094 },
+  { id: "095_remote_audit", sql: m095 },
+  { id: "096_remote_idempotency", sql: m096 },
 ];

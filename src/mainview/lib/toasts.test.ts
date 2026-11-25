@@ -6,6 +6,9 @@
  * description, and the bare copy for a lone gate. A silent change to either
  * string would otherwise only show up in front of a user.
  *
+ * The OS notification for these events is the core's decision now (src/bun/notification-policy.ts), so the suite also pins that no
+ * toast helper calls the API at all.
+ *
  * `sonner` and `./api` are boundaries this repo doesn't own, so both are
  * mocked; `toasts.ts` itself (slot bookkeeping, description composition) runs
  * for real. Both mocked modules are snapshotted and restored in `afterAll` —
@@ -29,8 +32,8 @@ interface SonnerCall {
 
 const calls: SonnerCall[] = [];
 const dismissed: Array<string | number> = [];
-const cleared: string[] = [];
-const posted: unknown[] = [];
+/** Every method name the toasts called on `api`. Empty means no OS notification route was touched. */
+const apiCalls: string[] = [];
 // Ids are unique across the file so a slot carried between tests can't make a
 // dismissal assertion pass by accident.
 let nextToastId = 0;
@@ -59,15 +62,12 @@ mock.module("sonner", () => ({
 
 mock.module("./api", () => ({
   ...realApiSnapshot,
-  api: {
-    ...realApiSnapshot.api,
-    notifyOS: async (payload: unknown) => {
-      posted.push(payload);
+  api: new Proxy({}, {
+    get: (_t, prop) => (...args: unknown[]) => {
+      apiCalls.push(`${String(prop)}(${args.length})`);
+      return Promise.resolve({ ok: true });
     },
-    clearTaskNotification: async (taskId: string) => {
-      cleared.push(taskId);
-    },
-  },
+  }),
 }));
 
 afterAll(() => {
@@ -75,13 +75,13 @@ afterAll(() => {
   mock.module("./api", () => realApiSnapshot);
 });
 
-const { toastHarnessSwap, toastPipelineReview } = await import("./toasts.ts");
+const toasts = await import("./toasts.ts");
+const { toastHarnessSwap, toastPipelineReview } = toasts;
 
 beforeEach(() => {
   calls.length = 0;
   dismissed.length = 0;
-  cleared.length = 0;
-  posted.length = 0;
+  apiCalls.length = 0;
 });
 
 function args(overrides: Partial<ToastArgs> = {}): ToastArgs {
@@ -129,25 +129,44 @@ describe("toastPipelineReview", () => {
     expect(description(calls[1])).toBe("Fix the header · Pipeline needs your review (3 gates)");
   });
 
-  test("a selected run view suppresses the toast but still alerts an unfocused window", () => {
+  test("a selected run view suppresses the toast, and the webview posts no OS notification for it", () => {
     toastPipelineReview(args({ taskId: "pipeline-parent-3", isSelected: true, isFocused: false }));
-
     expect(calls).toHaveLength(0);
-    expect(cleared).toEqual([]);
-    expect(posted).toHaveLength(1);
-    expect(posted[0]).toMatchObject({
-      title: "Pipeline needs your review",
-      taskId: "pipeline-parent-3",
-      kind: "blocked",
-    });
+    expect(apiCalls).toEqual([]);
   });
 
-  test("a selected run view in a focused window suppresses the toast and clears the OS entry", () => {
+  test("a selected run view in a focused window suppresses the toast and clears nothing", () => {
     toastPipelineReview(args({ taskId: "pipeline-parent-4", isSelected: true, isFocused: true }));
-
     expect(calls).toHaveLength(0);
-    expect(posted).toEqual([]);
-    expect(cleared).toEqual(["pipeline-parent-4"]);
+    expect(apiCalls).toEqual([]);
+  });
+});
+
+describe("the webview never calls the notification routes (the core decides, grill D5)", () => {
+  const base = (taskId: string) => args({ taskId, isSelected: false, isFocused: false });
+
+  test("every toast helper shows its in-app toast and touches no API method", () => {
+    toasts.toastSuccess({ ...base("n1") });
+    toasts.toastError({ ...base("n2"), reason: "boom" });
+    toasts.toastPending(base("n3"));
+    toasts.toastApiError(base("n4"));
+    toasts.toastSessionEnded(base("n5"));
+    toasts.toastUnknownCommand(base("n6"));
+    toasts.toastHarnessExhausted(base("n7"));
+    toasts.toastHarnessUnusable(base("n8"));
+    toasts.notifyWaitingInput(base("n9"));
+    toasts.notifyFilesSent({ ...base("n10"), count: 2, caption: "shots", proactive: true });
+    toastHarnessSwap({ ...base("n11"), fromLabel: "A", toLabel: "B", position: 1, count: 2 });
+    toastPipelineReview(base("n12"));
+    expect(calls.length).toBeGreaterThanOrEqual(11);
+    expect(apiCalls).toEqual([]);
+  });
+
+  test("a selected task and a focused window change no toast rule here either", () => {
+    toasts.toastSuccess({ ...args({ taskId: "n20", isSelected: true, isFocused: true }) });
+    toasts.notifyWaitingInput(args({ taskId: "n21", isSelected: true, isFocused: false }));
+    toasts.notifyFilesSent({ ...args({ taskId: "n22", isSelected: true, isFocused: true }), count: 1, caption: null, proactive: true });
+    expect(apiCalls).toEqual([]);
   });
 });
 

@@ -1,0 +1,126 @@
+{
+  "$schema": "http://json-schema.org/draft-07/schema#",
+  "type": "object",
+  "properties": {
+    "taskId": {
+      "type": "string"
+    },
+    "taskTitle": {
+      "type": "string"
+    },
+    "stepId": {
+      "type": "string"
+    },
+    "seq": {
+      "type": "number"
+    },
+    "startedAt": {
+      "type": "number"
+    },
+    "arrivals": {
+      "type": "array",
+      "items": {
+        "$ref": "#/definitions/PipelineJoinArrival"
+      }
+    }
+  },
+  "required": [
+    "taskId",
+    "taskTitle",
+    "stepId",
+    "seq",
+    "startedAt",
+    "arrivals"
+  ],
+  "additionalProperties": false,
+  "definitions": {
+    "PipelineJoinArrival": {
+      "type": "object",
+      "properties": {
+        "fromStepId": {
+          "type": "string"
+        },
+        "seq": {
+          "type": "number"
+        },
+        "handoff": {
+          "anyOf": [
+            {
+              "$ref": "#/definitions/Handoff"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "comment": {
+          "type": [
+            "string",
+            "null"
+          ]
+        }
+      },
+      "required": [
+        "fromStepId",
+        "seq",
+        "handoff"
+      ],
+      "additionalProperties": false
+    },
+    "Handoff": {
+      "type": "object",
+      "properties": {
+        "schemaVersion": {
+          "type": "number",
+          "const": 1
+        },
+        "purpose": {
+          "type": "string"
+        },
+        "summary": {
+          "type": "string"
+        },
+        "reason": {
+          "type": "string"
+        },
+        "next": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "artifacts": {
+          "type": "array",
+          "items": {
+            "type": "string"
+          }
+        },
+        "openQuestions": {
+          "type": "array",
+          "items": {
+            "type": "string"
+          }
+        },
+        "status": {
+          "type": "string",
+          "enum": [
+            "done",
+            "blocked"
+          ]
+        }
+      },
+      "required": [
+        "schemaVersion",
+        "purpose",
+        "summary",
+        "reason",
+        "next",
+        "artifacts",
+        "openQuestions"
+      ],
+      "additionalProperties": false
+    }
+  },
+  "$id": "https://agetor.dev/schemas/remote/routes/InboxGate.json",
+  "title": "InboxGate"
+}

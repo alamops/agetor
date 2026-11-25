@@ -61,6 +61,7 @@ import { useConfirm } from "@/components/ui/confirm";
 import { BOARD_KEYBOARD_CODES, BOARD_SCREEN_READER_INSTRUCTIONS, boardKeyboardCoordinates, isBoardCancelInProgress, makeBoardAnnouncements, setBoardDragging } from "@/lib/board-keyboard";
 import { toast } from "sonner";
 import { Toaster } from "@/components/ui/sonner";
+import { createPresenceReporter, type PresenceReport, type PresenceReporter } from "@/lib/presence-report";
 import { dismissPending, dismissTaskToast, hasPendingToast, notifyFilesSent, notifyWaitingInput, toastApiError, toastError, toastFxAutoResumeExhausted, toastFxAutoResumeFired, toastHarnessExhausted, toastHarnessSwap, toastHarnessUnusable, toastPending, toastPipelineReview, toastSendFailed, toastSessionEnded, toastSuccess, toastUnknownCommand, type ToastArgs } from "@/lib/toasts";
 import { PendingInputTracker } from "@/lib/pending-input-tracker";
 import { runStatusToastKind } from "@/lib/run-status-toast";
@@ -1130,14 +1131,14 @@ function AppInner() {
   }, [selected?.id]);
 
   // Opening the full-page pipeline run view counts as opening the parent
-  // task (D6a/D16, plan §8 Q1): its OS Notification Center entry goes (the
-  // `/seen` route only covers the run panel and "Mark as read") and so does
-  // its in-app toast slot. Keyed on the viewed run's task id so a poll
-  // re-render of the same view doesn't re-fire.
+  // task (D6a/D16, plan §8 Q1): its in-app toast slot goes, and the presence
+  // report below tells the core, which removes its OS Notification Center
+  // entry (the `/seen` route only covers the run panel and "Mark as read").
+  // Keyed on the viewed run's task id so a poll re-render of the same view
+  // doesn't re-fire.
   const runViewTaskId = view.kind === "pipeline-run" ? view.taskId : null;
   useEffect(() => {
     if (!runViewTaskId) return;
-    api.clearTaskNotification(runViewTaskId).catch(() => {});
     dismissTaskToast(runViewTaskId);
   }, [runViewTaskId]);
 
@@ -1299,22 +1300,39 @@ function AppInner() {
     for (const id of owedPipelineAlertsRef.current.parentIds()) settleOwedPipelineAlert(id);
   }, [tasks, settleOwedPipelineAlert]);
 
-  // Window focus (D6d): the window the user is looking at may already show
-  // the open task (panel or pipeline run view) while a newer Notification
-  // Center entry for it arrived in the background — returning focus clears
-  // it. Deliberately does NOT mark the task seen and leaves in-app toasts
-  // alone. Reads refs so the listener binds once; the server maps a step id
-  // to its pipeline parent.
-  useEffect(() => {
-    const onFocus = () => {
-      const openId = selectedIdRef.current;
-      if (openId) api.clearTaskNotification(openId).catch(() => {});
-      const v = viewRef.current;
-      if (v.kind === "pipeline-run") api.clearTaskNotification(v.taskId).catch(() => {});
-    };
-    window.addEventListener("focus", onFocus);
-    return () => window.removeEventListener("focus", onFocus);
+  // What the window shows, reported to the core (`PUT /app/presence`): focus, the open task and its view. The core's notification
+  // policy decides every OS notification from it (src/bun/notification-policy.ts, grill D5): nothing for the task the window shows,
+  // the older entry cleared when focus returns to an open task (D6d) or a task is opened, a post for everything else. The webview
+  // only keeps its in-app toasts. Reads refs so the listeners bind once; `lib/presence-report.ts` debounces and dedupes.
+  const presenceReporterRef = useRef<PresenceReporter | null>(null);
+  const readPresence = useCallback((): PresenceReport => {
+    const v = viewRef.current;
+    if (v.kind === "pipeline-run") return { focused: document.hasFocus(), selectedTaskId: v.taskId, view: "pipeline" };
+    const id = selectedIdRef.current;
+    return { focused: document.hasFocus(), selectedTaskId: id, view: id ? "run-panel" : null };
   }, []);
+  useEffect(() => {
+    const reporter = createPresenceReporter({ send: (p) => api.reportPresence(p) });
+    presenceReporterRef.current = reporter;
+    const onFocusChange = () => {
+      reporter.update(readPresence());
+      reporter.flush();
+    };
+    reporter.update(readPresence());
+    window.addEventListener("focus", onFocusChange);
+    window.addEventListener("blur", onFocusChange);
+    document.addEventListener("visibilitychange", onFocusChange);
+    return () => {
+      window.removeEventListener("focus", onFocusChange);
+      window.removeEventListener("blur", onFocusChange);
+      document.removeEventListener("visibilitychange", onFocusChange);
+      reporter.dispose();
+      presenceReporterRef.current = null;
+    };
+  }, [readPresence]);
+  useEffect(() => {
+    presenceReporterRef.current?.update(readPresence());
+  }, [selected?.id, runViewTaskId, readPresence]);
 
   // Cmd/Ctrl+F while no task details panel is open focuses the board's
   // free-text search box and selects its contents so typing replaces the

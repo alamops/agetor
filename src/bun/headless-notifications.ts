@@ -72,7 +72,7 @@ export function shouldPostHeadlessNotifications(
 }
 
 /** Task rows for `ids`, read together; an id that cannot be read maps to null. */
-async function fetchTaskRows(ids: readonly string[]): Promise<Map<string, Task | null>> {
+export async function fetchTaskRows(ids: readonly string[]): Promise<Map<string, Task | null>> {
   const unique = [...new Set(ids)].filter((id) => id.length > 0);
   const rows = await Promise.all(unique.map(async (id) => {
     try {

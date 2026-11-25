@@ -1,0 +1,133 @@
+{
+  "$schema": "http://json-schema.org/draft-07/schema#",
+  "type": "object",
+  "properties": {
+    "kind": {
+      "type": "string",
+      "const": "ask_questions"
+    },
+    "id": {
+      "type": "string"
+    },
+    "taskId": {
+      "type": "string"
+    },
+    "runId": {
+      "type": "string"
+    },
+    "pipelineParentId": {
+      "type": "string"
+    },
+    "questions": {
+      "type": "array",
+      "items": {
+        "$ref": "#/definitions/AskQuestion"
+      }
+    },
+    "createdAt": {
+      "type": "number"
+    },
+    "source": {
+      "type": "string",
+      "enum": [
+        "scraper",
+        "cursor",
+        "opencode"
+      ]
+    },
+    "title": {
+      "type": "string"
+    },
+    "toolCallId": {
+      "type": "string"
+    },
+    "delivery": {
+      "type": "string",
+      "enum": [
+        "live",
+        "restart-followup"
+      ]
+    },
+    "followupCause": {
+      "type": "string",
+      "enum": [
+        "restart",
+        "child-exit"
+      ]
+    },
+    "fingerprint": {
+      "type": "string"
+    },
+    "allowCustom": {
+      "type": "boolean"
+    },
+    "allowReason": {
+      "type": "boolean"
+    }
+  },
+  "required": [
+    "kind",
+    "id",
+    "taskId",
+    "runId",
+    "questions",
+    "createdAt"
+  ],
+  "additionalProperties": false,
+  "definitions": {
+    "AskQuestion": {
+      "type": "object",
+      "properties": {
+        "id": {
+          "type": "string"
+        },
+        "question": {
+          "type": "string"
+        },
+        "header": {
+          "type": "string"
+        },
+        "multiSelect": {
+          "type": "boolean"
+        },
+        "options": {
+          "type": "array",
+          "items": {
+            "type": "object",
+            "properties": {
+              "id": {
+                "type": "string"
+              },
+              "label": {
+                "type": "string"
+              },
+              "description": {
+                "type": "string"
+              },
+              "preview": {
+                "type": "string"
+              }
+            },
+            "required": [
+              "label"
+            ],
+            "additionalProperties": false
+          }
+        },
+        "hasTypeRow": {
+          "type": "boolean"
+        },
+        "allowCustom": {
+          "type": "boolean"
+        }
+      },
+      "required": [
+        "question",
+        "options"
+      ],
+      "additionalProperties": false
+    }
+  },
+  "$id": "https://agetor.dev/schemas/remote/routes/AskQuestionsRequest.json",
+  "title": "AskQuestionsRequest"
+}

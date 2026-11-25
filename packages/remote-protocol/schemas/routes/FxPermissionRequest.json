@@ -1,0 +1,105 @@
+{
+  "$schema": "http://json-schema.org/draft-07/schema#",
+  "type": "object",
+  "properties": {
+    "kind": {
+      "type": "string",
+      "const": "fx_permission"
+    },
+    "id": {
+      "type": "string"
+    },
+    "taskId": {
+      "type": "string"
+    },
+    "runId": {
+      "type": "string"
+    },
+    "pipelineParentId": {
+      "type": "string"
+    },
+    "createdAt": {
+      "type": "number"
+    },
+    "toolCall": {
+      "$ref": "#/definitions/FxPermissionToolCall"
+    },
+    "options": {
+      "type": "array",
+      "items": {
+        "$ref": "#/definitions/FxPermissionOption"
+      }
+    },
+    "mode": {
+      "type": "string",
+      "enum": [
+        "auto",
+        "ask",
+        "plan"
+      ]
+    },
+    "harness": {
+      "type": "string",
+      "enum": [
+        "fx",
+        "opencode"
+      ]
+    },
+    "allowReason": {
+      "type": "boolean"
+    }
+  },
+  "required": [
+    "kind",
+    "id",
+    "taskId",
+    "runId",
+    "createdAt",
+    "toolCall",
+    "options",
+    "mode"
+  ],
+  "additionalProperties": false,
+  "definitions": {
+    "FxPermissionToolCall": {
+      "type": "object",
+      "properties": {
+        "toolCallId": {
+          "type": "string"
+        },
+        "title": {
+          "type": "string"
+        },
+        "kind": {
+          "type": "string"
+        },
+        "rawInput": {}
+      },
+      "required": [
+        "toolCallId"
+      ],
+      "additionalProperties": false
+    },
+    "FxPermissionOption": {
+      "type": "object",
+      "properties": {
+        "optionId": {
+          "type": "string"
+        },
+        "name": {
+          "type": "string"
+        },
+        "kind": {
+          "type": "string"
+        }
+      },
+      "required": [
+        "optionId",
+        "name"
+      ],
+      "additionalProperties": false
+    }
+  },
+  "$id": "https://agetor.dev/schemas/remote/routes/FxPermissionRequest.json",
+  "title": "FxPermissionRequest"
+}

@@ -92,5 +92,9 @@ export const insertCursorAsk = modules.cursorAsks.insertCursorAsk;
 export const resolveCursorAsk = modules.cursorAsks.resolveCursorAsk;
 export const listOpenCursorAsks = modules.cursorAsks.listOpenCursorAsks;
 
+export const remoteDevices = modules.remoteDevices;
+export const remoteAudit = modules.remoteAudit;
+export const remoteIdempotency = modules.remoteIdempotency;
+
 export const hiddenClaudeSessionIds = modules.hiddenSessionIds.hiddenClaudeSessionIds;
 export const hiddenOpencodeSessionIds = modules.hiddenSessionIds.hiddenOpencodeSessionIds;

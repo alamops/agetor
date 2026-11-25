@@ -181,8 +181,9 @@ describe("route coverage (server.ts ↔ ROUTE_POLICY)", () => {
     expect(pub).toEqual(["/health"]);
   });
 
-  it("every entry carries remote: none and conditional is only used on the test-only routes", () => {
-    for (const { policy } of policyEntries()) expect(policy.remote).toBe("none");
+  it("a remote policy only sits on an app+cli route, and conditional is only used on the test-only routes", () => {
+    // The exact set of remote routes and their levels is pinned in route-policy-remote.test.ts.
+    for (const { policy } of policyEntries()) if (policy.remote !== "none") expect(policy.callers).toBe("app+cli");
     const conditional = policyEntries().filter((e) => e.policy.conditional).map((e) => `${e.method} ${e.key}`);
     expect(conditional).toEqual(["POST /test/block-event-loop", "POST /test/drop-task-streams"]);
   });
@@ -307,7 +308,10 @@ describe("harness-stack fix-round routes", () => {
       const entry = ROUTE_POLICY[key] as Record<string, RoutePolicy>;
       expect(Object.keys(entry).sort()).toEqual([...methods].sort());
       for (const m of methods) {
-        expect(entry[m]).toEqual(CLI_POLICY);
+        // switch-account POST is one of the five operate routes of the v1 remote set (grill D12); everything else here is CLI-only.
+        expect(entry[m]).toEqual(key === "/tasks/:id/switch-account" && m === "POST"
+          ? { ...CLI_POLICY, remote: { level: "operate", stepUp: "none", rate: "normal", since: 1 } }
+          : CLI_POLICY);
         expect(resolveCaller(req(`http://x${key}`, { token: CLI_TOKEN }), entry[m]!)).toBe("cli");
         expect(resolveCaller(req(`http://x${key}`, { token: API_TOKEN }), entry[m]!)).toBe("app");
         expect(resolveCaller(req(`http://x${key}`), entry[m]!)).toBeNull();

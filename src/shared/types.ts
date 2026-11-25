@@ -6916,6 +6916,25 @@ export type AppMenuAction = (typeof APP_MENU_ACTIONS)[number];
  */
 export type AppEvent =
   | {
+      /** A phone attached to (or detached from) a task's tmux session (docs/specs/remote-readiness-spec.md "Terminal"). The run panel shows "Phone attached to <task>" with a Detach button while one is attached. */
+      type: "phone_terminal";
+      taskId: string;
+      deviceId: string;
+      /** The cleaned device name, at most 40 characters. */
+      deviceName: string;
+      attached: boolean;
+      since: number;
+      ts: number;
+    }
+  | {
+      /** A remote action a phone took, for the Mac's toast ("Plan approved from Ana's iPhone") and the Settings activity refresh. */
+      type: "remote_action";
+      taskId: string | null;
+      deviceName: string;
+      action: "plan-approved" | "card-allowed" | "gate-decided" | "auto-mode-approved" | "terminal-attached" | "device-paired" | "device-revoked";
+      ts: number;
+    }
+  | {
       type: "quit_request";
       runningRunCount: number;
       runningTaskTitles: string[];

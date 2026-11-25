@@ -1,0 +1,32 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://agetor.dev/schemas/remote/messages/pairing-result.json",
+  "title": "pairing-result",
+  "x-direction": "core",
+  "type": "object",
+  "properties": {
+    "deviceId": {
+      "type": "string",
+      "pattern": "^[0-9a-f]{32}$"
+    },
+    "linkSecret": {
+      "type": "string",
+      "pattern": "^[0-9a-f]{64}$"
+    },
+    "level": {
+      "type": "string",
+      "enum": [
+        "observe",
+        "respond",
+        "operate",
+        "configure"
+      ]
+    }
+  },
+  "required": [
+    "deviceId",
+    "linkSecret",
+    "level"
+  ],
+  "additionalProperties": false
+}

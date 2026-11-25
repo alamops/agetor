@@ -1,0 +1,43 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://agetor.dev/schemas/remote/messages/response.json",
+  "title": "response",
+  "x-direction": "core",
+  "type": "object",
+  "properties": {
+    "id": {
+      "type": "string",
+      "maxLength": 64,
+      "minLength": 1,
+      "pattern": "^[A-Za-z0-9._:~-]+$"
+    },
+    "status": {
+      "type": "integer",
+      "minimum": 100,
+      "maximum": 599
+    },
+    "contentType": {
+      "type": "string",
+      "maxLength": 128
+    },
+    "encoding": {
+      "type": "string",
+      "enum": [
+        "utf8",
+        "base64"
+      ]
+    },
+    "body": {
+      "type": "string",
+      "maxLength": 89478485
+    }
+  },
+  "required": [
+    "id",
+    "status",
+    "contentType",
+    "encoding",
+    "body"
+  ],
+  "additionalProperties": false
+}

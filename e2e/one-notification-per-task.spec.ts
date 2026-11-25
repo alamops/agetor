@@ -1,5 +1,6 @@
 import { randomUUID } from "node:crypto";
-import { mkdtempSync } from "node:fs";
+import { mkdtempSync, readFileSync, writeFileSync } from "node:fs";
+import { fileURLToPath } from "node:url";
 import { tmpdir } from "node:os";
 import path from "node:path";
 import { test, expect, type APIRequestContext, type E2EBackend, type Locator, type Page } from "./fixtures";
@@ -8,17 +9,20 @@ import { gotoApp, injectSseFrame, installSseInjector } from "./helpers";
 /**
  * E2E coverage for "one notification per task" (docs/plans/duplicated-macos-
  * notifications.md §5 TT9): the in-app sonner slot (one toast per task, a newer
- * event replaces the older one, opening the task dismisses it) and the
- * webview -> core requests that drive the OS notification (`POST
- * /notifications` only while unfocused, `DELETE /notifications/:taskId` when
- * the entry no longer applies).
+ * event replaces the older one, opening the task dismisses it) and the OS
+ * notification the CORE decides (docs/architecture/notifications.md, grill D5).
  *
- * Real Notification Center behavior is not observable here — the headless
- * backend 501s both `/notifications` routes — so the specs observe the
- * REQUESTS with `page.route` and fulfil them themselves (a 200, so the app
- * never sees an error). Window focus is faked by overriding
- * `document.hasFocus` (App.tsx reads `document.hasFocus()` when it handles a
- * global event) through an init script with a flippable flag.
+ * The decision moved out of the webview: the core posts and removes through its
+ * notifier helper from the global event bus and the window's presence, which the
+ * webview reports with `PUT /app/presence`. So these specs run against a backend
+ * with `AGETOR_HEADLESS_NOTIFICATIONS=1` whose `AGETOR_NOTIFIER_BIN` is the
+ * recording stub `e2e/notification-stub.ts`, and observe its log: one `post` line
+ * per notification the core made, one `remove` line per entry it removed. (A
+ * removal for a task that never had an entry is skipped by the notifier, so the
+ * "clears the older entry" rule is pinned by the policy unit tests in
+ * src/bun/notification-policy.test.ts; here only removals of delivered entries
+ * show.) Window focus is faked by overriding `document.hasFocus` through an init
+ * script with a flippable flag; the webview reports it as presence.
  *
  * Tasks run the fake claude driver's sent-files scenario
  * (`FAKE_CLAUDE_SENT_FILES_PROMPT_MARKER`): one `files-sent` event, then the
@@ -43,61 +47,63 @@ interface TaskRow {
 
 interface CapturedRequest {
   method: "POST" | "DELETE";
-  /** `/notifications` or `/notifications/<id>`. */
+  /** The notifier's request id, `agetor.task.<taskId>`. */
   pathname: string;
-  /** Parsed JSON body of a POST. */
+  /** What the stub recorded for a post. */
   body: { taskId?: string; kind?: string; title?: string } | null;
 }
 
 interface NotificationCapture {
   all: CapturedRequest[];
-  /** Kinds of the POSTs naming `taskId`, in arrival order. */
+  /** Kinds of the posts naming `taskId`, in arrival order. */
   postKinds(taskId: string): (string | undefined)[];
   posts(taskId: string): CapturedRequest[];
   deletes(taskId: string): CapturedRequest[];
   clear(): void;
 }
 
-const CORS_HEADERS = {
-  "access-control-allow-origin": "*",
-  "access-control-allow-headers": "*",
-  "access-control-allow-methods": "GET, POST, PUT, PATCH, DELETE, OPTIONS",
+/** The recording stub's log (`e2e/notification-stub.ts`): one file for the file's backends; every test keys its assertions by its own task id. */
+const NOTIFIER_STUB = path.join(fileURLToPath(new URL(".", import.meta.url)), "notification-stub.ts");
+const NOTIFIER_LOG = path.join(mkdtempSync(path.join(tmpdir(), "agetor-e2e-notifier-")), "notifier.log");
+writeFileSync(NOTIFIER_LOG, "");
+const NOTIFIER_ENV = {
+  AGETOR_HEADLESS_NOTIFICATIONS: "1",
+  AGETOR_NOTIFIER_BIN: NOTIFIER_STUB,
+  AGETOR_E2E_NOTIFIER_LOG: NOTIFIER_LOG,
 };
+// Every spec in this file runs against its own core with the recording notifier on.
+test.use({ backendEnv: NOTIFIER_ENV });
 
-/** Records every `POST /notifications` and `DELETE /notifications/:id` and
- *  answers them with a 200 (the headless core would 501). Preflights are
- *  answered here too: the webview and the API are different origins. */
-async function captureNotifications(page: Page): Promise<NotificationCapture> {
-  const all: CapturedRequest[] = [];
-  await page.route(/\/notifications(\/[^?#]*)?(\?.*)?$/, async (route) => {
-    const request = route.request();
-    const method = request.method();
-    if (method === "OPTIONS") {
-      await route.fulfill({ status: 204, headers: CORS_HEADERS });
-      return;
+/** Reads the stub's log: each line is one helper call the core made. */
+function captureNotifications(_page?: Page): NotificationCapture {
+  let cleared = 0;
+  const read = (): CapturedRequest[] => {
+    let text = "";
+    try {
+      text = readFileSync(NOTIFIER_LOG, "utf8");
+    } catch {
+      return [];
     }
-    if (method === "POST" || method === "DELETE") {
-      let body: CapturedRequest["body"] = null;
-      if (method === "POST") {
-        try {
-          body = request.postDataJSON() as CapturedRequest["body"];
-        } catch {
-          body = null;
-        }
-      }
-      all.push({ method, pathname: new URL(request.url()).pathname, body });
+    const lines = text.split("\n").filter(Boolean).slice(cleared);
+    const out: CapturedRequest[] = [];
+    for (const line of lines) {
+      const e = JSON.parse(line) as { op: string; id?: string; kind?: string; title?: string };
+      const taskId = e.id?.replace(/^agetor\.task\./, "");
+      if (e.op === "post") out.push({ method: "POST", pathname: e.id ?? "", body: { taskId, kind: e.kind, title: e.title } });
+      else if (e.op === "remove") out.push({ method: "DELETE", pathname: e.id ?? "", body: null });
     }
-    await route.fulfill({ status: 200, headers: CORS_HEADERS, contentType: "application/json", json: { ok: true } });
-  });
-  const posts = (taskId: string) => all.filter((r) => r.method === "POST" && r.body?.taskId === taskId);
+    return out;
+  };
+  const posts = (taskId: string) => read().filter((r) => r.method === "POST" && r.body?.taskId === taskId);
   return {
-    all,
+    get all() {
+      return read();
+    },
     posts,
     postKinds: (taskId) => posts(taskId).map((r) => r.body?.kind),
-    deletes: (taskId) =>
-      all.filter((r) => r.method === "DELETE" && r.pathname === `/notifications/${encodeURIComponent(taskId)}`),
+    deletes: (taskId) => read().filter((r) => r.method === "DELETE" && r.pathname === `agetor.task.${taskId}`),
     clear: () => {
-      all.length = 0;
+      cleared += read().length;
     },
   };
 }
@@ -252,7 +258,7 @@ async function openTaskCard(page: Page, title: string): Promise<Locator> {
 }
 
 test.describe("one notification per task: in-app slot", () => {
-  test("(a) a task's files-sent toast is replaced by its Task succeeded toast", async ({ page, request, backend }) => {
+  test("(a) a task's files-sent toast is replaced by its Task succeeded toast", async ({ page, request, freshBackend: backend }) => {
     const title = uniqueTitle("replace");
     await installToastLog(page);
     await gotoAppSubscribed(page, backend);
@@ -271,7 +277,7 @@ test.describe("one notification per task: in-app slot", () => {
     await expect(page.getByText("2 files sent to you")).toHaveCount(0);
   });
 
-  test("(b) opening the card dismisses the task's toast", async ({ page, request, backend }) => {
+  test("(b) opening the card dismisses the task's toast", async ({ page, request, freshBackend: backend }) => {
     const title = uniqueTitle("open");
     await installToastLog(page);
     await gotoAppSubscribed(page, backend);
@@ -289,116 +295,79 @@ test.describe("one notification per task: in-app slot", () => {
 });
 
 test.describe("one notification per task: OS notification requests", () => {
-  test("(c) an unfocused window posts one notification per event, files-sent then succeeded", async ({
-    page,
-    request,
-    backend,
-  }) => {
+  test("(c) an unfocused window posts one notification per event, files-sent then succeeded", async ({ page, request, freshBackend: backend }) => {
     const title = uniqueTitle("unfocused");
     await fakeWindowFocus(page, false);
-    const capture = await captureNotifications(page);
+    const capture = captureNotifications(page);
     await gotoAppSubscribed(page, backend);
     const task = await createOnBoardThenStart(page, request, backend, title);
 
     await expect.poll(() => capture.postKinds(task.id), { timeout: CONVERGE_TIMEOUT }).toEqual(["files-sent", "succeeded"]);
-    // Every POST names the task and carries a title/body; nothing was cleared
-    // while the window was unfocused.
-    for (const post of capture.posts(task.id)) expect(post.pathname).toBe("/notifications");
+    // Every post is under the task's one fixed notification id; nothing was
+    // removed while the window was unfocused.
+    for (const post of capture.posts(task.id)) expect(post.pathname).toBe(`agetor.task.${task.id}`);
     expect(capture.deletes(task.id)).toHaveLength(0);
   });
 
-  test("(d) a focused window posts nothing and clears the task's entry instead", async ({ page, request, backend }) => {
+  test("(d) a focused window posts nothing (the core clears an older entry instead)", async ({ page, request, freshBackend: backend }) => {
     const title = uniqueTitle("focused");
     await fakeWindowFocus(page, true);
-    const capture = await captureNotifications(page);
+    const capture = captureNotifications(page);
     await gotoAppSubscribed(page, backend);
     const task = await createOnBoardThenStart(page, request, backend, title);
 
     // The in-app toast carries the news…
     await expectSuccessToastReplacedOthers(page, title);
-    // …and the entry is removed (D7), never posted.
-    await expect.poll(() => capture.deletes(task.id).length, { timeout: CONVERGE_TIMEOUT }).toBeGreaterThan(0);
+    // …and nothing is posted (D7). Removing an older entry is the policy's other
+    // half; with no entry delivered the notifier skips it, so that part is pinned
+    // by the unit tests (src/bun/notification-policy.test.ts).
+    await page.waitForTimeout(750);
     expect(capture.posts(task.id)).toHaveLength(0);
   });
 
-  test("(f) the window regaining focus with a panel open clears that task's entry", async ({
+  test("(f) opening the task's panel removes the entry the core posted for it", async ({
     page,
     request,
-    backend,
+    freshBackend: backend,
   }) => {
-    const title = uniqueTitle("refocus");
-    await fakeWindowFocus(page, true);
-    const capture = await captureNotifications(page);
+    const title = uniqueTitle("open");
+    await fakeWindowFocus(page, false);
+    const capture = captureNotifications(page);
     const task = await createSentFilesTask(request, backend, title, { start: true });
     await waitForColumn(request, backend, task.id, "review");
     await gotoApp(page, backend.bootBase);
+    // The unfocused core had no window to hold the news back, so it posted... (the task finished before the page loaded; the
+    // core posts from its own event bus, not from what any page saw)
+    await expect.poll(() => capture.postKinds(task.id), { timeout: CONVERGE_TIMEOUT }).toContain("succeeded");
+    expect(capture.deletes(task.id)).toHaveLength(0);
     await openTaskCard(page, title);
-
-    // Let the open-panel effects settle, then only look at what the focus
-    // event itself sends.
-    await page.evaluate(() => new Promise((resolve) => requestAnimationFrame(() => resolve(null))));
-    capture.clear();
-    await page.evaluate(() => window.dispatchEvent(new Event("focus")));
+    // ...and opening the task is reported as presence, so the core removes its entry.
     await expect.poll(() => capture.deletes(task.id).length, { timeout: CONVERGE_TIMEOUT }).toBeGreaterThan(0);
   });
 
-  test("(g) a focused proactive files-sent keeps its OS entry through the turn's succeeded event until the task is opened", async ({
-    page,
-    request,
-    backend,
-  }) => {
-    const title = uniqueTitle("proactive");
+  test("the webview reports what the window shows with PUT /app/presence", async ({ page, request, freshBackend: backend }) => {
+    const title = uniqueTitle("presence");
     await fakeWindowFocus(page, true);
-    await installGlobalEventSink(page);
-    const capture = await captureNotifications(page);
-    await gotoAppSubscribed(page, backend);
-    // Created, not started: the board shows the card but no run emits real
-    // events, so every request below comes from the two synthetic ones.
-    const task = await createSentFilesTask(request, backend, title, { start: false });
-    await expect(taskCard(page, title)).toBeVisible({ timeout: CONVERGE_TIMEOUT });
-
-    const runId = randomUUID();
-    await deliverGlobalEvent(page, {
-      kind: "files-sent",
-      taskId: task.id,
-      runId,
-      count: 2,
-      caption: "chart and report",
-      proactive: true,
-      ts: Date.now(),
+    const task = await createSentFilesTask(request, backend, title, { start: true });
+    await waitForColumn(request, backend, task.id, "review");
+    const reports: Array<{ focused: boolean; selectedTaskId: string | null; view: string | null }> = [];
+    page.on("request", (r) => {
+      if (r.method() === "PUT" && new URL(r.url()).pathname === "/app/presence") reports.push(r.postDataJSON());
     });
-    // The forced post goes out even though the window is focused.
-    await expect.poll(() => capture.postKinds(task.id), { timeout: CONVERGE_TIMEOUT }).toEqual(["files-sent"]);
-
-    // The same turn then settles `succeeded` (focused, not forced): D7 must
-    // leave the proactive entry alone — no DELETE, no second POST.
-    await deliverGlobalEvent(page, { kind: "run-status", taskId: task.id, runId, status: "succeeded", ts: Date.now() });
-    await expect(liveToasts(page, title)).toHaveCount(1);
-    await expect(liveToasts(page, title)).toContainText("Task succeeded");
-    // Allow any (wrongly) fired request to land before asserting its absence.
-    await page.waitForTimeout(750);
-    expect(capture.deletes(task.id)).toHaveLength(0);
-    expect(capture.postKinds(task.id)).toEqual(["files-sent"]);
-
-    // Opening the task is what removes the entry: the panel open marks the
-    // task seen (`POST /tasks/:id/seen`; the core removes the OS entry there —
-    // the headless backend can't observe that part) and drops the in-app toast.
-    const seen = page.waitForRequest(
-      (r) => r.method() === "POST" && new URL(r.url()).pathname === `/tasks/${task.id}/seen`,
-    );
+    await gotoApp(page, backend.bootBase);
+    await expect.poll(() => reports.some((r) => r.focused && r.selectedTaskId === null), { timeout: CONVERGE_TIMEOUT }).toBe(true);
     await openTaskCard(page, title);
-    await seen;
-    await expect(liveToasts(page, title)).toHaveCount(0);
-    expect(capture.deletes(task.id)).toHaveLength(0);
-
-    // The protection ended with the open: with the panel closed again, the next
-    // focused event clears the task's entry as plain D7 says.
-    await page.getByRole("button", { name: "Close task details" }).click();
-    await expect(page.getByTestId("run-panel-resize")).toHaveCount(0, { timeout: CONVERGE_TIMEOUT });
-    await deliverGlobalEvent(page, { kind: "run-status", taskId: task.id, runId, status: "succeeded", ts: Date.now() });
-    await expect.poll(() => capture.deletes(task.id).length, { timeout: CONVERGE_TIMEOUT }).toBeGreaterThan(0);
-    expect(capture.postKinds(task.id)).toEqual(["files-sent"]);
+    await expect.poll(() => reports.some((r) => r.selectedTaskId === task.id && r.view === "run-panel"), { timeout: CONVERGE_TIMEOUT }).toBe(true);
+    await page.evaluate(() => {
+      (window as unknown as { __agetorFocused: boolean }).__agetorFocused = false;
+      window.dispatchEvent(new Event("blur"));
+    });
+    await expect.poll(() => reports.some((r) => !r.focused && r.selectedTaskId === task.id), { timeout: CONVERGE_TIMEOUT }).toBe(true);
   });
+
+  // (g) "a focused proactive files-sent keeps its OS entry through the turn's succeeded event until the task is opened" is pinned by
+  // src/bun/notification-policy.test.ts: it needs a synthetic core-side `files-sent` event, which a page-side SSE injector cannot
+  // produce now that the core decides.
 });
 
 // ---------------------------------------------------------------------------
@@ -407,7 +376,7 @@ test.describe("one notification per task: OS notification requests", () => {
 // ---------------------------------------------------------------------------
 
 test.describe("one notification per task: pipeline run view", () => {
-  test("(e) opening a pipeline run view clears the parent's entry", async ({ page, freshBackend }) => {
+  test("(e) opening a pipeline run view is reported as the parent being open", async ({ page, freshBackend }) => {
     const backend = freshBackend;
     const headers = { ...authHeaders(backend), "content-type": "application/json" };
 
@@ -457,15 +426,22 @@ test.describe("one notification per task: pipeline run view", () => {
     expect(taskRes.ok, `POST /tasks -> ${taskRes.status}`).toBeTruthy();
     const parent = (await taskRes.json()) as TaskRow;
 
-    const capture = await captureNotifications(page);
+    const reports: Array<{ focused: boolean; selectedTaskId: string | null; view: string | null }> = [];
+    page.on("request", (r) => {
+      if (r.method() === "PUT" && new URL(r.url()).pathname === "/app/presence") reports.push(r.postDataJSON());
+    });
     await gotoApp(page, backend.bootBase);
-    // On the board with no panel and no run view, nothing is cleared.
+    // On the board with no panel and no run view, no task is reported open.
     await expect(taskCard(page, title)).toBeVisible();
-    expect(capture.deletes(parent.id)).toHaveLength(0);
+    await expect.poll(() => reports.length, { timeout: CONVERGE_TIMEOUT }).toBeGreaterThan(0);
+    expect(reports.every((r) => r.selectedTaskId === null)).toBe(true);
 
     await taskCard(page, title).getByText(title, { exact: true }).click();
     await expect(page.getByTestId("pipeline-run-view")).toBeVisible();
-    await expect.poll(() => capture.deletes(parent.id).length, { timeout: CONVERGE_TIMEOUT }).toBeGreaterThan(0);
+    // The run view counts as opening the parent: the webview reports it, and the core removes the parent's entry.
+    await expect
+      .poll(() => reports.some((r) => r.selectedTaskId === parent.id && r.view === "pipeline"), { timeout: CONVERGE_TIMEOUT })
+      .toBe(true);
   });
 });
 
@@ -627,6 +603,7 @@ async function answerStepQuestion(backend: E2EBackend, parentId: string): Promis
 test.describe("one notification per task: an owed 'Pipeline needs you' alert", () => {
   test.use({
     backendEnv: {
+      ...NOTIFIER_ENV,
       AGETOR_FAKE_CLAUDE_RESOLVE_DELAY_MS: "3000",
       AGETOR_FAKE_CLAUDE_SPAWN_DELAY_MS: "3000",
     },
@@ -639,7 +616,7 @@ test.describe("one notification per task: an owed 'Pipeline needs you' alert", (
     test.setTimeout(90_000);
     const backend = freshBackend;
     await fakeWindowFocus(page, false);
-    const capture = await captureNotifications(page);
+    const capture = captureNotifications(page);
     const run = await createOwedAlertPipelineTask(backend);
     await gotoAppSubscribed(page, backend);
     // The toast copy reads the parent's title from the polled list.
@@ -664,21 +641,20 @@ test.describe("one notification per task: an owed 'Pipeline needs you' alert", (
     await expect(liveToasts(page, run.title)).toContainText("Pipeline needs you", { timeout: CONVERGE_TIMEOUT });
     // …and, unfocused, it replaces the parent's OS entry with a `blocked` post.
     await expect.poll(() => capture.postKinds(run.parent.id)[0], { timeout: CONVERGE_TIMEOUT }).toBe("blocked");
-    expect(capture.deletes(run.parent.id)).toHaveLength(0);
     // Server side the run really is still blocked, with nothing left to answer.
     const after = await getParent(backend, run.parent.id);
     expect(after.pipelineRun?.status).toBe("blocked");
     expect(after.pendingInteractionCount ?? 0).toBe(0);
   });
 
-  test("(i) focused: the re-raised block alert is a toast only, and clears the parent's OS entry (D7)", async ({
+  test("(i) focused: the re-raised block alert is a toast only, and posts no OS notification (D7)", async ({
     page,
     freshBackend,
   }) => {
     test.setTimeout(90_000);
     const backend = freshBackend;
     await fakeWindowFocus(page, true);
-    const capture = await captureNotifications(page);
+    const capture = captureNotifications(page);
     const run = await createOwedAlertPipelineTask(backend);
     await gotoAppSubscribed(page, backend);
     await expect(taskCard(page, run.title)).toBeVisible({ timeout: CONVERGE_TIMEOUT });
@@ -691,7 +667,7 @@ test.describe("one notification per task: an owed 'Pipeline needs you' alert", (
 
     await expect(liveToasts(page, run.title)).toHaveCount(1, { timeout: CONVERGE_TIMEOUT });
     await expect(liveToasts(page, run.title)).toContainText("Pipeline needs you", { timeout: CONVERGE_TIMEOUT });
-    await expect.poll(() => capture.deletes(run.parent.id).length, { timeout: CONVERGE_TIMEOUT }).toBeGreaterThan(0);
+    await page.waitForTimeout(750);
     expect(capture.posts(run.parent.id)).toHaveLength(0);
   });
 });

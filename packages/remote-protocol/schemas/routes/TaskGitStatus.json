@@ -1,0 +1,103 @@
+{
+  "$schema": "http://json-schema.org/draft-07/schema#",
+  "type": "object",
+  "properties": {
+    "hasChanges": {
+      "type": "boolean"
+    },
+    "ahead": {
+      "type": "number"
+    },
+    "ignored": {
+      "type": "boolean"
+    },
+    "hasUpstream": {
+      "type": "boolean"
+    },
+    "remoteSynced": {
+      "type": "boolean"
+    },
+    "branch": {
+      "type": [
+        "string",
+        "null"
+      ]
+    },
+    "isDefaultBranch": {
+      "type": "boolean"
+    },
+    "repositories": {
+      "type": "array",
+      "items": {
+        "$ref": "#/definitions/TaskRepoGitStatus"
+      }
+    }
+  },
+  "required": [
+    "hasChanges",
+    "ahead",
+    "ignored",
+    "hasUpstream",
+    "remoteSynced",
+    "branch",
+    "isDefaultBranch"
+  ],
+  "additionalProperties": false,
+  "definitions": {
+    "TaskRepoGitStatus": {
+      "type": "object",
+      "properties": {
+        "hasChanges": {
+          "type": "boolean"
+        },
+        "ahead": {
+          "type": "number"
+        },
+        "ignored": {
+          "type": "boolean"
+        },
+        "hasUpstream": {
+          "type": "boolean"
+        },
+        "remoteSynced": {
+          "type": "boolean"
+        },
+        "branch": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "isDefaultBranch": {
+          "type": "boolean"
+        },
+        "repositories": {
+          "type": "array",
+          "items": {
+            "$ref": "#/definitions/TaskRepoGitStatus"
+          }
+        },
+        "name": {
+          "type": "string"
+        },
+        "path": {
+          "type": "string"
+        }
+      },
+      "required": [
+        "ahead",
+        "branch",
+        "hasChanges",
+        "hasUpstream",
+        "ignored",
+        "isDefaultBranch",
+        "name",
+        "path",
+        "remoteSynced"
+      ],
+      "additionalProperties": false
+    }
+  },
+  "$id": "https://agetor.dev/schemas/remote/routes/TaskGitStatus.json",
+  "title": "TaskGitStatus"
+}

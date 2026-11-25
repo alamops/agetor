@@ -124,10 +124,12 @@ describe("installNotificationPolicy: events", () => {
     expect(t.os.posts.map((p) => p.notification.kind)).toEqual(["files-sent"]);
     await t.emit({ kind: "run-status", taskId: "t1", runId: "r", status: "succeeded" } as unknown as GlobalEvent);
     expect(t.os.removes).toEqual([]);
-    t.pres.set({ selectedTaskId: "t1" });
+    t.pres.set({ selectedTaskId: "t1" }); // opening removes the entry itself...
+    expect(t.os.removes).toEqual(["t1"]);
     t.pres.set({ selectedTaskId: null });
     await t.emit({ kind: "run-status", taskId: "t1", runId: "r2", status: "succeeded" } as unknown as GlobalEvent);
-    expect(t.os.removes).toEqual(["t1"]);
+    // ...and ended the protection, so the next focused event clears the entry again.
+    expect(t.os.removes).toEqual(["t1", "t1"]);
   });
 
   test("a headless core (no window, nothing selected) posts every qualifying event", async () => {
@@ -144,6 +146,28 @@ describe("installNotificationPolicy: events", () => {
     expect(t.os.removes).toEqual(["t1"]);
     await t.emit({ kind: "run-status", taskId: "t1", runId: "r", status: "succeeded" } as unknown as GlobalEvent);
     expect(t.os.removes).toEqual(["t1", "t1"]);
+  });
+
+  test("opening a task removes its entry and ends a forced post's protection (it used to be the webview's job)", async () => {
+    const t = setup({ focused: true });
+    await t.emit({ kind: "files-sent", taskId: "t1", count: 1, caption: null, proactive: true } as unknown as GlobalEvent);
+    expect(t.os.removes).toEqual([]);
+    t.pres.set({ selectedTaskId: "t1" });
+    expect(t.os.removes).toEqual(["t1"]);
+    t.pres.set({ selectedTaskId: "t1" }); // an unchanged report removes nothing more
+    expect(t.os.removes).toEqual(["t1"]);
+    t.pres.set({ selectedTaskId: "t2" });
+    expect(t.os.removes).toEqual(["t1", "t2"]);
+  });
+
+  test("focus returning to a window that shows a task clears its entry (D6d); focus with no task open clears nothing", async () => {
+    const t = setup({ focused: false, selectedTaskId: "t1" });
+    t.pres.set({ focused: true });
+    expect(t.os.removes).toEqual(["t1"]);
+    t.pres.set({ focused: false });
+    t.pres.set({ selectedTaskId: null });
+    t.pres.set({ focused: true });
+    expect(t.os.removes).toEqual(["t1"]);
   });
 
   test("a sink that throws does not stop the others, and disposed policies hear nothing", async () => {

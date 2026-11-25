@@ -35,6 +35,7 @@ import {
   sweepArchivedTeardowns,
   reapIdleSessions,
   stopFxAutoResumeTimers,
+  subscribeGlobal,
   waitForLaunchesToSettle,
 } from "./orchestrator.ts";
 import { HANDOFF_LAUNCH_SETTLE_MS } from "./daemon-mode.ts";
@@ -97,6 +98,9 @@ import { resolveNotifierApp } from "./notifier.ts";
 import { parseTaskDeepLink } from "./deep-link.ts";
 import { createTaskNotifier } from "./task-notifier.ts";
 import { installNotificationRemovalHooks } from "./notification-hooks.ts";
+import { fetchTaskRows } from "./headless-notifications.ts";
+import { installNotificationPolicy, registerDeviceNotificationHook } from "./notification-policy.ts";
+import { setAppAttached, setNativeWindowFocus } from "./presence.ts";
 import { setPendingMenuAction, setPendingOpenTask } from "./pending-open.ts";
 import { buildAppMenu, deliverMenuAction, menuActionFromClick } from "./app-menu.ts";
 import pkg from "../../package.json" with { type: "json" };
@@ -236,9 +240,21 @@ registerNotifierBundle();
 // Learn which tasks still have an entry from a previous run, so opening one
 // removes it without spawning the helper for every other task.
 void taskNotifier.seed();
+// The ONE notification decision (docs/architecture/notifications.md, grill D5): the core decides every OS notification from the global
+// event bus and the window's presence (native focus/blur below, plus the webview's `PUT /app/presence`), then tells its sinks. The OS
+// sink is this notifier; the phone sink joins in the remote gateway. The webview keeps only its in-app toasts.
+setAppAttached(true);
+const notificationPolicy = installNotificationPolicy({ subscribe: subscribeGlobal, loadRows: fetchTaskRows });
+notificationPolicy.registerSink({
+  id: "os",
+  deliver: (d) => taskNotifier.post(d.notification),
+  remove: (r) => taskNotifier.remove(r),
+});
+// "Ana's iPhone was paired", revoke alerts: not about a task, so the notifier posts them through its plain path.
+registerDeviceNotificationHook((n) => taskNotifier.post({ title: n.title, body: n.body }));
 // Remove a task's entry once its reason goes away (answered from any client,
 // or the task left `blocked`).
-installNotificationRemovalHooks((r) => taskNotifier.remove(r));
+installNotificationRemovalHooks((r) => notificationPolicy.remove(r));
 
 // Native-host capabilities the API server needs but that only exist inside
 // Electrobun (file dialogs, OS notifications, open-in-Finder/browser, the
@@ -957,6 +973,15 @@ Electrobun.events.on(
   },
 );
 
+// Window focus is authoritative for the notification policy once seen (src/bun/presence.ts): the webview of a backgrounded or
+// occluded window may not get to report. Filtered to our main window like move/resize above.
+Electrobun.events.on("focus", (e: { data: { id: number } }) => {
+  if (getMainWindow()?.id === e.data.id) setNativeWindowFocus(true);
+});
+Electrobun.events.on("blur", (e: { data: { id: number } }) => {
+  if (getMainWindow()?.id === e.data.id) setNativeWindowFocus(false);
+});
+
 // Clear the registered window reference *only* when the main window
 // closes. The "close" event fires for every BrowserWindow the bun
 // process owns; without the id filter, closing a future secondary
@@ -964,7 +989,10 @@ Electrobun.events.on(
 // clear the main-window registration and break getMainWindow callers
 // like the /window/toggle-zoom endpoint.
 Electrobun.events.on("close", (e: { data: { id: number } }) => {
-  if (getMainWindow()?.id === e.data.id) setMainWindow(null);
+  if (getMainWindow()?.id === e.data.id) {
+    setMainWindow(null);
+    setNativeWindowFocus(false);
+  }
 });
 
 // macOS Dock-icon click on an already-running app fires Cocoa's

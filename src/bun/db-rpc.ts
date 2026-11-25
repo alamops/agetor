@@ -265,6 +265,9 @@ function inProcessClient(base: Base, noteRev: (rev: number) => void): DbRpc {
           hiddenClaudeSessionIds: m.hiddenClaudeSessionIds,
           hiddenOpencodeSessionIds: m.hiddenOpencodeSessionIds,
         },
+        remoteDevices: m.remoteDevices,
+        remoteAudit: m.remoteAudit,
+        remoteIdempotency: m.remoteIdempotency,
       } satisfies DbModules;
       const revQuery = m.db.query<{ rev: number }, []>(`SELECT rev FROM task_rev_meta WHERE id = 1`);
       return { conn: m.db, modules, readRev: () => revQuery.get()?.rev ?? 0 };

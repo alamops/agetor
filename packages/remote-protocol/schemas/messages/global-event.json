@@ -1,0 +1,23 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://agetor.dev/schemas/remote/messages/global-event.json",
+  "title": "global-event",
+  "x-direction": "core",
+  "type": "object",
+  "properties": {
+    "sub": {
+      "type": "string",
+      "maxLength": 64,
+      "minLength": 1,
+      "pattern": "^[A-Za-z0-9._:~-]+$"
+    },
+    "event": {
+      "description": "any JSON value, at most 1048576 characters when serialized"
+    }
+  },
+  "required": [
+    "sub",
+    "event"
+  ],
+  "additionalProperties": false
+}
