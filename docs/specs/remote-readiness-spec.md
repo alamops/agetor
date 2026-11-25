@@ -5,8 +5,9 @@ exported as Markdown on 2026-11-25. The content below is that revision UNAMENDED
 The export replaced its two embedded diagrams (architecture; pairing sequence) with
 text placeholders; the numbered pairing steps carry the same content.
 The owner's grill amendments (docs/plans/remote-readiness-grill.md, "Spec amendments
-for the owner to approve") are applied in a separate, later commit, marked inline,
-so they show up as a reviewable diff against this text.
+for the owner to approve") are applied below, marked inline as "Amended (grill ...)"
+blocks, with the replaced sentence struck through. The unamended text is the previous
+commit of this file, so the amendments are a reviewable diff.
 -->
 
 # Agetor Remote Readiness Spec
@@ -23,7 +24,7 @@ This change is Mac-side only: everything the core needs before a v1 app can pair
 | --- | --- | --- |
 | Keys and pairing | A signed key helper, the native pairing window, a signed device registry | Raising a device's level (v2) |
 | Sessions | Noise sessions over a relay link; a local test relay | Production relay and push gateway (their own specs); iroh direct link (v1.x) |
-| Routes | Remote levels in `ROUTE_POLICY`; v1 opens observe and respond only | Operate and configure routes (v2), after a per-key preference schema |
+| Routes | Remote levels in `ROUTE_POLICY`; ~~v1 opens observe and respond only~~ v1 opens observe, respond and the five `operate` routes listed in the router section | ~~Operate and configure routes (v2)~~ Further operate and configure routes (v2), after a per-key preference schema |
 | Consent | Signed approvals, the unlock window, idempotency keys | Signed launches, merges and deletes (v2) |
 | Data | Remote subscriptions on today's cursors; one needs-you query; a phone projection of events; small first loads; per-task file previews | — |
 | Notifications | One notification decision in the core; sealed pushes; presence from window focus | Idle-time presence; Live Activities |
@@ -31,7 +32,10 @@ This change is Mac-side only: everything the core needs before a v1 app can pair
 | Protocol code | `packages/remote-protocol`: the core's TypeScript implementation, message schemas and test vectors | The Swift (iOS) and Kotlin (Android) implementations, in the app work |
 | Quality | Headless test client, security suite, a CI gate for both, an external review | Full-suite CI baseline; demo core and canary channel before App Review |
 
-Not in any phase of this spec: keep-awake (deferred), a terminal on the phone, lock-screen approvals, commands sent while no session exists, and tailcat.
+Not in any phase of this spec: keep-awake (deferred), ~~a terminal on the phone~~ (a configure-level terminal is now in scope, see Terminal), lock-screen approvals, commands sent while no session exists, and tailcat.
+
+
+> **Amended (grill D17, 2026-11-25):** A phone with the `configure` level can attach to a task's tmux session. See the Terminal section.
 
 ## Security invariants
 
@@ -39,9 +43,13 @@ Each rule is a MUST, and each has a named test in the security suite (see Tests,
 
 1. **Nothing is exposed before a device is paired.** The relay link opens only while the remote-access switch is on AND either a trusted device exists or a native pairing window is open. The switch alone never authorizes anything.
 2. **Adding a device needs you at the Mac.** It takes the native pairing window, a code shown on the phone and typed on the Mac, and Touch ID or the login password. No HTTP route, CLI command or webview action can add a device or raise its level.
+
+> **Amended (grill D6, D7, 2026-11-25):** The level is chosen in the native pairing window (Respond by default, Operate, or Configure with a second confirmation) and is covered by the registry signature. A level is never raised later: revoke and pair again.
 3. **Trust comes from signatures, not rows.** A device counts only if its registry row carries a valid signature from the Mac's registry key and the key helper has not revoked it. Any other row is ignored and logged.
 4. **Every byte to a phone is end-to-end encrypted and authenticated both ways.** The relay and the push gateway see only ciphertext, padded sizes and timing.
 5. **The HTTP API stays on 127.0.0.1.** Phones reach route handlers only through the in-process router; no listener is added.
+
+> **Amended (grill D11, 2026-11-25):** ~~The HTTP API stays on 127.0.0.1.~~ The HTTP API keeps the bind it has today: loopback for the app, and for the headless core whatever `AGETOR_API_HOST` resolves to (loopback or a wildcard, with the existing cleartext warning). The gateway adds no listener, and when the core is bound beyond loopback the gateway logs a warning to `core.log` and `GET /remote-access` reports `bindWarning`.
 6. **Deny by default.** A phone may call a route only if its `ROUTE_POLICY` entry has an explicit remote level. Desktop-only routes, test routes and native-only actions are never remote.
 7. **A device caller exists only inside an authenticated session.** No header, query string or token can produce it.
 8. **Consent that runs code is signed.** Plan approvals, Allow-once answers, trust screens and pipeline gate decisions carry a Face ID signature over the exact content the phone showed. A changed content hash voids it.
@@ -65,6 +73,7 @@ The most likely attacker is already on the Mac: an agent running as you. The des
 | Thief who knows the passcode | Read the board, stop runs, answer questions in tasks that ask before acting | Approve, allow, or send into tasks that run without asking (current biometrics, no passcode fallback) |
 | Tampered app or OS on the phone | Show one thing and sign another | Avoid the Mac alert and the audit entry every remote approval creates (this is detection, not prevention) |
 | Agent text shown on the phone | Mislead you with words | Change the facts the core shows outside agent text (mode, project, command) or load remote images |
+| A phone paired at `configure` (grill D17) | Attach to a task's tmux session and type anything the agent's shell accepts, with the user's full privileges | Do it without a signed approve-key attach, in a task with no tmux session, or after revoke; keystrokes are not audited, attach and detach are. This is an accepted bypass of the consent classes: configure means "as trusted as the keyboard" |
 
 What a revoke or Remote access off protects: from that moment the device's sessions end and its keys stop working, even if an agent rewrites the database.
 
@@ -82,8 +91,8 @@ Seven keys, each in the strongest store its algorithm allows, built only from st
 
 | Key | Algorithm | Lives in | Who can use it | Replaced when |
 | --- | --- | --- | --- | --- |
-| Core session key | X25519 | A keychain item only the key helper's signature can open (spike K1) | The key helper, for one Diffie-Hellman per handshake; Bun never holds it | Revoke all; every device pairs again |
-| Registry key | P-256 ECDSA | The Mac's Secure Enclave, requiring user presence | The key helper, only at the end of its own pairing window, with Touch ID or the login password each time | Never; replacing it means every device pairs again |
+| Core session key | X25519 | A ~~keychain item~~ data-protection keychain item (access group of the key helper) only the key helper's signature can open (spike K1) | The key helper, for one Diffie-Hellman per handshake; Bun never holds it | Revoke all; every device pairs again |
+| Registry key | P-256 ECDSA | The Mac's Secure Enclave, requiring user presence (no Secure Enclave: pairing is refused) | The key helper, only at the end of its own pairing window, with Touch ID or the login password each time | Never; replacing it means every device pairs again |
 | Device session key | P-256 ECDSA | Phone Secure Enclave or StrongBox, usable while unlocked | The phone; the core verifies | Each pairing |
 | Device approve key | P-256 ECDSA | Phone Secure Enclave or StrongBox, current biometrics, no passcode fallback | The phone; the core verifies | When biometrics change: pair again |
 | Device push key | X25519 | Phone keychain shared with the notification extension | The core seals to it | Each pairing |
@@ -100,7 +109,9 @@ Seven keys, each in the strongest store its algorithm allows, built only from st
 - Signed JSON: RFC 8785 canonical JSON, ES256 with raw r and s.
 - Mailbox key and id: the key is HKDF-SHA256 of the link secret with info `agetor-mailbox/1` and the UTC date, 32 bytes (pairing uses the pairing secret with info `agetor-pairing/1`). The id is the first 16 bytes of the key's SHA-256. A side joins by presenting the key; the relay keeps only the id.
 - Pairing code: six digits, the first four bytes of HKDF(handshake hash, `agetor-sas/1`) as an unsigned integer, modulo 1,000,000.
-- Implementations: three, each on its platform's standard primitives, and all must pass the cacophony and snow Noise vectors plus this protocol's own vectors.
+- Implementations: three, each on its platform's standard primitives, and all must pass ~~the cacophony and snow Noise vectors~~ the vector set below, plus this protocol's own vectors.
+
+> **Amended (grill C5, 2026-11-25):** The vector set is: the cacophony NK and NKpsk0 vectors for `Noise_*_25519_ChaChaPoly_SHA256` (ciphertexts and handshake hash), snow's NK vectors (ciphertexts; snow has no NKpsk0 vectors for this suite and no handshake hash), RFC 9180 base-mode vectors for DHKEM(X25519, HKDF-SHA256) with ChaCha20-Poly1305, and this protocol's own vectors for prologue, rekey, NKpsk0 failures, framing, padding, canonical JSON, ES256 (high-S included), mailbox ids, SAS codes, push seals and signed decisions. Each vector file records its source, license and retrieval date.
   - Core: `@noble/curves`, `@noble/ciphers` and `@noble/hashes` 2.x in `packages/remote-protocol`. The responder's static Diffie-Hellman is an injected function, so the key helper performs it.
   - iOS: CryptoKit only: Curve25519, P256 in the Secure Enclave, ChaChaPoly, SHA256, HKDF and HPKE (iOS 17 and later). No third-party crypto ships in the iOS app.
   - Android: Android Keystore for the P-256 keys (StrongBox when present), and Google's Tink for X25519, ChaCha20-Poly1305 and HPKE.
@@ -119,11 +130,13 @@ The highlighted step is the one an agent on the Mac cannot do for you: it never 
 4. The phone scans and runs the `NKpsk0` handshake through the relay. Its first message carries its name (40 characters at most), platform, app version and its session, approve and push public keys. The session and approve keys each sign the handshake hash.
 5. The core checks both signatures and hands the hash, keys and name to the helper.
 6. The phone shows the six-digit code derived from the handshake hash. You type it in the helper window. A wrong code three times, or the expiry, ends the pairing.
-7. The helper compares the code, asks for Touch ID ("Add 'Ana's iPhone' to Agetor"), and signs the registry entry. Only then does the core write the row, at level `respond`.
+7. The helper compares the code, asks for Touch ID ("Add 'Ana's iPhone' to Agetor"), and signs the registry entry. Only then does the core write the row, at ~~level `respond`~~ the level chosen in the window (Respond preselected, Operate, or Configure after a second confirmation), which the signature covers.
 8. Over the same session the core sends the device id and link secret. It posts a Mac notification ("Ana's iPhone was paired"), alerts other paired devices, and writes an audit entry.
 9. The window closes, the pairing mailbox is retired, and the device's own mailbox takes over.
 
 The device name comes from the phone, so the window and Settings show it as plain text, cleaned of control and invisible characters.
+
+> **Amended (grill D2, D3, 2026-11-25):** The key helper is a Developer ID signed nested `.app` carrying an embedded provisioning profile, and keeps the core key in the data-protection keychain under its own access group. There is **no login-keychain fallback**: when the Secure Enclave or the data-protection keychain is unavailable the helper answers `no-secure-enclave` or `keychain-unavailable`, and pairing is refused with an explanation.
 
 ## Sessions and the relay link
 
@@ -135,7 +148,9 @@ The core and the phone only dial out to the relay, which forwards ciphertext bet
 - **Framing.** Noise messages are at most 65,535 bytes. Each app message has a type, an id and a chunk index and count, and is padded inside the encryption to 256 B, 1 KB, 4 KB, 16 KB or 64 KB.
 - **Order.** Any decryption failure, nonce gap or oversized frame ends the session. The phone handshakes again and resumes from its cursors. Every frame also carries an 8-byte session tag outside the encryption; a frame tagged with an ended session is dropped without decrypting, so a frame the relay delivers again after a reconnect can never end a new session.
 - **Lifetime.** Noise rekey every 10 minutes or 2^20 messages; a session ends after 15 idle minutes or 12 hours. Revoke, Remote access off and Revoke all end it immediately.
-- **Hello.** The core's first message carries the protocol version and minimum version, the device's level, the routes open to it (read from `ROUTE_POLICY`), the audit chain head, and the core's clock. This replaces adding a protocol version to `/info` (blueprint item 3.5).
+- **Hello.** The core's first message carries the protocol version and minimum version, the device's level, the routes open to it (read from `ROUTE_POLICY`), the audit chain head, and the core's clock, and the Mac's name (`macName`, at most 40 characters, from the `remoteMacName` preference or the computer name). This replaces adding a protocol version to `/info` (blueprint item 3.5).
+
+> **Amended (grill D16, 2026-11-25):** `macName` is added to the hello.
 - **Handoff.** The gateway runs in whichever core owns the port, app or background. After a handoff the link reconnects from the new owner. A launch refused with `launches-frozen` is retried by the phone.
 - **Rate limits.** Token buckets per device: 6 handshakes a minute, 30 requests a second, 2 heavy reads a second. Stop, cancel, reject and revoke are never limited.
 
@@ -149,7 +164,7 @@ Devices live in a new SQLite table, but a row is only trusted with a valid regis
 | `name`, `platform`, `app_version` | From the phone at pairing; the name cleaned and capped at 40 characters |
 | `session_pub`, `approve_pub`, `push_pub` | Public keys, raw bytes |
 | `link_secret` | The device's mailbox secret (finds mailboxes, grants nothing) |
-| `level` | `respond` for v1; `watch`, `operate` and `full` are reserved for v2 |
+| `level` | ~~`respond` for v1; `watch`, `operate` and `full` are reserved for v2~~ One of `observe`, `respond`, `operate`, `configure`, chosen in the native pairing window and covered by `sig` |
 | `status` | `active` or `revoked` (a convenience copy; the helper's list decides) |
 | `enrolled_at`, `last_seen_at` | Times |
 | `push_ref` | The gateway's opaque push address and the device's push send key, set by the phone over its session |
@@ -166,7 +181,7 @@ Phones call the same route handlers the webview and CLI use, in-process, and the
 
 ```ts
 remote: "none" | {
-  level: "observe" | "respond" | "operate" | "configure"; // v1 opens observe and respond
+  level: "observe" | "respond" | "operate" | "configure"; // v1 opens observe, respond and five operate routes (grill D9, D12)
   stepUp: "none" | "unlock" | "signed";  // "unlock" applies only when the task runs without asking
   rate: "normal" | "heavy" | "stop";       // "stop" is never limited
   since: 1;                                  // protocol version that opened it
@@ -176,7 +191,9 @@ remote: "none" | {
 - **Startup checks.** The core refuses to start if a remote entry sits on an `app` or `public` route, or lacks a level. `route-policy.test.ts` pins the exact v1 remote set, so opening a route shows up in review.
 - **Router.** `invokeRoute(method, path, body, principal)` builds the request inside the core and runs the handler. `resolveCaller` returns a new caller kind, `device`, only from a private in-process mark, never from a header or query.
 - **Device checks.** A device caller passes every check the CLI token passes today (desktop-only routes refused, filesystem path probes) plus level, step-up, rate and file scope. Handlers read the caller to name the device in toasts and audit entries.
-- **File previews.** A new `GET /tasks/:id/files/preview` serves devices only the paths the task points at: its attachments and references, sent files, images in its transcript, and files under its worktree or project. Images only, 10 MB at most, read through the existing disclaimed reader. The desktop route keeps previewing any path (owner decision, 24 Nov).
+- **File previews.** A new `GET /tasks/:id/files/preview` serves devices only the paths the task points at: its attachments and references, sent files, images in its transcript, and files under its worktree or project. ~~Images only, 10 MB at most, read through the existing disclaimed reader.~~ Read through the existing disclaimed no-follow reader, 50 MB at most, in chunks under the relay limits. The desktop route keeps previewing any path (owner decision, 24 Nov).
+
+> **Amended (grill D14, D15, 2026-11-25):** Previews are 50 MB with no folder limit. A path inside the task's folders (workdir, worktrees, sent files) opens at any level; any other path needs `operate` or above. ~~Phones get only the paths the task points at.~~
 
 | Group | v1 routes | Step-up |
 | --- | --- | --- |
@@ -184,6 +201,7 @@ remote: "none" | {
 | Respond, removing | `POST /runs/:id/cancel`, `POST /tasks/:id/pipeline/cancel`, reject or dismiss on any card, `POST` and `DELETE /tasks/:id/seen` | None; rate `stop` for the cancels |
 | Respond, content | `POST /ask-questions/:id/answer`, `POST /runs/:id/input`, `/tasks/:id/backlog` and `/tasks/:id/backlog/:itemId` | Unlock window when the task runs without asking |
 | Respond, consent | `POST /tasks/:id/plans/:planId/approve`, `POST /tmux-prompts/:id/answer` (any non-reject choice), `POST /fx-permissions/:id/answer` (allow options), `POST /tasks/:id/pipeline/review` | Signed, every time |
+| Added to v1 (grill D12) | `GET /tasks/:id/messages/history` (observe); `PATCH /tasks/:id/plans/:planId` (respond, signed over the edited body, D13); `POST /tasks/:id/fx-resume` (respond, signed); `POST /tasks/:id/switch-account` (operate, session only); `DELETE /tasks/:id/phone-terminal` is Mac-side only and not remote | As listed |
 | Session operations | Hello, push registration, revoke this device | Session only |
 
 ## Signed decisions and the unlock window
@@ -197,6 +215,8 @@ The proof a phone must give grows with what the action can cause: removing needs
 | Content | Answers to questions, follow-ups, drafts | Session; plus the unlock window if the task's mode runs without asking (auto, yolo, Full access) |
 | Consent | Plan approval, Allow once, Claude Code trust and Press-Enter screens, pipeline gate Accept or Return | A signed decision, every time |
 | Never remote in v1 | Always allow, Claude login codes, starting tasks, settings | Refused |
+
+> **Amended (grill D8, D9, D10, 2026-11-25):** A tmux card choice is classified by value with exact known label shapes only: `once` is consent, `reject` is removal, `always` and anything unknown are never remote. The Claude plan modal's "Yes, and use auto mode" row needs `operate`, a signature over the plan hash and the unlock window; the manual-approve row is consent; "Tell Claude what to change" is content. A reject or skip that carries text is content, not removal.
 
 **Signed decision.** The core sends the exact bytes to show (plan markdown and revision; card question, options and the task's mode; gate handoffs and sequence number), their SHA-256 and a challenge. The phone renders those bytes, recomputes the hash, and signs with its approve key:
 
@@ -215,6 +235,8 @@ The core then checks, in order, and refuses on the first failure:
 5. The decision is valid for that target.
 
 Only then does the handler run, and the audit entry keeps the payload and the signature. A gate comment is inside the signed payload, because it reaches the next step's prompt as trusted owner text.
+
+> **Amended (grill E4, 2026-11-25):** The pipeline gate signature covers all six fields: handoffs, `stepId`, `seq`, `decision`, `comment`, `nextStepIds` and the task's `mode`.
 
 **Unlock window.** One approve-key signature over `{kind: "unlock", sessionHash, expiresAt}`, at most 10 minutes ahead, opens the content class for tasks that run without asking. It ends with the session.
 
@@ -236,10 +258,24 @@ The phone reuses the cursors main already has; this change adds one inbox query,
 The core decides once whether a task needs you, then tells the Mac and every phone. A push carries a sealed payload only the phone can open.
 
 - **One decision in the core (blueprint item 4.1).** Today the headless core decides in `headlessNotificationFor` and the open app decides in the webview's `maybeNotifyOS`. Move the app's decision into the core, so both use one module with two sinks (macOS, phones), the same `NOTIFICATION_KINDS`, one entry per task, and the same removal triggers.
-- **Presence.** No phone push while the Agetor window had focus in the last 2 minutes (the webview already reports focus). A background core with no app open counts as away.
+- **Presence.** No phone push while the Agetor window had focus in the last 2 minutes ~~(the webview already reports focus)~~.
+
+> **Amended (grill D5, 2026-11-25):** Electrobun's native window focus and blur events are authoritative in the app; the webview reports focus, the selected task and view through `PUT /app/presence` as the backup and the only source on a headless core. The core owns the decision through one notification policy with an OS sink and a phone sink. A background core with no app open counts as away.
 - **What is sent.** Only needs-you kinds by default. The payload `{v, taskId, kind, title, subtitle, ts}` is padded to 1 KB and HPKE-sealed to the device's push key. The visible text is generic ("A task needs you"); the phone decrypts the title on the device. No plan, command, path or transcript text ever goes in a push.
 - **One entry per task.** The collapse id is an HMAC-SHA256 of the task id under the device's link secret, so Apple and Google see an opaque, stable value.
 - **Delivery.** The core posts to the push gateway with the device's `push_ref`, authenticated by an HMAC under the device's push send key. The gateway's own contract is a separate spec; tests use a stub gateway.
+
+## Terminal
+
+> **Amended (grill D17, 2026-11-25):** New section.
+
+A phone paired at `configure` can attach to a task's tmux session and type into it.
+
+- **Gate.** The `terminal-attach` session op needs level `configure` and a signature by the approve key over `{kind:"terminal-attach", sessionHash, taskId, tmuxSession, challenge}` (current biometrics). The signature is checked by the same five-check verifier as other decisions.
+- **Transport.** The core runs `tmux attach-session -t <session>` on Agetor's tmux socket in a PTY through `coreSpawn`. Output is coalesced every 50 ms into chunks of at most 16 KB and paced under the relay limits. Messages: `terminal-attach`, `terminal-input`, `terminal-resize`, `terminal-detach` from the phone; `terminal-output` and `terminal-closed` from the core.
+- **Harnesses.** Only tmux-hosted per-task sessions qualify (claude-code, codex, gemini, antigravity, copilot and the OpenCode 1.x `run` driver). ACP harnesses and the OpenCode 2.x server answer `no-terminal`.
+- **Detach.** On request, when the session ends or the peer leaves for 30 s, after 15 minutes without input, from the Mac (`DELETE /tasks/:id/phone-terminal`, Mac side only), on archive, delete or revoke. Detach kills only the tmux client, never the session. One phone per task: a second attach replaces the first.
+- **Mac side.** The run panel shows "Phone attached to <task>" with a Detach button. Attach and detach are audited; keystrokes are not logged or audited.
 
 ## Audit log
 
@@ -252,6 +288,8 @@ Every remote action leaves a hash-chained entry before its answer goes out, and 
 - **Viewer.** Settings › Remote access › Activity, and `agetor remote log`.
 - **Retention.** One year or 50,000 entries. Trimming records the hash of the last dropped entry as the new starting point.
 
+> **Amended (grill C2, C3, 2026-11-25):** A trim drops and recreates the DELETE trigger and writes an anchor row inside one `BEGIN IMMEDIATE`. A mutation writes an attempt row first and a result row after; an attempt with no result reads "outcome unknown".
+
 ## Controls: menu, Settings, CLI and kill switches
 
 Turning things on and adding devices stay native; reading, revoking and turning off work everywhere.
@@ -263,7 +301,9 @@ Turning things on and adding devices stay native; reading, revoking and turning 
 | CLI | `agetor remote status`, `agetor remote off` | `agetor remote devices`, `revoke <device>`, `revoke-all`, `log`; still no `on` and no `pair` |
 | HTTP | `GET` and `DELETE /remote-access` | `GET /remote-access/devices`, `DELETE /remote-access/devices/:id`, `DELETE /remote-access/devices (revoke all)`, `GET /remote-access/log` |
 
-- **The route test changes on purpose.** `REMOTE_ACCESS_ALLOWLIST` in `route-policy.test.ts` gains exactly the routes above, all GET or DELETE, so no POST, PUT or PATCH ever sits under /remote-access. They only read or remove authority, which the repo's rule 3 allows; nothing under them can add a device or raise a level.
+- **The route test changes on purpose.** `REMOTE_ACCESS_ALLOWLIST` in `route-policy.test.ts` gains exactly the routes above, all GET or DELETE, so no POST, PUT or PATCH ever sits under /remote-access.
+
+> **Amended (grill D19, 2026-11-25):** The rule is rewritten: no route pairs a device, turns remote access on or raises a device's level. Under `/remote-access` only GET (read) and DELETE (revoke or turn off) exist. The pairing button in Settings is replaced by the text "Pair a phone from Agetor › Remote Access › Pair a Phone…" (grill C1). They only read or remove authority, which the repo's rule 3 allows; nothing under them can add a device or raise a level.
 - **Remote access off** ends every session and the link at once.
 - **Revoke all** has the key helper revoke every device and replace the core session key, so every phone must pair again.
 - **Mac alerts.** A notification for every pairing and revoke, and a toast for every remote approval ("Plan approved from Ana's iPhone").
@@ -348,7 +388,9 @@ Seventeen items in six waves; items in a wave own different files and can run in
 
 Two spikes gate the work; the rest are decisions for later specs.
 
-- **K1, key storage (gates R2).** Can a Developer ID-signed Swift helper keep keys in the data-protection keychain under its own access group, and use the Mac's Secure Enclave, so that Agetor's own `bun` cannot read them? This may need the `keychain-access-groups` entitlement and an embedded provisioning profile. Fallback: a login-keychain item whose only trusted app is the helper, so any other caller triggers a visible macOS prompt.
+- **K1, key storage (gates R2).** Can a Developer ID-signed Swift helper keep keys in the data-protection keychain under its own access group, and use the Mac's Secure Enclave, so that Agetor's own `bun` cannot read them? This may need the `keychain-access-groups` entitlement and an embedded provisioning profile. ~~Fallback: a login-keychain item whose only trusted app is the helper, so any other caller triggers a visible macOS prompt.~~
+
+> **Amended (grill D3, 2026-11-25):** There is no fallback. If the live check fails, stop and decide again.
 - **W1, schemas to native models (gates R1).** Generate JSON Schema from the `src/shared` types the v1 routes return, then Swift `Codable` and Kotlin serialization models from it (for example with quicktype), and check the output compiles and needs no hand edits.
 - **Open: the relay's delivery guarantees** on Cloudflare Durable Objects (order per mailbox, at-least-once) belong to the relay spec; the core already tolerates redelivery through idempotency and fresh handshakes.
 - **Decided: Agetor runs the only relay.** On Durable Objects at workers.dev addresses, picked by a signed config on agetor.dev that Agetor can switch without an app or Mac update. No self-host image and no setting to use another relay (owner, 25 Nov); details in the relay spec.
