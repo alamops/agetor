@@ -1,0 +1,435 @@
+/**
+ * The pure event → notification policy and its stateful per-event handler, shared by the app core and the headless
+ * core (docs/specs/remote-readiness-spec.md "Push notifications", grill D5). It knows nothing about windows: whether a
+ * notification is shown, cleared or skipped for the Mac is decided by `notification-policy.ts` from `presence.ts`.
+ *
+ * Moved verbatim out of `headless-notifications.ts`, which re-exports everything here so its callers and tests
+ * are unchanged. The titles, bodies and kinds are the ones the webview used to word in `src/mainview/lib/toasts.ts`.
+ *
+ * No side effects at module load.
+ */
+
+import { humanReviewSubtitle, newHumanGateSeqs } from "../shared/pipeline.ts";
+import type { GlobalEvent, PipelineRunState, PipelineRunStatus, Task } from "../shared/types.ts";
+import type { TaskNotification } from "./task-notifier.ts";
+
+/** Extra facts the policy needs about one notification, beyond the notification itself. */
+export interface NotificationMeta {
+  /**
+   * Post even while the notification's task is the one open in the window (a pending question, a proactive files send,
+   * an account switch, a review gate: the webview called these with its own "selected" rule off).
+   */
+  whenSelected?: boolean;
+  /** Post even while the window is focused (a proactive `files-sent`). */
+  force?: boolean;
+}
+
+/** Kinds the webview notified even when the task's panel was open (`notifyWaitingInput`, `notifyFilesSent`, `toastHarnessSwap`). */
+const WHEN_SELECTED_KINDS: ReadonlySet<string> = new Set(["waiting", "files-sent", "harness-swap"]);
+
+/** The meta for the notification an event produced. */
+export function notificationMetaFor(ev: GlobalEvent, n: TaskNotification): NotificationMeta {
+  const meta: NotificationMeta = {};
+  if (n.kind && WHEN_SELECTED_KINDS.has(n.kind)) meta.whenSelected = true;
+  if (ev.kind === "files-sent" && ev.proactive) meta.force = true;
+  return meta;
+}
+
+/** The slice of a task row the policy needs for display. */
+export interface HeadlessTaskInfo {
+  title: string;
+  /** The harness id; the webview's toast subtitle for an ordinary task. */
+  agent?: string | null;
+  /** A pipeline parent's run name, used to trim a step title's prefix. */
+  pipelineName?: string | null;
+}
+
+export type HeadlessTaskLookup = (taskId: string) => HeadlessTaskInfo | null;
+
+/** State the pure policy cannot derive from one event. */
+export interface HeadlessNotificationContext {
+  /** The pipeline parent's previous run status; "done" is notified on the transition only. */
+  prevPipelineStatus?: PipelineRunStatus | null;
+  /**
+   * A question is pending for the notification's target (a pipeline parent's
+   * own, or any of its steps'). A parent's `reason: "pipeline"` block then
+   * stays silent: the step's retargeted "Waiting on you" already holds the
+   * task's one notification, and the "Pipeline needs you" alert is owed
+   * instead (see {@link decideOwedPipelineAlert}).
+   */
+  hasPendingQuestion?: boolean;
+}
+
+/** The body of the "Pipeline needs you" notification, as the webview words it. */
+function pipelineNeedsYou(taskId: string, lookup: HeadlessTaskLookup): TaskNotification {
+  const title = lookup(taskId)?.title || `Pipeline ${taskId.slice(0, 7)}`;
+  return { title: "Waiting on you", body: `${title} · Pipeline needs you`, taskId, kind: "blocked" };
+}
+
+/**
+ * What to do with a pipeline parent's owed "Pipeline needs you" alert given its
+ * current row — the headless twin of `OwedPipelineAlerts.decide`
+ * (src/mainview/lib/owed-pipeline-alerts.ts; that module is on the webview side
+ * of the process split, so the rule is repeated here). `raise` while the run is
+ * blocked on something other than a question the user already answered
+ * (`answered` step task ids: the runner records an unanswered-at-settle
+ * question as a `step-blocked` block that lasts until the step runs again) or a
+ * step that runs again (the runner clears that step's blocks asynchronously);
+ * `wait` while those are the only blocks; `drop` once the run left `blocked` or
+ * the parent is archived or gone.
+ */
+export function decideOwedPipelineAlert(
+  answered: ReadonlySet<string>,
+  parent: { archivedAt?: number | null; pipelineRun?: Pick<PipelineRunState, "status" | "blocked"> | null } | null,
+  isStepRunning: (taskId: string) => boolean,
+): "raise" | "wait" | "drop" {
+  const run = parent?.pipelineRun;
+  if (!parent || parent.archivedAt != null || !run || run.status !== "blocked") return "drop";
+  const blocked = run.blocked.some((b) => {
+    if (b.taskId === null) return true;
+    if (b.kind === "step-blocked" && answered.has(b.taskId)) return false;
+    return !isStepRunning(b.taskId);
+  });
+  return blocked ? "raise" : "wait";
+}
+
+/** The reason text the webview shows for an orphaned run (App.tsx). */
+const ORPHANED_REASON = "agetor restarted while running";
+
+// Same copy as src/mainview/lib/files-sent-notify.ts `filesSentCopy`; that
+// module sits on the webview side of the process split, so the few lines are
+// repeated here rather than imported across it.
+const CAPTION_BODY_MAX_CHARS = 120;
+
+function filesSentCopy(count: number, caption: string | null): { title: string; body: string | null } {
+  const title = count === 1 ? "1 file sent to you" : `${count} files sent to you`;
+  if (caption === null) return { title, body: null };
+  const firstLine = caption.split("\n")[0]?.trim() ?? "";
+  if (firstLine.length === 0) return { title, body: null };
+  return {
+    title,
+    body: firstLine.length > CAPTION_BODY_MAX_CHARS ? firstLine.slice(0, CAPTION_BODY_MAX_CHARS) + "…" : firstLine,
+  };
+}
+
+/** A step row's title is `<pipeline name> · <step name>`; the toast names only the step. */
+function stepSubtitle(step: HeadlessTaskInfo | null, parent: HeadlessTaskInfo | null): string | undefined {
+  if (!step) return undefined;
+  const prefix = parent?.pipelineName;
+  const sep = " · ";
+  if (prefix && step.title.startsWith(`${prefix}${sep}`)) return step.title.slice(prefix.length + sep.length);
+  return step.title;
+}
+
+function stepParentIdOf(ev: GlobalEvent): string | null {
+  if (!("pipelineParentId" in ev)) return null;
+  return ev.pipelineParentId ? ev.pipelineParentId : null;
+}
+
+function stepParentTitleOf(ev: GlobalEvent): string | null {
+  if (!("pipelineParentTitle" in ev)) return null;
+  return ev.pipelineParentTitle ? ev.pipelineParentTitle : null;
+}
+
+/**
+ * The notification a global event implies, or null.
+ *
+ * Mirrors the webview, without its window rules:
+ * - `interaction` pending → "Waiting on you". (The webview raises it once per
+ *   task, on the first of several stacked prompts; that bookkeeping needs
+ *   state across events, so the installer owns it.)
+ * - `run-status` succeeded → "Task succeeded"; failed / orphaned → "Task
+ *   failed"; cancelled → none (the user asked for it).
+ * - `column` → blocked, by reason: api-error, session-died ("Session ended"),
+ *   unknown-command, pipeline ("Pipeline needs you", unless a question is
+ *   pending — see `ctx.hasPendingQuestion`), anything else "Waiting on you".
+ * - `files-sent` → "N files sent to you".
+ * - `pipeline` → done, on the transition into it → "Task succeeded" with the
+ *   `pipeline-finished` kind.
+ *
+ * A hidden pipeline step's events are retargeted at its parent (title = the
+ * parent's, body names the step, `taskId` = the parent) for the user-facing
+ * kinds; a step's own run settling or blocked transition is never notified.
+ */
+export function headlessNotificationFor(
+  ev: GlobalEvent,
+  lookup: HeadlessTaskLookup,
+  ctx: HeadlessNotificationContext = {},
+): TaskNotification | null {
+  if (ev.kind === "update" || ev.kind === "tasks-changed" || ev.kind === "send-failed" || ev.kind === "fx-auto-resume") return null;
+
+  const stepParentId = stepParentIdOf(ev);
+
+  if (ev.kind === "pipeline") {
+    if (ev.status !== "done" || ctx.prevPipelineStatus === "done") return null;
+    const title = lookup(ev.taskId)?.title || `Pipeline ${ev.taskId.slice(0, 7)}`;
+    return {
+      title: "Task succeeded",
+      body: `${title} · Pipeline finished`,
+      taskId: ev.taskId,
+      kind: "pipeline-finished",
+    };
+  }
+
+  // Resolve who the notification names: the task itself, or for a hidden step
+  // its pipeline parent with the step as the subtitle.
+  const task = lookup(ev.taskId);
+  let taskId = ev.taskId;
+  let title = task?.title || `Task ${ev.taskId.slice(0, 7)}`;
+  let subtitle: string | undefined = task?.agent || undefined;
+  if (stepParentId) {
+    const parent = lookup(stepParentId);
+    taskId = stepParentId;
+    title = parent?.title || stepParentTitleOf(ev) || `Pipeline ${stepParentId.slice(0, 7)}`;
+    subtitle = stepSubtitle(task, parent);
+  }
+  const describe = subtitle ? `${title} · ${subtitle}` : title;
+
+  switch (ev.kind) {
+    case "interaction":
+      if (ev.state !== "pending") return null;
+      return { title: "Waiting on you", body: describe, taskId, kind: "waiting" };
+
+    case "run-status": {
+      // A harness-stack failover marks the old run failed while the task
+      // keeps running; the successor's settle is the real outcome. An
+      // all-exhausted settle is also non-terminal — its `column` block
+      // carries the stack-specific notification, so the generic "Task
+      // failed" must not fire first.
+      if (ev.reason === "harness-swap" || ev.reason === "harness-exhausted") return null;
+      // A step's own run settling never notifies; the parent's pipeline
+      // events are the user-facing signal.
+      if (stepParentId) return null;
+      if (ev.status === "succeeded") {
+        return { title: "Task succeeded", body: describe, taskId, kind: "succeeded" };
+      }
+      if (ev.status === "failed" || ev.status === "orphaned") {
+        const body = ev.status === "orphaned" ? `${describe} — ${ORPHANED_REASON}` : describe;
+        return { title: "Task failed", body, taskId, kind: "failed" };
+      }
+      return null;
+    }
+
+    case "column": {
+      if (ev.column !== "blocked" || stepParentId) return null;
+      if (ev.reason === "api-error") {
+        return { title: "API error — retry", body: describe, taskId, kind: "api-error" };
+      }
+      if (ev.reason === "session-died") {
+        return { title: "Session ended", body: describe, taskId, kind: "session-ended" };
+      }
+      if (ev.reason === "unknown-command") {
+        return { title: "Message not delivered", body: describe, taskId, kind: "unknown-command" };
+      }
+      // The parent's "pipeline" block ("Pipeline needs you"): silent only while
+      // a step's question holds the parent's notification; a block with no
+      // question behind it (step-failed, handoff-missing, step-cap, …) would
+      // otherwise never reach the user.
+      if (ev.reason === "pipeline") {
+        return ctx.hasPendingQuestion ? null : pipelineNeedsYou(taskId, lookup);
+      }
+      if (ev.reason === "harness-exhausted") {
+        return { title: "Stack out of quota", body: describe, taskId, kind: "blocked" };
+      }
+      if (ev.reason === "harness-swap-failed") {
+        return { title: "No usable backup account", body: describe, taskId, kind: "blocked" };
+      }
+      return { title: "Waiting on you", body: describe, taskId, kind: "blocked" };
+    }
+
+    case "harness-swap": {
+      return {
+        title: "Account switched",
+        // Same rule as `stackPositionText`: no position for a stack with
+        // fewer than two accounts.
+        body: `${describe} — ${ev.fromLabel} → ${ev.toLabel}${ev.count >= 2 ? ` (${ev.position}/${ev.count})` : ""}`,
+        taskId,
+        kind: "harness-swap",
+      };
+    }
+
+    case "files-sent": {
+      const copy = filesSentCopy(ev.count, ev.caption);
+      return {
+        title: copy.title,
+        body: copy.body ? `${describe} — ${copy.body}` : describe,
+        taskId,
+        kind: "files-sent",
+      };
+    }
+
+    default:
+      return null;
+  }
+}
+
+export function lookupTaskIn(rows: ReadonlyMap<string, Task | null>, taskId: string): HeadlessTaskInfo | null {
+  const t = rows.get(taskId);
+  if (!t) return null;
+  return { title: t.title, agent: t.agent, pipelineName: t.pipelineRun?.pipelineName ?? null };
+}
+
+
+/** Bound on remembered pipeline statuses; a core runs for days, pipelines accumulate. */
+const PIPELINE_STATUS_CAP = 500;
+
+/** What the stateful handler needs from the outside; injected so tests drive it without the bus or the db. */
+export interface HeadlessHandlerDeps {
+  lookup: HeadlessTaskLookup;
+  /** A task row's column and pipeline run, or null when unknown. */
+  readTask(taskId: string): {
+    column?: string | null;
+    archivedAt?: number | null;
+    pipelineRun?: Pick<PipelineRunState, "status" | "blocked"> | null;
+  } | null;
+  post(n: TaskNotification, meta?: NotificationMeta): void;
+}
+
+/** The per-event handler, plus the task ids it may read for an event, so an
+ *  async caller can load exactly those rows before the (synchronous) handler runs. */
+export type HeadlessEventHandler = ((ev: GlobalEvent) => void) & {
+  taskIdsFor(ev: GlobalEvent): string[];
+};
+
+/**
+ * The stateful half of the policy: the once-per-task rule for stacked prompts,
+ * the done-transition memory and the owed "Pipeline needs you" alerts, on top
+ * of the pure {@link headlessNotificationFor}. Returns the per-event handler.
+ */
+export function createHeadlessNotificationHandler(deps: HeadlessHandlerDeps): HeadlessEventHandler {
+  const { lookup: lookupTask, readTask } = deps;
+  const notifier = { post: deps.post };
+
+  // The webview's once-per-task rule for stacked prompts, keyed on whoever
+  // the notification names (a step's prompts collapse onto its parent).
+  const pendingByTarget = new Map<string, Set<string>>();
+  const pipelineStatus = new Map<string, PipelineRunStatus>();
+  // Pipeline parents whose "Pipeline needs you" alert is owed (a step's question
+  // held the parent's notification while the run was, or became, blocked), each
+  // with the step tasks whose questions were answered since. Mirrors the
+  // webview's OwedPipelineAlerts.
+  const owed = new Map<string, Set<string>>();
+  // Human gates already announced per parent, keyed by run generation — one
+  // "Pipeline needs your review" per event that first announces a gate,
+  // naming how many gates are pending. A single event can open two gates
+  // (R-S2); the task notifier keeps one entry per task, so the alert names the
+  // count instead of announcing only the first and losing the second.
+  const announcedGates = new Map<string, { runStartedAt: number | null; seqs: number[] }>();
+
+  const hasPending = (target: string): boolean => (pendingByTarget.get(target)?.size ?? 0) > 0;
+  const owe = (parentId: string): void => {
+    if (!owed.has(parentId)) owed.set(parentId, new Set());
+  };
+  /** Raises the owed alert once no question is left and the run is still blocked on something else. */
+  const settleOwed = (parentId: string): void => {
+    const answered = owed.get(parentId);
+    if (!answered || hasPending(parentId)) return;
+    const decision = decideOwedPipelineAlert(answered, readTask(parentId), (id) => readTask(id)?.column === "running");
+    if (decision === "wait") return;
+    owed.delete(parentId);
+    if (decision === "raise") notifier.post(pipelineNeedsYou(parentId, lookupTask));
+  };
+
+  const handle = (ev: GlobalEvent): void => {
+    const stepParentId = stepParentIdOf(ev);
+    const target = stepParentId ?? ("taskId" in ev ? ev.taskId : "");
+    let prevPipelineStatus: PipelineRunStatus | null = null;
+    let reviewAlert: { parentId: string; gateCount: number } | null = null;
+
+    if (ev.kind === "interaction") {
+      let set = pendingByTarget.get(target);
+      if (ev.state === "pending") {
+        if (!set) pendingByTarget.set(target, (set = new Set()));
+        const first = set.size === 0;
+        set.add(ev.interactionId);
+        if (!first) return;
+        // The question takes over the parent's one notification; if the run is
+        // already blocked, the "Pipeline needs you" it replaces is owed again
+        // once the question is answered.
+        if (stepParentId) {
+          const parent = readTask(stepParentId);
+          if (parent?.column === "blocked" || parent?.pipelineRun?.status === "blocked") owe(stepParentId);
+        }
+      } else {
+        set?.delete(ev.interactionId);
+        if (set && set.size === 0) pendingByTarget.delete(target);
+        if (stepParentId) owed.get(stepParentId)?.add(ev.taskId);
+        settleOwed(target);
+        return;
+      }
+    } else if (ev.kind === "run-status") {
+      // A terminal run supersedes its prompts; a stale id would suppress the
+      // first-prompt alert of the next run.
+      pendingByTarget.delete(ev.taskId);
+    } else if (ev.kind === "column") {
+      // A step running again ends the "answered question" exemption for its blocks.
+      if (stepParentId && ev.column === "running") owed.get(stepParentId)?.delete(ev.taskId);
+      if (!stepParentId && ev.column === "blocked" && ev.reason === "pipeline" && hasPending(ev.taskId)) {
+        owe(ev.taskId);
+      }
+    } else if (ev.kind === "pipeline") {
+      prevPipelineStatus = pipelineStatus.get(ev.taskId) ?? null;
+      pipelineStatus.delete(ev.taskId);
+      pipelineStatus.set(ev.taskId, ev.status);
+      if (pipelineStatus.size > PIPELINE_STATUS_CAP) {
+        const oldest = pipelineStatus.keys().next().value;
+        if (oldest !== undefined) pipelineStatus.delete(oldest);
+      }
+      if (ev.status === "blocked") {
+        settleOwed(ev.taskId);
+      } else if (ev.status !== "review") {
+        // A `review` transition keeps a sibling's pending question/owed alert:
+        // the run still needs the owner, exactly as the webview's
+        // `OwedPipelineAlerts` does (R-S4). Every other non-blocked status
+        // clears them.
+        pendingByTarget.delete(ev.taskId);
+        owed.delete(ev.taskId);
+      }
+      if (ev.status === "review") {
+        const previous = announcedGates.get(ev.taskId) ?? null;
+        const runStartedAt = ev.runStartedAt ?? null;
+        const fresh = newHumanGateSeqs(previous, runStartedAt, ev.humanStepSeqs ?? []);
+        if (fresh.length > 0) {
+          const sameGeneration = previous !== null && previous.runStartedAt === runStartedAt;
+          announcedGates.set(ev.taskId, {
+            runStartedAt,
+            seqs: [...(sameGeneration ? previous.seqs : []), ...fresh],
+          });
+          if (announcedGates.size > PIPELINE_STATUS_CAP) {
+            const oldest = announcedGates.keys().next().value;
+            if (oldest !== undefined) announcedGates.delete(oldest);
+          }
+          reviewAlert = { parentId: ev.taskId, gateCount: new Set(ev.humanStepSeqs ?? []).size || 1 };
+        }
+      }
+    }
+
+    const n = headlessNotificationFor(ev, lookupTask, { prevPipelineStatus, hasPendingQuestion: hasPending(target) });
+    if (n) notifier.post(n, notificationMetaFor(ev, n));
+    if (reviewAlert) {
+      const title = lookupTask(reviewAlert.parentId)?.title || `Pipeline ${reviewAlert.parentId.slice(0, 7)}`;
+      notifier.post({
+        title: "Pipeline needs your review",
+        body: `${title} · ${humanReviewSubtitle(reviewAlert.gateCount)}`,
+        taskId: reviewAlert.parentId,
+        kind: "blocked",
+      }, { whenSelected: true });
+    }
+  };
+
+  /** Every task id `handle(ev)` can read: the event's task, its pipeline parent,
+   *  and the owed-alert parents with the steps answered since. */
+  const taskIdsFor = (ev: GlobalEvent): string[] => {
+    const ids: string[] = [];
+    if ("taskId" in ev) ids.push(ev.taskId);
+    const parent = stepParentIdOf(ev);
+    if (parent) ids.push(parent);
+    for (const [parentId, answered] of owed) {
+      ids.push(parentId, ...answered);
+    }
+    return ids;
+  };
+
+  return Object.assign(handle, { taskIdsFor });
+}
+

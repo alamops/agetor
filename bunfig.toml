@@ -8,3 +8,8 @@ root = "src"
 # tests from running the real `opencode` binary (it writes into $HOME on every
 # call) — see src/test-preload.ts.
 preload = ["./src/test-preload.ts"]
+
+# Adding the `packages/*` workspace makes Bun default to the isolated linker, which hides hoisted
+# transitive types (for example @types/hast) from the root. Keep the flat layout the repo was built on.
+[install]
+linker = "hoisted"

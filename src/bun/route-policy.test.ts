@@ -227,6 +227,7 @@ const DESKTOP_ONLY = [
   "POST /updates/check",
   "POST /window/focus",
   "POST /window/toggle-zoom",
+  "PUT /app/presence",
 ].sort();
 
 // Desktop-only routes whose handler answers 501 first when `native` is absent

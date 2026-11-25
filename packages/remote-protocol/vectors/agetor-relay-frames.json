@@ -1,0 +1,131 @@
+{
+  "source": "Agetor relay framing: [version=1][type][fields], big-endian; types hello=1 welcome=2 send=3 deliver=4 ack=5 peer=6 full=7 replaced=8 ping=9 pong=10; roles core=1 device=2",
+  "frames": [
+    {
+      "frame": {
+        "type": "hello",
+        "role": "core",
+        "keys": [
+          "0102030405060708090a0b0c0d0e0f101112131415161718191a1b1c1d1e1f20",
+          "02030405060708090a0b0c0d0e0f101112131415161718191a1b1c1d1e1f2021"
+        ]
+      },
+      "hex": "010101020102030405060708090a0b0c0d0e0f101112131415161718191a1b1c1d1e1f2002030405060708090a0b0c0d0e0f101112131415161718191a1b1c1d1e1f2021"
+    },
+    {
+      "frame": {
+        "type": "hello",
+        "role": "device",
+        "keys": [
+          "030405060708090a0b0c0d0e0f101112131415161718191a1b1c1d1e1f202122"
+        ]
+      },
+      "hex": "01010201030405060708090a0b0c0d0e0f101112131415161718191a1b1c1d1e1f202122"
+    },
+    {
+      "frame": {
+        "type": "welcome",
+        "ids": [
+          "0102030405060708090a0b0c0d0e0f10",
+          "02030405060708090a0b0c0d0e0f1011"
+        ],
+        "queued": 3
+      },
+      "hex": "0102020102030405060708090a0b0c0d0e0f1002030405060708090a0b0c0d0e0f10110003"
+    },
+    {
+      "frame": {
+        "type": "send",
+        "mailbox": "0102030405060708090a0b0c0d0e0f10",
+        "tag": "05060708090a0b0c",
+        "payload": "63697068657274657874"
+      },
+      "hex": "01030102030405060708090a0b0c0d0e0f1005060708090a0b0c000a63697068657274657874"
+    },
+    {
+      "frame": {
+        "type": "deliver",
+        "mailbox": "0102030405060708090a0b0c0d0e0f10",
+        "seq": "42",
+        "tag": "05060708090a0b0c",
+        "payload": "63697068657274657874"
+      },
+      "hex": "01040102030405060708090a0b0c0d0e0f10000000000000002a05060708090a0b0c000a63697068657274657874"
+    },
+    {
+      "frame": {
+        "type": "ack",
+        "mailbox": "0102030405060708090a0b0c0d0e0f10",
+        "seq": "42"
+      },
+      "hex": "01050102030405060708090a0b0c0d0e0f10000000000000002a"
+    },
+    {
+      "frame": {
+        "type": "peer",
+        "mailbox": "0102030405060708090a0b0c0d0e0f10",
+        "present": true
+      },
+      "hex": "01060102030405060708090a0b0c0d0e0f1001"
+    },
+    {
+      "frame": {
+        "type": "peer",
+        "mailbox": "0102030405060708090a0b0c0d0e0f10",
+        "present": false
+      },
+      "hex": "01060102030405060708090a0b0c0d0e0f1000"
+    },
+    {
+      "frame": {
+        "type": "full",
+        "mailbox": "0102030405060708090a0b0c0d0e0f10"
+      },
+      "hex": "01070102030405060708090a0b0c0d0e0f10"
+    },
+    {
+      "frame": {
+        "type": "replaced",
+        "mailbox": "0102030405060708090a0b0c0d0e0f10"
+      },
+      "hex": "01080102030405060708090a0b0c0d0e0f10"
+    },
+    {
+      "frame": {
+        "type": "ping"
+      },
+      "hex": "0109"
+    },
+    {
+      "frame": {
+        "type": "pong"
+      },
+      "hex": "010a"
+    }
+  ],
+  "refused": [
+    {
+      "name": "unknown-type",
+      "hex": "0163"
+    },
+    {
+      "name": "unknown-version",
+      "hex": "0209"
+    },
+    {
+      "name": "truncated-hello",
+      "hex": "01010101"
+    },
+    {
+      "name": "empty",
+      "hex": ""
+    }
+  ],
+  "ignoredTrailing": {
+    "hex": "01070102030405060708090a0b0c0d0e0f10667574757265",
+    "frame": {
+      "type": "full",
+      "mailbox": "0102030405060708090a0b0c0d0e0f10"
+    }
+  }
+}

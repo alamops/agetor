@@ -6306,6 +6306,19 @@ export const EVENTS_PAGE_MAX_BYTES = 2 * 1024 * 1024;
  */
 export const MIN_REPLAY_EVENTS = 20;
 
+/**
+ * Smallest `maxBytes` a client may ask the event routes for (`GET /tasks/:id/events` replay and
+ * `GET /tasks/:id/events/page`). Smaller asks are raised to it. The largest is the route's own budget
+ * (`EVENTS_REPLAY_MAX_BYTES` / `EVENTS_PAGE_MAX_BYTES`). With no `maxBytes` the routes behave exactly as before.
+ */
+export const EVENTS_MAX_BYTES_FLOOR = 64 * 1024;
+
+/** The first-load size the phone asks for (docs/specs/remote-readiness-spec.md "Small first loads"). */
+export const EVENTS_FIRST_LOAD_BYTES = 256 * 1024;
+
+/** Tool results longer than this reach a phone cut, with a fetch-by-event-id for the full text. */
+export const PHONE_TOOL_RESULT_BYTES = 16 * 1024;
+
 /** Max number of events the run panel keeps in webview memory for one task.
  *  When live streaming pushes past this, the oldest events are trimmed and the
  *  "Load earlier" affordance re-appears. */

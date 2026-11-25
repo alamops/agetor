@@ -6,6 +6,10 @@ import type { WebSocketHandler } from "bun";
 import pkg from "../../package.json" with { type: "json" };
 import { API_TOKEN, DEFAULT_API_HOST, formatHostForUrl, getApiPort, nonLoopbackBindWarning } from "./api-config.ts";
 import { removeCoreCreds } from "./core-creds.ts";
+import { setServedRoutes, type ServedRoutes } from "./route-table.ts";
+import { openTaskEventStream, parseMaxBytesParam, type TaskEventStreamHandle } from "./task-event-stream.ts";
+import { buildPendingInbox, pendingCardsForTask } from "./pending-inbox.ts";
+import { setWebviewPresence } from "./presence.ts";
 import { applyRoutePolicy, callerOf, desktopOnlyResponse, isDbWorkerError, type ApiCaller } from "./route-policy.ts";
 import { callerProjectTree, gateCallerPath, probePaths } from "./caller-fs.ts";
 import { readTextNoFollow } from "./no-follow.ts";
@@ -1893,28 +1897,15 @@ export function startApiServer(
     },
   };
 
-  const server = Bun.serve({
-    port: PORT,
-    hostname: HOST,
-    development: false,
-    // Bun's default idleTimeout is 10s, which is far too short here: it closes
-    // idle pooled keep-alive sockets that WKWebView then reuses for a POST
-    // (CFNetwork never auto-retries on a dropped reused connection, so the
-    // webview surfaces "cannot reach agetor API"), and it kills any handler
-    // that awaits >10s before writing bytes. 255 is Bun's max; some handlers
-    // below opt out entirely via server.timeout(req, 0).
-    idleTimeout: 255,
-    // Bun refuses a larger Content-Length body itself (413) and keeps the
-    // keep-alive socket usable; see REFUSED_BODY_DRAIN_MAX_BYTES.
-    maxRequestBodySize: REFUSED_BODY_DRAIN_MAX_BYTES,
-    websocket: terminalWebSocket,
-    // Every route goes through the policy walker (route-policy.ts): it resolves
-    // the caller, refuses the CLI token on desktop-only routes, gates
-    // CLI-supplied paths, and THROWS HERE — the server won't start — when a route
-    // has no ROUTE_POLICY entry (or an entry has no route). The explicit type
-    // keeps the handlers' contextual `req` typing, which a bare generic would
-    // lose; the cast hands Bun its own route typing back.
-    routes: gateRoutesUntilReady(applyRoutePolicy<ServerRoutes>({
+  // The routes object is built first and registered in route-table.ts, so the in-process remote router calls the very
+  // handlers Bun serves (docs/specs/remote-readiness-spec.md "Remote router and route policy").
+  // Every route goes through the policy walker (route-policy.ts): it resolves
+  // the caller, refuses the CLI token on desktop-only routes, gates
+  // CLI-supplied paths, and THROWS HERE — the server won't start — when a route
+  // has no ROUTE_POLICY entry (or an entry has no route). The explicit type
+  // keeps the handlers' contextual `req` typing, which a bare generic would
+  // lose; the cast hands Bun its own route typing back.
+  const servedRoutesObject = gateRoutesUntilReady(applyRoutePolicy<ServerRoutes>({
       // Unauthenticated liveness probe — never returns data (`callers:
       // "public"` in ROUTE_POLICY). `app: "agetor"` is a self-identifier for
       // its callers (the CLI's creds/daemon probes, the webview's busy-banner
@@ -8636,21 +8627,32 @@ export function startApiServer(
       },
 
       "/tasks/:id/interactions/pending": {
-        GET: authed(async (req) => {
-          const id = req.params.id;
-          let pending = listPendingForTask(id);
-          // H4: a pipeline PARENT never has interactions registered against
-          // its own (hidden, agent-less) id — they live on its step tasks,
-          // whose counts `tasks.list()/get()` already fold into the parent's
-          // `pendingInteractionCount`. Union the steps' pending requests here
-          // too, so the id the board showed as "waiting on you" is the id
-          // whose pending list actually carries the cards to answer.
-          const task = await tasks.get(id);
-          if (task?.pipelineId) {
-            for (const step of await tasks.stepsForParent(id)) pending = pending.concat(listPendingForTask(step.id));
-            pending.sort((a, b) => a.createdAt - b.createdAt);
-          }
-          return json(pending, { headers: corsHeaders(req) });
+        GET: authed(async (req) => json(await pendingCardsForTask(req.params.id), { headers: corsHeaders(req) })),
+      },
+
+      // The cross-task "needs you" inbox: every pending card (a pipeline step's card folded into its parent through
+      // `parentTaskId`) plus every pipeline gate waiting for a human. One request builds the phone's inbox instead of one per
+      // task (docs/specs/remote-readiness-spec.md "One needs-you query"). Shares its builder with the per-task route above.
+      "/interactions/pending": {
+        GET: authed(async (req) => json(await buildPendingInbox(), { headers: corsHeaders(req) })),
+      },
+
+      // What the webview can see: window focus, the open task and its view. The notification policy reads it (grill D5);
+      // native window focus/blur from Electrobun override `focused` once seen. Desktop only: a CLI or phone has no window.
+      "/app/presence": {
+        PUT: authed(async (req) => {
+          const body = (await req.json().catch(() => null)) as Record<string, unknown> | null;
+          const view = body?.view;
+          const selected = body?.selectedTaskId;
+          const valid =
+            body !== null &&
+            typeof body === "object" &&
+            typeof body.focused === "boolean" &&
+            (selected === null || (typeof selected === "string" && selected.length > 0 && selected.length <= 128)) &&
+            (view === null || view === "run-panel" || view === "pipeline");
+          if (!valid) return json({ error: "focused (boolean), selectedTaskId (string|null) and view ('run-panel'|'pipeline'|null) required" }, { status: 400, headers: corsHeaders(req) });
+          setWebviewPresence({ focused: body.focused as boolean, selectedTaskId: selected as string | null, view: view as "run-panel" | "pipeline" | null });
+          return json({ ok: true }, { headers: corsHeaders(req) });
         }),
       },
 
@@ -9859,11 +9861,14 @@ export function startApiServer(
           const limit = Number.isFinite(limitRaw) && limitRaw > 0
             ? Math.max(1, Math.min(Math.floor(limitRaw), 2000))
             : EVENTS_REPLAY_LIMIT;
+          // `?maxBytes=` asks for a smaller page (the phone's 256 KB first load). Clamped to [64 KB, the page budget]; with it
+          // the "newest N events always show" floor drops to one, so the page is at most one oversize event over the ask.
+          const pageMaxBytes = parseMaxBytesParam(url.searchParams.get("maxBytes"), EVENTS_PAGE_MAX_BYTES);
           const rows = await runs.eventsForTask(taskId, {
             beforeId: beforeIdRaw,
             limit,
-            maxBytes: EVENTS_PAGE_MAX_BYTES,
-            minEvents: MIN_REPLAY_EVENTS,
+            maxBytes: pageMaxBytes ?? EVENTS_PAGE_MAX_BYTES,
+            minEvents: pageMaxBytes === undefined ? MIN_REPLAY_EVENTS : 1,
           });
           const events = rows.map((ev) => ({
             id: ev.id,
@@ -9877,6 +9882,31 @@ export function startApiServer(
           const earliestId = events.length > 0 ? events[0]!.id : null;
           const hasMore = earliestId !== null && await runs.hasEventsBefore(taskId, earliestId);
           return json({ events, earliestId, hasMore }, { headers: corsHeaders(req) });
+        }),
+      },
+
+      // One stored event of a task by id, raw: how the phone fetches a tool result it received cut (docs/architecture/
+      // core-responsiveness.md, "Event by id"). 404 for an unknown task or an event of another task, 400 for a non-numeric id.
+      // `/tasks/:id/events/page` is a static segment, so Bun routes it to the page handler first (route-precedence test).
+      "/tasks/:id/events/:eventId": {
+        GET: authed(async (req) => {
+          const taskId = req.params.id;
+          if (!/^\d{1,15}$/.test(req.params.eventId)) {
+            return json({ error: "eventId (positive integer) required" }, { status: 400, headers: corsHeaders(req) });
+          }
+          const eventId = Number(req.params.eventId);
+          if (!Number.isSafeInteger(eventId) || eventId <= 0) {
+            return json({ error: "eventId (positive integer) required" }, { status: 400, headers: corsHeaders(req) });
+          }
+          if (!await tasks.get(taskId)) {
+            return json({ error: "not found" }, { status: 404, headers: corsHeaders(req) });
+          }
+          const ev = await runs.eventById(taskId, eventId);
+          if (!ev) return json({ error: "not found" }, { status: 404, headers: corsHeaders(req) });
+          return json(
+            { id: ev.id, runId: ev.runId, taskId, stream: ev.stream as RunEvent["stream"], data: ev.data, ts: ev.ts, subagentId: ev.subagentId },
+            { headers: corsHeaders(req) },
+          );
         }),
       },
 
@@ -9919,7 +9949,7 @@ export function startApiServer(
         const taskId = req.params.id;
         const url = new URL(req.url);
         // `?anchor=0` opts the replay window out of the last-user-message
-        // extension below. The webview and `agetor logs` want it (they render
+        // extension. The webview and `agetor logs` want it (they render
         // everything replayed); the TUI dashboard does not — it keeps only its
         // newest 500 lines (`MAX_LINES` in `useCoalescedStream`), so an
         // anchored window of up to 3000 events / 16 MB would be paid for and
@@ -9928,11 +9958,13 @@ export function startApiServer(
         const anchorReplay = url.searchParams.get("anchor") !== "0";
         // Forward resume (docs/plans/event-stream-forward-resume.md §3.1): a
         // reconnecting client names the last event id it saw, as the standard
-        // `Last-Event-ID` header (what `EventSource` and fetch-based readers
-        // send on reconnect) or `?afterId=`. The first valid of the two wins;
+        // `Last-Event-ID` header or `?afterId=`. The first valid of the two wins;
         // a malformed value is ignored as if absent — never a 400, since a
         // client retries an error forever. No cursor = today's behaviour.
         const cursor = resolveResumeCursor(req.headers.get("last-event-id"), url.searchParams.get("afterId"));
+        // `?maxBytes=` caps the replay in bytes (docs/architecture/core-responsiveness.md). Absent or malformed: the
+        // route's own budget, exactly as before.
+        const maxBytes = parseMaxBytesParam(url.searchParams.get("maxBytes"));
         // Test-only (AGETOR_TEST_DROP_STREAMS_ROUTE): a hold set by
         // `POST /test/drop-task-streams` parks this request until it ends,
         // so the events landing meanwhile are the gap the cursor resumes
@@ -9950,8 +9982,10 @@ export function startApiServer(
           });
           if (req.signal.aborted) return new Response(null, { status: 204, headers: corsHeaders(req) });
         }
+        // The SSE adapter over `openTaskEventStream` (task-event-stream.ts): frames, the keep-alive ping and the
+        // attached-client bookkeeping live here; the replay, resume, snapshot and dedup logic is the shared module's.
         const stream = new ReadableStream({
-          async start(controller) {
+          start(controller) {
             attachedClients++;
             const enc = new TextEncoder();
             // A SAVED row carries its `run_events.id` both in the JSON and as
@@ -9966,18 +10000,14 @@ export function startApiServer(
                 const idLine = typeof id === "number" ? `id: ${id}\n` : "";
                 controller.enqueue(enc.encode(`${idLine}data: ${JSON.stringify(e)}\n\n`));
               } catch {
-                // Client went away mid-send (replay or a live event landing on a
-                // closed controller). Swallow so `start` never throws before the
-                // abort handler is registered — that handler owns the cleanup
-                // (unsubscribe + attachedClients--), and letting `start` throw
-                // would leak both the subscription and the attached-client count
-                // (which would then permanently block the daemon's idle-shutdown).
+                // Client went away mid-send. Swallow so a send never throws before the abort handler is registered —
+                // that handler owns the cleanup (unsubscribe + attachedClients--), and a throw would leak both the
+                // subscription and the attached-client count (which would then block the daemon's idle-shutdown).
               }
             };
             // Named frame — invisible to a plain `onmessage` listener (only
             // `addEventListener(name, ...)` sees it), so old/unmodified
-            // clients keep working unchanged even though a new frame now
-            // precedes the replayed window. Never carries an `id:` line.
+            // clients keep working unchanged. Never carries an `id:` line.
             const sendNamed = (name: string, data: unknown) => {
               try {
                 controller.enqueue(enc.encode(`event: ${name}\ndata: ${JSON.stringify(data)}\n\n`));
@@ -9985,47 +10015,16 @@ export function startApiServer(
                 // Same rationale as `send`'s catch above.
               }
             };
-            // Unified task-level stream: one scrollback per task, merging
-            // events across every run. Subscribe before replay (same race
-            // protection as the per-run endpoint). The replay is a database
-            // read, so live events keep arriving while it is in flight: they
-            // wait in `buffer`. A saved row committed before that read is in
-            // the replay, and its live send may land either in the buffer or
-            // after it is drained, so every saved row at or below the last id
-            // the replay covered (`replayedThrough`) is dropped as a duplicate
-            // ONLY when the replay sent that very row with that very data
-            // (`replayedHashes`: id -> data hash, one number per replayed row, so
-            // memory stays bounded by the replay window). OpenCode rewrites a
-            // tool_use row in place and re-broadcasts it under the same id with
-            // new data; that frame differs from what the replay sent (or the row
-            // is at or below a resume cursor and was never replayed), so it goes
-            // through, and the client replaces the row by id.
-            // Live-only frames (no id) always go through.
-            let buffer: RunEvent[] | null = [];
-            let replayedThrough = 0;
-            const replayedHashes = new Map<number, number | bigint>();
-            const sendLive = (e: RunEvent) => {
-              if (typeof e.id === "number" && e.id <= replayedThrough) {
-                const sent = replayedHashes.get(e.id);
-                if (sent !== undefined && sent === Bun.hash(e.data)) return;
-              }
-              send(e);
-            };
-            const unsubscribe = subscribe((e) => {
-              if (e.taskId !== taskId) return;
-              if (buffer) buffer.push(e);
-              else sendLive(e);
-            });
             let ping: ReturnType<typeof setInterval> | null = null;
-            // One idempotent teardown for both exits — the client aborting
-            // and the test-only drop route — so neither can double-decrement
-            // `attachedClients` or close an already-closed controller.
+            let handle: TaskEventStreamHandle | null = null;
+            // One idempotent teardown for every exit — the client aborting, the test-only drop route and a failed replay
+            // — so none can double-decrement `attachedClients` or close an already-closed controller.
             let cleanedUp = false;
             const cleanup = () => {
               if (cleanedUp) return;
               cleanedUp = true;
               if (ping) clearInterval(ping);
-              unsubscribe();
+              handle?.close();
               try {
                 controller.close();
               } catch {
@@ -10043,107 +10042,21 @@ export function startApiServer(
               if (!set) streamDrop.open.set(taskId, (set = new Set()));
               set.add(cleanup);
             }
-            // Registered before the replay read: the client can go away while
-            // it is in flight.
+            // Registered before the replay read: the client can go away while it is in flight.
             if (req.signal.aborted) {
               cleanup();
               return;
             }
             req.signal.addEventListener("abort", cleanup, { once: true });
-            // Cap replay to the most recent EVENTS_REPLAY_LIMIT events instead
-            // of the task's full history — a task with thousands of events
-            // used to replay every one of them on every SSE (re)connect.
-            // Older history is fetched on demand via /tasks/:id/events/page.
-            // Also cap it in BYTES (EVENTS_REPLAY_MAX_BYTES): the event-count
-            // cap alone still let a replay window weigh tens of MB on large
-            // transcripts (measured 61 MB — see
-            // docs/plans/task-details-blank-while-session-restores.md §2/§3.3),
-            // which is what made opening a task with a big transcript stall.
-            // `eventsForTask` may raise the window's floor above what `limit`
-            // alone would keep, never below MIN_REPLAY_EVENTS; `hasMore` below
-            // still derives from the returned window's own earliest id, so it
-            // correctly flips true whenever the byte cut (not just the count
-            // cap) dropped older events.
-            // `anchor` extends that floor BACK DOWN to the newest main-stream
-            // `user` event when the span to it fits under
-            // EVENTS_REPLAY_ANCHOR_MAX_EVENTS/_BYTES, so opening a task shows
-            // at least the user's last message without a "Load earlier" click
-            // — see docs/plans/first-load-reaches-last-user-message.md. All
-            // or nothing: over either ceiling, the plain count/byte window
-            // above stands unchanged. Skipped entirely on `?anchor=0` (see
-            // `anchorReplay` above).
-            // Shared by the no-cursor connect and the snapshot answer, so a
-            // snapshot is exactly the window a fresh connect would get.
-            const freshWindow = async () => {
-              const window = await runs.eventsForTask(taskId, {
-                limit: EVENTS_REPLAY_LIMIT,
-                maxBytes: EVENTS_REPLAY_MAX_BYTES,
-                minEvents: MIN_REPLAY_EVENTS,
-                ...(anchorReplay
-                  ? { anchor: { maxEvents: EVENTS_REPLAY_ANCHOR_MAX_EVENTS, maxBytes: EVENTS_REPLAY_ANCHOR_MAX_BYTES } }
-                  : {}),
-              });
-              const earliestId = window.length > 0 ? window[0]!.id : null;
-              const hasMore = earliestId !== null && await runs.hasEventsBefore(taskId, earliestId);
-              return { window, earliestId, hasMore };
-            };
-            let meta: TaskEventsReplayMeta;
-            let replay: Awaited<ReturnType<typeof freshWindow>>["window"];
-            try {
-              if (cursor === null) {
-                const fresh = await freshWindow();
-                meta = { earliestId: fresh.earliestId, hasMore: fresh.hasMore };
-                replay = fresh.window;
-              } else {
-                // Resume: only the rows after the cursor, subagent rows included.
-                // `earliestId`/`hasMore` describe a window, which a resume
-                // doesn't send, so the client is told to leave its own alone.
-                // Snapshot (gap too big, or a cursor from another database):
-                // the fresh window plus `snapshotRequired`, so the client
-                // replaces what it holds instead of splicing across the gap.
-                const after = await runs.eventsForTaskAfter(taskId, cursor, {
-                  maxEvents: EVENTS_REPLAY_LIMIT,
-                  maxBytes: EVENTS_REPLAY_MAX_BYTES,
-                });
-                if (after.kind === "resume") {
-                  meta = { earliestId: null, hasMore: false, resumedAfter: cursor };
-                  replay = after.rows;
-                  // The client holds everything up to its cursor already.
-                  replayedThrough = cursor;
-                } else {
-                  const fresh = await freshWindow();
-                  meta = { earliestId: fresh.earliestId, hasMore: fresh.hasMore, snapshotRequired: true };
-                  replay = fresh.window;
-                }
-              }
-            } catch (err) {
-              // The database worker is restarting or gone: end the stream; the
-              // client reconnects with its cursor and resumes.
-              console.warn(`[agetor] /tasks/${taskId}/events replay failed:`, (err as Error)?.message ?? String(err));
-              cleanup();
-              return;
-            }
-            if (cleanedUp) return;
-            for (const ev of replay) {
-              replayedThrough = Math.max(replayedThrough, ev.id);
-              replayedHashes.set(ev.id, Bun.hash(ev.data));
-            }
-            sendNamed(TASK_EVENTS_REPLAY_META_EVENT, meta);
-            for (const ev of replay) {
-              send({
-                id: ev.id,
-                runId: ev.runId,
-                taskId,
-                stream: ev.stream as RunEvent["stream"],
-                data: ev.data,
-                ts: ev.ts,
-                subagentId: ev.subagentId,
-              });
-            }
-            const drained = buffer;
-            buffer = null;
-            for (const ev of drained) sendLive(ev);
-            ping = setInterval(() => send({ type: "ping" }), 15_000);
+            handle = openTaskEventStream(
+              taskId,
+              { cursor, anchor: anchorReplay, maxBytes, onFatal: cleanup },
+              { meta: (m) => sendNamed(TASK_EVENTS_REPLAY_META_EVENT, m), event: (e) => send(e) },
+            );
+            void handle.started.then(() => {
+              if (cleanedUp) return;
+              ping = setInterval(() => send({ type: "ping" }), 15_000);
+            });
           },
         });
         return new Response(stream, {
@@ -10159,7 +10072,25 @@ export function startApiServer(
       cors: corsHeaders,
       gate: gateCallerPath,
       notAvailableHeadless,
-    }), deps.ready, native ? BOOT_GATE_EXEMPT_ALWAYS : [...BOOT_GATE_EXEMPT_ALWAYS, ...BOOT_GATE_EXEMPT_HEADLESS]) as never,
+    }), deps.ready, native ? BOOT_GATE_EXEMPT_ALWAYS : [...BOOT_GATE_EXEMPT_ALWAYS, ...BOOT_GATE_EXEMPT_HEADLESS]) as unknown as ServedRoutes;
+  setServedRoutes(servedRoutesObject);
+
+  const server = Bun.serve({
+    port: PORT,
+    hostname: HOST,
+    development: false,
+    // Bun's default idleTimeout is 10s, which is far too short here: it closes
+    // idle pooled keep-alive sockets that WKWebView then reuses for a POST
+    // (CFNetwork never auto-retries on a dropped reused connection, so the
+    // webview surfaces "cannot reach agetor API"), and it kills any handler
+    // that awaits >10s before writing bytes. 255 is Bun's max; some handlers
+    // below opt out entirely via server.timeout(req, 0).
+    idleTimeout: 255,
+    // Bun refuses a larger Content-Length body itself (413) and keeps the
+    // keep-alive socket usable; see REFUSED_BODY_DRAIN_MAX_BYTES.
+    maxRequestBodySize: REFUSED_BODY_DRAIN_MAX_BYTES,
+    websocket: terminalWebSocket,
+    routes: servedRoutesObject as never,
     fetch(req, server) {
       if (req.method === "OPTIONS") return new Response(null, { headers: corsHeaders(req) });
       // WebSocket upgrade for a terminal tab's live byte stream. The routes API

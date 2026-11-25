@@ -6,6 +6,7 @@
  * Runs standalone (`bun run build:cli`) and as a step inside `scripts/release.ts`.
  */
 import { mkdirSync } from "node:fs";
+import { buildFlagDefines } from "../src/shared/build-flags.ts";
 
 /**
  * Target resolution: `AGETOR_CLI_TARGET` (a bun `--target` value, e.g.
@@ -108,6 +109,8 @@ await run([
   "src/cli/index.ts",
   "--outfile",
   OUT,
+  // Companion flags (src/shared/build-flags.ts): a release CLI hides the device subcommands and drops the test seams.
+  ...Object.entries(buildFlagDefines(process.env)).flatMap(([k, v]) => ["--define", `${k}=${v}`]),
 ]);
 
 const devId = process.env.ELECTROBUN_DEVELOPER_ID;

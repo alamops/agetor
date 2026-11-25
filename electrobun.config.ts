@@ -1,4 +1,5 @@
 import type { ElectrobunConfig } from "electrobun";
+import { buildFlagDefines } from "./src/shared/build-flags.ts";
 
 export default {
   app: {
@@ -49,6 +50,9 @@ export default {
     exitOnLastWindowClosed: false,
   },
   build: {
+    // Companion build flags (grill D1, D4): `AGETOR_RELEASE_BUILD=1` (set by the build* scripts) ships the Companion
+    // dark and removes every test seam from the main bundle. docs/specs/remote-readiness-spec.md, src/shared/build-flags.ts.
+    bun: { define: buildFlagDefines(process.env) },
     copy: {
       "dist/index.html": "views/mainview/index.html",
       "dist/assets": "views/mainview/assets",

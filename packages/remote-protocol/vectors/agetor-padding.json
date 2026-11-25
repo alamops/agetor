@@ -1,0 +1,107 @@
+{
+  "source": "Agetor: ISO/IEC 7816-4 padding to the buckets 256, 1024, 4096, 16384, 65519",
+  "buckets": [
+    256,
+    1024,
+    4096,
+    16384,
+    65519
+  ],
+  "payloadByte": "61",
+  "cases": [
+    {
+      "payloadLength": 255,
+      "paddedLength": 256,
+      "bucket": 256
+    },
+    {
+      "payloadLength": 254,
+      "paddedLength": 256,
+      "bucket": 256
+    },
+    {
+      "payloadLength": 0,
+      "paddedLength": 256,
+      "bucket": 256
+    },
+    {
+      "payloadLength": 1023,
+      "paddedLength": 1024,
+      "bucket": 1024
+    },
+    {
+      "payloadLength": 1022,
+      "paddedLength": 1024,
+      "bucket": 1024
+    },
+    {
+      "payloadLength": 512,
+      "paddedLength": 1024,
+      "bucket": 1024
+    },
+    {
+      "payloadLength": 4095,
+      "paddedLength": 4096,
+      "bucket": 4096
+    },
+    {
+      "payloadLength": 4094,
+      "paddedLength": 4096,
+      "bucket": 4096
+    },
+    {
+      "payloadLength": 2048,
+      "paddedLength": 4096,
+      "bucket": 4096
+    },
+    {
+      "payloadLength": 16383,
+      "paddedLength": 16384,
+      "bucket": 16384
+    },
+    {
+      "payloadLength": 16382,
+      "paddedLength": 16384,
+      "bucket": 16384
+    },
+    {
+      "payloadLength": 8192,
+      "paddedLength": 16384,
+      "bucket": 16384
+    },
+    {
+      "payloadLength": 65518,
+      "paddedLength": 65519,
+      "bucket": 65519
+    },
+    {
+      "payloadLength": 65517,
+      "paddedLength": 65519,
+      "bucket": 65519
+    },
+    {
+      "payloadLength": 32759.5,
+      "paddedLength": 65519,
+      "bucket": 65519
+    },
+    {
+      "payloadLength": 0,
+      "paddedLength": 256,
+      "bucket": 256
+    },
+    {
+      "payloadLength": 255,
+      "paddedLength": 256,
+      "bucket": 256
+    },
+    {
+      "payloadLength": 256,
+      "paddedLength": 1024,
+      "bucket": 1024
+    }
+  ],
+  "small": {
+    "payload": "6869",
+    "padded": "686980000000…"
+  }
+}

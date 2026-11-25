@@ -61,8 +61,8 @@ describe("eslint.config.js async gate", () => {
     expect(sourceBlock).toBeDefined();
     expect(testBlock).toBeDefined();
     expect(blocks.indexOf(testBlock!)).toBeGreaterThan(blocks.indexOf(sourceBlock!));
-    expect(sourceBlock!.files).toEqual(["src/bun/**/*.ts", "src/cli/**/*.{ts,tsx}", "src/shared/**/*.ts"]);
-    expect(testBlock!.files).toEqual(["src/**/*.test.ts", "src/**/*.test.tsx"]);
+    expect(sourceBlock!.files).toEqual(["src/bun/**/*.ts", "src/cli/**/*.{ts,tsx}", "src/shared/**/*.ts", "packages/remote-protocol/src/**/*.ts"]);
+    expect(testBlock!.files).toEqual(["src/**/*.test.ts", "src/**/*.test.tsx", "packages/remote-protocol/src/**/*.test.ts"]);
     expect(level(testBlock?.rules?.["@typescript-eslint/await-thenable"])).toBe("off");
     expect(level(testBlock?.rules?.["local/await-matcher"])).toBe("error");
   });

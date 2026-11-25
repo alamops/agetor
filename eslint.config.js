@@ -95,7 +95,7 @@ export default [
     ],
   },
   {
-    files: ["src/bun/**/*.ts", "src/cli/**/*.{ts,tsx}", "src/shared/**/*.ts"],
+    files: ["src/bun/**/*.ts", "src/cli/**/*.{ts,tsx}", "src/shared/**/*.ts", "packages/remote-protocol/src/**/*.ts"],
     languageOptions: {
       parser: tseslint.parser,
       parserOptions: {
@@ -143,7 +143,7 @@ export default [
     // (bare, `void`, an assignment, `cond && …`, a `forEach` body, the computed
     // `["rejects"]` form). This block must stay AFTER the source block (flat config is
     // last-wins for `await-thenable`); lint-async-config.test.ts pins the order.
-    files: ["src/**/*.test.ts", "src/**/*.test.tsx"],
+    files: ["src/**/*.test.ts", "src/**/*.test.tsx", "packages/remote-protocol/src/**/*.test.ts"],
     plugins: { local: localPlugin },
     rules: {
       "@typescript-eslint/await-thenable": "off",

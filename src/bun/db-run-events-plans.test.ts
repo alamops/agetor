@@ -296,6 +296,7 @@ function invocationTable(s: Seed): Record<string, Invocation[]> {
     "runs.hasEventsBefore": [
       { label: "hasEventsBefore(taskId, id)", run: () => runs.hasEventsBefore(s.taskId, s.lastEventId) },
     ],
+    "runs.eventById": [{ label: "eventById(taskId, id)", run: () => runs.eventById(s.taskId, s.lastEventId) }],
     "runs.lastUserEventId": [
       { label: "lastUserEventId(taskId)", run: () => runs.lastUserEventId(s.taskId) },
       { label: "lastUserEventId(taskId, beforeId)", run: () => runs.lastUserEventId(s.taskId, s.lastEventId) },

@@ -1,0 +1,57 @@
+{
+  "source": "Agetor: HKDF-SHA256 (RFC 5869) derivations, also cross-checked against node:crypto in derive.test.ts",
+  "linkSecret": "0102030405060708090a0b0c0d0e0f101112131415161718191a1b1c1d1e1f20",
+  "pairingSecret": "6465666768696a6b6c6d6e6f707172737475767778797a7b7c7d7e7f80818283",
+  "handshakeHash": "32333435363738393a3b3c3d3e3f404142434445464748494a4b4c4d4e4f5051",
+  "corePub": "090a0b0c0d0e0f101112131415161718191a1b1c1d1e1f202122232425262728",
+  "mailbox": [
+    {
+      "date": "2026-11-24",
+      "key": "56a0fb3a527dc17ed8cd7d77466b207a3a7d836a01c7093eafa7a1a413874f2e",
+      "id": "cde3d86abf01e278445abbca1325e120"
+    },
+    {
+      "date": "2026-11-25",
+      "key": "ef7e97b8499da05cd4188f8e50ba2c51aba20213d7fba5de93b9e6cccc656f31",
+      "id": "7d895fbe47991ce2d58d4c0bf59363fc"
+    },
+    {
+      "date": "2026-12-31",
+      "key": "8c7b7e6845160f1811e8185705d38664b7b562e307bc196eed43769447864a96",
+      "id": "c380f5fa04d10132fd93005f81801d5b"
+    }
+  ],
+  "pairingMailbox": {
+    "key": "d092eed907ced8033aed5bf68a1f48a5fe0c12f93093ad378abae43cf0a352a5",
+    "id": "e582ee251e4e91e93bdfb716d528609a"
+  },
+  "sas": "650019",
+  "sasCases": [
+    {
+      "handshakeHash": "000102030405060708090a0b0c0d0e0f101112131415161718191a1b1c1d1e1f",
+      "code": "143412"
+    },
+    {
+      "handshakeHash": "0102030405060708090a0b0c0d0e0f101112131415161718191a1b1c1d1e1f20",
+      "code": "566469"
+    },
+    {
+      "handshakeHash": "02030405060708090a0b0c0d0e0f101112131415161718191a1b1c1d1e1f2021",
+      "code": "142942"
+    },
+    {
+      "handshakeHash": "030405060708090a0b0c0d0e0f101112131415161718191a1b1c1d1e1f202122",
+      "code": "845396"
+    }
+  ],
+  "coreId": "ab396304d00a3ee7e859b4962f32db0f463f8ad6b8b22b977a1442e7715c3610",
+  "collapse": {
+    "taskId": "9a1f0c2e-1111-4222-8333-444455556666",
+    "id": "0757c21f469327abe1cfb710e272f1367ec9b5341aa9ef9db46628db8a5c6e90"
+  },
+  "pushMac": {
+    "sendKey": "4d4e4f505152535455565758595a5b5c5d5e5f606162636465666768696a6b6c",
+    "request": "7b2261223a317d",
+    "mac": "d03d0110150b2431725b00c94b5e8d967887439c4e0e3052181e3c34d8d0b268"
+  }
+}

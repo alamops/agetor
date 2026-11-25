@@ -1,0 +1,32 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PLIST-1.0.dtd">
+<plist version="1.0">
+<dict>
+  <key>CFBundleName</key>
+  <string>Agetor Key Helper</string>
+  <key>CFBundleDisplayName</key>
+  <string>Agetor Key Helper</string>
+  <!-- Must stay stable: the keychain access group, the embedded provisioning profile and the App ID all name it. -->
+  <key>CFBundleIdentifier</key>
+  <string>sh.alamops.agetor.keyhelper</string>
+  <key>CFBundleExecutable</key>
+  <string>keyhelper</string>
+  <key>CFBundlePackageType</key>
+  <string>APPL</string>
+  <key>CFBundleInfoDictionaryVersion</key>
+  <string>6.0</string>
+  <key>CFBundleShortVersionString</key>
+  <string>1.0.0</string>
+  <key>CFBundleVersion</key>
+  <string>1</string>
+  <!-- Agent app: no Dock icon, no menu bar. The pairing window is the only UI it ever draws. -->
+  <key>LSUIElement</key>
+  <true/>
+  <key>LSMinimumSystemVersion</key>
+  <string>13.0</string>
+  <key>NSPrincipalClass</key>
+  <string>NSApplication</string>
+  <key>NSFaceIDUsageDescription</key>
+  <string>Agetor asks for Touch ID or your login password to add a phone.</string>
+</dict>
+</plist>

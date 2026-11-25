@@ -853,6 +853,28 @@ export function makeRuns(conn: Database) {
        ORDER BY run_events.id ASC`,
       ).all(taskId);
     },
+    /** One persisted event of a task by its id, or null when the id does not exist or belongs to another task. Backs
+     *  `GET /tasks/:id/events/:eventId` (the phone fetches a cut tool result whole). Primary-key lookup on `run_events`,
+     *  then the run's task id is checked, so another task's event is never returned. */
+    eventById(taskId: string, eventId: number): TaskEventRow | null {
+      const row = conn.query<{
+        id: number;
+        runId: string;
+        stream: string;
+        data: string;
+        ts: number;
+        subagentId: string | null;
+        taskId: string;
+      }, [number]>(
+        `SELECT run_events.id AS id, run_events.run_id AS runId, run_events.stream AS stream, run_events.data AS data,
+                run_events.ts AS ts, run_events.subagent_id AS subagentId, runs.task_id AS taskId
+         FROM run_events
+         JOIN runs ON runs.id = run_events.run_id
+         WHERE run_events.id = ?`,
+      ).get(eventId);
+      if (!row || row.taskId !== taskId) return null;
+      return { id: row.id, runId: row.runId, stream: row.stream, data: row.data, ts: row.ts, subagentId: row.subagentId } as TaskEventRow;
+    },
     /** Cheap existence check — is there at least one persisted event for this
      *  task older than `beforeId`? Backs the `hasMore` flag on both the SSE
      *  `replay_meta` frame and the `/events/page` paging route, so the client

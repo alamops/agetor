@@ -449,6 +449,8 @@ export const ROUTE_POLICY: Record<string, PolicyEntry> = {
   "/tmux-prompts/:id/answer": { POST: CLI },
   "/fx-permissions/:id/answer": { POST: CLI },
   "/tasks/:id/interactions/pending": { GET: CLI },
+  "/interactions/pending": { GET: CLI },
+  "/app/presence": { PUT: APP },
   "/tasks/:id/backlog": {
     POST: CLI,
     PUT: CLI,
@@ -504,6 +506,7 @@ export const ROUTE_POLICY: Record<string, PolicyEntry> = {
   "/terminals/:id": { DELETE: APP },
   "/terminals/:id/ws-ticket": { POST: APP },
   "/tasks/:id/events/page": { GET: CLI },
+  "/tasks/:id/events/:eventId": { GET: CLI },
   "/tasks/:id/messages/history": { GET: CLI },
   "/tasks/:id/events": SSE_LEGACY,
 };
