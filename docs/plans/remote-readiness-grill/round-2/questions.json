@@ -1,0 +1,105 @@
+{
+  "version": 1,
+  "id": "remote-readiness-grill-r2",
+  "title": "Grill — Remote Readiness, round 2 (follow-ups)",
+  "skill": "grill",
+  "slug": "remote-readiness",
+  "round": 2,
+  "summary": "Round 1 is fully answered. These **7 follow-ups** come from your four overrides and two notes. Some answers now conflict with each other, and some notes open new scope. Each question quotes your round-1 answer.",
+  "proven": [
+    "Decided in round 1: ship dark in release builds, a build-time constant for the seams, the core owns every notification, one level vocabulary (`observe` < `respond` < `operate` < `configure`), fail-closed tmux classification, text with a reject or skip counts as content, `macName` goes in the hello, both residual risks accepted, the rule rewritten to allow read and revoke, plus every confirm default."
+  ],
+  "sections": [
+    {
+      "id": "followups",
+      "title": "Follow-ups on your answers",
+      "questions": [
+        {
+          "id": "device-level",
+          "type": "single",
+          "title": "v1 now includes `operate` actions. Which level does a paired device get, and how?",
+          "impact": "blocking",
+          "oneWayDoor": true,
+          "why": "Decides the pairing window's UI, the device row's `level` column, and whether a stolen unlocked phone can switch a task to autonomous.",
+          "context": "In round 1 you allowed **'All three, signed'** for Claude plan approval, which includes `Yes, and use auto mode`, a switch to an autonomous mode. You also added `POST /tasks/:id/switch-account` (operate) to v1. The spec's v1 grants devices up to `respond`. So v1 needs devices that can hold `operate`. The rewritten rule says no route may raise a device's level, so a level is set at pairing, and changing it means pairing again.",
+          "options": [
+            { "id": "choose-at-pair", "label": "Chosen per device in the native pairing window", "description": "The window offers 'Respond' (the default) or 'Operate'. Operate-level actions (auto-mode plan approval, switch-account) are refused for a `respond` device. To change the level, revoke the device and pair it again.", "consequence": "One extra control in the pairing window. The router checks the route's level against the device's level." },
+            { "id": "all-operate", "label": "Every device gets `operate`", "description": "There's no choice at pairing.", "consequence": "Simpler, but every phone can switch a task to autonomous." },
+            { "id": "respond-plus", "label": "Devices stay `respond`; these two actions count as `respond`", "description": "Auto-mode approval and switch-account are re-levelled down to `respond`, with a signature.", "consequence": "The level vocabulary stops meaning what it says." }
+          ],
+          "recommendation": { "value": "choose-at-pair", "reason": "It keeps your choice to allow these actions, and a device only gets them if you grant them on purpose." }
+        },
+        {
+          "id": "preview-size",
+          "type": "single",
+          "title": "You wrote 'the same as in the mac' for phone previews. Which parts carry over?",
+          "impact": "shape",
+          "oneWayDoor": true,
+          "why": "'The same' could mean the 50 MB cap only, or also no folder limit. The second would reverse your earlier fleet decision.",
+          "context": "Round-1 answer to `preview-cap`: **\"the same as in the mac\"**. The desktop `/files/preview` has a **50 MB** cap and **no folder limit**. Your earlier decision (fleet entry, 24 Nov): *the desktop keeps no folder limit; a remote (Companion) caller gets a per-task path check instead*. The relay limits throughput to **2 MB per 10 s**, so a 50 MB file takes at least **~4 minutes** and must be sent in chunks (queues hold 256 KB or 64 frames).",
+          "evidence": [
+            { "label": "desktop cap", "path": "src/shared/attachments.ts", "line": 152 },
+            { "label": "relay limits", "path": "docs/plans/remote-readiness-investigation.md", "line": 286 }
+          ],
+          "options": [
+            { "id": "50mb-pathcheck", "label": "50 MB cap, with the per-task path check, sent in chunks", "description": "Same cap as the Mac. Paths are limited to the task's workdir, its worktrees and its sent files. The file is chunked under the relay limits, with progress shown on the phone.", "consequence": "Matches your earlier decision; the router needs a chunked byte stream." },
+            { "id": "50mb-anywhere", "label": "Exactly as on the Mac: 50 MB, any path", "description": "A paired phone can preview any file the user can read.", "consequence": "Reverses the fleet decision. A phone, or anyone holding it unlocked, can read `~/.ssh` or `.env` files." },
+            { "id": "10mb-pathcheck", "label": "Back to 10 MB with the path check", "consequence": "The spec's number; no wait of several minutes." }
+          ],
+          "recommendation": { "value": "50mb-pathcheck", "reason": "Gives you the Mac's size limit and keeps the path rule you already chose for phones." }
+        },
+        {
+          "id": "tmux-stream",
+          "type": "single",
+          "title": "Your note: 'stream tmux so the user can control it from their phone, like Attach'. Is that in this change?",
+          "impact": "blocking",
+          "oneWayDoor": true,
+          "why": "A live terminal is the most powerful remote action there is: raw keystrokes into the agent session can pick any 'always allow' row, type any command, and switch any mode. It needs its own level, threat model and protocol messages.",
+          "context": "Round-1 note on `tmux-always`: **\"we might need to stream tmux so user can control from their phone when needed, similar to the `Attach` feature\"**. Today the desktop opens a terminal over a WebSocket with a single-use ticket (`POST /terminals/:id/ws-ticket`). Over the relay, a terminal stream also runs into the 50 frames/s and 2 MB/10 s limits. The spec's v1 has no terminal.",
+          "options": [
+            { "id": "deferred", "label": "Owner-deferred: its own spec and ticket after v1", "description": "v1's protocol reserves a `terminal` message family and a `configure`-level slot, so adding it later needs no protocol version bump.", "consequence": "Recorded as owner-deferred; the fail-closed classifier's 'Answer on your Mac' stays as v1's fallback." },
+            { "id": "read-only-in", "label": "In this change, read-only (watch the pane, no keystrokes)", "description": "Stream the pane at `observe` level.", "consequence": "Adds a stream workstream (pane snapshots under the relay limits); no control." },
+            { "id": "full-in", "label": "In this change, full control at `configure` level", "description": "Keystrokes from the phone, signed per session, allowed only for devices paired at `configure`.", "consequence": "The largest addition to v1; it needs its own threat-model section and an external review." },
+            { "id": "out", "label": "Out of scope: never remote", "consequence": "The phone only ever answers cards." }
+          ],
+          "recommendation": { "value": "deferred", "reason": "It's a different feature with its own trust model; reserving the protocol slot now keeps it cheap later." }
+        },
+        {
+          "id": "macos27-host",
+          "type": "text",
+          "title": "Where will K1 run on macOS 27? (a machine, a VM, a borrowed Mac)",
+          "impact": "shape",
+          "why": "You required K1 to pass on 26 and 27, and this Mac runs 26.6.2.",
+          "context": "Round-1 answer to `k1-account`: **'Profile route, K1 must pass on 26 and 27'**, with a note naming your Developer ID team. The team name stays out of committed files; the plan refers to 'the owner's Developer ID team'. An Apple-silicon VM (Virtualization.framework, UTM or Tart) can run macOS 27; whether a Developer ID profile and the Secure Enclave behave the same in a VM is unverified, so a physical Mac is the safer host.",
+          "placeholder": "e.g. a Tart VM on this Mac running macOS 27.1",
+          "recommendation": { "value": "A physical Mac on macOS 27", "reason": "A VM may not expose the Secure Enclave the way a real Mac does." }
+        },
+        {
+          "id": "wildcard-detail",
+          "type": "confirm",
+          "title": "Wildcard bind with remote access: what the warning looks like",
+          "impact": "minor",
+          "context": "Round-1 answer to `wildcard-bind`: **'Allow it, with a warning'**. Note that a Linux container core has no key helper, so remote access works only on a macOS headless core bound to `0.0.0.0` or `::`.",
+          "recommendation": { "value": "The gateway runs. GET /remote-access, `agetor remote status` and core.log show 'API is also reachable beyond loopback over plain HTTP'. Invariant 5 in the spec and security.md is amended to 'loopback, or a wildcard bind with that warning'.", "reason": "Makes your choice visible wherever remote status is read." }
+        },
+        {
+          "id": "auto-mode-guard",
+          "type": "confirm",
+          "title": "'Yes, and use auto mode' from the phone counts as an operate action, with the unlock window",
+          "impact": "minor",
+          "oneWayDoor": false,
+          "context": "Round-1 answer to `claude-plan`: **'All three, signed; row 3 as content'**. Row 1 makes the task run without asking from then on.",
+          "recommendation": { "value": "Row 1 needs an `operate` device, a signature bound to the plan hash, and the unlock window (the same gate content gets on a task that runs without asking). Row 2 is respond and signed; row 3 is content.", "reason": "The strongest gate goes on the step that removes every later gate." }
+        },
+        {
+          "id": "plan-edit-scope",
+          "type": "confirm",
+          "title": "Mac side only for the plan-edit route",
+          "impact": "minor",
+          "context": "You added `PATCH /tasks/:id/plans/:planId` to v1. No phone app ships in this change.",
+          "recommendation": { "value": "This change adds its remote policy entry, content-level signing over the edited plan body, the router mapping, and coverage in the headless test client. The phone's plan editor belongs to the iOS app spec.", "reason": "Keeps this change to the Mac side, as its purpose says." }
+        }
+      ]
+    }
+  ]
+}

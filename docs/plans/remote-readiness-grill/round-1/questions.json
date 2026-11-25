@@ -1,0 +1,696 @@
+{
+  "version": 1,
+  "id": "remote-readiness-grill-r1",
+  "title": "Grill — Remote Readiness (Mac side of the Companion)",
+  "skill": "grill",
+  "slug": "remote-readiness",
+  "round": 1,
+  "summary": "The investigation (`docs/plans/remote-readiness-investigation.md`) checked the spec (rev 40) against the code and found **14 decisions** the build would otherwise make silently. Several of them come from a premise in the spec that is false. The first section **changes the plan's shape**: release visibility, signing and the key helper, and notifications. The second covers what a phone may approve, which is mostly trust decisions. The last section lists defaults I'd bet on; confirm or override each one.\n\nSpec: https://claude.ai/artifact/VepsfQcg7WYRuy8brBf3LX (outside the repo; Q-confirm `spec-commit` decides where it lands).",
+  "proven": [
+    {
+      "text": "**@noble 2.4.0 implements both Noise suites with the responder's DH injected** (the key-helper design). Ciphertexts and the handshake hash match cacophony for `Noise_NK_25519_ChaChaPoly_SHA256` and `Noise_NKpsk0_25519_ChaChaPoly_SHA256`.",
+      "evidence": [
+        {
+          "label": "spike verdict",
+          "path": "docs/plans/remote-readiness-investigation.md",
+          "line": 141
+        }
+      ]
+    },
+    {
+      "text": "**ES256 must be verified with `lowS:false`.** With noble's defaults, only 107 of 200 WebCrypto signatures verify; with `lowS:false`, all 200 do. The plan pins this, with a test.",
+      "evidence": [
+        {
+          "label": "spike verdict",
+          "path": "docs/plans/remote-readiness-investigation.md",
+          "line": 143
+        }
+      ]
+    },
+    {
+      "text": "**The in-process router can't use `server.fetch`** (Bun 1.3.10 skips `routes:`). It calls the policy-wrapped handlers directly, with a synthetic `Request` carrying `params` and the WeakMap caller mark. `server.timeout()` doesn't throw on that request.",
+      "evidence": [
+        {
+          "label": "spike verdicts",
+          "path": "docs/plans/remote-readiness-investigation.md",
+          "line": 144
+        }
+      ]
+    },
+    {
+      "text": "**Claude Code writes the ExitPlanMode plan to the JSONL while its approval modal is open** (2.1.332), so the core can show the plan and hash it before the phone approves.",
+      "evidence": [
+        {
+          "label": "live spike",
+          "path": "docs/plans/remote-readiness-investigation.md",
+          "line": 146
+        }
+      ]
+    },
+    "A signed gate decision covers all six body fields of `POST /tasks/:id/pipeline/review` (`stepId`, `seq`, `decision`, `comment`, `nextStepIds`, `mode`), not only `decision` and `comment` (`server.ts:7171-7226`). This is a correction, so no question is needed.",
+    "No devices or audit rows exist yet, so migrations 094 (devices) and 095 (audit) are additive and backfill nothing."
+  ],
+  "sections": [
+    {
+      "id": "shape",
+      "title": "Decisions that change the plan's shape",
+      "intro": "Each answer here adds or removes a whole workstream.",
+      "questions": [
+        {
+          "id": "release-visibility",
+          "type": "single",
+          "title": "What should a release build show of pairing while there is no hosted relay and no phone app?",
+          "impact": "blocking",
+          "oneWayDoor": true,
+          "why": "Decides whether the release pipeline ships the key helper and the pairing UI live, and how 'Pair a Phone…' is gated.",
+          "context": "The purpose line says **no phone app ships**, and the relay spec runs *after* this spec. So a released Agetor built from this change would show 'Pair a Phone…' with nothing to pair with and no relay to reach. The remote-access switch is already labelled *(preview)* and is off by default, but it is visible today.",
+          "evidence": [
+            {
+              "label": "Settings row today",
+              "path": "src/mainview/components/settings/BackgroundSection.tsx",
+              "line": 178
+            },
+            {
+              "label": "relay spec runs after this one",
+              "url": "https://claude.ai/artifact/StLvx8goStUPYWH7hyzyd4"
+            }
+          ],
+          "options": [
+            {
+              "id": "hidden",
+              "label": "Ship the code dark",
+              "description": "Everything is compiled in and tested. In a release build, 'Pair a Phone…', the Settings device list and the CLI `devices` commands stay hidden, and the gateway never starts. One switch turns them on (a build constant or a dev pref) for dev builds, e2e and a future preview channel.",
+              "consequence": "The key helper and its profile can still ship, so K1 is proven in a real signed build. One extra gate, plus a test that it is off in release."
+            },
+            {
+              "id": "preview",
+              "label": "Visible as a preview",
+              "description": "Shown in release under the existing *(preview)* label, with copy saying the phone app is coming.",
+              "consequence": "Users can pair a headless test client only, and support questions follow. The relay URL must point somewhere real."
+            },
+            {
+              "id": "no-release",
+              "label": "Keep it off main's release path",
+              "description": "Merge, but leave the key helper out of release builds until the relay and app exist.",
+              "consequence": "K1 is not proven in a shipped build; the release-script work moves to a later change."
+            }
+          ],
+          "recommendation": {
+            "value": "hidden",
+            "reason": "Nothing can pair yet, and shipping dark still proves the signed helper in a real release."
+          }
+        },
+        {
+          "id": "k1-account",
+          "type": "single",
+          "title": "Key helper (K1): may the plan rely on an App ID and a Developer ID provisioning profile from your Apple account, and on which macOS versions must K1 pass?",
+          "impact": "blocking",
+          "oneWayDoor": true,
+          "why": "Decides whether the helper is a profile-backed nested `.app` with Secure Enclave keys, and whether a login-keychain fallback exists at all.",
+          "context": "Public reports say AMFI kills a bare binary carrying `keychain-access-groups` unless an embedded Developer ID profile grants it, and Secure Enclave keys need the data-protection keychain. So the helper must be a nested `.app` under `Resources/app/bin`, because Electrobun re-signs `Contents/MacOS` and would strip the entitlement. A third-party report (Oct 2026) says **macOS 27 routes every keychain call to the data-protection keychain**, which would remove the login-keychain fallback. This Mac runs 26.6.2, so that report is unverified here. You would create the App ID and the profile; the plan adds embedding and verifying the profile to `scripts/release.ts` and `verify-release.ts`, and the build fails if the profile is missing.",
+          "evidence": [
+            {
+              "label": "assumptions 1–2",
+              "path": "docs/plans/remote-readiness-investigation.md",
+              "line": 150
+            },
+            {
+              "label": "Sunrise #389",
+              "url": "https://github.com/justin13888/Sunrise/issues/389"
+            },
+            {
+              "label": "M1K3 #518",
+              "url": "https://github.com/Round-Tower/M1K3/pull/518"
+            }
+          ],
+          "options": [
+            {
+              "id": "profile-26-27",
+              "label": "Profile route, K1 must pass on 26 and 27",
+              "description": "I'll create the App ID and profile. K1 runs on macOS 26 and 27 before the helper ships. The fallback exists only if K1 proves it works on 27.",
+              "consequence": "Needs a macOS 27 machine or VM (say which in a note)."
+            },
+            {
+              "id": "profile-26",
+              "label": "Profile route, K1 on 26 only for now",
+              "description": "I'll create the App ID and profile. K1 runs on 26 here; 27 is checked later.",
+              "consequence": "Records 'unverified on 27' as an open risk."
+            },
+            {
+              "id": "no-profile",
+              "label": "No profile: login keychain only",
+              "description": "No Secure Enclave; keys go in the login keychain.",
+              "consequence": "Weaker key protection, and it may not work at all on macOS 27."
+            }
+          ],
+          "recommendation": {
+            "value": "profile-26-27",
+            "reason": "Users are already on 27, and the fallback is the part most likely to be gone there."
+          }
+        },
+        {
+          "id": "release-seams",
+          "type": "single",
+          "title": "How does a release build refuse the fake key helper and the relay-URL test seams?",
+          "impact": "shape",
+          "oneWayDoor": true,
+          "why": "A seam honored in a release build lets an agent start a core whose pairings use a key the agent controls.",
+          "context": "Nothing in the repo detects a signed release build. The existing seams are env-only and are honored **in every build** (`AGETOR_FAKE_REMOTE_ACCESS`, `AGETOR_FAKE_LOGIN_ITEM`). The harness seams gate on `NODE_ENV=test || AGETOR_E2E_HARNESS_SEAMS=1`. Agents can set env vars on any core they start.",
+          "evidence": [
+            {
+              "label": "fake remote-access seam, any build",
+              "path": "src/bun/background.ts",
+              "line": 68,
+              "lang": "ts",
+              "code": "/** AGETOR_FAKE_REMOTE_ACCESS=on (honored only together with\n *  AGETOR_FAKE_LOGIN_ITEM=1) seeds the preference \"on\" at the first read in\n *  the process, so an e2e can start with remote access already enabled\n *  without driving the native box. */"
+            },
+            {
+              "label": "harness seam gate",
+              "path": "src/bun/harness-failover.ts",
+              "line": 279
+            }
+          ],
+          "options": [
+            {
+              "id": "build-constant",
+              "label": "Build-time constant",
+              "description": "The release build (`scripts/release.ts` → bundle `define`) bakes in `RELEASE_BUILD=true`, and the remote seams are dead code there. `verify-release.ts` asserts the constant is set in the shipped bundles.",
+              "consequence": "No env var can switch it back on; dev and e2e builds keep the seams."
+            },
+            {
+              "id": "channel",
+              "label": "`version.json` channel",
+              "description": "Refuse the seams when the channel is `stable`/`beta`.",
+              "consequence": "An agent can edit `version.json` inside the installed app only if it can write to the bundle, which is the weaker of the two."
+            },
+            {
+              "id": "helper-sig",
+              "label": "Check the helper's code signature at runtime",
+              "description": "Refuse any helper not signed with the Agetor team id.",
+              "consequence": "Strongest for the helper, but it doesn't cover the relay-URL seam on its own."
+            }
+          ],
+          "recommendation": {
+            "value": "build-constant",
+            "reason": "Cheap, can't be flipped at runtime, and verify-release can assert it."
+          }
+        },
+        {
+          "id": "notifications",
+          "type": "single",
+          "title": "One notification decision: does the core take over OS notifications from the webview in this change?",
+          "impact": "blocking",
+          "why": "Option (a) is the spec's R11 (size L) and moves desktop behavior that a whole grill settled; option (b) is about a third of the work.",
+          "context": "**The spec's premise is false.** It says 'the webview already reports focus', but the core is never told. The webview decides OS notifications itself in `maybeNotifyOS`, from `document.hasFocus()`, `isSelected` (the open RunPanel or pipeline view) and the D7 focused-window rules. The core can learn window focus natively (Electrobun 1.18.1 emits window `focus`/`blur` on the Bun side), but not which task is selected. The phone sink needs 'is the user looking at this task right now' to avoid pushing what you're already reading.",
+          "evidence": [
+            {
+              "label": "webview decides OS notifications",
+              "path": "src/mainview/lib/toasts.ts",
+              "line": 81
+            },
+            {
+              "label": "native focus events",
+              "path": "node_modules/electrobun/dist/api/bun/events/windowEvents.ts",
+              "line": 19
+            },
+            {
+              "label": "the decisions this would move",
+              "path": "docs/plans/duplicated-macos-notifications-grill.md"
+            }
+          ],
+          "options": [
+            {
+              "id": "core-owns",
+              "label": "(a) The core owns every notification",
+              "description": "A new app-only route lets the webview report the selected task (and focus as a backup to the native events). The core runs one shared policy for OS notifications, the phone push and the headless case; the webview stops calling `maybeNotifyOS`.",
+              "consequence": "Matches the spec. The duplicated-notifications e2e must stay green; the desktop change is the riskiest part."
+            },
+            {
+              "id": "split",
+              "label": "(b) The app keeps its OS decision; the core decides only pushes and headless",
+              "description": "The core uses the shared policy plus native focus/blur and the selected task the webview reports, but only for the phone sink and a headless core.",
+              "consequence": "Two decision sites for now; the spec text is amended to say so."
+            }
+          ],
+          "recommendation": {
+            "value": "core-owns",
+            "reason": "The spec asks for one decision, and you prefer the complete path; the e2e suite guards the regression."
+          }
+        },
+        {
+          "id": "levels",
+          "type": "single",
+          "title": "Two level vocabularies: unify them or map them?",
+          "impact": "shape",
+          "why": "Fixes the names and order used in the `ROUTE_POLICY.remote` type, the device row, the protocol schema and the UI.",
+          "context": "The spec uses device levels `respond`, `watch`, `operate`, `full` and route levels `observe`, `respond`, `operate`, `configure`. The two lists disagree in both names and order (respond comes before watch for devices).",
+          "options": [
+            {
+              "id": "one",
+              "label": "One ordered vocabulary: `observe` < `respond` < `operate` < `configure`",
+              "description": "A route needs a level; a device is granted a ceiling from the same list. v1 grants up to `respond`.",
+              "consequence": "One enum in `packages/remote-protocol`; the spec text is amended."
+            },
+            {
+              "id": "map",
+              "label": "Keep both, with a fixed mapping",
+              "description": "`watch`↔`observe`, `full`↔`configure`, order observe < respond < operate < configure.",
+              "consequence": "Two enums and a mapping table to test."
+            }
+          ],
+          "recommendation": {
+            "value": "one",
+            "reason": "Two names for one idea will drift across three languages."
+          }
+        }
+      ]
+    },
+    {
+      "id": "trust",
+      "title": "What a phone may approve (trust boundaries)",
+      "intro": "Each of these decides which action a phone can take with one tap, and which ones need a signature or the unlock window.",
+      "questions": [
+        {
+          "id": "tmux-always",
+          "type": "single",
+          "title": "Claude's tmux cards include 'always allow' rows, but their choices carry only `{ key, label }`. How should the phone handle them?",
+          "impact": "blocking",
+          "oneWayDoor": true,
+          "why": "The spec says both 'any non-reject choice on a tmux card is signed consent' and 'Always allow is never remote in v1'. The code can't keep both rules without classifying the choices.",
+          "context": "fx and OpenCode options carry an ACP `kind` (`allow_once`/`allow_always`/…), so refusing always-allow there is straightforward. Claude's tmux rows are scraped text: `Yes, allow all`, `Yes, and don't ask again for … commands in <path>`, and new wordings arrive with each Claude version.",
+          "evidence": [
+            {
+              "label": "tmux choice shape",
+              "path": "src/bun/interactions.ts",
+              "line": 173,
+              "lang": "ts",
+              "code": "export interface TmuxPromptChoice {\n  key: string;\n  label: string;\n}"
+            },
+            {
+              "label": "scraped always-style rows",
+              "path": "src/bun/claude-tmux-scraper.test.ts",
+              "line": 72,
+              "code": "    2. Yes, allow all"
+            },
+            {
+              "label": "scraped don't-ask-again row",
+              "path": "src/bun/claude-tmux-scraper.test.ts",
+              "line": 179
+            }
+          ],
+          "options": [
+            {
+              "id": "allowlist",
+              "label": "Fail closed: allow only rows recognized as once-only",
+              "description": "A shared classifier marks a tmux choice `once`, `reject` or `unknown`. Only exact known shapes (`Yes`, `No`, numbered `Yes`/`No, and tell Claude…`) count as once or reject. `unknown` and anything always-style is shown on the phone but greyed out ('Answer on your Mac').",
+              "consequence": "A new Claude wording degrades to 'answer on your Mac' and never to always-allow. Needs fixtures for every row seen so far."
+            },
+            {
+              "id": "denylist",
+              "label": "Refuse labels that look always-style",
+              "description": "Match 'allow all', 'don't ask again', 'always' and allow everything else.",
+              "consequence": "Fails open when Claude adds a new wording."
+            },
+            {
+              "id": "all-signed",
+              "label": "Allow every non-reject choice, signed",
+              "description": "The spec's first rule wins; always-allow becomes remotely possible.",
+              "consequence": "The spec's 'never remote in v1' rule is dropped."
+            },
+            {
+              "id": "enter-only",
+              "label": "tmux: only Enter-only and trust screens in v1",
+              "description": "No numbered tmux choices from the phone at all.",
+              "consequence": "Most Claude permission cards can't be answered remotely."
+            }
+          ],
+          "recommendation": {
+            "value": "allowlist",
+            "reason": "Keeps 'always is never remote' true across Claude versions."
+          }
+        },
+        {
+          "id": "claude-plan",
+          "type": "single",
+          "title": "Claude plan approval from the phone: which of the modal's three rows are allowed?",
+          "impact": "shape",
+          "oneWayDoor": true,
+          "why": "Row 1 switches the session to an autonomous mode, which the Blueprint classes as a v2 'Operate' action.",
+          "context": "Claude 2.1.332's ExitPlanMode modal offers `1. Yes, and use auto mode`, `2. Yes, manually approve edits`, `3. Tell Claude what to change`. The modal arrives as a `tmux_prompt` card answered with `POST /tmux-prompts/:id/answer`. The plan is hashed from the JSONL, so a signature binds to the exact plan text.",
+          "evidence": [
+            {
+              "label": "spike",
+              "path": "docs/plans/remote-readiness-investigation.md",
+              "line": 146
+            },
+            {
+              "label": "plan card source",
+              "path": "src/bun/claude-tmux.ts",
+              "line": 8289
+            }
+          ],
+          "options": [
+            {
+              "id": "manual-and-tell",
+              "label": "Row 2 signed and row 3 as content; row 1 Mac-only",
+              "description": "'Tell Claude what to change' follows the rules for a follow-up message: signed, plus the unlock window when the task runs without asking.",
+              "consequence": "No mode switch from the phone in v1."
+            },
+            {
+              "id": "all-three",
+              "label": "All three, signed; row 3 as content",
+              "description": "The auto-mode row is allowed with a signature bound to the plan hash.",
+              "consequence": "A phone can switch a task to autonomous; the Blueprint's v2 'Operate' line moves to v1."
+            },
+            {
+              "id": "manual-only",
+              "label": "Row 2 only",
+              "description": "Rows 1 and 3 are answered on the Mac.",
+              "consequence": "You can't send changes back from the phone."
+            }
+          ],
+          "recommendation": {
+            "value": "manual-and-tell",
+            "reason": "Keeps the switch to an autonomous mode out of v1, as the Blueprint says."
+          }
+        },
+        {
+          "id": "text-reject",
+          "type": "single",
+          "title": "An OpenCode Reject or Skip can carry typed text that reaches the agent. Is that 'remove' or content?",
+          "impact": "shape",
+          "oneWayDoor": true,
+          "why": "The spec classes reject and dismiss as 'Remove' (session only). Text sent to an agent with them bypasses the unlock window if it is classed that way.",
+          "context": "An OpenCode permission Reject may carry a `message` that the driver relays to the agent. A question Skip may carry a `message` too.",
+          "evidence": [
+            {
+              "label": "question skip with message",
+              "path": "src/bun/server.ts",
+              "line": 8139
+            },
+            {
+              "label": "OpenCode permission options",
+              "path": "src/bun/interactions.ts",
+              "line": 1123,
+              "lang": "ts",
+              "code": "    { optionId: \"once\", name: \"Allow once\", kind: \"allow_once\" },\n    { optionId: \"always\", name: \"Always allow\", kind: \"allow_always\" },\n    { optionId: \"reject\", name: \"Reject\", kind: \"reject_once\" },"
+            }
+          ],
+          "options": [
+            {
+              "id": "text-is-content",
+              "label": "Bare reject/skip is Remove; with text it is content",
+              "description": "With text, the same rules as a follow-up message apply: signed, plus the unlock window when the task runs without asking.",
+              "consequence": "The phone UI offers both; the router classifies by body."
+            },
+            {
+              "id": "bare-only",
+              "label": "Only bare reject/skip from the phone in v1",
+              "description": "The text field is hidden remotely, and the router refuses a `message`.",
+              "consequence": "Simpler; you can't explain a rejection from the phone."
+            }
+          ],
+          "recommendation": {
+            "value": "text-is-content",
+            "reason": "Text that reaches the agent is content, whatever button carries it."
+          }
+        },
+        {
+          "id": "wildcard-bind",
+          "type": "single",
+          "title": "Should remote access refuse to run on a headless core bound beyond loopback (`AGETOR_API_HOST=0.0.0.0` or `::`)?",
+          "impact": "shape",
+          "oneWayDoor": true,
+          "why": "Invariant 5 assumes the local API is loopback-only, so the Noise gateway is the only way in from outside.",
+          "context": "A headless core can still bind a wildcard (that's for running it in a container), and it already logs a cleartext-token warning. A container core also has no macOS keychain, so it has no key helper.",
+          "evidence": [
+            {
+              "label": "wildcard hosts allowed",
+              "path": "src/bun/api-config.ts",
+              "line": 46,
+              "lang": "ts",
+              "code": "const WILDCARD_API_HOSTS = new Set([\"0.0.0.0\", \"::\"]);"
+            }
+          ],
+          "options": [
+            {
+              "id": "refuse",
+              "label": "Refuse: the gateway doesn't start, and the status says why",
+              "description": "`GET /remote-access` and `agetor remote status` report 'remote access needs a loopback-bound core'.",
+              "consequence": "One check, one test."
+            },
+            {
+              "id": "warn",
+              "label": "Allow it, with a warning",
+              "consequence": "Invariant 5 is weakened; the spec is amended."
+            }
+          ],
+          "recommendation": {
+            "value": "refuse",
+            "reason": "Fails closed, and the only wildcard use case can't run the key helper anyway."
+          }
+        },
+        {
+          "id": "v1-routes",
+          "type": "multi",
+          "title": "Which routes outside the spec's v1 table join the remote v1 set?",
+          "impact": "shape",
+          "why": "Each route added needs a level, a signing rule, a projection and tests.",
+          "context": "The spec says tool results over 16 KB arrive cut, 'with a fetch-by-event-id for the full text', but **no route fetches one event by id** today. Other routes that exist but aren't in the table are listed below. `src/shared/tool-result-trim.ts` already trims tool results (4 KB budget, for retention).",
+          "evidence": [
+            {
+              "label": "missing routes",
+              "path": "docs/plans/remote-readiness-investigation.md",
+              "line": 51
+            }
+          ],
+          "options": [
+            {
+              "id": "event-by-id",
+              "label": "New `GET /tasks/:id/events/:eventId` (observe)",
+              "consequence": "Needed for the spec's 16 KB cut; new route, policy entry and test."
+            },
+            {
+              "id": "fx-resume",
+              "label": "`POST /tasks/:id/fx-resume` (respond, signed)",
+              "description": "An fx task paused in recovery waits for you.",
+              "consequence": "Without it, a paused fx task stays stuck until you're at the Mac."
+            },
+            {
+              "id": "plan-edit",
+              "label": "`PATCH /tasks/:id/plans/:planId` (content)",
+              "description": "Edit a Cursor or Copilot plan before approving it.",
+              "consequence": "Needs a plan editor on the phone."
+            },
+            {
+              "id": "msg-history",
+              "label": "`GET /tasks/:id/messages/history` (observe)",
+              "consequence": "Recalling earlier prompts; minor."
+            },
+            {
+              "id": "switch-account",
+              "label": "`POST /tasks/:id/switch-account` (operate)",
+              "consequence": "Above v1's ceiling unless the level rules change."
+            }
+          ],
+          "recommendation": {
+            "value": [
+              "event-by-id",
+              "fx-resume"
+            ],
+            "reason": "One is required by the spec's own 16 KB rule; the other unblocks a task that is waiting for you."
+          }
+        },
+        {
+          "id": "mac-name",
+          "type": "single",
+          "title": "Protocol v1's hello carries a Mac name",
+          "impact": "shape",
+          "oneWayDoor": true,
+          "context": "The iOS app spec asks for one; without it the app makes the user type a name for every Mac. The hello is sent inside the Noise session, so the relay never sees it.",
+          "recommendation": {
+            "value": "yes",
+            "reason": "Adding it later would cost a protocol version bump."
+          },
+          "options": [
+            {
+              "id": "yes",
+              "label": "Add `macName` to the v1 hello",
+              "description": "Add `macName` (string, at most 40 characters, defaults to the computer name, editable in Settings) to the v1 hello."
+            },
+            {
+              "id": "no",
+              "label": "No Mac name in v1",
+              "description": "The app asks the user to name each Mac; a later protocol version can add it."
+            }
+          ]
+        },
+        {
+          "id": "residual-risks",
+          "type": "single",
+          "title": "Two residual risks are accepted and documented in security.md, not closed",
+          "impact": "shape",
+          "oneWayDoor": true,
+          "context": "(1) An on-Mac agent can pose as the core to the phone: it reads the link secret from SQLite and uses the helper as a DH oracle. The signatures it collects are bound to its own session hash, so they are useless against the real core. (2) An agent can forge push text, because `push_pub` and `send_key` are in SQLite. The lock screen offers no approvals.",
+          "recommendation": {
+            "value": "yes",
+            "reason": "The spec's threat model already accepts the first; the second exposes notification text only."
+          },
+          "options": [
+            {
+              "id": "yes",
+              "label": "Accept both and document them",
+              "description": "Accept both, write them in docs/architecture/security.md and the new remote-gateway.md."
+            },
+            {
+              "id": "no",
+              "label": "Close the push-forgery gap in this change",
+              "description": "The key helper signs each push, and the phone's notification extension checks the signature before it shows the text. This adds a helper call per push and work on the phone side."
+            }
+          ]
+        },
+        {
+          "id": "vocab-rule",
+          "type": "single",
+          "title": "Rewrite the 'no device routes' rule in CLAUDE.md, pairing rule 5 and TT3(c)",
+          "impact": "shape",
+          "oneWayDoor": true,
+          "context": "Four new routes (`GET /remote-access/devices`, `DELETE /remote-access/devices/:id`, `DELETE /remote-access/devices`, `GET /remote-access/log`) break the current text and test.",
+          "recommendation": {
+            "value": "yes",
+            "reason": "Keeps the intent of the rule (nothing over HTTP grants access) while allowing read and revoke."
+          },
+          "options": [
+            {
+              "id": "yes",
+              "label": "Rewrite the rule to allow read and revoke",
+              "description": "New rule: no route pairs a device, turns remote access on, or raises a device's level; under /remote-access only GET (read) and DELETE (revoke/off) exist, all app-only except what the CLI already has. TT3(c) pins that exact allowlist."
+            },
+            {
+              "id": "no",
+              "label": "Keep the old rule; the device list and log are menu/native-only",
+              "description": "No new HTTP routes; Settings and the CLI can't list or revoke devices, so the spec's Controls section is amended."
+            }
+          ]
+        }
+      ]
+    },
+    {
+      "id": "confirm",
+      "title": "Defaults I'd bet on: confirm or override",
+      "intro": "One line each. Edit the text to override.",
+      "questions": [
+        {
+          "id": "pair-button",
+          "type": "confirm",
+          "title": "Settings' 'Pair a phone' points to the menu item; there is no HTTP route that opens the pairing window",
+          "impact": "minor",
+          "context": "This follows the precedent for turning remote access on: Settings says 'Turn it on from Agetor › Remote Access…' (`BackgroundSection.tsx:186`). A route that opens a window which brings the relay link up would break pairing rule 5.",
+          "recommendation": {
+            "value": "Settings shows 'Pair from Agetor › Pair a Phone…'; no new route.",
+            "reason": "Same as the remote-access switch; no route can start a pairing."
+          }
+        },
+        {
+          "id": "audit-retention",
+          "type": "confirm",
+          "title": "Audit retention vs append-only",
+          "impact": "minor",
+          "context": "The spec says both 'triggers refuse UPDATE and DELETE' and 'retention: 1 year or 50,000 entries, the trim records the hash of the last dropped entry'. Triggers are only an accident guard, since an agent can write SQLite; the hash chain is what makes tampering visible.",
+          "recommendation": {
+            "value": "The trim is a named op: in one BEGIN IMMEDIATE it drops the DELETE trigger, deletes the oldest rows, writes an anchor row with the hash of the last dropped entry, and recreates the trigger. UPDATE stays refused at all times.",
+            "reason": "Keeps the guard everywhere except inside the one op that trims."
+          }
+        },
+        {
+          "id": "audit-timing",
+          "type": "confirm",
+          "title": "Audit writes: an attempt row before the handler and a result row after",
+          "impact": "minor",
+          "context": "Investigation assumption 7: writing only after the handler leaves an unaudited action if the core crashes between the two.",
+          "recommendation": {
+            "value": "Attempt row (device, route, body hash, signature id) before; result row (status code) after; a missing result row reads 'outcome unknown'.",
+            "reason": "No gaps, and it costs one extra worker write per remote action."
+          }
+        },
+        {
+          "id": "hpke",
+          "type": "confirm",
+          "title": "HPKE for sealed pushes: built by hand on noble (RFC 9180 base mode, one suite), checked against RFC 9180's vectors",
+          "impact": "minor",
+          "context": "noble has no HPKE. The alternatives are `hpke` 1.1.10 with `@panva/hpke-noble` 1.1.9, or `@hpke/core` 1.10.1. Building it by hand keeps the spec's 'noble only' rule in the core.",
+          "recommendation": {
+            "value": "Hand-built on @noble, about 150 lines, RFC 9180 vectors in the test suite; covered by the R16 external review.",
+            "reason": "Keeps the core's crypto on noble only, as the spec says."
+          }
+        },
+        {
+          "id": "vectors",
+          "type": "confirm",
+          "title": "Vector rule: cacophony for NK and NKpsk0, snow for NK, plus our own vectors",
+          "impact": "minor",
+          "context": "The spec says 'all three implementations must pass the cacophony and snow Noise vectors', but snow has no NKpsk0 for this suite and no handshake hash.",
+          "recommendation": {
+            "value": "Cacophony (NK, NKpsk0, including the handshake hash) + snow NK + our own vectors under packages/remote-protocol/vectors/; the spec text is amended.",
+            "reason": "The spec's wording asks for vectors that don't exist."
+          }
+        },
+        {
+          "id": "background-core",
+          "type": "confirm",
+          "title": "Both cores run the gateway; only the app opens the pairing window",
+          "impact": "minor",
+          "context": "A background core runs the gateway and the key helper's DH with no app open.",
+          "recommendation": {
+            "value": "The key helper is spawned through coreSpawn (disclaimed) from both cores; the background core never opens a pairing window; the link reconnects after a port handoff.",
+            "reason": "Follows the existing port-ownership and spawn rules."
+          }
+        },
+        {
+          "id": "spec-commit",
+          "type": "confirm",
+          "title": "Commit the spec into the repo before planning",
+          "impact": "minor",
+          "context": "The spec, the Blueprint and the relay spec all live outside the repo.",
+          "recommendation": {
+            "value": "docs/specs/remote-readiness-spec.md = rev 40 plus this grill's amendments marked inline; excerpts of Blueprint §12 and the relay spec's wire contract (30 s ping, 256 KB / 64 frames, 50 frames/s, 2 MB/10 s) in docs/specs/remote-relay-contract.md.",
+            "reason": "Reviewers need a path to cite."
+          }
+        },
+        {
+          "id": "ci-scope",
+          "type": "confirm",
+          "title": "The first CI job (R15): GitHub Actions on macos-15",
+          "impact": "minor",
+          "context": "There is no CI today (`.github/` holds only FUNDING.yml). `packages/remote-protocol` must also join the bun test root, tsconfig, the lint:async globs and workspaces.",
+          "recommendation": {
+            "value": "On PR and push to main: bun install, bun run check (which now covers packages/), the remote security suite and the protocol vectors. No Playwright in CI for now.",
+            "reason": "The unit and integration gate is stable; e2e is flaky under load and stays local."
+          }
+        },
+        {
+          "id": "e2e-scope",
+          "type": "confirm",
+          "title": "Acceptance: which flows get end-to-end coverage",
+          "impact": "minor",
+          "context": "The native pairing window can't be driven by Playwright.",
+          "recommendation": {
+            "value": "Integration (bun test): headless test client + local test relay + headless core with fake drivers covering pair (through the fake key helper), approve each card kind, signed gate, unlock window, idempotent retry, revoke, revoke-all, audit chain. Playwright: Settings device list, revoke, log view, with seeded devices. Existing duplicated-notifications and task-stream e2e stay green.",
+            "reason": "Each user-visible flow gets covered at the layer that can drive it."
+          }
+        },
+        {
+          "id": "preview-cap",
+          "type": "confirm",
+          "title": "A phone's preview cap is 10 MB, checked against the task's paths",
+          "impact": "minor",
+          "context": "The desktop `/files/preview` keeps 50 MB and no folder limit, per your earlier decision; a remote caller gets a per-task path check.",
+          "recommendation": {
+            "value": "A new per-task preview route for device callers: 10 MB, no-follow, paths limited to the task's workdir/worktrees and sent files.",
+            "reason": "Matches the spec and the fleet decision."
+          }
+        }
+      ]
+    }
+  ]
+}

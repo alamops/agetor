@@ -1,0 +1,72 @@
+{
+  "version": 1,
+  "id": "remote-readiness-grill-r3",
+  "title": "Grill — Remote Readiness, round 3 (last follow-ups)",
+  "skill": "grill",
+  "slug": "remote-readiness",
+  "round": 3,
+  "summary": "**4 short follow-ups.** One answers your question about macOS 27. The other three settle the gates for what you added in round 2: full terminal control at `configure`, and previews of any path at 50 MB.",
+  "proven": [
+    "Decided in round 2: the device level is chosen in the native pairing window; the terminal is in this change with full control at `configure`; phone previews work as on the Mac (50 MB, any path); the wildcard-bind warning, the auto-mode guard and the plan-edit scope are as recommended."
+  ],
+  "sections": [
+    {
+      "id": "followups",
+      "title": "Follow-ups",
+      "questions": [
+        {
+          "id": "k1-macos27",
+          "type": "single",
+          "title": "K1 on macOS 27: it isn't only signing. Here's why 27 came up, and a way to avoid needing it.",
+          "impact": "blocking",
+          "oneWayDoor": true,
+          "why": "Decides whether the key helper has a login-keychain fallback, and whether a macOS 27 test run is needed.",
+          "context": "Your round-2 answer: **\"why do we need a macos? I have my mac, it's just for signing right?\"**\n\nSigning is half of it. K1 is a spike that runs the **signed** helper and checks at runtime that it can (1) create its keys in the **Secure Enclave** under its keychain access group, (2) read them back after a reboot and an app update, and (3) refuse other processes. The spec also has a **fallback** for when (1) fails: keys in the ordinary login keychain.\n\nmacOS 27 came up because of a third-party report (Oct 2026) that **macOS 27 sends every keychain call to the data-protection keychain**, which would remove that login-keychain fallback. Your Mac runs 26.6.2, so we can't check that here.\n\n**The way out:** the profile route (your Developer ID team, round 1) already uses the data-protection keychain, which is the part that survives 27. If we **drop the login-keychain fallback**, nothing depends on behavior that 27 changes, and K1 runs only on your Mac.",
+          "evidence": [
+            { "label": "assumption 2", "path": "docs/plans/remote-readiness-investigation.md", "line": 151 },
+            { "label": "M1K3 #518", "url": "https://github.com/Round-Tower/M1K3/pull/518" }
+          ],
+          "options": [
+            { "id": "no-fallback-26", "label": "Profile route only, no fallback; K1 runs on my Mac (26.6.2)", "description": "If the helper can't use the Secure Enclave, pairing refuses and explains why; there is no weaker key store.", "consequence": "No macOS 27 run is needed. A Mac without a working Secure Enclave can't pair, which is rare on Apple silicon." },
+            { "id": "upgrade-27", "label": "Keep the fallback; I'll upgrade a Mac to 27 for one K1 run", "consequence": "The fallback ships only if K1 proves it works on 27." },
+            { "id": "fallback-unverified", "label": "Keep the fallback, unverified on 27", "consequence": "Users on 27 may hit a fallback that silently doesn't work. Recorded as an open risk." }
+          ],
+          "recommendation": { "value": "no-fallback-26", "reason": "Removes the only part that depends on 27, with no second Mac needed." }
+        },
+        {
+          "id": "pair-levels",
+          "type": "confirm",
+          "title": "The pairing window offers three levels: Respond (default), Operate, Configure",
+          "impact": "shape",
+          "oneWayDoor": true,
+          "context": "You chose per-device levels (round 2) and a full-control terminal at `configure` (round 2). A `configure` device can type into any agent session, which bypasses every other phone gate, including the fail-closed 'always allow' rule, because it can just press the key itself. To change a device's level, revoke it and pair again.",
+          "recommendation": { "value": "The window shows Respond (default), Operate (adds auto-mode plan approval and switch-account), Configure (adds the terminal), each with a one-line description of what it allows. Configure asks for a second confirmation on the Mac.", "reason": "The most powerful level should never be one stray click away." }
+        },
+        {
+          "id": "terminal-gates",
+          "type": "confirm",
+          "title": "Gates on the phone terminal",
+          "impact": "shape",
+          "oneWayDoor": true,
+          "context": "On the desktop, a terminal opens over a WebSocket with a single-use ticket (`POST /terminals/:id/ws-ticket`). The relay allows 50 frames/s and 2 MB per 10 s, so output must be batched.",
+          "recommendation": { "value": "Attaching needs a `configure` device and a signed attach with the biometric approve key, bound to the task id and session. While attached, the Mac shows 'Phone attached to <task>' in the run panel with a Detach button, and the audit log records the attach and the detach (not the keystrokes). The phone detaches when it backgrounds or locks, and after 15 minutes idle. Output is batched to stay under the relay limits; keystrokes ride the Noise session. It uses Claude's tmux session and the other tmux-hosted harnesses; ACP harnesses (fx, cursor) have no terminal.", "reason": "Makes the most powerful phone action visible on the Mac and always time-limited." }
+        },
+        {
+          "id": "preview-level",
+          "type": "single",
+          "title": "Which device level may preview a file outside the task's own folders?",
+          "impact": "shape",
+          "oneWayDoor": true,
+          "why": "With 'any path', a `respond` phone could open `~/.ssh/id_ed25519` or a `.env` from the cache on its lock screen.",
+          "context": "Your round-2 answer: **'Exactly as on the Mac: 50 MB, any path'** (this replaces the fleet decision from 24 Nov). On the Mac, `/files/preview` is app-only, so only the person at the Mac's own window uses it. On a phone, the level decides who can.",
+          "options": [
+            { "id": "split", "label": "Task folders at any level; other paths need Operate or above", "description": "A preview inside the task's workdir, worktrees or sent files works for every paired device. Any other path needs an `operate` or `configure` device.", "consequence": "Attachments from anywhere still open on an Operate phone; a Respond phone can't read arbitrary files." },
+            { "id": "configure", "label": "Other paths need Configure", "consequence": "Ties any-path reads to the terminal level, which can already read anything." },
+            { "id": "any", "label": "Any path at any level", "consequence": "Every paired phone can read every file the user can read." }
+          ],
+          "recommendation": { "value": "split", "reason": "Keeps your 'any path' while tying it to a level you grant on purpose." }
+        }
+      ]
+    }
+  ]
+}

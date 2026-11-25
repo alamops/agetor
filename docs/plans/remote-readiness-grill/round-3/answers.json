@@ -1,0 +1,71 @@
+{
+  "version": 1,
+  "formId": "remote-readiness-grill-r3",
+  "title": "Grill — Remote Readiness, round 3 (last follow-ups)",
+  "round": 3,
+  "mode": "served",
+  "specFile": "questions.json",
+  "specSha256": "fff29061fdfb19550a9be445112ed9925eac0b9a89c186c5d3543d3447ec47a3",
+  "submittedAt": "2026-11-25T20:44:06.637Z",
+  "receivedAt": "2026-11-25T20:44:06.642Z",
+  "answeredBy": null,
+  "summary": {
+    "total": 4,
+    "answered": 4,
+    "skipped": 0,
+    "unanswered": 0,
+    "optionalLeftBlank": 0,
+    "notApplicable": 0,
+    "acceptedRecommendations": 4,
+    "overrodeRecommendations": [],
+    "oneWayDoorsNotAnswered": [],
+    "withNotes": [],
+    "needsAnswer": [],
+    "complete": true
+  },
+  "answers": {
+    "k1-macos27": {
+      "n": 1,
+      "title": "K1 on macOS 27: it isn't only signing. Here's why 27 came up, and a way to avoid needing it.",
+      "type": "single",
+      "status": "answered",
+      "oneWayDoor": true,
+      "impact": "blocking",
+      "value": "no-fallback-26",
+      "display": "Profile route only, no fallback; K1 runs on my Mac (26.6.2)",
+      "acceptedRecommendation": true
+    },
+    "pair-levels": {
+      "n": 2,
+      "title": "The pairing window offers three levels: Respond (default), Operate, Configure",
+      "type": "confirm",
+      "status": "answered",
+      "oneWayDoor": true,
+      "impact": "shape",
+      "value": "The window shows Respond (default), Operate (adds auto-mode plan approval and switch-account), Configure (adds the terminal), each with a one-line description of what it allows. Configure asks for a second confirmation on the Mac.",
+      "acceptedRecommendation": true
+    },
+    "terminal-gates": {
+      "n": 3,
+      "title": "Gates on the phone terminal",
+      "type": "confirm",
+      "status": "answered",
+      "oneWayDoor": true,
+      "impact": "shape",
+      "value": "Attaching needs a `configure` device and a signed attach with the biometric approve key, bound to the task id and session. While attached, the Mac shows 'Phone attached to <task>' in the run panel with a Detach button, and the audit log records the attach and the detach (not the keystrokes). The phone detaches when it backgrounds or locks, and after 15 minutes idle. Output is batched to stay under the relay limits; keystrokes ride the Noise session. It uses Claude's tmux session and the other tmux-hosted harnesses; ACP harnesses (fx, cursor) have no terminal.",
+      "acceptedRecommendation": true
+    },
+    "preview-level": {
+      "n": 4,
+      "title": "Which device level may preview a file outside the task's own folders?",
+      "type": "single",
+      "status": "answered",
+      "oneWayDoor": true,
+      "impact": "shape",
+      "value": "split",
+      "display": "Task folders at any level; other paths need Operate or above",
+      "acceptedRecommendation": true
+    }
+  },
+  "generalNotes": null
+}
