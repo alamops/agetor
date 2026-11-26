@@ -50,7 +50,13 @@ export interface Classified {
   level: RemoteLevel;
   stepUp: "none" | "unlock" | "signed";
   rate: "normal" | "heavy" | "stop";
+  /** A signed call that ALSO needs the unlock window when the task runs without asking (a plan edit, Claude's "auto mode" row). */
+  alsoUnlock?: boolean;
+  /** The task the call acts on, when the class rules resolved it (the router checks `runsWithoutAsking` against it). */
+  taskId?: string;
   target?: ContentTarget;
+  /** For a signed gate call: the decision and comment the request body must repeat exactly as signed. */
+  bound?: { decision?: string; comment?: string | null };
   /** Why a `never` call was refused, or which rule raised the level. */
   reason?: string;
 }

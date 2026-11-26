@@ -1012,6 +1012,25 @@ export function remoteRoutesFor(level: RemoteLevel): Array<{ method: HttpMethod;
   return out;
 }
 
+/**
+ * EVERY route and method of the table, with its remote policy or `"none"`. The router matches a phone's path against all of them, not only
+ * the remote ones: a path that Bun.serve would hand to a route a phone may not call must answer `not-remote`, never fall through to a
+ * different remote route that merely matches the same path shape. A function-valued route answers every method; only its GET can be remote.
+ */
+export function everyRoute(): Array<{ method: HttpMethod; route: string; policy: RemotePolicy | "none" }> {
+  const out: Array<{ method: HttpMethod; route: string; policy: RemotePolicy | "none" }> = [];
+  for (const route of Object.keys(ROUTE_POLICY).sort()) {
+    const entry = ROUTE_POLICY[route]!;
+    const pick = (p: RoutePolicy | undefined): RemotePolicy | "none" => (p && p.callers === "app+cli" ? p.remote : "none");
+    if (isRoutePolicy(entry)) {
+      for (const method of ["GET", "POST", "PUT", "PATCH", "DELETE"] as const) out.push({ method, route, policy: method === "GET" ? pick(entry) : "none" });
+    } else {
+      for (const [method, policy] of Object.entries(entry) as Array<[HttpMethod, RoutePolicy | undefined]>) out.push({ method, route, policy: pick(policy) });
+    }
+  }
+  return out;
+}
+
 /** Every route with a remote policy at any level, with its method: the router matches against this to answer 403 `level` rather than 404. */
 export function allRemoteRoutes(): Array<{ method: HttpMethod; route: string; policy: RemotePolicy }> {
   return remoteRoutesFor("configure");

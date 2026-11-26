@@ -16,7 +16,7 @@
  */
 import { equalBytes, fromHex, randomBytes, toHex } from "@agetor/remote-protocol/bytes";
 import { CHALLENGE_TTL_MS, UNLOCK_MAX_MS } from "@agetor/remote-protocol/constants";
-import { ALLOWED_DECISIONS, verifySigned, type DecisionPayload, type UnlockPayload } from "@agetor/remote-protocol/decision";
+import { ALLOWED_DECISIONS, verifySigned, type DecisionPayload, type TerminalAttachPayload, type UnlockPayload } from "@agetor/remote-protocol/decision";
 import { buildContent, createLiveContentSources, targetKey, type ContentSources } from "./content-hash.ts";
 import type { ContentTarget, DevicePrincipal } from "./types.ts";
 
@@ -63,6 +63,11 @@ export interface Decisions {
    * the route the call names would act on (the router derives it from the request), and must equal what the challenge was issued for.
    */
   verifyDecision(principal: DevicePrincipal, signed: SignedDecisionInput, target: ContentTarget): Promise<DecisionPayload>;
+  /**
+   * The same checks for a terminal attach (configure level): challenge, session, signature by the approve key, then the content (the task
+   * has a live tmux session of that name). The signed task and tmux session must be the ones asked for.
+   */
+  verifyTerminalAttach(principal: DevicePrincipal, signed: { payload: unknown; sig: string }, target: Extract<ContentTarget, { kind: "terminal" }>): Promise<TerminalAttachPayload>;
   /** Verify an unlock signature and open the window. Returns its expiry. */
   verifyUnlock(principal: DevicePrincipal, payload: unknown, sigHex: string): number;
   isUnlocked(principal: DevicePrincipal): boolean;
@@ -127,6 +132,29 @@ export function createDecisions(deps: { sources?: ContentSources; now?: () => nu
       if (!(ALLOWED_DECISIONS[target.kind] as readonly string[]).includes(payload.decision)) {
         throw new DecisionError("decision", `${payload.decision} is not a decision for ${target.kind}`);
       }
+      return payload;
+    },
+
+    async verifyTerminalAttach(principal, signed, target) {
+      const payload = signed.payload as TerminalAttachPayload;
+      if (typeof payload !== "object" || payload === null) throw new DecisionError("challenge", "malformed attach");
+      const rec = typeof payload.challenge === "string" ? challenges.get(payload.challenge) : undefined;
+      if (rec) challenges.delete(payload.challenge);
+      if (
+        !rec || rec.used || rec.sessionId !== principal.sessionId || rec.deviceId !== principal.deviceId ||
+        rec.targetKey !== targetKey(target) || now() - rec.issuedAt >= CHALLENGE_TTL_MS
+      ) {
+        throw new DecisionError("challenge", "the challenge is unknown, expired, used or for something else");
+      }
+      if (typeof payload.sessionHash !== "string" || !equalBytes(safeHex(payload.sessionHash), principal.sessionHash)) {
+        throw new DecisionError("session", "the attach was signed for another session");
+      }
+      if (!verifySigned("terminal-attach", payload, signed.sig, principal.approvePub)) throw new DecisionError("signature", "the signature does not verify");
+      if (payload.deviceId !== principal.deviceId || payload.taskId !== target.taskId || payload.tmuxSession !== target.tmuxSession) {
+        throw new DecisionError("signature", "the signed device, task or session is not this call's");
+      }
+      const built = await buildContent(target, sources);
+      if (!built || built.hash !== payload.contentHash) throw new DecisionError("content-changed", "the terminal is not what it was when it was shown");
       return payload;
     },
 

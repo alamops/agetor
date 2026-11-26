@@ -74,7 +74,6 @@ interface QueueItem {
   type: string;
   id: string;
   bytes: Uint8Array;
-  priority: boolean;
 }
 
 type State = "binding" | "active" | "ended";
@@ -191,7 +190,7 @@ export function createSessionManager(deps: SessionManagerDeps): SessionManager {
           throw new Error(`refusing to send a malformed ${type} message`);
         }
         const id = String((body as { id?: unknown }).id ?? (body as { sub?: unknown }).sub ?? `c${s.sentMessages}`).slice(0, 64) || "m";
-        enqueue(s, { kind: "message", type, id, bytes, priority: type === "error" || type === "ok" || type === "snapshot-required" });
+        enqueue(s, { kind: "message", type, id, bytes });
         void opts;
       },
       queuedBytes: () => deps.link.queuedBytes(s.deviceId) + s.queuedBytesInQueue,
@@ -211,7 +210,7 @@ export function createSessionManager(deps: SessionManagerDeps): SessionManager {
     if (s.state === "ended") return;
     s.queue.push(item);
     s.queuedBytesInQueue += item.bytes.length;
-    void pump(s);
+    pump(s).catch(() => end(s, "send-failed"));
   }
 
   const isEnded = (s: Session): boolean => s.state === "ended";
@@ -231,7 +230,9 @@ export function createSessionManager(deps: SessionManagerDeps): SessionManager {
           while (!isEnded(s) && deps.link.queuedBytes(s.deviceId) > PUMP_HIGH_WATER_BYTES) await new Promise((r) => setTimeout(r, 5));
           if (isEnded(s)) return;
           const ct = s.send.encrypt(new Uint8Array(0), plaintext);
-          deps.link.send(s.deviceId, s.mailbox, s.tag, ct, { priority: item.priority });
+          // Never `priority`: a session's ciphertexts are one strictly ordered stream (the nonce counts them), and the pacer lets a priority
+          // frame overtake the queue. One frame out of order ends the session on the other side.
+          deps.link.send(s.deviceId, s.mailbox, s.tag, ct);
           s.sentMessages++;
           // Yield between chunks so a big message never holds the main thread.
           await new Promise<void>((r) => setImmediate(r));
@@ -247,8 +248,8 @@ export function createSessionManager(deps: SessionManagerDeps): SessionManager {
   function rekeyNow(s: Session): void {
     if (s.state !== "active") return;
     s.sentMessages = 0;
-    enqueue(s, { kind: "message", type: "rekey", id: "rekey", bytes: canonicalBytes({}), priority: true });
-    enqueue(s, { kind: "rekey", type: "rekey", id: "rekey", bytes: new Uint8Array(0), priority: true });
+    enqueue(s, { kind: "message", type: "rekey", id: "rekey", bytes: canonicalBytes({}) });
+    enqueue(s, { kind: "rekey", type: "rekey", id: "rekey", bytes: new Uint8Array(0) });
   }
 
   // ── frames ───────────────────────────────────────────────────────────────────────────────────────────────────────────
@@ -349,7 +350,7 @@ export function createSessionManager(deps: SessionManagerDeps): SessionManager {
         setIv(() => {
           if (now() - s.lastActivity > lim.idleMs) end(s, "idle");
           else if (now() - s.startedAt > lim.maxMs) end(s, "max-lifetime");
-        }, Math.max(10, Math.min(30_000, Math.floor(lim.idleMs / 4)))),
+        }, Math.max(10, Math.min(30_000, Math.floor(Math.min(lim.idleMs, lim.maxMs) / 4)))),
         setIv(() => rekeyNow(s), lim.rekeyMs),
       );
       void Promise.resolve(deps.touch?.(row.id, now())).catch(() => undefined);

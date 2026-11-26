@@ -146,8 +146,13 @@ export function createLiveContentSources(): ContentSources {
       return t?.fxRecovery ? { recovery: t.fxRecovery } : null;
     },
     async terminal(taskId, tmuxSession) {
+      // Only a task whose harness keeps one tmux session per task (claude-code), and only that session by its derived name, and only
+      // while it is alive on agetor's own socket.
       const t = await (await tasks()).get(taskId);
-      return t && tmuxSession.length > 0 ? { ok: true } : null;
+      if (!t || t.agent !== "claude-code") return null;
+      const tmux = await import("../claude-tmux.ts");
+      if (tmuxSession !== tmux.sessionNameFor(taskId)) return null;
+      return (await tmux.sessionExistsByName(tmuxSession)) ? { ok: true } : null;
     },
   };
 }

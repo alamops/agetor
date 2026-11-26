@@ -144,7 +144,12 @@ export class TestPhone {
 
   // ── relay socket ───────────────────────────────────────────────────────────────────────────────────────────────────────
 
+  /** Bumped by every `open`: a reader from an earlier connection (a pump of an earlier session) must not consume the new one's frames. */
+  private generation = 0;
+
   private async open(keys: Uint8Array[]): Promise<Uint8Array[]> {
+    this.generation++;
+    this.wake(this.frameWaiters);
     this.frames = [];
     this.closedInfo = null;
     this.sessionEnded = false;
@@ -180,9 +185,10 @@ export class TestPhone {
     for (const w of list.splice(0)) w();
   }
 
-  private async nextFrame(pred: (f: RelayFrame) => boolean): Promise<RelayFrame> {
+  private async nextFrame(pred: (f: RelayFrame) => boolean, generation = this.generation): Promise<RelayFrame> {
     const deadline = this.now() + this.timeoutMs;
     for (;;) {
+      if (generation !== this.generation) throw new Error("a newer connection replaced this one");
       const i = this.frames.findIndex(pred);
       if (i >= 0) return this.frames.splice(i, 1)[0]!;
       if (this.closedInfo) throw new Error(`relay closed (${this.closedInfo.code} ${this.closedInfo.reason})`);
@@ -199,9 +205,9 @@ export class TestPhone {
   }
 
   /** The next deliver frame of this session (tag matches); stale tags are acknowledged and skipped. */
-  private async nextCiphertext(): Promise<Uint8Array> {
+  private async nextCiphertext(generation = this.generation): Promise<Uint8Array> {
     for (;;) {
-      const f = (await this.nextFrame((x) => x.type === "deliver")) as Extract<RelayFrame, { type: "deliver" }>;
+      const f = (await this.nextFrame((x) => x.type === "deliver", generation)) as Extract<RelayFrame, { type: "deliver" }>;
       this.ws?.send(encodeFrame({ type: "ack", mailbox: f.mailbox, seq: f.seq }));
       if (toHex(f.tag) !== toHex(this.tag)) continue;
       this.mailbox = f.mailbox;
@@ -263,12 +269,14 @@ export class TestPhone {
 
   /** Read deliver frames until one whole app message is reassembled (or the wait ends). Messages go to the inbox. */
   private async pump(): Promise<void> {
+    const generation = this.generation;
     for (;;) {
-      if (this.sessionEnded) return;
+      if (this.sessionEnded || generation !== this.generation) return;
       let ct: Uint8Array;
       try {
-        ct = await this.nextCiphertext();
+        ct = await this.nextCiphertext(generation);
       } catch {
+        if (generation !== this.generation) return; // replaced by a newer connection: not this session's end
         this.sessionEnded = true;
         this.wake(this.inboxWaiters);
         return;
@@ -346,7 +354,7 @@ export class TestPhone {
    * exists, so it travels in the first transport message). `sas` is what the phone would show; `result` resolves when the Mac's window
    * finished (code typed, level chosen, Touch ID) and the core sent `pairing-result`.
    */
-  pair(opts: { qr: string; name: string; platform?: "ios" | "android"; appVersion?: string }): PairHandle {
+  pair(opts: { qr: string; name: string; platform?: "ios" | "android"; appVersion?: string; /** Sign one of the two proofs with a key that is not the enrolled one (a refusal test). */ badSignature?: "session" | "approve" }): PairHandle {
     const qr: QrPayload = decodeQr(opts.qr);
     const corePub = fromHex(qr.corePub);
     let resolveSas!: (s: string) => void;
@@ -380,10 +388,17 @@ export class TestPhone {
           sessionPub: toHex(this.sessionPub),
           approvePub: toHex(this.approvePub),
           pushPub: toHex(this.pushPub),
-          sessionSig: toHex(signEs256(this.sessionSecret, hash)),
-          approveSig: toHex(signEs256(this.approveSecret, hash)),
+          sessionSig: toHex(signEs256(opts.badSignature === "session" ? p256.utils.randomSecretKey() : this.sessionSecret, hash)),
+          approveSig: toHex(signEs256(opts.badSignature === "approve" ? p256.utils.randomSecretKey() : this.approveSecret, hash)),
         });
-        const r = await this.next<{ deviceId: string; linkSecret: string; level: RemoteLevel }>("pairing-result", () => true, 180_000);
+        // The core answers a refused pairing with an `error` message (and closes its mailbox): that ends the wait.
+        const won = this.next<{ deviceId: string; linkSecret: string; level: RemoteLevel }>("pairing-result", () => true, 180_000);
+        const lost = this.next<{ code: string }>("error", () => true, 180_000).then((e) => {
+          throw new Error(`pairing refused: ${e.code}`);
+        });
+        won.catch(() => undefined);
+        lost.catch(() => undefined);
+        const r = await Promise.race([won, lost]);
         this.deviceId = r.deviceId;
         this.linkSecret = fromHex(r.linkSecret);
         this.level = r.level;
