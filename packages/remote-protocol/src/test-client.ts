@@ -288,6 +288,7 @@ export class TestPhone {
         if (!msg) continue;
         if (msg.t === "rekey") {
           this.recv!.rekey();
+          this.rekeysReceived++;
           continue;
         }
         const value = parseMessage<Record<string, unknown>>(msg.t, msg.body);
@@ -323,6 +324,9 @@ export class TestPhone {
   }
 
   /** Every message of a type received so far (and not yet consumed by `next`). */
+  /** How many in-band rekeys the core has sent this phone (each one rekeyed the receiving side). */
+  rekeysReceived = 0;
+
   received(type: string): Array<Record<string, unknown>> {
     return this.log.filter((m) => m.type === type).map((m) => m.value);
   }

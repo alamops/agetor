@@ -101,7 +101,7 @@ import { createTaskNotifier } from "./task-notifier.ts";
 import { installNotificationRemovalHooks } from "./notification-hooks.ts";
 import { fetchTaskRows } from "./headless-notifications.ts";
 import { installNotificationPolicy, registerDeviceNotificationHook } from "./notification-policy.ts";
-import { setAppAttached, setNativeWindowFocus } from "./presence.ts";
+import { clearWebviewPresence, setAppAttached, setNativeWindowFocus } from "./presence.ts";
 import { setPendingMenuAction, setPendingOpenTask } from "./pending-open.ts";
 import { buildAppMenu, deliverMenuAction, menuActionFromClick } from "./app-menu.ts";
 import pkg from "../../package.json" with { type: "json" };
@@ -251,8 +251,9 @@ notificationPolicy.registerSink({
   deliver: (d) => taskNotifier.post(d.notification),
   remove: (r) => taskNotifier.remove(r),
 });
-// "Ana's iPhone was paired", revoke alerts: not about a task, so the notifier posts them through its plain path.
-registerDeviceNotificationHook((n) => taskNotifier.post({ title: n.title, body: n.body }));
+// "Ana's iPhone was paired", revoke alerts: not about a task, so the notifier posts them under the device's own id
+// (`remoteDeviceNotificationId`), with the plain path as its fallback.
+registerDeviceNotificationHook((n) => taskNotifier.postDevice(n));
 // Remove a task's entry once its reason goes away (answered from any client,
 // or the task left `blocked`).
 installNotificationRemovalHooks((r) => notificationPolicy.remove(r));
@@ -1021,6 +1022,8 @@ Electrobun.events.on("close", (e: { data: { id: number } }) => {
   if (getMainWindow()?.id === e.data.id) {
     setMainWindow(null);
     setNativeWindowFocus(false);
+    // The closed window's last report named a selected task; with no webview left it would never be unselected.
+    clearWebviewPresence();
   }
 });
 

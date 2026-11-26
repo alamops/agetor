@@ -247,10 +247,32 @@ export async function startRemoteGateway(opts: GatewayOptions): Promise<RemoteGa
     return link;
   }
 
-  async function openDeviceGroups(): Promise<void> {
+  // One pass at a time, each reading the trusted set after the one before it finished: two interleaved passes (the poll, a pairing, the
+  // gate) would otherwise let the older one act on a stale set and close a phone that was just paired, or reopen one just revoked.
+  let groupsTail: Promise<void> = Promise.resolve();
+  function openDeviceGroups(): Promise<void> {
+    const run = groupsTail.then(openDeviceGroupsNow);
+    groupsTail = run.catch(() => undefined);
+    return run;
+  }
+
+  async function openDeviceGroupsNow(): Promise<void> {
     const l = ensureLink();
     if (!l) return;
-    for (const row of (await registry.trustedDevices()).trusted) {
+    const { trusted } = await registry.trustedDevices();
+    // The link can have been dropped (the gate went down) or the gateway stopped while the trusted set was being read: a later pass
+    // opens the groups on whatever link comes up next.
+    if (stopped || link !== l) return;
+    const trustedIds = new Set(trusted.map((r) => r.id));
+    // Leave the mailbox of a device that is no longer trusted (a revoke or an expiry made behind this gateway's back): end its session and
+    // its terminal too, instead of keeping it up until the next restart.
+    for (const name of [...linkGroups]) {
+      if (name === PAIRING_GROUP || trustedIds.has(name)) continue;
+      sessions.endDeviceSessions(name, "revoked");
+      terminals.detachForDevice(name, "revoked");
+      linkAdapter.close(name);
+    }
+    for (const row of trusted) {
       if (linkGroups.has(row.id)) continue;
       l.open({ name: row.id, keys: (now) => deviceMailboxKeys(row.linkSecret, now) });
       linkGroups.add(row.id);
@@ -310,6 +332,12 @@ export async function startRemoteGateway(opts: GatewayOptions): Promise<RemoteGa
     decisions,
     macName: getName,
     routes: (level) => remoteRoutesFor(level),
+    isRemoval: (type, body) => {
+      if (type === "terminal-detach" || type === "unsubscribe") return true;
+      if (type !== "request") return false;
+      const b = body as { method: string; path: string };
+      return router.isStopCall(b.method, b.path);
+    },
     touch: async (id, ts) => void (await (await import("../db-async.ts")).remoteDevices.setLastSeen(id, ts)),
     onOpen: (channel) => {
       const subs = createSubscriptions(channel);
@@ -351,7 +379,7 @@ export async function startRemoteGateway(opts: GatewayOptions): Promise<RemoteGa
   const ops: Array<() => void> = [
     registerSessionOp("request", async (ch, body) => {
       const b = body as { id: string; method: "GET" | "POST" | "PUT" | "PATCH" | "DELETE"; path: string; query: string | null; body: unknown; idem: string | null; decision: { payload: unknown; sig: string } | null };
-      const res = await router.invoke(ch.principal, { method: b.method, path: b.path, query: b.query, body: b.body, idem: b.idem, decision: b.decision });
+      const res = await router.invoke(ch.principal, { method: b.method, path: b.path, query: b.query, body: b.body, idem: b.idem, decision: b.decision }, { live: () => ch.isOpen() });
       const contentType = res.contentType.slice(0, 128);
       let encoding: "utf8" | "base64" = "base64";
       let text = "";

@@ -20,6 +20,14 @@ export function registerSessionOp(type: string, handler: SessionOpHandler): () =
   };
 }
 
+/**
+ * Ops that change a session's own stateful attachment (the phone terminal: attach, input, resize, detach). Their handlers await before they
+ * act (a task lookup, a tmux probe, a signature check), so run concurrently a `terminal-detach` sent after a `terminal-attach` would find
+ * nothing to detach and the attach would then land and stay. The session runs these one at a time, in arrival order; every other op
+ * (a request, a subscription, a challenge) stays concurrent so a slow one never holds the frames behind it.
+ */
+export const ORDERED_SESSION_OPS: ReadonlySet<string> = new Set(["terminal-attach", "terminal-input", "terminal-resize", "terminal-detach"]);
+
 export function getSessionOp(type: string): SessionOpHandler | undefined {
   return handlers.get(type);
 }

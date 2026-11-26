@@ -28,6 +28,8 @@ export interface PhoneChannel {
   queuedBytes(): number;
   /** Whether the phone is on the other end of the mailbox right now. */
   peerPresent(): boolean;
+  /** Whether the session is still active. An op that was dispatched before the session ended checks this before it acts. */
+  isOpen(): boolean;
   onClose(fn: (reason: string) => void): () => void;
   onPeerChange(fn: (present: boolean) => void): () => void;
 }

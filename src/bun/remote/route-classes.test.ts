@@ -25,6 +25,7 @@ const lookups = (over: Partial<ClassifyLookups> = {}): ClassifyLookups => ({
   runTask: async (id) => (id === "r1" ? "t1" : null),
   askQuestionTask: async (id) => (id === "q" ? "t1" : null),
   previewInScope: async (_t, path) => path.startsWith("/work/"),
+  planApprovalFlipsToAuto: async (id) => id === "tplan",
   ...over,
 });
 
@@ -132,6 +133,10 @@ describe("fx and OpenCode permission cards (D10)", () => {
 describe("consent routes", () => {
   test("a plan approval, an fx resume and a switch of account", async () => {
     expect(await call("POST", "/tasks/:id/plans/:planId/approve", { id: "t1", planId: "p1" })).toMatchObject({ class: "consent", stepUp: "signed", target: { kind: "plan", planId: "p1" } });
+    // M1: a plan approval that flips a Plan-mode task to Auto is operate-level and needs the unlock window, like a Claude plan card's row 1.
+    const flips = await call("POST", "/tasks/:id/plans/:planId/approve", { id: "tplan", planId: "p1" });
+    expect(flips).toMatchObject({ class: "consent", stepUp: "signed", alsoUnlock: "always", level: "operate" });
+    expect((await call("POST", "/tasks/:id/plans/:planId/approve", { id: "t1", planId: "p1" })).alsoUnlock).toBeUndefined();
     expect(await call("POST", "/tasks/:id/fx-resume", { id: "t1" })).toMatchObject({ class: "consent", target: { kind: "fx-resume", taskId: "t1" } });
     expect(await call("POST", "/tasks/:id/switch-account", { id: "t1" }, {}, "", POLICY({ level: "operate", stepUp: "none" }))).toMatchObject({ class: "action", level: "operate", stepUp: "none" });
   });

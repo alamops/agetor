@@ -23,6 +23,7 @@ import { buildTaskDeepLink } from "./deep-link.ts";
 import { launchedBy } from "./daemon-mode.ts";
 import {
   notificationUrgency,
+  remoteDeviceNotificationId,
   soundOverUrgencies,
   taskNotificationId,
   type DeliveredUrgency,
@@ -187,6 +188,15 @@ export function buildTaskNotifierPostArgs(n: {
     urgency,
     soundOver: soundOverUrgencies(urgency),
   });
+}
+
+/**
+ * The post argv for a device notification (paired, revoked, a session ended): one fixed id per device, so a newer one
+ * replaces the device's entry. No deep link (nothing to open) and no kind, so the helper reads it as a plain post under
+ * that id; it takes any `--id`.
+ */
+export function buildDeviceNotifierPostArgs(n: { title: string; body?: string; deviceId: string }): string[] {
+  return buildNotifierArgs({ title: n.title, body: n.body, id: remoteDeviceNotificationId(n.deviceId) });
 }
 
 /**

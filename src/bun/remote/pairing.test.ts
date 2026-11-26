@@ -274,6 +274,24 @@ describe("what writes nothing", () => {
   });
 });
 
+describe("a redelivered frame", () => {
+  test("R2: every frame the relay hands over twice (the handshake and the request) is dropped, and the pairing still completes", async () => {
+    const r = rig();
+    await r.pairing.start();
+    const orig = r.pairing.onFrame.bind(r.pairing);
+    // The relay redelivers each frame it has not seen acknowledged, e.g. after a reconnect: hand every frame over twice, back to back.
+    r.pairing.onFrame = (d) => {
+      void orig(d);
+      return orig(d);
+    };
+    const phone = await openPhone();
+    const handle = phone.pair({ qr: r.lastQr()!, name: "Ana" });
+    fakeKeyHelperControl.enterCode(await handle.sas);
+    expect((await handle.result).level).toBe("respond");
+    expect(r.added).toHaveLength(1);
+  });
+});
+
 describe("cancel and refusals to start", () => {
   test("cancel closes the helper's window and the link within a second, and the gate recomputes", async () => {
     const r = rig();

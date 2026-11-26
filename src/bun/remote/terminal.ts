@@ -16,9 +16,10 @@ import type { AppEvent } from "../../shared/types.ts";
 import { levelAtLeast } from "@agetor/remote-protocol/levels";
 import { fromBase64, toBase64 } from "@agetor/remote-protocol/bytes";
 import { sessionExistsByName, sessionNameFor } from "../claude-tmux.ts";
-import { coreSpawn } from "../core-spawn.ts";
+import { childEnv, coreSpawn } from "../core-spawn.ts";
 import { resolveTmuxBin, tmuxSocketArgs } from "../tmux-resolution.ts";
 import type { Audit } from "./audit.ts";
+import { PHONE_TERMINAL_KINDS, resolveHarnessKind } from "./harness-kind.ts";
 import { DecisionError, type Decisions } from "./decisions.ts";
 import type { PhoneChannel } from "./types.ts";
 
@@ -39,6 +40,7 @@ export interface TerminalClient {
 export interface TerminalDeps {
   decisions: Pick<Decisions, "verifyTerminalAttach">;
   audit: Pick<Audit, "event">;
+  /** The task's harness KIND (not its harness id). */
   task(taskId: string): Promise<{ agent: string } | null>;
   sessionName(taskId: string): string;
   sessionAlive(name: string): Promise<boolean>;
@@ -161,13 +163,18 @@ export function createTerminalManager(deps: TerminalDeps): TerminalManager {
       if (!levelAtLeast(p.level, "configure")) return fail(channel, msg.id, "level", "the terminal needs a configure-level device");
       const task = await deps.task(msg.taskId);
       const name = deps.sessionName(msg.taskId);
-      if (!task || task.agent !== "claude-code" || !(await deps.sessionAlive(name))) return fail(channel, msg.id, "no-terminal", "this task has no terminal to attach to");
+      if (!task || !PHONE_TERMINAL_KINDS.has(task.agent) || !(await deps.sessionAlive(name))) return fail(channel, msg.id, "no-terminal", "this task has no terminal to attach to");
       try {
         await deps.decisions.verifyTerminalAttach(p, { payload: msg.payload, sig: msg.sig }, { kind: "terminal", taskId: msg.taskId, tmuxSession: name });
       } catch (e) {
         void deps.audit.event("refusal", { deviceId: p.deviceId, resultCode: e instanceof DecisionError ? e.code : "signature", target: { taskId: msg.taskId, op: "terminal-attach" } }).catch(() => undefined);
         return fail(channel, msg.id, e instanceof DecisionError ? e.code : "signature", "the attach was not accepted");
       }
+      // The session may have closed while the lookup, the tmux probe and the signature awaited. A closed channel answers `onClose` at
+      // once, so this finds out without a second state: leave the earlier phone attached and spawn no tmux client for a dead session.
+      let closedAlready = false;
+      channel.onClose(() => void (closedAlready = true))();
+      if (closedAlready) return;
       // One phone per task: the earlier one is told it was replaced.
       const earlier = live.get(msg.taskId);
       if (earlier) end(earlier, "replaced");
@@ -184,6 +191,8 @@ export function createTerminalManager(deps: TerminalDeps): TerminalManager {
       live.set(msg.taskId, l);
       l.client.onExit(() => end(l, "exited"));
       l.offClose = channel.onClose((reason) => end(l, `session-${reason}`));
+      // Nothing since the check above awaits, so only a client that exited at once can have ended it; a later close reaches `end`.
+      if (l.ended) return;
       l.offPeer = channel.onPeerChange((present) => {
         if (present) {
           if (l.awayTimer !== null) clearTimer(l.awayTimer);
@@ -249,13 +258,15 @@ export function createLiveTerminalDeps(): Pick<TerminalDeps, "task" | "sessionNa
   return {
     async task(taskId) {
       const t = await (await import("../db-async.ts")).tasks.get(taskId);
-      return t ? { agent: t.agent } : null;
+      // `agent` is the harness KIND, resolved from the task's harness id.
+      return t ? { agent: await resolveHarnessKind(t.agent) } : null;
     },
     sessionName: sessionNameFor,
     sessionAlive: sessionExistsByName,
     spawnClient(name, size, onData) {
       const proc = coreSpawn([resolveTmuxBin(), ...tmuxSocketArgs(), "attach-session", "-t", "=" + name], {
-        env: { TERM: "xterm-256color" },
+        // The live env (PATH, LANG for a UTF-8 client) minus the master token, like every other child.
+        env: childEnv({ TERM: "xterm-256color" }),
         terminal: { cols: size.cols, rows: size.rows, data: (_t: unknown, data: Uint8Array) => onData(new Uint8Array(data)) },
       });
       const term = proc.terminal!;

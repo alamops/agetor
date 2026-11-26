@@ -47,6 +47,7 @@ import { resolveResumeCursor } from "./event-resume.ts";
 import { isNotificationKind, UNBLOCKED_REMOVAL_KINDS, type NotificationKind, type TaskNotificationRemoval } from "../shared/os-notification.ts";
 import { notificationTargetTaskId } from "./notification-hooks.ts";
 import { COMPANION_ENABLED } from "../shared/build-flags.ts";
+import { planApprovalFlipsToAuto } from "../shared/plan-approval.ts";
 import { MAC_NAME_PREF, validateMacName } from "./remote/mac-name.ts";
 import { DEVICE_ID_RE, buildRemoteAccessStatus, detachPhoneTerminal, listDevices, readLog, revokeAllDevices, revokeDevice } from "./remote/remote-status.ts";
 import { HIDDEN_CONTINUATION_REFUSAL, activeRunCount, backgroundAgentsHoldTask, isScheduledSwitchUnderway, appendRunStatusLine, archiveTask, beginManualAccountSwitch, cancelFxAutoResume, cancelHarnessRetryForTask, cancelScheduledAccountSwitch, claimTaskForAccountSwitch, clearManualAccountSwitch, createTask, deleteOrphanWorktree, deleteTask, isOrphanedPipelineStep, listWorktrees, minCliVersionError, rearmRetriesAfterCooldownClear, releaseTaskAccountSwitch, startTask, switchTaskAccountNow, SwitchAccountRefusedError, cancelRun, reconcileTaskSession, resumeFxRecovery, sendInput, subscribe, subscribeGlobal, teardownBranchesForTask, unarchiveTask, removeTaskRepository, worktreeGitStatus } from "./orchestrator.ts";
@@ -9009,7 +9010,7 @@ export function startApiServer(
             // `tasks.update`, never the PATCH route. A profile-bound task
             // keeps Plan — its mode belongs to the agent profile (PATCH 409s
             // it) — and gets a warning instead. Plan §3.3 (Q1 = a).
-            const flipToAuto = task.mode === "plan" && task.agentProfileId === null;
+            const flipToAuto = planApprovalFlipsToAuto(task);
             const boundPlanWarning =
               task.mode === "plan" && !flipToAuto
                 ? `plan approved, but this task's agent runs ${agentLabel} in Plan mode — detach the agent or switch the mode to implement`

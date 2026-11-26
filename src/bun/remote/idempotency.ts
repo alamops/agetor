@@ -32,7 +32,7 @@ export interface StoredResult {
 
 export interface IdempotencyStore {
   get(deviceId: string, key: string): Promise<{ bodyHash: string; status: number; contentType: string; response: Uint8Array | null; createdAt: number } | null>;
-  put(row: { deviceId: string; idemKey: string; bodyHash: string; status: number; contentType: string; response: Uint8Array | null; createdAt: number }): Promise<boolean>;
+  put(row: { deviceId: string; idemKey: string; bodyHash: string; status: number; contentType: string; response: Uint8Array | null; createdAt: number; expiredBefore?: number }): Promise<boolean>;
   prune(beforeTs: number): Promise<number>;
 }
 
@@ -88,7 +88,7 @@ export function createIdempotency(store: IdempotencyStore = createDbIdempotencyS
         commit: async (result) => {
           try {
             const keep = result.body && result.body.length <= IDEMPOTENCY_MAX_RESPONSE_BYTES ? result.body : null;
-            await store.put({ deviceId, idemKey: key, bodyHash, status: result.status, contentType: result.contentType, response: keep, createdAt: now() });
+            await store.put({ deviceId, idemKey: key, bodyHash, status: result.status, contentType: result.contentType, response: keep, createdAt: now(), expiredBefore: now() - IDEMPOTENCY_WINDOW_MS });
           } finally {
             running.delete(k);
             release();

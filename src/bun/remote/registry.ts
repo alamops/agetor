@@ -137,11 +137,24 @@ export function createRegistry(deps: RegistryDeps = {}): Registry {
     } catch (e) {
       helperError = e;
     }
-    const rows = await store.list();
-    const row = rows.find((r) => r.id === id);
-    await store.revoke([id], reason, now());
+    // Only the name for the notice: a failing read must not stop the sessions from ending below.
+    const row = await store.list().then((rows) => rows.find((r) => r.id === id), () => undefined);
+    // Trust is withdrawn once either write lands (`trustedDevices` reads the helper's list and the row's status afresh), so the live
+    // sessions end whether or not the other one succeeded: a failing database must not leave a revoked phone attached. When neither
+    // landed the phone is still trusted, so nothing is ended and no notice claims otherwise; both failures are reported.
+    let storeError: unknown = null;
+    try {
+      await store.revoke([id], reason, now());
+    } catch (e) {
+      storeError = e;
+    }
+    if (helperError && storeError) {
+      const msg = (e: unknown) => (e instanceof Error ? e.message : String(e));
+      throw new Error(`the revoke was not recorded: ${msg(helperError)}; ${msg(storeError)}`, { cause: storeError });
+    }
     fire(id, reason);
     deps.notify?.({ deviceId: id, deviceName: row?.name ?? id.slice(0, 8), title: "Phone revoked", body: `${row?.name ?? "A phone"} can no longer reach this Mac.` });
+    if (storeError) throw storeError;
     if (helperError) throw helperError;
   }
 
@@ -159,17 +172,22 @@ export function createRegistry(deps: RegistryDeps = {}): Registry {
       const active = rows.filter((r) => r.status === "active").map((r) => r.id);
       const result = await helper().revokeAll();
       const ids = [...new Set([...active, ...result.ids])];
-      await store.revoke(ids, "revoke-all", now());
-      await deps.audit?.event("revoke-all", { target: { count: ids.length } }).catch(() => undefined);
-      for (const id of ids) fire(id, "revoke-all");
-      for (const fn of [...keyFns]) {
-        try {
-          fn();
-        } catch {
-          /* ignore */
+      // The helper has already replaced the core key: every session and mailbox is stale whether or not the rows can be written.
+      try {
+        await store.revoke(ids, "revoke-all", now());
+      } finally {
+        // Audited whether or not the rows were written: the key is already replaced, so the revoke has happened.
+        await deps.audit?.event("revoke-all", { target: { count: ids.length } }).catch(() => undefined);
+        for (const id of ids) fire(id, "revoke-all");
+        for (const fn of [...keyFns]) {
+          try {
+            fn();
+          } catch {
+            /* ignore */
+          }
         }
+        deps.notify?.({ deviceId: "all", deviceName: "all phones", title: "All phones revoked", body: "Every paired phone was revoked. Pair again to reconnect." });
       }
-      deps.notify?.({ deviceId: "all", deviceName: "all phones", title: "All phones revoked", body: "Every paired phone was revoked. Pair again to reconnect." });
       return result.corePub;
     },
     async expireStale(at = now()) {

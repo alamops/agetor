@@ -15,6 +15,7 @@ function fakeChannel() {
     send: (type, body) => void sent.push({ type, body: body as Record<string, unknown> }),
     queuedBytes: () => queued,
     peerPresent: () => present,
+    isOpen: () => true,
     onClose: (fn) => (closeFns.add(fn), () => void closeFns.delete(fn)),
     onPeerChange: (fn) => (peerFns.add(fn), () => void peerFns.delete(fn)),
   };
@@ -117,6 +118,16 @@ describe("task subscriptions", () => {
     expect(subs.count()).toBe(0);
   });
 
+  test("a channel that already ended: creating the subscriptions does not throw, and nothing can be subscribed", () => {
+    const c = fakeChannel();
+    const ended: PhoneChannel = { ...c.ch, onClose: (fn) => (fn("ended"), () => undefined) };
+    const s = fakeStream();
+    const subs = createSubscriptions(ended, { openTaskEventStream: s.open });
+    subs.subscribeTask("a", "t1", null, null);
+    expect(s.opens).toHaveLength(0);
+    expect(subs.count()).toBe(0);
+  });
+
   test("a phone that opens too many subscriptions is refused", () => {
     const c = fakeChannel();
     const subs = createSubscriptions(c.ch, { openTaskEventStream: fakeStream().open, maxSubscriptions: 3 });
@@ -156,6 +167,36 @@ describe("backpressure", () => {
     for (let i = 1; i <= 20; i++) s.opens[0]!.sink.event(ev(i));
     expect(c.types().filter((t) => t === "snapshot-required")).toHaveLength(1);
     expect(c.sent.length).toBeLessThan(10);
+  });
+
+  test("a stream that dies (onFatal) is released and forgotten, and the phone is told to take a snapshot", () => {
+    const c = fakeChannel();
+    const s = fakeStream();
+    const subs = createSubscriptions(c.ch, { openTaskEventStream: s.open });
+    subs.subscribeTask("a", "t1", null, null);
+    (s.opens[0]!.opts as unknown as { onFatal(): void }).onFatal();
+    expect(c.sent.at(-1)).toEqual({ type: "snapshot-required", body: { sub: "a", reason: "restart" } });
+    expect(s.opens[0]!.closed).toBe(true);
+    expect(subs.count()).toBe(0);
+  });
+
+  test("a stream that dies while it is being opened (onFatal before open returns) is closed at once and forgotten; the phone is told once", () => {
+    const c = fakeChannel();
+    let closes = 0;
+    const open = ((_taskId: string, opts: { onFatal(): void }) => {
+      opts.onFatal();
+      return { close: () => void closes++, started: Promise.resolve() };
+    }) as never;
+    const subs = createSubscriptions(c.ch, { openTaskEventStream: open });
+    subs.subscribeTask("a", "t1", null, null);
+    expect(closes).toBe(1);
+    expect(subs.count()).toBe(0);
+    expect(c.sent.filter((s) => s.type === "snapshot-required")).toEqual([{ type: "snapshot-required", body: { sub: "a", reason: "restart" } }]);
+    // nothing is left to restart when the phone comes back
+    c.setPeer(false);
+    c.setPeer(true);
+    expect(closes).toBe(1);
+    expect(subs.count()).toBe(0);
   });
 
   test("the global subscription is dropped the same way", () => {

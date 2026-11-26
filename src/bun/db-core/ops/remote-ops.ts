@@ -20,6 +20,11 @@ export interface IdempotencyPut {
   /** Up to 64 KB stored whole; a larger response is stored as null (status only). */
   response: Uint8Array | null;
   createdAt: number;
+  /**
+   * An existing row for the same key created at or before this instant is expired (the 10-minute window) and is replaced; a newer one is kept.
+   * The prune runs once a minute, so an expired row can still be there when its key is used again.
+   */
+  expiredBefore?: number;
 }
 
 export const IDEMPOTENCY_MAX_RESPONSE_BYTES = 64 * 1024;
@@ -104,14 +109,17 @@ export const remoteOps = {
     },
   }),
 
-  /** Store a result under (device, idem key). A second put of the same key keeps the first. Returns whether this call stored it. */
+  /** Store a result under (device, idem key). A second put of the same key keeps the first unless that one has expired. Returns whether this call stored it. */
   "remote.idempotencyPut": defineOp({
     tx: true,
     run({ conn }, row: IdempotencyPut): boolean {
       const response = row.response && row.response.length <= IDEMPOTENCY_MAX_RESPONSE_BYTES ? row.response : null;
       const r = conn.run(
-        `INSERT OR IGNORE INTO remote_idempotency (device_id, idem_key, body_hash, status, content_type, response, created_at) VALUES (?, ?, ?, ?, ?, ?, ?)`,
-        [row.deviceId, row.idemKey, row.bodyHash, row.status, row.contentType, response, row.createdAt],
+        `INSERT INTO remote_idempotency (device_id, idem_key, body_hash, status, content_type, response, created_at) VALUES (?, ?, ?, ?, ?, ?, ?)
+         ON CONFLICT (device_id, idem_key) DO UPDATE SET
+           body_hash = excluded.body_hash, status = excluded.status, content_type = excluded.content_type, response = excluded.response, created_at = excluded.created_at
+         WHERE remote_idempotency.created_at <= ?`,
+        [row.deviceId, row.idemKey, row.bodyHash, row.status, row.contentType, response, row.createdAt, row.expiredBefore ?? 0],
       );
       return r.changes === 1;
     },

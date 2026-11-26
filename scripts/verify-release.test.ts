@@ -3,7 +3,7 @@ import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { COMPANION_MARKER, RELEASE_FORBIDDEN_STRINGS, profileTeamId, verifyKeyHelperLayout, verifyReleaseBundles } from "./verify-release.ts";
-import { checkKeyHelperSigning } from "./verify-vendor-signing.ts";
+import { checkKeyHelperSigning, shouldSkipKeyHelper } from "./verify-vendor-signing.ts";
 
 const TEAM = "ZQG3522LY7"; // the release team (verify-release.ts TEAM_ID)
 const roots: string[] = [];
@@ -130,5 +130,15 @@ describe("profileTeamId", () => {
     expect(profileTeamId(PROFILE_PLIST("ABCDE12345"))).toBe("ABCDE12345");
     expect(profileTeamId("garbage")).toBeNull();
     expect(profileTeamId(PROFILE_PLIST("short"))).toBeNull();
+  });
+});
+
+describe("M3: a Developer ID without a key-helper profile is a local build", () => {
+  test("the helper's signing checks are skipped only for a local build with an ad-hoc helper", () => {
+    expect(shouldSkipKeyHelper({ requireDeveloperId: false, helperHasProfile: false })).toBe(true);
+    expect(shouldSkipKeyHelper({ requireDeveloperId: false, helperHasProfile: true })).toBe(false);
+    // a release never skips it
+    expect(shouldSkipKeyHelper({ requireDeveloperId: true, helperHasProfile: false })).toBe(false);
+    expect(shouldSkipKeyHelper({ requireDeveloperId: true, helperHasProfile: true })).toBe(false);
   });
 });

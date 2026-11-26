@@ -1,5 +1,5 @@
 import { afterEach, beforeEach, describe, expect, test } from "bun:test";
-import { __testing, atTheMac, onPresenceChange, presence, setAppAttached, setNativeWindowFocus, setWebviewPresence } from "./presence.ts";
+import { __testing, atTheMac, clearWebviewPresence, onPresenceChange, presence, setAppAttached, setNativeWindowFocus, setWebviewPresence } from "./presence.ts";
 
 let now = 1_000_000;
 beforeEach(() => {
@@ -9,6 +9,14 @@ beforeEach(() => {
 afterEach(() => __testing.reset());
 
 describe("presence", () => {
+  test("S8: a closed window no longer selects a task, so its notifications are not skipped", () => {
+    setAppAttached(true);
+    setWebviewPresence({ focused: true, selectedTaskId: "t1", view: "run-panel" });
+    setNativeWindowFocus(false);
+    clearWebviewPresence();
+    expect(presence()).toMatchObject({ selectedTaskId: null, view: null, focused: false });
+  });
+
   test("a core with no window says: not focused, nothing selected, no app", () => {
     expect(presence()).toEqual({ focused: false, selectedTaskId: null, view: null, lastFocusedAt: null, appAttached: false });
     expect(atTheMac()).toBe(false);

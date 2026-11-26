@@ -102,9 +102,20 @@ export function createSubscriptions(channel: PhoneChannel, deps: SubscriptionDep
   };
 
   const startTask = (s: TaskSub, cursor: number | null): void => {
-    s.handle = open(
+    const handle = open(
       s.taskId,
-      { cursor, ...(s.maxBytes !== null ? { maxBytes: s.maxBytes } : {}), onFatal: () => channel.send("snapshot-required", { sub: s.sub, reason: "restart" }) },
+      {
+        cursor,
+        ...(s.maxBytes !== null ? { maxBytes: s.maxBytes } : {}),
+        // A stream that cannot go on is over: drop it (the phone takes a snapshot and subscribes again) instead of leaving a dead entry
+        // that counts against the cap and is restarted at the next peer change.
+        onFatal: () => {
+          if (subs.get(s.sub) !== s) return;
+          release(s);
+          subs.delete(s.sub);
+          channel.send("snapshot-required", { sub: s.sub, reason: "restart" });
+        },
+      },
       {
         meta: (meta) => {
           if (subs.get(s.sub) !== s || overloaded(s)) return;
@@ -123,6 +134,9 @@ export function createSubscriptions(channel: PhoneChannel, deps: SubscriptionDep
         },
       },
     );
+    // `onFatal` may have run before `open` returned: then there is no subscription left to attach the handle to.
+    if (subs.get(s.sub) === s) s.handle = handle;
+    else handle.close();
   };
 
   const startGlobal = (s: GlobalSub): void => {
@@ -145,7 +159,8 @@ export function createSubscriptions(channel: PhoneChannel, deps: SubscriptionDep
       }
     }
   });
-  const stopCloseWatch = channel.onClose(() => api.closeAll());
+  // A channel that already ended answers `onClose` at once, before `api` exists: the watch is registered after it is built.
+  let stopCloseWatch: () => void = () => undefined;
 
   const api: Subscriptions = {
     subscribeTask(sub, taskId, afterId, maxBytes) {
@@ -187,5 +202,6 @@ export function createSubscriptions(channel: PhoneChannel, deps: SubscriptionDep
     },
     count: () => subs.size,
   };
+  stopCloseWatch = channel.onClose(() => api.closeAll());
   return api;
 }

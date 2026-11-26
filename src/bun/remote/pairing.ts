@@ -118,6 +118,8 @@ interface Window {
   /** Serializes the frames of the window. */
   chain: Promise<void>;
   closing: boolean;
+  /** Relay frames (mailbox + seq) the window already took: a redelivery after a reconnect must not reach the cipher twice. */
+  seen: Set<string>;
   /** Resolves when the window is fully gone (its mailbox closed, the gate told). */
   closed: Promise<void>;
   markClosed: () => void;
@@ -200,7 +202,7 @@ export function createPairing(deps: PairingDeps): Pairing {
     let markClosed!: () => void;
     const closed = new Promise<void>((r) => (markClosed = r));
     const w: Window = {
-      expiresAt, secret: begun.pairingSecret.slice(), mailbox: mailboxId(key), timer: null, offEvent: () => undefined, session: null, chain: Promise.resolve(), closing: false,
+      expiresAt, secret: begun.pairingSecret.slice(), mailbox: mailboxId(key), timer: null, offEvent: () => undefined, session: null, chain: Promise.resolve(), closing: false, seen: new Set(),
       closed, markClosed,
     };
     win = w;
@@ -337,6 +339,10 @@ export function createPairing(deps: PairingDeps): Pairing {
       w.chain = w.chain
         .then(async () => {
           if (win !== w || w.closing) return;
+          // The relay redelivers a frame it has not seen acknowledged; decrypting it again would read as a replay and end the pairing.
+          const key = `${toHex(d.mailbox)}:${d.seq}`;
+          if (w.seen.has(key)) return;
+          w.seen.add(key);
           if (!w.session) return await handshake(w, d);
           if (equalBytes(w.session.tag, d.tag)) return await onTransport(w, d);
           // Another phone's frames while one is pairing: ignored.

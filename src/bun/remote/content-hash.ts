@@ -21,6 +21,7 @@
 import { toHex, utf8 } from "@agetor/remote-protocol/bytes";
 import { canonicalBytes } from "@agetor/remote-protocol/canonical-json";
 import { contentHashOf } from "@agetor/remote-protocol/decision";
+import { PHONE_TERMINAL_KINDS, resolveHarnessKind } from "./harness-kind.ts";
 import type { ContentTarget } from "./types.ts";
 
 export interface BuiltContent {
@@ -105,7 +106,7 @@ export function createLiveContentSources(): ContentSources {
     const t = await (await tasks()).get(taskId);
     if (!t) return null;
     const { effectiveMode } = await import("./autonomy.ts");
-    return effectiveMode(t);
+    return effectiveMode({ agent: await resolveHarnessKind(t.agent), mode: t.mode });
   };
   return {
     async plan(taskId, planId) {
@@ -146,10 +147,10 @@ export function createLiveContentSources(): ContentSources {
       return t?.fxRecovery ? { recovery: t.fxRecovery } : null;
     },
     async terminal(taskId, tmuxSession) {
-      // Only a task whose harness keeps one tmux session per task (claude-code), and only that session by its derived name, and only
-      // while it is alive on agetor's own socket.
+      // Only a task whose harness runs in a per-task tmux session, and only that session by its derived name, and only while it is alive
+      // on agetor's own socket.
       const t = await (await tasks()).get(taskId);
-      if (!t || t.agent !== "claude-code") return null;
+      if (!t || !PHONE_TERMINAL_KINDS.has(await resolveHarnessKind(t.agent))) return null;
       const tmux = await import("../claude-tmux.ts");
       if (tmuxSession !== tmux.sessionNameFor(taskId)) return null;
       return (await tmux.sessionExistsByName(tmuxSession)) ? { ok: true } : null;

@@ -58,6 +58,7 @@ function rig() {
       askQuestionTask: async () => "t1",
       runTask: async () => "t1",
       previewInScope: async () => true,
+      planApprovalFlipsToAuto: async () => false,
       task: async () => task,
     },
     routes: () => routes as never,

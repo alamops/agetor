@@ -50,15 +50,15 @@ export function RemoteAccessView(p: RemoteAccessViewProps) {
         <div
           data-testid="remote-access-switch-state"
           data-enabled={p.status.enabled ? "true" : "false"}
-          className="text-[11px] text-muted-foreground"
+          className="text-2xs text-muted-foreground"
         >
           {p.status.enabled ? "On. Phones you paired can reach this Mac." : "Off. Turn it on from Agetor › Remote Access…"}
         </div>
-        <div data-testid="remote-access-relay" className="text-[11px] text-muted-foreground">
+        <div data-testid="remote-access-relay" className="text-2xs text-muted-foreground">
           {p.status.relay.url ? `Relay: ${p.status.relay.url} (${p.status.relay.state})` : "No relay configured"}
         </div>
         {p.status.bindWarning && (
-          <p data-testid="remote-access-bind-warning" className="text-[11px] text-warning" role="alert">
+          <p data-testid="remote-access-bind-warning" className="text-2xs text-warning" role="alert">
             {p.status.bindWarning}
           </p>
         )}
@@ -85,7 +85,7 @@ export function RemoteAccessView(p: RemoteAccessViewProps) {
       <div className="space-y-1">
         <div className="text-xs text-muted-foreground">Paired phones</div>
         {rows.length === 0 ? (
-          <p data-testid="remote-devices-empty" className="text-[11px] text-muted-foreground">
+          <p data-testid="remote-devices-empty" className="text-2xs text-muted-foreground">
             No phones are paired. Pair a phone from the menu bar: Agetor › Pair a Phone…
           </p>
         ) : (
@@ -95,12 +95,12 @@ export function RemoteAccessView(p: RemoteAccessViewProps) {
                 <div className="min-w-0 space-y-0.5">
                   {/* A phone supplies its name: rendered as plain text, never as markup. */}
                   <div className="truncate text-xs text-foreground" data-testid="remote-device-name">{r.name}</div>
-                  <div className="text-[11px] text-muted-foreground">
+                  <div className="text-2xs text-muted-foreground">
                     {r.platform} · {r.level} · {r.lastSeen}
                     {r.online ? " · connected now" : ""}
                   </div>
                   {r.notTrusted && (
-                    <div className="text-[11px] text-danger" data-testid="remote-device-not-trusted">{r.notTrusted}</div>
+                    <div className="text-2xs text-danger" data-testid="remote-device-not-trusted">{r.notTrusted}</div>
                   )}
                 </div>
                 {r.canRevoke && (
@@ -122,13 +122,13 @@ export function RemoteAccessView(p: RemoteAccessViewProps) {
       <div className="space-y-1">
         <div className="text-xs text-muted-foreground">Activity</div>
         {p.log === null ? (
-          <p className="text-[11px] text-muted-foreground">Loading…</p>
+          <p className="text-2xs text-muted-foreground">Loading…</p>
         ) : (
           <>
             <p
               data-testid="remote-log-chain"
               data-ok={p.log.chain.ok ? "true" : "false"}
-              className={p.log.chain.ok ? "text-[11px] text-muted-foreground" : "text-[11px] text-danger"}
+              className={p.log.chain.ok ? "text-2xs text-muted-foreground" : "text-2xs text-danger"}
               role="status"
             >
               {p.log.chain.ok ? "The log is intact." : `The log was altered at entry ${p.log.chain.firstBadSeq}.`}
@@ -137,7 +137,7 @@ export function RemoteAccessView(p: RemoteAccessViewProps) {
               {p.log.rows.map((r) => {
                 const v = logRowView(r, p.devices);
                 return (
-                  <li key={r.seq} data-testid={`remote-log-row-${r.seq}`} className="text-[11px] text-muted-foreground">
+                  <li key={r.seq} data-testid={`remote-log-row-${r.seq}`} className="text-2xs text-muted-foreground">
                     <span className="text-foreground">{v.text}</span> · {v.when}
                     {v.outcomeUnknown && <span className="text-warning" data-testid="remote-log-unknown"> · outcome unknown (the Mac stopped before it finished)</span>}
                   </li>
@@ -153,11 +153,11 @@ export function RemoteAccessView(p: RemoteAccessViewProps) {
         )}
       </div>
 
-      <p data-testid="remote-pair-hint" className="text-[11px] text-muted-foreground">
+      <p data-testid="remote-pair-hint" className="text-2xs text-muted-foreground">
         Pair a phone from the menu bar: Agetor › Pair a Phone…. Pairing happens in a native window, never from here.
       </p>
       {p.error && (
-        <p data-testid="remote-access-error" className="text-[11px] text-danger" role="alert">
+        <p data-testid="remote-access-error" className="text-2xs text-danger" role="alert">
           {p.error}
         </p>
       )}

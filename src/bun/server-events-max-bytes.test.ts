@@ -182,7 +182,13 @@ describe("GET /interactions/pending", () => {
     const { taskId } = seed(["stdout"]);
     const res = await get(`/interactions/pending`);
     expect(res.status).toBe(200);
-    expect(await res.json()).toEqual({ cards: [], gates: [] });
+    // The interaction registry is process-wide and `bun test` runs every file in one process, so another file's leftover cards may be
+    // listed: assert the shape, and that nothing is pending for this task.
+    const body = (await res.json()) as { cards: Array<{ taskId: string }>; gates: Array<{ taskId: string }> };
+    expect(Object.keys(body).sort()).toEqual(["cards", "gates"]);
+    expect(Array.isArray(body.cards) && Array.isArray(body.gates)).toBe(true);
+    expect(body.cards.filter((c) => c.taskId === taskId)).toEqual([]);
+    expect(body.gates.filter((g) => g.taskId === taskId)).toEqual([]);
     const perTask = await get(`/tasks/${taskId}/interactions/pending`);
     expect(await perTask.json()).toEqual([]);
   });
@@ -195,7 +201,7 @@ describe("GET /interactions/pending", () => {
     });
     void reg.answer.catch(() => undefined);
     const res = await (await get(`/interactions/pending`)).json() as { cards: Array<{ taskId: string; parentTaskId: string }> };
-    expect(res.cards.map((c) => [c.taskId, c.parentTaskId])).toEqual([[taskId, taskId]]);
+    expect(res.cards.filter((c) => c.taskId === taskId).map((c) => [c.taskId, c.parentTaskId])).toEqual([[taskId, taskId]]);
     interactions.cancelPendingForTask(taskId, "test done");
   });
 });

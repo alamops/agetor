@@ -256,6 +256,78 @@ describe("the link follows the switch and the devices", () => {
     expect((await b.phone.request("GET", "/tasks")).status).toBe(200);
   });
 
+  test("S7: a device made untrusted behind the gateway's back loses its session and its mailbox at the next refresh; the other stays", async () => {
+    const r = await rig();
+    const a = await r.enroll();
+    const b = await r.enroll();
+    const g = await r.start();
+    r.setRemote(true);
+    await until(() => r.coreOnRelay());
+    await r.connect(a);
+    await r.connect(b);
+    expect(g.status().activeSessions).toBe(2);
+    r.rows.find((row) => row.id === a.deviceId)!.status = "revoked";
+    await until(() => g.status().activeSessions === 1, 2000);
+    expect((await b.phone.request("GET", "/tasks")).status).toBe(200);
+    await expect(r.connect(a)).rejects.toThrow();
+  });
+
+  test("R5-S1: an older pass over the trusted set that resolves late never closes the mailbox of a phone a newer pass just opened", async () => {
+    const r = await rig();
+    const a = await r.enroll();
+    // Every read of the rows made while `holding` is parked with the rows as they were then (the stale set), until released.
+    let holding = false;
+    const held: Array<() => void> = [];
+    const realList = (): RemoteDeviceRow[] => r.rows.map((row) => ({ ...row }));
+    const store: RegistryStore = {
+      list: async () => {
+        const snapshot = realList();
+        if (!holding) return snapshot;
+        await new Promise<void>((res) => held.push(res));
+        return snapshot;
+      },
+      revoke: async (ids) => void r.rows.forEach((row) => ids.includes(row.id) && (row.status = "revoked")),
+    };
+    const g = await r.start("app", { registryStore: store });
+    r.setRemote(true);
+    await until(() => r.coreOnRelay());
+    await r.connect(a);
+    const coreMailboxes = () => relay!.mailboxes().filter((m) => m.core).length;
+    // The core's mailboxes for the first phone (one device may hold more than one, across a key epoch).
+    const base = coreMailboxes();
+    expect(base).toBeGreaterThan(0);
+
+    // Park the polls at their first read (the refresh), then let those through while still holding: their next read (the pass over the
+    // groups) parks too, on the stale set. Every read parked from here on lacks the second phone.
+    holding = true;
+    await until(() => held.length >= 3, 3000);
+    for (const release of held.splice(0)) release();
+    await until(() => held.length >= 3, 3000);
+    // A second phone is paired; fresh reads see it, and the newer passes are not held.
+    const b = await r.enroll();
+    holding = false;
+    const stale = held.splice(0);
+    // Wait (briefly) for a newer pass to open the new phone's mailbox. A single-flight gateway opens it only after the older passes end.
+    await until(() => coreMailboxes() > base, 500).catch(() => undefined);
+    let sawOpen = coreMailboxes() > base;
+    let closedAfterOpen = false;
+    const watch = setInterval(() => {
+      const n = coreMailboxes();
+      if (n > base) sawOpen = true;
+      else if (sawOpen) closedAfterOpen = true;
+    }, 2);
+    try {
+      for (const release of stale) release(); // the older passes resolve with the set that lacks the new phone
+      await until(() => sawOpen, 3000);
+      await sleep(300);
+    } finally {
+      clearInterval(watch);
+    }
+    expect(closedAfterOpen).toBe(false);
+    expect(await r.connect(b)).toMatchObject({ deviceId: b.deviceId });
+    expect(g.status().activeSessions).toBe(2);
+  });
+
   test("Revoke all: every session closes, the helper's core key changes and the link drops", async () => {
     const r = await rig();
     const dev = await r.enroll();

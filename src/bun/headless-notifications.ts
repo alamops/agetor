@@ -26,7 +26,7 @@ import { tasks } from "./db-async.ts";
 
 import { resolveNotifier } from "./notifier.ts";
 import { installNotificationRemovalHooks } from "./notification-hooks.ts";
-import { installNotificationPolicy } from "./notification-policy.ts";
+import { installNotificationPolicy, registerDeviceNotificationHook } from "./notification-policy.ts";
 import { subscribeGlobal } from "./orchestrator.ts";
 import type { ApiNative } from "./server.ts";
 import { createTaskNotifier } from "./task-notifier.ts";
@@ -114,6 +114,8 @@ export function installHeadlessNotifications(): {
     remove: (r) => notifier.remove(r),
   });
   const unhook = installNotificationRemovalHooks((r) => policy.remove(r));
+  // Pair and revoke alerts for a phone (a CLI revoke, a phone revoking itself): under the device's own id, no plain fallback.
+  const unregisterDevice = registerDeviceNotificationHook((n) => notifier.postDevice(n));
 
   return {
     sink: {
@@ -125,6 +127,7 @@ export function installHeadlessNotifications(): {
       policy.dispose();
       unregister();
       unhook();
+      unregisterDevice();
     },
   };
 }

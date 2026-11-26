@@ -72,6 +72,7 @@ function rig(over: { mode?: string; agent?: string } = {}) {
     askQuestionTask: async () => "t1",
     runTask: async (id) => (id === "r1" ? "t1" : null),
     previewInScope: async (_t, p) => p.startsWith("/work/"),
+    planApprovalFlipsToAuto: async () => false,
     task: async (id) => (id === "t1" ? { agent: over.agent ?? "claude-code", mode: over.mode ?? "auto" } : null),
   };
   let t = 1_800_000_000_000;
@@ -112,7 +113,7 @@ function rig(over: { mode?: string; agent?: string } = {}) {
     const payload = { kind: "unlock" as const, sessionHash: toHex(sessionHash), expiresAt: t + 60_000 };
     decisions.verifyUnlock(p, payload, toHex(signEs256(approveSk, unlockBytes(payload))));
   };
-  return { call, calls, log, audit, events, notes, sign, openUnlock, setAuditFails: (v: boolean) => void (auditFails = v), setThrows: (v: boolean) => void (handlerThrows = v), handlerStatus, advance: (ms: number) => void (t += ms), setNow: (v: number) => void (t = v) };
+  return { router, call, calls, log, audit, events, notes, sign, openUnlock, setAuditFails: (v: boolean) => void (auditFails = v), setThrows: (v: boolean) => void (handlerThrows = v), handlerStatus, advance: (ms: number) => void (t += ms), setNow: (v: number) => void (t = v) };
 }
 
 const body = async (r: { body: Uint8Array }) => JSON.parse(new TextDecoder().decode(r.body)) as Record<string, unknown>;
@@ -159,6 +160,40 @@ describe("matching and refusals", () => {
     for (let i = 0; i < 40; i++) if ((await r.call(principal("observe"), { method: "GET", path: "/tasks/t1" })).status === 429) limited++;
     expect(limited).toBeGreaterThan(0);
     for (let i = 0; i < 60; i++) expect((await r.call(principal("respond"), { method: "POST", path: "/runs/r1/cancel", idem: toHex(new Uint8Array(16).fill(i)) })).status).toBe(200);
+  });
+});
+
+describe("S3/S9: removals pass a spent bucket, and refusals are rate-limited too", () => {
+  test("S3: a reject (a removal on a normal-rate route) is answered when the bucket is empty; content on the same route is 429", async () => {
+    const r = rig();
+    const p = principal("respond");
+    for (let i = 0; i < 60; i++) await r.call(p, { method: "GET", path: "/tasks/t1" });
+    expect((await r.call(p, { method: "GET", path: "/tasks/t1" })).status).toBe(429);
+    // "No" is a reject (a removal); "Yes" would be a signed consent and is refused on the rate
+    const reject = await r.call(p, { method: "POST", path: "/tmux-prompts/bash1/answer", body: { key: "3" }, idem: toHex(new Uint8Array(16).fill(1)) });
+    expect(reject.status).toBe(200);
+    const consent = await r.call(p, { method: "POST", path: "/tmux-prompts/bash1/answer", body: { key: "1" }, idem: toHex(new Uint8Array(16).fill(2)) });
+    expect(consent.status).toBe(429);
+  });
+
+  test("S9: calls to a route with no remote policy are limited too; a stop-class call still passes the bucket they spent", async () => {
+    const r = rig();
+    const p = principal("configure");
+    const statuses: number[] = [];
+    for (let i = 0; i < 60; i++) statuses.push((await r.call(p, { method: "POST", path: "/tasks", body: {}, idem: toHex(new Uint8Array(16).fill(i)) })).status);
+    expect(statuses[0]).toBe(403);
+    expect(statuses).toContain(429);
+    expect(r.calls).toHaveLength(0);
+    expect((await r.call(p, { method: "POST", path: "/runs/r1/cancel", idem: toHex(new Uint8Array(16).fill(200)) })).status).toBe(200);
+  });
+
+  test("S9: calls refused for the level are limited too, so a device cannot write refusals without bound", async () => {
+    const r = rig();
+    const p = principal("observe");
+    const statuses: number[] = [];
+    for (let i = 0; i < 60; i++) statuses.push((await r.call(p, { method: "POST", path: "/tasks/t1/backlog", body: {}, idem: toHex(new Uint8Array(16).fill(i)) })).status);
+    expect(statuses[0]).toBe(403);
+    expect(statuses).toContain(429);
   });
 });
 
@@ -358,5 +393,39 @@ describe("the preview scope (D15)", () => {
     expect(await body(await read("respond", "/etc/hosts"))).toMatchObject({ code: "level", required: "operate" });
     expect((await read("operate", "/etc/hosts")).status).toBe(200);
     expect((await read("configure", "/etc/hosts")).status).toBe(200);
+  });
+});
+
+describe("R5-S3: a call whose session ended", () => {
+  const cancel = { method: "POST" as const, path: "/runs/r1/cancel", query: null, body: null, idem: IDEM, decision: null };
+  test("a session that ended before the call is recorded: no attempt row, no handler, 410", async () => {
+    const r = rig();
+    const res = await r.router.invoke(principal("respond"), cancel, { live: () => false });
+    expect(res.status).toBe(410);
+    expect(await body(res)).toMatchObject({ code: "session-ended" });
+    expect(r.calls).toHaveLength(0);
+    expect(r.audit.filter((a) => a.kind === "attempt")).toHaveLength(0);
+  });
+  test("a session that ends while the attempt is being recorded: the attempt gets a session-ended result and the handler never runs", async () => {
+    const r = rig();
+    let checks = 0;
+    const res = await r.router.invoke(principal("respond"), cancel, { live: () => ++checks === 1 });
+    expect(res.status).toBe(410);
+    expect(r.calls).toHaveLength(0);
+    expect(r.audit.filter((a) => a.kind === "attempt")).toHaveLength(1);
+    expect(r.audit.filter((a) => a.kind === "result")).toEqual([expect.objectContaining({ code: "session-ended" })]);
+  });
+  test("a live session's call runs as before", async () => {
+    const r = rig();
+    expect((await r.router.invoke(principal("respond"), cancel, { live: () => true })).status).toBe(200);
+    expect(r.calls.map((c) => c.route)).toEqual(["POST /runs/:id/cancel"]);
+  });
+  test("isStopCall names the stop-rate routes only", () => {
+    const r = rig();
+    expect(r.router.isStopCall("POST", "/runs/r1/cancel")).toBe(true);
+    expect(r.router.isStopCall("GET", "/tasks/t1/events/page")).toBe(false);
+    expect(r.router.isStopCall("POST", "/runs/r1/input")).toBe(false);
+    expect(r.router.isStopCall("POST", "/no/such/route")).toBe(false);
+    expect(r.router.isStopCall("POST", "/tasks/../seen")).toBe(false);
   });
 });

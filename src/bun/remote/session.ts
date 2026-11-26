@@ -32,7 +32,7 @@ import type { KeyHelper } from "./key-helper-api.ts";
 import type { RateLimiter } from "./rate-limit.ts";
 import type { Registry } from "./registry.ts";
 import type { Delivered } from "./relay-link.ts";
-import { bindSessionEnder, getSessionOp } from "./session-dispatch.ts";
+import { bindSessionEnder, getSessionOp, ORDERED_SESSION_OPS } from "./session-dispatch.ts";
 import type { DevicePrincipal, PhoneChannel } from "./types.ts";
 
 export const BINDING_TIMEOUT_MS = 10_000;
@@ -41,6 +41,12 @@ export const MAX_HANDSHAKE_BYTES = 1024;
 const MIN_HANDSHAKE_BYTES = 48;
 const ENDED_TAGS_KEPT = 64;
 const PUMP_HIGH_WATER_BYTES = 1024 * 1024;
+/** Ops of one session that may run at once. Decryption stays strictly ordered; the ops it yields do not wait for each other. */
+export const MAX_INFLIGHT_OPS = 64;
+/** The slots past `MAX_INFLIGHT_OPS` only a removal may take, so the cap never refuses a Stop and a flood of removals is still bounded. */
+export const REMOVAL_HEADROOM_OPS = 32;
+/** Relay sequence numbers remembered per session, to drop a frame the relay delivers twice. */
+const SEEN_FRAMES_KEPT = 256;
 
 export interface SessionLink {
   send(name: string, mailbox: Uint8Array | null, tag: Uint8Array, payload: Uint8Array, opts?: { priority?: boolean }): boolean;
@@ -67,6 +73,11 @@ export interface SessionManagerDeps {
   clearTimeout?: (h: unknown) => void;
   /** Test seams for the lifetime rules. */
   limits?: { bindingMs?: number; idleMs?: number; maxMs?: number; rekeyMs?: number; rekeyMessages?: number };
+  /**
+   * Whether a parsed op removes work or authority (a detach, an unsubscribe, a request to a stop-rate route). Removals are never refused as
+   * busy (invariant 9): they get `REMOVAL_HEADROOM_OPS` slots past the cap, so a stalled core still takes the user's Stop.
+   */
+  isRemoval?: (type: string, body: unknown) => boolean;
 }
 
 interface QueueItem {
@@ -89,6 +100,10 @@ class Session {
   readonly queue: QueueItem[] = [];
   queuedBytesInQueue = 0;
   pumping = false;
+  inflightOps = 0;
+  /** The tail of the ordered ops (see `ORDERED_SESSION_OPS`): each of those waits for the one before it. */
+  orderedTail: Promise<void> = Promise.resolve();
+  readonly seenFrames = new Set<string>();
   timers: unknown[] = [];
   closeFns = new Set<(reason: string) => void>();
   peerFns = new Set<(present: boolean) => void>();
@@ -195,7 +210,18 @@ export function createSessionManager(deps: SessionManagerDeps): SessionManager {
       },
       queuedBytes: () => deps.link.queuedBytes(s.deviceId) + s.queuedBytesInQueue,
       peerPresent: () => s.peer,
+      isOpen: () => s.state === "active",
       onClose(fn) {
+        if (s.state === "ended") {
+          // A listener added to a session that already ended (an op that was still awaiting when it closed) would never hear about it:
+          // tell it now, so what it set up is torn down at once.
+          try {
+            fn("ended");
+          } catch {
+            /* a listener must not break its caller */
+          }
+          return () => undefined;
+        }
         s.closeFns.add(fn);
         return () => void s.closeFns.delete(fn);
       },
@@ -297,11 +323,26 @@ export function createSessionManager(deps: SessionManagerDeps): SessionManager {
     const { send, recv } = hs.split();
     const s = new Session(name, d.mailbox, d.tag, send, recv, hs.handshakeHash(), now());
     state.session = s;
+    // The relay redelivers this frame too (after a reconnect, before it saw the ack): it must read as a redelivery on the session it
+    // opened, not as a transport frame the cipher has never seen, which would fail to decrypt and end the live session.
+    isRedelivery(s, d);
     deps.link.send(name, d.mailbox, d.tag, reply, { priority: true });
     s.timers.push(setTo(() => end(s, "binding-timeout"), lim.bindingMs));
   }
 
+  /** True when this relay frame (mailbox + seq) was already taken by the session: a redelivery, which must not reach the cipher twice. */
+  function isRedelivery(s: Session, d: Delivered): boolean {
+    const key = `${toHex(d.mailbox)}:${d.seq}`;
+    if (s.seenFrames.has(key)) return true;
+    s.seenFrames.add(key);
+    if (s.seenFrames.size > SEEN_FRAMES_KEPT) s.seenFrames.delete(s.seenFrames.values().next().value as string);
+    return false;
+  }
+
   async function transport(s: Session, d: Delivered): Promise<void> {
+    // The relay redelivers a frame it has not seen acknowledged (after a reconnect). Decrypting it again would read as a replay and end a
+    // healthy session, so a frame already taken is dropped (and acknowledged by the link).
+    if (isRedelivery(s, d)) return;
     let plaintext: Uint8Array;
     let msg: { t: string; id: string; body: Uint8Array } | null;
     try {
@@ -319,7 +360,14 @@ export function createSessionManager(deps: SessionManagerDeps): SessionManager {
       return;
     }
     if (s.state === "binding") return await bind(s, msg);
-    await dispatch(s, msg);
+    // Decrypting is one ordered chain per device (a nonce gap ends the session), but the op it carries must not hold that chain: a slow op
+    // would otherwise delay the frames behind it (a Stop, terminal input) and the relay acks that wait for this call to return.
+    s.inflightOps++;
+    void dispatch(s, msg)
+      .catch(() => undefined)
+      .finally(() => {
+        s.inflightOps--;
+      });
   }
 
   async function bind(s: Session, msg: { t: string; id: string; body: Uint8Array }): Promise<void> {
@@ -339,12 +387,18 @@ export function createSessionManager(deps: SessionManagerDeps): SessionManager {
       for (const t of s.timers) clearTo(t);
       s.timers = [];
       const channel = makeChannel(s, principal);
+      // The session can end while any of these awaits is pending (a revoke, a replacement, the relay dropping). `end` has already
+      // cleared the timers it knew of, so going on would arm two intervals nothing ever clears and open a channel on a dead session.
       const head = await deps.audit.head().catch(() => null);
+      if (isEnded(s)) return;
       const routes = deps.routes(row.level).map((r) => ({ method: r.method, route: r.route, level: r.policy.level, stepUp: r.policy.stepUp, rate: r.policy.rate }));
       await deps.audit.event("session-open", { deviceId: row.id, sessionHash: toHex(s.handshakeHash) });
+      if (isEnded(s)) return;
+      const macName = await deps.macName();
+      if (isEnded(s)) return;
       channel.send("hello", {
         protocolVersion: PROTOCOL_VERSION, minProtocolVersion: MIN_PROTOCOL_VERSION, deviceId: row.id, level: row.level, routes,
-        auditHead: head, clock: now(), macName: await deps.macName(),
+        auditHead: head, clock: now(), macName,
       });
       s.timers.push(
         setIv(() => {
@@ -379,13 +433,28 @@ export function createSessionManager(deps: SessionManagerDeps): SessionManager {
       void deps.audit.refusal(s.deviceId, "bad-message", msg.t).catch(() => undefined);
       return;
     }
+    const removal = s.inflightOps > MAX_INFLIGHT_OPS && s.inflightOps <= MAX_INFLIGHT_OPS + REMOVAL_HEADROOM_OPS && (deps.isRemoval?.(msg.t, body) ?? false);
+    if (s.inflightOps > MAX_INFLIGHT_OPS && !removal) {
+      channel.send("error", { id: (body as { id?: string }).id ?? null, code: "busy", message: "too many operations in flight" });
+      void deps.audit.refusal(s.deviceId, "busy", msg.t).catch(() => undefined);
+      return;
+    }
     const handler = getSessionOp(msg.t);
     if (!handler) {
       channel.send("error", { id: (body as { id?: string }).id ?? null, code: "unsupported", message: "this operation is not available" });
       return;
     }
+    // The session can have ended (a revoke, Revoke all, Remote access off) while the op was parsed or waited its turn: an op that was already
+    // decrypted must not act for a phone that is no longer trusted.
+    if (s.state !== "active") return;
     try {
-      await handler(channel, body, msg.id);
+      if (ORDERED_SESSION_OPS.has(msg.t)) {
+        const run = s.orderedTail.then(() => (s.state === "active" ? handler(channel, body, msg.id) : undefined));
+        s.orderedTail = run.catch(() => undefined);
+        await run;
+      } else {
+        await handler(channel, body, msg.id);
+      }
     } catch {
       // Handlers audit their own refusals; a throw is an internal failure and says nothing about why.
       if (s.state === "active") channel.send("error", { id: (body as { id?: string }).id ?? null, code: "internal", message: "the operation failed" });

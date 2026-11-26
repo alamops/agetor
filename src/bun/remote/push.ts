@@ -55,6 +55,9 @@ export interface PhoneSink extends NotificationSink {
   status(): { configured: boolean };
 }
 
+/** How long a push request may take before it is given up (a push is best effort). */
+export const PUSH_TIMEOUT_MS = 10_000;
+
 export function createPhoneSink(deps: PushDeps): PhoneSink {
   const now = deps.now ?? Date.now;
   const gateway = deps.pushUrl ?? (() => defaultPushUrl());
@@ -78,6 +81,8 @@ export function createPhoneSink(deps: PushDeps): PhoneSink {
         method: "POST",
         headers: { "content-type": "application/json", "x-agetor-mac": mac },
         body: JSON.stringify(body),
+        // A gateway that accepts the connection and never answers must not hold a notification delivery open.
+        signal: AbortSignal.timeout(PUSH_TIMEOUT_MS),
       });
       if (res.status === 410) await deps.markDead?.(device.id);
     } catch {

@@ -23,7 +23,8 @@ const { FakeKeyHelper } = await import("../key-helper-fake.ts");
 const { setKeyHelperForTests } = await import("../key-helper-api.ts");
 const { registryEntryJson } = await import("../registry.ts");
 const asyncDb = await import("../../db-async.ts");
-const { db, preferences } = await import("../../db.ts");
+const { db, harnesses, preferences, tasks } = await import("../../db.ts");
+const { snapshotHarnessState } = await import("../../test-harness-state.ts");
 const { createTask } = await import("../../orchestrator.ts");
 const { resolveTmuxBin, tmuxSocketArgs } = await import("../../tmux-resolution.ts");
 const { sessionNameFor } = await import("../../claude-tmux.ts");
@@ -48,11 +49,18 @@ let gateway: Awaited<ReturnType<typeof startRemoteGateway>> | null = null;
 const phones: TestPhone[] = [];
 const sessions: string[] = [];
 
+/** A second account of the Claude kind: its tasks carry this harness id, not "claude-code". */
+const SECOND_CLAUDE = "claude-it-second";
+let restoreHarnesses: () => void = () => undefined;
+
 beforeAll(() => {
   server = startApiServer() as unknown as { stop: () => void };
+  restoreHarnesses = snapshotHarnessState();
+  harnesses.insert({ id: SECOND_CLAUDE, kind: "claude-code", label: "Claude (second account)" });
 });
 afterAll(() => {
   server.stop();
+  restoreHarnesses();
   rmTestDataDir(DATA);
 });
 afterEach(async () => {
@@ -106,8 +114,10 @@ describe.skipIf(!TMUX && process.env.CI !== "true")("the phone terminal", () => 
     await t.phone.next("terminal-attached");
     await t.phone.terminal.input(t.taskId, "from-the-phone\n");
     await until(() => seen(t.phone, t.taskId).includes("from-the-phone"));
-    await sleep(100);
-    expect(tmux("capture-pane", "-p", "-t", "=" + t.name + ":").stdout.toString()).toContain("from-the-phone");
+    // The Mac's own view of the same session shows it too (polled: the pane redraws on tmux's schedule, not ours).
+    const pane = () => tmux("capture-pane", "-p", "-t", "=" + t.name + ":").stdout.toString();
+    await until(() => pane().includes("from-the-phone"));
+    expect(pane()).toContain("from-the-phone");
   }, 60_000);
 
   test("an operate device is refused at the level, and nothing attaches", async () => {
@@ -150,6 +160,47 @@ describe.skipIf(!TMUX && process.env.CI !== "true")("the phone terminal", () => 
     expect(res.status).toBe(200);
     await until(() => (gateway!.terminals?.attachedTerminals().length ?? 1) === 0, 2000);
     expect(alive(t.name)).toBe(true);
+  }, 60_000);
+
+  test("S5: archiving the task detaches the phone's terminal first, with the reason task-archived", async () => {
+    if (!TMUX) throw new Error("tmux is required in CI");
+    const t = await setup("configure");
+    await t.phone.terminal.attach(t.taskId, t.name);
+    await t.phone.next("terminal-attached");
+    const res = await fetch(`${BASE}/tasks/${t.taskId}/archive`, {
+      method: "POST",
+      headers: { authorization: `Bearer ${API_TOKEN}`, "content-type": "application/json" },
+      body: JSON.stringify({ force: true }),
+    });
+    expect(res.status, await res.clone().text()).toBe(200);
+    // the phone hears why (not "exited", which is what a tmux session killed under it would say)
+    expect(await t.phone.next<{ taskId: string; reason: string }>("terminal-closed")).toEqual({ taskId: t.taskId, reason: "task-archived" });
+    expect(gateway!.terminals?.attachedTerminals()).toEqual([]);
+    const detach = (await asyncDb.remoteAudit.page({ limit: 50 })).find((a) => a.action === "terminal-detach");
+    expect(detach?.resultCode).toBe("task-archived");
+  }, 60_000);
+
+  test("S5: deleting the task detaches the phone's terminal first, with the reason task-deleted", async () => {
+    if (!TMUX) throw new Error("tmux is required in CI");
+    const t = await setup("configure");
+    await t.phone.terminal.attach(t.taskId, t.name);
+    await t.phone.next("terminal-attached");
+    const res = await fetch(`${BASE}/tasks/${t.taskId}`, { method: "DELETE", headers: { authorization: `Bearer ${API_TOKEN}` } });
+    expect(res.status, await res.clone().text()).toBe(204);
+    expect(await t.phone.next<{ taskId: string; reason: string }>("terminal-closed")).toEqual({ taskId: t.taskId, reason: "task-deleted" });
+    expect(gateway!.terminals?.attachedTerminals()).toEqual([]);
+  }, 60_000);
+
+  test("S4: a task on a second account of a tmux kind offers its terminal like the built-in one: the challenge and the attach both pass", async () => {
+    if (!TMUX) throw new Error("tmux is required in CI");
+    const t = await setup("configure");
+    tasks.update(t.taskId, { agent: SECOND_CLAUDE });
+    expect(tasks.get(t.taskId)!.agent).toBe(SECOND_CLAUDE);
+    await t.phone.terminal.attach(t.taskId, t.name);
+    await t.phone.next("terminal-attached");
+    await t.phone.terminal.input(t.taskId, "second-account\n");
+    await until(() => seen(t.phone, t.taskId).includes("second-account"));
+    expect(gateway!.terminals?.attachedTerminals().map((a) => a.taskId)).toEqual([t.taskId]);
   }, 60_000);
 
   test("a task with no tmux session (or a harness that has none) answers no-terminal", async () => {

@@ -110,6 +110,14 @@ async function collectCodeObjects(dir: string): Promise<string[]> {
   return found;
 }
 
+/**
+ * Whether the key helper's signing checks are skipped: a local build whose helper carries no embedded profile was built ad hoc by design
+ * (build-keyhelper.ts needs ELECTROBUN_DEVELOPER_ID and AGETOR_KEYHELPER_PROFILE together). A release always checks it.
+ */
+export function shouldSkipKeyHelper(f: { requireDeveloperId: boolean; helperHasProfile: boolean }): boolean {
+  return !f.requireDeveloperId && !f.helperHasProfile;
+}
+
 export interface VerifyVendorSigningOptions {
   /**
    * When true, a missing ELECTROBUN_DEVELOPER_ID is a failure rather than a
@@ -157,7 +165,21 @@ export async function verifyVendorSigning(
     };
   }
 
-  const targets = await collectCodeObjects(VENDOR_DIR);
+  const keyHelper = path.join(VENDOR_DIR, "keyhelper", "AgetorKeyHelper.app");
+  // The key helper is built signed only when BOTH ELECTROBUN_DEVELOPER_ID and AGETOR_KEYHELPER_PROFILE are set (build-keyhelper.ts falls
+  // back to an ad-hoc helper otherwise). A local build with a Developer ID but no profile therefore has an ad-hoc helper by design: it is
+  // not checked, exactly as an ad-hoc build is not. A release (requireDeveloperId) always checks it.
+  const skipKeyHelper = shouldSkipKeyHelper({
+    requireDeveloperId: opts.requireDeveloperId === true,
+    helperHasProfile: existsSync(path.join(keyHelper, "Contents", "embedded.provisionprofile")),
+  });
+  if (skipKeyHelper && existsSync(keyHelper)) {
+    console.log(`${tag} key helper was built ad hoc (no AGETOR_KEYHELPER_PROFILE) — skipping its signing checks (local build)`);
+  }
+  const keyHelperRoot = path.join(VENDOR_DIR, "keyhelper") + path.sep;
+
+  const allTargets = await collectCodeObjects(VENDOR_DIR);
+  const targets = skipKeyHelper ? allTargets.filter((t) => !t.startsWith(keyHelperRoot)) : allTargets;
   const problems: string[] = [];
 
   for (const target of targets) {
@@ -184,11 +206,10 @@ export async function verifyVendorSigning(
 
   // The Companion's key helper: its own rules on top (same identity as the notifier, the profile, the keychain entitlement). A release
   // (requireDeveloperId) refuses to go on without it.
-  const keyHelper = path.join(VENDOR_DIR, "keyhelper", "AgetorKeyHelper.app");
-  if (existsSync(keyHelper)) {
+  if (existsSync(keyHelper) && !skipKeyHelper) {
     const notifier = path.join(VENDOR_DIR, "notifier", "AgetorNotifier.app");
     problems.push(...checkKeyHelperSigning(await keyHelperFacts(keyHelper, existsSync(notifier) ? notifier : null)));
-  } else if (opts.requireDeveloperId) {
+  } else if (opts.requireDeveloperId && !existsSync(keyHelper)) {
     problems.push("vendor/keyhelper/AgetorKeyHelper.app is missing — run `bun run vendor:keyhelper` (with AGETOR_KEYHELPER_PROFILE) before building.");
   }
 

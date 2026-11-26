@@ -254,6 +254,61 @@ describe("idempotency", () => {
     expect(await asyncDb.remoteIdempotency.get(id(2), "k1")).toBeNull();
   });
 
+  test("an expired row (not yet pruned) is replaced by a put of the same key; a live one is kept", async () => {
+    const WINDOW = 10 * 60_000;
+    expect(await asyncDb.op("remote.idempotencyPut", [row("exp", { createdAt: T0 })])).toBe(true);
+    // 11 minutes later the old row is outside the window: the new result is stored
+    const later = T0 + WINDOW + 60_000;
+    expect(await asyncDb.op("remote.idempotencyPut", [row("exp", { createdAt: later, expiredBefore: later - WINDOW, status: 201, response: b(4, 2) })])).toBe(true);
+    expect(await asyncDb.remoteIdempotency.get(id(1), "exp")).toMatchObject({ status: 201, createdAt: later });
+    // and inside the window it is still kept
+    expect(await asyncDb.op("remote.idempotencyPut", [row("exp", { createdAt: later + 1000, expiredBefore: later + 1000 - WINDOW, status: 500 })])).toBe(false);
+    expect(await asyncDb.remoteIdempotency.get(id(1), "exp")).toMatchObject({ status: 201 });
+  });
+
+  test("through createIdempotency on the real store: a key reused after its window (not yet pruned) runs once, and its repeat is the new result", async () => {
+    const { IDEMPOTENCY_WINDOW_MS, createDbIdempotencyStore, createIdempotency } = await import("./remote/idempotency.ts");
+    let t = T0;
+    const idem = createIdempotency(createDbIdempotencyStore(), () => t);
+    const KEY = "cd".repeat(16);
+    const res = (status: number, text: string) => ({ status, contentType: "application/json", body: new TextEncoder().encode(text) });
+    const first = await idem.claim(id(1), KEY, "h-first");
+    expect(first.kind).toBe("run");
+    if (first.kind === "run") await first.commit(res(200, "first"));
+    // past the window and before the once-a-minute prune: the old row is still in the table
+    t += IDEMPOTENCY_WINDOW_MS + 60_000;
+    expect(await asyncDb.remoteIdempotency.get(id(1), KEY)).toMatchObject({ createdAt: T0 });
+    const second = await idem.claim(id(1), KEY, "h-second");
+    expect(second.kind).toBe("run");
+    if (second.kind === "run") await second.commit(res(201, "second"));
+    // the repeat of the new call answers its stored result instead of applying it again
+    const repeat = await idem.claim(id(1), KEY, "h-second");
+    expect(repeat.kind).toBe("hit");
+    if (repeat.kind === "hit") {
+      expect(repeat.result.status).toBe(201);
+      expect(new TextDecoder().decode(repeat.result.body!)).toBe("second");
+    }
+    // and the old body is now a different call under a live key
+    expect((await idem.claim(id(1), KEY, "h-first")).kind).toBe("mismatch");
+  });
+
+  test("R5: at exactly the window's end the key is expired for both the claim and the write: the new call runs and its result is kept", async () => {
+    const { IDEMPOTENCY_WINDOW_MS, createDbIdempotencyStore, createIdempotency } = await import("./remote/idempotency.ts");
+    let t = T0;
+    const idem = createIdempotency(createDbIdempotencyStore(), () => t);
+    const KEY = "ef".repeat(16);
+    const res = (status: number, text: string) => ({ status, contentType: "application/json", body: new TextEncoder().encode(text) });
+    const first = await idem.claim(id(1), KEY, "h-first");
+    if (first.kind === "run") await first.commit(res(200, "first"));
+    t = T0 + IDEMPOTENCY_WINDOW_MS; // the first claim calls this expired (`now - createdAt < window` is false)
+    const second = await idem.claim(id(1), KEY, "h-second");
+    expect(second.kind).toBe("run");
+    if (second.kind === "run") await second.commit(res(201, "second"));
+    expect(await asyncDb.remoteIdempotency.get(id(1), KEY)).toMatchObject({ createdAt: T0 + IDEMPOTENCY_WINDOW_MS, status: 201 });
+    const repeat = await idem.claim(id(1), KEY, "h-second");
+    expect(repeat.kind).toBe("hit");
+  });
+
   test("a response over 64 KB is stored as status only", async () => {
     await asyncDb.op("remote.idempotencyPut", [row("big", { response: b(64 * 1024 + 1) })]);
     expect((await asyncDb.remoteIdempotency.get(id(1), "big"))!.response).toBeNull();

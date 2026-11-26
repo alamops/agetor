@@ -175,6 +175,70 @@ describe("revoking", () => {
     expect(store.rows[0]!.status).toBe("revoked");
   });
 
+  test("S7: the sessions end even when the row's own write fails, and the failure is reported", async () => {
+    const r = rig();
+    const row = await pairDevice(r.helper, 1);
+    r.store.rows.push(row);
+    r.store.revoke = async () => {
+      throw new Error("database is locked");
+    };
+    const seen: string[] = [];
+    r.registry.onRevoked((id) => void seen.push(id));
+    await expect(r.registry.revoke(row.id)).rejects.toThrow("database is locked");
+    expect(await r.helper.revoked()).toEqual([row.id]);
+    expect(seen).toEqual([row.id]);
+    expect(r.notices).toEqual(["Phone revoked"]);
+  });
+
+  test("R5-S4: when neither the helper nor the row can be written, nothing claims the phone was revoked, and both failures surface", async () => {
+    const r = rig();
+    const row = await pairDevice(r.helper, 1);
+    r.store.rows.push(row);
+    const broken = { ...r.helper, revoke: async () => { throw new Error("helper down"); }, status: () => r.helper.status(), revoked: () => r.helper.revoked() } as unknown as FakeKeyHelper;
+    r.store.revoke = async () => {
+      throw new Error("database is locked");
+    };
+    const reg = createRegistry({ helper: () => broken, store: r.store, notify: (n) => void r.notices.push(n.title) });
+    const seen: string[] = [];
+    reg.onRevoked((id) => void seen.push(id));
+    const err = await reg.revoke(row.id).then(() => null, (e: unknown) => e);
+    expect(String(err)).toContain("helper down");
+    expect(String(err)).toContain("database is locked");
+    // The phone is still trusted (the helper's list lacks it and the row is active), so no session ends and no notice says otherwise.
+    expect(seen).toEqual([]);
+    expect(r.notices).toEqual([]);
+    expect((await reg.trustedDevices()).trusted.map((x) => x.id)).toEqual([row.id]);
+  });
+
+  test("R5: revoke all audits itself even when the rows cannot be written (the helper has already replaced the core key)", async () => {
+    const r = rig();
+    for (const n of [1, 2]) r.store.rows.push(await pairDevice(r.helper, n));
+    r.store.revoke = async () => {
+      throw new Error("database is locked");
+    };
+    await expect(r.registry.revokeAll()).rejects.toThrow("database is locked");
+    expect(r.audited.map((a) => a.action)).toContain("revoke-all");
+  });
+
+  test("R2: the sessions end even when the store cannot be read for the notice's name, and the revoke still lands", async () => {
+    const r = rig();
+    const row = await pairDevice(r.helper, 1);
+    r.store.rows.push(row);
+    const list = r.store.list;
+    let reads = 0;
+    r.store.list = async () => {
+      if (++reads === 1) throw new Error("database is locked");
+      return list();
+    };
+    const seen: string[] = [];
+    r.registry.onRevoked((id) => void seen.push(id));
+    await r.registry.revoke(row.id);
+    expect(await r.helper.revoked()).toEqual([row.id]);
+    expect(seen).toEqual([row.id]);
+    expect(r.store.revokes).toHaveLength(1);
+    expect(r.notices).toEqual(["Phone revoked"]);
+  });
+
   test("a listener that throws does not stop the others or the revoke", async () => {
     const r = rig();
     const row = await pairDevice(r.helper, 1);
@@ -201,6 +265,25 @@ describe("revoking", () => {
     expect(keyChanged).toBe(1);
     expect((await r.registry.trustedDevices()).trusted).toEqual([]);
     expect(r.audited.map((a) => a.action)).toContain("revoke-all");
+  });
+
+  test("S7: revoke all still ends every session, runs the key-replaced listeners and posts its notice when the rows cannot be written", async () => {
+    const r = rig();
+    for (const n of [1, 2]) r.store.rows.push(await pairDevice(r.helper, n));
+    r.store.revoke = async () => {
+      throw new Error("database is locked");
+    };
+    const ended: string[] = [];
+    let keyChanged = 0;
+    r.registry.onRevoked((id) => void ended.push(id));
+    r.registry.onKeyReplaced(() => void keyChanged++);
+    await expect(r.registry.revokeAll()).rejects.toThrow("database is locked");
+    expect(ended.sort()).toEqual(r.store.rows.map((x) => x.id).sort());
+    expect(keyChanged).toBe(1);
+    expect(r.notices).toEqual(["All phones revoked"]);
+    // trust follows the helper, which already revoked them: nothing is trusted even though the rows still say active
+    expect(r.store.rows.every((x) => x.status === "active")).toBe(true);
+    expect((await r.registry.trustedDevices()).trusted).toEqual([]);
   });
 
   test("expiry revokes devices unused for 60 days through the same path, and leaves the rest", async () => {

@@ -37,6 +37,11 @@ export interface ClassifyLookups {
   askQuestionTask(cardId: string): Promise<string | null>;
   /** Whether `path` is inside the task's own folders (its workdir or worktrees, or a file it sent) (D15). */
   previewInScope(taskId: string, path: string): Promise<boolean>;
+  /**
+   * Whether approving a plan will switch the task from Plan to Auto (force): the task is in Plan mode and not bound to an agent profile
+   * (the approve route's own `flipToAuto` rule). An unknown task answers true, so it fails closed.
+   */
+  planApprovalFlipsToAuto(taskId: string): Promise<boolean>;
 }
 
 const isObj = (v: unknown): v is Record<string, unknown> => typeof v === "object" && v !== null && !Array.isArray(v);
@@ -109,6 +114,11 @@ export async function classifyRoute(input: ClassifyInput, policy: RemotePolicy, 
     // ── consent ──────────────────────────────────────────────────────────────────────────────────────────────────
     case "POST /tasks/:id/plans/:planId/approve": {
       const target: ContentTarget = { kind: "plan", taskId: input.params.id!, planId: input.params.planId! };
+      // The approve route flips a Plan-mode task to Auto (force) before it sends the approval, so that call raises the task's autonomy
+      // exactly as a Claude plan card's row 1 does (D9): operate-level, signed, and behind the unlock window.
+      if (await lookups.planApprovalFlipsToAuto(input.params.id!)) {
+        return base(policy, { class: "consent", stepUp: "signed", alsoUnlock: "always", level: raise(policy.level, "operate"), taskId: input.params.id, target });
+      }
       return base(policy, { class: "consent", stepUp: "signed", taskId: input.params.id, target });
     }
     case "POST /tasks/:id/fx-resume":

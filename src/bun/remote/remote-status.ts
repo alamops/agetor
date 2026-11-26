@@ -91,7 +91,7 @@ export async function readLog(opts: { beforeSeq?: number; limit: number }): Prom
   return { rows: page.rows, chain: page.chain, nextBeforeSeq: page.rows.length >= opts.limit && last ? last.seq : null };
 }
 
-/** The Mac's Detach button: end the phone's terminal on a task. False when none was attached. */
-export function detachPhoneTerminal(taskId: string): boolean {
-  return currentGateway()?.terminals?.detachForTask(taskId, "mac-detach") ?? false;
+/** End the phone's terminal on a task (the Mac's Detach button, or the task going away). False when none was attached. */
+export function detachPhoneTerminal(taskId: string, reason = "mac-detach"): boolean {
+  return currentGateway()?.terminals?.detachForTask(taskId, reason) ?? false;
 }

@@ -30,7 +30,7 @@ This change is Mac-side only: everything the core needs before a v1 app can pair
 | Notifications | One notification decision in the core; sealed pushes; presence from window focus | Idle-time presence; Live Activities |
 | Audit | Hash-chained log with a viewer and CLI | The phone's witness of chain heads (app work) |
 | Protocol code | `packages/remote-protocol`: the core's TypeScript implementation, message schemas and test vectors | The Swift (iOS) and Kotlin (Android) implementations, in the app work |
-| Quality | Headless test client, security suite, a CI gate for both, an external review | Full-suite CI baseline; demo core and canary channel before App Review |
+| Quality | Headless test client, security suite, a CI gate for both, ~~an external review~~ an internal adversarial review and a SECURITY.md (Amended, owner decision, 2026-11-25) | Full-suite CI baseline; demo core and canary channel before App Review |
 
 Not in any phase of this spec: keep-awake (deferred), ~~a terminal on the phone~~ (a configure-level terminal is now in scope, see Terminal), lock-screen approvals, commands sent while no session exists, and tailcat.
 
@@ -349,7 +349,9 @@ The change is done when a headless client pairs, works the blocked-agent loop en
 - **End to end.** A headless test client pairs through the local relay (with a fake key helper), reads the inbox and the board delta, answers a question, approves a plan with a signed decision, accepts a pipeline gate, and stops a run.
 - **Test seams.** `AGETOR_FAKE_KEY_HELPER` (keys in memory, Touch ID granted, the code typed by the test) and `AGETOR_REMOTE_RELAY_URL` (the local relay). Neither is honoured in a signed release build.
 - **CI.** A required GitHub Actions job on `macos-15`: typecheck, lint, the route-policy test, `packages/remote-protocol` and the security suite. The full-suite baseline is separate work (blueprint §13).
-- **Review.** An external security review of pairing, the Noise implementation, the key helper and signed decisions, before the first TestFlight build connects to a real Mac.
+- **Review.** ~~An external security review of pairing, the Noise implementation, the key helper and signed decisions, before the first TestFlight build connects to a real Mac.~~
+
+  > **Amended (owner decision, 2026-11-25):** there is no outside review before launch. Before the first TestFlight build connects to a real Mac, a separate agent session that did not write the code reviews pairing, the Noise code, the key helper, signed decisions and the gateway's authentication against the threat model above; every finding is fixed or recorded with its reason. The repository carries a `SECURITY.md` that points reporters to GitHub private vulnerability reporting. An outside review is reconsidered after launch.
 
 ## Work breakdown
 

@@ -1,5 +1,5 @@
 import { afterAll, afterEach, describe, expect, test } from "bun:test";
-import { mkdtempSync } from "node:fs";
+import { chmodSync, existsSync, mkdtempSync, readFileSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import path from "node:path";
 import { fromBase64, toBase64 } from "@agetor/remote-protocol/bytes";
@@ -29,6 +29,7 @@ function fakeChannel(p = principal()) {
     send: (type, body) => void sent.push({ type, body: body as Record<string, unknown> }),
     queuedBytes: () => 0,
     peerPresent: () => present,
+    isOpen: () => true,
     onClose: (fn) => (closeFns.add(fn), () => void closeFns.delete(fn)),
     onPeerChange: (fn) => (peerFns.add(fn), () => void peerFns.delete(fn)),
   };
@@ -102,6 +103,13 @@ describe("attach", () => {
     expect(r.events[0]).toMatchObject({ type: "phone_terminal", taskId: "t1", deviceId: "d1", attached: true });
     expect(r.mgr.attachedTerminals()).toEqual([expect.objectContaining({ taskId: "t1", deviceId: "d1", deviceName: "Ana's iPhone" })]);
   });
+  test("S4: any tmux-hosted per-task kind may attach (codex here), not only claude-code", async () => {
+    const r = rig({ task: async () => ({ agent: "codex" }) });
+    const c = fakeChannel();
+    await r.mgr.attach(c.ch, attachMsg());
+    expect(c.sent[0]).toMatchObject({ type: "terminal-attached" });
+    expect(r.clients).toHaveLength(1);
+  });
   test("below configure it is a level error and nothing is spawned", async () => {
     const r = rig();
     for (const level of ["observe", "respond", "operate"] as const) {
@@ -131,6 +139,24 @@ describe("attach", () => {
     expect(c.sent[0]).toMatchObject({ type: "error", body: { code: "signature" } });
     expect(r.clients).toHaveLength(0);
     expect(r.audit).toEqual([{ action: "refusal", fields: expect.objectContaining({ resultCode: "signature" }) }]);
+  });
+  test("R3-S3: a session that closed while the attach awaited spawns no tmux client, announces nothing and leaves the earlier phone attached", async () => {
+    const r = rig();
+    const first = fakeChannel(principal("configure", "s1", "d1"));
+    await r.mgr.attach(first.ch, attachMsg());
+    r.events.length = 0;
+    r.audit.length = 0;
+    const c = fakeChannel(principal("configure", "s2", "d2"));
+    // The session ended during the lookup: its channel answers a late `onClose` at once, as the real one does.
+    const ch: PhoneChannel = { ...c.ch, onClose: (fn) => (fn("ended"), () => undefined) };
+    await r.mgr.attach(ch, attachMsg({ id: "a2" }));
+    expect(r.clients).toHaveLength(1); // only the first phone's client; none for the dead session
+    expect(r.clients[0]!.killed).toBe(0);
+    expect(first.types()).not.toContain("terminal-closed");
+    expect(r.mgr.attachedTerminals().map((t) => t.deviceId)).toEqual(["d1"]);
+    expect(c.types()).not.toContain("terminal-attached");
+    expect(r.events).toEqual([]);
+    expect(r.audit).toEqual([]);
   });
   test("a second phone replaces the first, which is told", async () => {
     const r = rig();
@@ -328,4 +354,37 @@ describe("with a real tmux", () => {
     const pane = Bun.spawnSync([resolveTmuxBin(), ...tmuxSocketArgs(), "capture-pane", "-p", "-t", "=" + name + ":"]).stdout.toString();
     expect(pane).toContain("hello-from-phone");
   }, 20_000);
+});
+
+// ── the live tmux client's environment ───────────────────────────────────────────────────────────────────────────────────
+
+describe("the live tmux client", () => {
+  test("it runs with the core's live environment (PATH, what the core set) and TERM=xterm-256color, minus the master token", async () => {
+    const dir = mkdtempSync(path.join(tmpdir(), "agt-term-env-"));
+    const out = path.join(dir, "env.txt");
+    const bin = path.join(dir, "tmux");
+    // Stands in for `tmux attach-session`: records the environment it was started with, then exits.
+    writeFileSync(bin, `#!/bin/sh\nenv > "${out}.tmp" && mv "${out}.tmp" "${out}"\n`);
+    chmodSync(bin, 0o755);
+    const saved = { bin: process.env.AGETOR_TMUX_BIN, probe: process.env.AGETOR_TERMINAL_ENV_PROBE, token: process.env.AGETOR_API_TOKEN };
+    process.env.AGETOR_TMUX_BIN = bin;
+    process.env.AGETOR_TERMINAL_ENV_PROBE = "set-by-the-core";
+    process.env.AGETOR_API_TOKEN = "master-token-must-not-reach-a-child";
+    try {
+      const client = createLiveTerminalDeps().spawnClient("agetor-envprobe", { cols: 80, rows: 24 }, () => undefined);
+      const deadline = Date.now() + 5000;
+      while (!existsSync(out) && Date.now() < deadline) await new Promise((res) => setTimeout(res, 20));
+      const env = new Map(readFileSync(out, "utf8").trim().split("\n").map((line) => [line.slice(0, line.indexOf("=")), line.slice(line.indexOf("=") + 1)] as const));
+      expect(env.get("TERM")).toBe("xterm-256color");
+      expect(env.get("AGETOR_TERMINAL_ENV_PROBE")).toBe("set-by-the-core");
+      expect(env.get("PATH")).toBe(process.env.PATH);
+      expect(env.has("AGETOR_API_TOKEN")).toBe(false);
+      client.kill();
+    } finally {
+      for (const [key, value] of [["AGETOR_TMUX_BIN", saved.bin], ["AGETOR_TERMINAL_ENV_PROBE", saved.probe], ["AGETOR_API_TOKEN", saved.token]] as const) {
+        if (value === undefined) delete process.env[key];
+        else process.env[key] = value;
+      }
+    }
+  });
 });

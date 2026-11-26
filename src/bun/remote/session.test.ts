@@ -9,7 +9,7 @@ import type { RemoteDeviceRow } from "../../shared/remote-types.ts";
 import { FakeKeyHelper } from "./key-helper-fake.ts";
 import { RateLimiter } from "./rate-limit.ts";
 import { RelayLink } from "./relay-link.ts";
-import { createSessionManager, type SessionManager, type SessionManagerDeps } from "./session.ts";
+import { MAX_INFLIGHT_OPS, REMOVAL_HEADROOM_OPS, createSessionManager, type SessionManager, type SessionManagerDeps } from "./session.ts";
 import { bindSessionEnder, registerSessionOp } from "./session-dispatch.ts";
 import type { PhoneChannel } from "./types.ts";
 
@@ -157,6 +157,43 @@ describe("a session opens", () => {
   });
 });
 
+describe("a session that ends while its binding is still being recorded", () => {
+  test("no hello, no intervals, no touch and no open callback: nothing is armed on a dead session", async () => {
+    let release: () => void = () => undefined;
+    const gate = new Promise<void>((res) => void (release = res));
+    let eventStarted = false;
+    let opened = 0;
+    let touched = 0;
+    let intervals = 0;
+    const r = await rig({
+      deps: {
+        audit: {
+          event: async () => {
+            eventStarted = true;
+            await gate;
+            return { seq: 1, hash: "" };
+          },
+          refusal: async () => true,
+          head: async () => ({ seq: 7, hash: "ab".repeat(32) }),
+        },
+        onOpen: () => void opened++,
+        touch: async () => void touched++,
+        setInterval: (fn: () => void, ms: number) => (intervals++, setInterval(fn, ms)),
+      },
+    });
+    const outcome = r.connect().then(() => "hello", () => "closed");
+    await until(() => eventStarted);
+    r.manager.endDeviceSessions(r.deviceId, "revoked"); // the session ends while audit.event is pending
+    release();
+    await sleep(100);
+    expect(r.manager.activeSessions()).toEqual([]);
+    expect(intervals).toBe(0);
+    expect(touched).toBe(0);
+    expect(opened).toBe(0);
+    expect(await outcome).toBe("closed");
+  });
+});
+
 describe("the transport fails closed (invariants 13 and 14)", () => {
   for (const [what, tamper] of [["a flipped bit", { flipBit: true }], ["a replayed frame", { replay: true }], ["reordered frames", { reorder: true }]] as const) {
     test(`${what} ends the session`, async () => {
@@ -265,6 +302,200 @@ describe("dispatch", () => {
   });
 });
 
+describe("S1/S2: a slow op does not hold the frames behind it, and a redelivered frame is not a replay", () => {
+  test("S1: an op that has not finished does not delay the next frame of the same session", async () => {
+    const r = await rig();
+    let release: () => void = () => undefined;
+    const gate = new Promise<void>((res) => void (release = res));
+    const seen: string[] = [];
+    unregister.push(registerSessionOp("subscribe-global", async (_ch, body) => {
+      seen.push((body as { sub: string }).sub);
+      if ((body as { sub: string }).sub === "slow") await gate;
+    }));
+    await r.connect();
+    await r.phone.subscribeGlobal("slow");
+    await until(() => seen.includes("slow"));
+    // the slow op is still running; a frame behind it must be taken and handled now
+    await r.phone.subscribeGlobal("fast");
+    await until(() => seen.includes("fast"), 1500);
+    expect(seen).toEqual(["slow", "fast"]);
+    release();
+  });
+
+  test("S2: the same relay frame delivered twice is dropped, and the session lives on", async () => {
+    const r = await rig();
+    const seen: string[] = [];
+    unregister.push(registerSessionOp("subscribe-global", async (_ch, body) => void seen.push((body as { sub: string }).sub)));
+    // Capture the frames the manager is handed, then hand the first one in again with the same relay seq.
+    const frames: Array<Parameters<SessionManager["onFrame"]>[1]> = [];
+    const orig = r.manager.onFrame.bind(r.manager);
+    r.manager.onFrame = (n, d) => (frames.push(d), orig(n, d));
+    await r.connect();
+    await r.phone.subscribeGlobal("a");
+    await until(() => seen.includes("a"));
+    const last = frames[frames.length - 1]!;
+    await r.manager.onFrame(r.deviceId, last);
+    await r.phone.subscribeGlobal("b");
+    await until(() => seen.includes("b"));
+    expect(seen).toEqual(["a", "b"]);
+    expect(r.manager.activeSessions()).toHaveLength(1);
+  });
+});
+
+describe("the in-flight cap", () => {
+  test("an op past MAX_INFLIGHT_OPS is refused as busy and audited, never run; once the held ops finish the session takes ops again", async () => {
+    const r = await rig();
+    let release: () => void = () => undefined;
+    const gate = new Promise<void>((res) => void (release = res));
+    const started: string[] = [];
+    unregister.push(registerSessionOp("subscribe-global", async (_ch, body) => {
+      const sub = (body as { sub: string }).sub;
+      started.push(sub);
+      if (sub.startsWith("held")) await gate;
+    }));
+    await r.connect();
+    for (let i = 0; i < MAX_INFLIGHT_OPS; i++) await r.phone.subscribeGlobal(`held${i}`);
+    // every op up to the cap runs at once (none waits for another) ...
+    await until(() => started.length === MAX_INFLIGHT_OPS);
+    // The relay holds up to 64 frames until the core acknowledges them, and the core's acks are paced (45 a second): wait until every held
+    // frame is acknowledged, so the next one is not answered `full` by the relay before it ever reaches the session.
+    await until(() => relay!.mailboxes().every((m) => m.queuedForCore === 0));
+    // ... and the one past it is refused, not queued
+    await r.phone.subscribeGlobal("over");
+    const err = await r.phone.next<{ code: string; id: string | null }>("error");
+    expect(err).toMatchObject({ code: "busy", id: null });
+    expect(started).not.toContain("over");
+    expect(r.audit.filter((a) => a.action === "refusal" && a.fields.resultCode === "busy")).toHaveLength(1);
+    expect(r.manager.activeSessions()).toHaveLength(1);
+    release();
+    await r.phone.subscribeGlobal("after");
+    await until(() => started.includes("after"));
+    expect(r.phone.ended).toBe(false);
+    expect(r.phone.received("error")).toHaveLength(1);
+  });
+});
+
+describe("R5-S2: removals past the in-flight cap", () => {
+  test("with the cap full, a removal (an unsubscribe here) still runs; a non-removal is still refused busy", async () => {
+    const r = await rig({ deps: { isRemoval: (type) => type === "unsubscribe" } });
+    expect(REMOVAL_HEADROOM_OPS).toBeGreaterThan(0);
+    let release: () => void = () => undefined;
+    const gate = new Promise<void>((res) => void (release = res));
+    const started: string[] = [];
+    const removed: string[] = [];
+    unregister.push(registerSessionOp("subscribe-global", async (_ch, body) => {
+      const sub = (body as { sub: string }).sub;
+      started.push(sub);
+      if (sub.startsWith("held")) await gate;
+    }));
+    unregister.push(registerSessionOp("unsubscribe", async (_ch, body) => void removed.push((body as { sub: string }).sub)));
+    await r.connect();
+    try {
+      for (let i = 0; i < MAX_INFLIGHT_OPS; i++) await r.phone.subscribeGlobal(`held${i}`);
+      await until(() => started.length === MAX_INFLIGHT_OPS);
+      await until(() => relay!.mailboxes().every((m) => m.queuedForCore === 0));
+      await r.phone.unsubscribe("held0");
+      await until(() => removed.includes("held0"));
+      expect(r.phone.received("error")).toHaveLength(0);
+      await until(() => relay!.mailboxes().every((m) => m.queuedForCore === 0));
+      await r.phone.subscribeGlobal("over");
+      expect(await r.phone.next<{ code: string }>("error")).toMatchObject({ code: "busy" });
+      expect(started).not.toContain("over");
+    } finally {
+      release();
+    }
+  });
+});
+
+describe("R5-S3: an op already dispatched when its session ends", () => {
+  test("an ordered op waiting behind a slow one never runs once the session has ended", async () => {
+    const r = await rig();
+    let release: () => void = () => undefined;
+    const gate = new Promise<void>((res) => void (release = res));
+    let resizeStarted = false;
+    let resizeDone = false;
+    const detached: string[] = [];
+    unregister.push(registerSessionOp("terminal-resize", async () => {
+      resizeStarted = true;
+      await gate;
+      resizeDone = true;
+    }));
+    unregister.push(registerSessionOp("terminal-detach", async (_ch, body) => void detached.push((body as { taskId: string }).taskId)));
+    await r.connect();
+    await r.phone.terminal.resize("t1", 80, 24);
+    await until(() => resizeStarted);
+    await r.phone.terminal.detach("t1");
+    // The detach frame is decrypted and dispatched (queued behind the resize) once the relay has it acknowledged.
+    await until(() => relay!.mailboxes().every((m) => m.queuedForCore === 0));
+    r.manager.endDeviceSessions(r.deviceId, "revoked");
+    expect(r.manager.activeSessions()).toHaveLength(0);
+    release();
+    await until(() => resizeDone);
+    // The queued op would run in the microtasks right after the resize settles; give them every chance to.
+    for (let i = 0; i < 10; i++) await Promise.resolve();
+    await sleep(20);
+    expect(detached).toEqual([]);
+  });
+});
+
+describe("R2: a redelivered handshake frame, and ordered terminal ops", () => {
+  test("R2-S1: the handshake frame delivered again after the session opened is dropped, and the session lives on", async () => {
+    const r = await rig();
+    const seen: string[] = [];
+    unregister.push(registerSessionOp("subscribe-global", async (_ch, body) => void seen.push((body as { sub: string }).sub)));
+    const frames: Array<Parameters<SessionManager["onFrame"]>[1]> = [];
+    const orig = r.manager.onFrame.bind(r.manager);
+    r.manager.onFrame = (n, d) => (frames.push(d), orig(n, d));
+    await r.connect();
+    // The first frame the manager took was the phone's handshake message; the relay hands it over again (a reconnect before the ack).
+    const handshake = frames[0]!;
+    await r.manager.onFrame(r.deviceId, handshake);
+    expect(r.manager.activeSessions()).toHaveLength(1);
+    await r.phone.subscribeGlobal("after");
+    await until(() => seen.includes("after"));
+    expect(seen).toEqual(["after"]);
+    expect(r.phone.ended).toBe(false);
+    expect(r.manager.activeSessions()).toHaveLength(1);
+  });
+
+  test("R2-S2: terminal ops of one session run one at a time, in arrival order, while other ops stay concurrent", async () => {
+    const r = await rig();
+    let release: () => void = () => undefined;
+    const gate = new Promise<void>((res) => void (release = res));
+    const order: string[] = [];
+    unregister.push(
+      registerSessionOp("terminal-resize", async (_ch, body) => {
+        const b = body as { cols: number };
+        order.push(`resize-${b.cols}-start`);
+        if (b.cols === 100) await gate;
+        order.push(`resize-${b.cols}-end`);
+      }),
+      registerSessionOp("terminal-detach", async () => void order.push("detach")),
+      registerSessionOp("subscribe-global", async (_ch, body) => void order.push(`sub-${(body as { sub: string }).sub}`)),
+    );
+    await r.connect();
+    await r.phone.terminal.resize("t1", 100, 30); // blocked, like an attach still awaiting its lookup
+    await until(() => order.includes("resize-100-start"));
+    await r.phone.terminal.detach("t1"); // arrives while the first is in flight: it must wait its turn
+    await r.phone.subscribeGlobal("x"); // a different kind of op is not held
+    await until(() => order.includes("sub-x"), 1500);
+    expect(order).toEqual(["resize-100-start", "sub-x"]);
+    release();
+    await until(() => order.includes("detach"));
+    expect(order).toEqual(["resize-100-start", "sub-x", "resize-100-end", "detach"]);
+  });
+
+  test("R2-S2: a listener added to a session that already ended is told at once, so what it set up is torn down", async () => {
+    const r = await rig();
+    await r.connect();
+    const ch = r.manager.channelFor(r.deviceId)!;
+    r.manager.endDeviceSessions(r.deviceId, "revoked");
+    const reasons: string[] = [];
+    ch.onClose((reason) => void reasons.push(reason));
+    expect(reasons).toEqual(["ended"]);
+  });
+});
+
 describe("sending", () => {
   test("a channel sends chunked, padded messages the phone reassembles (a 300 KB response)", async () => {
     const r = await rig();
@@ -336,21 +567,36 @@ describe("rekey", () => {
     const r = await rig({ deps: { limits: { rekeyMs: 60 } } });
     await r.connect();
     const ch = r.manager.channelFor(r.deviceId)!;
-    await sleep(250);
+    // The interval sends the rekeys (no message budget is near); messages under the new keys still arrive.
+    await until(() => r.phone.rekeysReceived >= 2, 3000);
     ch.send("ok", { id: "after" });
     expect((await r.phone.next<{ id: string }>("ok")).id).toBe("after");
+    expect(r.manager.activeSessions()).toHaveLength(1);
   });
 });
 
 describe("lifetimes and the kill switches", () => {
   test("15 idle minutes (scaled down) end it; activity keeps it", async () => {
-    const r = await rig({ deps: { limits: { idleMs: 400 } } });
+    // The session's clock is the test's: wall-clock gaps under load can neither end it early nor keep it alive.
+    let t = Date.now();
+    let ticks = 0;
+    const r = await rig({ deps: { limits: { idleMs: 400 }, now: () => t, setInterval: (fn: () => void, ms: number) => setInterval(() => (ticks++, fn()), ms) } });
+    const got: string[] = [];
+    unregister.push(registerSessionOp("unsubscribe", async (_ch, body) => void got.push((body as { sub: string }).sub)));
     await r.connect();
+    const twoTicks = async () => {
+      const n = ticks;
+      await until(() => ticks >= n + 2, 3000);
+    };
     for (let i = 0; i < 3; i++) {
-      await sleep(200);
+      t += 300; // under the idle limit since the last activity
       await r.phone.sendMessage("unsubscribe", { sub: `k${i}` });
+      await until(() => got.includes(`k${i}`));
+      await twoTicks();
     }
+    // 900 ms of session time have passed, more than the idle limit, but never 400 without activity
     expect(r.manager.activeSessions()).toHaveLength(1);
+    t += 500;
     await until(() => r.manager.activeSessions().length === 0, 3000);
     expect(r.audit.some((a) => a.action === "session-close" && a.fields.resultCode === "idle")).toBe(true);
   });

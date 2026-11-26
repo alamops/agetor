@@ -1,4 +1,4 @@
-import { afterEach, describe, expect, test } from "bun:test";
+import { afterEach, describe, expect, jest, test } from "bun:test";
 import { x25519 } from "@noble/curves/ed25519.js";
 import { fromBase64, toBase64Url, toHex } from "@agetor/remote-protocol/bytes";
 import { canonicalBytes } from "@agetor/remote-protocol/canonical-json";
@@ -6,7 +6,7 @@ import { collapseId, pushRequestMac } from "@agetor/remote-protocol/derive";
 import { SEALED_PUSH_BYTES, openPush } from "@agetor/remote-protocol/push-payload";
 import type { RemoteDeviceRow } from "../../shared/remote-types.ts";
 import type { NotificationDecision } from "../notification-policy.ts";
-import { createPhoneSink, type PushBody } from "./push.ts";
+import { PUSH_TIMEOUT_MS, createPhoneSink, type PushBody } from "./push.ts";
 
 interface Received {
   headers: Record<string, string>;
@@ -131,6 +131,41 @@ describe("the phone sink", () => {
     const down = createPhoneSink({ devices: async () => [device("a1")], pushUrl: () => "http://127.0.0.1:1", atTheMac: () => false });
     await down.deliver(decision("waiting"));
     expect(down.status()).toEqual({ configured: true });
+  });
+
+  test("a gateway that takes the request and never answers is given up after PUSH_TIMEOUT_MS: the delivery settles, nothing is marked dead", async () => {
+    // A fetch that behaves like the real one with respect to its signal: it settles only when the signal aborts.
+    let calls = 0;
+    const hanging = ((_url: string, init?: RequestInit) => {
+      calls++;
+      return new Promise<Response>((_res, rej) => {
+        const signal = init?.signal;
+        if (!signal) return; // no deadline: this request would hang forever
+        signal.addEventListener("abort", () => rej(signal.reason));
+      });
+    }) as unknown as typeof fetch;
+    const dead: string[] = [];
+    jest.useFakeTimers();
+    try {
+      const sink = createPhoneSink({ devices: async () => [device("a1")], pushUrl: () => "http://gateway.test", atTheMac: () => false, fetch: hanging, markDead: async (id) => void dead.push(id) });
+      let settled = false;
+      const delivered = Promise.resolve(sink.deliver(decision("waiting"))).then(() => void (settled = true));
+      const flush = async () => {
+        for (let i = 0; i < 50; i++) await Promise.resolve();
+      };
+      await flush();
+      expect(calls).toBe(1);
+      jest.advanceTimersByTime(PUSH_TIMEOUT_MS - 1);
+      await flush();
+      expect(settled).toBe(false);
+      jest.advanceTimersByTime(2);
+      await flush();
+      expect(settled).toBe(true);
+      await delivered;
+      expect(dead).toEqual([]);
+    } finally {
+      jest.useRealTimers();
+    }
   });
 
   test("a decision with no task is not pushed", async () => {

@@ -74,6 +74,20 @@ export function setWebviewPresence(p: { focused: boolean; selectedTaskId: string
   emit();
 }
 
+/**
+ * The window closed (the app keeps running on macOS): nothing is open any more. The webview can no longer report, so its last report
+ * would otherwise keep `selectedTaskId` set and silence that task's OS notifications until a new window reports. The native focus state
+ * is left to the native `blur` the caller sends.
+ */
+export function clearWebviewPresence(): void {
+  const was = effectiveFocus();
+  webviewFocused = false;
+  selectedTaskId = null;
+  view = null;
+  touchFocus(was);
+  emit();
+}
+
 export function setAppAttached(attached: boolean): void {
   appAttached = attached;
   if (!attached) {

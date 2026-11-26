@@ -1,6 +1,6 @@
 // TS3 and invariant 12 (SC7): the hash-chained audit. In-process on a real SQLite file: the chain verifies, a forged row is detected, a trim leaves
 // an anchor that still verifies, and an attempt with no result reads "outcome unknown" even after the process that wrote it is gone.
-import { afterAll, afterEach, describe, expect, test } from "bun:test";
+import { afterAll, afterEach, beforeEach, describe, expect, test } from "bun:test";
 import { pinDataDir, principal } from "./inproc.ts";
 
 const DATA = pinDataDir("audit");
@@ -13,14 +13,19 @@ const asyncDb = await import("../../db-async.ts");
 const { db } = await import("../../db.ts");
 const { rmTestDataDir } = await import("../../test-data-dir.ts");
 afterAll(() => rmTestDataDir(DATA));
-afterEach(() => {
+/** Empties the log and restores the append-only triggers. Runs before AND after each test: another file in the same bun process
+ * (the process shares one `db.ts` singleton) can leave rows behind, and the chain tests count rows and read the head's seq. */
+function resetAudit(): void {
   db.run(`DROP TRIGGER IF EXISTS remote_audit_no_update`);
   db.run(`DROP TRIGGER IF EXISTS remote_audit_no_delete`);
+  db.run(`DROP TRIGGER IF EXISTS remote_audit_block`);
   db.run(`DELETE FROM remote_audit`);
   db.run(`DELETE FROM sqlite_sequence WHERE name = 'remote_audit'`);
   db.run(`CREATE TRIGGER remote_audit_no_update BEFORE UPDATE ON remote_audit BEGIN SELECT RAISE(ABORT, 'remote_audit is append-only'); END`);
   db.run(`CREATE TRIGGER remote_audit_no_delete BEFORE DELETE ON remote_audit BEGIN SELECT RAISE(ABORT, 'remote_audit is append-only'); END`);
-});
+}
+beforeEach(resetAudit);
+afterEach(resetAudit);
 
 describe("the chain", () => {
   test("rows verify, the head is the last row, and every row names the one before it", async () => {
@@ -71,7 +76,7 @@ describe("invariant 12: audited first", () => {
     const routes = { "/runs/:id/cancel": { POST: handler }, "/tasks": { GET: async () => Response.json({ tasks: [] }) } };
     const router = createRouter({
       limiter: new RateLimiter(), idempotency: createIdempotency(), decisions: createDecisions(), audit,
-      lookups: { tmuxPrompt: async () => null, fxPermission: async () => null, askQuestionTask: async () => null, runTask: async () => "t1", previewInScope: async () => true, task: async () => ({ agent: "claude-code", mode: "ask" }) },
+      lookups: { tmuxPrompt: async () => null, fxPermission: async () => null, askQuestionTask: async () => null, runTask: async () => "t1", previewInScope: async () => true, planApprovalFlipsToAuto: async () => false, task: async () => ({ agent: "claude-code", mode: "ask" }) },
       routes: () => routes as never,
     });
     return { router, audit };

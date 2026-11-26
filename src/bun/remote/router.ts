@@ -21,12 +21,14 @@ import { toHex } from "@agetor/remote-protocol/bytes";
 import { canonicalBytes } from "@agetor/remote-protocol/canonical-json";
 import { sha256Hex } from "@agetor/remote-protocol/derive";
 import { levelAtLeast } from "@agetor/remote-protocol/levels";
+import { planApprovalFlipsToAuto } from "../../shared/plan-approval.ts";
 import type { AppEvent } from "../../shared/types.ts";
 import { everyRoute, markDeviceRequest, type HttpMethod, type RemotePolicy } from "../route-policy.ts";
 import { servedRoutes, type ServedHandler, type ServedRoutes } from "../route-table.ts";
 import type { Audit } from "./audit.ts";
 import { runsWithoutAsking } from "./autonomy.ts";
 import { DecisionError, type Decisions } from "./decisions.ts";
+import { resolveHarnessKind } from "./harness-kind.ts";
 import { requestHash, type Idempotency } from "./idempotency.ts";
 import type { RateLimiter } from "./rate-limit.ts";
 import { classifyRoute, type ClassifyLookups } from "./route-classes.ts";
@@ -208,8 +210,15 @@ const NO_SERVER = { timeout: () => undefined, requestIP: () => null, upgrade: ()
 
 // ── the router ────────────────────────────────────────────────────────────────────────────────────────────────────────────
 
+export interface InvokeOptions {
+  /** Whether the session the call came on is still active. Checked before the call is recorded and run (a revoke mid-call stops it). */
+  live?: () => boolean;
+}
+
 export interface Router {
-  invoke(principal: DevicePrincipal, req: RouteRequest): Promise<RouteResult>;
+  invoke(principal: DevicePrincipal, req: RouteRequest, opts?: InvokeOptions): Promise<RouteResult>;
+  /** Whether a request names a remote route whose rate is `stop` (a removal the session's in-flight cap never refuses). */
+  isStopCall(method: string, path: string): boolean;
 }
 
 export function createRouter(deps: RouterDeps): Router {
@@ -225,7 +234,7 @@ export function createRouter(deps: RouterDeps): Router {
     return entry[method] ?? null;
   };
 
-  async function invoke(principal: DevicePrincipal, req: RouteRequest): Promise<RouteResult> {
+  async function invoke(principal: DevicePrincipal, req: RouteRequest, opts: InvokeOptions = {}): Promise<RouteResult> {
     const routeLabel = `${req.method} ${req.path}`;
     const refuse = (status: number, code: string, message: string, extra: Record<string, unknown> = {}): RouteResult => {
       void deps.audit.refusal(principal.deviceId, code, routeLabel).catch(() => undefined);
@@ -239,16 +248,17 @@ export function createRouter(deps: RouterDeps): Router {
     const m = matchPath(compiled(), req.method, req.path);
     const entry = m?.route.methods.get(req.method);
     if (!m || entry === undefined) return errorResult(404, "not-found", "no such route");
-    if (entry === "none") return refuse(403, "not-remote", "this route is not available from a phone");
+    // 3. rate, taken as soon as the route is known so that a call refused below (not remote, level too low) is limited too, instead of a
+    // device writing refusals as fast as it can send them. A stop-class call is never limited. A call the route's rate refuses may still be
+    // a removal (a bare reject, a bare skip): that is only known once it is classified, so the refusal is applied after step 4.
+    const rate = deps.limiter.check(principal.deviceId, entry === "none" ? "normal" : entry.rate);
+    const rateRefusal = (): RouteResult | null => (rate.ok ? null : refuse(429, "rate-limited", "too many requests", { retryAfterMs: rate.retryAfterMs }));
+    if (entry === "none") return rateRefusal() ?? refuse(403, "not-remote", "this route is not available from a phone");
     const { params } = m;
     const route = { route: m.route.route, method: req.method, policy: entry };
     if (!levelAtLeast(principal.level, route.policy.level)) {
-      return refuse(403, "level", "this device's level is too low for this route", { required: route.policy.level, level: principal.level });
+      return rateRefusal() ?? refuse(403, "level", "this device's level is too low for this route", { required: route.policy.level, level: principal.level });
     }
-
-    // 3. rate (a stop-class call is never limited)
-    const rate = deps.limiter.check(principal.deviceId, route.policy.rate);
-    if (!rate.ok) return refuse(429, "rate-limited", "too many requests", { retryAfterMs: rate.retryAfterMs });
 
     // 4. classify
     const query = new URLSearchParams(req.query ?? "");
@@ -257,6 +267,11 @@ export function createRouter(deps: RouterDeps): Router {
       cls = await classifyRoute({ method: req.method, route: route.route, params, query, body: req.body }, route.policy, deps.lookups);
     } catch {
       return errorResult(500, "internal", "the request could not be classified");
+    }
+    // Removing authority or work is never rate-limited (invariant 9), whichever route carries it.
+    if (cls.class !== "remove") {
+      const limited = rateRefusal();
+      if (limited) return limited;
     }
     if (cls.class === "never") {
       if (cls.reason === "gone") return errorResult(404, "gone", "what you are answering no longer exists");
@@ -299,6 +314,11 @@ export function createRouter(deps: RouterDeps): Router {
       return await done(errorResult(500, "internal", "the step-up check failed"), false);
     }
 
+    // The session can have ended while the call was classified or checked (a revoke, Revoke all, Remote access off): stop before anything
+    // is recorded or run. Nobody is left to read the answer.
+    const ended = (): boolean => opts.live !== undefined && !opts.live();
+    if (ended()) return await done(errorResult(410, "session-ended", "the session ended"), false);
+
     // 7. attempt (a call that changes anything is audited before it runs; a read is not)
     let attemptSeq: number | null = null;
     if (cls.class !== "read") {
@@ -311,6 +331,12 @@ export function createRouter(deps: RouterDeps): Router {
         // No audit row, no action.
         return await done(errorResult(500, "audit-failed", "the call could not be recorded, so it was not made"), false);
       }
+    }
+
+    if (ended()) {
+      // Recorded, but not run: the result row says so, so the audit never shows an attempt with no outcome.
+      if (attemptSeq !== null) await deps.audit.result(attemptSeq, "session-ended", { deviceId: principal.deviceId }).catch(() => undefined);
+      return await done(errorResult(410, "session-ended", "the session ended"), false);
     }
 
     // 8. the handler
@@ -396,12 +422,13 @@ export function createRouter(deps: RouterDeps): Router {
     }
   }
 
-  return { invoke };
-}
+  function isStopCall(method: string, path: string): boolean {
+    const m = matchPath(compiled(), method, path);
+    const entry = m?.route.methods.get(method as HttpMethod);
+    return entry !== undefined && entry !== "none" && entry.rate === "stop";
+  }
 
-/** The pinned entry point (plan §3.3): one call of the router. */
-export function invokeRoute(router: Router, principal: DevicePrincipal, req: RouteRequest): Promise<RouteResult> {
-  return router.invoke(principal, req);
+  return { invoke, isStopCall };
 }
 
 // ── the live lookups ──────────────────────────────────────────────────────────────────────────────────────────────────────
@@ -425,9 +452,14 @@ export function createLiveLookups(): RouterDeps["lookups"] {
     async runTask(runId) {
       return (await (await db()).runs.get(runId))?.taskId ?? null;
     },
+    async planApprovalFlipsToAuto(taskId) {
+      const t = await (await db()).tasks.get(taskId);
+      return !t || planApprovalFlipsToAuto(t);
+    },
     async task(taskId) {
       const t = await (await db()).tasks.get(taskId);
-      return t ? { agent: t.agent, mode: t.mode ?? null, title: t.title ?? null } : null;
+      // `agent` here is the harness KIND (autonomy.ts is keyed by kind), resolved from the task's harness id.
+      return t ? { agent: await resolveHarnessKind(t.agent), mode: t.mode ?? null, title: t.title ?? null } : null;
     },
     async previewInScope(taskId, path) {
       const t = await (await db()).tasks.get(taskId);
