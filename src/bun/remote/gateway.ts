@@ -475,6 +475,18 @@ export async function startRemoteGateway(opts: GatewayOptions): Promise<RemoteGa
   stopFns.push(subscribeChanges(() => void gate.recompute()));
   await refreshTrusted();
   gate.start(d.gatePollMs ?? 5000);
+  // The device set changes through this gateway (pairing, revoke), which refreshes it at once; this slower refresh, only while the switch is
+  // on, also notices a change made behind its back (a revoke from another process, a row restored from a backup) and joins or leaves mailboxes.
+  const trustedPoll = setInterval(() => {
+    void remoteOn().then(async (on) => {
+      if (!on || stopped) return;
+      const before = trustedKnown;
+      await refreshTrusted();
+      if (trustedKnown || before) await openDeviceGroups().catch(() => undefined);
+    }).catch(() => undefined);
+  }, d.gatePollMs ?? 5000);
+  trustedPoll.unref();
+  stopFns.push(() => clearInterval(trustedPoll));
 
   const gateway: RemoteGateway = {
     enabled: true,

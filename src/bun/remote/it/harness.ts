@@ -79,7 +79,9 @@ export async function startCore(opts: CoreOptions = {}): Promise<CoreHandle> {
   const dataDir = opts.reuse?.dataDir ?? mkdtempSync(path.join(tmpdir(), "agt-it-core-"));
   const helperDir = opts.reuse?.helperDir ?? path.join(dataDir, "..", `${path.basename(dataDir)}-helper`);
   mkdirSync(helperDir, { recursive: true });
-  const token = toHex(crypto.getRandomValues(new Uint8Array(16)));
+  // `coreSpawn` scrubs the master token from a child's env (the point of it), so the harness authenticates with the CLI token the core writes to
+  // its creds file, the same way `agetor` does.
+  let token = "";
   const port = await freePort();
 
   let devices: SeededDevice[] = opts.reuse?.devices ?? [];
@@ -100,7 +102,6 @@ export async function startCore(opts: CoreOptions = {}): Promise<CoreHandle> {
     NODE_ENV: undefined,
     AGETOR_DATA_DIR: dataDir,
     AGETOR_API_PORT: String(port),
-    AGETOR_API_TOKEN: token,
     AGETOR_DAEMON_IDLE_MS: "600000",
     AGETOR_HEADLESS_NOTIFICATIONS: "0",
     AGETOR_E2E_HARNESS_SEAMS: "1",
@@ -123,7 +124,11 @@ export async function startCore(opts: CoreOptions = {}): Promise<CoreHandle> {
     child = coreSpawn(["bun", "src/bun/headless.ts"], { cwd: REPO_ROOT, env: env as Record<string, string>, stdin: "ignore", stdout: "ignore", stderr: "ignore" });
     await until(async () => {
       try {
-        return (await fetch(`http://127.0.0.1:${port}/info`, { headers: { authorization: `Bearer ${token}` } })).status === 200;
+        const creds = JSON.parse(readFileSync(path.join(dataDir, "agetor-core.json"), "utf8")) as { token?: string; port?: number; pid?: number };
+        if (creds.port !== port || !creds.token || creds.pid !== child?.pid) return false;
+        const ok = (await fetch(`http://127.0.0.1:${port}/info`, { headers: { authorization: `Bearer ${creds.token}` } })).status === 200;
+        if (ok) token = creds.token;
+        return ok;
       } catch {
         return false;
       }
@@ -132,7 +137,7 @@ export async function startCore(opts: CoreOptions = {}): Promise<CoreHandle> {
   await boot();
 
   const handle: CoreHandle = {
-    port, token, dataDir, helperDir, relay, devices, corePub,
+    port, get token() { return token; }, dataDir, helperDir, relay, devices, corePub,
     pid: () => child?.pid ?? -1,
     api: (method, p, body, tok) =>
       fetch(`http://127.0.0.1:${port}${p}`, {
