@@ -6,9 +6,9 @@
 | Source | Spec `docs/specs/remote-readiness-spec.md` (rev 40, unamended; the grill's amendments land as task D0) and `docs/specs/remote-relay-contract.md`; investigation `docs/plans/remote-readiness-investigation.md`; grill record `docs/plans/remote-readiness-grill.md` (D1–D19, C1–C9, E1–E6) with `docs/plans/remote-readiness-grill/round-{1,2,3}/` |
 | Flags | none |
 | Gates | Grilled (3 owner rounds, nothing skipped) and **approved by the owner on 2026-11-25**, with three decisions taken at approval: full `bun run check` is the required CI job (A-2), switch-account is session-only (A-4), and delivery is one PR with per-wave commits (A-11). See §8.2. |
-| Status | planned |
-| Branch | TBD — set when execution starts (expected `feature/agetor-remote-ready`, base `1d37cdc2` = v1.2.2) |
-| Base SHA | TBD — set when execution starts |
+| Status | **implemented** on `feature/agetor-remote-ready` (waves 0–6 committed, one checkpoint commit per wave; wave 7 is this refresh and the e2e specs). **K1V (live key-helper verification) was NOT run: it is owner-gated** (App ID and Developer ID profile); see `docs/plans/remote-readiness-k1.md`. **W1 verdict:** `ts-json-schema-generator` expressed all 11 route-body types, no hand-written fallback was needed. **Verification at the final head:** typecheck, `lint:async`, the package tests (134), the script tests (18) and every changed or affected `bun test` file (7,500 tests across remote, route-policy, migrations, db, server, background, headless, cli, mainview, shared) pass. The last full `bun test` run (24 min, before the final fixes) had 16 failures: 14 were this change's own and are fixed (three migration-list tests, the spawn allowlist for the IT harness, `route-db-errors` fixtures, two load-sensitive tests in `server-remote-access.test.ts`), and 2 are pre-existing on `1d37cdc2` (`archiveTask keeps a dirty worktree on disk…`, `archiving a multi task with one dirty repository…`, reproduced on the base commit). Integration suites `src/bun/remote/it`: 82 tests against a real headless core. e2e (Playwright, one run at a time): `remote-access-devices` (2), `phone-terminal-banner` (1), `one-notification-per-task`, `event-stream-resume`, `cursor-stream` and `background-settings` all pass. Known red on `main`, untouched: `tmux-socket.test.ts`, `reconcile.test.ts` "startTask honors cancel", `model-discovery.test.ts` copilot refreshAllModels, `github-network.test.ts`, and the two archive tests above. |
+| Branch | `feature/agetor-remote-ready` |
+| Base SHA | `1d37cdc2` (v1.2.2). Wave commits: 0 `ee6bb316`, 1 `186aa6c6`, 2 `cda89b2a`, 3 `5aba2fa0`, 4 `2f723b6b`, 5 `e4cc2b7d`, 6 `56917fcb`, 7 `b9a91366` |
 
 Reading guide. §1 says what "done" means and which production path produces each result. §3 pins the interfaces several tasks code against at once. §4 is the contract each implementation agent works from: every task lists the files it owns, the scenarios it must prove, and what wires it in. §6 orders the tasks into waves whose owned files never overlap.
 
@@ -1611,3 +1611,14 @@ The planner's defaults, approved with the plan:
 | External security review (R16) | Out of scope for code; required before the first TestFlight build connects | Owner schedules it after PR F |
 | Raising a device's level without re-pairing | Out of scope by design | D7 (owner): revoke and pair again |
 | Fleet decision "phones get a per-task path check" (2026-11-24) superseded | Done | Grill step (decision 76298acb updated) |
+
+## 10. Changes made during execution (not ratified by the owner)
+
+- **Claude plan row 1 always needs the unlock window**, whatever the task's current mode (the plan said "plus unlock (D9)"; the first implementation read the live mode and the integration suite showed an ask-mode task skipped it although the row makes it autonomous): `Classified.alsoUnlock: "always"`.
+- **Session ciphertexts never use the pacer's priority lane**; the pacer spaces frames evenly (one per 1000/45 ms) and caps 192 KB per second (the relay holds 256 KB the phone has not acknowledged, then drops). The plan only named 45 frames/s and 1.9 MB/10 s.
+- **The router matches over every route and method** of `ROUTE_POLICY`, method-aware as `Bun.serve` is, then checks the winner's remote policy (the plan said the remote routes only).
+- **`rekey` is an in-band control message** (`dir: "both"`); `RUN_EVENT.id` and `subagentId` are optional for live-only frames.
+- **The gateway refreshes its trusted-device set every 5 s while the switch is on**, so a change made behind its back is noticed.
+- **`agetor remote revoke-all` needs `--yes`**; `GET /remote-access/devices` answers 503 `helper-unavailable` when the key helper is missing.
+- **Tests outside the plan's list were updated** for additive changes: three migration-list expectations, the `route-db-errors` policy fixtures (`remote: "none"` is now required), the remote CLI and background-routes status expectations, and one wording check in `e2e/background-settings.spec.ts`.
+
