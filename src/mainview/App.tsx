@@ -69,6 +69,8 @@ import { OwedPipelineAlerts } from "@/lib/owed-pipeline-alerts";
 import { findTaskById } from "@/lib/notification-open";
 import { publishCloneProgress } from "@/lib/clone-progress";
 import { publishBackgroundStatus } from "@/lib/background";
+import { publishRemoteChanged, remoteActionToast } from "@/lib/remote-access-store";
+import { applyPhoneTerminalEvent, seedPhoneTerminals } from "@/lib/phone-terminal";
 import { QuitConfirmDialog } from "@/components/QuitConfirmDialog";
 import type { QuitRequestEvent } from "@/lib/quit-dialog";
 import { publishPipelineGlobalEvent } from "@/lib/pipeline-events";
@@ -1513,10 +1515,23 @@ function AppInner() {
         })();
         return;
       }
+      if (ev.type === "phone_terminal") {
+        // A phone's terminal attached to a task or detached: the run panel's banner reads this module store.
+        applyPhoneTerminalEvent(ev);
+        publishRemoteChanged();
+        return;
+      }
+      if (ev.type === "remote_action") {
+        // A phone allowed, approved or decided something, or a device was paired or revoked: say so, and let Settings refresh.
+        toast.message(remoteActionToast(ev));
+        publishRemoteChanged();
+        return;
+      }
       if (ev.type === "background_changed") {
         // Forwarded to the module store the Settings background section
         // subscribes to — never opens its own event stream.
         publishBackgroundStatus(ev.status);
+        publishRemoteChanged();
         return;
       }
       if (ev.type !== "quit_request") return;
@@ -1524,6 +1539,15 @@ function AppInner() {
     });
     return cancel;
   }, [refreshAgents, refreshAgentModels, refreshHarnessModels, openTask, openPipelineAttention]);
+
+  // The phone terminals attached right now (a banner for one attached before this window opened), read once; live changes arrive as
+  // `phone_terminal` app events, handled in the single subscription above.
+  useEffect(() => {
+    void api
+      .getRemoteAccess()
+      .then((s) => seedPhoneTerminals(s.attachedTerminals ?? []))
+      .catch(() => undefined);
+  }, []);
 
   // App-wide lifecycle subscription. Drives toasts + native notifications.
   //

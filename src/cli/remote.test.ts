@@ -136,15 +136,15 @@ beforeEach(() => {
 test("remote status reports the core's remote-access setting (and bare `remote` is status)", async () => {
   const off = await agetor(["remote", "status"], SERVER_DIR);
   expect(off.code).toBe(0);
-  expect(off.stdout.trim()).toBe("Remote access (preview): off");
+  expect(off.stdout.trim().split("\n")[0]).toBe("Remote access (preview): off");
 
   preferences.set(REMOTE_ACCESS_PREF_KEY, "on");
   const on = await agetor(["remote", "status"], SERVER_DIR);
   expect(on.code).toBe(0);
-  expect(on.stdout.trim()).toBe("Remote access (preview): on");
+  expect(on.stdout.trim().split("\n")[0]).toBe("Remote access (preview): on");
 
   const bare = await agetor(["remote"], SERVER_DIR);
-  expect(bare.stdout.trim()).toBe("Remote access (preview): on");
+  expect(bare.stdout.trim().split("\n")[0]).toBe("Remote access (preview): on");
   // Reading never changes it.
   expect(remoteIs()).toBe("on");
 });
@@ -160,10 +160,10 @@ test("remote off turns it off in the core and says so", async () => {
   preferences.set(REMOTE_ACCESS_PREF_KEY, "on");
   const res = await agetor(["remote", "off"], SERVER_DIR);
   expect(res.code).toBe(0);
-  expect(res.stdout.trim()).toBe("Remote access (preview): off");
+  expect(res.stdout.trim().split("\n")[0]).toBe("Remote access (preview): off");
   expect(remoteIs()).toBe("off");
   // A later read agrees.
-  expect((await agetor(["remote", "status"], SERVER_DIR)).stdout.trim()).toBe("Remote access (preview): off");
+  expect((await agetor(["remote", "status"], SERVER_DIR)).stdout.trim().split("\n")[0]).toBe("Remote access (preview): off");
 });
 
 test("remote off --json, and off when already off", async () => {
@@ -183,7 +183,9 @@ test("there is no `remote on`: it is refused before any request and changes noth
   for (const sub of ["on", "enable", "true"]) {
     const res = await agetor(["remote", sub], SERVER_DIR);
     expect(res.code).toBe(1);
-    expect(res.stderr).toContain(`unknown remote subcommand: ${sub} (use status | off)`);
+    expect(res.stderr).toContain(`unknown remote subcommand: ${sub} (use status | off |`);
+    // the list of what exists names neither `on` nor `pair`
+    expect(res.stderr.replace(/unknown remote subcommand: \S+/, "")).not.toMatch(/\b(on|pair)\b/);
   }
   expect(remoteIs()).toBe("on");
 
@@ -202,7 +204,7 @@ test("a stray flag or extra argument is refused with the usage line", async () =
   ]) {
     const res = await agetor(args, SERVER_DIR);
     expect(res.code).toBe(1);
-    expect(res.stderr).toContain("usage: agetor remote [status | off]");
+    expect(res.stderr).toContain("usage: agetor remote [status | off");
   }
   // `off --foo` must not have switched anything off.
   expect(remoteIs()).toBe("on");
@@ -216,4 +218,130 @@ test("remote status and off with no core fail instead of starting a daemon", asy
   }
   expect(existsSync(path.join(EMPTY_DIR, CORE_CREDS_FILENAME))).toBe(false);
   expect(existsSync(path.join(EMPTY_DIR, "daemon.log"))).toBe(false);
+});
+
+
+// ── devices, revoke, log (docs/architecture/remote-gateway.md) ─────────────────────────────────────────────────────────────────
+// The in-process core uses the fake key helper, and the rows are signed by its registry key the way a pairing signs them.
+import { p256 } from "@noble/curves/nist.js";
+import { x25519 } from "@noble/curves/ed25519.js";
+import { randomBytes, toHex } from "@agetor/remote-protocol/bytes";
+import type { RemoteLevel } from "@agetor/remote-protocol/levels";
+import { resolveDevice } from "./commands/remote.ts";
+
+let helperFake: import("../bun/remote/key-helper-fake.ts").FakeKeyHelper;
+let setHelper: typeof import("../bun/remote/key-helper-api.ts").setKeyHelperForTests;
+
+async function enroll(over: { name: string; level?: RemoteLevel; badSig?: boolean; id?: string }): Promise<string> {
+  const { registryEntryJson } = await import("../bun/remote/registry.ts");
+  const asyncDb = await import("../bun/db-async.ts");
+  const id = over.id ?? toHex(randomBytes(16));
+  const row = {
+    id, name: over.name, platform: "ios" as const, sessionPub: p256.getPublicKey(p256.utils.randomSecretKey(), false),
+    approvePub: p256.getPublicKey(p256.utils.randomSecretKey(), false), pushPub: x25519.getPublicKey(x25519.utils.randomSecretKey()), level: over.level ?? "respond", enrolledAt: Date.now(),
+  };
+  const sig = over.badSig ? new Uint8Array(64).fill(1) : helperFake.signRegistryEntry(id, registryEntryJson(row));
+  await asyncDb.op("remote.addDevice", [{ ...row, appVersion: "1", linkSecret: randomBytes(32), sig }, { ts: Date.now(), action: "pair", deviceId: id }]);
+  return id;
+}
+
+async function helperOn(): Promise<void> {
+  if (helperFake) return;
+  const { FakeKeyHelper } = await import("../bun/remote/key-helper-fake.ts");
+  ({ setKeyHelperForTests: setHelper } = await import("../bun/remote/key-helper-api.ts"));
+  helperFake = new FakeKeyHelper();
+  setHelper(helperFake);
+}
+
+test("remote devices lists the phones with their trust, and --json is the route's own shape; names are escaped", async () => {
+  await helperOn();
+  const db = await import("../bun/db.ts");
+  db.db.run(`DELETE FROM remote_devices`);
+  const good = await enroll({ name: "Ana's iPhone", level: "operate" });
+  await enroll({ name: "Forged\u202e", badSig: true });
+  const res = await agetor(["remote", "devices"], SERVER_DIR);
+  expect(res.code).toBe(0);
+  expect(res.stdout).toContain(good.slice(0, 8));
+  expect(res.stdout).toContain("Ana's iPhone");
+  expect(res.stdout).toContain("operate");
+  expect(res.stdout).toContain("NOT TRUSTED (signature)");
+  expect(res.stdout).not.toContain("\u202e");
+  const json = await agetor(["remote", "devices", "--json"], SERVER_DIR);
+  expect((JSON.parse(json.stdout) as { devices: unknown[] }).devices).toHaveLength(2);
+});
+
+test("remote revoke <device> by id prefix or exact name; an unknown or ambiguous one is refused and nothing is revoked", async () => {
+  await helperOn();
+  const db = await import("../bun/db.ts");
+  db.db.run(`DELETE FROM remote_devices`);
+  const a = await enroll({ name: "Ana", id: "ab" + "0".repeat(30) });
+  const b = await enroll({ name: "Ana", id: "ab" + "1".repeat(30) });
+  const c2 = await enroll({ name: "Ben" });
+  const ambiguous = await agetor(["remote", "revoke", "Ana"], SERVER_DIR);
+  expect(ambiguous.code).toBe(1);
+  expect(ambiguous.stderr).toContain("matches 2 devices");
+  const prefixTwo = await agetor(["remote", "revoke", "ab"], SERVER_DIR);
+  expect(prefixTwo.code).toBe(1); // under 4 characters is never a prefix
+  const unknown = await agetor(["remote", "revoke", "zzzzzz"], SERVER_DIR);
+  expect(unknown.code).toBe(1);
+  expect(unknown.stderr).toContain("no device matches");
+  const status = (id: string) => db.db.query<{ status: string }, [string]>(`SELECT status FROM remote_devices WHERE id = ?`).get(id)?.status;
+  expect([status(a), status(b), status(c2)]).toEqual(["active", "active", "active"]);
+
+  const byName = await agetor(["remote", "revoke", "Ben"], SERVER_DIR);
+  expect(byName.code).toBe(0);
+  expect(status(c2)).toBe("revoked");
+  const byPrefix = await agetor(["remote", "revoke", a.slice(0, 6)], SERVER_DIR);
+  expect(byPrefix.code).toBe(0);
+  expect(status(a)).toBe("revoked");
+  expect(status(b)).toBe("active");
+});
+
+test("remote revoke-all needs --yes, and with it revokes every phone", async () => {
+  await helperOn();
+  const db = await import("../bun/db.ts");
+  db.db.run(`DELETE FROM remote_devices`);
+  const id = await enroll({ name: "Ana" });
+  const refused = await agetor(["remote", "revoke-all"], SERVER_DIR);
+  expect(refused.code).toBe(1);
+  expect(refused.stderr).toContain("--yes");
+  expect(db.db.query<{ status: string }, [string]>(`SELECT status FROM remote_devices WHERE id = ?`).get(id)?.status).toBe("active");
+  const done = await agetor(["remote", "revoke-all", "--yes"], SERVER_DIR);
+  expect(done.code).toBe(0);
+  expect(db.db.query<{ status: string }, [string]>(`SELECT status FROM remote_devices WHERE id = ?`).get(id)?.status).toBe("revoked");
+});
+
+test("remote log prints the chain status and the rows; --limit is validated", async () => {
+  await helperOn();
+  const res = await agetor(["remote", "log", "--limit", "5"], SERVER_DIR);
+  expect(res.code).toBe(0);
+  expect(res.stdout).toContain("audit chain: intact");
+  expect(res.stdout).toContain("ACTION");
+  for (const bad of [["--limit", "0"], ["--limit", "x"], ["--limit"], ["--nope"]]) {
+    expect((await agetor(["remote", "log", ...bad], SERVER_DIR)).code, bad.join(" ")).toBe(1);
+  }
+});
+
+test("there is still no `pair` and no `on`", async () => {
+  for (const sub of ["pair", "on", "add", "level"]) {
+    const res = await agetor(["remote", sub], SERVER_DIR);
+    expect(res.code).toBe(1);
+    expect(res.stderr).toContain("unknown remote subcommand");
+  }
+});
+
+test("resolveDevice: an id prefix of 4+ characters or an exact name, never a guess", () => {
+  const mk = (id: string, name: string) => ({ id, name, platform: "ios" as const, appVersion: "1", level: "respond" as const, trust: "trusted" as const, enrolledAt: 1, lastSeenAt: null, pushRegistered: false, online: false });
+  const ds = [mk("abcd" + "0".repeat(28), "Ana"), mk("abce" + "0".repeat(28), "Ben"), mk("ffff" + "0".repeat(28), "Ana")];
+  expect(resolveDevice(ds, "Ben").name).toBe("Ben");
+  expect(resolveDevice(ds, "abcd").id.startsWith("abcd")).toBe(true);
+  expect(resolveDevice(ds, "ABCD").id.startsWith("abcd")).toBe(true);
+  expect(() => resolveDevice(ds, "Ana")).toThrow("matches 2 devices");
+  expect(() => resolveDevice(ds, "abc")).toThrow("no device matches");
+  expect(() => resolveDevice(ds, "")).toThrow("which device");
+  expect(() => resolveDevice(ds, "nobody")).toThrow("no device matches");
+});
+
+afterAll(() => {
+  setHelper?.(null);
 });

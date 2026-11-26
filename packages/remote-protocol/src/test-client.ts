@@ -185,8 +185,8 @@ export class TestPhone {
     for (const w of list.splice(0)) w();
   }
 
-  private async nextFrame(pred: (f: RelayFrame) => boolean, generation = this.generation): Promise<RelayFrame> {
-    const deadline = this.now() + this.timeoutMs;
+  private async nextFrame(pred: (f: RelayFrame) => boolean, generation = this.generation, waitMs = this.timeoutMs): Promise<RelayFrame> {
+    const deadline = this.now() + waitMs;
     for (;;) {
       if (generation !== this.generation) throw new Error("a newer connection replaced this one");
       const i = this.frames.findIndex(pred);
@@ -205,9 +205,10 @@ export class TestPhone {
   }
 
   /** The next deliver frame of this session (tag matches); stale tags are acknowledged and skipped. */
-  private async nextCiphertext(generation = this.generation): Promise<Uint8Array> {
+  /** `waitMs`: how long to wait for a frame. A session's reader waits as long as the connection lives; a handshake step waits `timeoutMs`. */
+  private async nextCiphertext(generation = this.generation, waitMs = this.timeoutMs): Promise<Uint8Array> {
     for (;;) {
-      const f = (await this.nextFrame((x) => x.type === "deliver", generation)) as Extract<RelayFrame, { type: "deliver" }>;
+      const f = (await this.nextFrame((x) => x.type === "deliver", generation, waitMs)) as Extract<RelayFrame, { type: "deliver" }>;
       this.ws?.send(encodeFrame({ type: "ack", mailbox: f.mailbox, seq: f.seq }));
       if (toHex(f.tag) !== toHex(this.tag)) continue;
       this.mailbox = f.mailbox;
@@ -274,7 +275,7 @@ export class TestPhone {
       if (this.sessionEnded || generation !== this.generation) return;
       let ct: Uint8Array;
       try {
-        ct = await this.nextCiphertext(generation);
+        ct = await this.nextCiphertext(generation, Number.POSITIVE_INFINITY);
       } catch {
         if (generation !== this.generation) return; // replaced by a newer connection: not this session's end
         this.sessionEnded = true;

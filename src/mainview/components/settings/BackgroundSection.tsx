@@ -182,7 +182,7 @@ export function BackgroundSection() {
               className="text-[11px] text-muted-foreground"
             >
               {status.remoteAccess
-                ? "On — nothing can pair with this Mac yet"
+                ? "On. Paired phones are listed under Remote access below."
                 : "Off. Turn it on from Agetor › Remote Access…"}
             </div>
           </div>

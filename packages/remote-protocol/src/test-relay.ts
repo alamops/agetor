@@ -98,7 +98,15 @@ interface ConnData {
   recent: Array<{ t: number; bytes: number }>;
 }
 
-export function startTestRelay(opts: { port?: number; limits?: Partial<RelayLimits>; now?: () => number } = {}): TestRelay {
+export function startTestRelay(
+  opts: {
+    port?: number;
+    limits?: Partial<RelayLimits>;
+    now?: () => number;
+    /** Sees every frame the relay receives (`in`) and sends (`out`), exactly as it crosses the wire: what a relay operator could log. */
+    tap?: (dir: "in" | "out", bytes: Uint8Array) => void;
+  } = {},
+): TestRelay {
   const limits: RelayLimits = { ...DEFAULT_RELAY_LIMITS, ...opts.limits };
   const now = opts.now ?? Date.now;
   const boxes = new Map<string, Mailbox>();
@@ -111,6 +119,7 @@ export function startTestRelay(opts: { port?: number; limits?: Partial<RelayLimi
   const other = (r: RelayRole): RelayRole => (r === "core" ? "device" : "core");
   const out = (ws: ServerWebSocket<ConnData>, frame: Parameters<typeof encodeFrame>[0]): void => {
     const bytes = encodeFrame(frame);
+    opts.tap?.("out", bytes);
     stats.framesOut++;
     stats.bytesOut += bytes.length;
     try {
@@ -160,6 +169,7 @@ export function startTestRelay(opts: { port?: number; limits?: Partial<RelayLimi
 
   const handle = (ws: ServerWebSocket<ConnData>, raw: Uint8Array): void => {
     ws.data.lastFrameAt = now();
+    opts.tap?.("in", raw);
     stats.framesIn++;
     stats.bytesIn += raw.length;
     if (raw.length > limits.maxFrameBytes) return void ws.close(1009, "frame too large");

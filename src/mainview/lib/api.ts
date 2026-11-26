@@ -108,6 +108,7 @@ import type {
   WorktreeInfo,
   WorktreeTeardownResult,
 } from "../../shared/types.ts";
+import type { RemoteDevicesResult, RemoteLogResult } from "../../shared/remote-types.ts";
 import { TASK_EVENTS_REPLAY_META_EVENT, taskListPath, type TaskDelta, type TaskListOptions } from "../../shared/types.ts";
 import { isTaskDelta, taskDeltaPath } from "../../shared/task-delta.ts";
 import { parseReplayMeta } from "../../shared/task-stream-resume.ts";
@@ -2454,6 +2455,24 @@ export const api = {
    *  webview can only turn it off. */
   turnOffRemoteAccess: () =>
     j<RemoteAccessStatus>("/remote-access", { method: "DELETE" }, { retry: false }),
+  /** The paired phones and why a row is not trusted. There is no route that pairs a phone or changes its level: only the app's native window does. */
+  getRemoteDevices: () => j<RemoteDevicesResult>("/remote-access/devices"),
+  revokeRemoteDevice: (id: string) =>
+    j<{ ok: true }>(`/remote-access/devices/${encodeURIComponent(id)}`, { method: "DELETE" }, { retry: false }),
+  revokeAllRemoteDevices: () => j<{ ok: true }>("/remote-access/devices", { method: "DELETE" }, { retry: false }),
+  getRemoteLog: (opts: { limit?: number; beforeSeq?: number } = {}) => {
+    const q = new URLSearchParams();
+    if (opts.limit !== undefined) q.set("limit", String(opts.limit));
+    if (opts.beforeSeq !== undefined) q.set("beforeSeq", String(opts.beforeSeq));
+    const qs = q.size > 0 ? `?${q.toString()}` : "";
+    return j<RemoteLogResult>(`/remote-access/log${qs}`);
+  },
+  /** The Mac's Detach button for a phone's terminal on a task. */
+  detachPhoneTerminal: (taskId: string) =>
+    j<{ ok: true; detached: boolean }>(`/tasks/${encodeURIComponent(taskId)}/phone-terminal`, { method: "DELETE" }, { retry: false }),
+  /** The name phones show for this Mac (at most 40 characters). */
+  setMacName: (name: string) =>
+    j<void>("/preferences/remoteMacName", { method: "PUT", body: JSON.stringify({ value: name }) }),
 
   subscribeRun(runId: string, onEvent: (e: RunEvent) => void): () => void {
     return openEventStream(

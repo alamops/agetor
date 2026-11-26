@@ -167,7 +167,7 @@ async function classifyTmuxAnswer(input: ClassifyInput, body: Record<string, unk
     case "plan-auto":
       // D9: row 1 switches the task to auto mode, so it is operate-level, signed over the plan, and unlock-gated too.
       return base(policy, {
-        class: "consent", stepUp: "signed", alsoUnlock: true, level: raise(policy.level, "operate"), taskId: card.taskId,
+        class: "consent", stepUp: "signed", alsoUnlock: "always", level: raise(policy.level, "operate"), taskId: card.taskId,
         target: { kind: "claude-plan", taskId: card.taskId, promptId: input.params.id!, row: "auto" },
       });
     case "plan-manual":

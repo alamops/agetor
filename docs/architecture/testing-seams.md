@@ -52,3 +52,17 @@ The boot poller and the card drive have no real-claude test in CI. These seams c
 ## Multiple repositories in one task
 
 A task created against two or more repositories stores `Task.repositories[]` and runs at a per-task workspace root with one linked worktree per repository. Preparation, the `Repositories:` launch block, per-repo diff/status/PR, per-repo teardown, nested worktree ids and the CLI/TUI surfaces are specified in [multi-repo-tasks.md](multi-repo-tasks.md). A single-repository task is unchanged (its one entry is derived from the scalar columns).
+
+## The Companion's seams (`AGETOR_FAKE_KEY_HELPER`, the relay and push addresses)
+
+All four are honored only when `remoteSeamsAllowed(env)` (`src/shared/build-flags.ts`) says so: outside a release build AND under `NODE_ENV=test` or `AGETOR_E2E_HARNESS_SEAMS=1` (the e2e backend sets the latter). In a release build the guard is an inline `!(typeof __AGETOR_RELEASE_BUILD__ !== "undefined" && __AGETOR_RELEASE_BUILD__) && …` (Bun folds that expression, not an imported constant), so the branch, and with it the env var's name, is removed from the bundle; `scripts/verify-release.ts` greps the shipped JS and `src/bun/remote/it/ship-dark.it.test.ts` bundles with the release define and proves it.
+
+| Variable | Effect |
+|---|---|
+| `AGETOR_FAKE_KEY_HELPER=1` | `getKeyHelper()` returns the in-process `FakeKeyHelper` (`remote/key-helper-fake.ts`) instead of the Swift helper: real X25519 and P-256 keys, a window driven by `fakeKeyHelperControl` (`enterCode`, `chooseLevel`, `confirmConfigure`, `deny`, `closeWindow`). Tests inject one with `setKeyHelperForTests`. |
+| `AGETOR_FAKE_KEY_HELPER_DIR=<dir>` | The fake persists its keys and its append-only revoked and signed lists in `<dir>/keyhelper-state.json`, and reads `<dir>/pairing-control.json` once, so a test process and a core in another process (`src/bun/remote/it/harness.ts`) share one helper. The fake keeps its private keys in that file by design; the key-hygiene test scans the data dir, never this one. |
+| `AGETOR_REMOTE_RELAY_URL` | The relay's WebSocket address (`remote/relay-config.ts`); null otherwise in this change. |
+| `AGETOR_REMOTE_PUSH_URL` | The push gateway's base URL; null otherwise. |
+
+The headless phone (`packages/remote-protocol/src/test-client.ts`) and the local relay (`test-relay.ts`, with its own frame and byte counters and a `tap` that sees every relayed frame) are test code only. `AGETOR_FAKE_LOGIN_ITEM=1` with `AGETOR_FAKE_REMOTE_ACCESS=on` starts a core with remote access already on.
+

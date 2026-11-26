@@ -442,6 +442,10 @@ describe("desktop-only set", () => {
       ["POST", "/background/start"],
       ["GET", "/remote-access"],
       ["DELETE", "/remote-access"],
+      ["GET", "/remote-access/devices"],
+      ["DELETE", "/remote-access/devices"],
+      ["DELETE", "/remote-access/devices/:id"],
+      ["GET", "/remote-access/log"],
       ["GET", "/info"],
       ["GET", "/github/issue-thread"],
       ["POST", "/refs/resolve"],
@@ -661,6 +665,10 @@ describe("routes the CLI (and the daemon handoff) call", () => {
       "POST /background/start",
       "GET /remote-access",
       "DELETE /remote-access",
+      "GET /remote-access/devices",
+      "DELETE /remote-access/devices",
+      "DELETE /remote-access/devices/:id",
+      "GET /remote-access/log", // trailing ${qs}
       // `agetor` repository removal (AgetorClient.removeTaskRepository).
       "DELETE /tasks/:id/repositories/:name",
     ]) {

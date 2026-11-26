@@ -356,7 +356,9 @@ export function createRouter(deps: RouterDeps): Router {
       if (cls.bound.decision !== undefined && payload.decision !== cls.bound.decision) return { code: "decision", message: "the signed decision is not the one requested" };
       if (cls.bound.comment !== undefined && (payload.comment ?? null) !== (cls.bound.comment ?? null)) return { code: "decision", message: "the signed comment is not the one sent" };
     }
-    if (cls.alsoUnlock && (await needsUnlock()) && !deps.decisions.isUnlocked(principal)) return { code: "unlock", message: "unlock this session first" };
+    if (cls.alsoUnlock && (cls.alsoUnlock === "always" || (await needsUnlock())) && !deps.decisions.isUnlocked(principal)) {
+      return { code: "unlock", message: "unlock this session first" };
+    }
     return null;
   }
 

@@ -8,8 +8,8 @@ import { rmTestDataDir } from "./test-data-dir.ts";
 
 const DATA_DIR = mkdtempSync(path.join(tmpdir(), "agetor-task-preview-"));
 process.env.AGETOR_DATA_DIR = DATA_DIR;
-process.env.AGETOR_API_PORT = "4486";
-const BASE = "http://127.0.0.1:4486";
+process.env.AGETOR_API_PORT = "4852";
+const BASE = "http://127.0.0.1:4852";
 
 const SCRATCH = mkdtempSync(path.join(tmpdir(), "agetor-task-preview-scratch-"));
 const PNG = Buffer.from([0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a, 1, 2, 3, 4]);

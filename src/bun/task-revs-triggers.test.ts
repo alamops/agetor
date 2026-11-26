@@ -157,7 +157,7 @@ describe("migration 093 through the runner", () => {
     expect(migrations[idx - 1]!.id).toBe("092_task_base_branch_and_prs");
     const mem = new Database(":memory:");
     expect(migrate(mem, migrations.slice(0, idx))).not.toContain("093_task_revs");
-    expect(migrate(mem, migrations)).toEqual(["093_task_revs"]);
+    expect(migrate(mem, migrations)).toEqual(["093_task_revs", "094_remote_devices", "095_remote_audit", "096_remote_idempotency"]);
     const epoch = mem.query<{ epoch: string }, []>(`SELECT epoch FROM task_rev_meta`).get()!.epoch;
     expect(migrate(mem, migrations)).toEqual([]);
     expect(mem.query<{ epoch: string }, []>(`SELECT epoch FROM task_rev_meta`).get()!.epoch).toBe(epoch);

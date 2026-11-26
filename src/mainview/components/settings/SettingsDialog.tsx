@@ -19,6 +19,7 @@ import { HarnessesPage } from "@/components/settings/HarnessesPage";
 import { isExperimentalKind } from "@/components/settings/HarnessAccountRow";
 import { StackHistory } from "@/components/settings/StackHistory";
 import { BackgroundSection } from "@/components/settings/BackgroundSection";
+import { RemoteAccessSection } from "@/components/settings/RemoteAccessSection";
 import { GitHubTokensSection } from "@/components/settings/GitHubTokensSection";
 import { PipelinesSection } from "@/components/settings/PipelinesSection";
 import { SavedPromptsSection } from "@/components/settings/SavedPromptsSection";
@@ -1457,6 +1458,9 @@ function GeneralSection({
       <SettingsGroup title="Background">
         <BackgroundSection />
       </SettingsGroup>
+
+      {/* Renders nothing in a build that ships without the Companion. */}
+      <RemoteAccessSection />
 
       <SettingsGroup title="Getting started">
         <section className="space-y-1">

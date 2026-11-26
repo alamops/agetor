@@ -334,7 +334,7 @@ async function verifyArtifacts() {
     // Agetor-<arch>.dmg ↔ build/<env>-macos-<arch>/Agetor.app
     const archMatch = dmgName.match(/-(arm64|x64)\.dmg$/);
     if (!archMatch) fail(`cannot parse arch from ${dmgName}`);
-    const arch = archMatch[1];
+    const arch = archMatch[1] as string;
     const buildSubdir = buildEntries.find((d) => d.endsWith(`-macos-${arch}`));
     if (!buildSubdir) fail(`no build/<env>-macos-${arch} directory for ${dmgName}`);
     const app = join(buildDir, buildSubdir, `${APP_NAME}.app`);
@@ -411,7 +411,7 @@ async function verifyArtifacts() {
     }
     console.log("    stapler:   ticket valid on DMG");
 
-    const sha = (await run(["shasum", "-a", "256", dmg])).split(/\s+/)[0];
+    const sha = (await run(["shasum", "-a", "256", dmg])).split(/\s+/)[0] ?? "";
     const size = (await stat(dmg)).size;
     summary.push({ dmg, arch, size, sha });
   }

@@ -253,6 +253,14 @@ const ROWS: Record<ClientMethod, Row> = {
     why: "DELETE /remote-access is allowlisted for the CLI",
     call: () => client.turnOffRemoteAccess(),
   },
+  getRemoteDevices: { expect: [200, 503], why: "listing paired phones is a read, allowed for the CLI token (503: this machine has no key helper, answered after auth)", call: () => client.getRemoteDevices() },
+  revokeRemoteDevice: {
+    expect: [404, 503],
+    why: "revoking removes authority, so the CLI token may; the id names no device → 404 after auth (503: no key helper here)",
+    call: () => client.revokeRemoteDevice("0".repeat(32)),
+  },
+  revokeAllRemoteDevices: { expect: [200, 503], why: "revoke all removes authority, allowed for the CLI token (503: no key helper here)", call: () => client.revokeAllRemoteDevices() },
+  getRemoteLog: { expect: [200], why: "the audit log is a read, allowed for the CLI token", call: () => client.getRemoteLog({ limit: 5 }) },
   shutdownCore: {
     expect: [200],
     why: "the handoff request reaches the injected shutdown handler, which records it",

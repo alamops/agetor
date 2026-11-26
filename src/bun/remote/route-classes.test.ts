@@ -105,7 +105,7 @@ describe("tmux cards (D8, D9)", () => {
     expect(await answer("missing", { key: "1" })).toMatchObject({ class: "never", reason: "gone" });
   });
   test("Claude's plan modal: row 1 is operate + signed over the plan + unlock; row 2 is consent; row 3 is content", async () => {
-    expect(await answer("plan", { key: "1" })).toMatchObject({ class: "consent", level: "operate", stepUp: "signed", alsoUnlock: true, target: { kind: "claude-plan", row: "auto" } });
+    expect(await answer("plan", { key: "1" })).toMatchObject({ class: "consent", level: "operate", stepUp: "signed", alsoUnlock: "always", target: { kind: "claude-plan", row: "auto" } });
     expect(await answer("plan", { key: "2" })).toMatchObject({ class: "consent", level: "respond", stepUp: "signed", target: { kind: "claude-plan", row: "manual" } });
     expect(await answer("plan", { key: "3" })).toMatchObject({ class: "content", stepUp: "unlock" });
   });

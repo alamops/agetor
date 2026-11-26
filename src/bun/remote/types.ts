@@ -50,8 +50,11 @@ export interface Classified {
   level: RemoteLevel;
   stepUp: "none" | "unlock" | "signed";
   rate: "normal" | "heavy" | "stop";
-  /** A signed call that ALSO needs the unlock window when the task runs without asking (a plan edit, Claude's "auto mode" row). */
-  alsoUnlock?: boolean;
+  /**
+   * A signed call that ALSO needs the unlock window: `true` while the task runs without asking (a plan edit), `"always"` when the call itself
+   * makes the task autonomous (Claude's "auto mode" row), so it needs the window whatever mode the task is in now.
+   */
+  alsoUnlock?: boolean | "always";
   /** The task the call acts on, when the class rules resolved it (the router checks `runsWithoutAsking` against it). */
   taskId?: string;
   target?: ContentTarget;

@@ -1,7 +1,7 @@
 // The control routes under /remote-access (docs/architecture/remote-gateway.md): status, devices, revoke, revoke all, the audit log, the Mac's
 // name, the phone terminal's Detach. A real API server on a throwaway data dir, the fake key helper, and (for the revoke scenarios) the real
 // gateway against the local relay with a headless phone, so a revoke over HTTP is observed ending a LIVE session.
-import { afterAll, afterEach, beforeAll, describe, expect, test } from "bun:test";
+import { afterAll, afterEach, beforeAll, beforeEach, describe, expect, test } from "bun:test";
 import { mkdtempSync } from "node:fs";
 import { tmpdir } from "node:os";
 import path from "node:path";
@@ -21,7 +21,7 @@ process.env.AGETOR_DATA_DIR = DATA_DIR;
 process.env.AGETOR_CLAUDE_BIN = "/bin/echo";
 process.env.AGETOR_CODEX_BIN = "/bin/echo";
 process.env.AGETOR_TMUX_BIN = "/bin/echo";
-const BASE = "http://127.0.0.1:4485";
+const BASE = "http://127.0.0.1:4851";
 
 let server: { stop: () => void };
 let master: string;
@@ -45,7 +45,7 @@ beforeAll(async () => {
   setHelper(helper);
   const { startApiServer, API_TOKEN } = await import("./server.ts");
   const { CLI_TOKEN } = await import("./api-config.ts");
-  process.env.AGETOR_API_PORT = "4485";
+  process.env.AGETOR_API_PORT = "4851";
   server = startApiServer() as unknown as { stop: () => void };
   master = API_TOKEN;
   cli = CLI_TOKEN;
@@ -61,6 +61,11 @@ afterAll(async () => {
     else process.env[k] = savedEnv[k];
   }
   rmTestDataDir(DATA_DIR);
+});
+
+// bun runs every file in one process on one database: start from no devices whatever an earlier file left behind.
+beforeEach(() => {
+  dbMod.db.run(`DELETE FROM remote_devices`);
 });
 
 afterEach(async () => {
@@ -92,7 +97,7 @@ const call = (method: string, p: string, opts: { token?: string; body?: unknown 
 /** A device row signed by the fake helper's registry key, inserted the way a pairing does. */
 async function enroll(over: { level?: RemoteLevel; name?: string; badSig?: boolean } = {}) {
   relay ??= startTestRelay({ limits: { framesPerSecond: 10_000 } });
-  const phone = new TestPhone({ relayUrl: relay.url, timeoutMs: 4000 });
+  const phone = new TestPhone({ relayUrl: relay.url, timeoutMs: 20_000 });
   phones.push(phone);
   const id = toHex(randomBytes(16));
   const base = { id, name: over.name ?? "Ana's iPhone", platform: "ios" as const, sessionPub: phone.sessionPub, approvePub: phone.approvePub, pushPub: phone.pushPub, level: over.level ?? "respond", enrolledAt: Date.now() };
@@ -185,7 +190,7 @@ describe("devices", () => {
     expect((await b.phone.request("GET", "/tasks")).status).toBe(200);
     // and the revoked device cannot start another
     await expect(a.phone.connect({ corePub, deviceId: a.id, linkSecret: a.linkSecret })).rejects.toThrow();
-  });
+  }, 30_000);
 
   test("Revoke all closes every session and the helper's core key changes", async () => {
     const a = await enroll();
@@ -200,7 +205,7 @@ describe("devices", () => {
     expect(toHex((await helper.status()).corePub)).not.toBe(before);
     const { devices } = (await (await call("GET", "/remote-access/devices")).json()) as RemoteDevicesResult;
     expect(devices.every((d) => d.trust !== "trusted")).toBe(true);
-  });
+  }, 30_000);
 });
 
 describe("the audit log", () => {

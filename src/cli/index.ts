@@ -5,6 +5,7 @@ import { getClient, ensureOpts, type Flags } from "./context.ts";
 import { ensureCore } from "./daemon/supervisor.ts";
 import { AgetorClient } from "./api-client.ts";
 import { cmdDaemon } from "./commands/daemon.ts";
+import { COMPANION_ENABLED } from "../shared/build-flags.ts";
 import { cmdRemote } from "./commands/remote.ts";
 import { cmdLs } from "./commands/ls.ts";
 import { cmdShow } from "./commands/show.ts";
@@ -62,7 +63,7 @@ Commands:
   info                show the connected core's version
   daemon <sub>        start | stop | status | background of the Agetor core
                       (background status|off: keep Agetor running in the background)
-  remote <sub>        status | off — remote access (preview; only the app turns it on)
+  remote <sub>        ${COMPANION_ENABLED ? "status | off | devices | revoke <device> | revoke-all --yes | log [--limit N]\n                      (remote access for the Companion app; only the app turns it on or pairs a phone)" : "status | off — remote access (preview; only the app turns it on)"}
   switch-account <id> [--cancel]  move a stacked task to its next account (a live run: at the end of the turn)
   harness <sub>       list | add | edit | enable | disable | rm | stack | cooldown | restore | shell agent harnesses
                       (stack: an ordered same-kind account train with failover;

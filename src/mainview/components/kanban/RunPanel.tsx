@@ -106,6 +106,7 @@ import {
   parseHarnessSwapNotice,
 } from "../../../shared/harness-stack.ts";
 import { harnessStackBannerView } from "@/lib/harness-stack-banner";
+import { PhoneAttachedBanner } from "@/components/kanban/PhoneAttachedBanner";
 import { agentSwitchPatch } from "@/lib/agent-switch";
 import { groupStickySections, type StickyItem } from "@/lib/sticky-sections";
 import { stackPickerOptions, stackPositionFor } from "@/lib/stack-badge";
@@ -4486,6 +4487,8 @@ function RunPanelBody({
             })}
           </div>
         )}
+        {/* Keyed by task: its `busy` flag resets on a task switch (RunPanel is one long-lived instance, docs/architecture/run-panel.md). */}
+        <PhoneAttachedBanner key={`phone-banner-${task.id}`} taskId={task.id} taskTitle={task.title} />
         <HarnessStackBanner
           task={task}
           stacks={stacks}

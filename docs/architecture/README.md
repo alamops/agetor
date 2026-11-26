@@ -28,6 +28,7 @@ Code comments cite these docs by path (`docs/architecture/<doc>.md`); `src/bun/c
 | item 20, Agents + Pipelines bundle | [bundle.md](bundle.md) |
 | item 21, Native notifications | [notifications.md](notifications.md) |
 | item 22, Always-on host | [always-on-host.md](always-on-host.md) |
+| New with the Companion (no old section): the remote gateway, the router and its class rules, signed decisions, the phone terminal, the audit log, ship-dark | [remote-gateway.md](remote-gateway.md); the keys, trust and invariants in [security.md](security.md) |
 | "Importing Claude Code / OpenCode sessions started outside Agetor" | [session-import.md](session-import.md) |
 | "Agent command shape": intro, auto-enable, session-id scoping, defaults, speed tiers, `AGENT_OPTIONS` | [harnesses.md](harnesses.md) |
 | Harness account stacks (backup accounts, automatic failover) | [harness-stacks.md](harness-stacks.md) |
