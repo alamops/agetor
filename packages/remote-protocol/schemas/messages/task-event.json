@@ -60,13 +60,11 @@
         }
       },
       "required": [
-        "id",
         "runId",
         "taskId",
         "stream",
         "data",
-        "ts",
-        "subagentId"
+        "ts"
       ],
       "additionalProperties": false
     },

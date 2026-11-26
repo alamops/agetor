@@ -30,17 +30,25 @@ export interface AppMessage {
   body: Uint8Array;
 }
 
-/** Split a message body into padded Noise plaintexts, one per chunk. */
-export function seal(t: string, id: string, body: Uint8Array, chunkBytes = CHUNK_RAW_BYTES): Uint8Array[] {
+/**
+ * Split a message body into padded Noise plaintexts, one per chunk, producing each chunk only when asked for it: a 50 MB body is never
+ * held as 67 MB of base64 at once. The size checks run before the first chunk is produced.
+ */
+export function* sealStream(t: string, id: string, body: Uint8Array, chunkBytes = CHUNK_RAW_BYTES): Generator<Uint8Array, void, undefined> {
   const cc = Math.max(1, Math.ceil(body.length / chunkBytes));
   if (cc > MAX_CHUNKS_PER_MESSAGE) throw new EnvelopeError("message needs too many chunks");
   if (body.length > MAX_MESSAGE_BYTES) throw new EnvelopeError("message too large");
-  const out: Uint8Array[] = [];
   for (let ci = 0; ci < cc; ci++) {
     const part = body.subarray(ci * chunkBytes, Math.min(body.length, (ci + 1) * chunkBytes));
-    out.push(pad(utf8(canonicalize({ t, id, ci, cc, b: toBase64(part) } satisfies Envelope))));
+    yield pad(utf8(canonicalize({ t, id, ci, cc, b: toBase64(part) } satisfies Envelope)));
   }
-  return out;
+}
+
+/** Split a message body into padded Noise plaintexts, one per chunk (all at once; see `sealStream` for big bodies). */
+export function seal(t: string, id: string, body: Uint8Array, chunkBytes = CHUNK_RAW_BYTES): Uint8Array[] {
+  const it = sealStream(t, id, body, chunkBytes);
+  const first = it.next(); // throws the size errors up front, even for an empty-iteration caller
+  return first.done ? [] : [first.value, ...it];
 }
 
 export function parseEnvelope(plaintext: Uint8Array): Envelope {

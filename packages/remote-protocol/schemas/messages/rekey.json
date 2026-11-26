@@ -1,0 +1,10 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://agetor.dev/schemas/remote/messages/rekey.json",
+  "title": "rekey",
+  "x-direction": "both",
+  "type": "object",
+  "properties": {},
+  "required": [],
+  "additionalProperties": false
+}

@@ -24,6 +24,7 @@ export const EXAMPLES: Record<MessageType, unknown> = {
   "subscribe-task": { sub: "s1", taskId: "t1", afterId: 40, maxBytes: 262144 },
   "subscribe-global": { sub: "g1" },
   unsubscribe: { sub: "s1" },
+  rekey: {},
   challenge: { id: "c-1", target: TARGET_PLAN },
   unlock: { id: "u-1", payload: { kind: "unlock", sessionHash: h(32, "01"), expiresAt: 1795560600000 }, sig: h(64, "33") },
   "push-register": { id: "p-1", pushRef: "opaque-ref", sendKey: h(32, "44") },

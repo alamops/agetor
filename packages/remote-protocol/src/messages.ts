@@ -110,22 +110,27 @@ const REMOTE_POLICY_ENTRY: Spec = obj({
   rate: { t: "enum", values: ["normal", "heavy", "stop"] },
 });
 
-const RUN_EVENT: Spec = obj({
-  id: int(0, 2 ** 53 - 1),
-  runId: id(),
-  taskId: id(),
-  stream: str(32, 1),
-  data: { t: "str", max: 67108864 },
-  ts: MS,
-  subagentId: nullable(id()),
-});
+// `id` and `subagentId` are absent on a live-only frame (a subagent chunk the core has not persisted yet).
+const RUN_EVENT: Spec = obj(
+  {
+    id: int(0, 2 ** 53 - 1),
+    runId: id(),
+    taskId: id(),
+    stream: str(32, 1),
+    data: { t: "str", max: 67108864 },
+    ts: MS,
+    subagentId: nullable(id()),
+  },
+  ["id", "subagentId"],
+);
 
 const REPLAY_META: Spec = obj(
   { earliestId: nullable(int(0, 2 ** 53 - 1)), hasMore: { t: "bool" }, resumedAfter: int(0, 2 ** 53 - 1), snapshotRequired: { t: "lit", value: true } },
   ["resumedAfter", "snapshotRequired"],
 );
 
-export type Direction = "phone" | "core";
+/** `both`: a control message either side may send (the in-band rekey marker). */
+export type Direction = "phone" | "core" | "both";
 
 export const MESSAGES = {
   // ── phone → core ───────────────────────────────────────────────────────────────────────────────────────────────────
@@ -158,6 +163,8 @@ export const MESSAGES = {
   "subscribe-task": { dir: "phone", spec: obj({ sub: id(64), taskId: id(), afterId: nullable(int(0, 2 ** 53 - 1)), maxBytes: nullable(int(1, 67108864)) }) },
   "subscribe-global": { dir: "phone", spec: obj({ sub: id(64) }) },
   unsubscribe: { dir: "phone", spec: obj({ sub: id(64) }) },
+  /** Sent under the old key; after it, the sender rekeys its send cipher and the receiver its receive cipher. */
+  rekey: { dir: "both", spec: obj({}) },
   challenge: { dir: "phone", spec: obj({ id: id(64), target: TARGET }) },
   unlock: { dir: "phone", spec: obj({ id: id(64), payload: UNLOCK_PAYLOAD, sig: SIG }) },
   "push-register": { dir: "phone", spec: obj({ id: id(64), pushRef: str(512, 1), sendKey: hex(32) }) },
