@@ -189,38 +189,6 @@ async function makeParentWithStep() {
   return { parentId, stepId, cleanup };
 }
 
-test("DELETE /notifications/:taskId without token returns 401", async () => {
-  const res = await fetch(url("/notifications/abc"), { method: "DELETE" });
-  expect(res.status).toBe(401);
-});
-
-test("DELETE /notifications/:taskId rejects an over-length id", async () => {
-  removals.length = 0;
-  const res = await fetch(url(`/notifications/${"x".repeat(513)}`), { method: "DELETE", headers: auth() });
-  expect(res.status).toBe(400);
-  expect(removals).toEqual([]);
-});
-
-test("DELETE /notifications/:taskId removes the task's entry", async () => {
-  removals.length = 0;
-  const res = await fetch(url("/notifications/plain-task"), { method: "DELETE", headers: auth() });
-  expect(res.status).toBe(200);
-  expect(await res.json()).toEqual({ ok: true });
-  expect(removals).toEqual([{ taskId: "plain-task" }]);
-});
-
-test("DELETE /notifications/:taskId maps a step to its pipeline parent", async () => {
-  const { parentId, stepId, cleanup } = await makeParentWithStep();
-  try {
-    removals.length = 0;
-    const res = await fetch(url(`/notifications/${stepId}`), { method: "DELETE", headers: auth() });
-    expect(res.status).toBe(200);
-    expect(removals).toEqual([{ taskId: parentId }]);
-  } finally {
-    cleanup();
-  }
-});
-
 test("POST /tasks/:id/seen removes the entry (a step's goes to its parent); DELETE …/seen does not", async () => {
   const { tasks } = await import("./db.ts");
   const task = await makeTask("notifications: seen");

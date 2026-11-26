@@ -45,9 +45,12 @@ export async function macName(deps: MacNameDeps = {}): Promise<string> {
   return "Mac";
 }
 
-/** Validate a name the owner typed in Settings: cleaned, at most 40 characters, not empty. Returns the cleaned name or null. */
+/**
+ * Validate a name the owner typed in Settings: at most 40 characters as typed (a longer one is refused, not silently clipped), cleaned of
+ * control and invisible characters, and not empty once cleaned. Returns the cleaned name or null.
+ */
 export function validateMacName(raw: unknown): string | null {
-  if (typeof raw !== "string" || raw.length > 400) return null;
+  if (typeof raw !== "string" || Array.from(raw.trim()).length > 40) return null;
   const cleaned = cleanDeviceName(raw);
   return cleaned.length > 0 ? cleaned : null;
 }

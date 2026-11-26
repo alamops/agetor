@@ -327,6 +327,16 @@ export class FakeKeyHelper implements KeyHelper {
     win?.fail?.(new KeyHelperError("closed", "the fake helper is closed"));
   }
 
+  /**
+   * Test aid: sign a registry entry the way a completed pairing does, without a window, so a gateway test can seed a trusted device. The id
+   * is recorded as signed first, so Revoke all covers it.
+   */
+  signRegistryEntry(deviceId: string, entryJson: string): Uint8Array {
+    if (!this.signedList.includes(deviceId)) this.signedList.push(deviceId);
+    this.save();
+    return signEs256(this.registryPriv, new TextEncoder().encode(entryJson));
+  }
+
   /** The window's pairing secret, for a test that plays the phone without scanning the QR. Null when no window is open. */
   windowSecret(): Uint8Array | null {
     return this.window ? this.window.secret.slice() : null;

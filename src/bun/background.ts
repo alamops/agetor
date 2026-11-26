@@ -20,7 +20,7 @@ import { homedir } from "node:os";
 import {
   REMOTE_ACCESS_PREF_KEY,
   type BackgroundStatus,
-  type RemoteAccessStatus,
+  type RemoteAccessSwitch,
 } from "../shared/types.ts";
 import { dataDir, preferences } from "./db-async.ts";
 import { launchedBy } from "./daemon-mode.ts";
@@ -84,7 +84,7 @@ async function remoteIsOn(): Promise<boolean> {
   return (await preferences.get(REMOTE_ACCESS_PREF_KEY)) === "on";
 }
 
-export async function getRemoteAccess(): Promise<RemoteAccessStatus> {
+export async function getRemoteAccess(): Promise<RemoteAccessSwitch> {
   return { enabled: await remoteIsOn(), preview: true };
 }
 

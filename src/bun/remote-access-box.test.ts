@@ -1,5 +1,6 @@
 import { describe, expect, test } from "bun:test";
 import {
+  runPairPhone,
   runRemoteAccessBox,
   type MessageBoxOptions,
   type RemoteAccessBackground,
@@ -372,5 +373,61 @@ describe("runRemoteAccessBox: failures", () => {
     await f.run();
     expect(f.calls).not.toContain("setRemoteAccessOnFromNativeBox");
     expect(f.logs[0]).toContain("register exploded");
+  });
+});
+
+
+describe("runPairPhone", () => {
+  function pairFixture(opts: { enabled: boolean[]; startPairing?: () => Promise<{ expiresAt: number; alreadyOpen: boolean }>; answers?: number[] }) {
+    const boxes: MessageBoxOptions[] = [];
+    const enabled = [...opts.enabled];
+    const calls: string[] = [];
+    const run = () =>
+      runPairPhone({
+        showMessageBox: async (b) => (boxes.push(b), { response: (opts.answers ?? [])[boxes.length - 1] ?? 0 }),
+        background: {
+          getBackgroundStatus: async () => status({ registration: "enabled", state: "running" }),
+          turnOnBackground: async () => status(),
+          getRemoteAccess: async () => ({ enabled: enabled.length > 1 ? enabled.shift()! : enabled[0]!, preview: true }),
+          setRemoteAccessOff: async () => void calls.push("off"),
+          setRemoteAccessOnFromNativeBox: async () => void calls.push("on"),
+        },
+        openLoginItems: async () => undefined,
+        startPairing: opts.startPairing,
+        log: () => undefined,
+      });
+    return { run, boxes, calls };
+  }
+
+  test("with remote access on it opens the pairing window and shows no box", async () => {
+    let opened = 0;
+    const f = pairFixture({ enabled: [true], startPairing: async () => (opened++, { expiresAt: 1, alreadyOpen: false }) });
+    expect(await f.run()).toBe("opened");
+    expect(opened).toBe(1);
+    expect(f.boxes).toHaveLength(0);
+  });
+
+  test("with it off, the Remote Access box comes first; if the owner leaves it off, nothing is opened", async () => {
+    let opened = 0;
+    const f = pairFixture({ enabled: [false, false], answers: [1], startPairing: async () => (opened++, { expiresAt: 1, alreadyOpen: false }) });
+    expect(await f.run()).toBe("needs-remote-access");
+    expect(opened).toBe(0);
+    expect(f.boxes.length).toBeGreaterThanOrEqual(1);
+    expect(f.calls).not.toContain("on");
+  });
+
+  test("no pairing entry (the Companion is not in this build, or a core that cannot pair) says so", async () => {
+    const f = pairFixture({ enabled: [true] });
+    expect(await f.run()).toBe("unavailable");
+    expect(f.boxes[0]!.message).toContain("not available");
+  });
+
+  test("a failure is explained in plain words, with the reason for the common ones", async () => {
+    for (const [code, text] of [["relay-not-configured", "no relay"], ["no-secure-enclave", "Secure Enclave"], ["helper-missing", "helper"]] as const) {
+      const f = pairFixture({ enabled: [true], startPairing: async () => { throw Object.assign(new Error("x"), { code }); } });
+      expect(await f.run()).toBe("failed");
+      expect(f.boxes[0]!.detail).toContain(text);
+      expect(f.boxes[0]!.type).toBe("error");
+    }
   });
 });

@@ -43,6 +43,7 @@ import { awaitDbReady, drainCoreForQuit } from "./boot-db.ts";
 import { countPendingForTask, pendingCountsByTask, preloadPipelineParents } from "./interactions.ts";
 import { countTerminals, terminalCountsByTask } from "./terminals.ts";
 import { CORE_EXIT_PARK, HANDOFF_LAUNCH_SETTLE_MS, launchedBy, resolveIdleTimeoutMs } from "./daemon-mode.ts";
+import { startRemoteGateway, type RemoteGateway } from "./remote/gateway.ts";
 import {
   installHeadlessNotifications,
   shouldPostHeadlessNotifications,
@@ -155,6 +156,8 @@ async function handOffPort(reason: string, code: number): Promise<void> {
  *  lost the port to a live core, or got a signal mid-boot) must not delete the
  *  winner's creds on its way out. */
 let ownsCreds = false;
+/** The Companion gateway of this core (null until started, and with the Companion compiled out it is a no-op object). */
+let remoteGateway: RemoteGateway | null = null;
 function shutdown(reason: string, code = 0, opts: { realStop?: boolean } = {}): void {
   if (shuttingDown) return;
   shuttingDown = true;
@@ -176,6 +179,9 @@ function shutdown(reason: string, code = 0, opts: { realStop?: boolean } = {}): 
   // reaping any live fx children — do it explicitly, before the rest of
   // teardown, rather than relying on fx-acp's handler to have done it.
   reapLiveFxProcs();
+  // The Companion: sessions end and the relay link closes first, so a phone is never left on a half-closed core (its mailbox is free for
+  // the app, or the next core, to take). Fire-and-forget: it is synchronous in effect, and the shutdown below is bounded anyway.
+  void remoteGateway?.stop().catch(() => undefined);
   // Same reasoning for the auto-resume engine's in-memory timers (Phase 8
   // review #7): `fxAutoResumeTimers` entries are `.unref()`'d so they never
   // block a clean exit on their own, but stopping them explicitly here keeps
@@ -541,13 +547,25 @@ export async function runDaemon(): Promise<void> {
   // stderr — which `spawnDaemon` points at this same daemon.log.
   daemonLog(`cli-daemon listening on http://${formatHostForUrl(apiHost.host)}:${server.port}`);
 
+  let headlessPolicy: ReturnType<typeof installHeadlessNotifications>["policy"] | undefined;
   if (notifications) {
     try {
-      notificationSink = installHeadlessNotifications().sink;
+      const installed = installHeadlessNotifications();
+      notificationSink = installed.sink;
+      headlessPolicy = installed.policy;
     } catch (err) {
       daemonLog(`headless notifications unavailable: ${(err as Error)?.message ?? String(err)}`);
     }
   }
+
+  // The Companion gateway follows the port owner. A login-item core is the "background" core; the CLI daemon is "headless". Neither pairs:
+  // the key helper's window needs a screen, so only the app's core opens one.
+  void startRemoteGateway({ mode: isLoginItem ? "background" : "headless", ...(headlessPolicy ? { notificationPolicy: headlessPolicy } : {}) })
+    .then((g) => {
+      remoteGateway = g;
+      if (shuttingDown) void g.stop();
+    })
+    .catch((err) => daemonLog(`remote gateway failed to start: ${(err as Error)?.message ?? String(err)}`));
 
   // Idle-shutdown loop: exit once nothing is running AND no client is attached
   // for longer than the timeout. The interval is unref'd so it never keeps the

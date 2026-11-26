@@ -196,7 +196,6 @@ describe("route coverage (server.ts ↔ ROUTE_POLICY)", () => {
 // Plan §3 "Desktop-only set" (D9, P7). Keep this list literal: it is the
 // reviewable statement of what the CLI token cannot reach.
 const DESKTOP_ONLY = [
-  "DELETE /notifications/:taskId",
   "DELETE /terminals/:id",
   "GET /files/preview",
   "GET /tasks/:id/diff/blob",
@@ -242,7 +241,6 @@ const DESKTOP_ONLY = [
 // flag only changes the CLI token's answer, so the seam stays reachable for the
 // master.
 const HEADLESS_501 = [
-  "DELETE /notifications/:taskId",
   "GET /updates/status",
   "POST /app/force-quit",
   "POST /background",
@@ -470,7 +468,12 @@ describe("route vocabulary", () => {
   // family whose name may contain "remote-access", and only to READ or turn it
   // OFF. Turning it on is the native box's job, so no POST/PUT/PATCH may ever
   // sit under it (asserted below).
-  const REMOTE_ACCESS_ALLOWLIST: Record<string, string[]> = { "/remote-access": ["GET", "DELETE"] };
+  const REMOTE_ACCESS_ALLOWLIST: Record<string, string[]> = {
+    "/remote-access": ["GET", "DELETE"],
+    "/remote-access/devices": ["GET", "DELETE"],
+    "/remote-access/devices/:id": ["DELETE"],
+    "/remote-access/log": ["GET"],
+  };
 
   it("no path segment looks like pairing, devices or remote access, except the allowlisted read/off routes", () => {
     const bad: string[] = [];
@@ -483,16 +486,30 @@ describe("route vocabulary", () => {
     expect(bad).toEqual([]);
   });
 
-  it("the remote-access allowlist is exactly GET and DELETE on /remote-access (no way to turn it on over HTTP)", () => {
-    expect(Object.keys(REMOTE_ACCESS_ALLOWLIST)).toEqual(["/remote-access"]);
-    const entry = ROUTE_POLICY["/remote-access"];
-    expect(entry).toBeDefined();
-    expect(Object.keys(entry as Record<string, unknown>).sort()).toEqual(["DELETE", "GET"]);
-    // No other key may carry a remote segment either.
-    const remoteKeys = Object.keys(ROUTE_POLICY).filter((k) =>
-      k.split("/").some((seg) => /^(remote|remote-access)$/i.test(seg)),
+  it("D19: under /remote-access only GET (read) and DELETE (revoke, off) exist; no POST, PUT or PATCH, so nothing pairs, turns it on or raises a level over HTTP", () => {
+    expect(Object.keys(REMOTE_ACCESS_ALLOWLIST).sort()).toEqual(["/remote-access", "/remote-access/devices", "/remote-access/devices/:id", "/remote-access/log"]);
+    for (const [key, methods] of Object.entries(REMOTE_ACCESS_ALLOWLIST)) {
+      const entry = ROUTE_POLICY[key];
+      expect(entry, key).toBeDefined();
+      expect(Object.keys(entry as Record<string, unknown>).sort(), key).toEqual([...methods].sort());
+    }
+    // No method that writes may sit under /remote-access, whatever its depth.
+    const writes = Object.entries(ROUTE_POLICY).flatMap(([key, entry]) =>
+      key === "/remote-access" || key.startsWith("/remote-access/")
+        ? Object.keys(entry as Record<string, unknown>).filter((m) => ["POST", "PUT", "PATCH"].includes(m)).map((m) => `${m} ${key}`)
+        : [],
     );
-    expect(remoteKeys).toEqual(["/remote-access"]);
+    expect(writes).toEqual([]);
+    // No other key may carry a remote segment either.
+    const remoteKeys = Object.keys(ROUTE_POLICY).filter((k) => k.split("/").some((seg) => /^(remote|remote-access)$/i.test(seg)));
+    expect(remoteKeys.sort()).toEqual(Object.keys(REMOTE_ACCESS_ALLOWLIST).sort());
+  });
+
+  it("the phone terminal's Detach and the presence report are not pairing routes: their names pass the vocabulary rule", () => {
+    for (const key of ["/tasks/:id/phone-terminal", "/app/presence"]) {
+      expect(ROUTE_POLICY[key], key).toBeDefined();
+      for (const segment of key.split("/").filter(Boolean)) expect(BANNED_SEGMENT.test(segment), `${key} (${segment})`).toBe(false);
+    }
   });
 
   it("no route is named for permissions, except the allowlisted read-only ones", () => {
@@ -764,6 +781,7 @@ describe("path-valued fields (D24)", () => {
       "GET /agent-discovery: query.workdir(exists)",
       "GET /files/index: query.dir(exists)",
       "GET /projects/branches: query.path(exists)",
+      "GET /tasks/:id/files/preview: query.path(exists)",
       "PATCH /harnesses/:id: body.home(nearest-ancestor), body.bin(exists)",
       "PATCH /tasks/:id: body.workdir(exists)",
       "POST /harnesses: body.home(nearest-ancestor), body.bin(exists)",

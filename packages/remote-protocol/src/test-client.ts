@@ -484,11 +484,22 @@ export class TestPhone {
     return { id, status: r.status, contentType: r.contentType, text: () => (r.encoding === "utf8" ? r.body : fromUtf8(bytes())), json: <T>() => JSON.parse(r.encoding === "utf8" ? r.body : fromUtf8(bytes())) as T, bytes };
   }
 
+  /** The reply of type `type` to message `id`, or a thrown Error naming the code of the `error` the core sent for it instead. */
+  private async reply<T extends { id: string }>(type: string, id: string): Promise<T> {
+    const ok = this.next<T>(type, (v) => v.id === id);
+    const bad = this.next<{ id: string | null; code: string }>("error", (v) => v.id === id).then((e) => {
+      throw new Error(`core refused: ${e.code}`);
+    });
+    ok.catch(() => undefined);
+    bad.catch(() => undefined);
+    return await Promise.race([ok, bad]);
+  }
+
   /** Ask for a challenge for a target and return what the core says to show. */
   async challenge(target: Record<string, unknown>): Promise<ChallengeIssued> {
     const id = `c${this.nextId++}`;
     await this.sendMessage("challenge", { id, target });
-    const r = await this.next<{ id: string; challenge: string; contentBytes: string; contentHash: string; expiresAt: number }>("challenge-issued", (v) => v.id === id);
+    const r = await this.reply<{ id: string; challenge: string; contentBytes: string; contentHash: string; expiresAt: number }>("challenge-issued", id);
     return { id, challenge: r.challenge, contentBytes: fromBase64Lenient(r.contentBytes), contentHash: r.contentHash, expiresAt: r.expiresAt };
   }
 
@@ -511,7 +522,7 @@ export class TestPhone {
     const payload = { kind: "unlock" as const, sessionHash: override.sessionHash ?? toHex(this.handshakeHash), expiresAt: override.expiresAt ?? this.now() + ttlMs };
     const id = `u${this.nextId++}`;
     await this.sendMessage("unlock", { id, payload, sig: toHex(signEs256(this.approveSecret, unlockBytes(payload))) });
-    return (await this.next<{ id: string; expiresAt: number }>("unlock-ok", (v) => v.id === id)).expiresAt;
+    return (await this.reply<{ id: string; expiresAt: number }>("unlock-ok", id)).expiresAt;
   }
 
   async subscribeTask(taskId: string, opts: { afterId?: number | null; maxBytes?: number | null; sub?: string } = {}): Promise<string> {
@@ -532,7 +543,7 @@ export class TestPhone {
   async registerPush(pushRef: string, sendKey: Uint8Array): Promise<void> {
     const id = `p${this.nextId++}`;
     await this.sendMessage("push-register", { id, pushRef, sendKey: toHex(sendKey) });
-    await this.next("ok", (v: { id: string }) => v.id === id);
+    await this.reply("ok", id);
   }
 
   async revokeSelf(): Promise<void> {

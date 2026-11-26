@@ -87,8 +87,8 @@ export async function fetchTaskRows(ids: readonly string[]): Promise<Map<string,
 /**
  * Builds the core's task notifier, seeds it, installs the removal hooks and
  * subscribes the notification policy to the global event bus. `sink` is what
- * `startApiServer` takes as `notifications`, so `POST /notifications` and
- * `DELETE /notifications/:taskId` share the notifier's queue and dedupe. The
+ * `startApiServer` takes as `notifications`, so `POST /notifications` and the
+ * removal hooks share the notifier's queue and dedupe. The
  * headless core installs its own removal hooks here (the desktop app installs
  * them in index.ts instead), so an answered or unblocked task's entry goes away.
  *

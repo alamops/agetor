@@ -6856,10 +6856,24 @@ export interface BackgroundStatus {
   remoteAccess: boolean;
 }
 
-/** `GET /remote-access`. Remote access is a preview: nothing pairs yet. */
-export interface RemoteAccessStatus {
+/** The remote-access switch alone (`background.ts` reads it from the preference). */
+export interface RemoteAccessSwitch {
   enabled: boolean;
   preview: true;
+}
+
+/** `GET /remote-access`: the switch and what the Companion gateway is doing (docs/architecture/remote-gateway.md). */
+export interface RemoteAccessStatus extends RemoteAccessSwitch {
+  /** Whether this build ships the Companion. When false every other field below is empty. */
+  companion: boolean;
+  relay: { url: string | null; state: "off" | "unconfigured" | "connecting" | "up" | "down" };
+  devices: { trusted: number; untrusted: number };
+  /** The D11 warning when the API is bound beyond loopback, else null. */
+  bindWarning: string | null;
+  /** The Mac's name as phones show it. */
+  macName: string;
+  attachedTerminals: Array<{ taskId: string; deviceId: string; deviceName: string; since: number }>;
+  auditHead: { seq: number; hash: string } | null;
 }
 
 /** `preferences` key holding the remote-access switch; stored "on" | "off".

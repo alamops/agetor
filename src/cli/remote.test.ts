@@ -153,7 +153,7 @@ test("remote status --json prints the RemoteAccessStatus shape", async () => {
   preferences.set(REMOTE_ACCESS_PREF_KEY, "on");
   const res = await agetor(["remote", "status", "--json"], SERVER_DIR);
   expect(res.code).toBe(0);
-  expect(JSON.parse(res.stdout)).toEqual({ enabled: true, preview: true });
+  expect(JSON.parse(res.stdout)).toMatchObject({ enabled: true, preview: true, companion: true });
 });
 
 test("remote off turns it off in the core and says so", async () => {
@@ -170,12 +170,12 @@ test("remote off --json, and off when already off", async () => {
   preferences.set(REMOTE_ACCESS_PREF_KEY, "on");
   const res = await agetor(["remote", "off", "--json"], SERVER_DIR);
   expect(res.code).toBe(0);
-  expect(JSON.parse(res.stdout)).toEqual({ enabled: false, preview: true });
+  expect(JSON.parse(res.stdout)).toMatchObject({ enabled: false, preview: true });
   expect(remoteIs()).toBe("off");
 
   const again = await agetor(["remote", "off", "--json"], SERVER_DIR);
   expect(again.code).toBe(0);
-  expect(JSON.parse(again.stdout)).toEqual({ enabled: false, preview: true });
+  expect(JSON.parse(again.stdout)).toMatchObject({ enabled: false, preview: true });
 });
 
 test("there is no `remote on`: it is refused before any request and changes nothing", async () => {

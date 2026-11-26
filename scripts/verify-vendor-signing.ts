@@ -36,7 +36,47 @@ const OWNERS: Record<string, string> = {
   // ID + runtime + timestamp signature here keeps this gate honest about the
   // bytes electrobun starts from.
   "login-item": "scripts/build-login-item.ts",
+  // The Companion's key helper. Nested under Resources/app/bin like the notifier, so it ships exactly as signed here.
+  keyhelper: "scripts/build-keyhelper.ts",
 };
+
+/** What `checkKeyHelperSigning` needs to know about the built helper and the notifier it must be signed alongside. */
+export interface KeyHelperSigningFacts {
+  /** `Authority=` of the helper (the first line, the leaf certificate). */
+  authority: string;
+  /** The same for AgetorNotifier.app, or null when there is none to compare with. */
+  notifierAuthority: string | null;
+  /** Whether Contents/embedded.provisionprofile exists in the helper bundle. */
+  hasProfile: boolean;
+  /** The helper's entitlements plist, as `codesign -d --entitlements :-` prints it. */
+  entitlements: string;
+}
+
+/**
+ * The Companion key helper's extra signing rules, beyond "Developer ID, hardened runtime, timestamp" (checked for every vendored object):
+ * the SAME identity as the notifier (one team, one certificate), the embedded provisioning profile the data-protection keychain needs, and
+ * a `keychain-access-groups` entitlement. Pure, so the release gate's tests can run it on facts instead of a signed bundle.
+ */
+export function checkKeyHelperSigning(f: KeyHelperSigningFacts): string[] {
+  const problems: string[] = [];
+  if (f.notifierAuthority !== null && f.authority !== f.notifierAuthority) {
+    problems.push(`AgetorKeyHelper.app is signed by "${f.authority}" but AgetorNotifier.app by "${f.notifierAuthority}": one identity must sign both`);
+  }
+  if (!f.hasProfile) problems.push("AgetorKeyHelper.app has no Contents/embedded.provisionprofile: the keychain access group needs it (set AGETOR_KEYHELPER_PROFILE)");
+  if (!f.entitlements.includes("keychain-access-groups")) problems.push("AgetorKeyHelper.app has no keychain-access-groups entitlement");
+  return problems;
+}
+
+async function keyHelperFacts(app: string, notifier: string | null): Promise<KeyHelperSigningFacts> {
+  const authorityOf = async (target: string): Promise<string> => (await run(["codesign", "-dvv", target])).out.match(/Authority=(.+)/)?.[1] ?? "(none)";
+  const ent = await run(["codesign", "-d", "--entitlements", ":-", app]);
+  return {
+    authority: await authorityOf(app),
+    notifierAuthority: notifier ? await authorityOf(notifier) : null,
+    hasProfile: existsSync(path.join(app, "Contents", "embedded.provisionprofile")),
+    entitlements: ent.out,
+  };
+}
 
 async function run(cmd: string[]): Promise<{ code: number; out: string }> {
   const p = Bun.spawn(cmd, { stdout: "pipe", stderr: "pipe" });
@@ -140,6 +180,16 @@ export async function verifyVendorSigning(
     if (!/^Timestamp=/m.test(out)) {
       problems.push(`${rel} lacks a secure timestamp (--timestamp)${suffix}`);
     }
+  }
+
+  // The Companion's key helper: its own rules on top (same identity as the notifier, the profile, the keychain entitlement). A release
+  // (requireDeveloperId) refuses to go on without it.
+  const keyHelper = path.join(VENDOR_DIR, "keyhelper", "AgetorKeyHelper.app");
+  if (existsSync(keyHelper)) {
+    const notifier = path.join(VENDOR_DIR, "notifier", "AgetorNotifier.app");
+    problems.push(...checkKeyHelperSigning(await keyHelperFacts(keyHelper, existsSync(notifier) ? notifier : null)));
+  } else if (opts.requireDeveloperId) {
+    problems.push("vendor/keyhelper/AgetorKeyHelper.app is missing — run `bun run vendor:keyhelper` (with AGETOR_KEYHELPER_PROFILE) before building.");
   }
 
   return { checked: targets.length, skipped: false, problems };

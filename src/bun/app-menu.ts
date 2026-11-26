@@ -15,6 +15,7 @@
  *
  * Kept free of any `electrobun` import so a unit test can load it.
  */
+import { COMPANION_ENABLED } from "../shared/build-flags.ts";
 import { APP_MENU_ACTIONS, type AppEvent, type AppMenuAction } from "../shared/types.ts";
 
 export type MenuItem =
@@ -28,7 +29,9 @@ function webviewItem(label: string, action: AppMenuAction, accelerator?: string)
   return { label, action: `${WEBVIEW_PREFIX}${action}`, ...(accelerator ? { accelerator } : {}) };
 }
 
-export function buildAppMenu(): MenuItem[] {
+/** `companion` is injected so a test runs both ways; the build flag decides in the app. */
+export function buildAppMenu(opts: { companion?: boolean } = {}): MenuItem[] {
+  const companion = opts.companion ?? COMPANION_ENABLED;
   return [
     {
       label: "Agetor",
@@ -38,6 +41,8 @@ export function buildAppMenu(): MenuItem[] {
         webviewItem("Settings…", "settings", "Cmd+,"),
         { type: "separator" },
         { label: "Remote Access…", action: "remote-access" },
+        // Only in a build that ships the Companion; the action turns remote access on first (index.ts), then opens the key helper's window.
+        ...(companion ? [{ label: "Pair a Phone…", action: "pair-phone" } as MenuItem] : []),
         { type: "separator" },
         { role: "hide", accelerator: "Cmd+H" },
         { role: "hideOthers", accelerator: "Cmd+Alt+H" },

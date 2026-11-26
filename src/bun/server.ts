@@ -46,6 +46,9 @@ import { beginLagLabel } from "./event-loop-lag.ts";
 import { resolveResumeCursor } from "./event-resume.ts";
 import { isNotificationKind, UNBLOCKED_REMOVAL_KINDS, type NotificationKind, type TaskNotificationRemoval } from "../shared/os-notification.ts";
 import { notificationTargetTaskId } from "./notification-hooks.ts";
+import { COMPANION_ENABLED } from "../shared/build-flags.ts";
+import { MAC_NAME_PREF, validateMacName } from "./remote/mac-name.ts";
+import { DEVICE_ID_RE, buildRemoteAccessStatus, detachPhoneTerminal, listDevices, readLog, revokeAllDevices, revokeDevice } from "./remote/remote-status.ts";
 import { HIDDEN_CONTINUATION_REFUSAL, activeRunCount, backgroundAgentsHoldTask, isScheduledSwitchUnderway, appendRunStatusLine, archiveTask, beginManualAccountSwitch, cancelFxAutoResume, cancelHarnessRetryForTask, cancelScheduledAccountSwitch, claimTaskForAccountSwitch, clearManualAccountSwitch, createTask, deleteOrphanWorktree, deleteTask, isOrphanedPipelineStep, listWorktrees, minCliVersionError, rearmRetriesAfterCooldownClear, releaseTaskAccountSwitch, startTask, switchTaskAccountNow, SwitchAccountRefusedError, cancelRun, reconcileTaskSession, resumeFxRecovery, sendInput, subscribe, subscribeGlobal, teardownBranchesForTask, unarchiveTask, removeTaskRepository, worktreeGitStatus } from "./orchestrator.ts";
 import { checkoutSessionBranch, importClaudeSessions, retryImport } from "./claude-session-import.ts";
 import { scanOpencodeSessions } from "./opencode-session-scan.ts";
@@ -1729,6 +1732,125 @@ async function gateStackMemberRoots(req: Request, memberIds: readonly string[]):
 // eslint-disable-next-line @typescript-eslint/no-explicit-any
 type RouteHandler = (req: any) => Response | Promise<Response>;
 type ServerRoutes = Record<string, RouteHandler | Record<string, RouteHandler>>;
+
+/**
+ * The image preview both preview routes serve: `GET /files/preview` (the desktop app, which follows symlinks and may fall back to the
+ * preview twin) and `GET /tasks/:id/files/preview` (a phone or the CLI, which never follows one and never reads a twin: a phone asks
+ * for a file the agent named, and a symlink the agent planted must not widen what it can read). Same content types, same 50 MB cap.
+ */
+async function previewFile(req: Request, opts: { followSymlinks: boolean; twin: boolean }): Promise<Response> {
+  const url = new URL(req.url);
+  const raw = url.searchParams.get("path") ?? "";
+  if (!raw) {
+    return json({ error: "path required" }, { status: 400, headers: corsHeaders(req) });
+  }
+  if (!path.isAbsolute(raw)) {
+    return json(
+      { error: `path must be absolute: ${raw}` },
+      { status: 400, headers: corsHeaders(req) },
+    );
+  }
+  if (!isImagePath(raw)) {
+    return json(
+      { error: `not an image path: ${raw}` },
+      { status: 400, headers: corsHeaders(req) },
+    );
+  }
+  // The path is the agent's (its markdown, its SendUserFile call), so
+  // while disclaiming the file is opened by a disclaimed child, never
+  // in the core's own process under Agetor's TCC identity (D26(j)).
+  // Only regular files (a FIFO named `*.png` would hang the stream).
+  // `maxBytes` bounds the memory `settleFileBytes` holds below.
+  let opened = await openFileBytes(raw, {
+    followSymlinks: opts.followSymlinks,
+    ifNoneMatch: req.headers.get("if-none-match"),
+    maxBytes: MAX_FILE_PREVIEW_BYTES,
+  });
+  // Only when the original is DENIED (on macOS, a TCC-protected
+  // folder the disclaimed reader may not enter) fall back to the
+  // preview twin written when the user picked, dropped or pasted this
+  // path (preview-twins.ts). A readable original always wins, and a
+  // missing, too-large or errored one never falls back. The twin read
+  // is the same disclaimed reader and never follows a symlink, so a
+  // twin an agent planted can only show a regular, non-protected file.
+  if (opened.kind === "denied" && opts.twin) {
+    const twin = previewTwinPath(dataDir, raw);
+    if (twin !== null) {
+      const viaTwin = await openFileBytes(twin, {
+        followSymlinks: false,
+        ifNoneMatch: req.headers.get("if-none-match"),
+        maxBytes: MAX_FILE_PREVIEW_BYTES,
+      });
+      if (viaTwin.kind === "ok" || viaTwin.kind === "not-modified") opened = viaTwin;
+    }
+  }
+  if (opened.kind === "missing") {
+    return json({ error: `not found: ${raw}` }, { status: 404, headers: corsHeaders(req) });
+  }
+  if (opened.kind === "denied") {
+    return json({ error: `not readable: ${raw}` }, { status: 403, headers: corsHeaders(req) });
+  }
+  if (opened.kind === "too-large") {
+    return json(
+      { error: `image exceeds ${MAX_FILE_PREVIEW_BYTES} bytes: ${raw}` },
+      { status: 413, headers: corsHeaders(req) },
+    );
+  }
+  if (opened.kind === "error") {
+    return json({ error: `could not read ${raw}: ${opened.message}` }, { status: 500, headers: corsHeaders(req) });
+  }
+  const ext = raw.slice(raw.lastIndexOf(".") + 1).toLowerCase();
+  // Shared canonical map (../shared/attachments.ts) — behavior is
+  // unchanged from the old inline map + `image/<ext>` fallback: every
+  // extension reachable here already passed `isImagePath`, so the
+  // shared lookup always hits and the fallback is never exercised.
+  const contentType = contentTypeForPreviewPath(raw) ?? `image/${ext}`;
+  // ETag derived from size+mtime so a re-saved file at the same path
+  // (e.g. a screenshot overwritten in place) is detected as changed.
+  const etag = opened.etag;
+  if (opened.kind === "not-modified") {
+    return new Response(null, {
+      status: 304,
+      headers: { ...corsHeaders(req), etag },
+    });
+  }
+  // A streamed body is read whole before the 200: Bun ends a chunked
+  // response cleanly when its stream errors, so a short read would
+  // otherwise reach the webview as a complete, truncated image.
+  const settled = await settleFileBytes(opened, req.signal);
+  if (settled.kind === "error") {
+    return json({ error: `could not read ${raw}: ${settled.message}` }, { status: 500, headers: corsHeaders(req) });
+  }
+  return new Response(settled.body, {
+    headers: {
+      ...corsHeaders(req),
+      "content-type": contentType,
+      // This route serves agent-writable content (e.g. SVG, which can
+      // carry <script>) on the API origin; nosniff + img-only
+      // consumption (the webview fetches it with its Authorization
+      // header and shows a blob: URL) keeps active-content risk down.
+      // The CSP header below makes that img-only mitigation
+      // self-enforcing: a browser ignores CSP on an <img> fetch, but
+      // if this URL were ever navigated to or framed
+      // instead, `sandbox` + `default-src 'none'` block script
+      // execution in an SVG. Agent-authored markdown can now point
+      // this route anywhere (plan
+      // docs/plans/markdown-image-rendering.md D9).
+      "x-content-type-options": "nosniff",
+      "content-security-policy": "sandbox; default-src 'none'",
+      // Content at a given path can change (a screenshot re-saved in
+      // place), so don't let the browser serve stale bytes without
+      // asking; the ETag makes the revalidation cheap (304, no body).
+      "cache-control": "private, max-age=0, must-revalidate",
+      etag,
+    },
+  });
+}
+
+/** The device, log, preview and phone-terminal routes answer this when the build ships without the Companion. */
+function companionUnavailable(req: Request): Response {
+  return json({ error: "the Companion is not available in this build", code: "companion-unavailable" }, { status: 404, headers: corsHeaders(req) });
+}
 
 export function startApiServer(
   deps: {
@@ -4455,6 +4577,15 @@ export function startApiServer(
               );
             }
             await setRemoteAccessOff();
+            return new Response(null, { status: 204, headers: corsHeaders(req) });
+          }
+          if (req.params.key === MAC_NAME_PREF) {
+            // The name phones show for this Mac: cleaned of control and invisible characters, at most 40, never empty.
+            const cleaned = validateMacName(body.value);
+            if (cleaned === null) {
+              return json({ error: "the Mac's name must be 1 to 40 visible characters" }, { status: 400, headers: corsHeaders(req) });
+            }
+            await preferences.set(req.params.key, cleaned);
             return new Response(null, { status: 204, headers: corsHeaders(req) });
           }
           if (req.params.key === TMUX_SOURCE_KEY) {
@@ -8001,113 +8132,15 @@ export function startApiServer(
       // usually an agent's choice, so the read goes through `openFileBytes`
       // (a disclaimed child while disclaiming — see core-file-read.ts).
       "/files/preview": {
+        GET: authed((req) => previewFile(req, { followSymlinks: true, twin: true })),
+      },
+      // A phone's (or the CLI's) image preview, scoped to a task. The path rules (D15: inside the task's folders is an observe read,
+      // anywhere else needs operate) are the router's class rules; the bytes come through the no-follow reader.
+      "/tasks/:id/files/preview": {
         GET: authed(async (req) => {
-          const url = new URL(req.url);
-          const raw = url.searchParams.get("path") ?? "";
-          if (!raw) {
-            return json({ error: "path required" }, { status: 400, headers: corsHeaders(req) });
-          }
-          if (!path.isAbsolute(raw)) {
-            return json(
-              { error: `path must be absolute: ${raw}` },
-              { status: 400, headers: corsHeaders(req) },
-            );
-          }
-          if (!isImagePath(raw)) {
-            return json(
-              { error: `not an image path: ${raw}` },
-              { status: 400, headers: corsHeaders(req) },
-            );
-          }
-          // The path is the agent's (its markdown, its SendUserFile call), so
-          // while disclaiming the file is opened by a disclaimed child, never
-          // in the core's own process under Agetor's TCC identity (D26(j)).
-          // Only regular files (a FIFO named `*.png` would hang the stream).
-          // `maxBytes` bounds the memory `settleFileBytes` holds below.
-          let opened = await openFileBytes(raw, {
-            followSymlinks: true,
-            ifNoneMatch: req.headers.get("if-none-match"),
-            maxBytes: MAX_FILE_PREVIEW_BYTES,
-          });
-          // Only when the original is DENIED (on macOS, a TCC-protected
-          // folder the disclaimed reader may not enter) fall back to the
-          // preview twin written when the user picked, dropped or pasted this
-          // path (preview-twins.ts). A readable original always wins, and a
-          // missing, too-large or errored one never falls back. The twin read
-          // is the same disclaimed reader and never follows a symlink, so a
-          // twin an agent planted can only show a regular, non-protected file.
-          if (opened.kind === "denied") {
-            const twin = previewTwinPath(dataDir, raw);
-            if (twin !== null) {
-              const viaTwin = await openFileBytes(twin, {
-                followSymlinks: false,
-                ifNoneMatch: req.headers.get("if-none-match"),
-                maxBytes: MAX_FILE_PREVIEW_BYTES,
-              });
-              if (viaTwin.kind === "ok" || viaTwin.kind === "not-modified") opened = viaTwin;
-            }
-          }
-          if (opened.kind === "missing") {
-            return json({ error: `not found: ${raw}` }, { status: 404, headers: corsHeaders(req) });
-          }
-          if (opened.kind === "denied") {
-            return json({ error: `not readable: ${raw}` }, { status: 403, headers: corsHeaders(req) });
-          }
-          if (opened.kind === "too-large") {
-            return json(
-              { error: `image exceeds ${MAX_FILE_PREVIEW_BYTES} bytes: ${raw}` },
-              { status: 413, headers: corsHeaders(req) },
-            );
-          }
-          if (opened.kind === "error") {
-            return json({ error: `could not read ${raw}: ${opened.message}` }, { status: 500, headers: corsHeaders(req) });
-          }
-          const ext = raw.slice(raw.lastIndexOf(".") + 1).toLowerCase();
-          // Shared canonical map (../shared/attachments.ts) — behavior is
-          // unchanged from the old inline map + `image/<ext>` fallback: every
-          // extension reachable here already passed `isImagePath`, so the
-          // shared lookup always hits and the fallback is never exercised.
-          const contentType = contentTypeForPreviewPath(raw) ?? `image/${ext}`;
-          // ETag derived from size+mtime so a re-saved file at the same path
-          // (e.g. a screenshot overwritten in place) is detected as changed.
-          const etag = opened.etag;
-          if (opened.kind === "not-modified") {
-            return new Response(null, {
-              status: 304,
-              headers: { ...corsHeaders(req), etag },
-            });
-          }
-          // A streamed body is read whole before the 200: Bun ends a chunked
-          // response cleanly when its stream errors, so a short read would
-          // otherwise reach the webview as a complete, truncated image.
-          const settled = await settleFileBytes(opened, req.signal);
-          if (settled.kind === "error") {
-            return json({ error: `could not read ${raw}: ${settled.message}` }, { status: 500, headers: corsHeaders(req) });
-          }
-          return new Response(settled.body, {
-            headers: {
-              ...corsHeaders(req),
-              "content-type": contentType,
-              // This route serves agent-writable content (e.g. SVG, which can
-              // carry <script>) on the API origin; nosniff + img-only
-              // consumption (the webview fetches it with its Authorization
-              // header and shows a blob: URL) keeps active-content risk down.
-              // The CSP header below makes that img-only mitigation
-              // self-enforcing: a browser ignores CSP on an <img> fetch, but
-              // if this URL were ever navigated to or framed
-              // instead, `sandbox` + `default-src 'none'` block script
-              // execution in an SVG. Agent-authored markdown can now point
-              // this route anywhere (plan
-              // docs/plans/markdown-image-rendering.md D9).
-              "x-content-type-options": "nosniff",
-              "content-security-policy": "sandbox; default-src 'none'",
-              // Content at a given path can change (a screenshot re-saved in
-              // place), so don't let the browser serve stale bytes without
-              // asking; the ETag makes the revalidation cheap (304, no body).
-              "cache-control": "private, max-age=0, must-revalidate",
-              etag,
-            },
-          });
+          if (!COMPANION_ENABLED) return companionUnavailable(req);
+          if (!(await tasks.get(req.params.id))) return json({ error: "not found" }, { status: 404, headers: corsHeaders(req) });
+          return await previewFile(req, { followSymlinks: false, twin: false });
         }),
       },
 
@@ -9554,11 +9587,65 @@ export function startApiServer(
           }
         }),
       },
+      // Read the switch and the gateway's state, or turn the switch OFF. Nothing here (or anywhere under /remote-access) turns it on, pairs a
+      // device or raises a level: only GET (read) and DELETE (revoke, off) exist, pinned by route-policy.test.ts TT3(c).
       "/remote-access": {
-        GET: authed(async (req) => json(await getRemoteAccess(), { headers: corsHeaders(req) })),
+        GET: authed(async (req) => json(await buildRemoteAccessStatus(), { headers: corsHeaders(req) })),
         DELETE: authed(async (req) => {
           await setRemoteAccessOff();
-          return json(await getRemoteAccess(), { headers: corsHeaders(req) });
+          return json(await buildRemoteAccessStatus(), { headers: corsHeaders(req) });
+        }),
+      },
+      "/remote-access/devices": {
+        GET: authed(async (req) => {
+          if (!COMPANION_ENABLED) return companionUnavailable(req);
+          try {
+            return json(await listDevices(), { headers: corsHeaders(req) });
+          } catch (err) {
+            return json({ error: err instanceof Error ? err.message : "the device list is unavailable", code: "helper-unavailable" }, { status: 503, headers: corsHeaders(req) });
+          }
+        }),
+        // Revoke all: the key helper revokes every id it ever signed and replaces the core key, every phone must pair again.
+        DELETE: authed(async (req) => {
+          if (!COMPANION_ENABLED) return companionUnavailable(req);
+          try {
+            await revokeAllDevices();
+            return json({ ok: true }, { headers: corsHeaders(req) });
+          } catch (err) {
+            return json({ error: err instanceof Error ? err.message : "revoke all failed", code: "helper-unavailable" }, { status: 503, headers: corsHeaders(req) });
+          }
+        }),
+      },
+      "/remote-access/devices/:id": {
+        DELETE: authed(async (req) => {
+          if (!COMPANION_ENABLED) return companionUnavailable(req);
+          if (!DEVICE_ID_RE.test(req.params.id)) return json({ error: "invalid device id" }, { status: 400, headers: corsHeaders(req) });
+          try {
+            if (!(await revokeDevice(req.params.id))) return json({ error: "not found" }, { status: 404, headers: corsHeaders(req) });
+            return json({ ok: true }, { headers: corsHeaders(req) });
+          } catch (err) {
+            return json({ error: err instanceof Error ? err.message : "revoke failed", code: "helper-unavailable" }, { status: 503, headers: corsHeaders(req) });
+          }
+        }),
+      },
+      "/remote-access/log": {
+        GET: authed(async (req) => {
+          if (!COMPANION_ENABLED) return companionUnavailable(req);
+          const q = new URL(req.url).searchParams;
+          const limitRaw = q.get("limit");
+          const limit = limitRaw === null ? 50 : Number(limitRaw);
+          if (!Number.isInteger(limit) || limit < 1 || limit > 500) return json({ error: "limit must be an integer 1..500" }, { status: 400, headers: corsHeaders(req) });
+          const beforeRaw = q.get("beforeSeq");
+          const beforeSeq = beforeRaw === null ? undefined : Number(beforeRaw);
+          if (beforeSeq !== undefined && (!Number.isInteger(beforeSeq) || beforeSeq < 1)) return json({ error: "beforeSeq must be a positive integer" }, { status: 400, headers: corsHeaders(req) });
+          return json(await readLog({ limit, beforeSeq }), { headers: corsHeaders(req) });
+        }),
+      },
+      // The Mac's Detach button for a phone's terminal: ends the phone's tmux client, never the session.
+      "/tasks/:id/phone-terminal": {
+        DELETE: authed(async (req) => {
+          if (!COMPANION_ENABLED) return companionUnavailable(req);
+          return json({ ok: true, detached: detachPhoneTerminal(req.params.id) }, { headers: corsHeaders(req) });
         }),
       },
 
@@ -9622,18 +9709,6 @@ export function startApiServer(
       // pipeline run view opened, the window coming to the front with the
       // task open (D6d), and an event arriving while the window is focused
       // (D7). A step id maps to its pipeline parent, which owns the entry.
-      "/notifications/:taskId": {
-        DELETE: authed(async (req) => {
-          if (!native) return notAvailableHeadless(req);
-          const taskId = req.params.taskId;
-          if (!taskId || taskId.length > 512) {
-            return json({ error: "invalid task id" }, { status: 400, headers: corsHeaders(req) });
-          }
-          removeTaskNotification(await notificationTargetTaskId(taskId));
-          return json({ ok: true }, { headers: corsHeaders(req) });
-        }),
-      },
-
       // App-level SSE channel. Currently used by the QuitConfirmDialog so the
       // main process can ask the webview "are you sure?" when Cmd+Q lands
       // while runs are active. Live-only (no replay) — events are transient

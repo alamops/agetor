@@ -69,7 +69,8 @@ import { liveSupervisor, requestSupervisorStop } from "./login-daemon-state.ts";
 import { acquireApiPort } from "./app-takeover.ts";
 import { bootReadySignal } from "./boot-gate.ts";
 import { startTasksChangedPush } from "./task-change-push.ts";
-import { runRemoteAccessBox } from "./remote-access-box.ts";
+import { runPairPhone, runRemoteAccessBox } from "./remote-access-box.ts";
+import { startRemoteGateway, type RemoteGateway } from "./remote/gateway.ts";
 import {
   getBackgroundStatus,
   turnOnBackground,
@@ -549,6 +550,21 @@ Electrobun.events.on("application-menu-clicked", (e: { data?: { action?: string 
       openLoginItems,
       log: (m) => console.warn(m),
     });
+  } else if (action === "pair-phone") {
+    void runPairPhone({
+      showMessageBox: showLabelledMessageBox,
+      background: {
+        getBackgroundStatus,
+        turnOnBackground,
+        startBackgroundNow,
+        getRemoteAccess,
+        setRemoteAccessOff,
+        setRemoteAccessOnFromNativeBox,
+      },
+      openLoginItems,
+      startPairing: remoteGateway?.startPairing ? () => remoteGateway!.startPairing!() : undefined,
+      log: (m) => console.warn(m),
+    });
   } else if (action === "quit-completely") {
     // before-quit reads this one-shot; with runs active it still asks first.
     requestQuitCompletely();
@@ -587,6 +603,17 @@ startPeriodicDiscovery();
 
 // The boot restore above is done: let the routes through (boot-gate.ts).
 markBootReady();
+
+// The Companion gateway (docs/architecture/remote-gateway.md): composed once the routes are up, in whichever core owns the port. With the
+// Companion compiled out this is a no-op that never touches the key helper. It stops in the quit sequence below.
+let remoteGateway: RemoteGateway | null = null;
+void startRemoteGateway({ mode: "app", notificationPolicy })
+  .then((g) => {
+    remoteGateway = g;
+  })
+  .catch((err) => {
+    console.error("[agetor] remote gateway failed to start:", err);
+  });
 
 // The quit prompt's running tasks, kept fresh in memory: the `before-quit`
 // hook below is synchronous and cannot await a database read. Re-read on task
@@ -715,6 +742,8 @@ const quitSequencer = createQuitSequencer({
         // worker can't hold this past the sequence cap with the creds file still
         // on disk (removeCoreCreds below must always run).
         await Promise.race([launchesFreezing, Bun.sleep(3_000)]);
+        // Sessions end and the relay link closes before the process goes (a quit hands the mailbox to whoever serves the port next).
+        await Promise.race([remoteGateway?.stop() ?? Promise.resolve(), Bun.sleep(1_000)]).catch(() => undefined);
         const { completely, stopSupervisor, backgroundArmed } = quitDecision;
         // Only when a supervisor is alive to read it (`stopSupervisor`): a request
         // written with none running would otherwise linger for the next supervisor

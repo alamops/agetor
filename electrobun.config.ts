@@ -74,6 +74,12 @@ export default {
       // inner executable. No third-party binary, no Rosetta. The agetor://
       // scheme registered above is what the click routes back through.
       "vendor/notifier": "bin",
+      // The Companion's key helper (AgetorKeyHelper.app, native/keyhelper/ via scripts/build-keyhelper.ts): holds the core session key and
+      // the Secure Enclave registry key and draws the native pairing window. Lands at Contents/Resources/app/bin/AgetorKeyHelper.app, NOT
+      // in Contents/MacOS: electrobun's codesign pass would re-sign a Mach-O there and strip the provisioning profile it needs for the
+      // data-protection keychain. scripts/verify-vendor-signing.ts and scripts/verify-release.ts assert the signature, the profile and the
+      // entitlements. docs/specs/remote-readiness-spec.md "Keys and cryptography".
+      "vendor/keyhelper": "bin",
       // Our own native arm64 "disclaim" helper — execs a spawned command as
       // TCC-responsible for itself instead of inheriting Agetor's responsible
       // process identity (built by scripts/build-disclaim.ts from

@@ -112,3 +112,37 @@ export interface RemoteIdempotencyRow {
   response: Uint8Array | null;
   createdAt: number;
 }
+
+
+// ── what the HTTP routes and the CLI show about devices and the log ──────────────────────────────────────────────────────────
+
+/** Why a stored row is not trusted: its entry signature fails, the helper revoked it, or its status is not active. */
+export type RemoteTrustState = "trusted" | "bad-signature" | "revoked" | "status";
+
+/** One device as `GET /remote-access/devices` lists it. Names are already cleaned (control and invisible characters removed, at most 40). */
+export interface RemoteDeviceDto {
+  id: string;
+  name: string;
+  platform: RemotePlatform;
+  appVersion: string;
+  level: RemoteLevel;
+  trust: RemoteTrustState;
+  enrolledAt: number;
+  lastSeenAt: number | null;
+  /** The device registered a push address. */
+  pushRegistered: boolean;
+  /** The device has a live session right now. */
+  online: boolean;
+}
+
+export interface RemoteDevicesResult {
+  devices: RemoteDeviceDto[];
+}
+
+/** `GET /remote-access/log`: one page of the audit chain, newest first, with the chain's integrity. */
+export interface RemoteLogResult {
+  rows: Array<RemoteAuditRow & { outcome?: string }>;
+  chain: { ok: boolean; firstBadSeq: number | null };
+  /** Pass as `beforeSeq` for the next page; null on the last one. */
+  nextBeforeSeq: number | null;
+}

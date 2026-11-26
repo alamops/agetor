@@ -272,18 +272,19 @@ describe("every way it ends kills only the tmux client, tells the phone, audits 
 
 // ── with a real tmux ───────────────────────────────────────────────────────────────────────────────────────────────────────
 
+// The real tmux, found on PATH: other test files in the same `bun test` process point AGETOR_TMUX_BIN at /bin/echo while they run, so the
+// real-tmux test sets the override itself for its own duration.
 const tmuxPath = (() => {
-  try {
-    const bin = resolveTmuxBin();
-    return Bun.spawnSync([bin, "-V"]).exitCode === 0 ? bin : null;
-  } catch {
-    return null;
-  }
+  const bin = Bun.which("tmux");
+  return bin && Bun.spawnSync([bin, "-V"]).exitCode === 0 ? bin : null;
 })();
 
 describe("with a real tmux", () => {
   const sessions: string[] = [];
+  const savedBin = process.env.AGETOR_TMUX_BIN;
   afterEach(async () => {
+    if (savedBin === undefined) delete process.env.AGETOR_TMUX_BIN;
+    else process.env.AGETOR_TMUX_BIN = savedBin;
     for (const s of sessions.splice(0)) Bun.spawnSync([resolveTmuxBin(), ...tmuxSocketArgs(), "kill-session", "-t", "=" + s]);
   });
 
@@ -293,6 +294,7 @@ describe("with a real tmux", () => {
       console.warn("SKIPPED (tmux not found): the real-tmux terminal test did not run");
       return;
     }
+    process.env.AGETOR_TMUX_BIN = tmuxPath;
     const name = `agetor-term${Math.random().toString(36).slice(2, 8)}`;
     sessions.push(name);
     const run = (args: string[]) => Bun.spawnSync([resolveTmuxBin(), ...tmuxSocketArgs(), ...args]);

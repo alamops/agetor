@@ -480,6 +480,9 @@ export const ROUTE_POLICY: Record<string, PolicyEntry> = {
   "/screenshots": { POST: APP },
   "/attachments": { POST: APP },
   "/files/preview": { GET: APP },
+  // A phone's (and the CLI's) image preview scoped to a task: observe inside the task's folders, operate anywhere else (D15, the router's
+  // class rule), through the no-follow reader. The path goes through the same gate the CLI token passes.
+  "/tasks/:id/files/preview": { GET: remote("observe", "none", "heavy", { pathParams: QUERY_PATH }) },
 
   // Interaction answers, backlog, plans, drafts and run input.
   "/ask-questions/:id/answer": { POST: remote("respond", "unlock") },
@@ -521,7 +524,6 @@ export const ROUTE_POLICY: Record<string, PolicyEntry> = {
   // Notifications, app lifecycle, daemon control and terminals. The terminal WebSocket
   // upgrade is NOT here (it lives in `fetch()`, P11); `ws-ticket` mints its ticket.
   "/notifications": { POST: CLI },
-  "/notifications/:taskId": { DELETE: app({ headless501: true }) },
   "/app/events": SSE_LEGACY,
   "/app/force-quit": { POST: app({ headless501: true }) },
   "/daemon/shutdown": { POST: CLI },
@@ -536,7 +538,14 @@ export const ROUTE_POLICY: Record<string, PolicyEntry> = {
   "/background": { GET: CLI, POST: app({ headless501: true }), DELETE: CLI },
   "/background/start": { POST: CLI },
   "/background/open-settings": { POST: app({ headless501: true }) },
+  // Read the switch and the gateway's state, turn the switch OFF, list or revoke devices, read the audit log. Never on, never pair, never a
+  // level change: only GET (read) and DELETE (revoke, off) exist under /remote-access (route-policy.test.ts TT3(c)).
   "/remote-access": { GET: CLI, DELETE: CLI },
+  "/remote-access/devices": { GET: CLI, DELETE: CLI },
+  "/remote-access/devices/:id": { DELETE: CLI },
+  "/remote-access/log": { GET: CLI },
+  // The Mac's Detach button for a phone's terminal.
+  "/tasks/:id/phone-terminal": { DELETE: CLI },
   "/tasks/:id/terminals": {
     GET: APP,
     POST: APP,

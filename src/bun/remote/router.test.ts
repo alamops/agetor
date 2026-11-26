@@ -347,11 +347,16 @@ describe("the tmux card rules end to end", () => {
 describe("the preview scope (D15)", () => {
   test("inside the task's folders respond is enough; outside it needs operate", async () => {
     const r = rig();
-    // The preview route is added to the policy by the control-routes task; here the table is the real one, so the route may not exist yet.
-    const present = allRemoteRoutes().some((x) => x.route === "/tasks/:id/files/preview");
-    if (!present) return;
-    expect((await r.call(principal("observe"), { method: "GET", path: "/tasks/t1/files/preview", query: "path=%2Fwork%2Fa.png" })).status).toBe(200);
-    expect((await body(await r.call(principal("respond"), { method: "GET", path: "/tasks/t1/files/preview", query: "path=%2Fetc%2Fhosts" }))).code).toBe("level");
-    expect((await r.call(principal("operate"), { method: "GET", path: "/tasks/t1/files/preview", query: "path=%2Fetc%2Fhosts" })).status).toBe(200);
+    expect(allRemoteRoutes().some((x) => x.route === "/tasks/:id/files/preview")).toBe(true);
+    // A heavy read: two a second per device, so time moves between calls.
+    const read = async (level: Parameters<typeof principal>[0], p: string) => {
+      r.advance(1000);
+      return await r.call(principal(level), { method: "GET", path: "/tasks/t1/files/preview", query: `path=${encodeURIComponent(p)}` });
+    };
+    expect((await read("observe", "/work/a.png")).status).toBe(200);
+    expect(await body(await read("observe", "/etc/hosts"))).toMatchObject({ code: "level", required: "operate" });
+    expect(await body(await read("respond", "/etc/hosts"))).toMatchObject({ code: "level", required: "operate" });
+    expect((await read("operate", "/etc/hosts")).status).toBe(200);
+    expect((await read("configure", "/etc/hosts")).status).toBe(200);
   });
 });

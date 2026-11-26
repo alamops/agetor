@@ -40,6 +40,7 @@ const V1_SET = [
   "GET /tasks/:id → observe/none/normal",
   "GET /tasks/:id/events/:eventId → observe/none/heavy",
   "GET /tasks/:id/events/page → observe/none/heavy",
+  "GET /tasks/:id/files/preview → observe/none/heavy",
   "GET /tasks/:id/git-status → observe/none/heavy",
   "GET /tasks/:id/interactions/pending → observe/none/normal",
   "GET /tasks/:id/messages/history → observe/none/normal",
