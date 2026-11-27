@@ -1486,6 +1486,20 @@ test("antigravity gemini-3.8-flash-high model id is emitted verbatim via --model
   expect(cmd).not.toContain("--effort");
 });
 
+test("antigravity composes grouped base model + effort into --model <base>-<effort> without --effort", () => {
+  const low = buildCommand(builtin("antigravity"), "hi", { mode: "auto", model: "gemini-4-argon", effort: "low" });
+  expect(low.cmd[low.cmd.indexOf("--model") + 1]).toBe("gemini-4-argon-low");
+  expect(low.cmd).not.toContain("--effort");
+
+  const neon = buildCommand(builtin("antigravity"), "hi", { mode: "auto", model: "gemini-4-neon", effort: "xhigh" });
+  expect(neon.cmd[neon.cmd.indexOf("--model") + 1]).toBe("gemini-4-neon-xhigh");
+  expect(neon.cmd).not.toContain("--effort");
+
+  const orch = buildCommand(builtin("antigravity"), "hi", { mode: "auto", model: "gemini-pro-orchestrator-neon", effort: null });
+  expect(orch.cmd[orch.cmd.indexOf("--model") + 1]).toBe("gemini-pro-orchestrator-neon");
+  expect(orch.cmd).not.toContain("--effort");
+});
+
 test("gemini 'ask' mode uses --approval-mode plan instead of --yolo", () => {
   const { cmd } = buildCommand(builtin("gemini"), "hi", { ...geminiDefaults, mode: "ask" });
   expect(cmd).not.toContain("--yolo");

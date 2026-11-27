@@ -11,6 +11,7 @@
  * discovery cache) plus the harness's login state.
  */
 
+import { antigravityVariantOf, normalizeAntigravityDiscovered } from "./antigravity-catalog.ts";
 import { cursorSpecKeyFor, cursorVariantOf } from "./cursor-catalog.ts";
 import { sanitizeCliLabel } from "./model-display.ts";
 import {
@@ -22,6 +23,7 @@ import {
 import { supportedSpeeds } from "./speed.ts";
 import {
   AGENT_OPTIONS,
+  ANTIGRAVITY_MODEL_SPECS,
   CATALOG_SCOPED_KINDS,
   CURSOR_MODEL_SPECS,
   DEFAULT_EFFORT,
@@ -105,7 +107,12 @@ export function buildModelOptions(
     loggedIn?: boolean | null;
   },
 ): ModelOption[] {
-  const discovered = kind === "cursor" ? withoutSpecCoveredVariants(input.discovered) : input.discovered;
+  const discovered =
+    kind === "cursor"
+      ? withoutSpecCoveredVariants(input.discovered)
+      : kind === "antigravity"
+        ? normalizeAntigravityDiscovered(input.discovered)
+        : input.discovered;
   const merged = mergeModelOptions({
     curated: AGENT_OPTIONS[kind].models,
     discovered,
@@ -114,9 +121,18 @@ export function buildModelOptions(
     ...(input.loggedIn !== undefined ? { loggedIn: input.loggedIn } : {}),
   });
   const rows = withoutRefusedCuratedRows(kind, merged, discovered, input.loggedIn, input.selected ?? null);
-  if (kind !== "cursor" || !input.selected) return rows;
+  if ((kind !== "cursor" && kind !== "antigravity") || !input.selected) return rows;
   const idx = rows.findIndex((r) => r.id === input.selected && r.unlisted);
   if (idx < 0) return rows;
+  if (kind === "antigravity") {
+    const variant = antigravityVariantOf(input.selected, discovered);
+    if (!variant) return rows;
+    const effort = EFFORT_OPTIONS.find((o) => o.id === variant.effort)?.label ?? variant.effort;
+    const label = sanitizeCliLabel([variant.label ?? variant.base, effort].filter(Boolean).join(" "));
+    const row = rows[idx] as ModelOption;
+    rows[idx] = { ...row, label: label || row.label, hint: CURSOR_VARIANT_HINT };
+    return rows;
+  }
   const variant = cursorVariantOf(input.selected, input.discovered);
   if (!variant) return rows;
   const effort = variant.effort ? (EFFORT_OPTIONS.find((o) => o.id === variant.effort)?.label ?? variant.effort) : null;
@@ -308,6 +324,19 @@ export function knownModelIds(
           if (!variant) continue;
           ids.add(variant);
           ids.add(`${variant}-fast`);
+        }
+      }
+    }
+  } else if (kind === "antigravity") {
+    for (const spec of Object.values(ANTIGRAVITY_MODEL_SPECS)) {
+      for (const variant of Object.values(spec.effortIds ?? {})) {
+        if (variant) ids.add(variant);
+      }
+    }
+    if (loggedIn !== false) {
+      for (const m of normalizeAntigravityDiscovered(discovered)) {
+        for (const variant of Object.values(m.antigravity?.effortIds ?? {})) {
+          if (variant) ids.add(variant);
         }
       }
     }

@@ -9,7 +9,7 @@
  * characters into the webview or a terminal.
  */
 
-import { AGENT_OPTIONS, CURSOR_MODEL_SPECS, type AgentKind } from "./types.ts";
+import { AGENT_OPTIONS, ANTIGRAVITY_MODEL_SPECS, CURSOR_MODEL_SPECS, type AgentKind } from "./types.ts";
 
 /** Drop zero-width characters (U+200B–U+200D, U+2060, U+FEFF) and C0/C1
  *  controls, collapse whitespace, trim, cap at 80 characters. */
@@ -98,6 +98,10 @@ export function modelDisplayName(
     if (curated?.label) return curated.label;
     if (k === "cursor") {
       const spec = CURSOR_MODEL_SPECS[id];
+      if (spec?.label) return spec.label;
+    }
+    if (k === "antigravity") {
+      const spec = ANTIGRAVITY_MODEL_SPECS[id];
       if (spec?.label) return spec.label;
     }
   }

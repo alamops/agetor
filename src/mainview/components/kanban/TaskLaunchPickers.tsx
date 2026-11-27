@@ -272,7 +272,7 @@ export function TaskLaunchPickers({
 
       {withMode ? modeField : null}
 
-      <div className="grid grid-cols-2 gap-2">
+      <div className="grid grid-cols-[minmax(0,3fr)_minmax(0,2fr)] gap-2">
         <Field controlId={id("model")} className="min-w-0">
           <div className="flex items-center justify-between gap-1">
             <FieldLabel id={id("model-label")}>Model</FieldLabel>
@@ -287,6 +287,8 @@ export function TaskLaunchPickers({
             onChange={launch.setModel}
             items={modelItems}
             searchable={modelItems.length > 8}
+            popoverMinWidth={260}
+            title={modelRow?.label ?? model}
             disabled={disabled}
             aria-describedby={note ? fieldDescriptionId(id("model")) : undefined}
           />

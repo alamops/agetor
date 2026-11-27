@@ -11,7 +11,7 @@ import { AGENT_OPTIONS, CATALOG_SCOPED_KINDS, DEFAULT_MODEL, cursorModelIdCovere
  */
 
 const ARGON_FX = "google/gemini-4-argon";
-const ARGON_AGY = ["gemini-4-argon-high", "gemini-4-argon-medium", "gemini-4-argon-low"];
+const ARGON_AGY = "gemini-4-argon";
 
 function ids(rows: { id: string }[]): string[] {
   return rows.map((r) => r.id);
@@ -75,9 +75,9 @@ test("fx: a task already pinned to Gemini 4 Argon keeps it visible as an unliste
   expect(argon?.unlisted).toBe(true);
 });
 
-// --- antigravity: not catalog-scoped, Argon rows always listed first ---------
+// --- antigravity: not catalog-scoped, grouped Argon base row listed first ----
 
-test("antigravity is not catalog-scoped, so the three Argon rows show even when discovery is empty", () => {
+test("antigravity is not catalog-scoped, so the grouped Argon base row shows first even when discovery is empty", () => {
   expect(CATALOG_SCOPED_KINDS.has("antigravity")).toBe(false);
   const rows = mergeModelOptions({
     curated: AGENT_OPTIONS.antigravity.models,
@@ -85,14 +85,15 @@ test("antigravity is not catalog-scoped, so the three Argon rows show even when 
     scoped: false,
     selected: null,
   });
-  expect(ids(rows).slice(0, 3)).toEqual(ARGON_AGY);
+  expect(rows[0]?.id).toBe(ARGON_AGY);
+  expect(rows[0]?.label).toBe("Gemini 4 Argon");
   expect(rows.length).toBe(AGENT_OPTIONS.antigravity.models.length);
 });
 
-test("antigravity: a differently named Argon id from `agy models` is listed in CLI order, and curated rows the CLI did not report follow (the fallback if the curated ids are wrong)", () => {
+test("antigravity: discovered models from `agy models` lead in CLI order, and curated rows the CLI did not report follow", () => {
   const discovered: DiscoveredModel[] = [
-    { id: "gemini-4-argon-high" },
-    { id: "gemini-4-argon" },
+    { id: "gemini-4-neon", label: "Gemini 4 Neon", efforts: ["high", "xhigh"], antigravity: { effortIds: { high: "gemini-4-neon-high", xhigh: "gemini-4-neon-xhigh" } } },
+    { id: "gemini-4-argon", efforts: ["high", "medium", "low"] },
     { id: DEFAULT_MODEL.antigravity },
   ];
   const rows = mergeModelOptions({
@@ -102,15 +103,14 @@ test("antigravity: a differently named Argon id from `agy models` is listed in C
     selected: null,
   });
   const curatedCount = AGENT_OPTIONS.antigravity.models.length;
-  // The CLI's order wins: its rows first, the discovered-only id (labelled
-  // with its id) appearing exactly where the CLI listed it.
-  expect(ids(rows).slice(0, 3)).toEqual(["gemini-4-argon-high", "gemini-4-argon", DEFAULT_MODEL.antigravity]);
-  expect(rows[1]?.label).toBe("gemini-4-argon");
-  // Every curated row is still offered, the unreported ones after the CLI's.
+  // The CLI's order wins: its rows first, then the curated rows it didn't list.
+  expect(ids(rows).slice(0, 3)).toEqual(["gemini-4-neon", "gemini-4-argon", DEFAULT_MODEL.antigravity]);
+  expect(rows[0]?.label).toBe("Gemini 4 Neon");
+  expect(rows[1]?.label).toBe("Gemini 4 Argon");
   expect(rows.length).toBe(curatedCount + 1);
   for (const m of AGENT_OPTIONS.antigravity.models) expect(ids(rows)).toContain(m.id);
   // A curated id that discovery also reported is not listed twice.
-  expect(ids(rows).filter((id) => id === "gemini-4-argon-high").length).toBe(1);
+  expect(ids(rows).filter((id) => id === "gemini-4-argon").length).toBe(1);
 });
 
 test("antigravity: a task still pinned to a retired 3.7 Flash id shows it as an unlisted row (migration 066 normally rewrites it first)", () => {

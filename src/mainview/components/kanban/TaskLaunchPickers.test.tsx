@@ -148,6 +148,36 @@ describe("TaskLaunchPickers — hints", () => {
       expect(html).toContain(`id="${id}"`);
     }
   });
+  test("antigravity renders grouped base models with enabled effort picker and full model title", () => {
+    const agyModels = buildModelOptions("antigravity", {
+      discovered: [
+        { id: "gemini-4-neon-high", label: "Gemini 4 Neon (High)" },
+        { id: "gemini-4-neon-xhigh", label: "Gemini 4 Neon (XHigh)" },
+      ],
+      selected: "gemini-4-neon",
+    });
+    const agyEfforts = effortOptionsFor("antigravity", "gemini-4-neon", agyModels);
+    expect(agyEfforts.map((e) => e.id)).toEqual(["xhigh", "high"]);
+    const html = renderToStaticMarkup(
+      <TaskLaunchPickers
+        launch={fakeLaunch({
+          kind: "antigravity",
+          agent: "antigravity",
+          model: "gemini-4-neon",
+          models: agyModels,
+          effort: "xhigh",
+          efforts: agyEfforts,
+        }, "antigravity")}
+        layout="flat"
+        hideProfilePicker
+      />,
+    );
+    expect(html).toContain('title="Gemini 4 Neon"');
+    expect(html).toContain("Extra high");
+    // Effort trigger must NOT have the HTML `disabled` attribute when the model has efforts.
+    expect(html).toMatch(/data-testid="launch-effort-picker-trigger"[^>]*data-value="xhigh"/);
+    expect(html).not.toMatch(/data-testid="launch-effort-picker-trigger"[^>]*\sdisabled(?:=|\s|>)/);
+  });
 });
 
 describe("tracked setters only", () => {

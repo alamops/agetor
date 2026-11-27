@@ -3648,7 +3648,9 @@ export const DEFAULT_MODEL: Record<AgentKind, string> = {
   // zai/glm-5.3-flash) to this value; null-model fx tasks resolve to it at
   // spawn with no data migration.
   "fx": "deepseek/deepseek-v4-flash",
-  "antigravity": "gemini-3.8-flash-high",
+  // Base id; paired with DEFAULT_EFFORT.antigravity ("high") → `gemini-3.8-flash-high`
+  // via `antigravityModelArg`.
+  "antigravity": "gemini-3.8-flash",
   // The one sentinel default (see the docblock above): no `-m`.
   "opencode": OPENCODE_DEFAULT_MODEL,
   // Owner decision D3 (docs/plans/github-copilot-harness-grill.md): Copilot's
@@ -3701,8 +3703,8 @@ export const DEFAULT_EFFORT: Record<AgentKind, string> = {
   // other four kinds use, since that would silently change every fx run's
   // cost/latency on the owner's rate-limited free-tier Gateway account.
   "fx": "auto",
-  // Unused, kept for symmetry: effort rides in the antigravity model id and
-  // every MODEL_EFFORT_SUPPORT.antigravity set is empty.
+  // Composed into the `agy --model` suffix by `antigravityModelArg`
+  // (e.g. `gemini-3.8-flash` + `high` → `gemini-3.8-flash-high`).
   "antigravity": "high",
   // OpenCode's variants are per model and discovered (G5, D-6); "auto"
   // ("Model default") passes no variant, so a new task runs exactly as
@@ -4295,6 +4297,129 @@ export function cursorModelArg(
   return fast && spec.fastEfforts?.includes(desiredEffort) ? `${baseId}-fast` : baseId;
 }
 
+/** Curated Antigravity base model spec: one picker row whose effort picker
+ *  maps to the exact suffixed `agy --model` id via {@link antigravityModelArg}. */
+export interface AntigravityModelSpec {
+  label: string;
+  hint?: string;
+  effortIds?: Readonly<Partial<Record<string, string>>>;
+}
+
+export type AntigravityVariantSpec = Pick<AntigravityModelSpec, "effortIds">;
+
+export type AntigravityVariantSpecInput = {
+  effortIds?: Readonly<Partial<Record<string, string>>>;
+};
+
+/**
+ * Curated Antigravity fallback catalog: base models with their effort-suffixed
+ * `agy --model` ids. Live `agy models` discovery groups every `<base>-<effort>`
+ * family dynamically (`parseAntigravityModelList` in `antigravity-catalog.ts`)
+ * and extends or overrides these fallback rows in CLI order.
+ */
+export const ANTIGRAVITY_MODEL_SPECS: Record<string, AntigravityModelSpec> = {
+  "gemini-4-argon": {
+    label: "Gemini 4 Argon",
+    hint: "Gemini 4 Argon. Needs Google AI Ultra or an eligible Gemini Enterprise subscription in Antigravity.",
+    effortIds: {
+      high: "gemini-4-argon-high",
+      medium: "gemini-4-argon-medium",
+      low: "gemini-4-argon-low",
+    },
+  },
+  "gemini-3.8-flash": {
+    label: "Gemini 3.8 Flash",
+    hint: "Latest Gemini 3.8 Flash.",
+    effortIds: {
+      high: "gemini-3.8-flash-high",
+      medium: "gemini-3.8-flash-medium",
+      low: "gemini-3.8-flash-low",
+    },
+  },
+  "gemini-3.6-flash": {
+    label: "Gemini 3.6 Flash",
+    hint: "Gemini 3.6 Flash.",
+    effortIds: {
+      high: "gemini-3.6-flash-high",
+      medium: "gemini-3.6-flash-medium",
+      low: "gemini-3.6-flash-low",
+    },
+  },
+  "gemini-3.1-pro": {
+    label: "Gemini 3.1 Pro",
+    hint: "Flagship Gemini 3.1 Pro.",
+    effortIds: {
+      high: "gemini-3.1-pro-high",
+      low: "gemini-3.1-pro-low",
+    },
+  },
+  "claude-opus-5-5": {
+    label: "Claude Opus 5.5",
+    hint: "Claude Opus 5.5.",
+    effortIds: {
+      high: "claude-opus-5-5-high",
+      medium: "claude-opus-5-5-medium",
+      low: "claude-opus-5-5-low",
+    },
+  },
+  "claude-sonnet-5-5": {
+    label: "Claude Sonnet 5.5",
+    hint: "Claude Sonnet 5.5.",
+    effortIds: {
+      high: "claude-sonnet-5-5-high",
+      medium: "claude-sonnet-5-5-medium",
+      low: "claude-sonnet-5-5-low",
+    },
+  },
+  "gpt-oss-120b": {
+    label: "GPT-OSS 120B",
+    hint: "Open weights model.",
+    effortIds: {
+      medium: "gpt-oss-120b-medium",
+    },
+  },
+};
+
+const ANTIGRAVITY_EFFORT_SUFFIX_RE = /-(?:extra-high|xhigh|high|medium|low|max|minimal|none)$/;
+
+/**
+ * Resolve an Antigravity `(model, effort)` pair to the exact `--model` id `agy`
+ * expects. Discovered `effortIds` extend/override curated `ANTIGRAVITY_MODEL_SPECS`
+ * so newly added tiers (e.g. `xhigh`) resolve cleanly; a flat suffixed id
+ * (legacy tasks, frozen snapshots, CLI overrides) or an effort-less model
+ * (`gemini-pro-orchestrator*`) passes through verbatim. When a discovered-only
+ * base model is launched with an explicit effort while the discovery cache is
+ * empty, falls back to `${model}-${effort}` so the chosen effort is never lost.
+ */
+export function antigravityModelArg(
+  model: string,
+  effort: string | null,
+  discovered?: AntigravityVariantSpecInput,
+): string {
+  const curated = ANTIGRAVITY_MODEL_SPECS[model];
+  const effortIds: Record<string, string> = {};
+  for (const [k, v] of Object.entries(curated?.effortIds ?? {})) {
+    if (v) effortIds[k] = v;
+  }
+  for (const [k, v] of Object.entries(discovered?.effortIds ?? {})) {
+    if (v) effortIds[k] = v;
+  }
+  const keys = Object.keys(effortIds);
+  if (keys.length > 0) {
+    const desiredEffort =
+      effort && effortIds[effort]
+        ? effort
+        : DEFAULT_EFFORT.antigravity && effortIds[DEFAULT_EFFORT.antigravity]
+          ? DEFAULT_EFFORT.antigravity
+          : keys[0];
+    if (!desiredEffort) return model;
+    return effortIds[desiredEffort] ?? model;
+  }
+  if (!effort || ANTIGRAVITY_EFFORT_SUFFIX_RE.test(model)) return model;
+  if (!EFFORT_ID_RE.test(effort)) return model;
+  return `${model}-${effort}`;
+}
+
 /**
  * Maps the prominent two-way "Code vs Plan" UI toggle onto a concrete mode id
  * per agent. The toggle is the primary mode picker in the UI; the full
@@ -4688,31 +4813,17 @@ export const MODEL_EFFORT_SUPPORT: Record<AgentKind, Record<string, string[]>> =
     "mistral/mistral-large-4": ["high", "none", "auto"],
     "reflection/beam": ["max", "xhigh", "high", "medium", "low", "auto"],
   },
-  // Effort is encoded in the model-id suffix (<model>-<effort>), and `agy
-  // --effort` accepts only low/medium/high anyway, so the builder never emits
-  // `--effort` (owner D6/D7, docs/plans/add-gemini-4-argon.md). Every set is
-  // empty, so the picker collapses and supportedEfforts() returns [] even for
-  // a discovered-only id (an unknown key falls back to the default model's []).
-  antigravity: {
-    "gemini-4-argon-high": [],
-    "gemini-4-argon-medium": [],
-    "gemini-4-argon-low": [],
-    "gemini-3.8-flash-high": [],
-    "gemini-3.8-flash-medium": [],
-    "gemini-3.8-flash-low": [],
-    "gemini-3.6-flash-high": [],
-    "gemini-3.6-flash-medium": [],
-    "gemini-3.6-flash-low": [],
-    "gemini-3.1-pro-high": [],
-    "gemini-3.1-pro-low": [],
-    "claude-opus-5-5-high": [],
-    "claude-opus-5-5-medium": [],
-    "claude-opus-5-5-low": [],
-    "claude-sonnet-5-5-high": [],
-    "claude-sonnet-5-5-medium": [],
-    "claude-sonnet-5-5-low": [],
-    "gpt-oss-120b-medium": [],
-  },
+  // Antigravity encodes effort in the `agy --model` id suffix (`<base>-<effort>`),
+  // just like Cursor. Curated base rows expose their effort ladders here and
+  // `antigravityModelArg` composes the exact flat id at spawn; discovered-only
+  // families (e.g. `gemini-4-neon`, `gemini-4-carbon`, `gemini-4-hydrogen`)
+  // supply their own ladders via `parseAntigravityModelList`.
+  antigravity: Object.fromEntries(
+    Object.entries(ANTIGRAVITY_MODEL_SPECS).map(([id, spec]) => [
+      id,
+      spec.effortIds ? Object.keys(spec.effortIds) : [],
+    ]),
+  ),
   // The sentinel accepts no variant (a variant needs a model). Every other
   // OpenCode model is discovered, and `supportedEfforts` answers for it
   // from discovery rather than from this table (D-6).
@@ -4816,7 +4927,7 @@ export function supportedEfforts(
   // one carve-out is a discovered-only base: the cursor probe attaches its
   // variant map (`DiscoveredModel.cursor`) and efforts together, and
   // `cursorModelArg` resolves them through that map.
-  if (agent === "cursor" && model !== null && !(model in MODEL_EFFORT_SUPPORT.cursor) && !hasDiscovered) return [];
+  if ((agent === "cursor" || agent === "antigravity") && model !== null && !(model in MODEL_EFFORT_SUPPORT[agent]) && !hasDiscovered) return [];
   if (agent === "opencode") return opencodeEfforts(model, discoveredEfforts);
   if (hasDiscovered && discoveredEfforts) {
     const fromDiscovery = discoveredEffortOptions(agent, discoveredEfforts, opts?.labels);
@@ -5377,32 +5488,11 @@ export const AGENT_OPTIONS: Record<AgentKind, AgentOptions> = {
     efforts: EFFORT_OPTIONS,
   },
   antigravity: {
-    models: [
-      // Gemini 4 Argon (GA 2026-10-13). Ids follow Antigravity's own
-      // <model>-<effort> convention (every known agy id and the cortexkit
-      // registry agree) but are unconfirmed against a live `agy models` on an
-      // Ultra account (owner D3/D4). Ultra / eligible-Enterprise only in
-      // Antigravity; discovery still appends whatever `agy models` really
-      // lists.
-      { id: "gemini-4-argon-high", label: "Gemini 4 Argon (High)", hint: "Gemini 4 Argon with high reasoning effort. Needs Google AI Ultra or an eligible Gemini Enterprise subscription in Antigravity. The id follows Antigravity's naming convention and is unconfirmed — if `agy models` lists it differently, pick that discovered row instead." },
-      { id: "gemini-4-argon-medium", label: "Gemini 4 Argon (Medium)", hint: "Gemini 4 Argon with medium reasoning effort. Needs Google AI Ultra or an eligible Gemini Enterprise subscription in Antigravity. The id follows Antigravity's naming convention and is unconfirmed — if `agy models` lists it differently, pick that discovered row instead." },
-      { id: "gemini-4-argon-low", label: "Gemini 4 Argon (Low)", hint: "Gemini 4 Argon with low reasoning effort. Needs Google AI Ultra or an eligible Gemini Enterprise subscription in Antigravity. The id follows Antigravity's naming convention and is unconfirmed — if `agy models` lists it differently, pick that discovered row instead." },
-      { id: "gemini-3.8-flash-high", label: "Gemini 3.8 Flash (High)", hint: "Latest Gemini 3.8 Flash with high reasoning effort." },
-      { id: "gemini-3.8-flash-medium", label: "Gemini 3.8 Flash (Medium)", hint: "Gemini 3.8 Flash with medium reasoning effort." },
-      { id: "gemini-3.8-flash-low", label: "Gemini 3.8 Flash (Low)", hint: "Fast Gemini 3.8 Flash with low reasoning effort." },
-      { id: "gemini-3.6-flash-high", label: "Gemini 3.6 Flash (High)", hint: "Gemini 3.6 Flash with high reasoning effort." },
-      { id: "gemini-3.6-flash-medium", label: "Gemini 3.6 Flash (Medium)", hint: "Gemini 3.6 Flash with medium reasoning effort." },
-      { id: "gemini-3.6-flash-low", label: "Gemini 3.6 Flash (Low)", hint: "Gemini 3.6 Flash with low reasoning effort." },
-      { id: "gemini-3.1-pro-high", label: "Gemini 3.1 Pro (High)", hint: "Flagship Gemini 3.1 Pro with high reasoning effort." },
-      { id: "gemini-3.1-pro-low", label: "Gemini 3.1 Pro (Low)", hint: "Gemini 3.1 Pro with low reasoning effort." },
-      { id: "claude-opus-5-5-high", label: "Claude Opus 5.5 (High)", hint: "Claude Opus 5.5 with high reasoning effort." },
-      { id: "claude-opus-5-5-medium", label: "Claude Opus 5.5 (Medium)", hint: "Claude Opus 5.5 with medium reasoning effort." },
-      { id: "claude-opus-5-5-low", label: "Claude Opus 5.5 (Low)", hint: "Claude Opus 5.5 with low reasoning effort." },
-      { id: "claude-sonnet-5-5-high", label: "Claude Sonnet 5.5 (High)", hint: "Claude Sonnet 5.5 with high reasoning effort." },
-      { id: "claude-sonnet-5-5-medium", label: "Claude Sonnet 5.5 (Medium)", hint: "Claude Sonnet 5.5 with medium reasoning effort." },
-      { id: "claude-sonnet-5-5-low", label: "Claude Sonnet 5.5 (Low)", hint: "Claude Sonnet 5.5 with low reasoning effort." },
-      { id: "gpt-oss-120b-medium", label: "GPT-OSS 120B (Medium)", hint: "Open weights model with medium reasoning effort." },
-    ],
+    models: Object.entries(ANTIGRAVITY_MODEL_SPECS).map(([id, spec]) => ({
+      id,
+      label: spec.label,
+      ...(spec.hint ? { hint: spec.hint } : {}),
+    })),
     modes: [
       { id: "auto", label: "Auto", hint: "Hands-off — auto-approves all tool permissions (--dangerously-skip-permissions)." },
       { id: "plan", label: "Plan only", hint: "Plan without making changes (--mode plan)." },

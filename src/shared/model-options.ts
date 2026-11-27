@@ -139,6 +139,12 @@ export interface CursorVariantSpecShape {
   fastId?: string;
 }
 
+/** An antigravity variant map for a base model: which flat `agy --model` id
+ *  carries each effort (e.g. `{ high: "gemini-4-neon-high", xhigh: "gemini-4-neon-xhigh" }`). */
+export interface AntigravityVariantSpecShape {
+  effortIds?: Readonly<Partial<Record<string, string>>>;
+}
+
 /** A row from a harness's live CLI-discovered model catalog. This is the ONE
  *  shape: the bun-side discovery module re-exports it and the webview/CLI
  *  API rows are this type. */
@@ -180,6 +186,8 @@ export interface DiscoveredModel {
   alias?: string;
   /** Cursor: the variant map of a discovered-only base. */
   cursor?: CursorVariantSpecShape;
+  /** Antigravity: the effort → flat CLI model id map for a grouped base. */
+  antigravity?: AntigravityVariantSpecShape;
 }
 
 /** One row in the merged, render-ready model list. */
@@ -206,6 +214,7 @@ export interface ModelOption {
   fastTier?: string;
   defaultFast?: true;
   cursor?: CursorVariantSpecShape;
+  antigravity?: AntigravityVariantSpecShape;
 }
 
 export interface MergeModelOptionsInput {
@@ -274,6 +283,9 @@ function copyDiscoveredFields(
       ...(entry.cursor.fastEfforts ? { fastEfforts: [...entry.cursor.fastEfforts] } : {}),
       ...(entry.cursor.fastId ? { fastId: entry.cursor.fastId } : {}),
     };
+  }
+  if (entry.antigravity?.effortIds && Object.keys(entry.antigravity.effortIds).length > 0) {
+    opt.antigravity = { effortIds: { ...entry.antigravity.effortIds } };
   }
 }
 

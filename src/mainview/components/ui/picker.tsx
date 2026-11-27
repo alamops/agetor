@@ -67,6 +67,10 @@ export interface PickerProps {
   placement?: "popover" | "inline";
   /** Which side the popover prefers when both fit. */
   prefer?: "above" | "below";
+  /** Minimum width (px) for the floating popover, clamped inside the viewport
+   *  by `placePopover`. Lets narrow triggers (e.g. Model beside Effort) open a
+   *  readable dropdown without truncating option labels. */
+  popoverMinWidth?: number;
   className?: string;
   triggerClassName?: string;
   /** Left-side icon on the trigger. */
@@ -115,6 +119,7 @@ export function Picker({
   labelId,
   placement = "popover",
   prefer = "below",
+  popoverMinWidth,
   className,
   triggerClassName,
   leadingIcon,
@@ -190,12 +195,13 @@ export function Picker({
       placePopover({
         trigger: { top: r.top, left: r.left, width: r.width, height: r.height },
         popoverHeight,
+        popoverWidth: popoverMinWidth,
         viewportWidth: window.innerWidth,
         viewportHeight: window.innerHeight,
         prefer,
       }),
     );
-  }, [open, placement, prefer, filtered.length, query]);
+  }, [open, placement, prefer, popoverMinWidth, filtered.length, query]);
 
   // Focus the search box (or the listbox) when the panel opens.
   React.useEffect(() => {
@@ -348,7 +354,12 @@ export function Picker({
         placement === "popover"
           ? place
             ? { top: place.top, left: place.left, width: place.width, maxHeight: place.maxHeight }
-            : { top: 0, left: 0, visibility: "hidden", width: triggerRef.current?.offsetWidth }
+            : {
+                top: 0,
+                left: 0,
+                visibility: "hidden",
+                width: Math.max(triggerRef.current?.offsetWidth ?? 0, popoverMinWidth ?? 0) || undefined,
+              }
           : undefined
       }
     >
@@ -403,7 +414,7 @@ export function Picker({
                   aria-selected={isSelected}
                   aria-disabled={item.disabled || undefined}
                   aria-label={item.label}
-                  title={item.title}
+                  title={item.title ?? item.label}
                   data-value={item.value}
                   data-testid={item.testId ?? (parts ? `${parts}-option` : undefined)}
                   {...item.dataAttrs}

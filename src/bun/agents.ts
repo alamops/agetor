@@ -1,6 +1,7 @@
 import { existsSync, mkdirSync, writeFileSync } from "node:fs";
 import { homedir } from "node:os";
-import path from "node:path";import { cursorModelArg, DEFAULT_MODEL, defaultModeFor, FX_PROVIDER_STATUS_PREFIX, FX_RECOVERY_STATUS_PREFIX, FX_SESSION_TITLE_STATUS_PREFIX, FX_USAGE_STATUS_PREFIX, HARNESS_LIMIT_STATUS_PREFIX, MODEL_EFFORT_SUPPORT, SESSION_DIED_STATUS_PREFIX, type AgentKind, type FxRecoveryPayload, type Harness, type OpencodeServerMode, type Speed } from "../shared/types.ts";
+import path from "node:path";import { antigravityModelArg, cursorModelArg, DEFAULT_MODEL, defaultModeFor, FX_PROVIDER_STATUS_PREFIX, FX_RECOVERY_STATUS_PREFIX, FX_SESSION_TITLE_STATUS_PREFIX, FX_USAGE_STATUS_PREFIX, HARNESS_LIMIT_STATUS_PREFIX, MODEL_EFFORT_SUPPORT, SESSION_DIED_STATUS_PREFIX, type AgentKind, type FxRecoveryPayload, type Harness, type OpencodeServerMode, type Speed } from "../shared/types.ts";
+import { normalizeAntigravityDiscovered } from "../shared/antigravity-catalog.ts";
 import { classifyHarnessLimitSignal } from "../shared/harness-limits.ts";
 import type { AutoTrustDirectory } from "./claude-prompt-screens.ts";
 import { claudeCliModelFor, claudeIdFromCliModel } from "../shared/claude-model-id.ts";
@@ -917,15 +918,18 @@ export function buildCommand(
     if (!opts.model) {
       throw new Error("model is required for antigravity");
     }
-    args.push("--model", opts.model);
-
-    // Effort is encoded in the model id suffix (`gemini-3.8-flash-high`,
-    // `gemini-4-argon-low`, …) and every `MODEL_EFFORT_SUPPORT.antigravity`
-    // set is empty, so `opts.effort` is deliberately ignored here — like the
-    // gemini branch, NOT routed through `modelDeclinesEffort`, so a
-    // user-typed or discovered id still launches. Owner decision D6/D7
-    // (docs/plans/add-gemini-4-argon-grill.md); migration 065 cleared the
-    // efforts older rows had saved.
+    // Effort is composed into the `--model` id suffix via `antigravityModelArg`
+    // (mirroring Cursor's `cursorModelArg`): curated or discovered `<base>-<effort>`
+    // families map `(model, effort)` to the exact `agy --model` id, while flat
+    // legacy ids and effort-less models (`gemini-pro-orchestrator*`) pass
+    // verbatim. `--effort` is still never emitted.
+    const discoveredAntigravity = normalizeAntigravityDiscovered(getDiscoveredModels("antigravity"));
+    const discoveredRow = discoveredAntigravity.find((m) => m.id === opts.model);
+    const antigravityModel =
+      discoveredRow && !discoveredRow.antigravity?.effortIds
+        ? opts.model
+        : antigravityModelArg(opts.model, opts.effort ?? null, discoveredRow?.antigravity);
+    args.push("--model", antigravityModel);
 
     const mode = opts.mode ?? defaultModeFor(harness.kind);
     if (mode === "auto") {

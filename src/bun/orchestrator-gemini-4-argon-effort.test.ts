@@ -58,32 +58,43 @@ async function create(agent: string, model?: string, effort?: string | null) {
 
 // --- defaultEffortFor ----------------------------------------------------------
 
-test("defaultEffortFor: every curated antigravity model resolves to null (effort is the id suffix)", () => {
+test("defaultEffortFor: curated antigravity base models resolve to high (or sole offered effort)", () => {
+  expect(defaultEffortFor("antigravity", "gemini-4-argon", "antigravity")).toBe("high");
+  expect(defaultEffortFor("antigravity", "gemini-3.8-flash", "antigravity")).toBe("high");
+  expect(defaultEffortFor("antigravity", "gpt-oss-120b", "antigravity")).toBe("medium");
   for (const m of AGENT_OPTIONS.antigravity.models) {
-    expect(defaultEffortFor("antigravity", m.id, "antigravity")).toBeNull();
+    expect(defaultEffortFor("antigravity", m.id, "antigravity")).not.toBeNull();
   }
 });
 
-test("defaultEffortFor: a discovered-only antigravity id (e.g. a bare gemini-4-argon) also resolves to null", () => {
-  expect(defaultEffortFor("antigravity", "gemini-4-argon", "antigravity")).toBeNull();
+test("defaultEffortFor: an unknown / effort-less antigravity id resolves to null", () => {
+  expect(defaultEffortFor("antigravity", "gemini-pro-orchestrator-neon", "antigravity")).toBeNull();
+  expect(defaultEffortFor("antigravity", "gemini-4-argon-low", "antigravity")).toBeNull();
 });
 
-test("defaultEffortFor: Gemini 4 Argon follows each kind's own rule — gemini null, cursor high, fx auto", () => {
+test("defaultEffortFor: Gemini 4 Argon follows each kind's own rule — gemini null, cursor high, antigravity high, fx auto", () => {
   expect(defaultEffortFor("gemini", "gemini-4-argon", "gemini")).toBeNull();
   expect(defaultEffortFor("cursor", "gemini-4-argon", "cursor")).toBe("high");
+  expect(defaultEffortFor("antigravity", "gemini-4-argon", "antigravity")).toBe("high");
   expect(defaultEffortFor("fx", "google/gemini-4-argon", "fx")).toBe("auto");
 });
 
 // --- createTask ------------------------------------------------------------------
 
-test("createTask (antigravity, no model, no effort): default model, effort null (was high before this change)", async () => {
+test("createTask (antigravity, no model, no effort): default base model with high effort", async () => {
   const task = await create("antigravity");
   expect(task.agent).toBe("antigravity");
   expect(task.model).toBe(DEFAULT_MODEL.antigravity);
-  expect(task.effort).toBeNull();
+  expect(task.effort).toBe("high");
 });
 
-test("createTask (antigravity, gemini-4-argon-low, no effort): effort null, model kept verbatim", async () => {
+test("createTask (antigravity, gemini-4-argon, explicit medium): base model + effort stored", async () => {
+  const task = await create("antigravity", "gemini-4-argon", "medium");
+  expect(task.model).toBe("gemini-4-argon");
+  expect(task.effort).toBe("medium");
+});
+
+test("createTask (antigravity, legacy flat gemini-4-argon-low, no effort): effort null, model kept verbatim", async () => {
   const task = await create("antigravity", "gemini-4-argon-low");
   expect(task.model).toBe("gemini-4-argon-low");
   expect(task.effort).toBeNull();

@@ -21,6 +21,7 @@ import {
   type KindProbeTarget,
 } from "./agent-discovery.ts";
 import { broadcastAppEvent } from "./quit-guard.ts";
+import { normalizeAntigravityDiscovered } from "../shared/antigravity-catalog.ts";
 import { sanitizeCliDescription, sanitizeCliLabel } from "../shared/model-display.ts";
 import type { AgentKind, Harness, HarnessStatus } from "../shared/types.ts";
 
@@ -239,6 +240,18 @@ function cleanModel(raw: unknown): DiscoveredModel | null {
       };
     }
   }
+  if (r.antigravity && typeof r.antigravity === "object") {
+    const a = r.antigravity as Record<string, unknown>;
+    const effortIds: Record<string, string> = {};
+    if (a.effortIds && typeof a.effortIds === "object") {
+      for (const [k, v] of Object.entries(a.effortIds as Record<string, unknown>).slice(0, 64)) {
+        if (typeof v === "string" && v) effortIds[k.slice(0, 64)] = v.slice(0, 256);
+      }
+    }
+    if (Object.keys(effortIds).length > 0) {
+      m.antigravity = { effortIds };
+    }
+  }
   return m;
 }
 
@@ -403,8 +416,12 @@ async function hydrateNow(): Promise<void> {
       if (rest.startsWith("kind:")) {
         const kind = rest.slice("kind:".length);
         if (!ALL_KINDS.has(kind) || isPerHarnessKind(kind as AgentKind)) continue;
-        persisted.set(prefKey, { cliVersion: stored.cliVersion, fingerprint: JSON.stringify(stored.models) });
-        if (stored.models.length > 0) seedDiscoveryCache({ scope: "kind", kind: kind as AgentKind }, stored.models);
+        // Older persisted antigravity catalogs stored flat `<base>-<effort>` rows;
+        // normalize on hydration so pickers and spawn see grouped bases + efforts
+        // immediately on restart without requiring a manual refresh.
+        const models = kind === "antigravity" ? normalizeAntigravityDiscovered(stored.models) : stored.models;
+        persisted.set(prefKey, { cliVersion: stored.cliVersion, fingerprint: JSON.stringify(models) });
+        if (models.length > 0) seedDiscoveryCache({ scope: "kind", kind: kind as AgentKind }, models);
       } else if (rest.startsWith("harness:")) {
         const harnessId = rest.slice("harness:".length);
         const harness = harnessCache.get(harnessId);

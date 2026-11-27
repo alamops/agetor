@@ -26,7 +26,7 @@ import opencodeTaskFields from "./migrations/079_opencode_task_fields.sql" with 
 import harnessAutoEnabled from "./migrations/080_harness_auto_enabled.sql" with { type: "text" };
 import normalizeCursorFable52 from "./migrations/086_normalize_cursor_fable_5_2.sql" with { type: "text" };
 import { migrations } from "./migrations/index.ts";
-import { cursorModelArg } from "../shared/types.ts";
+import { antigravityModelArg, cursorModelArg } from "../shared/types.ts";
 
 // Minimal harnesses table matching the shape after 013 + 014 (adds `enabled`).
 const HARNESSES_DDL = `
@@ -2120,7 +2120,7 @@ test("086 on the real schema: cursor Fable 5.2/5.1 variants fold to a base id th
        ('lastModel:fx', 'claude-fable-5-2-high', 7)`,
   );
 
-  expect(migrate(db, migrations)).toEqual(["086_normalize_cursor_fable_5_2", "087_harness_stacks_fix_round", "088_harness_orphaned_copies", "089_harness_mirror_sources", "090_harness_mirror_backup_folder", "091_task_repositories", "092_task_base_branch_and_prs", "093_task_revs"]);
+  expect(migrate(db, migrations)).toEqual(["086_normalize_cursor_fable_5_2", "087_harness_stacks_fix_round", "088_harness_orphaned_copies", "089_harness_mirror_sources", "090_harness_mirror_backup_folder", "091_task_repositories", "092_task_base_branch_and_prs", "093_task_revs", "094_normalize_antigravity_efforts"]);
 
   type TaskRow = {
     id: string;
@@ -2283,7 +2283,7 @@ test("082 adds opencode_stopped_children (no foreign key) and the partial OpenCo
     INSERT INTO subagents (id, task_id, parent_kind, source_path, status, started_at, ended_at)
       VALUES ('opencode-ses_1', 't1', 'opencode_subagent', 'opencode-session:ses_1', 'orphaned', 1, 2);
   `);
-  expect(migrate(db, migrations)).toEqual(["082_opencode_child_bookkeeping", "083_opencode_watch_tombstones", "084_harness_stacks", "085_harness_stack_members_no_harness_fk", "086_normalize_cursor_fable_5_2", "087_harness_stacks_fix_round", "088_harness_orphaned_copies", "089_harness_mirror_sources", "090_harness_mirror_backup_folder", "091_task_repositories", "092_task_base_branch_and_prs", "093_task_revs"]);
+  expect(migrate(db, migrations)).toEqual(["082_opencode_child_bookkeeping", "083_opencode_watch_tombstones", "084_harness_stacks", "085_harness_stack_members_no_harness_fk", "086_normalize_cursor_fable_5_2", "087_harness_stacks_fix_round", "088_harness_orphaned_copies", "089_harness_mirror_sources", "090_harness_mirror_backup_folder", "091_task_repositories", "092_task_base_branch_and_prs", "093_task_revs", "094_normalize_antigravity_efforts"]);
   expect(columnNames(db, "opencode_stopped_children")).toEqual(["child_session_id", "task_id", "stopped_at"]);
   expect(db.query<unknown, []>(`PRAGMA foreign_key_list(opencode_stopped_children)`).all()).toEqual([]);
   // A note for a task id that doesn't exist (or no longer does) is accepted.
@@ -2343,7 +2343,7 @@ test("083 adds opencode_watch_tombstones (no foreign key, session id primary key
   const db = new Database(":memory:");
   migrateThrough(db, "082_opencode_child_bookkeeping");
   db.exec(`INSERT INTO tasks (id, title, prompt, "column", agent, workdir, created_at, updated_at) VALUES ('t1', 't', 'p', 'backlog', 'opencode', '/w', 1, 1)`);
-  expect(migrate(db, migrations)).toEqual(["083_opencode_watch_tombstones", "084_harness_stacks", "085_harness_stack_members_no_harness_fk", "086_normalize_cursor_fable_5_2", "087_harness_stacks_fix_round", "088_harness_orphaned_copies", "089_harness_mirror_sources", "090_harness_mirror_backup_folder", "091_task_repositories", "092_task_base_branch_and_prs", "093_task_revs"]);
+  expect(migrate(db, migrations)).toEqual(["083_opencode_watch_tombstones", "084_harness_stacks", "085_harness_stack_members_no_harness_fk", "086_normalize_cursor_fable_5_2", "087_harness_stacks_fix_round", "088_harness_orphaned_copies", "089_harness_mirror_sources", "090_harness_mirror_backup_folder", "091_task_repositories", "092_task_base_branch_and_prs", "093_task_revs", "094_normalize_antigravity_efforts"]);
   expect(columnNames(db, "opencode_watch_tombstones")).toEqual(["session_id", "harness_id", "task_id", "expires_at"]);
   expect(db.query<unknown, []>(`PRAGMA foreign_key_list(opencode_watch_tombstones)`).all()).toEqual([]);
   // A tombstone outlives its task: a task id that doesn't exist is accepted.
@@ -2409,6 +2409,7 @@ test("078-080 on a 077-era DB keep every harnesses row and column, seed a disabl
     "091_task_repositories",
     "092_task_base_branch_and_prs",
     "093_task_revs",
+    "094_normalize_antigravity_efforts",
   ]);
   expect(db.query(`SELECT name FROM sqlite_master WHERE type = 'table' AND name = 'cursor_asks'`).get()).toBeTruthy();
 
@@ -2505,7 +2506,7 @@ test("085 rebuilds harness_stack_members without the harnesses FK, keeping rows,
     INSERT INTO harness_stacks (id, label, kind, created_at, updated_at) VALUES ('s1', 'Claude', 'claude-code', 1, 1);
     INSERT INTO harness_stack_members (stack_id, harness_id, position) VALUES ('s1', 'claude-code', 0), ('s1', 'cc-b', 1);
   `);
-  expect(migrate(db, migrations)).toEqual(["085_harness_stack_members_no_harness_fk", "086_normalize_cursor_fable_5_2", "087_harness_stacks_fix_round", "088_harness_orphaned_copies", "089_harness_mirror_sources", "090_harness_mirror_backup_folder", "091_task_repositories", "092_task_base_branch_and_prs", "093_task_revs"]);
+  expect(migrate(db, migrations)).toEqual(["085_harness_stack_members_no_harness_fk", "086_normalize_cursor_fable_5_2", "087_harness_stacks_fix_round", "088_harness_orphaned_copies", "089_harness_mirror_sources", "090_harness_mirror_backup_folder", "091_task_repositories", "092_task_base_branch_and_prs", "093_task_revs", "094_normalize_antigravity_efforts"]);
   expect(columnNames(db, "harness_stack_members")).toEqual(["stack_id", "harness_id", "position"]);
   const fks = db.query<{ table: string; on_delete: string }, []>(`PRAGMA foreign_key_list(harness_stack_members)`).all();
   expect(fks.map((f) => [f.table, f.on_delete])).toEqual([["harness_stacks", "CASCADE"]]);
@@ -2565,7 +2566,7 @@ test("087 keeps cooldown rows as whole-account (model ''), keys by (harness, mod
   migrateThrough(db, "086_normalize_cursor_fable_5_2");
   db.exec(`INSERT INTO harness_limit_state (harness_id, reason, source, message, exhausted_until_ms, updated_at)
            VALUES ('cc-a', 'quota', 'claude-pane', 'usage limit', 9000, 100)`);
-  expect(migrate(db, migrations)).toEqual(["087_harness_stacks_fix_round", "088_harness_orphaned_copies", "089_harness_mirror_sources", "090_harness_mirror_backup_folder", "091_task_repositories", "092_task_base_branch_and_prs", "093_task_revs"]);
+  expect(migrate(db, migrations)).toEqual(["087_harness_stacks_fix_round", "088_harness_orphaned_copies", "089_harness_mirror_sources", "090_harness_mirror_backup_folder", "091_task_repositories", "092_task_base_branch_and_prs", "093_task_revs", "094_normalize_antigravity_efforts"]);
   expect(columnNames(db, "harness_limit_state")).toEqual(
     ["harness_id", "model", "reason", "source", "message", "exhausted_until_ms", "updated_at"],
   );
@@ -2605,7 +2606,7 @@ test("087 N-1: several real cooldown rows survive byte-for-byte as whole-account
       [id, reason, source, message, until, at],
     );
   }
-  expect(migrate(db, migrations)).toEqual(["087_harness_stacks_fix_round", "088_harness_orphaned_copies", "089_harness_mirror_sources", "090_harness_mirror_backup_folder", "091_task_repositories", "092_task_base_branch_and_prs", "093_task_revs"]);
+  expect(migrate(db, migrations)).toEqual(["087_harness_stacks_fix_round", "088_harness_orphaned_copies", "089_harness_mirror_sources", "090_harness_mirror_backup_folder", "091_task_repositories", "092_task_base_branch_and_prs", "093_task_revs", "094_normalize_antigravity_efforts"]);
   const rows = db.query(`SELECT * FROM harness_limit_state ORDER BY harness_id`).all();
   expect(rows).toEqual(
     seeded.map(([harness_id, reason, source, message, exhausted_until_ms, updated_at]) => ({
@@ -2651,7 +2652,7 @@ test("088 adds harness_orphaned_copies (no foreign key, (harness, column, path) 
      VALUES ('t1', 'cc-b', 'claude_session_id', 's-new', '["/r/projects/e/s-old.jsonl","/r/projects/e/s-new.jsonl"]', 5)`,
   );
   const before = db.query(`SELECT * FROM harness_session_handoffs`).all();
-  expect(migrate(db, migrations)).toEqual(["088_harness_orphaned_copies", "089_harness_mirror_sources", "090_harness_mirror_backup_folder", "091_task_repositories", "092_task_base_branch_and_prs", "093_task_revs"]);
+  expect(migrate(db, migrations)).toEqual(["088_harness_orphaned_copies", "089_harness_mirror_sources", "090_harness_mirror_backup_folder", "091_task_repositories", "092_task_base_branch_and_prs", "093_task_revs", "094_normalize_antigravity_efforts"]);
   expect(db.query(`SELECT * FROM harness_session_handoffs`).all()).toEqual(before);
   expect(columnNames(db, "harness_orphaned_copies")).toEqual(["harness_id", "column_name", "session_id", "path", "created_at"]);
   expect(db.query<{ name: string }, []>(`PRAGMA foreign_key_list(harness_orphaned_copies)`).all()).toEqual([]);
@@ -2669,7 +2670,7 @@ test("088 adds harness_orphaned_copies (no foreign key, (harness, column, path) 
 test("089 adds harness_mirror_sources (one row per backup account, no foreign key) on an 088 DB", () => {
   const db = new Database(":memory:");
   migrateThrough(db, "088_harness_orphaned_copies");
-  expect(migrate(db, migrations)).toEqual(["089_harness_mirror_sources", "090_harness_mirror_backup_folder", "091_task_repositories", "092_task_base_branch_and_prs", "093_task_revs"]);
+  expect(migrate(db, migrations)).toEqual(["089_harness_mirror_sources", "090_harness_mirror_backup_folder", "091_task_repositories", "092_task_base_branch_and_prs", "093_task_revs", "094_normalize_antigravity_efforts"]);
   expect(columnNames(db, "harness_mirror_sources")).toEqual([
     "harness_id", "primary_id", "primary_root", "primary_config", "updated_at", "backup_root", "backup_config",
   ]);
@@ -2684,7 +2685,7 @@ test("090 adds the backup's own folder and fingerprint to harness_mirror_sources
   const db = new Database(":memory:");
   migrateThrough(db, "089_harness_mirror_sources");
   db.run(`INSERT INTO harness_mirror_sources VALUES ('backup', 'primary', '/a', '{"home":null,"env":{}}', 7)`);
-  expect(migrate(db, migrations)).toEqual(["090_harness_mirror_backup_folder", "091_task_repositories", "092_task_base_branch_and_prs", "093_task_revs"]);
+  expect(migrate(db, migrations)).toEqual(["090_harness_mirror_backup_folder", "091_task_repositories", "092_task_base_branch_and_prs", "093_task_revs", "094_normalize_antigravity_efforts"]);
   expect(columnNames(db, "harness_mirror_sources")).toEqual([
     "harness_id", "primary_id", "primary_root", "primary_config", "updated_at", "backup_root", "backup_config",
   ]);
@@ -2954,4 +2955,80 @@ describe("two connections migrating one database", () => {
     b.close();
     rmSync(dir, { recursive: true, force: true });
   });
+});
+
+test("094_normalize_antigravity_efforts folds flat suffixed antigravity models into base + effort on antigravity-kind rows only, leaving effort-less models and other kinds untouched, idempotently", () => {
+  const db = new Database(":memory:");
+  migrateThrough(db, "093_task_revs");
+  db.exec(`
+    INSERT INTO harnesses (id, kind, label, is_builtin, created_at, updated_at)
+      VALUES ('antigravity-2', 'antigravity', 'Antigravity 2', 0, 1, 1);
+    INSERT INTO tasks (id, title, prompt, "column", agent, workdir, model, effort, created_at, updated_at) VALUES
+      ('t1', 't', 'p', 'backlog', 'antigravity', '/w', 'gemini-4-neon-xhigh', NULL, 1, 10),
+      ('t2', 't', 'p', 'backlog', 'antigravity-2', '/w', 'gemini-3.8-flash-high', NULL, 1, 10),
+      ('t3', 't', 'p', 'backlog', 'antigravity', '/w', 'gpt-oss-120b-medium', NULL, 1, 10),
+      ('t4', 't', 'p', 'backlog', 'antigravity', '/w', 'gemini-pro-orchestrator-neon', NULL, 1, 10),
+      ('t5', 't', 'p', 'backlog', 'antigravity', '/w', 'gemini-pro-orchestrator', NULL, 1, 10),
+      ('t6', 't', 'p', 'backlog', 'claude-code', '/w', 'some-model-high', 'max', 1, 10);
+    INSERT INTO agent_profiles (id, name, name_key, harness_id, model, effort, instructions, skills_json, created_at, updated_at) VALUES
+      ('p1', 'P1', 'p1', 'antigravity', 'gemini-4-argon-low', NULL, '', '[]', 1, 10),
+      ('p2', 'P2', 'p2', 'antigravity-2', 'claude-opus-5-5-medium', NULL, '', '[]', 1, 10),
+      ('p3', 'P3', 'p3', 'antigravity', 'gemini-pro-orchestrator-argon', NULL, '', '[]', 1, 10),
+      ('p4', 'P4', 'p4', 'claude-code', 'some-model-high', 'max', '', '[]', 1, 10);
+    INSERT INTO preferences (key, value, updated_at) VALUES
+      ('lastModel:antigravity', 'gemini-4-neon-xhigh', 42),
+      ('lastModel:claude-code', 'some-model-high', 42);
+  `);
+
+  expect(migrate(db, migrations)).toEqual(["094_normalize_antigravity_efforts"]);
+
+  const taskRows = db
+    .query<{ id: string; model: string | null; effort: string | null; updated_at: number }, []>(
+      `SELECT id, model, effort, updated_at FROM tasks ORDER BY id`,
+    )
+    .all();
+  expect(taskRows).toEqual([
+    { id: "t1", model: "gemini-4-neon", effort: "xhigh", updated_at: 10 },
+    { id: "t2", model: "gemini-3.8-flash", effort: "high", updated_at: 10 },
+    { id: "t3", model: "gpt-oss-120b", effort: "medium", updated_at: 10 },
+    { id: "t4", model: "gemini-pro-orchestrator-neon", effort: null, updated_at: 10 },
+    { id: "t5", model: "gemini-pro-orchestrator", effort: null, updated_at: 10 },
+    { id: "t6", model: "some-model-high", effort: "max", updated_at: 10 },
+  ]);
+  // Re-composing via antigravityModelArg yields the exact original CLI ids.
+  expect(antigravityModelArg(taskRows[0]!.model!, taskRows[0]!.effort)).toBe("gemini-4-neon-xhigh");
+  expect(antigravityModelArg(taskRows[1]!.model!, taskRows[1]!.effort)).toBe("gemini-3.8-flash-high");
+  expect(antigravityModelArg(taskRows[2]!.model!, taskRows[2]!.effort)).toBe("gpt-oss-120b-medium");
+  expect(antigravityModelArg(taskRows[3]!.model!, taskRows[3]!.effort)).toBe("gemini-pro-orchestrator-neon");
+
+  const profileRows = db
+    .query<{ id: string; model: string | null; effort: string | null }, []>(
+      `SELECT id, model, effort FROM agent_profiles ORDER BY id`,
+    )
+    .all();
+  expect(profileRows).toEqual([
+    { id: "p1", model: "gemini-4-argon", effort: "low" },
+    { id: "p2", model: "claude-opus-5-5", effort: "medium" },
+    { id: "p3", model: "gemini-pro-orchestrator-argon", effort: null },
+    { id: "p4", model: "some-model-high", effort: "max" },
+  ]);
+
+  const prefs = db
+    .query<{ key: string; value: string }, []>(`SELECT key, value FROM preferences ORDER BY key`)
+    .all();
+  expect(prefs).toEqual([
+    { key: "lastEffort:antigravity", value: "xhigh" },
+    { key: "lastModel:antigravity", value: "gemini-4-neon" },
+    { key: "lastModel:claude-code", value: "some-model-high" },
+  ]);
+
+  // Idempotent: re-running migration SQL is a no-op.
+  const m094 = migrations.find((m) => m.id === "094_normalize_antigravity_efforts")!;
+  db.exec(m094.sql);
+  expect(
+    db.query<{ id: string; model: string | null; effort: string | null; updated_at: number }, []>(
+      `SELECT id, model, effort, updated_at FROM tasks ORDER BY id`,
+    ).all(),
+  ).toEqual(taskRows);
+  db.close();
 });

@@ -7,6 +7,7 @@ import {
   EFFORT_OPTIONS,
   MODEL_EFFORT_SUPPORT,
   MODEL_MIN_CLI_VERSION,
+  antigravityModelArg,
   cursorModelArg,
   cursorModelIdCoveredByCatalog,
   cursorModelSupportsFast,
@@ -629,20 +630,45 @@ test("cursor Gemini 4 Argon exposes exactly High/Medium/Low and composes <base>-
   expect(ids.indexOf("gemini-3.7-flash")).toBeLessThan(ids.indexOf("gemini-3.6-flash"));
 });
 
-// --- antigravity: effort rides in the model id, no --effort flag ----------------
+// --- antigravity: grouped base models + effort ladders composed into id suffix ---
 
-test("antigravity exposes no effort options for any curated model (effort is the id suffix)", () => {
-  for (const m of AGENT_OPTIONS.antigravity.models) {
-    expect(supportedEfforts("antigravity", m.id)).toEqual([]);
-  }
+test("antigravity curated base models expose their effort ladders in canonical order", () => {
+  expect(supportedEfforts("antigravity", "gemini-4-argon").map((o) => o.id)).toEqual(["high", "medium", "low"]);
+  expect(supportedEfforts("antigravity", "gemini-3.8-flash").map((o) => o.id)).toEqual(["high", "medium", "low"]);
+  expect(supportedEfforts("antigravity", "gemini-3.1-pro").map((o) => o.id)).toEqual(["high", "low"]);
+  expect(supportedEfforts("antigravity", "claude-opus-5-5").map((o) => o.id)).toEqual(["high", "medium", "low"]);
+  expect(supportedEfforts("antigravity", "gpt-oss-120b").map((o) => o.id)).toEqual(["medium"]);
+  expect(supportedEfforts("antigravity", null).map((o) => o.id)).toEqual(["high", "medium", "low"]);
 });
 
-test("antigravity discovered-only / unknown ids and null fall back to the default model's empty set", () => {
+test("antigravity unknown / flat / effort-less ids report zero efforts unless discovery attaches some", () => {
   expect(supportedEfforts("antigravity", "some-discovered-id")).toEqual([]);
-  expect(supportedEfforts("antigravity", null)).toEqual([]);
+  expect(supportedEfforts("antigravity", "gemini-pro-orchestrator-neon")).toEqual([]);
+  expect(supportedEfforts("antigravity", "gemini-4-argon-high")).toEqual([]);
+  expect(
+    supportedEfforts("antigravity", "gemini-4-neon", ["high", "xhigh", "medium", "low"]).map((o) => o.id),
+  ).toEqual(["xhigh", "high", "medium", "low"]);
 });
 
-test("DEFAULT_EFFORT.antigravity stays a valid EFFORT_OPTIONS id (symmetry pin; unused at runtime)", () => {
+test("antigravityModelArg composes curated, discovered, fallback, and verbatim flat/effort-less ids", () => {
+  expect(antigravityModelArg("gemini-4-argon", "high")).toBe("gemini-4-argon-high");
+  expect(antigravityModelArg("gemini-4-argon", "low")).toBe("gemini-4-argon-low");
+  expect(antigravityModelArg("gemini-4-argon", null)).toBe("gemini-4-argon-high");
+  expect(antigravityModelArg("gpt-oss-120b", null)).toBe("gpt-oss-120b-medium");
+  expect(
+    antigravityModelArg("gemini-4-neon", "xhigh", { effortIds: { xhigh: "gemini-4-neon-xhigh", high: "gemini-4-neon-high" } }),
+  ).toBe("gemini-4-neon-xhigh");
+  // Cache-empty fallback for a discovered-only base with an explicit effort:
+  expect(antigravityModelArg("gemini-4-neon", "xhigh")).toBe("gemini-4-neon-xhigh");
+  // Legacy flat suffixed ids never double-suffix:
+  expect(antigravityModelArg("gemini-4-argon-high", "high")).toBe("gemini-4-argon-high");
+  expect(antigravityModelArg("gemini-4-argon-high", "max")).toBe("gemini-4-argon-high");
+  expect(antigravityModelArg("gemini-4-argon-high", null)).toBe("gemini-4-argon-high");
+  // Effort-less models with null effort stay verbatim:
+  expect(antigravityModelArg("gemini-pro-orchestrator-neon", null)).toBe("gemini-pro-orchestrator-neon");
+});
+
+test("DEFAULT_EFFORT.antigravity is a valid EFFORT_OPTIONS id", () => {
   expect(EFFORT_OPTIONS.map((o) => o.id)).toContain(DEFAULT_EFFORT.antigravity);
 });
 

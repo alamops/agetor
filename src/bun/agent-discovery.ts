@@ -6,6 +6,7 @@ import type { AgentKind } from "../shared/types.ts";
 import { coreSpawn } from "./core-spawn.ts";
 import { disambiguateOpencodeLabels, opencodeMajor } from "../shared/opencode.ts";
 import type { DiscoveredModel } from "../shared/model-options.ts";
+import { parseAntigravityModelList } from "../shared/antigravity-catalog.ts";
 import { parseCursorModelList } from "../shared/cursor-catalog.ts";
 import { sanitizeCliDescription, sanitizeCliLabel } from "../shared/model-display.ts";
 import { probeClaudeModels } from "./discovery/claude-probe.ts";
@@ -522,27 +523,14 @@ async function discoverGemini(): Promise<DiscoveredModel[]> {
   }
 }
 
+/**
+ * Parse `agy models` output (one `<id>  <Label>` line per flat variant) into
+ * one row per base model with its effort ladder and variant map
+ * (`src/shared/antigravity-catalog.ts`). Effort-less rows (such as
+ * `gemini-pro-orchestrator*`) stay plain rows.
+ */
 function parseAntigravityModels(stdout: string): DiscoveredModel[] {
-  const out: DiscoveredModel[] = [];
-  const seen = new Set<string>();
-  const clean = stdout.replace(/\x1B\[[0-9;]*[a-zA-Z]/g, "");
-  for (const raw of clean.split("\n")) {
-    const line = raw.trim();
-    if (!line) continue;
-    if (line.includes("Fetching available models")) continue;
-    const parts = line.split(/\s+/);
-    const id = parts[0]!;
-    if (!/^[a-z0-9][a-z0-9.\-_]*[a-z0-9]$/i.test(id)) continue;
-    if (!id.includes("-")) continue;
-    if (seen.has(id)) continue;
-    seen.add(id);
-    const label = parts.slice(1).join(" ").trim();
-    out.push({
-      id,
-      label: label.length > 0 ? label : undefined,
-    });
-  }
-  return out;
+  return parseAntigravityModelList(stdout);
 }
 
 /**
