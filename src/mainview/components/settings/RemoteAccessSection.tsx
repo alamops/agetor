@@ -12,7 +12,9 @@ import {
   logRowView,
   macNameProblem,
   remoteSectionVisible,
+  reportRemoteSwitch,
   subscribeRemoteChanged,
+  subscribeRemoteSwitch,
 } from "@/lib/remote-access-store";
 import { subscribeBackgroundStatus } from "@/lib/background";
 
@@ -179,28 +181,45 @@ export function RemoteAccessSection() {
   const [error, setError] = useState<string | null>(null);
   const mountedRef = useRef(true);
   const inFlightRef = useRef(false);
+  // A refresh asked for while a load is in flight runs once that load ends, rather than being dropped until the next poll.
+  const rerunRef = useRef(false);
+  // Newest-wins: a load that started before a newer switch value arrived does not put the older state back.
+  const seqRef = useRef(0);
+  const enabledRef = useRef<boolean | null>(null);
   const nameTouchedRef = useRef(false);
+  const loadRef = useRef<() => Promise<void>>(async () => {});
 
   const load = useCallback(async () => {
-    if (inFlightRef.current) return;
+    if (inFlightRef.current) {
+      rerunRef.current = true;
+      return;
+    }
     inFlightRef.current = true;
+    const seq = seqRef.current;
     try {
       const s = await api.getRemoteAccess();
-      if (!mountedRef.current) return;
+      if (!mountedRef.current || seq !== seqRef.current) return;
       setStatus(s);
+      enabledRef.current = s.enabled;
+      reportRemoteSwitch(s.enabled);
       if (!nameTouchedRef.current) setNameDraft(s.macName);
       if (!s.companion) return;
       const [d, l] = await Promise.all([api.getRemoteDevices(), api.getRemoteLog({ limit: LOG_PAGE })]);
-      if (!mountedRef.current) return;
+      if (!mountedRef.current || seq !== seqRef.current) return;
       setDevices(d.devices);
       setLog(l);
       setError(null);
     } catch (e) {
-      if (mountedRef.current) setError(errorText(e));
+      if (mountedRef.current && seq === seqRef.current) setError(errorText(e));
     } finally {
       inFlightRef.current = false;
+      if (rerunRef.current && mountedRef.current) {
+        rerunRef.current = false;
+        void loadRef.current();
+      }
     }
   }, []);
+  loadRef.current = load;
 
   useEffect(() => {
     mountedRef.current = true;
@@ -209,11 +228,20 @@ export function RemoteAccessSection() {
     // The existing app-event stream (forwarded by App.tsx), never a stream of its own.
     const offRemote = subscribeRemoteChanged(() => { void load(); });
     const offBackground = subscribeBackgroundStatus(() => { void load(); });
+    // The background card read a different switch: show it now, then re-read the rest.
+    const offSwitch = subscribeRemoteSwitch((enabled) => {
+      if (!mountedRef.current || enabledRef.current === enabled) return;
+      seqRef.current += 1;
+      enabledRef.current = enabled;
+      setStatus((prev) => (prev ? { ...prev, enabled } : prev));
+      void load();
+    });
     return () => {
       mountedRef.current = false;
       clearInterval(timer);
       offRemote();
       offBackground();
+      offSwitch();
     };
   }, [load]);
 

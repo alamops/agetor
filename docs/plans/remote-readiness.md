@@ -1609,11 +1609,14 @@ The planner's defaults, approved with the plan:
 | Closing push forgery (helper-signed pushes) | Out of scope | Accepted residual risk (D18, owner) |
 | Keep-awake | Out of scope | Deferred by the owner (always-on host grill) |
 | Security review (R16) | Out of scope for code. Owner decision 2026-11-25: no outside review before launch. Before the first TestFlight build connects, a separate agent session that did not write the code reviews pairing, Noise, the key helper, signed decisions and the gateway's auth against the threat model, and every finding is fixed or recorded. An outside review is reconsidered after launch | Owner runs it after PR F |
-| `SECURITY.md` and GitHub private vulnerability reporting (R16) | `SECURITY.md` is in this PR (repository root). Turning on private vulnerability reporting is a repository setting only the owner can change | Owner |
+| `SECURITY.md` and GitHub private vulnerability reporting (R16) | `SECURITY.md` is in this PR (repository root). Private vulnerability reporting was turned on with the owner's OK on 2026-11-27 | Done |
 | Raising a device's level without re-pairing | Out of scope by design | D7 (owner): revoke and pair again |
 | Fleet decision "phones get a per-task path check" (2026-11-24) superseded | Done | Grill step (decision 76298acb updated) |
 
-## 10. Changes made during execution (not ratified by the owner)
+## 10. Changes made during execution (ratified by the owner, 2026-11-27)
+
+The owner ratified every change below at the review gate on 2026-11-27, including the Plan-to-Auto approval at operate level, signed and behind the unlock window. Changes made after that review are listed under 10.1.
+
 
 - **Claude plan row 1 always needs the unlock window**, whatever the task's current mode (the plan said "plus unlock (D9)"; the first implementation read the live mode and the integration suite showed an ask-mode task skipped it although the row makes it autonomous): `Classified.alsoUnlock: "always"`.
 - **Session ciphertexts never use the pacer's priority lane**; the pacer spaces frames evenly (one per 1000/45 ms) and caps 192 KB per second (the relay holds 256 KB the phone has not acknowledged, then drops). The plan only named 45 frames/s and 1.9 MB/10 s.
@@ -1626,3 +1629,11 @@ The planner's defaults, approved with the plan:
 - **Code-review round 3 fixes (Bug Fix step, second pass).** Device notifications now go through the notifier helper under `remoteDeviceNotificationId` from the app and from a headless or background core (round 2 said the helper took only task ids; it takes any `--id`), with the plain path as the app's fallback; the `audit.it` chain suite empties `remote_audit` before each test, so it no longer depends on which file ran before it in the process; `bind()` in `session.ts` stops after each await once the session has ended, so no intervals, hello, touch or open callback are armed on a dead session; `terminal.ts` `attach` checks the channel is still open before it ends the earlier phone's attachment and spawns a tmux client; `createSubscriptions` registers its close watch after `api` exists (an already ended channel no longer throws); the spec's quality row carries its Amended marker; `plan-approval-lookup.test.ts` restores the environment it sets. Not done: the unreferenced exports.
 - **Tests outside the plan's list were updated** for additive changes: three migration-list expectations, the `route-db-errors` policy fixtures (`remote: "none"` is now required), the remote CLI and background-routes status expectations, and one wording check in `e2e/background-settings.spec.ts`.
 
+### 10.1 Changes from the 2026-11-27 review gate
+
+- **A `!` or `/` follow-up into a Claude task needs operate and the unlock window**, whatever the task's mode (owner decision): Claude's REPL runs such a line as a shell or slash command without the model. An unresolvable kind fails closed. Other kinds keep the plain follow-up rule.
+- **Device notifications carry `--sound-over`**, so a later alert that replaces a device's delivered banner (a revoke after a pairing) still plays its sound (N2).
+- **The two Settings surfaces share the remote-access switch** (`reportRemoteSwitch` in `remote-access-store.ts`): whichever reads a change first shows it in the other at once, and a refresh asked for during a load runs after it instead of being dropped.
+- **Archive tests follow the confirm-then-remove contract** (task-lifecycle.md item 7): the two tests that expected a dirty checkout to stay on disk now expect a refusal, then removal after `forceWorktree`.
+- **GitHub private vulnerability reporting is on** for the repository, as `SECURITY.md` says (R16).
+- **Specs:** the relay spec now promises sequence numbers that never repeat per mailbox side, across a restart; the iOS app spec says answers are matched by request id, not arrival order.

@@ -284,6 +284,25 @@ test("bundle calls: an unreadable 2xx rejects with the lost-answer message", asy
   }
 });
 
+/**
+ * A core that is gone: it holds its port for the whole test and drops every
+ * request without an answer, so the client sees a transport failure (status
+ * 0). Freeing an ephemeral port and assuming nothing answers there raced with
+ * any other listener the OS handed that port to under a parallel run.
+ */
+function noAnswerCore() {
+  const listener = Bun.listen({
+    hostname: "127.0.0.1",
+    port: 0,
+    socket: {
+      data(socket) {
+        socket.end();
+      },
+    },
+  });
+  return { port: listener.port, stop: () => listener.stop(true) };
+}
+
 // An import that got no answer at all (a dropped socket, a timeout) may still
 // have committed, so it reads as lost — never as a plain "cannot reach core"
 // that invites a rerun. Preview/export keep `req`'s own text.
@@ -421,26 +440,28 @@ test("createHarnessStack / patchHarnessStack use the long mirror budget, and a t
   }
 
   // A core that is gone: no answer at all → status 0 with the save hint.
-  const dead = Bun.serve({ port: 0, fetch: () => new Response("") });
-  const deadPort = dead.port!;
-  void dead.stop(true);
-  const client = new AgetorClient({ port: deadPort, token: "tok" });
-  let err: unknown;
+  const dead = noAnswerCore();
   try {
-    await client.createHarnessStack({ label: "T", kind: "claude-code", members: ["a"] });
-  } catch (e) {
-    err = e;
+    const client = new AgetorClient({ port: dead.port, token: "tok" });
+    let err: unknown;
+    try {
+      await client.createHarnessStack({ label: "T", kind: "claude-code", members: ["a"] });
+    } catch (e) {
+      err = e;
+    }
+    expect(err).toBeInstanceOf(ApiError);
+    expect((err as ApiError).status).toBe(0);
+    expect((err as ApiError).message).toContain("may have been saved");
+    err = undefined;
+    try {
+      await client.patchHarnessStack("s1", { label: "U" });
+    } catch (e) {
+      err = e;
+    }
+    expect((err as ApiError).message).toContain("may have been saved");
+  } finally {
+    dead.stop();
   }
-  expect(err).toBeInstanceOf(ApiError);
-  expect((err as ApiError).status).toBe(0);
-  expect((err as ApiError).message).toContain("may have been saved");
-  err = undefined;
-  try {
-    await client.patchHarnessStack("s1", { label: "U" });
-  } catch (e) {
-    err = e;
-  }
-  expect((err as ApiError).message).toContain("may have been saved");
 });
 
 test("ids are URL-encoded; switch/preview/restore/agent-patch use the long budget; a lost switch says it may have gone through", async () => {
@@ -505,19 +526,21 @@ test("ids are URL-encoded; switch/preview/restore/agent-patch use the long budge
     void server.stop(true);
   }
 
-  const dead = Bun.serve({ port: 0, fetch: () => new Response("") });
-  const deadPort = dead.port!;
-  void dead.stop(true);
-  const client = new AgetorClient({ port: deadPort, token: "tok" });
-  for (const call of [() => client.switchTaskAccount("t1"), () => client.patchTask("t1", { agent: "b" })]) {
-    let err: unknown;
-    try {
-      await call();
-    } catch (e) {
-      err = e;
+  const dead = noAnswerCore();
+  try {
+    const client = new AgetorClient({ port: dead.port, token: "tok" });
+    for (const call of [() => client.switchTaskAccount("t1"), () => client.patchTask("t1", { agent: "b" })]) {
+      let err: unknown;
+      try {
+        await call();
+      } catch (e) {
+        err = e;
+      }
+      expect((err as ApiError).status).toBe(0);
+      expect((err as ApiError).message).toContain("the switch may have gone through; check 'agetor show t1' before retrying");
     }
-    expect((err as ApiError).status).toBe(0);
-    expect((err as ApiError).message).toContain("the switch may have gone through; check 'agetor show t1' before retrying");
+  } finally {
+    dead.stop();
   }
 });
 
@@ -627,18 +650,20 @@ test("a switch 409 refusal reaches the caller untouched (status, body, message);
     void server.stop(true);
   }
   // The stack writes keep their own wording and a lost patch of a non-agent field has none.
-  const dead = Bun.serve({ port: 0, fetch: () => new Response("") });
-  const port = dead.port!;
-  void dead.stop(true);
-  const lost = new AgetorClient({ port, token: "tok" });
-  let plain: unknown;
+  const dead = noAnswerCore();
   try {
-    await lost.patchTask("t1", { title: "x" });
-  } catch (e) {
-    plain = e;
+    const lost = new AgetorClient({ port: dead.port, token: "tok" });
+    let plain: unknown;
+    try {
+      await lost.patchTask("t1", { title: "x" });
+    } catch (e) {
+      plain = e;
+    }
+    expect((plain as ApiError).status).toBe(0);
+    expect((plain as ApiError).message).not.toContain("may have gone through");
+  } finally {
+    dead.stop();
   }
-  expect((plain as ApiError).status).toBe(0);
-  expect((plain as ApiError).message).not.toContain("may have gone through");
 });
 
 // `listTaskDelta` against a bare stub: the path it builds, the envelope it

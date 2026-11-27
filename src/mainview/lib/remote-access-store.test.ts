@@ -2,7 +2,18 @@ import { afterEach, describe, expect, test } from "bun:test";
 import type { RemoteDeviceDto, RemoteLogResult } from "../../shared/remote-types.ts";
 import type { RemoteAccessStatus } from "../../shared/types.ts";
 import { api } from "./api.ts";
-import { deviceRowView, lastSeenText, logRowView, macNameProblem, publishRemoteChanged, remoteSectionVisible, subscribeRemoteChanged } from "./remote-access-store.ts";
+import {
+  deviceRowView,
+  lastSeenText,
+  logRowView,
+  macNameProblem,
+  publishRemoteChanged,
+  remoteSectionVisible,
+  reportRemoteSwitch,
+  resetRemoteSwitchForTests,
+  subscribeRemoteChanged,
+  subscribeRemoteSwitch,
+} from "./remote-access-store.ts";
 
 const NOW = 1_800_000_000_000;
 const dev = (over: Partial<RemoteDeviceDto> = {}): RemoteDeviceDto => ({
@@ -77,6 +88,33 @@ describe("visibility and the event store", () => {
     off2();
     publishRemoteChanged();
     expect(heard).toEqual(["b"]);
+  });
+});
+
+describe("the shared remote-access switch", () => {
+  afterEach(() => resetRemoteSwitchForTests());
+  test("a surface that reads a new value tells the other at once; a repeat of the same value is not announced", () => {
+    resetRemoteSwitchForTests();
+    const heard: boolean[] = [];
+    const off = subscribeRemoteSwitch((on) => void heard.push(on));
+    // The Remote access section reads On, then the background card's poll reads Off after the probe turned it off.
+    reportRemoteSwitch(true);
+    reportRemoteSwitch(true);
+    reportRemoteSwitch(false);
+    reportRemoteSwitch(false);
+    off();
+    reportRemoteSwitch(true);
+    expect(heard).toEqual([true, false]);
+  });
+  test("a throwing listener does not stop the others", () => {
+    resetRemoteSwitchForTests();
+    const heard: boolean[] = [];
+    const off1 = subscribeRemoteSwitch(() => { throw new Error("bug"); });
+    const off2 = subscribeRemoteSwitch((on) => void heard.push(on));
+    reportRemoteSwitch(false);
+    off1();
+    off2();
+    expect(heard).toEqual([false]);
   });
 });
 

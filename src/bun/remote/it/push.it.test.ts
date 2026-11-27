@@ -71,10 +71,24 @@ function rig() {
   });
   const rows = new Map<string, Task | null>([["t1", { id: "t1", title: "SECRET-TITLE", agent: "claude-code" } as unknown as Task], ["t2", { id: "t2", title: "Other", agent: "claude-code" } as unknown as Task]]);
   const policy = installNotificationPolicy({ subscribe: () => () => {}, loadRows: async () => rows });
-  policy.registerSink(sink);
+  // The policy fires a sink's delivery without awaiting it, so the rig tracks each one: `flush` waits until every push has been sent and
+  // answered, rather than for a fixed time a loaded machine can overrun (a late push then lands in the next test).
+  const pending = new Set<Promise<void>>();
+  policy.registerSink({
+    ...sink,
+    deliver: (d) => {
+      const p = Promise.resolve(sink.deliver(d));
+      pending.add(p);
+      void p.catch(() => undefined).finally(() => pending.delete(p));
+      return p;
+    },
+  });
   const interaction = (taskId: string, id: string): GlobalEvent => ({ kind: "interaction", taskId, runId: "r1", state: "pending", interactionId: id, ts: Date.now() } as GlobalEvent);
   const runStatus = (taskId: string, status: "succeeded" | "failed"): GlobalEvent => ({ kind: "run-status", taskId, runId: "r1", status, ts: Date.now() } as unknown as GlobalEvent);
-  return { policy, interaction, runStatus, flush: async () => { await new Promise((r) => setTimeout(r, 150)); } };
+  const flush = async () => {
+    while (pending.size > 0) await Promise.allSettled([...pending]);
+  };
+  return { policy, interaction, runStatus, flush };
 }
 
 describe("pushes", () => {

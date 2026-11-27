@@ -60,4 +60,19 @@ test.describe("Settings → Remote access", () => {
     const res = await page.request.get(`${freshBackend.apiBase}/remote-access`, { headers: { authorization: `Bearer ${freshBackend.apiToken}` } });
     expect(((await res.json()) as { macName: string }).macName).toBe("Studio Mac");
   });
+
+  test("the background card and the Remote access section never disagree for long when the probe turns remote access off", async ({ page, freshBackend }) => {
+    // No live host is recorded, so the background probe turns the seeded switch off (remote access never stays on over a host that isn't
+    // running). The two surfaces poll on their own clocks (5 s and 10 s); whichever reads Off first tells the other at once.
+    await gotoApp(page, freshBackend.bootBase);
+    const dialog = await openSettingsGeneral(page);
+    const section = dialog.getByTestId("remote-access-section");
+    await expect(section).toBeVisible({ timeout: 20_000 });
+    const card = dialog.getByTestId("background-section").getByTestId("remote-access-state");
+    const own = section.getByTestId("remote-access-switch-state");
+    const off = async (l: typeof card) => (await l.getAttribute("data-enabled")) === "false";
+    await expect.poll(async () => (await off(card)) || (await off(own)), { timeout: 30_000, intervals: [100] }).toBe(true);
+    await expect(card).toHaveAttribute("data-enabled", "false", { timeout: 2_000 });
+    await expect(own).toHaveAttribute("data-enabled", "false", { timeout: 2_000 });
+  });
 });

@@ -5,6 +5,7 @@ import { Button } from "@/components/ui/button";
 import { Switch } from "@/components/ui/switch";
 import { useConfirm } from "@/components/ui/confirm";
 import { backgroundCopy, subscribeBackgroundStatus } from "@/lib/background";
+import { reportRemoteSwitch, subscribeRemoteSwitch } from "@/lib/remote-access-store";
 
 /** How often the section re-reads `GET /background` while mounted. The
  *  `background_changed` event covers most changes; this catches the ones no
@@ -33,16 +34,25 @@ export function BackgroundSection() {
   // answer (or a newer event) must not put the older state back on screen.
   const seqRef = useRef(0);
   const inFlightRef = useRef(false);
+  // A refresh asked for while a load is in flight runs once that load ends.
+  const rerunRef = useRef(false);
   const mountedRef = useRef(true);
+  const remoteRef = useRef<boolean | null>(null);
+  const loadRef = useRef<(opts?: { fresh?: boolean }) => Promise<void>>(async () => {});
 
   const apply = useCallback((next: BackgroundStatus) => {
     seqRef.current += 1;
     setStatus(next);
     setError(null);
+    remoteRef.current = next.remoteAccess;
+    reportRemoteSwitch(next.remoteAccess);
   }, []);
 
   const load = useCallback(async (opts?: { fresh?: boolean }) => {
-    if (inFlightRef.current) return;
+    if (inFlightRef.current) {
+      rerunRef.current = true;
+      return;
+    }
     inFlightRef.current = true;
     const seq = seqRef.current;
     try {
@@ -50,12 +60,19 @@ export function BackgroundSection() {
       if (!mountedRef.current || seq !== seqRef.current) return;
       setStatus(next);
       setError(null);
+      remoteRef.current = next.remoteAccess;
+      reportRemoteSwitch(next.remoteAccess);
     } catch (e) {
       if (mountedRef.current && seq === seqRef.current) setError(errorText(e));
     } finally {
       inFlightRef.current = false;
+      if (rerunRef.current && mountedRef.current) {
+        rerunRef.current = false;
+        void loadRef.current();
+      }
     }
   }, []);
+  loadRef.current = load;
 
   useEffect(() => {
     mountedRef.current = true;
@@ -64,10 +81,19 @@ export function BackgroundSection() {
     const unsubscribe = subscribeBackgroundStatus((next) => {
       if (mountedRef.current) apply(next);
     });
+    // The Remote access section read a different switch: show it now, then re-read.
+    const offSwitch = subscribeRemoteSwitch((enabled) => {
+      if (!mountedRef.current || remoteRef.current === enabled) return;
+      seqRef.current += 1;
+      remoteRef.current = enabled;
+      setStatus((prev) => (prev ? { ...prev, remoteAccess: enabled } : prev));
+      void loadRef.current();
+    });
     return () => {
       mountedRef.current = false;
       clearInterval(timer);
       unsubscribe();
+      offSwitch();
     };
   }, [load, apply]);
 

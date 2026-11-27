@@ -364,7 +364,7 @@ export function createRouter(deps: RouterDeps): Router {
     };
     if (cls.stepUp === "none") return null;
     if (cls.stepUp === "unlock") {
-      if ((await needsUnlock()) && !deps.decisions.isUnlocked(principal)) return { code: "unlock", message: "unlock this session first" };
+      if ((cls.alsoUnlock === "always" || (await needsUnlock())) && !deps.decisions.isUnlocked(principal)) return { code: "unlock", message: "unlock this session first" };
       return null;
     }
     // signed
@@ -455,6 +455,10 @@ export function createLiveLookups(): RouterDeps["lookups"] {
     async planApprovalFlipsToAuto(taskId) {
       const t = await (await db()).tasks.get(taskId);
       return !t || planApprovalFlipsToAuto(t);
+    },
+    async taskKind(taskId) {
+      const t = await (await db()).tasks.get(taskId);
+      return t ? await resolveHarnessKind(t.agent) : null;
     },
     async task(taskId) {
       const t = await (await db()).tasks.get(taskId);

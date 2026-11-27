@@ -123,6 +123,41 @@ export function subscribeRemoteChanged(fn: Listener): () => void {
   };
 }
 
+// ── the remote-access switch, shared by the two Settings surfaces ─────────────────────────────────────────────────────────────
+
+// Settings shows the switch twice: the Remote access row of the background card (`GET /background`, `remoteAccess`) and this section
+// (`GET /remote-access`, `enabled`). They poll on their own clocks, so without a shared value one could read "Off" while the other still
+// read "On". Each surface reports every value it applies; a change reaches the other surface at once, which shows it and re-reads.
+
+type SwitchListener = (enabled: boolean) => void;
+const switchListeners = new Set<SwitchListener>();
+let lastSwitch: boolean | null = null;
+
+/** Report the remote-access switch a surface just applied. Listeners hear only a change from the last reported value. */
+export function reportRemoteSwitch(enabled: boolean): void {
+  if (lastSwitch === enabled) return;
+  lastSwitch = enabled;
+  for (const fn of [...switchListeners]) {
+    try {
+      fn(enabled);
+    } catch (e) {
+      console.warn("[agetor] remote switch listener threw", e);
+    }
+  }
+}
+
+export function subscribeRemoteSwitch(fn: SwitchListener): () => void {
+  switchListeners.add(fn);
+  return () => {
+    switchListeners.delete(fn);
+  };
+}
+
+/** Test seam: forget the last reported value. */
+export function resetRemoteSwitchForTests(): void {
+  lastSwitch = null;
+}
+
 type RemoteActionEvent = Extract<AppEvent, { type: "remote_action" }>;
 
 const ACTION_TEXT_TOAST: Record<RemoteActionEvent["action"], (device: string) => string> = {

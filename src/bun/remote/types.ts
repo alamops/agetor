@@ -54,7 +54,8 @@ export interface Classified {
   rate: "normal" | "heavy" | "stop";
   /**
    * A signed call that ALSO needs the unlock window: `true` while the task runs without asking (a plan edit), `"always"` when the call itself
-   * makes the task autonomous (Claude's "auto mode" row), so it needs the window whatever mode the task is in now.
+   * makes the task autonomous (Claude's "auto mode" row), so it needs the window whatever mode the task is in now. On an `unlock` call,
+   * `"always"` asks for the window whatever the task's mode too (a `!` or `/` follow-up, which runs a command without the model).
    */
   alsoUnlock?: boolean | "always";
   /** The task the call acts on, when the class rules resolved it (the router checks `runsWithoutAsking` against it). */

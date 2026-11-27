@@ -42,6 +42,20 @@ export interface ClassifyLookups {
    * (the approve route's own `flipToAuto` rule). An unknown task answers true, so it fails closed.
    */
   planApprovalFlipsToAuto(taskId: string): Promise<boolean>;
+  /** The task's harness KIND (`resolveHarnessKind`), or null for an unknown task. */
+  taskKind(taskId: string): Promise<string | null>;
+}
+
+/**
+ * Kinds whose REPL acts on a line's first character: in Claude Code `!` runs the rest as a shell command and `/` runs a slash command, both
+ * without the model or the task's mode in between. agetor's own slash detection trims leading blanks too (`sendInput`).
+ */
+const DIRECT_COMMAND_KINDS: ReadonlySet<string> = new Set(["claude-code"]);
+
+/** Whether a follow-up line would run a command on the Mac directly (a `!` shell line or a `/` command) rather than reach the model. */
+export function isDirectCommandLine(line: string): boolean {
+  const t = line.trimStart();
+  return t.startsWith("!") || t.startsWith("/");
 }
 
 const isObj = (v: unknown): v is Record<string, unknown> => typeof v === "object" && v !== null && !Array.isArray(v);
@@ -87,7 +101,19 @@ export async function classifyRoute(input: ClassifyInput, policy: RemotePolicy, 
     // ── content ──────────────────────────────────────────────────────────────────────────────────────────────────
     case "POST /runs/:id/input": {
       const taskId = await lookups.runTask(input.params.id!);
-      return taskId ? base(policy, { class: "content", stepUp: "unlock", taskId }) : gone(policy);
+      if (!taskId) return gone(policy);
+      // A `!` or `/` line on a Claude task runs a command on the Mac whatever the task's mode: operate level and the unlock window, always.
+      // An unknown kind counts as one (fail closed).
+      const line = typeof body.line === "string" ? body.line : "";
+      if (isDirectCommandLine(line)) {
+        const kind = await lookups.taskKind(taskId);
+        if (kind === null || DIRECT_COMMAND_KINDS.has(kind)) {
+          return base(policy, {
+            class: "content", stepUp: "unlock", alsoUnlock: "always", level: raise(policy.level, "operate"), taskId, reason: "a '!' or '/' line runs a command on the Mac",
+          });
+        }
+      }
+      return base(policy, { class: "content", stepUp: "unlock", taskId });
     }
     case "POST /tasks/:id/backlog":
     case "PUT /tasks/:id/backlog":

@@ -59,6 +59,7 @@ function rig() {
       runTask: async () => "t1",
       previewInScope: async () => true,
       planApprovalFlipsToAuto: async () => false,
+      taskKind: async () => "claude-code",
       task: async () => task,
     },
     routes: () => routes as never,

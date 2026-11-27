@@ -117,7 +117,7 @@ describe("posting", () => {
 });
 
 describe("device notifications", () => {
-  test("posts under the device's fixed id with no url, kind or sound escalation", async () => {
+  test("posts under the device's fixed id with no url or kind, and plays its sound over any entry the device still shows (N2)", async () => {
     const h = makeHarness();
     h.notifier.postDevice({ deviceId: "d1", title: "Ana's iPhone was paired", body: "Paired" });
     await tick();
@@ -128,7 +128,9 @@ describe("device notifications", () => {
     expect(flag(argv, "--message")).toBe("Paired");
     expect(argv).not.toContain("--url");
     expect(argv).not.toContain("--kind");
-    expect(argv).not.toContain("--sound-over");
+    // A revoke that replaces an unread "paired" banner must still sound: every delivered urgency is listed.
+    expect(flag(argv, "--urgency")).toBe("needs-you");
+    expect(argv.filter((_, i) => argv[i - 1] === "--sound-over").sort()).toEqual(["needs-you", "quiet", "unknown"]);
     h.spawns[0]!.settle(0);
     await h.notifier.whenIdle();
     expect(h.plains).toEqual([]);

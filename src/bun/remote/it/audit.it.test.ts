@@ -76,7 +76,7 @@ describe("invariant 12: audited first", () => {
     const routes = { "/runs/:id/cancel": { POST: handler }, "/tasks": { GET: async () => Response.json({ tasks: [] }) } };
     const router = createRouter({
       limiter: new RateLimiter(), idempotency: createIdempotency(), decisions: createDecisions(), audit,
-      lookups: { tmuxPrompt: async () => null, fxPermission: async () => null, askQuestionTask: async () => null, runTask: async () => "t1", previewInScope: async () => true, planApprovalFlipsToAuto: async () => false, task: async () => ({ agent: "claude-code", mode: "ask" }) },
+      lookups: { tmuxPrompt: async () => null, fxPermission: async () => null, askQuestionTask: async () => null, runTask: async () => "t1", previewInScope: async () => true, planApprovalFlipsToAuto: async () => false, taskKind: async () => "claude-code", task: async () => ({ agent: "claude-code", mode: "ask" }) },
       routes: () => routes as never,
     });
     return { router, audit };
