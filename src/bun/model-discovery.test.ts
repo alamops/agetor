@@ -1202,8 +1202,6 @@ test("antigravity: a boot or periodic sweep never runs `agy models` and keeps th
   try {
     const held = [{ id: "gemini-3.8-flash-high", label: "Held" }];
     discovery.seedDiscoveryCache({ scope: "kind", kind: "antigravity" }, held);
-    expect((await scheduler.__testing.kindTargets({ sweep: true, background: true })).antigravity?.skip).toBe(true);
-    expect((await scheduler.__testing.kindTargets({ sweep: true })).antigravity).toBeUndefined();
 
     // Boot and the 15-minute timer both call refreshAllModels() bare.
     await scheduler.refreshAllModels();
@@ -1223,6 +1221,14 @@ test("antigravity: a boot or periodic sweep never runs `agy models` and keeps th
     // A harness change or a per-harness refresh probes.
     await scheduler.refreshHarnessModels("antigravity");
     expect(probes()).toEqual(["models", "models"]);
+
+    // A background sweep whose target resolution fails (falls back to no
+    // targets) still skips `agy models`; a non-background one still probes.
+    const failing = (): Promise<never> => Promise.reject(new Error("harness read failed"));
+    await discovery.refreshDiscoveredModels({ kindTargets: failing, background: true });
+    expect(probes()).toEqual(["models", "models"]);
+    await discovery.refreshDiscoveredModels({ kindTargets: failing });
+    expect(probes()).toEqual(["models", "models", "models"]);
   } finally {
     if (prevBin === undefined) delete process.env.AGETOR_ANTIGRAVITY_BIN;
     else process.env.AGETOR_ANTIGRAVITY_BIN = prevBin;

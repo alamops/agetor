@@ -442,16 +442,8 @@ function probeCwd(): string | undefined {
  * Resolved inside the enqueued sweep so it reflects the harness rows at run
  * time.
  */
-async function kindTargets(
-  opts: { sweep?: boolean; background?: boolean } = {},
-): Promise<Partial<Record<AgentKind, KindProbeTarget>>> {
+async function kindTargets(opts: { sweep?: boolean } = {}): Promise<Partial<Record<AgentKind, KindProbeTarget>>> {
   const out: Partial<Record<AgentKind, KindProbeTarget>> = {};
-  // A boot or periodic sweep never runs `agy models`: agetor sends Antigravity
-  // no unattended background requests, because Google reports that
-  // out-of-band usage-limit requests can get the account flagged
-  // (docs/architecture/harness-antigravity.md). The held catalog (or the
-  // curated rows) stays until a manual refresh or a harness status change.
-  if (opts.background) out.antigravity = { env: {}, skip: true };
   const cwd = probeCwd();
   const claude = await harnesses.get("claude-code");
   if (claude && claude.enabled !== false) {
@@ -528,7 +520,15 @@ export async function refreshAllModels(opts: { manual?: boolean } = {}): Promise
     // The persisted catalog is served as soon as it is read, before the probes run.
     await hydrateFromStore();
     await refreshHarnessCache();
-    await refreshDiscoveredModels({ fxHarnesses: discoveryTargets, kindTargets: () => kindTargets({ sweep: true, background: !opts.manual }) });
+    // A boot or periodic sweep never runs `agy models`: agetor sends
+    // Antigravity no unattended requests, because Google reports that
+    // out-of-band usage-limit requests can get the account flagged
+    // (docs/architecture/harness-antigravity.md).
+    await refreshDiscoveredModels({
+      fxHarnesses: discoveryTargets,
+      kindTargets: () => kindTargets({ sweep: true }),
+      background: !opts.manual,
+    });
     await publishIfChanged();
   } catch (err) {
     console.error("[agetor] model discovery failed:", err);
