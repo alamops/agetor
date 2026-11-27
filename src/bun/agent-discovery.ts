@@ -545,7 +545,16 @@ function parseAntigravityModels(stdout: string): DiscoveredModel[] {
   return out;
 }
 
-async function discoverAntigravity(): Promise<DiscoveredModel[]> {
+/**
+ * `agy models`. `skip` (a `background` refresh: a boot or periodic sweep)
+ * returns [] without spawning, so the held catalog stays: agetor sends
+ * Antigravity no unattended background requests, because Google reports that
+ * out-of-band usage-limit requests can get the account flagged
+ * (docs/architecture/harness-antigravity.md). A manual refresh or a harness
+ * status change still probes.
+ */
+async function discoverAntigravity(skip?: boolean): Promise<DiscoveredModel[]> {
+  if (skip) return [];
   const fallback = process.env.AGETOR_ANTIGRAVITY_BIN ?? "agy";
   const bin = Bun.which(fallback, { PATH: process.env.PATH }) ?? fallback;
   const probe = await runProbe([bin, "models"]);
@@ -1539,7 +1548,17 @@ export type FxHarnessTargetsOption = HarnessTarget[] | (() => HarnessTarget[] | 
 /** Per-kind probe targets, resolved inside the enqueued run (see `runRefresh`). */
 export type KindTargetsOption = () => Promise<Partial<Record<AgentKind, KindProbeTarget>>>;
 
-async function runRefresh(opts?: { fxHarnesses?: FxHarnessTargetsOption; kindTargets?: KindTargetsOption }): Promise<void> {
+/** Options for one queued full refresh. `background` marks a boot or periodic
+ *  sweep, which never runs `agy models` (discoverAntigravity). It is carried
+ *  apart from `kindTargets` so a failed target resolution, which falls back to
+ *  no targets, cannot drop the skip. */
+export interface RefreshOptions {
+  fxHarnesses?: FxHarnessTargetsOption;
+  kindTargets?: KindTargetsOption;
+  background?: boolean;
+}
+
+async function runRefresh(opts?: RefreshOptions): Promise<void> {
   try {
     // Resolved late, like the fx thunk: the built-in claude/copilot harness
     // rows may change while a sweep waits in the queue.
@@ -1563,7 +1582,7 @@ async function runRefresh(opts?: { fxHarnesses?: FxHarnessTargetsOption; kindTar
       discoverCursor(),
       discoverGemini(),
       discoverFx(),
-      discoverAntigravity(),
+      discoverAntigravity(opts?.background === true),
       discoverOpencode(),
       discoverCopilot(kindTargets.copilot?.env, kindTargets.copilot?.bin, kindTargets.copilot?.cwd, kindTargets.copilot?.skip),
     ]);
@@ -1633,10 +1652,7 @@ async function runRefresh(opts?: { fxHarnesses?: FxHarnessTargetsOption; kindTar
  * *run* time, not at the moment this function was called and possibly left
  * waiting behind another in-flight refresh.
  */
-export function refreshDiscoveredModels(opts?: {
-  fxHarnesses?: FxHarnessTargetsOption;
-  kindTargets?: KindTargetsOption;
-}): Promise<void> {
+export function refreshDiscoveredModels(opts?: RefreshOptions): Promise<void> {
   return enqueue(() => runRefresh(opts));
 }
 

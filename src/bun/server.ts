@@ -6140,7 +6140,8 @@ export function startApiServer(
             }
             await refreshHarnessModels(harnessId);
           } else {
-            await refreshAllModels();
+            // A user's refresh: the only full sweep that runs `agy models`.
+            await refreshAllModels({ manual: true });
           }
           return json(
             {

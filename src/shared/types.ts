@@ -2721,7 +2721,11 @@ export const USAGE_CRIT_PERCENT = 90;
  *  `USAGE_PROVIDERS` registry in `src/bun/usage/poller.ts` is typed against
  *  this list, so the two can't drift). The webview uses it to decide whether
  *  a chip without a snapshot should say "enable the harness / refresh" vs
- *  "usage tracking isn't supported for this kind yet" (gemini/grok). */
+ *  "usage tracking isn't supported for this kind yet" (gemini/grok).
+ *  Never add `antigravity`: Google reports that out-of-band quota requests can
+ *  get an Antigravity account flagged or banned
+ *  (`docs/architecture/harness-antigravity.md`, pinned by
+ *  `antigravity-no-usage-checks.test.ts`). */
 export const USAGE_SUPPORTED_KINDS = ["claude-code", "codex", "cursor"] as const satisfies readonly AgentKind[];
 
 /**

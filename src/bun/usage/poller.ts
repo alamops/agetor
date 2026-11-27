@@ -36,7 +36,9 @@ export type UsageProviderOpts = { allowIdeRead?: boolean };
  * out of the sweep). Adding a new provider later is one new module + one
  * line here + the kind added to `USAGE_SUPPORTED_KINDS` (shared/types.ts) —
  * the key type below is derived from that list so the webview's
- * supported-kind messaging can't drift from this registry.
+ * supported-kind messaging can't drift from this registry. Antigravity must
+ * never get a provider: out-of-band quota requests can get the Google account
+ * flagged (docs/architecture/harness-antigravity.md).
  */
 export type UsageProvider = (h: Harness, opts?: UsageProviderOpts) => Promise<HarnessQuota>;
 

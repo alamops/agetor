@@ -1186,3 +1186,54 @@ test("kindTargets: the built-in claude harness gets its own env, bin and an empt
     harnesses.setEnabled("claude-code", was);
   }
 });
+
+test("antigravity: a boot or periodic sweep never runs `agy models` and keeps the held catalog; a manual refresh or a harness refresh does probe", async () => {
+  resetAll();
+  preferences.delete("modelCatalog:kind:antigravity");
+  // A stub agy that records every invocation and lists one model.
+  const dir = mkdtempSync(path.join("/tmp", "agetor-md-agy-"));
+  const log = path.join(dir, "calls.log");
+  const bin = path.join(dir, "agy");
+  writeFileSync(bin, `#!/bin/sh\necho "$*" >> '${log}'\necho 'gemini-9-test-high Gemini 9 Test'\nexit 0\n`, { mode: 0o755 });
+  const probes = (): string[] =>
+    (existsSync(log) ? readFileSync(log, "utf8").split("\n").filter(Boolean) : []).filter((l) => l === "models");
+  const prevBin = process.env.AGETOR_ANTIGRAVITY_BIN;
+  process.env.AGETOR_ANTIGRAVITY_BIN = bin;
+  try {
+    const held = [{ id: "gemini-3.8-flash-high", label: "Held" }];
+    discovery.seedDiscoveryCache({ scope: "kind", kind: "antigravity" }, held);
+
+    // Boot and the 15-minute timer both call refreshAllModels() bare.
+    await scheduler.refreshAllModels();
+    expect(probes()).toEqual([]);
+    expect(discovery.getDiscoveredModels("antigravity")).toEqual(held);
+
+    // The user's "refresh models" (POST /agent-models) probes.
+    await scheduler.refreshAllModels({ manual: true });
+    expect(probes()).toEqual(["models"]);
+    expect(discovery.getDiscoveredModels("antigravity").map((m) => m.id)).toEqual(["gemini-9-test-high"]);
+
+    // A later background sweep leaves the probed catalog in place.
+    await scheduler.refreshAllModels();
+    expect(probes()).toEqual(["models"]);
+    expect(discovery.getDiscoveredModels("antigravity").map((m) => m.id)).toEqual(["gemini-9-test-high"]);
+
+    // A harness change or a per-harness refresh probes.
+    await scheduler.refreshHarnessModels("antigravity");
+    expect(probes()).toEqual(["models", "models"]);
+
+    // A background sweep whose target resolution fails (falls back to no
+    // targets) still skips `agy models`; a non-background one still probes.
+    const failing = (): Promise<never> => Promise.reject(new Error("harness read failed"));
+    await discovery.refreshDiscoveredModels({ kindTargets: failing, background: true });
+    expect(probes()).toEqual(["models", "models"]);
+    await discovery.refreshDiscoveredModels({ kindTargets: failing });
+    expect(probes()).toEqual(["models", "models", "models"]);
+  } finally {
+    if (prevBin === undefined) delete process.env.AGETOR_ANTIGRAVITY_BIN;
+    else process.env.AGETOR_ANTIGRAVITY_BIN = prevBin;
+    preferences.delete("modelCatalog:kind:antigravity");
+    rmSync(dir, { recursive: true, force: true });
+    resetAll();
+  }
+}, 30_000);

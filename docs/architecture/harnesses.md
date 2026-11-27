@@ -47,7 +47,7 @@ CLI: `--speed <off|fast|ultrafast>` on `agetor add`/`edit`/`profile add`/`profil
 | gemini | `gemini models -o json`, only after `--version` proves ≥ 0.67.0 (an older CLI would read `models` as a prompt) | none |
 | copilot | ACP `session/new` (`discovery/copilot-acp-probe.ts`: no prompt; a sweep skips it while a catalog stored under the installed CLI version is held, so it runs for a first catalog, a per-harness refresh, a status change or a different or unrecorded CLI version; `AGETOR_COPILOT_ACP_PROBE=0` disables it), falling back to `copilot help config` | efforts of the current model, with the CLI's own labels |
 | fx, opencode | unchanged (per-harness catalogs) | unchanged |
-| antigravity | `agy models`, unchanged | curated-table policy only |
+| antigravity | `agy models`, but never from a boot or 15-minute sweep: only a manual refresh (`POST /agent-models`), a per-harness refresh or a harness status change runs it, because Google reports that out-of-band usage-limit requests can get the account flagged ([harness-antigravity.md](harness-antigravity.md)) | curated-table policy only |
 
 The claude, gemini and copilot ACP probes share `discovery/spawn-probe.ts`: each spawns through `coreSpawn` with `childEnv` and a budget, and reads at most `PROBE_STDOUT_CAP_BYTES` (4 MB) of stdout: a CLI, or a wrapper earlier on `PATH`, that streams without end is killed at the cap and answers nothing, instead of growing the core's memory until the budget fires.
 
