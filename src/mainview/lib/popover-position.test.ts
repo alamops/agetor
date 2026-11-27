@@ -32,6 +32,14 @@ describe("placePopover", () => {
     const p = placePopover({ trigger: { top: 400, left: 50, width: 200, height: 36 }, popoverHeight: 100, prefer: "above", ...vp });
     expect(p.side).toBe("above");
   });
+  test("widens past a narrow trigger when popoverWidth is larger, still clamped to viewport", () => {
+    const p = placePopover({ trigger: { top: 100, left: 50, width: 140, height: 36 }, popoverHeight: 200, popoverWidth: 260, ...vp });
+    expect(p.width).toBe(260);
+    expect(p.left).toBe(50);
+    const right = placePopover({ trigger: { top: 100, left: 860, width: 130, height: 36 }, popoverHeight: 200, popoverWidth: 260, ...vp });
+    expect(right.width).toBe(260);
+    expect(right.left + right.width).toBeLessThanOrEqual(1000 - VIEWPORT_MARGIN);
+  });
 });
 
 describe("naturalPopoverHeight", () => {

@@ -92,6 +92,7 @@ export interface AntigravityEvent {
       name?: string;
       parameters?: unknown;
       output?: unknown;
+      error?: { type?: string; message?: string } | string;
       [k: string]: unknown;
     };
     duration_seconds?: number;
@@ -141,11 +142,91 @@ function errMessage(e: AntigravityEvent["error"] | AntigravityEvent["result"], f
   return fallback;
 }
 
+/**
+ * Folds `agy --output-format stream-json`'s token-level `agent_response`
+ * `text_delta` updates back into one `assistant` chunk per step (mirroring
+ * `FxTextCoalescer` in `fx-acp.ts` and `TurnText` in `cursor-acp.ts`).
+ *
+ * Forwarding each `ACTIVE` `text_delta` as its own `assistant` event persisted
+ * hundreds of 10-character `run_events` rows that RunPanel rendered as separate
+ * Markdown bubbles (breaking bold, inline code, lists, and paragraphs mid-word).
+ * Buffering per `step_index` and flushing on `state === "DONE"`, a step change,
+ * any non-`agent_response` event, or session settlement produces one intact
+ * Markdown message per step with a deterministic `antigravity:step_<index>`
+ * lineUuid that dedups cleanly on reattach replay.
+ */
+export class AntigravityTextCoalescer {
+  private stepIndex: number | undefined;
+  private firstLineIndex: number | undefined;
+  private text = "";
+  /** Counts previously flushed fragments per `step_index` so if an
+   *  interleaved event (e.g. non-JSON chatter, tool, error) flushes a step
+   *  early and the same `step_index` later emits more `text_delta`s, each
+   *  fragment gets a distinct, replay-stable lineUuid instead of colliding
+   *  with `seenLineUuids` and getting dropped. Uninterrupted steps always get
+   *  count 0 (`antigravity:step_<index>`). */
+  private emittedCountByStep = new Map<number, number>();
+
+  pushDelta(
+    delta: string,
+    stepIndex: number | undefined,
+    lineIndex: number,
+    done: boolean,
+    emit: ChunkHandler,
+  ): boolean {
+    let emitted = false;
+    if (
+      this.text.length > 0 &&
+      stepIndex !== undefined &&
+      this.stepIndex !== undefined &&
+      stepIndex !== this.stepIndex
+    ) {
+      emitted = this.flush(emit) || emitted;
+    }
+    if (this.text.length === 0) {
+      this.stepIndex = stepIndex;
+      this.firstLineIndex = lineIndex;
+    }
+    if (delta) this.text += delta;
+    if (done) {
+      emitted = this.flush(emit) || emitted;
+    }
+    return emitted;
+  }
+
+  flush(emit: ChunkHandler): boolean {
+    if (!this.text) {
+      this.stepIndex = undefined;
+      this.firstLineIndex = undefined;
+      return false;
+    }
+    let uuid: string;
+    if (this.stepIndex !== undefined) {
+      const count = this.emittedCountByStep.get(this.stepIndex) ?? 0;
+      this.emittedCountByStep.set(this.stepIndex, count + 1);
+      uuid = count === 0 ? `antigravity:step_${this.stepIndex}` : `antigravity:step_${this.stepIndex}:${count}`;
+    } else {
+      uuid = `antigravity:${this.firstLineIndex ?? 0}`;
+    }
+    const data = this.text;
+    this.text = "";
+    this.stepIndex = undefined;
+    this.firstLineIndex = undefined;
+    emit("assistant", data, uuid);
+    return true;
+  }
+
+  hasPending(): boolean {
+    return this.text.length > 0;
+  }
+}
+
 export function mapAntigravityEvent(
   evt: AntigravityEvent,
   onChunk: ChunkHandler,
   lineIndex: number,
   priorAssistantText: boolean = false,
+  coalescer?: AntigravityTextCoalescer,
 ): AntigravityMapResult {
   const event = evt.event ?? "";
   const sessionId = typeof evt.conversation_id === "string" ? evt.conversation_id : undefined;
@@ -161,14 +242,22 @@ export function mapAntigravityEvent(
       const stepType = step.step_type ?? "";
 
       if (stepType === "agent_response") {
-        if (step.text_delta) {
-          onChunk("assistant", step.text_delta, `antigravity:${lineIndex}`);
+        const delta = step.text_delta ?? "";
+        const isTerminalState = step.state === "DONE" || step.state === "ERROR" || step.state === "FAILED" || step.state === "CANCELLED";
+        if (coalescer) {
+          const emitted = coalescer.pushDelta(delta, step.step_index, lineIndex, isTerminalState, onChunk);
+          return emitted ? { sessionId, assistantTextEmitted: true } : { sessionId };
+        }
+        if (delta) {
+          const uuid = step.step_index !== undefined ? `antigravity:step_${step.step_index}` : `antigravity:${lineIndex}`;
+          onChunk("assistant", delta, uuid);
           return { sessionId, assistantTextEmitted: true };
         }
         return { sessionId };
       }
 
       if (stepType === "tool") {
+        const flushed = coalescer?.flush(onChunk) ?? false;
         const id = `step_${step.step_index ?? lineIndex}`;
         if (step.state === "ACTIVE") {
           const toolName = step.tool_name ?? step.tool_info?.name ?? "tool";
@@ -180,20 +269,41 @@ export function mapAntigravityEvent(
           }), `tool_use:${id}`);
         } else if (step.state === "DONE") {
           const output = step.tool_info?.output;
-          const content = typeof output === "string" ? output : JSON.stringify(output ?? "");
+          const toolErr = step.tool_info?.error;
+          const isError = Boolean(toolErr);
+          const content =
+            output !== undefined
+              ? (typeof output === "string" ? output : JSON.stringify(output))
+              : toolErr
+                ? errMessage(toolErr, "tool failed")
+                : "";
           onChunk("tool_result", JSON.stringify({
             toolUseId: id,
             content,
-            isError: false,
+            isError,
+          }), `tool_result:${id}`);
+        } else if (step.state === "ERROR" || step.state === "FAILED" || step.state === "CANCELLED") {
+          const toolErr = step.tool_info?.error;
+          const output = step.tool_info?.output;
+          const fallback =
+            output !== undefined
+              ? (typeof output === "string" ? output : JSON.stringify(output))
+              : `tool ${step.state.toLowerCase()}`;
+          onChunk("tool_result", JSON.stringify({
+            toolUseId: id,
+            content: errMessage(toolErr, fallback),
+            isError: true,
           }), `tool_result:${id}`);
         }
-        return { sessionId };
+        return flushed ? { sessionId, assistantTextEmitted: true } : { sessionId };
       }
 
       return { sessionId };
     }
 
     case "result": {
+      const flushed = coalescer?.flush(onChunk) ?? false;
+      const emittedBeforeResult = priorAssistantText || flushed;
       const res = evt.result;
       const ok = res?.status === "SUCCESS";
       if (!ok) {
@@ -202,19 +312,20 @@ export function mapAntigravityEvent(
           errMessage(res?.error ?? res, `antigravity turn failed (status: ${res?.status ?? "unknown"})`),
           `antigravity:result:${lineIndex}`,
         );
-      } else if (!priorAssistantText && res?.response) {
+      } else if (!emittedBeforeResult && res?.response) {
         onChunk("assistant", res.response, `antigravity:result:${lineIndex}`);
       }
       return {
         done: ok ? 0 : 1,
         sessionId: res?.conversation_id ?? sessionId,
-        assistantTextEmitted: ok && res?.response ? true : undefined,
+        assistantTextEmitted: flushed || (ok && Boolean(res?.response)) ? true : undefined,
       };
     }
 
     case "error": {
+      const flushed = coalescer?.flush(onChunk) ?? false;
       onChunk("stderr", errMessage(evt.error, "antigravity error"), `antigravity:error:${lineIndex}`);
-      return { sessionId };
+      return flushed ? { sessionId, assistantTextEmitted: true } : { sessionId };
     }
 
     default:
@@ -236,6 +347,7 @@ interface AntigravitySessionState {
   partial: string;
   nextLineIndex: number;
   assistantTextEmitted: boolean;
+  coalescer: AntigravityTextCoalescer;
   watcher: FSWatcher | null;
   pollTimer: ReturnType<typeof setInterval> | null;
   deathTimer: ReturnType<typeof setInterval> | null;
@@ -260,58 +372,77 @@ function disposeAntigravityState(state: AntigravitySessionState): void {
   if (state.deathTimer) { clearInterval(state.deathTimer); state.deathTimer = null; }
 }
 
-function flushAntigravityLog(state: AntigravitySessionState): void {
-  let fd: number;
+function processAntigravityLine(state: AntigravitySessionState, rawLine: string): void {
+  const trimmed = rawLine.trim();
+  if (!trimmed) return;
+  const lineIndex = state.nextLineIndex++;
+  const emit: ChunkHandler = (stream, data, lineUuid) => onChunkDedup(state, stream, data, lineUuid);
+  let parsed: AntigravityEvent;
   try {
-    const st = fsStatSync(state.logPath);
-    if (st.size <= state.offset) return;
-    fd = openReadNoFollow(state.logPath);
+    parsed = JSON.parse(trimmed) as AntigravityEvent;
   } catch {
+    // Plain text banner or non-JSON chatter — flush any buffered assistant text
+    // first so wire order stays intact.
+    if (state.coalescer.flush(emit)) state.assistantTextEmitted = true;
+    onChunkDedup(state, "stdout", trimmed, `antigravity:${lineIndex}`);
     return;
   }
+
+  const res = mapAntigravityEvent(
+    parsed,
+    emit,
+    lineIndex,
+    state.assistantTextEmitted,
+    state.coalescer,
+  );
+  if (res.assistantTextEmitted) state.assistantTextEmitted = true;
+  if (res.sessionId && !state.sessionIdSent && state.onSessionId) {
+    state.sessionIdSent = true;
+    try { state.onSessionId(res.sessionId); } catch { /* noop */ }
+  }
+  if (res.done !== undefined && state.lastCode === null) {
+    state.lastCode = res.done;
+  }
+}
+
+function flushAntigravityLog(state: AntigravitySessionState, eof = false): void {
+  let fd: number | undefined;
   try {
-    const buf = Buffer.alloc(64 * 1024);
-    let bytesRead: number;
-    let text = "";
-    while ((bytesRead = fsReadSync(fd, buf, 0, buf.length, state.offset)) > 0) {
-      state.offset += bytesRead;
-      text += state.decoder.write(buf.subarray(0, bytesRead));
+    const st = fsStatSync(state.logPath);
+    if (st.size > state.offset) {
+      fd = openReadNoFollow(state.logPath);
     }
-    if (!text) return;
-    const combined = state.partial + text;
-    const lines = combined.split("\n");
-    state.partial = lines.pop() ?? "";
-
-    for (const line of lines) {
-      const trimmed = line.trim();
-      if (!trimmed) continue;
-      const lineIndex = state.nextLineIndex++;
-      let parsed: AntigravityEvent;
-      try {
-        parsed = JSON.parse(trimmed) as AntigravityEvent;
-      } catch {
-        // Plain text banner or non-JSON chatter
-        onChunkDedup(state, "stdout", trimmed, `antigravity:${lineIndex}`);
-        continue;
+  } catch {
+    if (!eof) return;
+  }
+  try {
+    let text = "";
+    if (fd !== undefined) {
+      const buf = Buffer.alloc(64 * 1024);
+      let bytesRead: number;
+      while ((bytesRead = fsReadSync(fd, buf, 0, buf.length, state.offset)) > 0) {
+        state.offset += bytesRead;
+        text += state.decoder.write(buf.subarray(0, bytesRead));
       }
-
-      const res = mapAntigravityEvent(
-        parsed,
-        (stream, data, lineUuid) => onChunkDedup(state, stream, data, lineUuid),
-        lineIndex,
-        state.assistantTextEmitted,
-      );
-      if (res.assistantTextEmitted) state.assistantTextEmitted = true;
-      if (res.sessionId && !state.sessionIdSent && state.onSessionId) {
-        state.sessionIdSent = true;
-        try { state.onSessionId(res.sessionId); } catch { /* noop */ }
-      }
-      if (res.done !== undefined && state.lastCode === null) {
-        state.lastCode = res.done;
-      }
+    }
+    if (eof) {
+      text += state.decoder.end();
+    }
+    if (text) {
+      const combined = state.partial + text;
+      const lines = combined.split("\n");
+      state.partial = lines.pop() ?? "";
+      for (const line of lines) processAntigravityLine(state, line);
+    }
+    if (eof && state.partial.trim()) {
+      const tail = state.partial;
+      state.partial = "";
+      processAntigravityLine(state, tail);
     }
   } finally {
-    try { fsCloseSync(fd); } catch { /* noop */ }
+    if (fd !== undefined) {
+      try { fsCloseSync(fd); } catch { /* noop */ }
+    }
   }
 }
 
@@ -331,6 +462,8 @@ function onChunkDedup(
 function resolveSession(state: AntigravitySessionState, code: number): void {
   if (state.resolved) return;
   state.resolved = true;
+  const emit: ChunkHandler = (stream, data, lineUuid) => onChunkDedup(state, stream, data, lineUuid);
+  if (state.coalescer.flush(emit)) state.assistantTextEmitted = true;
   disposeAntigravityState(state);
   antigravitySessions.delete(state.taskId);
   state.resolveDone(code);
@@ -382,7 +515,7 @@ function startAntigravityTailer(state: AntigravitySessionState): Promise<number>
           if (outcome === "reset") { misses = 0; return; }
           if (outcome === "wait") { misses++; return; }
           setTimeout(() => {
-            flushAntigravityLog(state);
+            flushAntigravityLog(state, true);
             if (state.lastCode !== null) {
               resolveSession(state, state.lastCode);
               return;
@@ -461,6 +594,7 @@ export async function spawnAntigravityViaTmux(opts: AntigravityLaunchOptions): P
     partial: "",
     nextLineIndex: 0,
     assistantTextEmitted: false,
+    coalescer: new AntigravityTextCoalescer(),
     watcher: null,
     pollTimer: null,
     deathTimer: null,
@@ -515,6 +649,7 @@ export async function reattachAntigravitySession(opts: AntigravityReattachOption
     partial: "",
     nextLineIndex: 0,
     assistantTextEmitted: false,
+    coalescer: new AntigravityTextCoalescer(),
     watcher: null,
     pollTimer: null,
     deathTimer: null,

@@ -5,7 +5,7 @@ import path from "node:path";
 
 process.env.AGETOR_DATA_DIR = mkdtempSync(path.join(tmpdir(), "agetor-antigravity-tmux-"));
 
-const { mapAntigravityEvent } = await import("./antigravity-tmux.ts");
+const { AntigravityTextCoalescer, mapAntigravityEvent } = await import("./antigravity-tmux.ts");
 import type { RunEventStream } from "../shared/types.ts";
 
 type Chunk = { stream: RunEventStream; data: string; lineUuid?: string };
@@ -51,7 +51,7 @@ test("agent_response step_update emits assistant chunk with text_delta", () => {
     {
       stream: "assistant",
       data: "Hello from Antigravity!",
-      lineUuid: "antigravity:1",
+      lineUuid: "antigravity:step_1",
     },
   ]);
   expect(res.assistantTextEmitted).toBe(true);
@@ -174,4 +174,243 @@ test("result event with ERROR emits stderr and resolves done: 1", () => {
     },
   ]);
   expect(res.done).toBe(1);
+});
+
+test("AntigravityTextCoalescer folds multi-delta ACTIVE + DONE agent_response into one intact Markdown chunk", () => {
+  const { chunks, onChunk } = collect();
+  const coalescer = new AntigravityTextCoalescer();
+  const deltas = [
+    "### Root Causes\n1. **",
+    "Flat suffixe",
+    "d Antigravity models wit",
+    "h no effort ladder:** Bo",
+    "th the curated list and `agy models`",
+  ];
+  let emitted = false;
+  deltas.forEach((text_delta, idx) => {
+    const res = mapAntigravityEvent(
+      {
+        event: "step_update",
+        step_update: { step_index: 215, state: "ACTIVE", step_type: "agent_response", text_delta },
+      },
+      onChunk,
+      idx,
+      emitted,
+      coalescer,
+    );
+    if (res.assistantTextEmitted) emitted = true;
+  });
+  expect(chunks).toHaveLength(0);
+  expect(coalescer.hasPending()).toBe(true);
+
+  const doneRes = mapAntigravityEvent(
+    {
+      event: "step_update",
+      step_update: { step_index: 215, state: "DONE", step_type: "agent_response", text_delta: "\n" },
+    },
+    onChunk,
+    deltas.length,
+    emitted,
+    coalescer,
+  );
+  expect(doneRes.assistantTextEmitted).toBe(true);
+  expect(coalescer.hasPending()).toBe(false);
+  expect(chunks).toEqual([
+    {
+      stream: "assistant",
+      data: "### Root Causes\n1. **Flat suffixed Antigravity models with no effort ladder:** Both the curated list and `agy models`\n",
+      lineUuid: "antigravity:step_215",
+    },
+  ]);
+
+  // Follow-up SUCCESS result must not duplicate the already-emitted text.
+  const endRes = mapAntigravityEvent(
+    {
+      event: "result",
+      result: { status: "SUCCESS", response: "### Root Causes..." },
+    },
+    onChunk,
+    deltas.length + 1,
+    true,
+    coalescer,
+  );
+  expect(endRes.done).toBe(0);
+  expect(chunks).toHaveLength(1);
+});
+
+test("single DONE agent_response emits immediately, and empty DONE (tool-only turn) emits nothing", () => {
+  const { chunks, onChunk } = collect();
+  const coalescer = new AntigravityTextCoalescer();
+
+  const empty = mapAntigravityEvent(
+    { event: "step_update", step_update: { step_index: 1, state: "DONE", step_type: "agent_response" } },
+    onChunk,
+    0,
+    false,
+    coalescer,
+  );
+  expect(empty.assistantTextEmitted).toBeUndefined();
+  expect(chunks).toHaveLength(0);
+
+  const single = mapAntigravityEvent(
+    {
+      event: "step_update",
+      step_update: { step_index: 147, state: "DONE", step_type: "agent_response", text_delta: "Waiting for tests.\n" },
+    },
+    onChunk,
+    1,
+    false,
+    coalescer,
+  );
+  expect(single.assistantTextEmitted).toBe(true);
+  expect(chunks).toEqual([
+    { stream: "assistant", data: "Waiting for tests.\n", lineUuid: "antigravity:step_147" },
+  ]);
+});
+
+test("tool step flushes pending assistant deltas first, and tool ERROR emits tool_result with isError: true", () => {
+  const { chunks, onChunk } = collect();
+  const coalescer = new AntigravityTextCoalescer();
+
+  mapAntigravityEvent(
+    { event: "step_update", step_update: { step_index: 10, state: "ACTIVE", step_type: "agent_response", text_delta: "Checking " } },
+    onChunk,
+    0,
+    false,
+    coalescer,
+  );
+  mapAntigravityEvent(
+    { event: "step_update", step_update: { step_index: 10, state: "ACTIVE", step_type: "agent_response", text_delta: "file..." } },
+    onChunk,
+    1,
+    false,
+    coalescer,
+  );
+  mapAntigravityEvent(
+    {
+      event: "step_update",
+      step_update: {
+        step_index: 11,
+        state: "ACTIVE",
+        step_type: "tool",
+        tool_name: "read_file",
+        tool_info: { name: "read_file", parameters: { Path: "/missing.ts" } },
+      },
+    },
+    onChunk,
+    2,
+    false,
+    coalescer,
+  );
+  mapAntigravityEvent(
+    {
+      event: "step_update",
+      step_update: {
+        step_index: 11,
+        state: "ERROR",
+        step_type: "tool",
+        tool_name: "read_file",
+        tool_info: {
+          name: "read_file",
+          parameters: { Path: "/missing.ts" },
+          error: { type: "TOOL_ERROR", message: "file does not exist" },
+        },
+      },
+    },
+    onChunk,
+    3,
+    true,
+    coalescer,
+  );
+
+  expect(chunks.map((c) => c.stream)).toEqual(["assistant", "tool_use", "tool_result"]);
+  expect(chunks[0]).toEqual({ stream: "assistant", data: "Checking file...", lineUuid: "antigravity:step_10" });
+  expect(chunks[2]?.lineUuid).toBe("tool_result:step_11");
+  expect(JSON.parse(chunks[2]!.data)).toEqual({
+    toolUseId: "step_11",
+    content: "file does not exist",
+    isError: true,
+  });
+});
+
+test("result event flushes pending ACTIVE deltas without duplicating result.response", () => {
+  const { chunks, onChunk } = collect();
+  const coalescer = new AntigravityTextCoalescer();
+
+  mapAntigravityEvent(
+    { event: "step_update", step_update: { step_index: 20, state: "ACTIVE", step_type: "agent_response", text_delta: "All " } },
+    onChunk,
+    0,
+    false,
+    coalescer,
+  );
+  mapAntigravityEvent(
+    { event: "step_update", step_update: { step_index: 20, state: "ACTIVE", step_type: "agent_response", text_delta: "done!" } },
+    onChunk,
+    1,
+    false,
+    coalescer,
+  );
+  const res = mapAntigravityEvent(
+    { event: "result", result: { status: "SUCCESS", response: "All done!" } },
+    onChunk,
+    2,
+    false,
+    coalescer,
+  );
+  expect(res.done).toBe(0);
+  expect(chunks).toEqual([
+    { stream: "assistant", data: "All done!", lineUuid: "antigravity:step_20" },
+  ]);
+});
+
+test("separately flushed fragments of the same step get distinct, replay-stable UUIDs", () => {
+  const runOnce = () => {
+    const seen = new Set<string>();
+    const chunks: Chunk[] = [];
+    const onChunk = (stream: RunEventStream, data: string, lineUuid?: string) => {
+      if (lineUuid) {
+        if (seen.has(lineUuid)) return;
+        seen.add(lineUuid);
+      }
+      chunks.push({ stream, data, lineUuid });
+    };
+    const coalescer = new AntigravityTextCoalescer();
+    // Fragment 0 of step 30
+    mapAntigravityEvent(
+      { event: "step_update", step_update: { step_index: 30, state: "ACTIVE", step_type: "agent_response", text_delta: "Part 1 " } },
+      onChunk,
+      0,
+      false,
+      coalescer,
+    );
+    // Interrupted by an error / non-JSON line flush
+    coalescer.flush(onChunk);
+    onChunk("stdout", "root agent idle; waiting for 1 background task(s) to finish", "antigravity:1");
+    // Fragment 1 of step 30 resumes and finishes
+    mapAntigravityEvent(
+      { event: "step_update", step_update: { step_index: 30, state: "ACTIVE", step_type: "agent_response", text_delta: "Part 2" } },
+      onChunk,
+      2,
+      true,
+      coalescer,
+    );
+    mapAntigravityEvent(
+      { event: "step_update", step_update: { step_index: 30, state: "DONE", step_type: "agent_response", text_delta: "!" } },
+      onChunk,
+      3,
+      true,
+      coalescer,
+    );
+    return chunks;
+  };
+
+  const first = runOnce();
+  const replay = runOnce();
+  expect(first).toEqual(replay);
+  expect(first).toEqual([
+    { stream: "assistant", data: "Part 1 ", lineUuid: "antigravity:step_30" },
+    { stream: "stdout", data: "root agent idle; waiting for 1 background task(s) to finish", lineUuid: "antigravity:1" },
+    { stream: "assistant", data: "Part 2!", lineUuid: "antigravity:step_30:1" },
+  ]);
 });

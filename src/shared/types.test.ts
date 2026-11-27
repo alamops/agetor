@@ -678,49 +678,49 @@ test("cursor picker lists Gemini Flash newest-first: 3.8 before 3.7 before 3.6",
   }
 });
 
-/* ── antigravity: Gemini 4 Argon rows + effort-in-id (docs/plans/add-gemini-4-argon.md) ── */
+/* ── antigravity: grouped base models + effort ladders ───────────────────── */
 
-test("antigravity picker leads with the three Gemini 4 Argon effort rows, and the default stays 3.8 Flash (High) right behind them", () => {
+test("antigravity picker leads with Gemini 4 Argon and keeps Gemini 3.8 Flash as the default right behind it", () => {
   const ids = AGENT_OPTIONS.antigravity.models.map((m) => m.id);
-  expect(ids.slice(0, 3)).toEqual([
-    "gemini-4-argon-high",
-    "gemini-4-argon-medium",
-    "gemini-4-argon-low",
-  ]);
-  expect(DEFAULT_MODEL.antigravity).toBe("gemini-3.8-flash-high");
-  expect(ids.indexOf(DEFAULT_MODEL.antigravity)).toBe(3);
-  expect(AGENT_OPTIONS.antigravity.models.slice(0, 3).map((m) => m.label)).toEqual([
-    "Gemini 4 Argon (High)",
-    "Gemini 4 Argon (Medium)",
-    "Gemini 4 Argon (Low)",
+  expect(ids[0]).toBe("gemini-4-argon");
+  expect(DEFAULT_MODEL.antigravity).toBe("gemini-3.8-flash");
+  expect(ids.indexOf(DEFAULT_MODEL.antigravity)).toBe(1);
+  expect(AGENT_OPTIONS.antigravity.models.slice(0, 2).map((m) => m.label)).toEqual([
+    "Gemini 4 Argon",
+    "Gemini 3.8 Flash",
   ]);
 });
 
-test("antigravity no longer offers the deprecated 3.7 Flash rows (migration 066), still 18 curated rows", () => {
+test("antigravity no longer offers the deprecated 3.7 Flash rows (migration 066), 7 grouped curated families", () => {
   const ids = AGENT_OPTIONS.antigravity.models.map((m) => m.id);
   for (const id of ids) expect(id.startsWith("gemini-3.7-flash")).toBe(false);
-  expect(ids.length).toBe(18);
+  expect(ids).toEqual([
+    "gemini-4-argon",
+    "gemini-3.8-flash",
+    "gemini-3.6-flash",
+    "gemini-3.1-pro",
+    "claude-opus-5-5",
+    "claude-sonnet-5-5",
+    "gpt-oss-120b",
+  ]);
 });
 
-test("MODEL_EFFORT_SUPPORT.antigravity keys exactly match the antigravity picker ids (both directions) and every value is empty — effort rides in the id", () => {
+test("MODEL_EFFORT_SUPPORT.antigravity keys exactly match the antigravity curated base ids with their effort ladders", () => {
   const catalogIds = new Set(AGENT_OPTIONS.antigravity.models.map((m) => m.id));
   const effortKeys = new Set(Object.keys(MODEL_EFFORT_SUPPORT.antigravity));
   for (const id of catalogIds) expect(effortKeys.has(id)).toBe(true);
   for (const key of effortKeys) expect(catalogIds.has(key)).toBe(true);
   expect(effortKeys.size).toBe(catalogIds.size);
-  for (const supported of Object.values(MODEL_EFFORT_SUPPORT.antigravity)) {
-    expect(supported).toEqual([]);
-  }
+  expect(MODEL_EFFORT_SUPPORT.antigravity["gemini-4-argon"]).toEqual(["high", "medium", "low"]);
+  expect(MODEL_EFFORT_SUPPORT.antigravity["gemini-3.8-flash"]).toEqual(["high", "medium", "low"]);
+  expect(MODEL_EFFORT_SUPPORT.antigravity["gemini-3.1-pro"]).toEqual(["high", "low"]);
+  expect(MODEL_EFFORT_SUPPORT.antigravity["gpt-oss-120b"]).toEqual(["medium"]);
 });
 
-test("every antigravity Gemini 4 Argon hint flags the id as unconfirmed and points at `agy models`", () => {
-  const argon = AGENT_OPTIONS.antigravity.models.filter((m) => m.id.startsWith("gemini-4-argon-"));
-  expect(argon.length).toBe(3);
-  for (const row of argon) {
-    expect(row.hint).toContain("unconfirmed");
-    expect(row.hint).toContain("agy models");
-    expect(row.hint).toContain("AI Ultra");
-  }
+test("antigravity Gemini 4 Argon hint notes AI Ultra / Gemini Enterprise eligibility", () => {
+  const argon = AGENT_OPTIONS.antigravity.models.find((m) => m.id === "gemini-4-argon");
+  expect(argon).toBeDefined();
+  expect(argon?.hint).toContain("AI Ultra");
 });
 
 /* ── defaultModeFor (docs/plans/fx-recovery-follow-ups.md §3.6) ─────────── */

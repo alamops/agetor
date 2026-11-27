@@ -1208,15 +1208,23 @@ test("antigravity: a boot or periodic sweep never runs `agy models` and keeps th
     expect(probes()).toEqual([]);
     expect(discovery.getDiscoveredModels("antigravity")).toEqual(held);
 
-    // The user's "refresh models" (POST /agent-models) probes.
+    // The user's "refresh models" (POST /agent-models) probes and groups
+    // flat `<base>-<effort>` rows into base + effort ladder.
     await scheduler.refreshAllModels({ manual: true });
     expect(probes()).toEqual(["models"]);
-    expect(discovery.getDiscoveredModels("antigravity").map((m) => m.id)).toEqual(["gemini-9-test-high"]);
+    expect(discovery.getDiscoveredModels("antigravity")).toEqual([
+      {
+        id: "gemini-9-test",
+        label: "Gemini 9 Test",
+        efforts: ["high"],
+        antigravity: { effortIds: { high: "gemini-9-test-high" } },
+      },
+    ]);
 
     // A later background sweep leaves the probed catalog in place.
     await scheduler.refreshAllModels();
     expect(probes()).toEqual(["models"]);
-    expect(discovery.getDiscoveredModels("antigravity").map((m) => m.id)).toEqual(["gemini-9-test-high"]);
+    expect(discovery.getDiscoveredModels("antigravity").map((m) => m.id)).toEqual(["gemini-9-test"]);
 
     // A harness change or a per-harness refresh probes.
     await scheduler.refreshHarnessModels("antigravity");
@@ -1237,3 +1245,35 @@ test("antigravity: a boot or periodic sweep never runs `agy models` and keeps th
     resetAll();
   }
 }, 30_000);
+
+test("antigravity: hydrating a legacy flat modelCatalog:kind:antigravity preference normalizes it into grouped base + efforts", async () => {
+  resetAll();
+  preferences.set(
+    "modelCatalog:kind:antigravity",
+    JSON.stringify({
+      v: 1,
+      cliVersion: "1.5.18",
+      savedAt: 1,
+      models: [
+        { id: "gemini-4-neon-high", label: "Gemini 4 Neon (High)" },
+        { id: "gemini-4-neon-xhigh", label: "Gemini 4 Neon (XHigh)" },
+        { id: "gemini-pro-orchestrator", label: "Orchestrator (Carbon)" },
+      ],
+    }),
+  );
+  try {
+    await scheduler.__testing.hydrateFromStore();
+    expect(discovery.getDiscoveredModels("antigravity")).toEqual([
+      {
+        id: "gemini-4-neon",
+        label: "Gemini 4 Neon",
+        efforts: ["high", "xhigh"],
+        antigravity: { effortIds: { high: "gemini-4-neon-high", xhigh: "gemini-4-neon-xhigh" } },
+      },
+      { id: "gemini-pro-orchestrator", label: "Orchestrator (Carbon)" },
+    ]);
+  } finally {
+    preferences.delete("modelCatalog:kind:antigravity");
+    resetAll();
+  }
+});

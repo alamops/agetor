@@ -28,6 +28,7 @@ const claude = parseClaudeInitModels(JSON.parse(text("claude-init-2.1.326.json")
 const codex = __testing.parseCodexModelList(JSON.parse(text("codex-model-list-0.166.0.json")));
 const cursor = __testing.parseCursorModels(text("cursor-models-2026.10.22.txt"));
 const gemini = parseGeminiModelsJson(text("gemini-models.json"));
+const antigravity = __testing.parseAntigravityModels(text("antigravity-models-1.5.18.txt"));
 const copilotAcp = parseCopilotSessionNew(JSON.parse(text("copilot-acp-session-new.json")));
 const copilotHelp = __testing.parseCopilotModels(`  \`model\`: m\n    - "claude-opus-5.5"\n    - "gpt-6.1-sol"\n    - "kimi-k3"\n`);
 
@@ -36,6 +37,7 @@ const CATALOGS: Record<string, { kind: AgentKind; rows: DiscoveredModel[] }> = {
   codex: { kind: "codex", rows: codex },
   cursor: { kind: "cursor", rows: cursor },
   gemini: { kind: "gemini", rows: gemini },
+  antigravity: { kind: "antigravity", rows: antigravity },
   copilotAcp: { kind: "copilot", rows: copilotAcp },
   copilotHelp: { kind: "copilot", rows: copilotHelp },
 };
