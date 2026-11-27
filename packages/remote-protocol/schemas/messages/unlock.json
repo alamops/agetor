@@ -1,0 +1,48 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://agetor.dev/schemas/remote/messages/unlock.json",
+  "title": "unlock",
+  "x-direction": "phone",
+  "type": "object",
+  "properties": {
+    "id": {
+      "type": "string",
+      "maxLength": 64,
+      "minLength": 1,
+      "pattern": "^[A-Za-z0-9._:~-]+$"
+    },
+    "payload": {
+      "type": "object",
+      "properties": {
+        "kind": {
+          "const": "unlock"
+        },
+        "sessionHash": {
+          "type": "string",
+          "pattern": "^[0-9a-f]{64}$"
+        },
+        "expiresAt": {
+          "type": "integer",
+          "minimum": 0,
+          "maximum": 253402300799999
+        }
+      },
+      "required": [
+        "kind",
+        "sessionHash",
+        "expiresAt"
+      ],
+      "additionalProperties": false
+    },
+    "sig": {
+      "type": "string",
+      "pattern": "^[0-9a-f]{128}$"
+    }
+  },
+  "required": [
+    "id",
+    "payload",
+    "sig"
+  ],
+  "additionalProperties": false
+}

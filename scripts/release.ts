@@ -36,7 +36,7 @@
 // applyVersion no-bump path skips the commit and lets you re-attempt
 // the failed downstream step.
 
-import { existsSync } from "node:fs";
+import { accessSync, constants, existsSync } from "node:fs";
 import { readFile, writeFile } from "node:fs/promises";
 
 const PKG = "package.json";
@@ -104,6 +104,22 @@ async function preflight(): Promise<void> {
   const missing = requiredSigning.filter((k) => !process.env[k]);
   if (missing.length) {
     fail(`missing signing env vars: ${missing.join(", ")} — set in .env.local (see .env.example).`);
+  }
+
+  // The Companion's key helper needs a Developer ID provisioning profile for its data-protection keychain access group, and its
+  // signature must carry it: without one the helper is ad hoc and notarization fails after a full build. The profile lives OUTSIDE the
+  // repo (it names the owner's team); a local `bun run build` falls back to an ad-hoc helper with a warning, a release never does.
+  const profile = process.env.AGETOR_KEYHELPER_PROFILE;
+  if (!profile) {
+    fail(
+      "AGETOR_KEYHELPER_PROFILE is not set — point it at the Developer ID .provisionprofile for sh.alamops.agetor.keyhelper "
+        + "(created in the Apple Developer portal, kept outside the repo) in .env.local. See docs/architecture/remote-gateway.md § Release.",
+    );
+  }
+  try {
+    accessSync(profile, constants.R_OK);
+  } catch {
+    fail(`AGETOR_KEYHELPER_PROFILE is not readable: ${profile} — check the path and its permissions.`);
   }
 }
 

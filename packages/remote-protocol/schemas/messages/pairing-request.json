@@ -1,0 +1,57 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://agetor.dev/schemas/remote/messages/pairing-request.json",
+  "title": "pairing-request",
+  "x-direction": "phone",
+  "type": "object",
+  "properties": {
+    "name": {
+      "type": "string",
+      "maxLength": 400,
+      "minLength": 1
+    },
+    "platform": {
+      "type": "string",
+      "enum": [
+        "ios",
+        "android"
+      ]
+    },
+    "appVersion": {
+      "type": "string",
+      "maxLength": 64,
+      "minLength": 1
+    },
+    "sessionPub": {
+      "type": "string",
+      "pattern": "^[0-9a-f]{130}$"
+    },
+    "approvePub": {
+      "type": "string",
+      "pattern": "^[0-9a-f]{130}$"
+    },
+    "pushPub": {
+      "type": "string",
+      "pattern": "^[0-9a-f]{64}$"
+    },
+    "sessionSig": {
+      "type": "string",
+      "pattern": "^[0-9a-f]{128}$"
+    },
+    "approveSig": {
+      "type": "string",
+      "pattern": "^[0-9a-f]{128}$"
+    }
+  },
+  "required": [
+    "name",
+    "platform",
+    "appVersion",
+    "sessionPub",
+    "approvePub",
+    "pushPub",
+    "sessionSig",
+    "approveSig"
+  ],
+  "additionalProperties": false
+}

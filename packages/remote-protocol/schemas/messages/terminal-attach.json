@@ -1,0 +1,102 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://agetor.dev/schemas/remote/messages/terminal-attach.json",
+  "title": "terminal-attach",
+  "x-direction": "phone",
+  "type": "object",
+  "properties": {
+    "id": {
+      "type": "string",
+      "maxLength": 64,
+      "minLength": 1,
+      "pattern": "^[A-Za-z0-9._:~-]+$"
+    },
+    "taskId": {
+      "type": "string",
+      "maxLength": 128,
+      "minLength": 1,
+      "pattern": "^[A-Za-z0-9._:~-]+$"
+    },
+    "cols": {
+      "type": "integer",
+      "minimum": 10,
+      "maximum": 500
+    },
+    "rows": {
+      "type": "integer",
+      "minimum": 2,
+      "maximum": 300
+    },
+    "payload": {
+      "type": "object",
+      "properties": {
+        "v": {
+          "const": 1
+        },
+        "kind": {
+          "const": "terminal-attach"
+        },
+        "deviceId": {
+          "type": "string",
+          "pattern": "^[0-9a-f]{32}$"
+        },
+        "sessionHash": {
+          "type": "string",
+          "pattern": "^[0-9a-f]{64}$"
+        },
+        "challenge": {
+          "type": "string",
+          "pattern": "^[0-9a-f]{32}$"
+        },
+        "taskId": {
+          "type": "string",
+          "maxLength": 128,
+          "minLength": 1,
+          "pattern": "^[A-Za-z0-9._:~-]+$"
+        },
+        "tmuxSession": {
+          "type": "string",
+          "maxLength": 64,
+          "minLength": 1,
+          "pattern": "^[A-Za-z0-9._:~-]+$"
+        },
+        "contentHash": {
+          "type": "string",
+          "maxLength": 71,
+          "minLength": 71,
+          "pattern": "^sha256:[0-9a-f]{64}$"
+        },
+        "ts": {
+          "type": "integer",
+          "minimum": 0,
+          "maximum": 253402300799999
+        }
+      },
+      "required": [
+        "v",
+        "kind",
+        "deviceId",
+        "sessionHash",
+        "challenge",
+        "taskId",
+        "tmuxSession",
+        "contentHash",
+        "ts"
+      ],
+      "additionalProperties": false
+    },
+    "sig": {
+      "type": "string",
+      "pattern": "^[0-9a-f]{128}$"
+    }
+  },
+  "required": [
+    "id",
+    "taskId",
+    "cols",
+    "rows",
+    "payload",
+    "sig"
+  ],
+  "additionalProperties": false
+}

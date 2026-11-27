@@ -1090,10 +1090,12 @@ test("multi teardown parks on its SECOND key too: each task waits for its non-sh
   }
 }, FIFO_TEST_TIMEOUT_MS);
 
-test("archiving a multi task with one dirty repository archives it and keeps that checkout intact", async () => {
-  // Contract (docs/architecture/multi-repo-tasks.md, Teardown): archive is per
-  // repository and best-effort — a dirty checkout is kept with its branch and
-  // the workspace, clean ones are detached, and the task is archived anyway.
+test("archiving a multi task with one dirty repository is refused naming it, and the confirmed archive removes every checkout", async () => {
+  // Contract (docs/architecture/task-lifecycle.md item 7, multi-repo-tasks.md
+  // Teardown): the desktop asks first. A plain archive answers
+  // uncommitted-changes naming the dirty repository and changes nothing; the
+  // confirmed retry (forceWorktree) detaches every checkout, the dirty one
+  // included, and keeps each branch for unarchive.
   const { createTask, archiveTask, tasks } = await load();
   const { prepareTaskWorkdir } = await import("./worktree.ts");
   const a = await makeRepo("frontend");
@@ -1116,40 +1118,33 @@ test("archiving a multi task with one dirty repository archives it and keeps tha
     tasks.setRepositories(id, prepared.repositories!);
     tasks.update(id, { worktreePath: prepared.worktreePath, column: "done" });
     const [clean, dirty] = prepared.repositories!;
-    // An uncommitted edit to a tracked file plus an untracked file: neither is
-    // on the branch, so detaching this checkout would lose them for good.
     writeFileSync(path.join(dirty!.worktreePath!, "README"), "edited, not committed\n");
     writeFileSync(path.join(dirty!.worktreePath!, "scratch.txt"), "untracked work\n");
 
-    const archived = await archiveTask(id, { awaitTeardown: true, stopRun: true });
+    const refused = await archiveTask(id, { awaitTeardown: true, stopRun: true });
+    expect("task" in refused).toBe(false);
+    expect("code" in refused && refused.code).toBe("uncommitted-changes");
+    expect("repositories" in refused && refused.repositories).toEqual([dirty!.name]);
+    expect(tasks.get(id)?.archivedAt).toBeNull();
+    expect(existsSync(clean!.worktreePath!)).toBe(true);
+    expect(await Bun.file(path.join(dirty!.worktreePath!, "scratch.txt")).text()).toBe("untracked work\n");
+
+    const archived = await archiveTask(id, { awaitTeardown: true, stopRun: true, forceWorktree: true });
     if ("error" in archived) throw new Error(archived.error);
     expect(archived.task.archivedAt).not.toBeNull();
-    expect(tasks.get(id)?.archivedAt).not.toBeNull();
-    expect(archived.teardown?.removed).toBe(false);
-    expect(archived.teardown?.reason).toBe("dirty");
-    expect(archived.teardown?.repositories?.map((r) => [r.name, r.result.removed, r.result.reason ?? null])).toEqual([
-      [clean!.name, true, null],
-      [dirty!.name, false, "dirty"],
+    expect(archived.teardown?.repositories?.map((r) => [r.name, r.result.removed])).toEqual([
+      [clean!.name, true],
+      [dirty!.name, true],
     ]);
-
-    // The clean repository was detached; its branch survives for unarchive.
     expect(existsSync(clean!.worktreePath!)).toBe(false);
+    expect(existsSync(dirty!.worktreePath!)).toBe(false);
+
     const branchExists = async (repo: string, branch: string) =>
       (await Bun.spawn(["git", "rev-parse", "--verify", "--quiet", `refs/heads/${branch}`], {
         cwd: repo, stdout: "pipe", stderr: "pipe",
       }).exited) === 0;
     expect(await branchExists(a, clean!.branch!)).toBe(true);
-
-    // The dirty checkout, its uncommitted changes, its branch and the
-    // workspace holding it are all still there.
-    expect(existsSync(workspace)).toBe(true);
-    expect(existsSync(path.join(dirty!.worktreePath!, ".git"))).toBe(true);
-    expect(await Bun.file(path.join(dirty!.worktreePath!, "README")).text()).toBe("edited, not committed\n");
-    expect(await Bun.file(path.join(dirty!.worktreePath!, "scratch.txt")).text()).toBe("untracked work\n");
     expect(await branchExists(b, dirty!.branch!)).toBe(true);
-    const { readCheckoutBranch } = await import("./worktree.ts");
-    const live = await readCheckoutBranch(dirty!.worktreePath!);
-    expect(live.ok && live.branch).toBe(dirty!.branch);
   } finally {
     cleanup(workspace, a, b);
   }

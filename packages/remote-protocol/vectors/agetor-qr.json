@@ -1,0 +1,27 @@
+{
+  "source": "Agetor pairing QR: base64url (no padding) of the RFC 8785 canonical JSON; the key helper builds it too",
+  "cases": [
+    {
+      "payload": {
+        "fmt": 1,
+        "corePub": "abababababababababababababababababababababababababababababababab",
+        "relayUrl": "wss://relay.example.test/v1",
+        "mailbox": "cdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcd",
+        "pairingSecret": "efefefefefefefefefefefefefefefefefefefefefefefefefefefefefefefef",
+        "expiresAt": 1795560120000
+      },
+      "qr": "eyJjb3JlUHViIjoiYWJhYmFiYWJhYmFiYWJhYmFiYWJhYmFiYWJhYmFiYWJhYmFiYWJhYmFiYWJhYmFiYWJhYmFiYWJhYmFiYWJhYiIsImV4cGlyZXNBdCI6MTc5NTU2MDEyMDAwMCwiZm10IjoxLCJtYWlsYm94IjoiY2RjZGNkY2RjZGNkY2RjZGNkY2RjZGNkY2RjZGNkY2QiLCJwYWlyaW5nU2VjcmV0IjoiZWZlZmVmZWZlZmVmZWZlZmVmZWZlZmVmZWZlZmVmZWZlZmVmZWZlZmVmZWZlZmVmZWZlZmVmZWZlZmVmZWZlZiIsInJlbGF5VXJsIjoid3NzOi8vcmVsYXkuZXhhbXBsZS50ZXN0L3YxIn0"
+    },
+    {
+      "payload": {
+        "fmt": 1,
+        "corePub": "0000000000000000000000000000000000000000000000000000000000000000",
+        "relayUrl": "ws://127.0.0.1:8787",
+        "mailbox": "11111111111111111111111111111111",
+        "pairingSecret": "2222222222222222222222222222222222222222222222222222222222222222",
+        "expiresAt": 1
+      },
+      "qr": "eyJjb3JlUHViIjoiMDAwMDAwMDAwMDAwMDAwMDAwMDAwMDAwMDAwMDAwMDAwMDAwMDAwMDAwMDAwMDAwMDAwMDAwMDAwMDAwMDAwMCIsImV4cGlyZXNBdCI6MSwiZm10IjoxLCJtYWlsYm94IjoiMTExMTExMTExMTExMTExMTExMTExMTExMTExMTExMTEiLCJwYWlyaW5nU2VjcmV0IjoiMjIyMjIyMjIyMjIyMjIyMjIyMjIyMjIyMjIyMjIyMjIyMjIyMjIyMjIyMjIyMjIyMjIyMjIyMjIyMjIyMjIyMiIsInJlbGF5VXJsIjoid3M6Ly8xMjcuMC4wLjE6ODc4NyJ9"
+    }
+  ]
+}

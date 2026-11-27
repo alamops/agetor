@@ -1,0 +1,30 @@
+{
+  "$schema": "http://json-schema.org/draft-07/schema#",
+  "type": "object",
+  "properties": {
+    "earliestId": {
+      "type": [
+        "number",
+        "null"
+      ]
+    },
+    "hasMore": {
+      "type": "boolean"
+    },
+    "resumedAfter": {
+      "type": "number"
+    },
+    "snapshotRequired": {
+      "type": "boolean",
+      "const": true
+    }
+  },
+  "required": [
+    "earliestId",
+    "hasMore"
+  ],
+  "additionalProperties": false,
+  "definitions": {},
+  "$id": "https://agetor.dev/schemas/remote/routes/TaskEventsReplayMeta.json",
+  "title": "TaskEventsReplayMeta"
+}

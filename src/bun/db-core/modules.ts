@@ -10,6 +10,7 @@ import { makePipelines } from "./pipelines.ts";
 import { makeRuns } from "./runs.ts";
 import { makeCursorAsks, makeOpencodeStoppedChildren, makeOpencodeWatchTombstones, makeSubagents } from "./subagents.ts";
 import { makeHiddenSessionIds } from "./hidden-sessions.ts";
+import { makeRemote } from "./remote.ts";
 
 /** Instantiate every SQL-owning module over one connection. `db.ts` calls this
  *  with the main-thread decorations; the worker's handler calls it with none
@@ -19,6 +20,7 @@ export function buildDbModules(conn: Database, decorations?: TaskDecorationDeps)
   const harnessOrphanedCopies = harnessStore.harnessOrphanedCopies;
   const tasks = makeTasks(conn, { harnessOrphanedCopies, decorations });
   const runs = makeRuns(conn);
+  const remote = makeRemote(conn);
   return {
     harnesses: harnessStore.harnesses,
     harnessSessionHandoffs: harnessStore.harnessSessionHandoffs,
@@ -43,6 +45,9 @@ export function buildDbModules(conn: Database, decorations?: TaskDecorationDeps)
     opencodeWatchTombstones: makeOpencodeWatchTombstones(conn),
     cursorAsks: makeCursorAsks(conn),
     hiddenSessionIds: makeHiddenSessionIds(runs, tasks),
+    remoteDevices: remote.remoteDevices,
+    remoteAudit: remote.remoteAudit,
+    remoteIdempotency: remote.remoteIdempotency,
   };
 }
 

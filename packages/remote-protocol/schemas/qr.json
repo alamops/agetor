@@ -1,0 +1,42 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://agetor.dev/schemas/remote/qr.json",
+  "title": "qr",
+  "type": "object",
+  "properties": {
+    "fmt": {
+      "const": 1
+    },
+    "corePub": {
+      "type": "string",
+      "pattern": "^[0-9a-f]{64}$"
+    },
+    "relayUrl": {
+      "type": "string",
+      "pattern": "^wss?://[^\\s]+$",
+      "maxLength": 512
+    },
+    "mailbox": {
+      "type": "string",
+      "pattern": "^[0-9a-f]{32}$"
+    },
+    "pairingSecret": {
+      "type": "string",
+      "pattern": "^[0-9a-f]{64}$"
+    },
+    "expiresAt": {
+      "type": "integer",
+      "minimum": 0
+    }
+  },
+  "required": [
+    "fmt",
+    "corePub",
+    "relayUrl",
+    "mailbox",
+    "pairingSecret",
+    "expiresAt"
+  ],
+  "additionalProperties": false,
+  "description": "The QR code carries base64url (no padding) of the RFC 8785 canonical JSON of this object."
+}

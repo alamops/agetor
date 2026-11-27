@@ -1,7 +1,7 @@
 import type {
   BackgroundStatus,
   BackgroundUnavailableReason,
-  RemoteAccessStatus,
+  RemoteAccessSwitch,
 } from "../shared/types.ts";
 
 /**
@@ -34,7 +34,7 @@ export type ShowMessageBox = (opts: MessageBoxOptions) => Promise<{ response: nu
 export interface RemoteAccessBackground {
   getBackgroundStatus(opts?: { fresh?: boolean }): Promise<BackgroundStatus>;
   turnOnBackground(): Promise<BackgroundStatus>;
-  getRemoteAccess(): Promise<RemoteAccessStatus>;
+  getRemoteAccess(): Promise<RemoteAccessSwitch>;
   setRemoteAccessOff(): Promise<void>;
   setRemoteAccessOnFromNativeBox(): Promise<void>;
   /**
@@ -86,6 +86,41 @@ function unavailableText(status: BackgroundStatus): string {
     : "Background running isn't available on this install.";
   // helper-failed carries the helper's own error, which is the useful part.
   return status.detail && status.detail !== reason ? `${reason} ${status.detail}` : reason;
+}
+
+export interface PairPhoneDeps extends RemoteAccessBoxDeps {
+  /** The gateway's pairing entry; absent when the Companion is not compiled in or this core cannot pair. */
+  startPairing?: () => Promise<{ expiresAt: number; alreadyOpen: boolean }>;
+}
+
+/**
+ * "Pair a Phone…": remote access must be on first (the native Remote Access box is the only place that turns it on), then the gateway
+ * opens the key helper's own window with the QR code. Every refusal is a plain message box; none of this is reachable from a route.
+ */
+export async function runPairPhone(deps: PairPhoneDeps): Promise<"opened" | "needs-remote-access" | "unavailable" | "failed"> {
+  const { showMessageBox, background } = deps;
+  if (!deps.startPairing) {
+    await showMessageBox({ type: "info", title: "Pair a Phone", message: "Pairing is not available in this build.", buttons: ["OK"], defaultId: 0, cancelId: 0 });
+    return "unavailable";
+  }
+  try {
+    if (!(await background.getRemoteAccess()).enabled) {
+      await runRemoteAccessBox(deps);
+      if (!(await background.getRemoteAccess()).enabled) return "needs-remote-access";
+    }
+    await deps.startPairing();
+    return "opened";
+  } catch (err) {
+    const code = (err as { code?: string } | null)?.code;
+    const detail =
+      code === "relay-not-configured" ? "This build has no relay configured, so a phone cannot connect yet."
+      : code === "no-secure-enclave" || code === "keychain-unavailable" ? "This Mac cannot keep the pairing keys safe (Secure Enclave or keychain unavailable), so pairing is refused."
+      : code === "helper-missing" || code === "helper-crashed" ? "The pairing helper could not start. Reinstall Agetor and try again."
+      : err instanceof Error ? err.message : "Something went wrong.";
+    deps.log?.(`[agetor] pair a phone failed: ${err instanceof Error ? err.message : String(err)}`);
+    await showMessageBox({ type: "error", title: "Pair a Phone", message: "Couldn't start pairing.", detail, buttons: ["OK"], defaultId: 0, cancelId: 0 }).catch(() => undefined);
+    return "failed";
+  }
 }
 
 export async function runRemoteAccessBox(deps: RemoteAccessBoxDeps): Promise<void> {

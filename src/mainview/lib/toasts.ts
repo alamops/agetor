@@ -1,8 +1,11 @@
 import { toast } from "sonner";
 import type { NotificationKind } from "../../shared/os-notification.ts";
-import { api } from "./api";
 import { filesSentCopy, shouldToastFilesSent } from "./files-sent-notify";
-import { FocusedForcedPosts, TaskToastSlots, type TaskToastKind } from "./toast-slots";
+import { TaskToastSlots, type TaskToastKind } from "./toast-slots";
+
+// In-app toasts only. The OS notification for the same events is decided in the core (src/bun/notification-policy.ts, grill D5):
+// it knows the window's focus and the open task from `PUT /app/presence` (lib/presence-report.ts), so nothing here posts or clears
+// a Notification Center entry any more. docs/architecture/notifications.md.
 
 /**
  * Args common to every toast helper. `isSelected` / `isFocused` are evaluated
@@ -36,9 +39,6 @@ export interface ToastArgs {
 // `blocked`; `hasPendingToast` reports them. Action-feedback toasts in App.tsx
 // ("Copied", …) are not task events and stay outside the slot.
 const slots = new TaskToastSlots();
-// Tasks whose OS entry was posted while focused because the event forced it;
-// D7 leaves that entry alone until the task is opened (see FocusedForcedPosts).
-const focusedForcedPosts = new FocusedForcedPosts();
 
 /** What `showTaskToast`'s `show` callback wires into the sonner call. */
 interface SlotLifecycle {
@@ -78,28 +78,6 @@ function describe(args: ToastArgs): string {
   return args.subtitle ? `${args.title} · ${args.subtitle}` : args.title;
 }
 
-function maybeNotifyOS(
-  args: ToastArgs,
-  kind: NotificationKind,
-  heading: string,
-  detail?: string,
-  opts?: { force?: boolean },
-): void {
-  const action = focusedForcedPosts.decide(args.taskId, {
-    isFocused: args.isFocused,
-    force: opts?.force === true,
-  });
-  if (action === "keep") return;
-  if (action === "clear") {
-    // D7: the in-app toast carries the news while the window is focused, so the
-    // task's older Notification Center entry (if any) is removed, not replaced.
-    api.clearTaskNotification(args.taskId).catch(() => { /* ignore */ });
-    return;
-  }
-  // Fire-and-forget — failure (e.g. user denied macOS permission) is silent.
-  api.notifyOS({ title: heading, body: detail, taskId: args.taskId, kind }).catch(() => { /* ignore */ });
-}
-
 export function toastSuccess(args: ToastArgs & { kind?: "succeeded" | "pipeline-finished" }): void {
   if (args.isSelected) return;
   const kind = args.kind ?? "succeeded";
@@ -113,7 +91,6 @@ export function toastSuccess(args: ToastArgs & { kind?: "succeeded" | "pipeline-
       onAutoClose: release,
     }),
   );
-  maybeNotifyOS(args, kind, "Task succeeded", detail);
 }
 
 export function toastError(args: ToastArgs & { reason?: string }): void {
@@ -129,7 +106,6 @@ export function toastError(args: ToastArgs & { reason?: string }): void {
       onAutoClose: release,
     }),
   );
-  maybeNotifyOS(args, "failed", "Task failed", detail);
 }
 
 /** Shared lifecycle for the `blocked`-column toasts (`toastPending` for
@@ -140,13 +116,11 @@ export function toastError(args: ToastArgs & { reason?: string }): void {
  *      toast, so we don't stack duplicates if the column re-enters `blocked`),
  *      which is what lets a `column-leaves-blocked` transition clear it via
  *      `dismissPending`,
- *    • use `duration: Infinity` (only user/programmatic dismissal cleans up),
- *    • mirror the heading to the OS notification when the app is unfocused.
+ *    • use `duration: Infinity` (only user/programmatic dismissal cleans up).
  *  Only the sonner severity (warning vs error), the heading and the kind differ
  *  — keep those at the call site so adding another variant is a two-line
- *  change. `notifyWhenSelected` opts a variant out of the "selected means the
- *  user already sees it" rule for the OS half only (`toastPipelineReview`: a
- *  gate in an open-but-backgrounded run view can't repaint). */
+ *  change. The OS notification for the same event is the core's decision now
+ *  (src/bun/notification-policy.ts), including the exceptions for a selected task. */
 function showBlockingToast(
   variant: {
     method: typeof toast.warning | typeof toast.error;
@@ -154,13 +128,9 @@ function showBlockingToast(
     kind: NotificationKind;
   },
   args: ToastArgs,
-  opts?: { notifyWhenSelected?: boolean },
 ): void {
   const detail = describe(args);
-  if (args.isSelected) {
-    if (opts?.notifyWhenSelected) maybeNotifyOS(args, variant.kind, variant.heading, detail);
-    return;
-  }
+  if (args.isSelected) return;
   showTaskToast(args.taskId, variant.kind, args.onOpen, ({ release, openAction }) =>
     variant.method(variant.heading, {
       description: detail,
@@ -170,7 +140,6 @@ function showBlockingToast(
       onAutoClose: release,
     }),
   );
-  maybeNotifyOS(args, variant.kind, variant.heading, detail);
 }
 
 export function toastPending(args: ToastArgs): void {
@@ -185,11 +154,7 @@ export function toastPending(args: ToastArgs): void {
  *  only thing that pulls the owner back. The in-app toast stays suppressed for
  *  the open run view. */
 export function toastPipelineReview(args: ToastArgs): void {
-  showBlockingToast(
-    { method: toast.warning, heading: "Pipeline needs your review", kind: "blocked" },
-    args,
-    { notifyWhenSelected: true },
-  );
+  showBlockingToast({ method: toast.warning, heading: "Pipeline needs your review", kind: "blocked" }, args);
 }
 
 /** Variant of `toastPending` for the `blocked → api-error` transition.
@@ -229,7 +194,6 @@ export function toastUnknownCommand(args: ToastArgs): void {
  * instant the window repaints on focus).
  */
 export function notifyWaitingInput(args: ToastArgs): void {
-  maybeNotifyOS(args, "waiting", "Waiting on you", describe(args));
   if (args.isSelected) return;
   const detail = describe(args);
   showTaskToast(args.taskId, "waiting", args.onOpen, ({ release, openAction }) =>
@@ -253,23 +217,14 @@ export function notifyWaitingInput(args: ToastArgs): void {
  * `toastSuccess`/`toastError`, not one of the `showBlockingToast` variants.
  * It still takes the task's one toast slot (as a non-reason kind), so
  * `dismissPending` leaves it alone.
- * The native notification bypasses the usual focused-window gate
- * (`maybeNotifyOS`'s `force` option) for a `proactive` send — Claude
- * volunteered the files unprompted, so there's no other signal something
- * just landed, focused window or not. A focused, not-proactive send goes
- * through `maybeNotifyOS` too, which then removes the task's older entry (D7).
- * A forced post made while focused is kept by D7 until the task is opened
- * (`FocusedForcedPosts`), so the turn's own next event doesn't remove it.
+ * The native notification, including its bypass of the focused-window rule
+ * for a `proactive` send, is the core's decision (src/bun/notification-policy.ts).
  */
 export function notifyFilesSent(
   args: ToastArgs & { count: number; caption: string | null; proactive: boolean },
 ): void {
   const { title, body } = filesSentCopy({ count: args.count, caption: args.caption });
   const description = body ? `${describe(args)} — ${body}` : describe(args);
-  // Posts when unfocused or proactive (`force`: Claude volunteered the files,
-  // so there's no other signal); a focused, not-proactive send removes the
-  // task's older entry instead.
-  maybeNotifyOS(args, "files-sent", title, description, { force: args.proactive });
   if (shouldToastFilesSent({ isSelected: args.isSelected, isFocused: args.isFocused })) {
     showTaskToast(args.taskId, "files-sent", args.onOpen, ({ release, openAction }) =>
       toast.info(title, {
@@ -322,8 +277,8 @@ export function toastSendFailed(
  * resume for a paused fx task (see `TaskFxRecovery` / the `fx-auto-resume`
  * `GlobalEvent` in `src/shared/types.ts`). Live-only, like
  * `notifyFilesSent` — a replayed historical `fired` must not re-toast — and
- * deliberately does NOT call `maybeNotifyOS`: auto-resume outcomes are
- * toast-only by design (the plan's §8 explicitly defers an OS notification).
+ * has no OS notification: auto-resume outcomes are toast-only by design
+ * (the plan's §8 explicitly defers an OS notification).
  * Self-dismissing (`toast.info`), matching `toastSuccess`.
  */
 export function toastFxAutoResumeFired(args: ToastArgs & { attempt: number; max: number }): void {
@@ -385,7 +340,6 @@ export function dismissPending(taskId: string): void {
  *  delete). The task's OS entry is removed on those same paths, so a forced
  *  focused post stops being protected from D7 too. */
 export function dismissTaskToast(taskId: string): void {
-  focusedForcedPosts.forget(taskId);
   const entry = slots.take(taskId);
   if (entry) toast.dismiss(entry.id);
 }
@@ -407,10 +361,7 @@ export function toastHarnessSwap(args: ToastArgs & { fromLabel: string; toLabel:
   // with fewer than two accounts has no meaningful position to print.
   const place = args.count >= 2 ? ` (${args.position}/${args.count})` : "";
   const detail = `${args.fromLabel} → ${args.toLabel}${place}`;
-  if (args.isSelected) {
-    maybeNotifyOS(args, "harness-swap", "Account switched", detail);
-    return;
-  }
+  if (args.isSelected) return;
   showTaskToast(args.taskId, "harness-swap", args.onOpen, ({ release, openAction }) =>
     toast.info("Account switched", {
       description: detail,
@@ -420,7 +371,6 @@ export function toastHarnessSwap(args: ToastArgs & { fromLabel: string; toLabel:
       onAutoClose: release,
     }),
   );
-  maybeNotifyOS(args, "harness-swap", "Account switched", detail);
 }
 
 /** The stack ran out of quota: the task is blocked with a countdown. Blocking

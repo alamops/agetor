@@ -1,0 +1,52 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://agetor.dev/schemas/remote/messages/subscribe-task.json",
+  "title": "subscribe-task",
+  "x-direction": "phone",
+  "type": "object",
+  "properties": {
+    "sub": {
+      "type": "string",
+      "maxLength": 64,
+      "minLength": 1,
+      "pattern": "^[A-Za-z0-9._:~-]+$"
+    },
+    "taskId": {
+      "type": "string",
+      "maxLength": 128,
+      "minLength": 1,
+      "pattern": "^[A-Za-z0-9._:~-]+$"
+    },
+    "afterId": {
+      "anyOf": [
+        {
+          "type": "integer",
+          "minimum": 0,
+          "maximum": 9007199254740991
+        },
+        {
+          "type": "null"
+        }
+      ]
+    },
+    "maxBytes": {
+      "anyOf": [
+        {
+          "type": "integer",
+          "minimum": 1,
+          "maximum": 67108864
+        },
+        {
+          "type": "null"
+        }
+      ]
+    }
+  },
+  "required": [
+    "sub",
+    "taskId",
+    "afterId",
+    "maxBytes"
+  ],
+  "additionalProperties": false
+}

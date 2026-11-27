@@ -6310,6 +6310,19 @@ export const EVENTS_PAGE_MAX_BYTES = 2 * 1024 * 1024;
  */
 export const MIN_REPLAY_EVENTS = 20;
 
+/**
+ * Smallest `maxBytes` a client may ask the event routes for (`GET /tasks/:id/events` replay and
+ * `GET /tasks/:id/events/page`). Smaller asks are raised to it. The largest is the route's own budget
+ * (`EVENTS_REPLAY_MAX_BYTES` / `EVENTS_PAGE_MAX_BYTES`). With no `maxBytes` the routes behave exactly as before.
+ */
+export const EVENTS_MAX_BYTES_FLOOR = 64 * 1024;
+
+/** The first-load size the phone asks for (docs/specs/remote-readiness-spec.md "Small first loads"). */
+export const EVENTS_FIRST_LOAD_BYTES = 256 * 1024;
+
+/** Tool results longer than this reach a phone cut, with a fetch-by-event-id for the full text. */
+export const PHONE_TOOL_RESULT_BYTES = 16 * 1024;
+
 /** Max number of events the run panel keeps in webview memory for one task.
  *  When live streaming pushes past this, the oldest events are trimmed and the
  *  "Load earlier" affordance re-appears. */
@@ -6847,10 +6860,24 @@ export interface BackgroundStatus {
   remoteAccess: boolean;
 }
 
-/** `GET /remote-access`. Remote access is a preview: nothing pairs yet. */
-export interface RemoteAccessStatus {
+/** The remote-access switch alone (`background.ts` reads it from the preference). */
+export interface RemoteAccessSwitch {
   enabled: boolean;
   preview: true;
+}
+
+/** `GET /remote-access`: the switch and what the Companion gateway is doing (docs/architecture/remote-gateway.md). */
+export interface RemoteAccessStatus extends RemoteAccessSwitch {
+  /** Whether this build ships the Companion. When false every other field below is empty. */
+  companion: boolean;
+  relay: { url: string | null; state: "off" | "unconfigured" | "connecting" | "up" | "down" };
+  devices: { trusted: number; untrusted: number };
+  /** The D11 warning when the API is bound beyond loopback, else null. */
+  bindWarning: string | null;
+  /** The Mac's name as phones show it. */
+  macName: string;
+  attachedTerminals: Array<{ taskId: string; deviceId: string; deviceName: string; since: number }>;
+  auditHead: { seq: number; hash: string } | null;
 }
 
 /** `preferences` key holding the remote-access switch; stored "on" | "off".
@@ -6906,6 +6933,25 @@ export type AppMenuAction = (typeof APP_MENU_ACTIONS)[number];
  *                  Settings section re-renders from `status`.
  */
 export type AppEvent =
+  | {
+      /** A phone attached to (or detached from) a task's tmux session (docs/specs/remote-readiness-spec.md "Terminal"). The run panel shows "Phone attached to <task>" with a Detach button while one is attached. */
+      type: "phone_terminal";
+      taskId: string;
+      deviceId: string;
+      /** The cleaned device name, at most 40 characters. */
+      deviceName: string;
+      attached: boolean;
+      since: number;
+      ts: number;
+    }
+  | {
+      /** A remote action a phone took, for the Mac's toast ("Plan approved from Ana's iPhone") and the Settings activity refresh. */
+      type: "remote_action";
+      taskId: string | null;
+      deviceName: string;
+      action: "plan-approved" | "card-allowed" | "gate-decided" | "auto-mode-approved" | "terminal-attached" | "device-paired" | "device-revoked";
+      ts: number;
+    }
   | {
       type: "quit_request";
       runningRunCount: number;

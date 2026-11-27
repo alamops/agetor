@@ -108,10 +108,10 @@ import type {
   WorktreeInfo,
   WorktreeTeardownResult,
 } from "../../shared/types.ts";
+import type { RemoteDevicesResult, RemoteLogResult } from "../../shared/remote-types.ts";
 import { TASK_EVENTS_REPLAY_META_EVENT, taskListPath, type TaskDelta, type TaskListOptions } from "../../shared/types.ts";
 import { isTaskDelta, taskDeltaPath } from "../../shared/task-delta.ts";
 import { parseReplayMeta } from "../../shared/task-stream-resume.ts";
-import type { NotificationKind } from "../../shared/os-notification.ts";
 import type { DiscoveredModel } from "../../shared/model-options.ts";
 import type {
   BundleExportResponse,
@@ -2352,31 +2352,13 @@ export const api = {
       `/runs/${runId}/rebuild-events${limit ? `?limit=${limit}` : ""}`,
     ),
 
-  /** Fire a native macOS notification via the Bun process. Fire-and-forget
-   *  — the OS handles display. When `taskId` is provided, the Bun side
-   *  encodes it into an `agetor://task/<id>` deep-link so clicking the
-   *  notification opens straight to that task, not just app focus. */
-  notifyOS: (input: {
-    title: string;
-    body?: string;
-    subtitle?: string;
-    silent?: boolean;
-    taskId?: string;
-    /** The event kind; the core uses it for the entry's urgency (sound) and
-     *  for the reason-scoped removals. */
-    kind?: NotificationKind;
-  }) =>
-    j<{ ok: boolean }>("/notifications", {
-      method: "POST",
+  /** Tell the core what the window shows (focus, the open task, its view). The core decides every OS notification from it
+   *  (src/bun/notification-policy.ts); the webview no longer posts or clears one. Fire-and-forget: `lib/presence-report.ts`
+   *  debounces, dedupes and backs off. */
+  reportPresence: (input: { focused: boolean; selectedTaskId: string | null; view: "run-panel" | "pipeline" | null }) =>
+    j<{ ok: boolean }>("/app/presence", {
+      method: "PUT",
       body: JSON.stringify(input),
-    }),
-
-  /** Remove a task's Notification Center entry (the focused-window update
-   *  path: the in-app toast carries the news, so the older entry goes).
-   *  Fire-and-forget like `notifyOS`; callers `.catch(() => {})`. */
-  clearTaskNotification: (taskId: string) =>
-    j<{ ok: boolean }>(`/notifications/${encodeURIComponent(taskId)}`, {
-      method: "DELETE",
     }),
 
   /** App-wide lifecycle event stream. Live-only (no replay) — subscribers
@@ -2473,6 +2455,24 @@ export const api = {
    *  webview can only turn it off. */
   turnOffRemoteAccess: () =>
     j<RemoteAccessStatus>("/remote-access", { method: "DELETE" }, { retry: false }),
+  /** The paired phones and why a row is not trusted. There is no route that pairs a phone or changes its level: only the app's native window does. */
+  getRemoteDevices: () => j<RemoteDevicesResult>("/remote-access/devices"),
+  revokeRemoteDevice: (id: string) =>
+    j<{ ok: true }>(`/remote-access/devices/${encodeURIComponent(id)}`, { method: "DELETE" }, { retry: false }),
+  revokeAllRemoteDevices: () => j<{ ok: true }>("/remote-access/devices", { method: "DELETE" }, { retry: false }),
+  getRemoteLog: (opts: { limit?: number; beforeSeq?: number } = {}) => {
+    const q = new URLSearchParams();
+    if (opts.limit !== undefined) q.set("limit", String(opts.limit));
+    if (opts.beforeSeq !== undefined) q.set("beforeSeq", String(opts.beforeSeq));
+    const qs = q.size > 0 ? `?${q.toString()}` : "";
+    return j<RemoteLogResult>(`/remote-access/log${qs}`);
+  },
+  /** The Mac's Detach button for a phone's terminal on a task. */
+  detachPhoneTerminal: (taskId: string) =>
+    j<{ ok: true; detached: boolean }>(`/tasks/${encodeURIComponent(taskId)}/phone-terminal`, { method: "DELETE" }, { retry: false }),
+  /** The name phones show for this Mac (at most 40 characters). */
+  setMacName: (name: string) =>
+    j<void>("/preferences/remoteMacName", { method: "PUT", body: JSON.stringify({ value: name }) }),
 
   subscribeRun(runId: string, onEvent: (e: RunEvent) => void): () => void {
     return openEventStream(

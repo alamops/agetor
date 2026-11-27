@@ -95,11 +95,16 @@ export default [
     ],
   },
   {
-    files: ["src/bun/**/*.ts", "src/cli/**/*.{ts,tsx}", "src/shared/**/*.ts"],
+    files: ["src/bun/**/*.ts", "src/cli/**/*.{ts,tsx}", "src/shared/**/*.ts", "packages/remote-protocol/src/**/*.ts"],
     languageOptions: {
       parser: tseslint.parser,
       parserOptions: {
-        projectService: true,
+        // A program of the linted folders only (not the webview or e2e):
+        // `projectService` over the root tsconfig peaked at ~4 GB and ran the
+        // CI runner's 2 GB default Node heap out of memory. Keep
+        // tsconfig.lint.json's `include` in step with the globs above
+        // (lint-async-config.test.ts pins it).
+        project: "./tsconfig.lint.json",
         tsconfigRootDir: import.meta.dirname,
       },
     },
@@ -143,7 +148,7 @@ export default [
     // (bare, `void`, an assignment, `cond && …`, a `forEach` body, the computed
     // `["rejects"]` form). This block must stay AFTER the source block (flat config is
     // last-wins for `await-thenable`); lint-async-config.test.ts pins the order.
-    files: ["src/**/*.test.ts", "src/**/*.test.tsx"],
+    files: ["src/**/*.test.ts", "src/**/*.test.tsx", "packages/remote-protocol/src/**/*.test.ts"],
     plugins: { local: localPlugin },
     rules: {
       "@typescript-eslint/await-thenable": "off",

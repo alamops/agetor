@@ -92,3 +92,11 @@ describe("removal kind sets (D6b)", () => {
     for (const k of UNBLOCKED_REMOVAL_KINDS) expect(notificationUrgency(k)).toBe("needs-you");
   });
 });
+
+describe("remoteDeviceNotificationId", () => {
+  test("a device has one stable id of its own, distinct from any task's", async () => {
+    const { remoteDeviceNotificationId, taskNotificationId } = await import("./os-notification.ts");
+    expect(remoteDeviceNotificationId("d1")).toBe("agetor.device.d1");
+    expect(remoteDeviceNotificationId("d1")).not.toBe(taskNotificationId("d1"));
+  });
+});

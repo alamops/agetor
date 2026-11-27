@@ -1,0 +1,59 @@
+{
+  "$schema": "http://json-schema.org/draft-07/schema#",
+  "type": "object",
+  "properties": {
+    "runId": {
+      "type": "string"
+    },
+    "taskId": {
+      "type": "string"
+    },
+    "stream": {
+      "$ref": "#/definitions/RunEventStream"
+    },
+    "data": {
+      "type": "string"
+    },
+    "ts": {
+      "type": "number"
+    },
+    "subagentId": {
+      "type": [
+        "string",
+        "null"
+      ]
+    },
+    "id": {
+      "type": "number"
+    }
+  },
+  "required": [
+    "runId",
+    "taskId",
+    "stream",
+    "data",
+    "ts"
+  ],
+  "additionalProperties": false,
+  "definitions": {
+    "RunEventStream": {
+      "type": "string",
+      "enum": [
+        "stdout",
+        "stderr",
+        "status",
+        "interaction",
+        "interaction_resolved",
+        "user",
+        "assistant",
+        "thinking",
+        "tool_use",
+        "tool_result",
+        "subagent",
+        "compaction_summary"
+      ]
+    }
+  },
+  "$id": "https://agetor.dev/schemas/remote/routes/RunEvent.json",
+  "title": "RunEvent"
+}

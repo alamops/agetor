@@ -1,0 +1,105 @@
+{
+  "version": 1,
+  "formId": "remote-readiness-grill-r2",
+  "title": "Grill — Remote Readiness, round 2 (follow-ups)",
+  "round": 2,
+  "mode": "served",
+  "specFile": "questions.json",
+  "specSha256": "b5bc3b7c803ec05d6a20f24335c9193f11716967a61eb85f665eea7e91b2a1bd",
+  "submittedAt": "2026-11-25T20:41:41.860Z",
+  "receivedAt": "2026-11-25T20:41:41.906Z",
+  "answeredBy": null,
+  "summary": {
+    "total": 7,
+    "answered": 7,
+    "skipped": 0,
+    "unanswered": 0,
+    "optionalLeftBlank": 0,
+    "notApplicable": 0,
+    "acceptedRecommendations": 4,
+    "overrodeRecommendations": [
+      "preview-size",
+      "tmux-stream",
+      "macos27-host"
+    ],
+    "oneWayDoorsNotAnswered": [],
+    "withNotes": [],
+    "needsAnswer": [],
+    "complete": true
+  },
+  "answers": {
+    "device-level": {
+      "n": 1,
+      "title": "v1 now includes `operate` actions. Which level does a paired device get, and how?",
+      "type": "single",
+      "status": "answered",
+      "oneWayDoor": true,
+      "impact": "blocking",
+      "value": "choose-at-pair",
+      "display": "Chosen per device in the native pairing window",
+      "acceptedRecommendation": true
+    },
+    "preview-size": {
+      "n": 2,
+      "title": "You wrote 'the same as in the mac' for phone previews. Which parts carry over?",
+      "type": "single",
+      "status": "answered",
+      "oneWayDoor": true,
+      "impact": "shape",
+      "value": "50mb-anywhere",
+      "display": "Exactly as on the Mac: 50 MB, any path",
+      "acceptedRecommendation": false,
+      "recommended": "50mb-pathcheck"
+    },
+    "tmux-stream": {
+      "n": 3,
+      "title": "Your note: 'stream tmux so the user can control it from their phone, like Attach'. Is that in this change?",
+      "type": "single",
+      "status": "answered",
+      "oneWayDoor": true,
+      "impact": "blocking",
+      "value": "full-in",
+      "display": "In this change, full control at `configure` level",
+      "acceptedRecommendation": false,
+      "recommended": "deferred"
+    },
+    "macos27-host": {
+      "n": 4,
+      "title": "Where will K1 run on macOS 27? (a machine, a VM, a borrowed Mac)",
+      "type": "text",
+      "status": "answered",
+      "impact": "shape",
+      "value": "why do we need a macos? I have my mac, it's just for signing right?",
+      "acceptedRecommendation": false,
+      "recommended": "A physical Mac on macOS 27"
+    },
+    "wildcard-detail": {
+      "n": 5,
+      "title": "Wildcard bind with remote access: what the warning looks like",
+      "type": "confirm",
+      "status": "answered",
+      "impact": "minor",
+      "value": "The gateway runs. GET /remote-access, `agetor remote status` and core.log show 'API is also reachable beyond loopback over plain HTTP'. Invariant 5 in the spec and security.md is amended to 'loopback, or a wildcard bind with that warning'.",
+      "acceptedRecommendation": true
+    },
+    "auto-mode-guard": {
+      "n": 6,
+      "title": "'Yes, and use auto mode' from the phone counts as an operate action, with the unlock window",
+      "type": "confirm",
+      "status": "answered",
+      "impact": "minor",
+      "value": "Row 1 needs an `operate` device, a signature bound to the plan hash, and the unlock window (the same gate content gets on a task that runs without asking). Row 2 is respond and signed; row 3 is content.",
+      "acceptedRecommendation": true
+    },
+    "plan-edit-scope": {
+      "n": 7,
+      "title": "Mac side only for the plan-edit route",
+      "type": "confirm",
+      "status": "answered",
+      "impact": "minor",
+      "value": "This change adds its remote policy entry, content-level signing over the edited plan body, the router mapping, and coverage in the headless test client. The phone's plan editor belongs to the iOS app spec.",
+      "acceptedRecommendation": true
+    }
+  },
+  "generalNotes": null
+}

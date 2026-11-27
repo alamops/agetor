@@ -23,6 +23,7 @@ import { buildTaskDeepLink } from "./deep-link.ts";
 import { launchedBy } from "./daemon-mode.ts";
 import {
   notificationUrgency,
+  remoteDeviceNotificationId,
   soundOverUrgencies,
   taskNotificationId,
   type DeliveredUrgency,
@@ -186,6 +187,28 @@ export function buildTaskNotifierPostArgs(n: {
     kind: n.kind,
     urgency,
     soundOver: soundOverUrgencies(urgency),
+  });
+}
+
+/**
+ * Every delivered urgency: a device alert plays its sound over whatever entry the device still has on screen. Each one is
+ * a security event (a phone paired or revoked, an approval sent from it), so a revoke that replaces an unread "paired"
+ * banner must not arrive silently (N2).
+ */
+const DEVICE_SOUND_OVER: readonly DeliveredUrgency[] = ["needs-you", "quiet", "unknown"];
+
+/**
+ * The post argv for a device notification (paired, revoked, a session ended): one fixed id per device, so a newer one
+ * replaces the device's entry. No deep link (nothing to open) and no kind; urgency `needs-you` and every urgency in
+ * `--sound-over`, so the replacement still plays its sound. The helper takes any `--id`.
+ */
+export function buildDeviceNotifierPostArgs(n: { title: string; body?: string; deviceId: string }): string[] {
+  return buildNotifierArgs({
+    title: n.title,
+    body: n.body,
+    id: remoteDeviceNotificationId(n.deviceId),
+    urgency: "needs-you",
+    soundOver: DEVICE_SOUND_OVER,
   });
 }
 

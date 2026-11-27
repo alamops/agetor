@@ -1,0 +1,25 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://agetor.dev/schemas/remote/messages/unlock-ok.json",
+  "title": "unlock-ok",
+  "x-direction": "core",
+  "type": "object",
+  "properties": {
+    "id": {
+      "type": "string",
+      "maxLength": 64,
+      "minLength": 1,
+      "pattern": "^[A-Za-z0-9._:~-]+$"
+    },
+    "expiresAt": {
+      "type": "integer",
+      "minimum": 0,
+      "maximum": 253402300799999
+    }
+  },
+  "required": [
+    "id",
+    "expiresAt"
+  ],
+  "additionalProperties": false
+}

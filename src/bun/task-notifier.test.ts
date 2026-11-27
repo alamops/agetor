@@ -116,6 +116,84 @@ describe("posting", () => {
   });
 });
 
+describe("device notifications", () => {
+  test("posts under the device's fixed id with no url or kind, and plays its sound over any entry the device still shows (N2)", async () => {
+    const h = makeHarness();
+    h.notifier.postDevice({ deviceId: "d1", title: "Ana's iPhone was paired", body: "Paired" });
+    await tick();
+    expect(h.spawns).toHaveLength(1);
+    const argv = h.spawns[0]!.argv;
+    expect(flag(argv, "--id")).toBe("agetor.device.d1");
+    expect(flag(argv, "--title")).toBe("Ana's iPhone was paired");
+    expect(flag(argv, "--message")).toBe("Paired");
+    expect(argv).not.toContain("--url");
+    expect(argv).not.toContain("--kind");
+    // A revoke that replaces an unread "paired" banner must still sound: every delivered urgency is listed.
+    expect(flag(argv, "--urgency")).toBe("needs-you");
+    expect(argv.filter((_, i) => argv[i - 1] === "--sound-over").sort()).toEqual(["needs-you", "quiet", "unknown"]);
+    h.spawns[0]!.settle(0);
+    await h.notifier.whenIdle();
+    expect(h.plains).toEqual([]);
+  });
+
+  test("a device's posts run one at a time; two devices run concurrently", async () => {
+    const h = makeHarness();
+    h.notifier.postDevice({ deviceId: "d1", title: "first" });
+    h.notifier.postDevice({ deviceId: "d1", title: "second" });
+    h.notifier.postDevice({ deviceId: "d2", title: "other" });
+    await tick();
+    expect(h.spawns.map((s) => flag(s.argv, "--title"))).toEqual(["first", "other"]);
+    h.spawns[0]!.settle(0);
+    await tick();
+    expect(h.spawns.map((s) => flag(s.argv, "--title"))).toEqual(["first", "other", "second"]);
+    h.spawns.forEach((x) => x.settle(0));
+    await h.notifier.whenIdle();
+  });
+
+  test("a device post never shares a queue with a task of the same id", async () => {
+    const h = makeHarness();
+    h.notifier.postDevice({ deviceId: "x", title: "device" });
+    h.notifier.post({ title: "task", taskId: "x" });
+    await tick();
+    expect(h.spawns.map((s) => flag(s.argv, "--id"))).toEqual(["agetor.device.x", "agetor.task.x"]);
+    h.spawns.forEach((x) => x.settle(0));
+    await h.notifier.whenIdle();
+  });
+
+  test("no helper → plain with title and body, no spawn", () => {
+    const h = makeHarness({ bin: null });
+    h.notifier.postDevice({ deviceId: "d1", title: "Revoked", body: "Ana's iPhone" });
+    expect(h.plains).toEqual([{ title: "Revoked", body: "Ana's iPhone" }]);
+    expect(h.spawns).toHaveLength(0);
+  });
+
+  test("exit 1 and a rejected exit → plain once each; exit 2 → none", async () => {
+    const h = makeHarness();
+    h.notifier.postDevice({ deviceId: "d1", title: "one" });
+    await tick();
+    h.spawns[0]!.settle(1);
+    await h.notifier.whenIdle();
+    h.notifier.postDevice({ deviceId: "d1", title: "two" });
+    await tick();
+    h.spawns[1]!.reject(new Error("boom"));
+    await h.notifier.whenIdle();
+    h.notifier.postDevice({ deviceId: "d1", title: "three" });
+    await tick();
+    h.spawns[2]!.settle(2);
+    await h.notifier.whenIdle();
+    expect(h.plains.map((p) => p.title)).toEqual(["one", "two"]);
+  });
+
+  test("an unacked exit 0 probes --list once, like a task post", async () => {
+    const h = makeHarness({ unackedSpawns: 1 });
+    h.notifier.postDevice({ deviceId: "d1", title: "T" });
+    await tick();
+    h.spawns[0]!.settle(0);
+    await h.notifier.whenIdle();
+    expect(h.lists()).toBe(1);
+  });
+});
+
 describe("fallbacks", () => {
   test("no taskId → plain immediately, no spawn", () => {
     const h = makeHarness();

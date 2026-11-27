@@ -44,6 +44,7 @@ import { childEnv } from "./core-spawn.ts";
 import { buildTaskDeepLink, parseTaskDeepLink } from "./deep-link.ts";
 import {
   buildNotifierListArgs,
+  buildDeviceNotifierPostArgs,
   buildNotifierRemoveArgs,
   buildTaskNotifierPostArgs,
   notifierListAcked,
@@ -52,6 +53,7 @@ import {
   resolveNotifier,
 } from "./notifier.ts";
 import {
+  remoteDeviceNotificationId,
   taskNotificationId,
   type NotificationKind,
   type TaskNotificationRemoval,
@@ -65,6 +67,13 @@ export interface TaskNotification {
   silent?: boolean;
   taskId?: string;
   kind?: NotificationKind;
+}
+
+/** A notification about a paired device (paired, revoked, a session ended); posted under the device's own id. */
+export interface DeviceNotification {
+  deviceId: string;
+  title: string;
+  body?: string;
 }
 
 type SpawnFn = (
@@ -84,6 +93,11 @@ export interface TaskNotifierDeps {
 
 export interface TaskNotifier {
   post(n: TaskNotification): void;
+  /**
+   * Posts a device notification under `remoteDeviceNotificationId(deviceId)`, serialized per device like a task's. With
+   * no helper, or a helper that fails (not a permission denial), it goes to `plain`, when there is one.
+   */
+  postDevice(n: DeviceNotification): void;
   remove(r: TaskNotificationRemoval): void;
   /** Seeds the may-be-delivered set from the helper's `--list`. Idempotent. */
   seed(): Promise<void>;
@@ -93,6 +107,7 @@ export interface TaskNotifier {
 
 type Op =
   | { type: "post"; bin: string; n: TaskNotification & { taskId: string } }
+  | { type: "device"; bin: string; n: DeviceNotification }
   | { type: "remove"; bin: string; r: TaskNotificationRemoval; postGen: number };
 
 interface TaskQueue {
@@ -200,7 +215,32 @@ export function createTaskNotifier(deps: TaskNotifierDeps): TaskNotifier {
     }
   };
 
+  const runDevice = async (op: Extract<Op, { type: "device" }>): Promise<void> => {
+    const fallback = () => plain({ title: op.n.title, body: op.n.body });
+    let result: { code: number; stdout: string };
+    try {
+      result = await runHelper([op.bin, ...buildDeviceNotifierPostArgs(op.n)]);
+    } catch (err) {
+      log("notifier helper failed, falling back to plain notification:", err);
+      fallback();
+      return;
+    }
+    if (result.code === 0) {
+      if (!notifierPostAcked(result.stdout, remoteDeviceNotificationId(op.n.deviceId))) {
+        await probeOutdated(op.bin, "--id");
+      }
+      return;
+    }
+    if (result.code === 2) {
+      log("notifier helper: notification permission not granted; skipping fallback");
+      return;
+    }
+    log(`notifier helper exited ${result.code}, falling back to plain notification`);
+    fallback();
+  };
+
   const run = async (taskId: string, op: Op): Promise<void> => {
+    if (op.type === "device") return runDevice(op);
     if (op.type === "post") {
       let result: { code: number; stdout: string };
       try {
@@ -275,6 +315,16 @@ export function createTaskNotifier(deps: TaskNotifierDeps): TaskNotifier {
     enqueue(taskId, { type: "post", bin, n: { ...n, taskId } });
   };
 
+  const postDevice = (n: DeviceNotification) => {
+    const bin = resolveBin();
+    if (!bin) {
+      plain({ title: n.title, body: n.body });
+      return;
+    }
+    // Its own queue key: a device id never collides with a task id, and its posts keep their order.
+    enqueue(remoteDeviceNotificationId(n.deviceId), { type: "device", bin, n });
+  };
+
   const remove = (r: TaskNotificationRemoval) => {
     const bin = resolveBin();
     if (!bin || helperOutdated) return;
@@ -315,6 +365,7 @@ export function createTaskNotifier(deps: TaskNotifierDeps): TaskNotifier {
 
   return {
     post,
+    postDevice,
     remove,
     seed: () => (seedPromise ??= runSeed()),
     whenIdle: () =>

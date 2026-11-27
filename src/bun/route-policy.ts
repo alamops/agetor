@@ -1,5 +1,7 @@
 import { timingSafeEqual } from "node:crypto";
+import { levelAtLeast, levelRank, type RemoteLevel } from "@agetor/remote-protocol/levels";
 import { API_TOKEN, CLI_TOKEN } from "./api-config.ts";
+import type { DevicePrincipal } from "./remote/types.ts";
 
 /**
  * Who may call which HTTP route, and the walker that enforces it
@@ -28,10 +30,23 @@ import { API_TOKEN, CLI_TOKEN } from "./api-config.ts";
  * device's permissions — those are native-only (docs/plans/
  * companion-pairing-requirements.md); `route-policy.test.ts` fails on route
  * names that look like it.
+ *
+ * Remote levels (docs/specs/remote-readiness-spec.md "Remote router and route
+ * policy", docs/architecture/security.md "Remote levels and the device caller"):
+ * a route's `remote` field is `"none"` (never reachable from a phone) or a
+ * `RemotePolicy` (a level, a step-up, a rate class, the protocol version that
+ * opened it). A phone reaches a handler only through `remote/router.ts`, which
+ * builds a request, marks it with `markDeviceRequest` (module-private mark,
+ * importable only by the router, pinned by a test) and calls the very wrapped
+ * handler Bun serves. `wrapHandler` then runs the DEVICE branch: no remote
+ * policy, an `app` or `public` route, or a level above the device's → 403; a
+ * `pathParams` route → the same path gate the CLI token passes; else the
+ * handler runs with `callerOf(req) === "device"`. No header, query string or
+ * token ever yields `device` (invariant 7).
  */
 
 /** The identity behind a request, as decided by `resolveCaller`. */
-export type ApiCaller = "app" | "cli";
+export type ApiCaller = "app" | "cli" | "device";
 
 /** Methods a `Bun.serve` route object can key on. */
 export type HttpMethod = "GET" | "POST" | "PUT" | "PATCH" | "DELETE" | "HEAD" | "OPTIONS";
@@ -56,6 +71,21 @@ export interface PathParam {
   itemField?: string;
 }
 
+/** How hard a remote route is limited (docs/specs/remote-readiness-spec.md "Rate limits"). `stop` is never limited. */
+export type RemoteRate = "normal" | "heavy" | "stop";
+/** The proof a remote call needs beyond the session: nothing, the unlock window (only while the task runs without asking), or a signed decision. */
+export type RemoteStepUp = "none" | "unlock" | "signed";
+
+export interface RemotePolicy {
+  /** The lowest device level that may call the route. A class rule (remote/route-classes.ts) may raise it for a call, never lower it. */
+  level: RemoteLevel;
+  /** The step-up for the route's content, consent and action calls. The router relaxes it only to `none` for a call classified as removal. */
+  stepUp: RemoteStepUp;
+  rate: RemoteRate;
+  /** The protocol version that opened the route to phones. */
+  since: 1;
+}
+
 export interface RoutePolicy {
   /**
    * `public`: no token needed. `app`: desktop-only — the master token only, the
@@ -63,8 +93,11 @@ export interface RoutePolicy {
    * every non-public route.)
    */
   callers: "public" | "app" | "app+cli";
-  /** Companion remote levels are added later; today nothing is reachable remotely. */
-  remote: "none";
+  /**
+   * Whether a phone may call this route, and at what level: `"none"` (never), or a {@link RemotePolicy}. Only `app+cli`
+   * routes may carry one; startup refuses it on an `app` or `public` route.
+   */
+  remote: "none" | RemotePolicy;
   /**
    * Desktop-only routes whose handler answers 501 first when the core runs
    * headless (no `native`): the CLI token keeps getting that 501 instead of a
@@ -113,6 +146,10 @@ function app(extra: Pick<RoutePolicy, "headless501" | "conditional">): RoutePoli
 }
 function cli(extra: Pick<RoutePolicy, "pathParams" | "pathParamsExempt">): RoutePolicy {
   return { ...CLI, ...extra };
+}
+/** Either token, and a phone at `level` or above (protocol version 1). */
+function remote(level: RemoteLevel, stepUp: RemoteStepUp = "none", rate: RemoteRate = "normal", extra: Partial<RoutePolicy> = {}): RoutePolicy {
+  return { ...CLI, ...extra, remote: { level, stepUp, rate, since: 1 } };
 }
 
 const QUERY_PATH: readonly PathParam[] = [{ in: "query", name: "path", mode: "exists" }];
@@ -334,7 +371,7 @@ export const ROUTE_POLICY: Record<string, PolicyEntry> = {
   "/harness-stacks/mirror-preview": { POST: CLI },
   "/harnesses/:id/limit-state": { DELETE: CLI },
   "/harnesses/:id/mirror-restore": { POST: CLI },
-  "/tasks/:id/switch-account": { POST: CLI, DELETE: CLI },
+  "/tasks/:id/switch-account": { POST: remote("operate"), DELETE: CLI },
   "/harnesses/:id": {
     GET: CLI,
     PATCH: cli({ pathParams: BODY_HOME_BIN }),
@@ -391,11 +428,11 @@ export const ROUTE_POLICY: Record<string, PolicyEntry> = {
 
   // Tasks, runs and worktrees.
   "/tasks": {
-    GET: CLI,
+    GET: remote("observe"),
     POST: cli({ pathParams: [...BODY_WORKDIR, ...BODY_REPOSITORY_PATHS] }),
   },
   "/tasks/:id": {
-    GET: CLI,
+    GET: remote("observe"),
     PATCH: cli({ pathParams: BODY_WORKDIR }),
     DELETE: CLI,
   },
@@ -413,23 +450,23 @@ export const ROUTE_POLICY: Record<string, PolicyEntry> = {
   "/tasks/:id/unarchive": { POST: CLI },
   // `:name` is a repository's workspace name, never a path: no pathParams.
   "/tasks/:id/repositories/:name": { DELETE: CLI },
-  "/tasks/:id/pipeline": { GET: CLI },
+  "/tasks/:id/pipeline": { GET: remote("observe") },
   "/tasks/:id/pipeline/advance": { POST: CLI },
-  "/tasks/:id/pipeline/review": { POST: CLI },
+  "/tasks/:id/pipeline/review": { POST: remote("respond", "signed") },
   "/tasks/:id/pipeline/retry": { POST: CLI },
-  "/tasks/:id/pipeline/cancel": { POST: CLI },
+  "/tasks/:id/pipeline/cancel": { POST: remote("respond", "none", "stop") },
   "/tasks/:id/pipeline/restart": { POST: CLI },
   "/worktrees": { GET: CLI },
   "/worktrees/:id": { DELETE: CLI },
   "/worktrees/:id/git-status": { GET: CLI },
-  "/tasks/:id/runs": { GET: CLI },
-  "/tasks/:id/subagents": { GET: CLI },
+  "/tasks/:id/runs": { GET: remote("observe") },
+  "/tasks/:id/subagents": { GET: remote("observe") },
   "/tasks/:id/diff": { GET: CLI },
   "/tasks/:id/diff/blob": { GET: APP },
   "/tasks/:id/open-tmux": { POST: APP },
-  "/tasks/:id/git-status": { GET: CLI },
+  "/tasks/:id/git-status": { GET: remote("observe", "none", "heavy") },
   "/tasks/:id/teardown-preview": { GET: CLI },
-  "/runs/:id/cancel": { POST: CLI },
+  "/runs/:id/cancel": { POST: remote("respond", "none", "stop") },
 
   // Native file/URL helpers and attachments: desktop-only, except `/refs/resolve` and
   // `/files/index`, which the CLI uses.
@@ -443,34 +480,40 @@ export const ROUTE_POLICY: Record<string, PolicyEntry> = {
   "/screenshots": { POST: APP },
   "/attachments": { POST: APP },
   "/files/preview": { GET: APP },
+  // A phone's (and the CLI's) image preview scoped to a task: observe inside the task's folders, operate anywhere else (D15, the router's
+  // class rule), through the no-follow reader. The path goes through the same gate the CLI token passes.
+  "/tasks/:id/files/preview": { GET: remote("observe", "none", "heavy", { pathParams: QUERY_PATH }) },
 
   // Interaction answers, backlog, plans, drafts and run input.
-  "/ask-questions/:id/answer": { POST: CLI },
-  "/tmux-prompts/:id/answer": { POST: CLI },
-  "/fx-permissions/:id/answer": { POST: CLI },
-  "/tasks/:id/interactions/pending": { GET: CLI },
+  "/ask-questions/:id/answer": { POST: remote("respond", "unlock") },
+  "/tmux-prompts/:id/answer": { POST: remote("respond", "signed") },
+  "/fx-permissions/:id/answer": { POST: remote("respond", "signed") },
+  "/tasks/:id/interactions/pending": { GET: remote("observe") },
+  "/interactions/pending": { GET: remote("observe") },
+  "/app/presence": { PUT: APP },
   "/tasks/:id/backlog": {
-    POST: CLI,
-    PUT: CLI,
+    POST: remote("respond", "unlock"),
+    PUT: remote("respond", "unlock"),
   },
   "/tasks/:id/backlog/:itemId": {
-    PATCH: CLI,
-    DELETE: CLI,
+    PATCH: remote("respond", "unlock"),
+    // Deleting a draft only removes: no unlock needed.
+    DELETE: remote("respond"),
   },
   "/tasks/:id/agent-profile": { DELETE: CLI },
   "/tasks/:id/seen": {
-    POST: CLI,
-    DELETE: CLI,
+    POST: remote("respond"),
+    DELETE: remote("respond"),
   },
-  "/tasks/:id/plans/:planId": { PATCH: CLI },
-  "/tasks/:id/plans/:planId/approve": { POST: CLI },
-  "/tasks/:id/fx-resume": { POST: CLI },
+  "/tasks/:id/plans/:planId": { PATCH: remote("respond", "signed") },
+  "/tasks/:id/plans/:planId/approve": { POST: remote("respond", "signed") },
+  "/tasks/:id/fx-resume": { POST: remote("respond", "signed") },
   "/tasks/:id/fx-auto-resume": { DELETE: CLI },
   "/tasks/:id/draft": {
     PUT: CLI,
     DELETE: CLI,
   },
-  "/runs/:id/input": { POST: CLI },
+  "/runs/:id/input": { POST: remote("respond", "unlock") },
   "/runs/:id/rebuild-events": { GET: CLI },
 
   // Event streams: function-valued routes, so one flat policy covers every method.
@@ -481,7 +524,6 @@ export const ROUTE_POLICY: Record<string, PolicyEntry> = {
   // Notifications, app lifecycle, daemon control and terminals. The terminal WebSocket
   // upgrade is NOT here (it lives in `fetch()`, P11); `ws-ticket` mints its ticket.
   "/notifications": { POST: CLI },
-  "/notifications/:taskId": { DELETE: app({ headless501: true }) },
   "/app/events": SSE_LEGACY,
   "/app/force-quit": { POST: app({ headless501: true }) },
   "/daemon/shutdown": { POST: CLI },
@@ -496,15 +538,23 @@ export const ROUTE_POLICY: Record<string, PolicyEntry> = {
   "/background": { GET: CLI, POST: app({ headless501: true }), DELETE: CLI },
   "/background/start": { POST: CLI },
   "/background/open-settings": { POST: app({ headless501: true }) },
+  // Read the switch and the gateway's state, turn the switch OFF, list or revoke devices, read the audit log. Never on, never pair, never a
+  // level change: only GET (read) and DELETE (revoke, off) exist under /remote-access (route-policy.test.ts TT3(c)).
   "/remote-access": { GET: CLI, DELETE: CLI },
+  "/remote-access/devices": { GET: CLI, DELETE: CLI },
+  "/remote-access/devices/:id": { DELETE: CLI },
+  "/remote-access/log": { GET: CLI },
+  // The Mac's Detach button for a phone's terminal.
+  "/tasks/:id/phone-terminal": { DELETE: CLI },
   "/tasks/:id/terminals": {
     GET: APP,
     POST: APP,
   },
   "/terminals/:id": { DELETE: APP },
   "/terminals/:id/ws-ticket": { POST: APP },
-  "/tasks/:id/events/page": { GET: CLI },
-  "/tasks/:id/messages/history": { GET: CLI },
+  "/tasks/:id/events/page": { GET: remote("observe", "none", "heavy") },
+  "/tasks/:id/events/:eventId": { GET: remote("observe", "none", "heavy") },
+  "/tasks/:id/messages/history": { GET: remote("observe") },
   "/tasks/:id/events": SSE_LEGACY,
 };
 
@@ -544,6 +594,23 @@ export function resolveCaller(req: Request, policy: RoutePolicy): ApiCaller | nu
 }
 
 const callers = new WeakMap<Request, ApiCaller>();
+
+/**
+ * Device marks (invariant 7). The ONLY way a request becomes a `device` request: `markDeviceRequest`, called by
+ * `remote/router.ts` after a session authenticated the phone. Module-private WeakMap, so no header, query string, token or
+ * clone can produce one (`req.clone()` drops the mark). `route-policy-remote.test.ts` scans `src/` and fails if any file
+ * other than the router (and that test) imports `markDeviceRequest`.
+ */
+const devices = new WeakMap<Request, DevicePrincipal>();
+
+export function markDeviceRequest(req: Request, principal: DevicePrincipal): void {
+  devices.set(req, principal);
+}
+
+/** The device principal a request was marked with, or `null` (every ordinary request). */
+export function deviceOf(req: Request): DevicePrincipal | null {
+  return devices.get(req) ?? null;
+}
 
 /**
  * The caller `applyRoutePolicy` authorized for this request, or `null` when the
@@ -764,6 +831,37 @@ function wrapHandler(
         ? new Response(null, { headers: opts.cors(req) })
         : runHandler(handler, req, rest, opts);
     }
+    // A request the remote router marked: a phone's call, authenticated by a Noise session (invariant 7). It never carries
+    // a token, so `resolveCaller` is not consulted. The order is the contract (docs/plans/remote-readiness.md §3.3).
+    const device = deviceOf(req);
+    if (device) {
+      // 1 and 2: only an `app+cli` route with a remote policy is reachable; `app`, `public` and `remote: "none"` are never.
+      if (policy.callers !== "app+cli" || policy.remote === "none") {
+        return jsonResponse({ error: "not available from a phone", code: "not-remote" }, 403, opts.cors(req));
+      }
+      // 3: the level ceiling.
+      if (!levelAtLeast(device.level, policy.remote.level)) {
+        return jsonResponse(
+          { error: "this device's level is too low for this route", code: "level", required: policy.remote.level, level: device.level },
+          403,
+          opts.cors(req),
+        );
+      }
+      // 4: the same path gate the CLI token passes.
+      if (policy.pathParams?.length) {
+        let refused: Response | null;
+        try {
+          refused = await gatePaths(req, "device", policy.pathParams, opts);
+        } catch {
+          return jsonResponse({ error: "path check failed", code: "path-check-failed" }, 500, opts.cors(req));
+        }
+        if (refused) return refused;
+      }
+      // 5: the handler, with the caller readable through `callerOf(req)`.
+      callers.set(req, "device");
+      return runHandler(handler, req, rest, opts);
+    }
+
     if (policy.callers === "public") return runHandler(handler, req, rest, opts);
 
     const caller = resolveCaller(req, policy);
@@ -845,6 +943,19 @@ export function applyRoutePolicy<T>(routes: T, opts: RoutePolicyOptions): T {
     if (entries.every((e) => e?.conditional)) continue;
     problems.push(`policy entry ${key} has no route`);
   }
+  for (const [key, entry] of Object.entries(table)) {
+    const each: Array<[string, RoutePolicy | undefined]> = isRoutePolicy(entry)
+      ? [["", entry]]
+      : (Object.entries(entry) as Array<[string, RoutePolicy | undefined]>);
+    for (const [method, p] of each) {
+      if (p && p.remote !== "none") {
+        const label = `${method ? `${method} ` : ""}${key}`;
+        if (p.callers !== "app+cli") problems.push(`${label} has a remote policy but is not an app+cli route`);
+        const problem = remotePolicyProblem(p.remote);
+        if (problem) problems.push(`${label}: ${problem}`);
+      }
+    }
+  }
   if (problems.length) {
     throw new Error(`route policy does not match the routes:\n  - ${problems.join("\n  - ")}`);
   }
@@ -868,4 +979,68 @@ export function applyRoutePolicy<T>(routes: T, opts: RoutePolicyOptions): T {
     }
   }
   return wrapped as T;
+}
+
+// ── remote policies ─────────────────────────────────────────────────────────
+
+const REMOTE_STEP_UPS: ReadonlySet<string> = new Set<RemoteStepUp>(["none", "unlock", "signed"]);
+const REMOTE_RATES: ReadonlySet<string> = new Set<RemoteRate>(["normal", "heavy", "stop"]);
+
+/** What is wrong with a remote policy, or null: a missing or unknown level, step-up, rate, or the `since` version. */
+export function remotePolicyProblem(r: unknown): string | null {
+  if (typeof r !== "object" || r === null) return "remote must be \"none\" or a policy object";
+  const p = r as Record<string, unknown>;
+  if (typeof p.level !== "string" || levelRank(p.level as RemoteLevel) < 0) return "remote.level is missing or unknown";
+  if (typeof p.stepUp !== "string" || !REMOTE_STEP_UPS.has(p.stepUp)) return "remote.stepUp is missing or unknown";
+  if (typeof p.rate !== "string" || !REMOTE_RATES.has(p.rate)) return "remote.rate is missing or unknown";
+  if (p.since !== 1) return "remote.since must be 1";
+  return null;
+}
+
+/** The remote policy of one route and method in the real table, or `"none"` (also for an unknown route). */
+export function remotePolicyFor(method: HttpMethod, routeKey: string): RemotePolicy | "none" {
+  const entry = ROUTE_POLICY[routeKey];
+  if (!entry) return "none";
+  const policy = isRoutePolicy(entry) ? entry : entry[method];
+  return policy?.callers === "app+cli" ? policy.remote : "none";
+}
+
+/** Every route a device at `level` may call, in a stable order (route key, then method). */
+export function remoteRoutesFor(level: RemoteLevel): Array<{ method: HttpMethod; route: string; policy: RemotePolicy }> {
+  const out: Array<{ method: HttpMethod; route: string; policy: RemotePolicy }> = [];
+  for (const route of Object.keys(ROUTE_POLICY).sort()) {
+    const entry = ROUTE_POLICY[route]!;
+    const each: Array<[HttpMethod, RoutePolicy | undefined]> = isRoutePolicy(entry)
+      ? [["GET", entry]]
+      : (Object.entries(entry) as Array<[HttpMethod, RoutePolicy | undefined]>);
+    for (const [method, policy] of each.sort((a, b) => a[0].localeCompare(b[0]))) {
+      if (!policy || policy.callers !== "app+cli" || policy.remote === "none") continue;
+      if (levelAtLeast(level, policy.remote.level)) out.push({ method, route, policy: policy.remote });
+    }
+  }
+  return out;
+}
+
+/**
+ * EVERY route and method of the table, with its remote policy or `"none"`. The router matches a phone's path against all of them, not only
+ * the remote ones: a path that Bun.serve would hand to a route a phone may not call must answer `not-remote`, never fall through to a
+ * different remote route that merely matches the same path shape. A function-valued route answers every method; only its GET can be remote.
+ */
+export function everyRoute(): Array<{ method: HttpMethod; route: string; policy: RemotePolicy | "none" }> {
+  const out: Array<{ method: HttpMethod; route: string; policy: RemotePolicy | "none" }> = [];
+  for (const route of Object.keys(ROUTE_POLICY).sort()) {
+    const entry = ROUTE_POLICY[route]!;
+    const pick = (p: RoutePolicy | undefined): RemotePolicy | "none" => (p && p.callers === "app+cli" ? p.remote : "none");
+    if (isRoutePolicy(entry)) {
+      for (const method of ["GET", "POST", "PUT", "PATCH", "DELETE"] as const) out.push({ method, route, policy: method === "GET" ? pick(entry) : "none" });
+    } else {
+      for (const [method, policy] of Object.entries(entry) as Array<[HttpMethod, RoutePolicy | undefined]>) out.push({ method, route, policy: pick(policy) });
+    }
+  }
+  return out;
+}
+
+/** Every route with a remote policy at any level, with its method: the router matches against this to answer 403 `level` rather than 404. */
+export function allRemoteRoutes(): Array<{ method: HttpMethod; route: string; policy: RemotePolicy }> {
+  return remoteRoutesFor("configure");
 }

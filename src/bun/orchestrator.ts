@@ -14040,6 +14040,20 @@ function enqueueArchiveTeardown(
  * directory is truly gone before it refreshes the list, unlike the kanban
  * archive button, which stays fire-and-forget by leaving this unset.
  */
+/**
+ * A task that is archived or deleted loses its tmux session, so a phone attached to it is detached first (the client dies, the banner on
+ * the Mac clears, the detach is audited). Best effort: nothing here may stop an archive or a delete, and a core with no gateway has
+ * nothing to detach.
+ */
+async function detachPhoneTerminalOf(taskId: string, reason: string): Promise<void> {
+  try {
+    const { detachPhoneTerminal } = await import("./remote/remote-status.ts");
+    detachPhoneTerminal(taskId, reason);
+  } catch (err) {
+    console.warn(`[agetor] could not detach the phone terminal of task ${taskId}: ${err instanceof Error ? err.message : String(err)}`);
+  }
+}
+
 export async function archiveTask(
   taskId: string,
   opts?: { force?: boolean; stopRun?: boolean; forceWorktree?: boolean; awaitTeardown?: boolean; fromPipeline?: boolean },
@@ -14099,6 +14113,9 @@ export async function archiveTask(
   await stashSwapFollowUps(taskId);
   swapCancelRequested.delete(taskId);
   await clearFailoverState(taskId);
+  // Before the run is stopped: stopping it can end the tmux session, and the phone should hear why its terminal closed (task-archived),
+  // not just that the session exited.
+  await detachPhoneTerminalOf(taskId, "task-archived");
   if (task.runId && active.has(task.runId)) {
     await stopActiveHandle(active.get(task.runId)!, "task archived");
   } else if (opts?.stopRun && await backgroundAgentsHoldTask(taskId)) {
@@ -14780,6 +14797,8 @@ export async function deleteTask(taskId: string, opts?: { fromPipeline?: boolean
     // the same `pipelineRun` JSON blob.
     await withPipelineLock(taskId, () => cascadePipelineDelete(taskId));
   }
+  // Before the run is killed, so the phone hears why its terminal closed (task-deleted) rather than that the session exited.
+  await detachPhoneTerminalOf(taskId, "task-deleted");
   if (task.runId && active.has(task.runId)) active.get(task.runId)?.kill();
   // Resolve any pending interactions for this task so hook scripts / MCP
   // children blocked on agetor unblock immediately. Done before dropSession

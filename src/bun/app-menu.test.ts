@@ -3,8 +3,8 @@ import { APP_MENU_ACTIONS, type AppEvent, type AppMenuAction } from "../shared/t
 import { buildAppMenu, deliverMenuAction, menuActionFromClick, type DeliverMenuActionDeps, type MenuItem } from "./app-menu.ts";
 
 type Submenu = { label: string; submenu: MenuItem[] };
-function menu(label: string): MenuItem[] {
-  const top = buildAppMenu().find((m): m is Submenu => "label" in m && m.label === label && "submenu" in m);
+function menu(label: string, opts: { companion?: boolean } = { companion: false }): MenuItem[] {
+  const top = buildAppMenu(opts).find((m): m is Submenu => "label" in m && m.label === label && "submenu" in m);
   if (!top?.submenu) throw new Error(`no menu ${label}`);
   return top.submenu;
 }
@@ -33,6 +33,13 @@ describe("buildAppMenu", () => {
       "role:quit Cmd+Q",
       "Quit Agetor Completely[quit-completely] Cmd+Alt+Q",
     ]);
+  });
+
+  test("with the Companion compiled in, Pair a Phone… sits right under Remote Access…; without it, the item is absent", () => {
+    expect(summary(menu("Agetor", { companion: true })).slice(4, 7)).toEqual(["Remote Access…[remote-access]", "Pair a Phone…[pair-phone]", "-"]);
+    expect(summary(menu("Agetor", { companion: false })).some((s) => s.includes("pair-phone"))).toBe(false);
+    // the item is not a webview action: no webview target may be named by it
+    expect(menuActionFromClick("pair-phone")).toBeNull();
   });
 
   test("Edit and Window are unchanged", () => {

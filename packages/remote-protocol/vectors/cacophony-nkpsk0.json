@@ -1,0 +1,50 @@
+{
+  "source": "https://github.com/centromere/cacophony/blob/master/vectors/cacophony.txt",
+  "license": "Unlicense (public domain)",
+  "retrieved": "2026-11-25",
+  "note": "Ciphertexts and handshake hash. Messages alternate initiator, responder.",
+  "vectors": [
+    {
+      "protocol_name": "Noise_NKpsk0_25519_ChaChaPoly_SHA256",
+      "init_prologue": "4a6f686e2047616c74",
+      "init_psks": [
+        "54686973206973206d7920417573747269616e20706572737065637469766521"
+      ],
+      "init_ephemeral": "893e28b9dc6ca8d611ab664754b8ceb7bac5117349a4439a6b0569da977c464a",
+      "init_remote_static": "31e0303fd6418d2f8c0e78b91f22e8caed0fbe48656dcf4767e4834f701b8f62",
+      "resp_prologue": "4a6f686e2047616c74",
+      "resp_psks": [
+        "54686973206973206d7920417573747269616e20706572737065637469766521"
+      ],
+      "resp_static": "4a3acbfdb163dec651dfa3194dece676d437029c62a408b4c5ea9114246e4893",
+      "resp_ephemeral": "bbdb4cdbd309f1a1f2e1456967fe288cadd6f712d65dc7b7793d5e63da6b375b",
+      "handshake_hash": "1609ef057bdd62c752b5960546a255a78aebff08c5f07ef2adaa1db8350e7077",
+      "messages": [
+        {
+          "payload": "4c756477696720766f6e204d69736573",
+          "ciphertext": "ca35def5ae56cec33dc2036731ab14896bc4c75dbb07a61f879f8e3afa4c7944190fec41487219f2069c3ba7b7f9521437045935231f0ed399dfd4baf6bd825b"
+        },
+        {
+          "payload": "4d757272617920526f746862617264",
+          "ciphertext": "95ebc60d2b1fa672c1f46a8aa265ef51bfe38e7ccb39ec5be34069f14480884385010e0c56e886e6da0c69aee7388bcf4000cc357af5ebd11a46a169a3712c"
+        },
+        {
+          "payload": "462e20412e20486179656b",
+          "ciphertext": "4beed26535f1a387c950fab9a162dc613cc5bf84e8a62653130b83"
+        },
+        {
+          "payload": "4361726c204d656e676572",
+          "ciphertext": "ceaffe71ce7f1bf7b080736d62e0579ce5dc1530a36e7df795a4cc"
+        },
+        {
+          "payload": "4a65616e2d426170746973746520536179",
+          "ciphertext": "da927a272831394122d0f2fef3e16ddf0814c4878401135b44b1e23873b45b2929"
+        },
+        {
+          "payload": "457567656e2042f6686d20766f6e2042617765726b",
+          "ciphertext": "4fed2b394fb4dbdc9cf863bc99ebb3397651d27bdd32e40d8f7fed109e46445c0fd66fc3f3"
+        }
+      ]
+    }
+  ]
+}

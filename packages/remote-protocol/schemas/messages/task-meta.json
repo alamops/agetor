@@ -1,0 +1,60 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://agetor.dev/schemas/remote/messages/task-meta.json",
+  "title": "task-meta",
+  "x-direction": "core",
+  "type": "object",
+  "properties": {
+    "sub": {
+      "type": "string",
+      "maxLength": 64,
+      "minLength": 1,
+      "pattern": "^[A-Za-z0-9._:~-]+$"
+    },
+    "taskId": {
+      "type": "string",
+      "maxLength": 128,
+      "minLength": 1,
+      "pattern": "^[A-Za-z0-9._:~-]+$"
+    },
+    "meta": {
+      "type": "object",
+      "properties": {
+        "earliestId": {
+          "anyOf": [
+            {
+              "type": "integer",
+              "minimum": 0,
+              "maximum": 9007199254740991
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "hasMore": {
+          "type": "boolean"
+        },
+        "resumedAfter": {
+          "type": "integer",
+          "minimum": 0,
+          "maximum": 9007199254740991
+        },
+        "snapshotRequired": {
+          "const": true
+        }
+      },
+      "required": [
+        "earliestId",
+        "hasMore"
+      ],
+      "additionalProperties": false
+    }
+  },
+  "required": [
+    "sub",
+    "taskId",
+    "meta"
+  ],
+  "additionalProperties": false
+}

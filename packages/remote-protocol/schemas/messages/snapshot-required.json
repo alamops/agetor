@@ -1,0 +1,28 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://agetor.dev/schemas/remote/messages/snapshot-required.json",
+  "title": "snapshot-required",
+  "x-direction": "core",
+  "type": "object",
+  "properties": {
+    "sub": {
+      "type": "string",
+      "maxLength": 64,
+      "minLength": 1,
+      "pattern": "^[A-Za-z0-9._:~-]+$"
+    },
+    "reason": {
+      "type": "string",
+      "enum": [
+        "backpressure",
+        "gap",
+        "restart"
+      ]
+    }
+  },
+  "required": [
+    "sub",
+    "reason"
+  ],
+  "additionalProperties": false
+}

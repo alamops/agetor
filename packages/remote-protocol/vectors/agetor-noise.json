@@ -1,0 +1,159 @@
+{
+  "source": "Agetor: Noise_NK / Noise_NKpsk0 over 25519, ChaChaPoly, SHA256 with the protocol prologue (agetor-remote/1 || core id), plus rekey",
+  "license": "Same as this repository",
+  "retrieved": "2026-11-25",
+  "cases": [
+    {
+      "pattern": "NK",
+      "prologue": "616765746f722d72656d6f74652f31b0b02635e0d1267264a16ab3495e45ee85423322b358faaa6847903773123356",
+      "responderStaticSecret": "0b0e1114171a1d202326292c2f3235383b3e4144474a4d505356595c5f626568",
+      "initiatorEphemeral": "16191c1f2225282b2e3134373a3d404346494c4f5255585b5e6164676a6d7073",
+      "responderEphemeral": "2124272a2d303336393c3f4245484b4e5154575a5d606366696c6f7275787b7e",
+      "handshakeHash": "e31a3a00affc9f65919213cd4f4e4e446f44693f6e592b59cff0fb5574daf8c5",
+      "messages": [
+        {
+          "from": "initiator",
+          "payload": "70616972696e672072657175657374",
+          "ciphertext": "0df207815f496a5d7c53b7ff15eed8a3ccf76ba6af422bc54199299a554fdf2dc3c5a927d98ed5ae812c9ecbca966c38ada419f354332d438a1ac25287107e"
+        },
+        {
+          "from": "responder",
+          "payload": "70616972696e6720726573756c74",
+          "ciphertext": "830bb2fd9ec2d96dc43058f66743db613b59e347e4e747a42c0cbb34964f622763671881431883e394e7e4ff27e33d92a870e37fa02bffc70de711b0c4fd"
+        },
+        {
+          "from": "initiator",
+          "payload": "7472616e73706f72742030",
+          "ciphertext": "30c28a68a5be1e3802bb082a283557b2206ed4a6fa3850f4b17368"
+        },
+        {
+          "from": "responder",
+          "payload": "7472616e73706f72742031",
+          "ciphertext": "6edf0bf5b4a663ccd9b0833b396d30386b6a002d40da08ce16b045"
+        },
+        {
+          "from": "initiator",
+          "payload": "7472616e73706f72742032",
+          "ciphertext": "78bdb717a685734c8e250106eda33e33ed007b74dd996e91be88bf"
+        },
+        {
+          "from": "responder",
+          "payload": "7472616e73706f72742033",
+          "ciphertext": "928caf2ca73e82ca89e024f403b5f76174e3e5238f014f69018a1e"
+        },
+        {
+          "from": "initiator",
+          "payload": "7472616e73706f72742034",
+          "ciphertext": "5ff1b2076044bb05674a89d4b5521a210319c24009348a08df28cf"
+        },
+        {
+          "from": "responder",
+          "payload": "7472616e73706f72742035",
+          "ciphertext": "a45763ecd1da4b55f0622e2371d7cb7890e9c909955114bccdfb59"
+        }
+      ]
+    },
+    {
+      "pattern": "NKpsk0",
+      "prologue": "616765746f722d72656d6f74652f31b0b02635e0d1267264a16ab3495e45ee85423322b358faaa6847903773123356",
+      "psk": "2c2f3235383b3e4144474a4d505356595c5f6265686b6e7174777a7d80838689",
+      "responderStaticSecret": "0b0e1114171a1d202326292c2f3235383b3e4144474a4d505356595c5f626568",
+      "initiatorEphemeral": "16191c1f2225282b2e3134373a3d404346494c4f5255585b5e6164676a6d7073",
+      "responderEphemeral": "2124272a2d303336393c3f4245484b4e5154575a5d606366696c6f7275787b7e",
+      "handshakeHash": "885e5627d26f8d9cb40177e7f4229c0c0f974090de284f1d8b26d40c08c2cbdf",
+      "messages": [
+        {
+          "from": "initiator",
+          "payload": "70616972696e672072657175657374",
+          "ciphertext": "0df207815f496a5d7c53b7ff15eed8a3ccf76ba6af422bc54199299a554fdf2d7c62bc019cf8d8b14f315b6ee0f3898935e7ba2ccd01490eeb274908f4ec00"
+        },
+        {
+          "from": "responder",
+          "payload": "70616972696e6720726573756c74",
+          "ciphertext": "830bb2fd9ec2d96dc43058f66743db613b59e347e4e747a42c0cbb34964f6227ee63fa99c13d57f75b9425fced5d3cf3a7d0d43146b82da2a7ea815368d2"
+        },
+        {
+          "from": "initiator",
+          "payload": "7472616e73706f72742030",
+          "ciphertext": "651ea61a2af2ef2979a2869ba4b76e1141ce39cf9900878d3d66e8"
+        },
+        {
+          "from": "responder",
+          "payload": "7472616e73706f72742031",
+          "ciphertext": "d8114c9ab6789c6eb3a844efc7c2bf70f39e9bf88e655ebfed9b38"
+        },
+        {
+          "from": "initiator",
+          "payload": "7472616e73706f72742032",
+          "ciphertext": "e6dcde2a13abd4315850a6da914a1ed9c8142bdeb1af6b8f32dc88"
+        },
+        {
+          "from": "responder",
+          "payload": "7472616e73706f72742033",
+          "ciphertext": "68ad67a69109b6a81fc8710d7d3d80e5d8fd16d17299a3d197e67a"
+        },
+        {
+          "from": "initiator",
+          "payload": "7472616e73706f72742034",
+          "ciphertext": "a72035343b90ba1f9cd60a18c26db6ce56ed2a1344b7aa841b3a4e"
+        },
+        {
+          "from": "responder",
+          "payload": "7472616e73706f72742035",
+          "ciphertext": "c2cc89eca9e99713fdfb96130ad7d5f8dfe543882b2c01bf66b1f3"
+        }
+      ]
+    },
+    {
+      "pattern": "NK",
+      "prologue": "616765746f722d72656d6f74652f31b0b02635e0d1267264a16ab3495e45ee85423322b358faaa6847903773123356",
+      "responderStaticSecret": "0b0e1114171a1d202326292c2f3235383b3e4144474a4d505356595c5f626568",
+      "initiatorEphemeral": "16191c1f2225282b2e3134373a3d404346494c4f5255585b5e6164676a6d7073",
+      "responderEphemeral": "2124272a2d303336393c3f4245484b4e5154575a5d606366696c6f7275787b7e",
+      "handshakeHash": "e31a3a00affc9f65919213cd4f4e4e446f44693f6e592b59cff0fb5574daf8c5",
+      "messages": [
+        {
+          "from": "initiator",
+          "payload": "70616972696e672072657175657374",
+          "ciphertext": "0df207815f496a5d7c53b7ff15eed8a3ccf76ba6af422bc54199299a554fdf2dc3c5a927d98ed5ae812c9ecbca966c38ada419f354332d438a1ac25287107e"
+        },
+        {
+          "from": "responder",
+          "payload": "70616972696e6720726573756c74",
+          "ciphertext": "830bb2fd9ec2d96dc43058f66743db613b59e347e4e747a42c0cbb34964f622763671881431883e394e7e4ff27e33d92a870e37fa02bffc70de711b0c4fd"
+        },
+        {
+          "from": "initiator",
+          "payload": "7472616e73706f72742030",
+          "ciphertext": "30c28a68a5be1e3802bb082a283557b2206ed4a6fa3850f4b17368"
+        },
+        {
+          "from": "responder",
+          "payload": "7472616e73706f72742031",
+          "ciphertext": "6edf0bf5b4a663ccd9b0833b396d30386b6a002d40da08ce16b045"
+        },
+        {
+          "from": "initiator",
+          "payload": "7472616e73706f72742032",
+          "ciphertext": "080cfb56fd29f2e217eea52d441723f0f1bc9a25865159e1c95236"
+        },
+        {
+          "from": "responder",
+          "payload": "7472616e73706f72742033",
+          "ciphertext": "0304ed408c6026caf586a58ae3b7e527bc7e984bb1d46af94bb2f2"
+        },
+        {
+          "from": "initiator",
+          "payload": "7472616e73706f72742034",
+          "ciphertext": "98bdabc680e1ea99de0bdf2de639efc2a744b46d7a79e0313729e2"
+        },
+        {
+          "from": "responder",
+          "payload": "7472616e73706f72742035",
+          "ciphertext": "ffe8cc6a716019e3e06f7df1710ca9770ef5b9340531dbf205ad3b"
+        }
+      ],
+      "rekeyAfterTransportMessages": 2
+    }
+  ]
+}

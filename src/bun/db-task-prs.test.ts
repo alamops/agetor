@@ -98,7 +98,7 @@ test("migration 092 backfills prs from pr_url on a 091 database and leaves pr_ur
   insert("no-pr", null, "feature/d", null);
   insert("empty-pr", "", "feature/e", null);
 
-  expect(migrate(mem, migrations)).toEqual(["092_task_base_branch_and_prs", "093_task_revs"]);
+  expect(migrate(mem, migrations)).toEqual(["092_task_base_branch_and_prs", "093_task_revs", "094_remote_devices", "095_remote_audit", "096_remote_idempotency"]);
   const rows = Object.fromEntries(
     mem
       .query<{ id: string; prs: string; pr_url: string | null; base_branch: string | null }, []>(

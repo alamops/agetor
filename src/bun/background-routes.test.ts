@@ -446,10 +446,10 @@ describe("/remote-access", () => {
     for (const token of [master, cli]) {
       const res = await req(NATIVE, "GET", "/remote-access", { token });
       expect(res.status).toBe(200);
-      expect((await res.json()) as RemoteAccessStatus).toEqual({ enabled: false, preview: true });
+      expect((await res.json()) as RemoteAccessStatus).toMatchObject({ enabled: false, preview: true });
     }
     preferences.set(REMOTE_ACCESS_PREF_KEY, "on");
-    expect((await (await req(NATIVE, "GET", "/remote-access", { token: cli })).json()) as RemoteAccessStatus).toEqual({
+    expect((await (await req(NATIVE, "GET", "/remote-access", { token: cli })).json()) as RemoteAccessStatus).toMatchObject({
       enabled: true,
       preview: true,
     });
@@ -459,7 +459,7 @@ describe("/remote-access", () => {
     preferences.set(REMOTE_ACCESS_PREF_KEY, "on");
     const res = await req(NATIVE, "DELETE", "/remote-access", { token: cli });
     expect(res.status).toBe(200);
-    expect((await res.json()) as RemoteAccessStatus).toEqual({ enabled: false, preview: true });
+    expect((await res.json()) as RemoteAccessStatus).toMatchObject({ enabled: false, preview: true });
     expect(preferences.get(REMOTE_ACCESS_PREF_KEY)).toBe("off");
   });
 

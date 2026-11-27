@@ -87,6 +87,14 @@ export function taskNotificationId(taskId: string): string {
   return `agetor.task.${taskId}`;
 }
 
+/**
+ * The fixed Notification Center request id for a notification about a paired device (paired, revoked, a session ended).
+ * A device owns at most one entry, like a task does (docs/specs/remote-readiness-spec.md "Controls").
+ */
+export function remoteDeviceNotificationId(deviceId: string): string {
+  return `agetor.device.${deviceId}`;
+}
+
 /** Kinds an answered question removes (D6b): only the question's own entry. */
 export const ANSWERED_REMOVAL_KINDS: readonly NotificationKind[] = ["waiting"];
 

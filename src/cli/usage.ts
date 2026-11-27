@@ -1,3 +1,4 @@
+import { COMPANION_ENABLED } from "../shared/build-flags.ts";
 import { COLUMNS, OPENCODE_SERVER_MODES, SPEEDS, type Speed } from "../shared/types.ts";
 import { isSpeed } from "../shared/speed.ts";
 import { parseOpencodeServerInput } from "../shared/opencode.ts";
@@ -505,7 +506,20 @@ export const USAGE: Record<string, string> = {
   background off    Turn off "Keep Agetor running in the background". Only the
                     Agetor app can turn it on.`,
 
-  remote: `usage: agetor remote [status | off]
+  remote: COMPANION_ENABLED
+    ? `usage: agetor remote [status | off | devices | revoke <device> | revoke-all --yes | log [--limit N]]
+
+  Remote access for the Agetor Companion app. status prints the switch, the
+  relay, the paired phones and any warning; off turns it off. devices lists the
+  paired phones (and any row that is not trusted, with why); revoke <device>
+  (an id prefix of 4+ characters, or an exact name) ends one phone's access
+  within a second; revoke-all --yes revokes every phone and replaces this Mac's
+  key, so each phone must pair again; log prints the hash-chained audit log,
+  newest first.
+
+  There is no \`on\` and no \`pair\`: only the Agetor app can turn remote access
+  on (Agetor › Remote Access…) and pair a phone (Agetor › Pair a Phone…).`
+    : `usage: agetor remote [status | off]
 
   Remote access (preview). status prints on or off; off turns it off. Only the
   Agetor app (Agetor › Remote Access…) can turn it on.`,

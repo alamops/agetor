@@ -12,7 +12,7 @@
  * the dynamic import (house rule: db.ts opens and migrates on module load).
  */
 import { afterAll, beforeAll, describe, expect, test } from "bun:test";
-import { mkdtempSync } from "node:fs";
+import { chmodSync, existsSync, mkdtempSync, readFileSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import path from "node:path";
 import type { GlobalEvent, PipelineBlock, PipelineBlockKind, PipelineRunStatus } from "../shared/types.ts";
@@ -549,5 +549,47 @@ describe("harness stacks", () => {
     });
     expect(n?.body).toContain("Work → Backup");
     expect(n?.body).not.toContain("(1/1)");
+  });
+});
+
+describe("headless device notifications", () => {
+  test("a device notification reaches the notifier helper under the device id; dispose stops it", async () => {
+    const stubDir = mkdtempSync(path.join(tmpdir(), "agetor-headless-device-"));
+    const log = path.join(stubDir, "argv.log");
+    const bin = path.join(stubDir, "notifier");
+    // Records each post's argv (one line) and acks it like the real helper; `--list` prints the header.
+    writeFileSync(
+      bin,
+      `#!/bin/sh
+if [ "$1" = "--list" ]; then echo "${(await import("./notifier.ts")).NOTIFIER_LIST_HEADER}"; exit 0; fi
+echo "$@" >> "${log}"
+while [ $# -gt 0 ]; do if [ "$1" = "--id" ]; then echo "posted $2"; fi; shift; done
+exit 0
+`,
+    );
+    chmodSync(bin, 0o755);
+    const prevBin = process.env.AGETOR_NOTIFIER_BIN;
+    process.env.AGETOR_NOTIFIER_BIN = bin;
+    const { installHeadlessNotifications } = await import("./headless-notifications.ts");
+    const { postDeviceNotification } = await import("./notification-policy.ts");
+    const installed = installHeadlessNotifications();
+    try {
+      postDeviceNotification({ deviceId: "dev-1", title: "Ana's iPhone was revoked", body: "From the CLI" });
+      const deadline = Date.now() + 5000;
+      while (!existsSync(log) && Date.now() < deadline) await new Promise((r) => setTimeout(r, 20));
+      const lines = readFileSync(log, "utf8").trim().split("\n");
+      expect(lines).toHaveLength(1);
+      expect(lines[0]).toContain("--id agetor.device.dev-1");
+      expect(lines[0]).toContain("--title Ana's iPhone was revoked");
+      expect(lines[0]).not.toContain("--url");
+      installed.dispose();
+      postDeviceNotification({ deviceId: "dev-1", title: "after dispose", body: "" });
+      await new Promise((r) => setTimeout(r, 200));
+      expect(readFileSync(log, "utf8").trim().split("\n")).toHaveLength(1);
+    } finally {
+      installed.dispose();
+      if (prevBin === undefined) delete process.env.AGETOR_NOTIFIER_BIN;
+      else process.env.AGETOR_NOTIFIER_BIN = prevBin;
+    }
   });
 });

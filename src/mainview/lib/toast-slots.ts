@@ -64,33 +64,6 @@ export class TaskToastSlots {
   }
 }
 
-/** What `maybeNotifyOS` does with one event's OS notification. */
-export type OsNotifyAction = "post" | "clear" | "keep";
-
-/**
- * The focused-window (D7) rule for a task's Notification Center entry, plus
- * the one exception the plan carves out of it: an event that FORCES its post
- * while the window is focused (a proactive "Files sent") still posts, and
- * that entry must outlive the task's next focused event, which would
- * otherwise remove it a few seconds later (usually the same turn's own
- * "succeeded"). Pure — `toasts.ts` performs the action.
- *
- * A task keeps that protection until it is opened, archived or deleted
- * (`forget`, via `dismissTaskToast`) or until a later unfocused post replaces
- * the entry. Window focus with the task open (D6d) still clears it: the user
- * is then looking at the task.
- */
-export class FocusedForcedPosts {
-  private readonly tasks = new Set<string>();
-
-  decide(taskId: string, s: { isFocused: boolean; force: boolean }): OsNotifyAction {
-    if (s.isFocused && !s.force) return this.tasks.has(taskId) ? "keep" : "clear";
-    if (s.isFocused) this.tasks.add(taskId);
-    else this.tasks.delete(taskId);
-    return "post";
-  }
-
-  forget(taskId: string): void {
-    this.tasks.delete(taskId);
-  }
-}
+// The focused-window (D7) rule moved to the core with the notification decision (docs/specs/remote-readiness-spec.md,
+// grill D5); the webview keeps importing it from here for its own tests.
+export { FocusedForcedPosts, type OsNotifyAction } from "../../shared/focused-forced-posts.ts";

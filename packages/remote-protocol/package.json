@@ -1,0 +1,24 @@
+{
+  "name": "@agetor/remote-protocol",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "description": "Agetor Companion protocol: Noise sessions, framing, canonical JSON, ES256, HPKE, strict parsers, JSON Schemas and test vectors.",
+  "exports": {
+    "./*": "./src/*.ts"
+  },
+  "scripts": {
+    "test": "bun test",
+    "gen:vectors": "bun scripts/gen-vectors.ts",
+    "gen:schemas": "bun scripts/gen-schemas.ts"
+  },
+  "dependencies": {
+    "@noble/ciphers": "2.4.0",
+    "@noble/curves": "2.4.0",
+    "@noble/hashes": "2.4.0"
+  },
+  "devDependencies": {
+    "ajv": "8.17.1",
+    "ts-json-schema-generator": "2.4.0"
+  }
+}

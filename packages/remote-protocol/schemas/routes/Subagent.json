@@ -1,0 +1,94 @@
+{
+  "$schema": "http://json-schema.org/draft-07/schema#",
+  "type": "object",
+  "properties": {
+    "id": {
+      "type": "string"
+    },
+    "taskId": {
+      "type": "string"
+    },
+    "runId": {
+      "type": [
+        "string",
+        "null"
+      ]
+    },
+    "parentKind": {
+      "type": "string",
+      "enum": [
+        "subagent",
+        "bg_session",
+        "workflow",
+        "workflow_agent",
+        "monitor",
+        "opencode_subagent",
+        "copilot_subagent"
+      ]
+    },
+    "agentType": {
+      "type": [
+        "string",
+        "null"
+      ]
+    },
+    "description": {
+      "type": [
+        "string",
+        "null"
+      ]
+    },
+    "spawnDepth": {
+      "type": "number"
+    },
+    "sourcePath": {
+      "type": "string"
+    },
+    "toolUseId": {
+      "type": [
+        "string",
+        "null"
+      ]
+    },
+    "status": {
+      "$ref": "#/definitions/SubagentStatus"
+    },
+    "startedAt": {
+      "type": "number"
+    },
+    "endedAt": {
+      "type": [
+        "number",
+        "null"
+      ]
+    }
+  },
+  "required": [
+    "id",
+    "taskId",
+    "runId",
+    "parentKind",
+    "agentType",
+    "description",
+    "spawnDepth",
+    "sourcePath",
+    "status",
+    "startedAt",
+    "endedAt"
+  ],
+  "additionalProperties": false,
+  "definitions": {
+    "SubagentStatus": {
+      "type": "string",
+      "enum": [
+        "running",
+        "completed",
+        "failed",
+        "cancelled",
+        "orphaned"
+      ]
+    }
+  },
+  "$id": "https://agetor.dev/schemas/remote/routes/Subagent.json",
+  "title": "Subagent"
+}

@@ -1,0 +1,282 @@
+{
+  "version": 1,
+  "formId": "remote-readiness-grill-r1",
+  "title": "Grill — Remote Readiness (Mac side of the Companion)",
+  "round": 1,
+  "mode": "served",
+  "specFile": "questions.json",
+  "specSha256": "6a4acebe19f834849bc86432b845d2eca540ee6bb7d710c6a1e900dc2288c730",
+  "submittedAt": "2026-11-25T20:19:00.311Z",
+  "receivedAt": "2026-11-25T20:19:00.323Z",
+  "answeredBy": null,
+  "summary": {
+    "total": 23,
+    "answered": 23,
+    "skipped": 0,
+    "unanswered": 0,
+    "optionalLeftBlank": 0,
+    "notApplicable": 0,
+    "acceptedRecommendations": 19,
+    "overrodeRecommendations": [
+      "claude-plan",
+      "wildcard-bind",
+      "v1-routes",
+      "preview-cap"
+    ],
+    "oneWayDoorsNotAnswered": [],
+    "withNotes": [
+      "k1-account",
+      "tmux-always"
+    ],
+    "needsAnswer": [],
+    "complete": true
+  },
+  "answers": {
+    "release-visibility": {
+      "n": 1,
+      "title": "What should a release build show of pairing while there is no hosted relay and no phone app?",
+      "type": "single",
+      "status": "answered",
+      "oneWayDoor": true,
+      "impact": "blocking",
+      "value": "hidden",
+      "display": "Ship the code dark",
+      "acceptedRecommendation": true
+    },
+    "k1-account": {
+      "n": 2,
+      "title": "Key helper (K1): may the plan rely on an App ID and a Developer ID provisioning profile from your Apple account, and on which macOS versions must K1 pass?",
+      "type": "single",
+      "status": "answered",
+      "oneWayDoor": true,
+      "impact": "blocking",
+      "value": "profile-26-27",
+      "display": "Profile route, K1 must pass on 26 and 27",
+      "acceptedRecommendation": true,
+      "note": "My profile under A&A GLOBAL INTERNATIONAL LLC"
+    },
+    "release-seams": {
+      "n": 3,
+      "title": "How does a release build refuse the fake key helper and the relay-URL test seams?",
+      "type": "single",
+      "status": "answered",
+      "oneWayDoor": true,
+      "impact": "shape",
+      "value": "build-constant",
+      "display": "Build-time constant",
+      "acceptedRecommendation": true
+    },
+    "notifications": {
+      "n": 4,
+      "title": "One notification decision: does the core take over OS notifications from the webview in this change?",
+      "type": "single",
+      "status": "answered",
+      "impact": "blocking",
+      "value": "core-owns",
+      "display": "(a) The core owns every notification",
+      "acceptedRecommendation": true
+    },
+    "levels": {
+      "n": 5,
+      "title": "Two level vocabularies: unify them or map them?",
+      "type": "single",
+      "status": "answered",
+      "impact": "shape",
+      "value": "one",
+      "display": "One ordered vocabulary: `observe` < `respond` < `operate` < `configure`",
+      "acceptedRecommendation": true
+    },
+    "tmux-always": {
+      "n": 6,
+      "title": "Claude's tmux cards include 'always allow' rows, but their choices carry only `{ key, label }`. How should the phone handle them?",
+      "type": "single",
+      "status": "answered",
+      "oneWayDoor": true,
+      "impact": "blocking",
+      "value": "allowlist",
+      "display": "Fail closed: allow only rows recognized as once-only",
+      "acceptedRecommendation": true,
+      "note": "we might need to stream tmux so user can control from their phone when needed, similar to the `Attach` feature"
+    },
+    "claude-plan": {
+      "n": 7,
+      "title": "Claude plan approval from the phone: which of the modal's three rows are allowed?",
+      "type": "single",
+      "status": "answered",
+      "oneWayDoor": true,
+      "impact": "shape",
+      "value": "all-three",
+      "display": "All three, signed; row 3 as content",
+      "acceptedRecommendation": false,
+      "recommended": "manual-and-tell"
+    },
+    "text-reject": {
+      "n": 8,
+      "title": "An OpenCode Reject or Skip can carry typed text that reaches the agent. Is that 'remove' or content?",
+      "type": "single",
+      "status": "answered",
+      "oneWayDoor": true,
+      "impact": "shape",
+      "value": "text-is-content",
+      "display": "Bare reject/skip is Remove; with text it is content",
+      "acceptedRecommendation": true
+    },
+    "wildcard-bind": {
+      "n": 9,
+      "title": "Should remote access refuse to run on a headless core bound beyond loopback (`AGETOR_API_HOST=0.0.0.0` or `::`)?",
+      "type": "single",
+      "status": "answered",
+      "oneWayDoor": true,
+      "impact": "shape",
+      "value": "warn",
+      "display": "Allow it, with a warning",
+      "acceptedRecommendation": false,
+      "recommended": "refuse"
+    },
+    "v1-routes": {
+      "n": 10,
+      "title": "Which routes outside the spec's v1 table join the remote v1 set?",
+      "type": "multi",
+      "status": "answered",
+      "impact": "shape",
+      "value": [
+        "event-by-id",
+        "fx-resume",
+        "plan-edit",
+        "msg-history",
+        "switch-account"
+      ],
+      "display": "New `GET /tasks/:id/events/:eventId` (observe); `POST /tasks/:id/fx-resume` (respond, signed); `PATCH /tasks/:id/plans/:planId` (content); `GET /tasks/:id/messages/history` (observe); `POST /tasks/:id/switch-account` (operate)",
+      "acceptedRecommendation": false,
+      "recommended": [
+        "event-by-id",
+        "fx-resume"
+      ]
+    },
+    "mac-name": {
+      "n": 11,
+      "title": "Protocol v1's hello carries a Mac name",
+      "type": "single",
+      "status": "answered",
+      "oneWayDoor": true,
+      "impact": "shape",
+      "value": "yes",
+      "display": "Add `macName` to the v1 hello",
+      "acceptedRecommendation": true
+    },
+    "residual-risks": {
+      "n": 12,
+      "title": "Two residual risks are accepted and documented in security.md, not closed",
+      "type": "single",
+      "status": "answered",
+      "oneWayDoor": true,
+      "impact": "shape",
+      "value": "yes",
+      "display": "Accept both and document them",
+      "acceptedRecommendation": true
+    },
+    "vocab-rule": {
+      "n": 13,
+      "title": "Rewrite the 'no device routes' rule in CLAUDE.md, pairing rule 5 and TT3(c)",
+      "type": "single",
+      "status": "answered",
+      "oneWayDoor": true,
+      "impact": "shape",
+      "value": "yes",
+      "display": "Rewrite the rule to allow read and revoke",
+      "acceptedRecommendation": true
+    },
+    "pair-button": {
+      "n": 14,
+      "title": "Settings' 'Pair a phone' points to the menu item; there is no HTTP route that opens the pairing window",
+      "type": "confirm",
+      "status": "answered",
+      "impact": "minor",
+      "value": "Settings shows 'Pair from Agetor › Pair a Phone…'; no new route.",
+      "acceptedRecommendation": true
+    },
+    "audit-retention": {
+      "n": 15,
+      "title": "Audit retention vs append-only",
+      "type": "confirm",
+      "status": "answered",
+      "impact": "minor",
+      "value": "The trim is a named op: in one BEGIN IMMEDIATE it drops the DELETE trigger, deletes the oldest rows, writes an anchor row with the hash of the last dropped entry, and recreates the trigger. UPDATE stays refused at all times.",
+      "acceptedRecommendation": true
+    },
+    "audit-timing": {
+      "n": 16,
+      "title": "Audit writes: an attempt row before the handler and a result row after",
+      "type": "confirm",
+      "status": "answered",
+      "impact": "minor",
+      "value": "Attempt row (device, route, body hash, signature id) before; result row (status code) after; a missing result row reads 'outcome unknown'.",
+      "acceptedRecommendation": true
+    },
+    "hpke": {
+      "n": 17,
+      "title": "HPKE for sealed pushes: built by hand on noble (RFC 9180 base mode, one suite), checked against RFC 9180's vectors",
+      "type": "confirm",
+      "status": "answered",
+      "impact": "minor",
+      "value": "Hand-built on @noble, about 150 lines, RFC 9180 vectors in the test suite; covered by the R16 external review.",
+      "acceptedRecommendation": true
+    },
+    "vectors": {
+      "n": 18,
+      "title": "Vector rule: cacophony for NK and NKpsk0, snow for NK, plus our own vectors",
+      "type": "confirm",
+      "status": "answered",
+      "impact": "minor",
+      "value": "Cacophony (NK, NKpsk0, including the handshake hash) + snow NK + our own vectors under packages/remote-protocol/vectors/; the spec text is amended.",
+      "acceptedRecommendation": true
+    },
+    "background-core": {
+      "n": 19,
+      "title": "Both cores run the gateway; only the app opens the pairing window",
+      "type": "confirm",
+      "status": "answered",
+      "impact": "minor",
+      "value": "The key helper is spawned through coreSpawn (disclaimed) from both cores; the background core never opens a pairing window; the link reconnects after a port handoff.",
+      "acceptedRecommendation": true
+    },
+    "spec-commit": {
+      "n": 20,
+      "title": "Commit the spec into the repo before planning",
+      "type": "confirm",
+      "status": "answered",
+      "impact": "minor",
+      "value": "docs/specs/remote-readiness-spec.md = rev 40 plus this grill's amendments marked inline; excerpts of Blueprint §12 and the relay spec's wire contract (30 s ping, 256 KB / 64 frames, 50 frames/s, 2 MB/10 s) in docs/specs/remote-relay-contract.md.",
+      "acceptedRecommendation": true
+    },
+    "ci-scope": {
+      "n": 21,
+      "title": "The first CI job (R15): GitHub Actions on macos-15",
+      "type": "confirm",
+      "status": "answered",
+      "impact": "minor",
+      "value": "On PR and push to main: bun install, bun run check (which now covers packages/), the remote security suite and the protocol vectors. No Playwright in CI for now.",
+      "acceptedRecommendation": true
+    },
+    "e2e-scope": {
+      "n": 22,
+      "title": "Acceptance: which flows get end-to-end coverage",
+      "type": "confirm",
+      "status": "answered",
+      "impact": "minor",
+      "value": "Integration (bun test): headless test client + local test relay + headless core with fake drivers covering pair (through the fake key helper), approve each card kind, signed gate, unlock window, idempotent retry, revoke, revoke-all, audit chain. Playwright: Settings device list, revoke, log view, with seeded devices. Existing duplicated-notifications and task-stream e2e stay green.",
+      "acceptedRecommendation": true
+    },
+    "preview-cap": {
+      "n": 23,
+      "title": "A phone's preview cap is 10 MB, checked against the task's paths",
+      "type": "confirm",
+      "status": "answered",
+      "impact": "minor",
+      "value": "the same as in the mac",
+      "acceptedRecommendation": false,
+      "recommended": "A new per-task preview route for device callers: 10 MB, no-follow, paths limited to the task's workdir/worktrees and sent files."
+    }
+  },
+  "generalNotes": null
+}

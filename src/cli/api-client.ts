@@ -44,6 +44,7 @@ import type {
   RemoteAccessStatus,
   TmuxPromptAnswerBody,
 } from "../shared/types.ts";
+import type { RemoteDevicesResult, RemoteLogResult } from "../shared/remote-types.ts";
 import type { NotificationKind } from "../shared/os-notification.ts";
 import type { DiscoveredModel } from "../shared/model-options.ts";
 import type { BundleExportResponse } from "../shared/bundle.ts";
@@ -500,6 +501,26 @@ export class AgetorClient {
   /** `GET /remote-access` — remote access (preview) on/off. */
   getRemoteAccess(): Promise<RemoteAccessStatus> {
     return this.req("GET", "/remote-access");
+  }
+  /** `GET /remote-access/devices` — the paired phones and why a row is not trusted. 404 `companion-unavailable` in a build without the Companion. */
+  getRemoteDevices(): Promise<RemoteDevicesResult> {
+    return this.req("GET", "/remote-access/devices");
+  }
+  /** `DELETE /remote-access/devices/:id` — revoke one device (its live session ends within a second). */
+  revokeRemoteDevice(id: string): Promise<{ ok: true }> {
+    return this.req("DELETE", `/remote-access/devices/${encodeURIComponent(id)}`);
+  }
+  /** `DELETE /remote-access/devices` — revoke every device and replace the core key. */
+  revokeAllRemoteDevices(): Promise<{ ok: true }> {
+    return this.req("DELETE", "/remote-access/devices");
+  }
+  /** `GET /remote-access/log` — one page of the hash-chained audit log, newest first. */
+  getRemoteLog(opts: { limit?: number; beforeSeq?: number } = {}): Promise<RemoteLogResult> {
+    const q = new URLSearchParams();
+    if (opts.limit !== undefined) q.set("limit", String(opts.limit));
+    if (opts.beforeSeq !== undefined) q.set("beforeSeq", String(opts.beforeSeq));
+    const qs = q.size > 0 ? `?${q.toString()}` : "";
+    return this.req("GET", `/remote-access/log${qs}`);
   }
   /** `DELETE /remote-access` — turn remote access off. There is deliberately
    *  no CLI route that turns it on (only the app's native box can). */

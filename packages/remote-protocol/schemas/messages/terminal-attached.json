@@ -1,0 +1,26 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://agetor.dev/schemas/remote/messages/terminal-attached.json",
+  "title": "terminal-attached",
+  "x-direction": "core",
+  "type": "object",
+  "properties": {
+    "id": {
+      "type": "string",
+      "maxLength": 64,
+      "minLength": 1,
+      "pattern": "^[A-Za-z0-9._:~-]+$"
+    },
+    "taskId": {
+      "type": "string",
+      "maxLength": 128,
+      "minLength": 1,
+      "pattern": "^[A-Za-z0-9._:~-]+$"
+    }
+  },
+  "required": [
+    "id",
+    "taskId"
+  ],
+  "additionalProperties": false
+}

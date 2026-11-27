@@ -35,6 +35,7 @@ import {
   sweepArchivedTeardowns,
   reapIdleSessions,
   stopFxAutoResumeTimers,
+  subscribeGlobal,
   waitForLaunchesToSettle,
 } from "./orchestrator.ts";
 import { HANDOFF_LAUNCH_SETTLE_MS } from "./daemon-mode.ts";
@@ -68,7 +69,8 @@ import { liveSupervisor, requestSupervisorStop } from "./login-daemon-state.ts";
 import { acquireApiPort } from "./app-takeover.ts";
 import { bootReadySignal } from "./boot-gate.ts";
 import { startTasksChangedPush } from "./task-change-push.ts";
-import { runRemoteAccessBox } from "./remote-access-box.ts";
+import { runPairPhone, runRemoteAccessBox } from "./remote-access-box.ts";
+import { startRemoteGateway, type RemoteGateway } from "./remote/gateway.ts";
 import {
   getBackgroundStatus,
   turnOnBackground,
@@ -97,6 +99,9 @@ import { resolveNotifierApp } from "./notifier.ts";
 import { parseTaskDeepLink } from "./deep-link.ts";
 import { createTaskNotifier } from "./task-notifier.ts";
 import { installNotificationRemovalHooks } from "./notification-hooks.ts";
+import { fetchTaskRows } from "./headless-notifications.ts";
+import { installNotificationPolicy, registerDeviceNotificationHook } from "./notification-policy.ts";
+import { clearWebviewPresence, setAppAttached, setNativeWindowFocus } from "./presence.ts";
 import { setPendingMenuAction, setPendingOpenTask } from "./pending-open.ts";
 import { buildAppMenu, deliverMenuAction, menuActionFromClick } from "./app-menu.ts";
 import pkg from "../../package.json" with { type: "json" };
@@ -236,9 +241,22 @@ registerNotifierBundle();
 // Learn which tasks still have an entry from a previous run, so opening one
 // removes it without spawning the helper for every other task.
 void taskNotifier.seed();
+// The ONE notification decision (docs/architecture/notifications.md, grill D5): the core decides every OS notification from the global
+// event bus and the window's presence (native focus/blur below, plus the webview's `PUT /app/presence`), then tells its sinks. The OS
+// sink is this notifier; the phone sink joins in the remote gateway. The webview keeps only its in-app toasts.
+setAppAttached(true);
+const notificationPolicy = installNotificationPolicy({ subscribe: subscribeGlobal, loadRows: fetchTaskRows });
+notificationPolicy.registerSink({
+  id: "os",
+  deliver: (d) => taskNotifier.post(d.notification),
+  remove: (r) => taskNotifier.remove(r),
+});
+// "Ana's iPhone was paired", revoke alerts: not about a task, so the notifier posts them under the device's own id
+// (`remoteDeviceNotificationId`), with the plain path as its fallback.
+registerDeviceNotificationHook((n) => taskNotifier.postDevice(n));
 // Remove a task's entry once its reason goes away (answered from any client,
 // or the task left `blocked`).
-installNotificationRemovalHooks((r) => taskNotifier.remove(r));
+installNotificationRemovalHooks((r) => notificationPolicy.remove(r));
 
 // Native-host capabilities the API server needs but that only exist inside
 // Electrobun (file dialogs, OS notifications, open-in-Finder/browser, the
@@ -533,6 +551,21 @@ Electrobun.events.on("application-menu-clicked", (e: { data?: { action?: string 
       openLoginItems,
       log: (m) => console.warn(m),
     });
+  } else if (action === "pair-phone") {
+    void runPairPhone({
+      showMessageBox: showLabelledMessageBox,
+      background: {
+        getBackgroundStatus,
+        turnOnBackground,
+        startBackgroundNow,
+        getRemoteAccess,
+        setRemoteAccessOff,
+        setRemoteAccessOnFromNativeBox,
+      },
+      openLoginItems,
+      startPairing: remoteGateway?.startPairing ? () => remoteGateway!.startPairing!() : undefined,
+      log: (m) => console.warn(m),
+    });
   } else if (action === "quit-completely") {
     // before-quit reads this one-shot; with runs active it still asks first.
     requestQuitCompletely();
@@ -571,6 +604,17 @@ startPeriodicDiscovery();
 
 // The boot restore above is done: let the routes through (boot-gate.ts).
 markBootReady();
+
+// The Companion gateway (docs/architecture/remote-gateway.md): composed once the routes are up, in whichever core owns the port. With the
+// Companion compiled out this is a no-op that never touches the key helper. It stops in the quit sequence below.
+let remoteGateway: RemoteGateway | null = null;
+void startRemoteGateway({ mode: "app", notificationPolicy })
+  .then((g) => {
+    remoteGateway = g;
+  })
+  .catch((err) => {
+    console.error("[agetor] remote gateway failed to start:", err);
+  });
 
 // The quit prompt's running tasks, kept fresh in memory: the `before-quit`
 // hook below is synchronous and cannot await a database read. Re-read on task
@@ -699,6 +743,8 @@ const quitSequencer = createQuitSequencer({
         // worker can't hold this past the sequence cap with the creds file still
         // on disk (removeCoreCreds below must always run).
         await Promise.race([launchesFreezing, Bun.sleep(3_000)]);
+        // Sessions end and the relay link closes before the process goes (a quit hands the mailbox to whoever serves the port next).
+        await Promise.race([remoteGateway?.stop() ?? Promise.resolve(), Bun.sleep(1_000)]).catch(() => undefined);
         const { completely, stopSupervisor, backgroundArmed } = quitDecision;
         // Only when a supervisor is alive to read it (`stopSupervisor`): a request
         // written with none running would otherwise linger for the next supervisor
@@ -957,6 +1003,15 @@ Electrobun.events.on(
   },
 );
 
+// Window focus is authoritative for the notification policy once seen (src/bun/presence.ts): the webview of a backgrounded or
+// occluded window may not get to report. Filtered to our main window like move/resize above.
+Electrobun.events.on("focus", (e: { data: { id: number } }) => {
+  if (getMainWindow()?.id === e.data.id) setNativeWindowFocus(true);
+});
+Electrobun.events.on("blur", (e: { data: { id: number } }) => {
+  if (getMainWindow()?.id === e.data.id) setNativeWindowFocus(false);
+});
+
 // Clear the registered window reference *only* when the main window
 // closes. The "close" event fires for every BrowserWindow the bun
 // process owns; without the id filter, closing a future secondary
@@ -964,7 +1019,12 @@ Electrobun.events.on(
 // clear the main-window registration and break getMainWindow callers
 // like the /window/toggle-zoom endpoint.
 Electrobun.events.on("close", (e: { data: { id: number } }) => {
-  if (getMainWindow()?.id === e.data.id) setMainWindow(null);
+  if (getMainWindow()?.id === e.data.id) {
+    setMainWindow(null);
+    setNativeWindowFocus(false);
+    // The closed window's last report named a selected task; with no webview left it would never be unselected.
+    clearWebviewPresence();
+  }
 });
 
 // macOS Dock-icon click on an already-running app fires Cocoa's

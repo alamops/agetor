@@ -1,0 +1,22 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://agetor.dev/schemas/remote/messages/binding.json",
+  "title": "binding",
+  "x-direction": "phone",
+  "type": "object",
+  "properties": {
+    "deviceId": {
+      "type": "string",
+      "pattern": "^[0-9a-f]{32}$"
+    },
+    "sig": {
+      "type": "string",
+      "pattern": "^[0-9a-f]{128}$"
+    }
+  },
+  "required": [
+    "deviceId",
+    "sig"
+  ],
+  "additionalProperties": false
+}

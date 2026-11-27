@@ -1,0 +1,1867 @@
+{
+  "$schema": "http://json-schema.org/draft-07/schema#",
+  "type": "object",
+  "properties": {
+    "id": {
+      "type": "string"
+    },
+    "title": {
+      "type": "string"
+    },
+    "prompt": {
+      "type": "string"
+    },
+    "column": {
+      "$ref": "#/definitions/ColumnId"
+    },
+    "agent": {
+      "type": "string"
+    },
+    "workdir": {
+      "type": "string"
+    },
+    "isolation": {
+      "$ref": "#/definitions/Isolation"
+    },
+    "taskType": {
+      "$ref": "#/definitions/TaskType"
+    },
+    "branch": {
+      "type": [
+        "string",
+        "null"
+      ]
+    },
+    "branchSource": {
+      "type": "string",
+      "enum": [
+        "created",
+        "existing"
+      ]
+    },
+    "worktreePath": {
+      "type": [
+        "string",
+        "null"
+      ]
+    },
+    "baseRef": {
+      "type": [
+        "string",
+        "null"
+      ]
+    },
+    "prUrl": {
+      "type": [
+        "string",
+        "null"
+      ]
+    },
+    "prs": {
+      "type": "array",
+      "items": {
+        "$ref": "#/definitions/TaskPr"
+      }
+    },
+    "baseBranch": {
+      "type": [
+        "string",
+        "null"
+      ]
+    },
+    "issueUrl": {
+      "type": [
+        "string",
+        "null"
+      ]
+    },
+    "agentProfileId": {
+      "type": [
+        "string",
+        "null"
+      ]
+    },
+    "agentProfile": {
+      "anyOf": [
+        {
+          "$ref": "#/definitions/AgentProfileSnapshot"
+        },
+        {
+          "type": "null"
+        }
+      ]
+    },
+    "pipelineId": {
+      "type": [
+        "string",
+        "null"
+      ]
+    },
+    "pipelineRun": {
+      "anyOf": [
+        {
+          "$ref": "#/definitions/PipelineRunState"
+        },
+        {
+          "type": "null"
+        }
+      ]
+    },
+    "pipelineParentId": {
+      "type": [
+        "string",
+        "null"
+      ]
+    },
+    "pipelineStepId": {
+      "type": [
+        "string",
+        "null"
+      ]
+    },
+    "harnessState": {
+      "anyOf": [
+        {
+          "$ref": "#/definitions/TaskHarnessState"
+        },
+        {
+          "type": "null"
+        }
+      ]
+    },
+    "mode": {
+      "type": [
+        "string",
+        "null"
+      ]
+    },
+    "model": {
+      "type": [
+        "string",
+        "null"
+      ]
+    },
+    "effort": {
+      "type": [
+        "string",
+        "null"
+      ]
+    },
+    "speed": {
+      "$ref": "#/definitions/Speed"
+    },
+    "fast": {
+      "type": "boolean"
+    },
+    "maxMode": {
+      "type": "boolean"
+    },
+    "opencodeServer": {
+      "$ref": "#/definitions/OpencodeServerMode"
+    },
+    "references": {
+      "type": "array",
+      "items": {
+        "$ref": "#/definitions/TaskReference"
+      }
+    },
+    "backlog": {
+      "type": "array",
+      "items": {
+        "$ref": "#/definitions/BacklogMessage"
+      }
+    },
+    "draft": {
+      "anyOf": [
+        {
+          "$ref": "#/definitions/TaskDraft"
+        },
+        {
+          "type": "null"
+        }
+      ]
+    },
+    "plans": {
+      "type": "array",
+      "items": {
+        "$ref": "#/definitions/TaskPlan"
+      }
+    },
+    "runId": {
+      "type": [
+        "string",
+        "null"
+      ]
+    },
+    "hasOpenableRun": {
+      "type": "boolean"
+    },
+    "pendingInteractionCount": {
+      "type": "number"
+    },
+    "openTerminalCount": {
+      "type": "number"
+    },
+    "todoProgress": {
+      "anyOf": [
+        {
+          "type": "object",
+          "properties": {
+            "completed": {
+              "type": "number"
+            },
+            "total": {
+              "type": "number"
+            }
+          },
+          "required": [
+            "completed",
+            "total"
+          ],
+          "additionalProperties": false
+        },
+        {
+          "type": "null"
+        }
+      ]
+    },
+    "sentFiles": {
+      "anyOf": [
+        {
+          "type": "array",
+          "items": {
+            "$ref": "#/definitions/SentFileEntry"
+          }
+        },
+        {
+          "type": "null"
+        }
+      ]
+    },
+    "fxRecovery": {
+      "anyOf": [
+        {
+          "$ref": "#/definitions/TaskFxRecovery"
+        },
+        {
+          "type": "null"
+        }
+      ]
+    },
+    "checkoutBranch": {
+      "type": [
+        "string",
+        "null"
+      ]
+    },
+    "repositories": {
+      "type": "array",
+      "items": {
+        "$ref": "#/definitions/TaskRepository"
+      }
+    },
+    "multiRepo": {
+      "type": "boolean"
+    },
+    "issueRepoPath": {
+      "type": [
+        "string",
+        "null"
+      ]
+    },
+    "importedClaude": {
+      "anyOf": [
+        {
+          "$ref": "#/definitions/ImportedClaudeSession"
+        },
+        {
+          "type": "null"
+        }
+      ]
+    },
+    "importedOpencode": {
+      "anyOf": [
+        {
+          "$ref": "#/definitions/ImportedOpencodeSession"
+        },
+        {
+          "type": "null"
+        }
+      ]
+    },
+    "unread": {
+      "type": "boolean"
+    },
+    "hasAssistantMessages": {
+      "type": "boolean"
+    },
+    "createdAt": {
+      "type": "number"
+    },
+    "updatedAt": {
+      "type": "number"
+    },
+    "archivedAt": {
+      "type": [
+        "number",
+        "null"
+      ]
+    },
+    "runningSubagents": {
+      "type": "number"
+    },
+    "stalledSince": {
+      "type": [
+        "number",
+        "null"
+      ]
+    }
+  },
+  "required": [
+    "id",
+    "title",
+    "prompt",
+    "column",
+    "agent",
+    "workdir",
+    "isolation",
+    "taskType",
+    "branch",
+    "branchSource",
+    "worktreePath",
+    "baseRef",
+    "prUrl",
+    "mode",
+    "model",
+    "effort",
+    "speed",
+    "maxMode",
+    "opencodeServer",
+    "references",
+    "backlog",
+    "draft",
+    "plans",
+    "runId",
+    "hasOpenableRun",
+    "pendingInteractionCount",
+    "openTerminalCount",
+    "createdAt",
+    "updatedAt",
+    "archivedAt"
+  ],
+  "additionalProperties": false,
+  "definitions": {
+    "ColumnId": {
+      "type": "string",
+      "enum": [
+        "backlog",
+        "ready",
+        "running",
+        "blocked",
+        "review",
+        "done"
+      ]
+    },
+    "Isolation": {
+      "type": "string",
+      "enum": [
+        "worktree",
+        "none"
+      ]
+    },
+    "TaskType": {
+      "type": "string",
+      "enum": [
+        "task",
+        "bug",
+        "spike"
+      ]
+    },
+    "TaskPr": {
+      "type": "object",
+      "properties": {
+        "url": {
+          "type": "string"
+        },
+        "head": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "base": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "number": {
+          "type": [
+            "number",
+            "null"
+          ]
+        },
+        "createdAt": {
+          "type": "number"
+        }
+      },
+      "required": [
+        "url",
+        "head",
+        "base",
+        "number",
+        "createdAt"
+      ],
+      "additionalProperties": false
+    },
+    "AgentProfileSnapshot": {
+      "type": "object",
+      "properties": {
+        "id": {
+          "type": "string"
+        },
+        "name": {
+          "type": "string"
+        },
+        "harness": {
+          "type": "string"
+        },
+        "harnessKind": {
+          "$ref": "#/definitions/AgentKind"
+        },
+        "harnessLabel": {
+          "type": "string"
+        },
+        "model": {
+          "type": "string"
+        },
+        "effort": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "mode": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "speed": {
+          "$ref": "#/definitions/Speed"
+        },
+        "fast": {
+          "type": "boolean"
+        },
+        "maxMode": {
+          "type": "boolean"
+        },
+        "opencodeServer": {
+          "$ref": "#/definitions/OpencodeServerMode"
+        },
+        "instructions": {
+          "type": "string"
+        },
+        "skills": {
+          "type": "array",
+          "items": {
+            "type": "string"
+          }
+        },
+        "capturedAt": {
+          "type": "number"
+        }
+      },
+      "required": [
+        "id",
+        "name",
+        "harness",
+        "harnessKind",
+        "harnessLabel",
+        "model",
+        "effort",
+        "mode",
+        "speed",
+        "maxMode",
+        "instructions",
+        "skills",
+        "capturedAt"
+      ],
+      "additionalProperties": false
+    },
+    "AgentKind": {
+      "type": "string",
+      "enum": [
+        "claude-code",
+        "codex",
+        "cursor",
+        "gemini",
+        "fx",
+        "antigravity",
+        "opencode",
+        "copilot"
+      ]
+    },
+    "Speed": {
+      "type": "string",
+      "enum": [
+        "off",
+        "fast",
+        "ultrafast"
+      ]
+    },
+    "OpencodeServerMode": {
+      "type": "string",
+      "enum": [
+        "shared",
+        "standalone"
+      ]
+    },
+    "PipelineRunState": {
+      "type": "object",
+      "properties": {
+        "pipelineId": {
+          "type": "string"
+        },
+        "pipelineName": {
+          "type": "string"
+        },
+        "snapshot": {
+          "anyOf": [
+            {
+              "$ref": "#/definitions/PipelineRunSnapshot"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "status": {
+          "$ref": "#/definitions/PipelineRunStatus"
+        },
+        "active": {
+          "type": "array",
+          "items": {
+            "$ref": "#/definitions/PipelineActiveStep"
+          }
+        },
+        "joins": {
+          "type": "object",
+          "additionalProperties": {
+            "type": "object",
+            "properties": {
+              "arrivals": {
+                "type": "array",
+                "items": {
+                  "$ref": "#/definitions/PipelineJoinArrival"
+                }
+              }
+            },
+            "required": [
+              "arrivals"
+            ],
+            "additionalProperties": false
+          }
+        },
+        "blocked": {
+          "type": "array",
+          "items": {
+            "$ref": "#/definitions/PipelineBlock"
+          }
+        },
+        "history": {
+          "type": "array",
+          "items": {
+            "$ref": "#/definitions/PipelineStepRecord"
+          }
+        },
+        "humanSteps": {
+          "type": "array",
+          "items": {
+            "$ref": "#/definitions/PipelineHumanStep"
+          }
+        },
+        "seqCounter": {
+          "type": "number"
+        },
+        "stepCount": {
+          "type": "number"
+        },
+        "startedAt": {
+          "type": [
+            "number",
+            "null"
+          ]
+        },
+        "endedAt": {
+          "type": [
+            "number",
+            "null"
+          ]
+        },
+        "capExtensions": {
+          "type": "number"
+        },
+        "stopRequestedAt": {
+          "type": [
+            "number",
+            "null"
+          ]
+        }
+      },
+      "required": [
+        "pipelineId",
+        "pipelineName",
+        "snapshot",
+        "status",
+        "active",
+        "joins",
+        "blocked",
+        "history",
+        "stepCount",
+        "startedAt",
+        "endedAt"
+      ],
+      "additionalProperties": false
+    },
+    "PipelineRunSnapshot": {
+      "type": "object",
+      "properties": {
+        "graph": {
+          "$ref": "#/definitions/PipelineGraph"
+        },
+        "maxSteps": {
+          "type": "number"
+        },
+        "profiles": {
+          "type": "object",
+          "additionalProperties": {
+            "$ref": "#/definitions/AgentProfileSnapshot"
+          }
+        },
+        "capturedAt": {
+          "type": "number"
+        }
+      },
+      "required": [
+        "graph",
+        "maxSteps",
+        "profiles",
+        "capturedAt"
+      ],
+      "additionalProperties": false
+    },
+    "PipelineGraph": {
+      "type": "object",
+      "properties": {
+        "steps": {
+          "type": "array",
+          "items": {
+            "$ref": "#/definitions/PipelineStep"
+          }
+        },
+        "edges": {
+          "type": "array",
+          "items": {
+            "$ref": "#/definitions/PipelineEdge"
+          }
+        },
+        "startStepId": {
+          "type": [
+            "string",
+            "null"
+          ]
+        }
+      },
+      "required": [
+        "steps",
+        "edges",
+        "startStepId"
+      ],
+      "additionalProperties": false
+    },
+    "PipelineStep": {
+      "type": "object",
+      "properties": {
+        "id": {
+          "type": "string"
+        },
+        "name": {
+          "type": "string"
+        },
+        "type": {
+          "type": "string",
+          "enum": [
+            "agent",
+            "human"
+          ]
+        },
+        "instructions": {
+          "type": "string"
+        },
+        "agentProfileId": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "position": {
+          "type": "object",
+          "properties": {
+            "x": {
+              "type": "number"
+            },
+            "y": {
+              "type": "number"
+            }
+          },
+          "required": [
+            "x",
+            "y"
+          ],
+          "additionalProperties": false
+        },
+        "subagents": {
+          "type": "object",
+          "properties": {
+            "profileIds": {
+              "type": "array",
+              "items": {
+                "type": "string"
+              }
+            },
+            "cap": {
+              "type": [
+                "number",
+                "null"
+              ]
+            }
+          },
+          "required": [
+            "profileIds",
+            "cap"
+          ],
+          "additionalProperties": false
+        },
+        "transition": {
+          "type": "string",
+          "enum": [
+            "choose",
+            "all"
+          ]
+        },
+        "join": {
+          "type": "string",
+          "enum": [
+            "any",
+            "all"
+          ]
+        }
+      },
+      "required": [
+        "id",
+        "name",
+        "instructions",
+        "agentProfileId",
+        "position",
+        "subagents",
+        "transition",
+        "join"
+      ],
+      "additionalProperties": false
+    },
+    "PipelineEdge": {
+      "type": "object",
+      "properties": {
+        "id": {
+          "type": "string"
+        },
+        "from": {
+          "type": "string"
+        },
+        "to": {
+          "type": "string"
+        },
+        "label": {
+          "type": "string"
+        }
+      },
+      "required": [
+        "id",
+        "from",
+        "to",
+        "label"
+      ],
+      "additionalProperties": false
+    },
+    "PipelineRunStatus": {
+      "type": "string",
+      "enum": [
+        "idle",
+        "running",
+        "blocked",
+        "done",
+        "cancelled",
+        "review"
+      ]
+    },
+    "PipelineActiveStep": {
+      "type": "object",
+      "properties": {
+        "stepId": {
+          "type": "string"
+        },
+        "taskId": {
+          "type": "string"
+        },
+        "seq": {
+          "type": "number"
+        }
+      },
+      "required": [
+        "stepId",
+        "taskId",
+        "seq"
+      ],
+      "additionalProperties": false
+    },
+    "PipelineJoinArrival": {
+      "type": "object",
+      "properties": {
+        "fromStepId": {
+          "type": "string"
+        },
+        "seq": {
+          "type": "number"
+        },
+        "handoff": {
+          "anyOf": [
+            {
+              "$ref": "#/definitions/Handoff"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "comment": {
+          "type": [
+            "string",
+            "null"
+          ]
+        }
+      },
+      "required": [
+        "fromStepId",
+        "seq",
+        "handoff"
+      ],
+      "additionalProperties": false
+    },
+    "Handoff": {
+      "type": "object",
+      "properties": {
+        "schemaVersion": {
+          "type": "number",
+          "const": 1
+        },
+        "purpose": {
+          "type": "string"
+        },
+        "summary": {
+          "type": "string"
+        },
+        "reason": {
+          "type": "string"
+        },
+        "next": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "artifacts": {
+          "type": "array",
+          "items": {
+            "type": "string"
+          }
+        },
+        "openQuestions": {
+          "type": "array",
+          "items": {
+            "type": "string"
+          }
+        },
+        "status": {
+          "type": "string",
+          "enum": [
+            "done",
+            "blocked"
+          ]
+        }
+      },
+      "required": [
+        "schemaVersion",
+        "purpose",
+        "summary",
+        "reason",
+        "next",
+        "artifacts",
+        "openQuestions"
+      ],
+      "additionalProperties": false
+    },
+    "PipelineBlock": {
+      "type": "object",
+      "properties": {
+        "taskId": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "stepId": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "kind": {
+          "$ref": "#/definitions/PipelineBlockKind"
+        },
+        "message": {
+          "type": "string"
+        },
+        "pending": {
+          "$ref": "#/definitions/PipelinePendingLaunch"
+        }
+      },
+      "required": [
+        "taskId",
+        "stepId",
+        "kind",
+        "message"
+      ],
+      "additionalProperties": false
+    },
+    "PipelineBlockKind": {
+      "type": "string",
+      "enum": [
+        "step-failed",
+        "step-blocked",
+        "handoff-missing",
+        "handoff-invalid",
+        "step-cap",
+        "profile-missing",
+        "join-incomplete"
+      ]
+    },
+    "PipelinePendingLaunch": {
+      "type": "object",
+      "properties": {
+        "stepId": {
+          "type": "string"
+        },
+        "arrivals": {
+          "type": "array",
+          "items": {
+            "$ref": "#/definitions/PipelineJoinArrival"
+          }
+        },
+        "returnToStepId": {
+          "type": "string"
+        },
+        "returned": {
+          "type": "boolean"
+        },
+        "humanFeedback": {
+          "type": [
+            "string",
+            "null"
+          ]
+        }
+      },
+      "required": [
+        "stepId",
+        "arrivals"
+      ],
+      "additionalProperties": false
+    },
+    "PipelineStepRecord": {
+      "type": "object",
+      "properties": {
+        "seq": {
+          "type": "number"
+        },
+        "stepId": {
+          "type": "string"
+        },
+        "taskId": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "startedAt": {
+          "type": "number"
+        },
+        "endedAt": {
+          "type": [
+            "number",
+            "null"
+          ]
+        },
+        "outcome": {
+          "type": [
+            "string",
+            "null"
+          ],
+          "enum": [
+            "succeeded",
+            "failed",
+            "cancelled",
+            "advanced-manually",
+            "returned",
+            null
+          ]
+        },
+        "handoff": {
+          "anyOf": [
+            {
+              "$ref": "#/definitions/Handoff"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "nextStepIds": {
+          "type": "array",
+          "items": {
+            "type": "string"
+          }
+        },
+        "human": {
+          "anyOf": [
+            {
+              "$ref": "#/definitions/PipelineHumanDecision"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "returnToStepId": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "responseKind": {
+          "anyOf": [
+            {
+              "$ref": "#/definitions/StepResponseKind"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "reminder": {
+          "anyOf": [
+            {
+              "$ref": "#/definitions/PipelineStepReminder"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "handoffRunId": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "handoffFromOtherRun": {
+          "type": "boolean"
+        },
+        "attemptStartedAt": {
+          "type": [
+            "number",
+            "null"
+          ]
+        },
+        "stoppedAt": {
+          "type": [
+            "number",
+            "null"
+          ]
+        },
+        "stoppedRunId": {
+          "type": [
+            "string",
+            "null"
+          ]
+        }
+      },
+      "required": [
+        "seq",
+        "stepId",
+        "taskId",
+        "startedAt",
+        "endedAt",
+        "outcome",
+        "handoff",
+        "nextStepIds"
+      ],
+      "additionalProperties": false
+    },
+    "PipelineHumanDecision": {
+      "type": "object",
+      "properties": {
+        "decision": {
+          "type": "string",
+          "enum": [
+            "accept",
+            "return"
+          ]
+        },
+        "comment": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "mode": {
+          "type": "string",
+          "enum": [
+            "fresh",
+            "resume"
+          ]
+        },
+        "returnToStepId": {
+          "type": [
+            "string",
+            "null"
+          ]
+        }
+      },
+      "required": [
+        "decision",
+        "comment"
+      ],
+      "additionalProperties": false
+    },
+    "StepResponseKind": {
+      "type": "string",
+      "enum": [
+        "handoff",
+        "handoff-blocked",
+        "handoff-missing",
+        "handoff-invalid",
+        "user-ask",
+        "error",
+        "cancelled"
+      ]
+    },
+    "PipelineStepReminder": {
+      "type": "object",
+      "properties": {
+        "at": {
+          "type": "number"
+        },
+        "reason": {
+          "type": "string",
+          "enum": [
+            "handoff-missing",
+            "handoff-invalid",
+            "handoff-next-unknown"
+          ]
+        },
+        "runId": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "detail": {
+          "type": "string"
+        },
+        "delivered": {
+          "type": "boolean"
+        }
+      },
+      "required": [
+        "at",
+        "reason",
+        "runId",
+        "detail",
+        "delivered"
+      ],
+      "additionalProperties": false
+    },
+    "PipelineHumanStep": {
+      "type": "object",
+      "properties": {
+        "stepId": {
+          "type": "string"
+        },
+        "seq": {
+          "type": "number"
+        },
+        "startedAt": {
+          "type": "number"
+        },
+        "arrivals": {
+          "type": "array",
+          "items": {
+            "$ref": "#/definitions/PipelineJoinArrival"
+          }
+        }
+      },
+      "required": [
+        "stepId",
+        "seq",
+        "startedAt",
+        "arrivals"
+      ],
+      "additionalProperties": false
+    },
+    "TaskHarnessState": {
+      "type": "object",
+      "properties": {
+        "stackId": {
+          "type": "string"
+        },
+        "position": {
+          "type": "number"
+        },
+        "count": {
+          "type": "number"
+        },
+        "tried": {
+          "type": "array",
+          "items": {
+            "type": "string"
+          }
+        },
+        "pendingSwap": {
+          "anyOf": [
+            {
+              "type": "object",
+              "properties": {
+                "from": {
+                  "type": "string"
+                },
+                "to": {
+                  "type": "string"
+                },
+                "reason": {
+                  "$ref": "#/definitions/HarnessLimitReason"
+                },
+                "runId": {
+                  "type": "string"
+                },
+                "startedAt": {
+                  "type": "number"
+                },
+                "manual": {
+                  "type": "boolean"
+                },
+                "switchNow": {
+                  "type": "string",
+                  "enum": [
+                    "manual",
+                    "scheduled"
+                  ]
+                }
+              },
+              "required": [
+                "from",
+                "to",
+                "reason",
+                "runId",
+                "startedAt"
+              ],
+              "additionalProperties": false
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "allExhausted": {
+          "anyOf": [
+            {
+              "type": "object",
+              "properties": {
+                "at": {
+                  "type": "number"
+                },
+                "attempts": {
+                  "type": "number"
+                },
+                "max": {
+                  "type": "number"
+                },
+                "nextAttemptAt": {
+                  "type": "number"
+                },
+                "earliestResetAtMs": {
+                  "type": [
+                    "number",
+                    "null"
+                  ]
+                },
+                "reason": {
+                  "anyOf": [
+                    {
+                      "$ref": "#/definitions/HarnessLimitReason"
+                    },
+                    {
+                      "type": "string",
+                      "const": "no-usable-member"
+                    }
+                  ]
+                },
+                "inFlight": {
+                  "type": "boolean"
+                },
+                "attemptRunId": {
+                  "type": "string"
+                },
+                "cleanRetryOf": {
+                  "type": "string"
+                },
+                "memberReasons": {
+                  "type": "array",
+                  "items": {
+                    "$ref": "#/definitions/HarnessMemberReason"
+                  }
+                }
+              },
+              "required": [
+                "at",
+                "attempts",
+                "max",
+                "nextAttemptAt",
+                "earliestResetAtMs",
+                "reason"
+              ],
+              "additionalProperties": false
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "lastMove": {
+          "anyOf": [
+            {
+              "type": "object",
+              "properties": {
+                "from": {
+                  "type": "string"
+                },
+                "to": {
+                  "type": "string"
+                },
+                "at": {
+                  "type": "number"
+                },
+                "reason": {
+                  "type": "string",
+                  "enum": [
+                    "member-removed",
+                    "member-disabled",
+                    "member-unavailable",
+                    "manual-switch",
+                    "switch-now"
+                  ]
+                }
+              },
+              "required": [
+                "from",
+                "to",
+                "at",
+                "reason"
+              ],
+              "additionalProperties": false
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "scheduledSwitch": {
+          "anyOf": [
+            {
+              "type": "object",
+              "properties": {
+                "requestedAt": {
+                  "type": "number"
+                }
+              },
+              "required": [
+                "requestedAt"
+              ],
+              "additionalProperties": false
+            },
+            {
+              "type": "null"
+            }
+          ]
+        }
+      },
+      "required": [
+        "stackId",
+        "position",
+        "tried",
+        "pendingSwap",
+        "allExhausted",
+        "lastMove"
+      ],
+      "additionalProperties": false
+    },
+    "HarnessLimitReason": {
+      "type": "string",
+      "enum": [
+        "quota",
+        "rate_limit",
+        "insufficient_credits"
+      ]
+    },
+    "HarnessMemberReason": {
+      "type": "object",
+      "properties": {
+        "harnessId": {
+          "type": "string"
+        },
+        "label": {
+          "type": "string"
+        },
+        "reason": {
+          "type": "string"
+        }
+      },
+      "required": [
+        "harnessId",
+        "label",
+        "reason"
+      ],
+      "additionalProperties": false
+    },
+    "TaskReference": {
+      "type": "object",
+      "properties": {
+        "path": {
+          "type": "string"
+        },
+        "isDirectory": {
+          "type": "boolean"
+        }
+      },
+      "required": [
+        "path",
+        "isDirectory"
+      ],
+      "additionalProperties": false
+    },
+    "BacklogMessage": {
+      "type": "object",
+      "properties": {
+        "id": {
+          "type": "string"
+        },
+        "text": {
+          "type": "string"
+        },
+        "references": {
+          "type": "array",
+          "items": {
+            "$ref": "#/definitions/TaskReference"
+          }
+        },
+        "createdAt": {
+          "type": "number"
+        }
+      },
+      "required": [
+        "id",
+        "text",
+        "references",
+        "createdAt"
+      ],
+      "additionalProperties": false
+    },
+    "TaskDraft": {
+      "type": "object",
+      "properties": {
+        "text": {
+          "type": "string"
+        },
+        "references": {
+          "type": "array",
+          "items": {
+            "$ref": "#/definitions/TaskReference"
+          }
+        }
+      },
+      "required": [
+        "text",
+        "references"
+      ],
+      "additionalProperties": false
+    },
+    "TaskPlan": {
+      "type": "object",
+      "properties": {
+        "id": {
+          "type": "string"
+        },
+        "toolCallId": {
+          "type": "string"
+        },
+        "runId": {
+          "type": "string"
+        },
+        "name": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "content": {
+          "type": "string"
+        },
+        "editedContent": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "status": {
+          "type": "string",
+          "enum": [
+            "pending",
+            "approved",
+            "superseded",
+            "rejected"
+          ]
+        },
+        "createdAt": {
+          "type": "number"
+        },
+        "approvedAt": {
+          "type": [
+            "number",
+            "null"
+          ]
+        },
+        "approvedEdited": {
+          "type": "boolean"
+        },
+        "filePath": {
+          "type": [
+            "string",
+            "null"
+          ]
+        }
+      },
+      "required": [
+        "id",
+        "toolCallId",
+        "runId",
+        "name",
+        "content",
+        "editedContent",
+        "status",
+        "createdAt",
+        "approvedAt",
+        "approvedEdited",
+        "filePath"
+      ],
+      "additionalProperties": false
+    },
+    "SentFileEntry": {
+      "type": "object",
+      "properties": {
+        "path": {
+          "type": "string"
+        },
+        "size": {
+          "type": [
+            "number",
+            "null"
+          ]
+        },
+        "mediaType": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "isImage": {
+          "type": [
+            "boolean",
+            "null"
+          ]
+        },
+        "sentAt": {
+          "type": "number"
+        },
+        "runId": {
+          "type": "string"
+        }
+      },
+      "required": [
+        "path",
+        "size",
+        "mediaType",
+        "isImage",
+        "sentAt",
+        "runId"
+      ],
+      "additionalProperties": false
+    },
+    "TaskFxRecovery": {
+      "type": "object",
+      "properties": {
+        "state": {
+          "type": "string",
+          "const": "paused"
+        },
+        "runId": {
+          "type": "string"
+        },
+        "pausedAt": {
+          "type": "number"
+        },
+        "cause": {
+          "type": "string"
+        },
+        "attempt": {
+          "type": "number"
+        },
+        "attemptLimit": {
+          "type": "number"
+        },
+        "message": {
+          "type": "string"
+        },
+        "autoResume": {
+          "anyOf": [
+            {
+              "type": "object",
+              "properties": {
+                "at": {
+                  "type": "number"
+                },
+                "attempt": {
+                  "type": "number"
+                },
+                "max": {
+                  "type": "number"
+                },
+                "delaySec": {
+                  "type": "number"
+                }
+              },
+              "required": [
+                "at",
+                "attempt",
+                "max",
+                "delaySec"
+              ],
+              "additionalProperties": false
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "autoResumeCount": {
+          "type": "number"
+        },
+        "autoResumeStopped": {
+          "type": "string",
+          "enum": [
+            "exhausted",
+            "cancelled",
+            "disabled",
+            "failed"
+          ]
+        }
+      },
+      "required": [
+        "state",
+        "runId",
+        "pausedAt",
+        "autoResume",
+        "autoResumeCount"
+      ],
+      "additionalProperties": false
+    },
+    "TaskRepository": {
+      "type": "object",
+      "properties": {
+        "path": {
+          "type": "string"
+        },
+        "name": {
+          "type": "string"
+        },
+        "branch": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "branchSource": {
+          "type": "string",
+          "enum": [
+            "created",
+            "existing"
+          ]
+        },
+        "worktreePath": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "baseRef": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "checkoutBranch": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "prUrl": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "prs": {
+          "type": "array",
+          "items": {
+            "$ref": "#/definitions/TaskPr"
+          }
+        },
+        "baseBranch": {
+          "type": [
+            "string",
+            "null"
+          ]
+        }
+      },
+      "required": [
+        "path",
+        "name",
+        "branch",
+        "branchSource",
+        "worktreePath",
+        "baseRef",
+        "checkoutBranch",
+        "prUrl"
+      ],
+      "additionalProperties": false
+    },
+    "ImportedClaudeSession": {
+      "type": "object",
+      "properties": {
+        "sessionId": {
+          "type": "string"
+        },
+        "gitBranch": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "importedAt": {
+          "type": "number"
+        },
+        "configDir": {
+          "type": "string"
+        },
+        "status": {
+          "type": "string",
+          "enum": [
+            "importing",
+            "ready",
+            "failed"
+          ]
+        },
+        "backfillOffset": {
+          "type": "number"
+        },
+        "error": {
+          "type": [
+            "string",
+            "null"
+          ]
+        }
+      },
+      "required": [
+        "sessionId",
+        "gitBranch",
+        "importedAt",
+        "configDir",
+        "status",
+        "backfillOffset",
+        "error"
+      ],
+      "additionalProperties": false
+    },
+    "ImportedOpencodeSession": {
+      "type": "object",
+      "properties": {
+        "sessionId": {
+          "type": "string"
+        },
+        "harnessId": {
+          "type": "string"
+        },
+        "directory": {
+          "type": "string"
+        },
+        "importedAt": {
+          "type": "number"
+        },
+        "status": {
+          "type": "string",
+          "enum": [
+            "importing",
+            "ready",
+            "failed"
+          ]
+        },
+        "error": {
+          "type": [
+            "string",
+            "null"
+          ]
+        }
+      },
+      "required": [
+        "sessionId",
+        "harnessId",
+        "directory",
+        "importedAt",
+        "status",
+        "error"
+      ],
+      "additionalProperties": false
+    }
+  },
+  "$id": "https://agetor.dev/schemas/remote/routes/Task.json",
+  "title": "Task"
+}

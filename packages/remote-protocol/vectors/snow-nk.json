@@ -1,0 +1,37 @@
+{
+  "source": "https://github.com/mcginty/snow/blob/main/tests/vectors/snow.txt",
+  "license": "Apache-2.0 OR MIT",
+  "retrieved": "2026-11-25",
+  "note": "Ciphertexts only: snow's file has no handshake hash and no NKpsk0 vector for this suite (investigation spike, grill C5).",
+  "vectors": [
+    {
+      "protocol_name": "Noise_NK_25519_ChaChaPoly_SHA256",
+      "init_prologue": "5468657265206973206e6f20726967687420616e642077726f6e672e2054686572652773206f6e6c792066756e20616e6420626f72696e672e",
+      "init_psks": [],
+      "init_ephemeral": "1b0c2affa2a0ba57c3d96a2b5def1671aa00f66a46d306618a2546a6757f5f65",
+      "init_remote_static": "a1685fa10096ad890ba2427ef08d85c44ffe7b1990ebb6ed7555f57b248b9319",
+      "resp_prologue": "5468657265206973206e6f20726967687420616e642077726f6e672e2054686572652773206f6e6c792066756e20616e6420626f72696e672e",
+      "resp_psks": [],
+      "resp_static": "eb80faf5ebe8437d8edacb3bd95d0718a4eb3e5de6f835bca4d7e161301a563e",
+      "resp_ephemeral": "908f7161432df9036325367c1592ca275fea9a44cdf70d4f3135e16d0034dedc",
+      "messages": [
+        {
+          "payload": "6b2da7554f3d4b8a27f371a0b2fb0d1b9c4830ea29e804b05d698f3f302740f4",
+          "ciphertext": "1c83e1721fadb9fc168e67da9d25503aa286e42d7d35b80c73096d29cce503096ee5516c7bd399fb1f8b0f2affa71e262626c7eb957069a46177f86530217aac9d18bbb78c297d3de7b651995c6783cc"
+        },
+        {
+          "payload": "0216bdac2fb32a7c53d9c4711e3ed995c2e856d19fb1ed465cc88efd4f347e6f",
+          "ciphertext": "d514c7509ba675f32aaaaef759846609383fb36f6081a3aed84737c800a3127c66ebfa61ba8ee2a58b5074e40e3c0ce02ac02c30f3b6afd9ace9fcc4494485e7e3e545d05f5e9f1336ab5cd9f0d8eb54"
+        },
+        {
+          "payload": "0497dfc21ec4d70f04ffc7094b9467808c043d027c87d410b62e1af3dc791dce",
+          "ciphertext": "5bd6fb7c4fd75dd4d15b6600c8df4a59509709a97affb19f4e4a72e62dc8459f89361ae710a9fd58545eee4ceb37ec01"
+        },
+        {
+          "payload": "874ba1f2539061f556a212f83c7a96faf33a451aa75099ef8a9b2aeb54c48f36",
+          "ciphertext": "1f7b7dd2a4992441bc91b6996b0079c3b0747e5aa8dc2443b1fe01331d57644647bbef13cda29f0abc9836739df52fff"
+        }
+      ]
+    }
+  ]
+}

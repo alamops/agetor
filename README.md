@@ -293,7 +293,7 @@ agetor export --all --out f  # Agents and/or Pipelines to a JSON file (--profile
 agetor import <file>         # preview + confirm, then import (--dry-run, --yes, --harness-map <from>=<to>, --enable-harnesses)
 agetor daemon status|start|stop            # the headless core (status also shows the background state)
 agetor daemon background [status|off]     # "Keep Agetor running in the background" (on is app-only)
-agetor remote [status|off]   # remote access (preview): read it or turn it off (on is app-only)
+agetor remote [status|off|devices|revoke <device>|revoke-all --yes|log]   # remote access: read it, turn it off, list or revoke phones, read the audit log (on and pairing are app-only)
 agetor config [key] [value]  # view or set preferences
 ```
 
@@ -317,7 +317,7 @@ By default a core only runs while the app is open (or a CLI daemon is up for fiv
 - **Canary and dev builds** run against `~/.agetor-dev` and port `4318` (not `~/.agetor` and `4317`) and register their own login item, `sh.alamops.agetor.canary.daemon`, so trying one never touches your real data. A canary and the release share one row in Login Items.
 - **Logs.** The background core writes to `daemon.log` in the data directory, and the login item's own state to `login-daemon.json` (informational only). `agetor daemon status` prints the core, the background state and the last log lines.
 
-**Remote access (preview).** **Agetor › Remote Access…** opens a native confirmation box, the only way to turn remote access on, and turning it on also turns on the background switch. Nothing can pair yet, so for now it only records the intent. You can read or turn it off from Settings, `agetor remote status|off` and `GET`/`DELETE /remote-access`. No HTTP route, `agetor` command or preference write can turn it on, so an agent can't open your Mac to a remote client.
+**Remote access.** **Agetor › Remote Access…** opens a native confirmation box, the only way to turn remote access on, and turning it on also turns on the background switch. **Agetor › Pair a Phone…** (only in a build that ships the Companion) opens the key helper's own window: you scan its QR code with the Agetor Companion app, type the code the phone shows, choose what that phone may do (look, answer, operate or open a terminal) and confirm with Touch ID. Phones talk to your Mac through an encrypted relay that only ever sees ciphertext, every approval that can run code is signed on the phone over the exact content it showed, and every action is written to a tamper-evident log. In **Settings › Remote access** you can see the phones, revoke one or all, read the log and name this Mac; `agetor remote` does the same from the terminal. No HTTP route, `agetor` command or preference write can turn remote access on, pair a phone or raise its level, so an agent can't open your Mac to a remote client. See [docs/architecture/remote-gateway.md](docs/architecture/remote-gateway.md).
 
 ---
 
@@ -399,12 +399,13 @@ Most settings live in the app under **Settings**: General, Harnesses, Stacks, Ag
 | `AGETOR_LOGIN_DAEMON_CORE` | Test seam: the core entry the login item's supervisor runs instead of the bundled one. | unset |
 | `AGETOR_LOGIN_DAEMON_TICK_MS` / `AGETOR_LOGIN_DAEMON_HANDOFF_GRACE_MS` / `AGETOR_LOGIN_DAEMON_UPDATE_GRACE_MS` | Test seams: the supervisor's tick (default 1 s), its wait after the app hands the core back (15 s) and after an update (30 s). | `1000` / `15000` / `30000` |
 | `AGETOR_FAKE_LOGIN_ITEM` / `AGETOR_FAKE_REMOTE_ACCESS` | Test seams (set `AGETOR_FAKE_LOGIN_ITEM=1`): replace the macOS login item with a file-backed fake, and start with remote access `on`. | unset |
+| `AGETOR_FAKE_KEY_HELPER` / `AGETOR_FAKE_KEY_HELPER_DIR` / `AGETOR_REMOTE_RELAY_URL` / `AGETOR_REMOTE_PUSH_URL` | Companion test seams: the in-process fake key helper (and its state directory) and the relay and push gateway addresses. Honored only outside a release build and only under `NODE_ENV=test` or `AGETOR_E2E_HARNESS_SEAMS=1`; a release bundle contains none of them. | unset |
 
 The bin, home and env overrides you set per harness in Settings take precedence over these variables. The CLI honors `AGETOR_DATA_DIR` and `AGETOR_API_PORT` too, and so do its `--data-dir` and `--port` flags. Test-only switches (fake drivers, API stubs) are documented in [`CLAUDE.md`](./CLAUDE.md) and the per-harness docs in [`docs/architecture/`](./docs/architecture).
 
 **Running headless in a container.** The API binds to `127.0.0.1` by default, and a Docker port mapping can't reach a loopback-only listener inside the container. Set `AGETOR_API_HOST=0.0.0.0` (or `::`) in the container so the published port works. The headless core (`agetor daemon`) accepts only `127.0.0.1`, `0.0.0.0` or `::`, and refuses to start on anything else: the CLI inside the container connects over `127.0.0.1`, which a specific address such as the container's own IP, or `localhost`/`::1` (IPv6-only), would break. The desktop app always stays on `127.0.0.1`.
 
-A wildcard bind is protected **only by the bearer tokens**, and the API speaks plain HTTP, so they travel in cleartext. Agetor logs a warning about this at startup. Publish the port to `127.0.0.1` on the host so nothing beyond your machine can reach it, and never publish it more widely. For remote access, use an SSH tunnel or a TLS-terminating proxy:
+A wildcard bind is protected **only by the bearer tokens**, and the API speaks plain HTTP, so they travel in cleartext. Agetor logs a warning about this at startup. Publish the port to `127.0.0.1` on the host so nothing beyond your machine can reach it, and never publish it more widely. To reach the API from another machine, use an SSH tunnel or a TLS-terminating proxy (the Companion app does not use this port at all: it connects through an encrypted relay, and the gateway adds no listener):
 
 ```bash
 docker run -e AGETOR_API_HOST=0.0.0.0 -p 127.0.0.1:4317:4317 <your-agetor-image>

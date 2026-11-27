@@ -183,6 +183,103 @@ export async function verifyBackgroundLayout(app: string): Promise<LayoutCheck[]
   return checks;
 }
 
+// --- the Companion's key helper and the dark release -----------------------------------------------------------------------
+
+/** Where the key helper lives in the inner bundle: with the other nested helpers, never in Contents/MacOS (electrobun would re-sign it). */
+const KEYHELPER_REL = "Contents/Resources/app/bin/AgetorKeyHelper.app";
+const KEYHELPER_GROUP_SUFFIX = "sh.alamops.agetor.keyhelper";
+
+type RunFn = (cmd: string[]) => Promise<{ code: number; out: string }>;
+
+/** The team a decoded provisioning profile (`security cms -D`) names. */
+export function profileTeamId(decoded: string): string | null {
+  return /<key>TeamIdentifier<\/key>\s*<array>\s*<string>([A-Z0-9]{10})<\/string>/.exec(decoded)?.[1] ?? null;
+}
+
+/**
+ * The key helper's packaging in one built inner .app: at Contents/Resources/app/bin (not in Contents/MacOS), `codesign --verify --strict`,
+ * the embedded profile's team equal to the signature's team, and the keychain entitlement for that team's group. Fails closed: a missing
+ * helper, a missing profile or an unreadable signature is a failed check. `run` is injectable so tests need no signed bundle.
+ */
+export async function verifyKeyHelperLayout(app: string, deps: { run?: RunFn } = {}): Promise<LayoutCheck[]> {
+  const run = deps.run ?? runCode;
+  const checks: LayoutCheck[] = [];
+  const add = (name: string, ok: boolean, detail?: string) => checks.push({ name, ok, detail });
+
+  const wrongPlace = join(app, "Contents", "MacOS", "AgetorKeyHelper.app");
+  add("key helper not in Contents/MacOS", !existsSync(wrongPlace), existsSync(wrongPlace) ? "found in Contents/MacOS: electrobun would re-sign it and drop its profile" : "ok");
+  const helper = join(app, KEYHELPER_REL);
+  if (!existsSync(helper)) {
+    add("key helper exists", false, `${KEYHELPER_REL} is missing`);
+    return checks;
+  }
+  add("key helper exists", true, KEYHELPER_REL);
+
+  const verify = await run(["codesign", "--verify", "--strict", "--verbose=2", helper]);
+  add("key helper signature valid", verify.code === 0, verify.code === 0 ? "codesign --verify --strict" : verify.out);
+
+  const profile = join(helper, "Contents", "embedded.provisionprofile");
+  if (!existsSync(profile)) {
+    add("key helper profile embedded", false, "Contents/embedded.provisionprofile is missing");
+    return checks;
+  }
+  add("key helper profile embedded", true, "Contents/embedded.provisionprofile");
+
+  const sig = await run(["codesign", "-dvv", helper]);
+  const sigTeam = sig.out.match(/TeamIdentifier=(.+)/)?.[1] ?? "(none)";
+  const decoded = await run(["security", "cms", "-D", "-i", profile]);
+  const profTeam = decoded.code === 0 ? profileTeamId(decoded.out) : null;
+  add("key helper team matches its profile", profTeam !== null && profTeam === sigTeam, `signature ${sigTeam}, profile ${profTeam ?? "(unreadable)"}`);
+  add("key helper team is the release team", sigTeam === TEAM_ID, `TeamIdentifier=${sigTeam}, expected ${TEAM_ID}`);
+
+  const ent = await run(["codesign", "-d", "--entitlements", ":-", helper]);
+  const group = `${sigTeam}.${KEYHELPER_GROUP_SUFFIX}`;
+  add("key helper keychain entitlement", ent.out.includes("keychain-access-groups") && ent.out.includes(group), `keychain-access-groups with ${group}`);
+  return checks;
+}
+
+/** Strings that must never reach a release bundle: the test seams. (`AGETOR_FAKE_KEY_HELPER` also covers `…_DIR`.) */
+export const RELEASE_FORBIDDEN_STRINGS = ["AGETOR_FAKE_KEY_HELPER", "AGETOR_REMOTE_RELAY_URL", "AGETOR_REMOTE_PUSH_URL"] as const;
+/** Emitted by the gateway only when the Companion is compiled in (`src/bun/remote/gateway.ts`, an inline define guard). */
+export const COMPANION_MARKER = "agetor-companion-compiled-in";
+
+async function bundleFiles(app: string): Promise<string[]> {
+  const files: string[] = [join(app, "Contents/Resources/app/bun/index.js")];
+  const daemon = join(app, "Contents/Resources/app/daemon");
+  if (existsSync(daemon)) for (const n of await readdir(daemon)) if (n.endsWith(".js")) files.push(join(daemon, n));
+  const cli = join(app, "Contents/Resources/app/bin/agetor");
+  if (existsSync(cli)) files.push(cli);
+  return files;
+}
+
+/**
+ * The shipped JS holds no test seam and, in a dark release, no Companion: the main bundle, every daemon bundle and the CLI binary (when
+ * bundled) contain none of the seam env names, and the companion marker is absent unless this is a Companion build (`companion: true`, from
+ * AGETOR_COMPANION_BUILD=1, where it must be present). A missing main bundle is a failure: nothing is assumed.
+ */
+export async function verifyReleaseBundles(app: string, opts: { companion?: boolean } = {}): Promise<LayoutCheck[]> {
+  const checks: LayoutCheck[] = [];
+  const add = (name: string, ok: boolean, detail?: string) => checks.push({ name, ok, detail });
+  const main = join(app, "Contents/Resources/app/bun/index.js");
+  if (!existsSync(main)) {
+    add("main bundle exists", false, "Contents/Resources/app/bun/index.js is missing");
+    return checks;
+  }
+  for (const file of await bundleFiles(app)) {
+    const rel = file.slice(app.length + 1);
+    const text = Buffer.from(await Bun.file(file).arrayBuffer()).toString("latin1");
+    const found = RELEASE_FORBIDDEN_STRINGS.filter((s) => text.includes(s));
+    add(`no test seam in ${rel}`, found.length === 0, found.length ? `contains ${found.join(", ")}` : "clean");
+    const hasMarker = text.includes(COMPANION_MARKER);
+    if (rel.endsWith("bun/index.js")) {
+      add(opts.companion ? "companion compiled in" : "companion compiled out", hasMarker === (opts.companion === true), hasMarker ? "the marker is present" : "no marker");
+    } else if (!opts.companion) {
+      add(`no companion in ${rel}`, !hasMarker, hasMarker ? "the marker is present" : "no marker");
+    }
+  }
+  return checks;
+}
+
 function printChecks(checks: LayoutCheck[], indent: string): boolean {
   let allOk = true;
   for (const c of checks) {
@@ -237,7 +334,7 @@ async function verifyArtifacts() {
     // Agetor-<arch>.dmg ↔ build/<env>-macos-<arch>/Agetor.app
     const archMatch = dmgName.match(/-(arm64|x64)\.dmg$/);
     if (!archMatch) fail(`cannot parse arch from ${dmgName}`);
-    const arch = archMatch[1];
+    const arch = archMatch[1] as string;
     const buildSubdir = buildEntries.find((d) => d.endsWith(`-macos-${arch}`));
     if (!buildSubdir) fail(`no build/<env>-macos-${arch} directory for ${dmgName}`);
     const app = join(buildDir, buildSubdir, `${APP_NAME}.app`);
@@ -287,6 +384,21 @@ async function verifyArtifacts() {
       await rm(inner.root, { recursive: true, force: true });
     }
 
+    // The key helper's packaging and the dark-release check: same inner bundle.
+    const inner2 = await extractInnerApp(app);
+    try {
+      console.log("    key helper (inner bundle):");
+      const helperChecks = await verifyKeyHelperLayout(inner2.app);
+      const bundleChecks = await verifyReleaseBundles(inner2.app, { companion: process.env.AGETOR_COMPANION_BUILD === "1" });
+      const ok = printChecks(helperChecks, "      ") && printChecks(bundleChecks, "      ");
+      if (!ok) {
+        const bad = [...helperChecks, ...bundleChecks].filter((c) => !c.ok).map((c) => `${c.name}: ${c.detail ?? ""}`);
+        fail(`the Companion packaging is wrong:\n   • ${bad.join("\n   • ")}`);
+      }
+    } finally {
+      await rm(inner2.root, { recursive: true, force: true });
+    }
+
     const spctl = await run(["spctl", "--assess", "--type", "execute", "-vv", app]);
     if (!spctl.includes("accepted") || !spctl.includes("Notarized Developer ID")) {
       fail(`Gatekeeper did not accept the app:\n${spctl}`);
@@ -299,7 +411,7 @@ async function verifyArtifacts() {
     }
     console.log("    stapler:   ticket valid on DMG");
 
-    const sha = (await run(["shasum", "-a", "256", dmg])).split(/\s+/)[0];
+    const sha = (await run(["shasum", "-a", "256", dmg])).split(/\s+/)[0] ?? "";
     const size = (await stat(dmg)).size;
     summary.push({ dmg, arch, size, sha });
   }

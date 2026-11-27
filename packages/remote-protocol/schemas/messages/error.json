@@ -1,0 +1,38 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://agetor.dev/schemas/remote/messages/error.json",
+  "title": "error",
+  "x-direction": "core",
+  "type": "object",
+  "properties": {
+    "id": {
+      "anyOf": [
+        {
+          "type": "string",
+          "maxLength": 64,
+          "minLength": 1,
+          "pattern": "^[A-Za-z0-9._:~-]+$"
+        },
+        {
+          "type": "null"
+        }
+      ]
+    },
+    "code": {
+      "type": "string",
+      "maxLength": 64,
+      "minLength": 1,
+      "pattern": "^[a-z0-9-]+$"
+    },
+    "message": {
+      "type": "string",
+      "maxLength": 400
+    }
+  },
+  "required": [
+    "id",
+    "code",
+    "message"
+  ],
+  "additionalProperties": false
+}

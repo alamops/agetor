@@ -1,0 +1,100 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://agetor.dev/schemas/remote/messages/task-event.json",
+  "title": "task-event",
+  "x-direction": "core",
+  "type": "object",
+  "properties": {
+    "sub": {
+      "type": "string",
+      "maxLength": 64,
+      "minLength": 1,
+      "pattern": "^[A-Za-z0-9._:~-]+$"
+    },
+    "event": {
+      "type": "object",
+      "properties": {
+        "id": {
+          "type": "integer",
+          "minimum": 0,
+          "maximum": 9007199254740991
+        },
+        "runId": {
+          "type": "string",
+          "maxLength": 128,
+          "minLength": 1,
+          "pattern": "^[A-Za-z0-9._:~-]+$"
+        },
+        "taskId": {
+          "type": "string",
+          "maxLength": 128,
+          "minLength": 1,
+          "pattern": "^[A-Za-z0-9._:~-]+$"
+        },
+        "stream": {
+          "type": "string",
+          "maxLength": 32,
+          "minLength": 1
+        },
+        "data": {
+          "type": "string",
+          "maxLength": 67108864
+        },
+        "ts": {
+          "type": "integer",
+          "minimum": 0,
+          "maximum": 253402300799999
+        },
+        "subagentId": {
+          "anyOf": [
+            {
+              "type": "string",
+              "maxLength": 128,
+              "minLength": 1,
+              "pattern": "^[A-Za-z0-9._:~-]+$"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        }
+      },
+      "required": [
+        "runId",
+        "taskId",
+        "stream",
+        "data",
+        "ts"
+      ],
+      "additionalProperties": false
+    },
+    "parsed": {
+      "description": "any JSON value, at most 1048576 characters when serialized"
+    },
+    "truncated": {
+      "type": "object",
+      "properties": {
+        "eventId": {
+          "type": "integer",
+          "minimum": 0,
+          "maximum": 9007199254740991
+        },
+        "fullBytes": {
+          "type": "integer",
+          "minimum": 0,
+          "maximum": 9007199254740991
+        }
+      },
+      "required": [
+        "eventId",
+        "fullBytes"
+      ],
+      "additionalProperties": false
+    }
+  },
+  "required": [
+    "sub",
+    "event"
+  ],
+  "additionalProperties": false
+}

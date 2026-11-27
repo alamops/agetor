@@ -328,14 +328,18 @@ test("archiveTask detaches the worktree from disk but keeps branch + DB pointers
   }
 });
 
-test("archiveTask keeps a dirty worktree on disk instead of discarding uncommitted work", async () => {
+test("archiveTask refuses a dirty worktree until confirmed, then removes it from disk", async () => {
+  // Same flow as the desktop's "Discard & archive" confirm
+  // (docs/architecture/task-lifecycle.md item 7): a plain archive is refused
+  // before anything changes, and the confirmed retry (forceWorktree) removes
+  // the checkout, uncommitted change included, and keeps the branch.
   const { createTask, archiveTask } = await import("./orchestrator.ts");
   const { prepareWorkdir } = await import("./worktree.ts");
   const { db, tasks } = await import("./db.ts");
 
   const repo = await makeRepo();
   const created = await createTask({
-    title: "archive skips dirty worktree",
+    title: "archive confirms dirty worktree",
     prompt: "p",
     agent: "claude-code",
     workdir: repo,
@@ -351,17 +355,20 @@ test("archiveTask keeps a dirty worktree on disk instead of discarding uncommitt
     tasks.update(taskId, { column: "done" });
 
     const worktreePath = prepared.worktreePath!;
-    // Uncommitted change — `git worktree remove --force` would otherwise
-    // silently destroy it, so detach must skip removal.
     writeFileSync(path.join(worktreePath, "uncommitted.txt"), "work in progress\n");
 
-    const archived = await archiveTask(taskId);
-    expect("task" in archived).toBe(true);
-    if (!("task" in archived)) throw new Error(archived.error);
-    expect(archived.task.archivedAt).not.toBeNull();
+    const refused = await archiveTask(taskId);
+    expect("task" in refused).toBe(false);
+    expect("code" in refused && refused.code).toBe("uncommitted-changes");
+    expect(tasks.get(taskId)?.archivedAt).toBeNull();
+    expect(existsSync(path.join(worktreePath, "uncommitted.txt"))).toBe(true);
 
-    // Dirty-skip: the checkout stays on disk.
-    expect(existsSync(worktreePath)).toBe(true);
+    const confirmed = await archiveTask(taskId, { forceWorktree: true, awaitTeardown: true });
+    if (!("task" in confirmed)) throw new Error(confirmed.error);
+    expect(confirmed.task.archivedAt).not.toBeNull();
+    expect(existsSync(worktreePath)).toBe(false);
+    const branches = Bun.spawnSync(["git", "branch", "--list", prepared.branch!], { cwd: repo });
+    expect(branches.stdout.toString()).toContain(prepared.branch!);
   } finally {
     db.run(`DELETE FROM tasks WHERE id = ?`, [taskId]);
   }

@@ -181,8 +181,9 @@ describe("route coverage (server.ts ↔ ROUTE_POLICY)", () => {
     expect(pub).toEqual(["/health"]);
   });
 
-  it("every entry carries remote: none and conditional is only used on the test-only routes", () => {
-    for (const { policy } of policyEntries()) expect(policy.remote).toBe("none");
+  it("a remote policy only sits on an app+cli route, and conditional is only used on the test-only routes", () => {
+    // The exact set of remote routes and their levels is pinned in route-policy-remote.test.ts.
+    for (const { policy } of policyEntries()) if (policy.remote !== "none") expect(policy.callers).toBe("app+cli");
     const conditional = policyEntries().filter((e) => e.policy.conditional).map((e) => `${e.method} ${e.key}`);
     expect(conditional).toEqual(["POST /test/block-event-loop", "POST /test/drop-task-streams"]);
   });
@@ -195,7 +196,6 @@ describe("route coverage (server.ts ↔ ROUTE_POLICY)", () => {
 // Plan §3 "Desktop-only set" (D9, P7). Keep this list literal: it is the
 // reviewable statement of what the CLI token cannot reach.
 const DESKTOP_ONLY = [
-  "DELETE /notifications/:taskId",
   "DELETE /terminals/:id",
   "GET /files/preview",
   "GET /tasks/:id/diff/blob",
@@ -227,6 +227,7 @@ const DESKTOP_ONLY = [
   "POST /updates/check",
   "POST /window/focus",
   "POST /window/toggle-zoom",
+  "PUT /app/presence",
 ].sort();
 
 // Desktop-only routes whose handler answers 501 first when `native` is absent
@@ -240,7 +241,6 @@ const DESKTOP_ONLY = [
 // flag only changes the CLI token's answer, so the seam stays reachable for the
 // master.
 const HEADLESS_501 = [
-  "DELETE /notifications/:taskId",
   "GET /updates/status",
   "POST /app/force-quit",
   "POST /background",
@@ -306,7 +306,10 @@ describe("harness-stack fix-round routes", () => {
       const entry = ROUTE_POLICY[key] as Record<string, RoutePolicy>;
       expect(Object.keys(entry).sort()).toEqual([...methods].sort());
       for (const m of methods) {
-        expect(entry[m]).toEqual(CLI_POLICY);
+        // switch-account POST is one of the five operate routes of the v1 remote set (grill D12); everything else here is CLI-only.
+        expect(entry[m]).toEqual(key === "/tasks/:id/switch-account" && m === "POST"
+          ? { ...CLI_POLICY, remote: { level: "operate", stepUp: "none", rate: "normal", since: 1 } }
+          : CLI_POLICY);
         expect(resolveCaller(req(`http://x${key}`, { token: CLI_TOKEN }), entry[m]!)).toBe("cli");
         expect(resolveCaller(req(`http://x${key}`, { token: API_TOKEN }), entry[m]!)).toBe("app");
         expect(resolveCaller(req(`http://x${key}`), entry[m]!)).toBeNull();
@@ -439,6 +442,10 @@ describe("desktop-only set", () => {
       ["POST", "/background/start"],
       ["GET", "/remote-access"],
       ["DELETE", "/remote-access"],
+      ["GET", "/remote-access/devices"],
+      ["DELETE", "/remote-access/devices"],
+      ["DELETE", "/remote-access/devices/:id"],
+      ["GET", "/remote-access/log"],
       ["GET", "/info"],
       ["GET", "/github/issue-thread"],
       ["POST", "/refs/resolve"],
@@ -465,7 +472,12 @@ describe("route vocabulary", () => {
   // family whose name may contain "remote-access", and only to READ or turn it
   // OFF. Turning it on is the native box's job, so no POST/PUT/PATCH may ever
   // sit under it (asserted below).
-  const REMOTE_ACCESS_ALLOWLIST: Record<string, string[]> = { "/remote-access": ["GET", "DELETE"] };
+  const REMOTE_ACCESS_ALLOWLIST: Record<string, string[]> = {
+    "/remote-access": ["GET", "DELETE"],
+    "/remote-access/devices": ["GET", "DELETE"],
+    "/remote-access/devices/:id": ["DELETE"],
+    "/remote-access/log": ["GET"],
+  };
 
   it("no path segment looks like pairing, devices or remote access, except the allowlisted read/off routes", () => {
     const bad: string[] = [];
@@ -478,16 +490,30 @@ describe("route vocabulary", () => {
     expect(bad).toEqual([]);
   });
 
-  it("the remote-access allowlist is exactly GET and DELETE on /remote-access (no way to turn it on over HTTP)", () => {
-    expect(Object.keys(REMOTE_ACCESS_ALLOWLIST)).toEqual(["/remote-access"]);
-    const entry = ROUTE_POLICY["/remote-access"];
-    expect(entry).toBeDefined();
-    expect(Object.keys(entry as Record<string, unknown>).sort()).toEqual(["DELETE", "GET"]);
-    // No other key may carry a remote segment either.
-    const remoteKeys = Object.keys(ROUTE_POLICY).filter((k) =>
-      k.split("/").some((seg) => /^(remote|remote-access)$/i.test(seg)),
+  it("D19: under /remote-access only GET (read) and DELETE (revoke, off) exist; no POST, PUT or PATCH, so nothing pairs, turns it on or raises a level over HTTP", () => {
+    expect(Object.keys(REMOTE_ACCESS_ALLOWLIST).sort()).toEqual(["/remote-access", "/remote-access/devices", "/remote-access/devices/:id", "/remote-access/log"]);
+    for (const [key, methods] of Object.entries(REMOTE_ACCESS_ALLOWLIST)) {
+      const entry = ROUTE_POLICY[key];
+      expect(entry, key).toBeDefined();
+      expect(Object.keys(entry as Record<string, unknown>).sort(), key).toEqual([...methods].sort());
+    }
+    // No method that writes may sit under /remote-access, whatever its depth.
+    const writes = Object.entries(ROUTE_POLICY).flatMap(([key, entry]) =>
+      key === "/remote-access" || key.startsWith("/remote-access/")
+        ? Object.keys(entry as Record<string, unknown>).filter((m) => ["POST", "PUT", "PATCH"].includes(m)).map((m) => `${m} ${key}`)
+        : [],
     );
-    expect(remoteKeys).toEqual(["/remote-access"]);
+    expect(writes).toEqual([]);
+    // No other key may carry a remote segment either.
+    const remoteKeys = Object.keys(ROUTE_POLICY).filter((k) => k.split("/").some((seg) => /^(remote|remote-access)$/i.test(seg)));
+    expect(remoteKeys.sort()).toEqual(Object.keys(REMOTE_ACCESS_ALLOWLIST).sort());
+  });
+
+  it("the phone terminal's Detach and the presence report are not pairing routes: their names pass the vocabulary rule", () => {
+    for (const key of ["/tasks/:id/phone-terminal", "/app/presence"]) {
+      expect(ROUTE_POLICY[key], key).toBeDefined();
+      for (const segment of key.split("/").filter(Boolean)) expect(BANNED_SEGMENT.test(segment), `${key} (${segment})`).toBe(false);
+    }
   });
 
   it("no route is named for permissions, except the allowlisted read-only ones", () => {
@@ -639,6 +665,10 @@ describe("routes the CLI (and the daemon handoff) call", () => {
       "POST /background/start",
       "GET /remote-access",
       "DELETE /remote-access",
+      "GET /remote-access/devices",
+      "DELETE /remote-access/devices",
+      "DELETE /remote-access/devices/:id",
+      "GET /remote-access/log", // trailing ${qs}
       // `agetor` repository removal (AgetorClient.removeTaskRepository).
       "DELETE /tasks/:id/repositories/:name",
     ]) {
@@ -759,6 +789,7 @@ describe("path-valued fields (D24)", () => {
       "GET /agent-discovery: query.workdir(exists)",
       "GET /files/index: query.dir(exists)",
       "GET /projects/branches: query.path(exists)",
+      "GET /tasks/:id/files/preview: query.path(exists)",
       "PATCH /harnesses/:id: body.home(nearest-ancestor), body.bin(exists)",
       "PATCH /tasks/:id: body.workdir(exists)",
       "POST /harnesses: body.home(nearest-ancestor), body.bin(exists)",

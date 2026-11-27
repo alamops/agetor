@@ -1,0 +1,3 @@
+# Tests live under src/ (unit) and vectors are JSON loaded by those tests.
+[test]
+root = "src"

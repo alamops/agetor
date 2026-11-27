@@ -54,9 +54,13 @@
 import { createHash } from "node:crypto";
 import { mkdir, readdir, rm } from "node:fs/promises";
 import path from "node:path";
+import { buildFlagDefines } from "../src/shared/build-flags.ts";
 
 const REPO_ROOT = path.resolve(import.meta.dir, "..");
-const OUT_DIR = path.join(REPO_ROOT, "vendor", "daemon");
+// `--out <dir>` writes the bundles somewhere else (tests build into a temp dir); the build id is only written for the default dir.
+const OUT_ARG = process.argv.indexOf("--out");
+const CUSTOM_OUT = OUT_ARG >= 0 ? process.argv[OUT_ARG + 1] : undefined;
+const OUT_DIR = CUSTOM_OUT ? path.resolve(CUSTOM_OUT) : path.join(REPO_ROOT, "vendor", "daemon");
 
 const ENTRIES = [
   path.join(REPO_ROOT, "src", "bun", "login-daemon.ts"),
@@ -112,7 +116,7 @@ async function main() {
   await rm(OUT_DIR, { recursive: true, force: true });
   await mkdir(OUT_DIR, { recursive: true });
 
-  const buildId = await writeBuildId();
+  const buildId = CUSTOM_OUT ? await hashSourceTree() : await writeBuildId();
   console.log(`[build-daemon] build id ${buildId}`);
 
   const result = await Bun.build({
@@ -120,6 +124,8 @@ async function main() {
     outdir: OUT_DIR,
     target: "bun",
     naming: "[name].js",
+    // Companion flags (src/shared/build-flags.ts): a release build removes the test seams from these bundles.
+    define: buildFlagDefines(process.env),
   });
 
   if (!result.success) {

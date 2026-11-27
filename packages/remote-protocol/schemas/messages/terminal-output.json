@@ -1,0 +1,26 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://agetor.dev/schemas/remote/messages/terminal-output.json",
+  "title": "terminal-output",
+  "x-direction": "core",
+  "type": "object",
+  "properties": {
+    "taskId": {
+      "type": "string",
+      "maxLength": 128,
+      "minLength": 1,
+      "pattern": "^[A-Za-z0-9._:~-]+$"
+    },
+    "data": {
+      "type": "string",
+      "contentEncoding": "base64",
+      "pattern": "^(?:[A-Za-z0-9+/]{4})*(?:[A-Za-z0-9+/]{2}==|[A-Za-z0-9+/]{3}=)?$",
+      "maxLength": 87386
+    }
+  },
+  "required": [
+    "taskId",
+    "data"
+  ],
+  "additionalProperties": false
+}

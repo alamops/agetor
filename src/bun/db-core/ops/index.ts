@@ -10,6 +10,7 @@ import { orchestratorOps } from "./orchestrator-ops.ts";
 import { retentionOps } from "./retention-ops.ts";
 import { serverOps } from "./server-ops.ts";
 import { deltaOps } from "./delta-ops.ts";
+import { remoteOps } from "./remote-ops.ts";
 
 export { defineOp };
 export type { OpCtx, OpDef };
@@ -40,6 +41,7 @@ export const ops = {
   ...retentionOps,
   ...serverOps,
   ...deltaOps,
+  ...remoteOps,
 };
 
 export type OpRegistry = typeof ops;

@@ -231,7 +231,7 @@ test.describe("Settings → Remote access (preview) row", () => {
     const section = await openBackgroundSection(page, freshBackend);
     const remote = section.getByTestId("remote-access-state");
     await expect(remote).toHaveAttribute("data-enabled", "true", { timeout: 15_000 });
-    await expect(remote).toContainText("nothing can pair with this Mac yet");
+    await expect(remote).toContainText("Paired phones are listed under Remote access below");
     expect(await remoteAccessEnabled(freshBackend, request)).toBe(true);
 
     await section.getByTestId("remote-access-turn-off").click();

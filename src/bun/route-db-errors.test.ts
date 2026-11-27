@@ -51,9 +51,9 @@ afterAll(async () => {
   rpcm.resetDbRpcForTests();
 });
 
-const APP_CLI = { callers: "app+cli" } as const;
+const APP_CLI = { callers: "app+cli", remote: "none" } as const;
 const TABLE = {
-  "/public": { callers: "public" },
+  "/public": { callers: "public", remote: "none" },
   "/flat": APP_CLI,
   "/methods": { GET: APP_CLI, POST: APP_CLI },
 } as const;
