@@ -4380,16 +4380,13 @@ export const ANTIGRAVITY_MODEL_SPECS: Record<string, AntigravityModelSpec> = {
   },
 };
 
-const ANTIGRAVITY_EFFORT_SUFFIX_RE = /-(?:extra-high|xhigh|high|medium|low|max|minimal|none)$/;
-
 /**
  * Resolve an Antigravity `(model, effort)` pair to the exact `--model` id `agy`
  * expects. Discovered `effortIds` extend/override curated `ANTIGRAVITY_MODEL_SPECS`
- * so newly added tiers (e.g. `xhigh`) resolve cleanly; a flat suffixed id
- * (legacy tasks, frozen snapshots, CLI overrides) or an effort-less model
- * (`gemini-pro-orchestrator*`) passes through verbatim. When a discovered-only
- * base model is launched with an explicit effort while the discovery cache is
- * empty, falls back to `${model}-${effort}` so the chosen effort is never lost.
+ * so newly added tiers (e.g. `xhigh`) resolve cleanly; any model with no
+ * resolved effort map — flat legacy ids, effort-less models
+ * (`gemini-pro-orchestrator*`), or unknown ids — passes through verbatim
+ * (mirroring `cursorModelArg`), never inventing an effort suffix.
  */
 export function antigravityModelArg(
   model: string,
@@ -4405,19 +4402,15 @@ export function antigravityModelArg(
     if (v) effortIds[k] = v;
   }
   const keys = Object.keys(effortIds);
-  if (keys.length > 0) {
-    const desiredEffort =
-      effort && effortIds[effort]
-        ? effort
-        : DEFAULT_EFFORT.antigravity && effortIds[DEFAULT_EFFORT.antigravity]
-          ? DEFAULT_EFFORT.antigravity
-          : keys[0];
-    if (!desiredEffort) return model;
-    return effortIds[desiredEffort] ?? model;
-  }
-  if (!effort || ANTIGRAVITY_EFFORT_SUFFIX_RE.test(model)) return model;
-  if (!EFFORT_ID_RE.test(effort)) return model;
-  return `${model}-${effort}`;
+  if (keys.length === 0) return model;
+  const desiredEffort =
+    effort && effortIds[effort]
+      ? effort
+      : DEFAULT_EFFORT.antigravity && effortIds[DEFAULT_EFFORT.antigravity]
+        ? DEFAULT_EFFORT.antigravity
+        : keys[0];
+  if (!desiredEffort) return model;
+  return effortIds[desiredEffort] ?? model;
 }
 
 /**

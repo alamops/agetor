@@ -926,7 +926,7 @@ export function buildCommand(
     const discoveredAntigravity = normalizeAntigravityDiscovered(getDiscoveredModels("antigravity"));
     const discoveredRow = discoveredAntigravity.find((m) => m.id === opts.model);
     const antigravityModel =
-      discoveredRow && !discoveredRow.antigravity?.effortIds
+      discoveredRow && Object.keys(discoveredRow.antigravity?.effortIds ?? {}).length === 0
         ? opts.model
         : antigravityModelArg(opts.model, opts.effort ?? null, discoveredRow?.antigravity);
     args.push("--model", antigravityModel);

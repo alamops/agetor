@@ -650,7 +650,7 @@ test("antigravity unknown / flat / effort-less ids report zero efforts unless di
   ).toEqual(["xhigh", "high", "medium", "low"]);
 });
 
-test("antigravityModelArg composes curated, discovered, fallback, and verbatim flat/effort-less ids", () => {
+test("antigravityModelArg composes curated and discovered maps, and passes effort-less / unknown / flat ids verbatim", () => {
   expect(antigravityModelArg("gemini-4-argon", "high")).toBe("gemini-4-argon-high");
   expect(antigravityModelArg("gemini-4-argon", "low")).toBe("gemini-4-argon-low");
   expect(antigravityModelArg("gemini-4-argon", null)).toBe("gemini-4-argon-high");
@@ -658,14 +658,15 @@ test("antigravityModelArg composes curated, discovered, fallback, and verbatim f
   expect(
     antigravityModelArg("gemini-4-neon", "xhigh", { effortIds: { xhigh: "gemini-4-neon-xhigh", high: "gemini-4-neon-high" } }),
   ).toBe("gemini-4-neon-xhigh");
-  // Cache-empty fallback for a discovered-only base with an explicit effort:
-  expect(antigravityModelArg("gemini-4-neon", "xhigh")).toBe("gemini-4-neon-xhigh");
-  // Legacy flat suffixed ids never double-suffix:
+  // No resolved effort map (effort-less or undiscovered id): never invent a suffix, even if effort is set.
+  expect(antigravityModelArg("gemini-pro-orchestrator", "high")).toBe("gemini-pro-orchestrator");
+  expect(antigravityModelArg("gemini-pro-orchestrator-neon", "high")).toBe("gemini-pro-orchestrator-neon");
+  expect(antigravityModelArg("gemini-pro-orchestrator-neon", null)).toBe("gemini-pro-orchestrator-neon");
+  expect(antigravityModelArg("gemini-4-neon", "xhigh")).toBe("gemini-4-neon");
+  // Legacy flat suffixed ids pass through verbatim:
   expect(antigravityModelArg("gemini-4-argon-high", "high")).toBe("gemini-4-argon-high");
   expect(antigravityModelArg("gemini-4-argon-high", "max")).toBe("gemini-4-argon-high");
   expect(antigravityModelArg("gemini-4-argon-high", null)).toBe("gemini-4-argon-high");
-  // Effort-less models with null effort stay verbatim:
-  expect(antigravityModelArg("gemini-pro-orchestrator-neon", null)).toBe("gemini-pro-orchestrator-neon");
 });
 
 test("DEFAULT_EFFORT.antigravity is a valid EFFORT_OPTIONS id", () => {

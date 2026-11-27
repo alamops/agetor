@@ -363,3 +363,54 @@ test("result event flushes pending ACTIVE deltas without duplicating result.resp
     { stream: "assistant", data: "All done!", lineUuid: "antigravity:step_20" },
   ]);
 });
+
+test("separately flushed fragments of the same step get distinct, replay-stable UUIDs", () => {
+  const runOnce = () => {
+    const seen = new Set<string>();
+    const chunks: Chunk[] = [];
+    const onChunk = (stream: RunEventStream, data: string, lineUuid?: string) => {
+      if (lineUuid) {
+        if (seen.has(lineUuid)) return;
+        seen.add(lineUuid);
+      }
+      chunks.push({ stream, data, lineUuid });
+    };
+    const coalescer = new AntigravityTextCoalescer();
+    // Fragment 0 of step 30
+    mapAntigravityEvent(
+      { event: "step_update", step_update: { step_index: 30, state: "ACTIVE", step_type: "agent_response", text_delta: "Part 1 " } },
+      onChunk,
+      0,
+      false,
+      coalescer,
+    );
+    // Interrupted by an error / non-JSON line flush
+    coalescer.flush(onChunk);
+    onChunk("stdout", "root agent idle; waiting for 1 background task(s) to finish", "antigravity:1");
+    // Fragment 1 of step 30 resumes and finishes
+    mapAntigravityEvent(
+      { event: "step_update", step_update: { step_index: 30, state: "ACTIVE", step_type: "agent_response", text_delta: "Part 2" } },
+      onChunk,
+      2,
+      true,
+      coalescer,
+    );
+    mapAntigravityEvent(
+      { event: "step_update", step_update: { step_index: 30, state: "DONE", step_type: "agent_response", text_delta: "!" } },
+      onChunk,
+      3,
+      true,
+      coalescer,
+    );
+    return chunks;
+  };
+
+  const first = runOnce();
+  const replay = runOnce();
+  expect(first).toEqual(replay);
+  expect(first).toEqual([
+    { stream: "assistant", data: "Part 1 ", lineUuid: "antigravity:step_30" },
+    { stream: "stdout", data: "root agent idle; waiting for 1 background task(s) to finish", lineUuid: "antigravity:1" },
+    { stream: "assistant", data: "Part 2!", lineUuid: "antigravity:step_30:1" },
+  ]);
+});

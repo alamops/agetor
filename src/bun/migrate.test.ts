@@ -2957,27 +2957,28 @@ describe("two connections migrating one database", () => {
   });
 });
 
-test("094_normalize_antigravity_efforts folds flat suffixed antigravity models into base + effort on antigravity-kind rows only, leaving effort-less models and other kinds untouched, idempotently", () => {
+test("094_normalize_antigravity_efforts folds curated flat antigravity models into base + effort on antigravity-kind rows only, leaving discovered-only/-extra-high/effort-less models and other kinds untouched, idempotently", () => {
   const db = new Database(":memory:");
   migrateThrough(db, "093_task_revs");
   db.exec(`
     INSERT INTO harnesses (id, kind, label, is_builtin, created_at, updated_at)
       VALUES ('antigravity-2', 'antigravity', 'Antigravity 2', 0, 1, 1);
     INSERT INTO tasks (id, title, prompt, "column", agent, workdir, model, effort, created_at, updated_at) VALUES
-      ('t1', 't', 'p', 'backlog', 'antigravity', '/w', 'gemini-4-neon-xhigh', NULL, 1, 10),
+      ('t1', 't', 'p', 'backlog', 'antigravity', '/w', 'gemini-4-argon-high', NULL, 1, 10),
       ('t2', 't', 'p', 'backlog', 'antigravity-2', '/w', 'gemini-3.8-flash-high', NULL, 1, 10),
       ('t3', 't', 'p', 'backlog', 'antigravity', '/w', 'gpt-oss-120b-medium', NULL, 1, 10),
       ('t4', 't', 'p', 'backlog', 'antigravity', '/w', 'gemini-pro-orchestrator-neon', NULL, 1, 10),
-      ('t5', 't', 'p', 'backlog', 'antigravity', '/w', 'gemini-pro-orchestrator', NULL, 1, 10),
-      ('t6', 't', 'p', 'backlog', 'claude-code', '/w', 'some-model-high', 'max', 1, 10);
+      ('t5', 't', 'p', 'backlog', 'antigravity', '/w', 'custom-model-extra-high', NULL, 1, 10),
+      ('t6', 't', 'p', 'backlog', 'antigravity', '/w', 'gemini-4-neon-xhigh', NULL, 1, 10),
+      ('t7', 't', 'p', 'backlog', 'claude-code', '/w', 'gemini-4-argon-high', 'max', 1, 10);
     INSERT INTO agent_profiles (id, name, name_key, harness_id, model, effort, instructions, skills_json, created_at, updated_at) VALUES
       ('p1', 'P1', 'p1', 'antigravity', 'gemini-4-argon-low', NULL, '', '[]', 1, 10),
       ('p2', 'P2', 'p2', 'antigravity-2', 'claude-opus-5-5-medium', NULL, '', '[]', 1, 10),
-      ('p3', 'P3', 'p3', 'antigravity', 'gemini-pro-orchestrator-argon', NULL, '', '[]', 1, 10),
-      ('p4', 'P4', 'p4', 'claude-code', 'some-model-high', 'max', '', '[]', 1, 10);
+      ('p3', 'P3', 'p3', 'antigravity', 'custom-model-extra-high', NULL, '', '[]', 1, 10),
+      ('p4', 'P4', 'p4', 'claude-code', 'gemini-4-argon-high', 'max', '', '[]', 1, 10);
     INSERT INTO preferences (key, value, updated_at) VALUES
-      ('lastModel:antigravity', 'gemini-4-neon-xhigh', 42),
-      ('lastModel:claude-code', 'some-model-high', 42);
+      ('lastModel:antigravity', 'gemini-3.8-flash-low', 42),
+      ('lastModel:claude-code', 'gemini-4-argon-high', 42);
   `);
 
   expect(migrate(db, migrations)).toEqual(["094_normalize_antigravity_efforts"]);
@@ -2988,18 +2989,21 @@ test("094_normalize_antigravity_efforts folds flat suffixed antigravity models i
     )
     .all();
   expect(taskRows).toEqual([
-    { id: "t1", model: "gemini-4-neon", effort: "xhigh", updated_at: 10 },
+    { id: "t1", model: "gemini-4-argon", effort: "high", updated_at: 10 },
     { id: "t2", model: "gemini-3.8-flash", effort: "high", updated_at: 10 },
     { id: "t3", model: "gpt-oss-120b", effort: "medium", updated_at: 10 },
     { id: "t4", model: "gemini-pro-orchestrator-neon", effort: null, updated_at: 10 },
-    { id: "t5", model: "gemini-pro-orchestrator", effort: null, updated_at: 10 },
-    { id: "t6", model: "some-model-high", effort: "max", updated_at: 10 },
+    { id: "t5", model: "custom-model-extra-high", effort: null, updated_at: 10 },
+    { id: "t6", model: "gemini-4-neon-xhigh", effort: null, updated_at: 10 },
+    { id: "t7", model: "gemini-4-argon-high", effort: "max", updated_at: 10 },
   ]);
-  // Re-composing via antigravityModelArg yields the exact original CLI ids.
-  expect(antigravityModelArg(taskRows[0]!.model!, taskRows[0]!.effort)).toBe("gemini-4-neon-xhigh");
+  // Every migrated AND unmigrated row still resolves to its exact original CLI id with zero discovery.
+  expect(antigravityModelArg(taskRows[0]!.model!, taskRows[0]!.effort)).toBe("gemini-4-argon-high");
   expect(antigravityModelArg(taskRows[1]!.model!, taskRows[1]!.effort)).toBe("gemini-3.8-flash-high");
   expect(antigravityModelArg(taskRows[2]!.model!, taskRows[2]!.effort)).toBe("gpt-oss-120b-medium");
   expect(antigravityModelArg(taskRows[3]!.model!, taskRows[3]!.effort)).toBe("gemini-pro-orchestrator-neon");
+  expect(antigravityModelArg(taskRows[4]!.model!, taskRows[4]!.effort)).toBe("custom-model-extra-high");
+  expect(antigravityModelArg(taskRows[5]!.model!, taskRows[5]!.effort)).toBe("gemini-4-neon-xhigh");
 
   const profileRows = db
     .query<{ id: string; model: string | null; effort: string | null }, []>(
@@ -3009,17 +3013,17 @@ test("094_normalize_antigravity_efforts folds flat suffixed antigravity models i
   expect(profileRows).toEqual([
     { id: "p1", model: "gemini-4-argon", effort: "low" },
     { id: "p2", model: "claude-opus-5-5", effort: "medium" },
-    { id: "p3", model: "gemini-pro-orchestrator-argon", effort: null },
-    { id: "p4", model: "some-model-high", effort: "max" },
+    { id: "p3", model: "custom-model-extra-high", effort: null },
+    { id: "p4", model: "gemini-4-argon-high", effort: "max" },
   ]);
 
   const prefs = db
     .query<{ key: string; value: string }, []>(`SELECT key, value FROM preferences ORDER BY key`)
     .all();
   expect(prefs).toEqual([
-    { key: "lastEffort:antigravity", value: "xhigh" },
-    { key: "lastModel:antigravity", value: "gemini-4-neon" },
-    { key: "lastModel:claude-code", value: "some-model-high" },
+    { key: "lastEffort:antigravity", value: "low" },
+    { key: "lastModel:antigravity", value: "gemini-3.8-flash" },
+    { key: "lastModel:claude-code", value: "gemini-4-argon-high" },
   ]);
 
   // Idempotent: re-running migration SQL is a no-op.

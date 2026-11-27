@@ -159,6 +159,13 @@ export class AntigravityTextCoalescer {
   private stepIndex: number | undefined;
   private firstLineIndex: number | undefined;
   private text = "";
+  /** Counts previously flushed fragments per `step_index` so if an
+   *  interleaved event (e.g. non-JSON chatter, tool, error) flushes a step
+   *  early and the same `step_index` later emits more `text_delta`s, each
+   *  fragment gets a distinct, replay-stable lineUuid instead of colliding
+   *  with `seenLineUuids` and getting dropped. Uninterrupted steps always get
+   *  count 0 (`antigravity:step_<index>`). */
+  private emittedCountByStep = new Map<number, number>();
 
   pushDelta(
     delta: string,
@@ -193,10 +200,14 @@ export class AntigravityTextCoalescer {
       this.firstLineIndex = undefined;
       return false;
     }
-    const uuid =
-      this.stepIndex !== undefined
-        ? `antigravity:step_${this.stepIndex}`
-        : `antigravity:${this.firstLineIndex ?? 0}`;
+    let uuid: string;
+    if (this.stepIndex !== undefined) {
+      const count = this.emittedCountByStep.get(this.stepIndex) ?? 0;
+      this.emittedCountByStep.set(this.stepIndex, count + 1);
+      uuid = count === 0 ? `antigravity:step_${this.stepIndex}` : `antigravity:step_${this.stepIndex}:${count}`;
+    } else {
+      uuid = `antigravity:${this.firstLineIndex ?? 0}`;
+    }
     const data = this.text;
     this.text = "";
     this.stepIndex = undefined;

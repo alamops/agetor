@@ -1486,18 +1486,48 @@ test("antigravity gemini-3.8-flash-high model id is emitted verbatim via --model
   expect(cmd).not.toContain("--effort");
 });
 
-test("antigravity composes grouped base model + effort into --model <base>-<effort> without --effort", () => {
-  const low = buildCommand(builtin("antigravity"), "hi", { mode: "auto", model: "gemini-4-argon", effort: "low" });
-  expect(low.cmd[low.cmd.indexOf("--model") + 1]).toBe("gemini-4-argon-low");
-  expect(low.cmd).not.toContain("--effort");
+test("antigravity composes grouped base model + effort into --model <base>-<effort> without --effort", async () => {
+  const discovery = await import("./agent-discovery.ts");
+  discovery.__testing.resetForTests();
+  try {
+    const low = buildCommand(builtin("antigravity"), "hi", { mode: "auto", model: "gemini-4-argon", effort: "low" });
+    expect(low.cmd[low.cmd.indexOf("--model") + 1]).toBe("gemini-4-argon-low");
+    expect(low.cmd).not.toContain("--effort");
 
-  const neon = buildCommand(builtin("antigravity"), "hi", { mode: "auto", model: "gemini-4-neon", effort: "xhigh" });
-  expect(neon.cmd[neon.cmd.indexOf("--model") + 1]).toBe("gemini-4-neon-xhigh");
-  expect(neon.cmd).not.toContain("--effort");
+    // Effort-less models stay verbatim even when effort is set and discovery is empty.
+    const orchEmpty = buildCommand(builtin("antigravity"), "hi", {
+      mode: "auto",
+      model: "gemini-pro-orchestrator-neon",
+      effort: "high",
+    });
+    expect(orchEmpty.cmd[orchEmpty.cmd.indexOf("--model") + 1]).toBe("gemini-pro-orchestrator-neon");
+    expect(orchEmpty.cmd).not.toContain("--effort");
 
-  const orch = buildCommand(builtin("antigravity"), "hi", { mode: "auto", model: "gemini-pro-orchestrator-neon", effort: null });
-  expect(orch.cmd[orch.cmd.indexOf("--model") + 1]).toBe("gemini-pro-orchestrator-neon");
-  expect(orch.cmd).not.toContain("--effort");
+    // With discovery populated, a discovered base composes its effort suffix
+    // while an effort-less discovered model still stays verbatim.
+    discovery.seedDiscoveryCache({ scope: "kind", kind: "antigravity" }, [
+      {
+        id: "gemini-4-neon",
+        label: "Gemini 4 Neon",
+        efforts: ["xhigh", "high"],
+        antigravity: { effortIds: { xhigh: "gemini-4-neon-xhigh", high: "gemini-4-neon-high" } },
+      },
+      { id: "gemini-pro-orchestrator-neon", label: "Orchestrator (Neon)" },
+    ]);
+    const neon = buildCommand(builtin("antigravity"), "hi", { mode: "auto", model: "gemini-4-neon", effort: "xhigh" });
+    expect(neon.cmd[neon.cmd.indexOf("--model") + 1]).toBe("gemini-4-neon-xhigh");
+    expect(neon.cmd).not.toContain("--effort");
+
+    const orchDiscovered = buildCommand(builtin("antigravity"), "hi", {
+      mode: "auto",
+      model: "gemini-pro-orchestrator-neon",
+      effort: "high",
+    });
+    expect(orchDiscovered.cmd[orchDiscovered.cmd.indexOf("--model") + 1]).toBe("gemini-pro-orchestrator-neon");
+    expect(orchDiscovered.cmd).not.toContain("--effort");
+  } finally {
+    discovery.__testing.resetForTests();
+  }
 });
 
 test("gemini 'ask' mode uses --approval-mode plan instead of --yolo", () => {
