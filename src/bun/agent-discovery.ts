@@ -545,7 +545,16 @@ function parseAntigravityModels(stdout: string): DiscoveredModel[] {
   return out;
 }
 
-async function discoverAntigravity(): Promise<DiscoveredModel[]> {
+/**
+ * `agy models`. `skip` (set by `model-discovery.ts` for a boot or periodic
+ * sweep) returns [] without spawning, so the held catalog stays: agetor sends
+ * Antigravity no unattended background requests, because Google reports that
+ * out-of-band usage-limit requests can get the account flagged
+ * (docs/architecture/harness-antigravity.md). A manual refresh or a harness
+ * status change still probes.
+ */
+async function discoverAntigravity(skip?: boolean): Promise<DiscoveredModel[]> {
+  if (skip) return [];
   const fallback = process.env.AGETOR_ANTIGRAVITY_BIN ?? "agy";
   const bin = Bun.which(fallback, { PATH: process.env.PATH }) ?? fallback;
   const probe = await runProbe([bin, "models"]);
@@ -1563,7 +1572,7 @@ async function runRefresh(opts?: { fxHarnesses?: FxHarnessTargetsOption; kindTar
       discoverCursor(),
       discoverGemini(),
       discoverFx(),
-      discoverAntigravity(),
+      discoverAntigravity(kindTargets.antigravity?.skip),
       discoverOpencode(),
       discoverCopilot(kindTargets.copilot?.env, kindTargets.copilot?.bin, kindTargets.copilot?.cwd, kindTargets.copilot?.skip),
     ]);
@@ -1717,7 +1726,7 @@ async function runRefreshKind(kind: AgentKind, target?: KindProbeTarget): Promis
         models = await discoverFx();
         break;
       case "antigravity":
-        models = await discoverAntigravity();
+        models = await discoverAntigravity(target?.skip);
         break;
       case "opencode":
         models = await discoverOpencode();

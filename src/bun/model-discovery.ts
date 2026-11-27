@@ -442,8 +442,16 @@ function probeCwd(): string | undefined {
  * Resolved inside the enqueued sweep so it reflects the harness rows at run
  * time.
  */
-async function kindTargets(opts: { sweep?: boolean } = {}): Promise<Partial<Record<AgentKind, KindProbeTarget>>> {
+async function kindTargets(
+  opts: { sweep?: boolean; background?: boolean } = {},
+): Promise<Partial<Record<AgentKind, KindProbeTarget>>> {
   const out: Partial<Record<AgentKind, KindProbeTarget>> = {};
+  // A boot or periodic sweep never runs `agy models`: agetor sends Antigravity
+  // no unattended background requests, because Google reports that
+  // out-of-band usage-limit requests can get the account flagged
+  // (docs/architecture/harness-antigravity.md). The held catalog (or the
+  // curated rows) stays until a manual refresh or a harness status change.
+  if (opts.background) out.antigravity = { env: {}, skip: true };
   const cwd = probeCwd();
   const claude = await harnesses.get("claude-code");
   if (claude && claude.enabled !== false) {
@@ -497,7 +505,10 @@ function installSettleHook(): void {
 
 /**
  * Full sweep: every kind's built-in discoverer plus every enabled fx,
- * codex or opencode harness's own catalog (`PER_HARNESS_KINDS`). Broadcasts `agent_models_changed`
+ * codex or opencode harness's own catalog (`PER_HARNESS_KINDS`). The one
+ * exception is antigravity's `agy models`, which runs only when `opts.manual`
+ * is set (the user's refresh route), never from boot or the periodic timer
+ * (docs/architecture/harness-antigravity.md). Broadcasts `agent_models_changed`
  * for whichever harnesses' lists changed. Never throws — this is called
  * fire-and-forget (`void refreshAllModels()`) from index.ts/headless.ts at
  * boot and from the periodic timer, with no caller left to observe a
@@ -511,13 +522,13 @@ function installSettleHook(): void {
  * meantime, rather than pruning it from a stale snapshot taken at enqueue
  * time.
  */
-export async function refreshAllModels(): Promise<void> {
+export async function refreshAllModels(opts: { manual?: boolean } = {}): Promise<void> {
   try {
     installSettleHook();
     // The persisted catalog is served as soon as it is read, before the probes run.
     await hydrateFromStore();
     await refreshHarnessCache();
-    await refreshDiscoveredModels({ fxHarnesses: discoveryTargets, kindTargets: () => kindTargets({ sweep: true }) });
+    await refreshDiscoveredModels({ fxHarnesses: discoveryTargets, kindTargets: () => kindTargets({ sweep: true, background: !opts.manual }) });
     await publishIfChanged();
   } catch (err) {
     console.error("[agetor] model discovery failed:", err);
