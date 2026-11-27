@@ -6,8 +6,9 @@
 // typed rules) through ESLint's Linter on good and bad sample code, so the test
 // block's `local/await-matcher` rule, its globs and the block order are
 // exercised, and checks that `json()` rejects a Promise at compile time.
-// Nothing runs `lint:async` automatically (there is no CI): `bun run check` is the gate.
+// `bun run check` is the gate, locally and in CI (.github/workflows/ci.yml).
 import { describe, expect, test } from "bun:test";
+import { readFileSync } from "node:fs";
 import path from "node:path";
 import { Linter } from "eslint";
 import config from "../../eslint.config.js";
@@ -65,6 +66,23 @@ describe("eslint.config.js async gate", () => {
     expect(testBlock!.files).toEqual(["src/**/*.test.ts", "src/**/*.test.tsx", "packages/remote-protocol/src/**/*.test.ts"]);
     expect(level(testBlock?.rules?.["@typescript-eslint/await-thenable"])).toBe("off");
     expect(level(testBlock?.rules?.["local/await-matcher"])).toBe("error");
+  });
+
+  test("the typed program is tsconfig.lint.json, covering every linted folder, with a raised heap", () => {
+    // The root-tsconfig program ran CI's 2 GB default Node heap out of memory.
+    const root = path.resolve(import.meta.dir, "../..");
+    const parserOptions = (sourceBlock as { languageOptions?: { parserOptions?: Record<string, unknown> } })
+      .languageOptions?.parserOptions;
+    expect(parserOptions?.project).toBe("./tsconfig.lint.json");
+    expect(parserOptions?.projectService).toBeUndefined();
+    const include = (JSON.parse(readFileSync(path.join(root, "tsconfig.lint.json"), "utf8")) as { include: string[] }).include;
+    for (const glob of sourceBlock!.files!) {
+      const dir = glob.slice(0, glob.indexOf("/**"));
+      expect(include, glob).toContain(dir);
+    }
+    const script = (JSON.parse(readFileSync(path.join(root, "package.json"), "utf8")) as { scripts: Record<string, string> })
+      .scripts["lint:async"];
+    expect(script).toContain("--max-old-space-size=4096");
   });
 });
 

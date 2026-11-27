@@ -1,0 +1,4 @@
+{
+  "extends": "./tsconfig.json",
+  "include": ["src/bun", "src/cli", "src/shared", "src/types", "packages/remote-protocol/src"]
+}

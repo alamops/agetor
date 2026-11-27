@@ -99,7 +99,12 @@ export default [
     languageOptions: {
       parser: tseslint.parser,
       parserOptions: {
-        projectService: true,
+        // A program of the linted folders only (not the webview or e2e):
+        // `projectService` over the root tsconfig peaked at ~4 GB and ran the
+        // CI runner's 2 GB default Node heap out of memory. Keep
+        // tsconfig.lint.json's `include` in step with the globs above
+        // (lint-async-config.test.ts pins it).
+        project: "./tsconfig.lint.json",
         tsconfigRootDir: import.meta.dirname,
       },
     },

@@ -26,7 +26,7 @@
     "release": "bun scripts/release.ts",
     "release:build-only": "bun run build:stable && bun scripts/verify-release.ts",
     "release:upload-only": "bun scripts/upload-release.ts",
-    "lint:async": "eslint --no-warn-ignored -c eslint.config.js \"src/bun/**/*.ts\" \"src/cli/**/*.{ts,tsx}\" \"src/shared/**/*.ts\" \"packages/remote-protocol/src/**/*.ts\"",
+    "lint:async": "node --max-old-space-size=4096 node_modules/eslint/bin/eslint.js --no-warn-ignored -c eslint.config.js \"src/bun/**/*.ts\" \"src/cli/**/*.{ts,tsx}\" \"src/shared/**/*.ts\" \"packages/remote-protocol/src/**/*.ts\"",
     "measure:core": "bun scripts/measure-core-responsiveness.ts",
     "typecheck": "tsc --noEmit",
     "check": "bun run typecheck && bun run lint:async && bun test && bun run test:scripts && bun run test:remote-protocol",
